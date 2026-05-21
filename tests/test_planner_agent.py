@@ -1,0 +1,168 @@
+"""Tests for agents/planner_agent.py — PlannerAgent and _parse_plan."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from agents.base_agent import AGENT_SECURITY_PREFIX
+from agents.planner_agent import PlannerAgent, _parse_plan
+from core.state import TaskState
+from tests.conftest import StubLLMClient
+
+
+def _make_agent(llm: StubLLMClient, project_config: dict | None = None, tools: dict | None = None) -> PlannerAgent:
+    return PlannerAgent(llm=llm, tools=tools or {}, project_config=project_config or {})
+
+
+class TestParsePlan:
+    def test_parses_numbered_list(self):
+        output = "1. Create ViewModel\n2. Update Repository\n3. Wire UI"
+        assert _parse_plan(output) == ["Create ViewModel", "Update Repository", "Wire UI"]
+
+    def test_ignores_non_step_lines(self):
+        output = "Here is the plan:\n1. Step one\nsome notes\n2. Step two"
+        assert _parse_plan(output) == ["Step one", "Step two"]
+
+    def test_empty_output_returns_empty(self):
+        assert _parse_plan("") == []
+
+    def test_single_item_list(self):
+        assert _parse_plan("1. Only step") == ["Only step"]
+
+    def test_strips_step_text(self):
+        assert _parse_plan("1.   Padded step   ") == ["Padded step"]
+
+
+class TestPlannerAgentRun:
+    def test_no_implementation_prompt_returns_failure(self):
+        state = TaskState(task_id="t1", task_description="task")
+        agent = _make_agent(StubLLMClient())
+        result = agent.run(state)
+        assert not result.success
+        assert "implementation prompt" in result.message.lower()
+
+    def test_single_pass_decision(self, stub_llm: StubLLMClient):
+        stub_llm.generate_result = "SINGLE_PASS"
+        state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
+        agent = _make_agent(stub_llm)
+        result = agent.run(state)
+        assert result.success
+        assert "Single-pass" in result.message
+        assert state.plan == []
+        assert state.plan_decided is True
+
+    def test_single_pass_case_insensitive(self, stub_llm: StubLLMClient):
+        stub_llm.generate_result = "single_pass"
+        state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
+        agent = _make_agent(stub_llm)
+        result = agent.run(state)
+        assert result.success
+        assert state.plan == []
+        assert state.plan_decided is True
+
+    def test_multi_step_plan(self, stub_llm: StubLLMClient):
+        stub_llm.generate_result = "1. Add ViewModel\n2. Update UI\n3. Wire DI"
+        state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
+        agent = _make_agent(stub_llm)
+        result = agent.run(state)
+        assert result.success
+        assert state.plan == ["Add ViewModel", "Update UI", "Wire DI"]
+        assert state.current_step == 0
+        assert state.plan_decided is True
+        assert result.data["steps"] == state.plan
+
+    def test_fewer_than_two_steps_falls_back_to_single_pass(self, stub_llm: StubLLMClient):
+        stub_llm.generate_result = "1. Only one step"
+        state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
+        agent = _make_agent(stub_llm)
+        result = agent.run(state)
+        assert result.success
+        assert state.plan == []
+        assert state.plan_decided is True
+
+    def test_llm_error_returns_failure(self, stub_llm: StubLLMClient):
+        stub_llm.generate_error = RuntimeError("model unavailable")
+        state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
+        agent = _make_agent(stub_llm)
+        result = agent.run(state)
+        assert not result.success
+        assert "model unavailable" in result.message
+
+    def test_llm_error_recorded_in_state(self, stub_llm: StubLLMClient):
+        stub_llm.generate_error = RuntimeError("model unavailable")
+        state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
+        agent = _make_agent(stub_llm)
+        agent.run(state)
+        assert any(e["action"] == "plan_failed" for e in state.history)
+
+    def test_empty_output_returns_failure(self, stub_llm: StubLLMClient):
+        stub_llm.generate_result = ""
+        state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
+        agent = _make_agent(stub_llm)
+        result = agent.run(state)
+        assert not result.success
+
+    def test_max_steps_passed_to_prompt(self, stub_llm: StubLLMClient):
+        stub_llm.generate_result = "SINGLE_PASS"
+        state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
+        config = {"planner": {"max_steps": 3}}
+        agent = _make_agent(stub_llm, project_config=config)
+        agent.run(state)
+        system_prompt = stub_llm.generate_calls[0][0]
+        assert "3" in system_prompt
+
+    def test_compile_dependencies_rule_in_prompt(self, stub_llm: StubLLMClient):
+        stub_llm.generate_result = "SINGLE_PASS"
+        state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
+        _make_agent(stub_llm).run(state)
+        system_prompt = stub_llm.generate_calls[0][0]
+        assert "every immediate compile dependency" in system_prompt
+        assert "resource or localization keys/IDs" in system_prompt
+        assert "dependency-injection" in system_prompt
+        assert "service registrations" in system_prompt
+        assert "interface/trait/protocol/abstract methods" in system_prompt
+        assert "If step N references it, step N must also create or update it" in system_prompt
+        assert "choose SINGLE_PASS" in system_prompt
+
+    def test_record_added_on_success(self, stub_llm: StubLLMClient):
+        stub_llm.generate_result = "SINGLE_PASS"
+        state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
+        agent = _make_agent(stub_llm)
+        agent.run(state)
+        assert any(e["action"] == "plan" for e in state.history)
+
+    def test_planner_prompt_saved_to_state(self, stub_llm: StubLLMClient):
+        stub_llm.generate_result = "SINGLE_PASS"
+        state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
+        _make_agent(stub_llm).run(state)
+        assert state.planner_prompt is not None
+        assert "do x" in state.planner_prompt
+
+
+class TestPlannerAgentExtraRules:
+    def test_extra_rules_included_in_prompt(self, stub_llm: StubLLMClient, file_tool, tmp_project: Path):
+        stub_llm.generate_result = "SINGLE_PASS"
+        (tmp_project / "planner_rules.md").write_text("Always split UI and business logic.")
+        config = {"planner": {"extra_rules": "planner_rules.md"}}
+        state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
+        _make_agent(stub_llm, project_config=config, tools={"file": file_tool}).run(state)
+        system_prompt = stub_llm.generate_calls[0][0]
+        assert "Always split UI and business logic." in system_prompt
+        assert "Project-specific rules" in system_prompt
+
+    def test_extra_rules_absent_when_not_configured(self, stub_llm: StubLLMClient):
+        stub_llm.generate_result = "SINGLE_PASS"
+        state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
+        _make_agent(stub_llm).run(state)
+        system_prompt = stub_llm.generate_calls[0][0]
+        assert "Project-specific rules" not in system_prompt
+
+
+class TestPlannerAgentSecurityPrefix:
+    def test_security_prefix_prepended_to_system_prompt(self, stub_llm: StubLLMClient):
+        stub_llm.generate_result = "SINGLE_PASS"
+        state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
+        _make_agent(stub_llm).run(state)
+        system_prompt = stub_llm.generate_calls[0][0]
+        assert system_prompt.startswith(AGENT_SECURITY_PREFIX)
+        assert state.planner_prompt.startswith(AGENT_SECURITY_PREFIX)

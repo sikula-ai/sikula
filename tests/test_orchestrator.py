@@ -1,0 +1,1579 @@
+"""Tests for core/orchestrator.py — pipeline orchestration logic."""
+
+from __future__ import annotations
+
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+from agents.base_agent import AgentResult
+from tests.conftest import StubLLMClient
+from core.orchestrator import Orchestrator, OrchestratorConfig, _build_tool, _fmt_elapsed
+from core.state import JsonStateStore, TaskState
+from tools.base_tool import Sandbox, ToolResult
+from tools.cargo_tool import CargoTool
+from tools.gradle_android_tool import AndroidGradleTool
+from tools.python_tool import PythonTool
+
+
+# ---------------------------------------------------------------------------
+# Stubs
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StubAgent:
+    name: str = ""
+    calls: list = field(default_factory=list)
+    side_effect: Callable[[TaskState], None] | None = None
+    result_data: dict | None = None  # when set, overrides auto-detected files_written
+    raise_exception: Exception | None = None
+
+    def run(self, state: TaskState) -> AgentResult:
+        if self.raise_exception:
+            raise self.raise_exception
+        self.calls.append(state)
+        files_before = list(state.files_changed)
+        if self.side_effect:
+            self.side_effect(state)
+        if state.failed:
+            return AgentResult(success=False, message=f"{self.name} failed")
+        data = (
+            self.result_data
+            if self.result_data is not None
+            else {"files_written": [f for f in state.files_changed if f not in files_before]}
+        )
+        return AgentResult(success=True, message=f"{self.name} ok", data=data)
+
+
+class StubBuildTool:
+    def __init__(self) -> None:
+        self.sync_success = True
+        self.compile_success = True
+        self.test_success = True
+        self.check_success = True
+        self.presync_success = True
+        self.check_results: dict[str, list[bool]] = {}
+        self.build_config_files: set[str] = set()
+        self.sync_calls = 0
+        self.compile_calls = 0
+        self.test_calls = 0
+        self.presync_calls = 0
+        self.check_calls: list[str] = []
+        self.check_configs: list[tuple[str, dict]] = []
+
+    def sync(self) -> ToolResult:
+        self.sync_calls += 1
+        return ToolResult(success=self.sync_success, output="", error="" if self.sync_success else "sync failed")
+
+    def generate_sources(self) -> ToolResult:
+        self.presync_calls += 1
+        return ToolResult(
+            success=self.presync_success, output="", error="" if self.presync_success else "presync failed"
+        )
+
+    def compile_check(self) -> ToolResult:
+        self.compile_calls += 1
+        return ToolResult(
+            success=self.compile_success, output="", error="" if self.compile_success else "compile failed"
+        )
+
+    def run_tests(self) -> ToolResult:
+        self.test_calls += 1
+        return ToolResult(success=self.test_success, output="", error="" if self.test_success else "tests failed")
+
+    def run_check(self, name: str, config: dict) -> ToolResult:
+        self.check_calls.append(name)
+        self.check_configs.append((name, config))
+        if name in self.check_results and self.check_results[name]:
+            success = self.check_results[name].pop(0)
+        else:
+            success = self.check_success
+        error_msg = "" if success else f"{name} failed"
+        return ToolResult(success=success, output=error_msg, error=error_msg)
+
+    def is_build_config_file(self, path: str) -> bool:
+        return path in self.build_config_files
+
+
+class RetryReportingAgent:
+    def __init__(self) -> None:
+        self.llm = StubLLMClient()
+
+    def run(self, state: TaskState) -> AgentResult:
+        self.llm._retry_observer(
+            {
+                "provider": "codex",
+                "model": "gpt-5.3-codex",
+                "operation": "run_agent",
+                "attempt": 1,
+                "max_attempts": 4,
+                "delay_s": 30,
+                "error": "temporary provider failure",
+                "error_type": "RuntimeError",
+            }
+        )
+        state.record("test_writer", "test_write", "files changed: []")
+        return AgentResult(success=True, message="ok", data={"files_written": []})
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_orchestrator(
+    tmp_path: Path,
+    **config_kwargs,
+) -> tuple[Orchestrator, dict[str, StubAgent], StubBuildTool]:
+    config = OrchestratorConfig(
+        project_root=tmp_path,
+        allowed_write_paths=["."],
+        allowed_read_paths=["."],
+        project_config={"project": {"build_tool": "python"}},
+        **config_kwargs,
+    )
+    store = JsonStateStore(tmp_path / "state")
+    orch = Orchestrator(config=config, llm=StubLLMClient(), state_store=store)
+
+    stubs: dict[str, StubAgent] = {
+        name: StubAgent(name=name)
+        for name in ["analyst", "planner", "implementer", "reviewer", "security_reviewer", "test_writer", "fixer"]
+    }
+
+    # Default reviewer/security_reviewer stubs approve so that tests not focused on
+    # review behaviour don't fail due to the "no decision" guard added in Bug 2 fix.
+    # Tests that care about rejection override these side_effects explicitly.
+    def _default_reviewer(state: TaskState) -> None:
+        state.review_approved = True
+        state.review_issues = []
+
+    def _default_security_reviewer(state: TaskState) -> None:
+        state.security_approved = True
+        state.review_issues = []
+
+    stubs["reviewer"].side_effect = _default_reviewer
+    stubs["security_reviewer"].side_effect = _default_security_reviewer
+
+    orch._agents = stubs  # type: ignore[assignment]
+
+    build = StubBuildTool()
+    orch._tools["build"] = build
+
+    return orch, stubs, build
+
+
+def _save_state(orch: Orchestrator, **kwargs) -> TaskState:
+    state = TaskState(task_id="t1", task_description="test task", **kwargs)
+    orch._store.save(state)
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Tests — loop gates and idempotency
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorLoop:
+    def test_done_task_skips_all_agents(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path)
+        _save_state(orch, done=True)
+        orch.run(task_id="t1")
+        assert all(len(s.calls) == 0 for s in stubs.values())
+
+    def test_failed_task_skips_all_agents(self, tmp_path: Path, caplog):
+        orch, stubs, _ = _make_orchestrator(tmp_path)
+        _save_state(orch, failed=True)
+        caplog.set_level("INFO")
+        orch.run(task_id="t1")
+        assert all(len(s.calls) == 0 for s in stubs.values())
+        assert "--reset-failed" in caplog.text
+        assert "nothing to do" not in caplog.text
+
+    def test_agent_llm_retry_is_recorded_in_history(self, tmp_path: Path):
+        orch, _, _ = _make_orchestrator(tmp_path)
+        state = TaskState(task_id="t1", task_description="test")
+        orch._agents["test_writer"] = RetryReportingAgent()  # type: ignore[assignment]
+
+        result = orch._run_agent("test_writer", state)
+
+        assert result.success
+        retry = state.history[0]
+        assert retry["agent"] == "test_writer"
+        assert retry["action"] == "llm_retry"
+        assert retry["result"] == "temporary provider failure"
+        assert retry["provider"] == "codex"
+        assert retry["model"] == "gpt-5.3-codex"
+        assert retry["operation"] == "run_agent"
+        assert retry["attempt"] == 1
+        assert retry["max_attempts"] == 4
+        assert retry["delay_s"] == 30
+        assert retry["error_type"] == "RuntimeError"
+        assert state.history[1]["action"] == "test_write"
+
+    def test_analyze_phase_skipped_when_prompt_exists(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_build=False)
+        _save_state(orch, implementation_prompt="existing", files_changed=["src/main.py"])
+        orch.run(task_id="t1")
+        assert len(stubs["analyst"].calls) == 0
+
+    def test_analyst_failure_aborts_task(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path)
+        stubs["analyst"].side_effect = lambda s: setattr(s, "failed", True)
+        _save_state(orch)
+        result = orch.run(task_id="t1")
+        assert result.failed
+        assert len(stubs["implementer"].calls) == 0
+
+    def test_planner_skipped_when_disabled(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=False, run_build=False)
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+        orch.run(task_id="t1")
+        assert len(stubs["planner"].calls) == 0
+
+    def test_planner_skipped_when_already_decided(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=True, run_build=False)
+        _save_state(orch, implementation_prompt="p", plan_decided=True, files_changed=["src/main.py"])
+        orch.run(task_id="t1")
+        assert len(stubs["planner"].calls) == 0
+
+    def test_implementer_no_files_sets_failed(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path)
+        _save_state(orch, implementation_prompt="p")
+        result = orch.run(task_id="t1")
+        assert result.failed
+        assert len(stubs["implementer"].calls) == 1
+
+    def test_implementer_no_files_adopts_dirty_worktree_on_resume(self, tmp_path: Path):
+        # Simulate a worktree where the previous (interrupted) implementer run modified a
+        # tracked file but the process was killed before state.files_changed was populated.
+        subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=tmp_path, check=True, capture_output=True)
+        (tmp_path / "src").mkdir()
+        original = tmp_path / "src" / "main.py"
+        original.write_text("# original")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+        original.write_text("# modified by previous interrupted implementer run")
+
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_build=False)
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            worktree_path=str(tmp_path),
+            worktree_base=str(tmp_path),
+        )
+        result = orch.run(task_id="t1")
+
+        assert not result.failed
+        assert "src/main.py" in result.files_changed
+        assert any(h["action"] == "adopt_worktree_changes" for h in result.history)
+
+    def test_implementer_skipped_when_files_already_changed(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_build=False)
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+        orch.run(task_id="t1")
+        assert len(stubs["implementer"].calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests — build/fix loop
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorBuildLoop:
+    def _build_ready(self, orch: Orchestrator) -> None:
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=True)
+
+    def test_max_build_iterations_sets_failed(self, tmp_path: Path):
+        orch, _, build = _make_orchestrator(tmp_path, run_build=True, max_iterations=2)
+        build.compile_success = False
+        self._build_ready(orch)
+        result = orch.run(task_id="t1")
+        assert result.failed
+        assert result.build_iterations == 2
+
+    def test_sync_skipped_when_already_synced(self, tmp_path: Path):
+        orch, _, build = _make_orchestrator(tmp_path, run_build=True)
+        self._build_ready(orch)
+        orch.run(task_id="t1")
+        assert build.sync_calls == 0
+
+    def test_sync_runs_when_not_synced(self, tmp_path: Path):
+        orch, _, build = _make_orchestrator(tmp_path, run_build=True)
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=False)
+        orch.run(task_id="t1")
+        assert build.sync_calls == 1
+
+    def test_tests_skipped_when_disabled(self, tmp_path: Path):
+        orch, _, build = _make_orchestrator(tmp_path, run_build=True, run_tests=False)
+        self._build_ready(orch)
+        result = orch.run(task_id="t1")
+        assert build.test_calls == 0
+        assert result.test_status == "skipped"
+
+    def test_done_set_when_build_passes(self, tmp_path: Path):
+        orch, _, _ = _make_orchestrator(tmp_path, run_build=True, run_tests=False, run_checks=False)
+        self._build_ready(orch)
+        result = orch.run(task_id="t1")
+        assert result.done
+        assert result.test_status == "skipped"
+        assert result.check_status == "skipped"
+
+    def test_test_and_check_statuses_set_when_enabled_phases_pass(self, tmp_path: Path):
+        orch, _, build = _make_orchestrator(tmp_path, run_build=True, run_tests=True, run_checks=True)
+        self._build_ready(orch)
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert build.test_calls == 1
+        assert result.test_status == "success"
+        assert result.check_status == "skipped"
+
+
+# ---------------------------------------------------------------------------
+# Tests — review loop
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorReviewLoop:
+    def _review_ready(self, orch: Orchestrator) -> None:
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+
+    def test_review_skipped_when_disabled(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_review=False, run_build=False)
+        self._review_ready(orch)
+        result = orch.run(task_id="t1")
+        assert len(stubs["reviewer"].calls) == 0
+        assert result.done
+        assert result.test_status == "skipped"
+        assert result.check_status == "skipped"
+
+    def test_review_and_security_skipped_when_both_disabled(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_review=False,
+            run_security_review=False,
+            run_build=False,
+        )
+        self._review_ready(orch)
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert len(stubs["reviewer"].calls) == 0
+        assert len(stubs["security_reviewer"].calls) == 0
+        assert result.test_status == "skipped"
+        assert result.check_status == "skipped"
+
+    def test_review_skipped_when_already_approved(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_review=True, run_build=False)
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], review_approved=True)
+        orch.run(task_id="t1")
+        assert len(stubs["reviewer"].calls) == 0
+
+    def test_max_review_iterations_sets_failed(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_review=True, run_build=False, max_review_iterations=2)
+        self._review_ready(orch)
+
+        def always_issues(state: TaskState) -> None:
+            state.review_issues = ["dead field X"]
+
+        stubs["reviewer"].side_effect = always_issues
+        result = orch.run(task_id="t1")
+        assert result.failed
+        # max_review_iterations=2 fix attempts → 3 reviews (initial + 2 post-fix), 2 implements
+        assert len(stubs["reviewer"].calls) == 3
+        assert len(stubs["implementer"].calls) == 2
+
+    def test_every_implement_fix_gets_reviewed(self, tmp_path: Path):
+        """Every fix attempt must be followed by a review — implementer never runs unreviewd."""
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_review=True, run_build=False, max_review_iterations=3)
+        self._review_ready(orch)
+
+        def always_issues(state: TaskState) -> None:
+            state.review_issues = ["dead field X"]
+
+        stubs["reviewer"].side_effect = always_issues
+        orch.run(task_id="t1")
+        # max=3 fix attempts → 4 reviews, 3 implements; reviews == implements + 1
+        assert len(stubs["reviewer"].calls) == 4
+        assert len(stubs["implementer"].calls) == 3
+        assert len(stubs["reviewer"].calls) == len(stubs["implementer"].calls) + 1
+
+    def test_review_issues_trigger_implementer_fix(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_review=True, run_build=False, max_review_iterations=3)
+        call_count = {"n": 0}
+
+        def reviewer_effect(state: TaskState) -> None:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                state.review_issues = ["missing null check"]
+            else:
+                state.review_approved = True
+                state.review_issues.clear()
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        self._review_ready(orch)
+        orch.run(task_id="t1")
+        assert len(stubs["reviewer"].calls) == 2
+        assert len(stubs["implementer"].calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests — security review loop
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorSecurityLoop:
+    def _security_ready(self, orch: Orchestrator) -> None:
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], review_approved=True)
+
+    def test_security_review_skipped_when_disabled(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_security_review=False, run_build=False)
+        self._security_ready(orch)
+        orch.run(task_id="t1")
+        assert len(stubs["security_reviewer"].calls) == 0
+
+    def test_max_security_iterations_sets_failed(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path, run_security_review=True, run_review=False, run_build=False, max_security_review_iterations=2
+        )
+        self._security_ready(orch)
+
+        def always_blocking(state: TaskState) -> None:
+            state.review_issues = ["hardcoded secret"]
+
+        stubs["security_reviewer"].side_effect = always_blocking
+        result = orch.run(task_id="t1")
+        assert result.failed
+        # max=2 fix attempts → 3 security reviews, 2 implements
+        assert len(stubs["security_reviewer"].calls) == 3
+        assert len(stubs["implementer"].calls) == 2
+
+    def test_security_blocking_issue_triggers_re_review(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_security_review=True,
+            run_review=True,
+            run_build=False,
+            max_security_review_iterations=2,
+            max_review_iterations=3,
+        )
+        sec_calls = {"n": 0}
+
+        def security_effect(state: TaskState) -> None:
+            sec_calls["n"] += 1
+            if sec_calls["n"] == 1:
+                state.review_issues = ["hardcoded key"]
+            else:
+                state.security_approved = True
+                state.review_issues.clear()
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        stubs["security_reviewer"].side_effect = security_effect
+        stubs["reviewer"].side_effect = reviewer_effect
+        self._security_ready(orch)
+        result = orch.run(task_id="t1")
+        assert not result.failed
+        assert len(stubs["implementer"].calls) == 1
+        assert len(stubs["reviewer"].calls) >= 1
+
+    def test_security_warnings_only_do_not_trigger_implementer_fix(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_security_review=True,
+            run_review=True,
+            run_build=False,
+        )
+
+        def security_warning_effect(state: TaskState) -> None:
+            state.review_cycle_records.append(
+                {
+                    "reviewer": "security_reviewer",
+                    "reviewer_output": "## Warnings\n\n### Missing audit log\nConcern: low-risk observability gap",
+                    "approved": True,
+                    "has_warnings": True,
+                }
+            )
+            state.security_approved = True
+
+        stubs["security_reviewer"].side_effect = security_warning_effect
+        self._security_ready(orch)
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert not result.failed
+        assert len(stubs["implementer"].calls) == 0
+        assert result.review_cycle_records[-1]["reviewer"] == "security_reviewer"
+        assert result.review_cycle_records[-1]["has_warnings"] is True
+
+
+# ---------------------------------------------------------------------------
+# Tests — fix phase flag resets
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorFixPhase:
+    def test_fix_resets_build_synced_on_build_config_change(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(tmp_path, run_build=True, max_iterations=2)
+        build.compile_success = False
+        build.build_config_files = {"requirements.txt"}
+
+        def fixer_effect(state: TaskState) -> None:
+            if "requirements.txt" not in state.files_changed:
+                state.files_changed.append("requirements.txt")
+
+        stubs["fixer"].side_effect = fixer_effect
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=True)
+        orch.run(task_id="t1")
+        assert build.sync_calls > 0
+
+    def test_fix_new_files_trigger_re_review(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path, run_build=True, run_review=True, max_iterations=2, max_review_iterations=2
+        )
+        build.compile_success = False
+
+        def fixer_effect(state: TaskState) -> None:
+            if "src/new.py" not in state.files_changed:
+                state.files_changed.append("src/new.py")
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        stubs["fixer"].side_effect = fixer_effect
+        stubs["reviewer"].side_effect = reviewer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            build_synced=True,
+            review_approved=True,
+        )
+        orch.run(task_id="t1")
+        assert len(stubs["reviewer"].calls) >= 1
+
+    def test_fix_re_edit_of_existing_file_triggers_re_review(self, tmp_path: Path):
+        """Second fixer pass modifying an already-tracked file must still trigger review."""
+        orch, stubs, build = _make_orchestrator(
+            tmp_path, run_build=True, run_review=True, max_iterations=3, max_review_iterations=2
+        )
+        build.compile_success = False
+
+        # Fixer always reports editing src/main.py — which is already in files_changed.
+        # Before the fix, new_files would be empty (set-diff misses re-edits), so review
+        # would not run. With the fix, fixer_result.data["files_written"] is used instead.
+        stubs["fixer"].result_data = {"files_written": ["src/main.py"]}
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            build_synced=True,
+            review_approved=True,
+        )
+        orch.run(task_id="t1")
+        # Each fixer pass should trigger review; max_iterations=3 so fixer runs ≥2 times
+        assert len(stubs["reviewer"].calls) >= 2
+
+    def test_fix_triggers_security_re_review(self, tmp_path: Path):
+        """After fixer writes files, both reviewer and security reviewer must be re-triggered."""
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            max_iterations=2,
+            max_review_iterations=2,
+            max_security_review_iterations=2,
+        )
+        build.compile_success = False
+
+        def fixer_effect(state: TaskState) -> None:
+            if "src/fix.py" not in state.files_changed:
+                state.files_changed.append("src/fix.py")
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        def security_effect(state: TaskState) -> None:
+            state.security_approved = True
+            state.review_issues.clear()
+
+        stubs["fixer"].side_effect = fixer_effect
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["security_reviewer"].side_effect = security_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            build_synced=True,
+            review_approved=True,
+            security_approved=True,
+        )
+        orch.run(task_id="t1")
+
+        assert len(stubs["reviewer"].calls) >= 1
+        assert len(stubs["security_reviewer"].calls) >= 1
+
+    def test_resume_after_interrupt_between_fixer_and_reviewer_runs_review(self, tmp_path: Path):
+        """Simulate interrupt after fixer ran and flags were reset+saved, but reviewer had not yet run.
+        On resume, review_approved=False must cause reviewer to run."""
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_build=False, run_review=True, max_review_iterations=2)
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        # State reflects: fixer ran, flags reset and saved, reviewer not yet run
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            review_approved=False,
+        )
+        orch.run(task_id="t1")
+        assert len(stubs["reviewer"].calls) >= 1
+
+    def test_fixer_no_files_skips_review(self, tmp_path: Path):
+        """If fixer writes no files, review must not be re-triggered."""
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            max_iterations=2,
+            max_review_iterations=2,
+        )
+        build.compile_success = False
+
+        # Fixer reports no files written
+        stubs["fixer"].result_data = {"files_written": []}
+
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            build_synced=True,
+            review_approved=True,
+        )
+        orch.run(task_id="t1")
+
+        assert len(stubs["reviewer"].calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests — interrupt / resume scenarios
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorInterruptResume:
+    def test_resume_after_interrupt_between_fixer_and_reviewer_runs_review(self, tmp_path: Path):
+        """Interrupt after fixer ran and flags were reset+saved, reviewer had not yet run.
+        On resume, review_approved=False must cause reviewer to run."""
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_build=False, run_review=True, max_review_iterations=2)
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], review_approved=False)
+        orch.run(task_id="t1")
+        assert len(stubs["reviewer"].calls) >= 1
+
+    def test_resume_after_interrupt_between_security_fix_and_review_runs_review(self, tmp_path: Path):
+        """Interrupt after security-fix implementer ran and review_approved was reset+saved,
+        but review loop had not yet run. On resume, reviewer must run."""
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path, run_build=False, run_review=True, run_security_review=True, max_review_iterations=2
+        )
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        # Simulates state saved after security-fix implementer reset review_approved
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            review_approved=False,
+            security_approved=False,
+        )
+        orch.run(task_id="t1")
+        assert len(stubs["reviewer"].calls) >= 1
+
+    def test_resume_with_tests_up_to_date_false_reruns_test_writer(self, tmp_path: Path):
+        """Interrupt after implementer fix reset tests_up_to_date but before test writer ran.
+        On resume, test writer must run."""
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_build=False, run_review=True, run_test_writing=True)
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            review_approved=False,
+            tests_up_to_date=False,
+        )
+        orch.run(task_id="t1")
+        assert len(stubs["test_writer"].calls) >= 1
+
+    def test_step_loop_runs_implementer_per_step(self, tmp_path: Path):
+        """Step loop: implementer must run once per step."""
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=True, run_build=False)
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        def implementer_effect(state: TaskState) -> None:
+            state.files_changed.append(f"src/step{len(stubs['implementer'].calls)}.py")
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].side_effect = implementer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: add feature A", "Step 2: add feature B"],
+            plan_decided=True,
+        )
+        result = orch.run(task_id="t1")
+        assert result.done
+        assert len(stubs["implementer"].calls) == 2
+
+    def test_step_loop_max_review_iterations_persists_failed_state(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=False,
+            max_review_iterations=1,
+        )
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = False
+            state.review_issues = ["future step is missing"]
+
+        def implementer_effect(state: TaskState) -> None:
+            if not state.files_changed:
+                state.files_changed.append("src/step0.py")
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].side_effect = implementer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: add feature A", "Step 2: add feature B"],
+            plan_decided=True,
+        )
+
+        result = orch.run(task_id="t1")
+        saved = orch._store.load("t1")
+
+        assert result.failed is True
+        assert saved.failed is True
+        assert saved.done is False
+        assert any(h["action"] == "abort" for h in saved.history)
+
+    def test_step_loop_resume_at_review_limit_allows_approval_before_abort(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=False,
+            max_review_iterations=3,
+        )
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        def implementer_effect(state: TaskState) -> None:
+            state.files_changed.append(f"src/step{state.current_step}.py")
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].side_effect = implementer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: add feature A", "Step 2: add feature B"],
+            plan_decided=True,
+            current_step=1,
+            step_implemented=True,
+            files_changed=["src/step0.py"],
+            review_approved=False,
+            review_iterations=3,
+        )
+
+        result = orch.run(task_id="t1")
+        saved = orch._store.load("t1")
+
+        assert result.done is True
+        assert saved.done is True
+        assert saved.failed is False
+        assert len(stubs["reviewer"].calls) == 1
+        assert len(stubs["implementer"].calls) == 0
+
+    def test_step_loop_resume_reruns_current_step(self, tmp_path: Path):
+        """Interrupt during step 1, resume: step 1 implementer must run again."""
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=True, run_build=False)
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        def implementer_effect(state: TaskState) -> None:
+            state.files_changed.append(f"src/step{state.current_step}.py")
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].side_effect = implementer_effect
+        # Simulate interrupt during step 0: step_implemented=False (implementer not yet done)
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: add feature A", "Step 2: add feature B"],
+            plan_decided=True,
+            current_step=0,
+            step_implemented=False,
+        )
+        result = orch.run(task_id="t1")
+        assert result.done
+        assert len(stubs["implementer"].calls) == 2
+
+    def test_step_loop_no_changes_advances_to_next_step(self, tmp_path: Path):
+        """Step with no file changes must not abort — treat as already implemented and advance."""
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=True, run_build=False)
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        call_count = [0]
+
+        def implementer_effect(state: TaskState) -> None:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                pass  # step 0: no changes — already implemented
+            else:
+                state.files_changed.append("src/step1.py")
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].side_effect = implementer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: already done", "Step 2: add feature B"],
+            plan_decided=True,
+        )
+        result = orch.run(task_id="t1")
+        assert result.done
+        assert len(stubs["implementer"].calls) == 2
+        history_actions = [h["action"] for h in result.history]
+        assert "step_skipped" in history_actions
+
+    def test_step_loop_skips_completed_step(self, tmp_path: Path):
+        """Interrupt after step 0 completed: on resume, step 0 implementer must not run again."""
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=True, run_build=False)
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        def implementer_effect(state: TaskState) -> None:
+            state.files_changed.append(f"src/step{state.current_step}.py")
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].side_effect = implementer_effect
+        # Simulate interrupt after step 0 completed: current_step=1, step_implemented=False
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: add feature A", "Step 2: add feature B"],
+            plan_decided=True,
+            current_step=1,
+            step_implemented=False,
+            files_changed=["src/step0.py"],
+        )
+        result = orch.run(task_id="t1")
+        assert result.done
+        assert len(stubs["implementer"].calls) == 1  # only step 1, not step 0 again
+
+
+# ---------------------------------------------------------------------------
+# Tests — preexisting-changes fast-path (review --fix with no fixer needed)
+# ---------------------------------------------------------------------------
+
+
+_REVIEW_DIFF = "@@ -1 +1 @@\n+x"  # minimal non-empty diff marking a task as a review task
+
+
+def _git_diff_refresh_subprocess(cmd, **kwargs):
+    if cmd[0:2] == ["git", "merge-base"]:
+        return subprocess.CompletedProcess(cmd, 0, stdout="base123\n", stderr="")
+    if cmd[0:2] == ["git", "diff"]:
+        return subprocess.CompletedProcess(cmd, 0, stdout="@@ fresh diff\n+current\n", stderr="")
+    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+
+class TestOrchestratorPreexistingChangesFastPath:
+    def test_review_fix_refreshes_review_diff_before_review(self, tmp_path: Path, monkeypatch):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_build=False,
+        )
+        monkeypatch.setattr(subprocess, "run", _git_diff_refresh_subprocess)
+
+        def reviewer_effect(state: TaskState) -> None:
+            assert state.review_diff == "@@ fresh diff\n+current\n"
+            state.review_approved = True
+            state.review_issues.clear()
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            review_diff="@@ stale diff\n+old",
+            review_mode="review_fix",
+            review_base_branch="main",
+            worktree_base=str(tmp_path),
+            build_synced=True,
+        )
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert result.review_diff == "@@ fresh diff\n+current\n"
+
+    def test_review_fix_reviews_test_writer_changes(self, tmp_path: Path, monkeypatch):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            run_build=False,
+            max_review_iterations=3,
+        )
+        monkeypatch.setattr(subprocess, "run", _git_diff_refresh_subprocess)
+
+        review_calls = {"n": 0}
+
+        def reviewer_effect(state: TaskState) -> None:
+            review_calls["n"] += 1
+            if review_calls["n"] == 1:
+                state.review_approved = False
+                state.review_issues = ["needs branch fix"]
+                return
+            state.review_approved = True
+            state.review_issues.clear()
+
+        def implementer_effect(state: TaskState) -> None:
+            state.files_changed.append("src/fix.py")
+
+        def test_writer_effect(state: TaskState) -> None:
+            if "tests/test_fix.py" not in state.files_changed:
+                state.files_changed.append("tests/test_fix.py")
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].side_effect = implementer_effect
+        stubs["test_writer"].side_effect = test_writer_effect
+
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            review_diff=_REVIEW_DIFF,
+            review_mode="review_fix",
+            review_base_branch="main",
+            worktree_base=str(tmp_path),
+            build_synced=True,
+        )
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert review_calls["n"] == 3
+        assert "tests/test_fix.py" in result.files_changed
+
+    def test_review_fix_rejects_test_writer_changes_without_rerunning_test_writer(self, tmp_path: Path, monkeypatch):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            run_build=False,
+            max_review_iterations=3,
+        )
+        monkeypatch.setattr(subprocess, "run", _git_diff_refresh_subprocess)
+
+        review_calls = {"n": 0}
+        test_writer_calls = {"n": 0}
+
+        def reviewer_effect(state: TaskState) -> None:
+            review_calls["n"] += 1
+            if review_calls["n"] == 1:
+                state.review_approved = False
+                state.review_issues = ["needs branch fix"]
+                return
+            if review_calls["n"] == 3:
+                state.review_approved = False
+                state.review_issues = ["test writer changes are not acceptable"]
+                return
+            state.review_approved = True
+            state.review_issues.clear()
+
+        def implementer_effect(state: TaskState) -> None:
+            state.files_changed.append(f"src/fix_{review_calls['n']}.py")
+
+        def test_writer_effect(state: TaskState) -> None:
+            test_writer_calls["n"] += 1
+            state.files_changed.append(f"tests/test_fix_{test_writer_calls['n']}.py")
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].side_effect = implementer_effect
+        stubs["test_writer"].side_effect = test_writer_effect
+
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            review_diff=_REVIEW_DIFF,
+            review_mode="review_fix",
+            review_base_branch="main",
+            worktree_base=str(tmp_path),
+            build_synced=True,
+        )
+        result = orch.run(task_id="t1")
+
+        assert result.failed
+        assert not result.done
+        assert review_calls["n"] == 3
+        assert test_writer_calls["n"] == 1
+        assert "tests/test_fix_1.py" in result.files_changed
+        assert "tests/test_fix_2.py" not in result.files_changed
+
+    def test_build_and_test_writer_skipped_when_reviewer_approves_without_fixes(self, tmp_path: Path):
+        """review --fix fast-path: files pre-exist, reviewer approves, nothing written → skip build."""
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_test_writing=True,
+            run_build=True,
+            run_tests=True,
+        )
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], review_diff=_REVIEW_DIFF)
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert len(stubs["test_writer"].calls) == 0
+        assert build.compile_calls == 0
+        assert build.test_calls == 0
+        assert result.test_status == "skipped"
+        assert result.check_status == "skipped"
+
+    def test_build_runs_when_review_issues_required_implementer_fix(self, tmp_path: Path):
+        """When reviewer finds issues and implementer runs to fix them, build must still run."""
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_build=True,
+            run_tests=True,
+            max_review_iterations=3,
+        )
+
+        review_call_count = {"n": 0}
+
+        def reviewer_effect(state: TaskState) -> None:
+            review_call_count["n"] += 1
+            if review_call_count["n"] >= 2:
+                state.review_approved = True
+                state.review_issues.clear()
+            else:
+                state.review_issues = ["needs fix"]
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        _save_state(
+            orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=True, review_diff=_REVIEW_DIFF
+        )
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert build.compile_calls >= 1
+
+    def test_fast_path_not_triggered_when_review_was_already_approved_before_session(self, tmp_path: Path):
+        """If review_approved=True at session start (previous session), reviewer is skipped →
+        fast-path must NOT trigger — build should still run."""
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_build=True,
+        )
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            build_synced=True,
+            review_approved=True,
+            review_diff=_REVIEW_DIFF,
+        )
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert len(stubs["reviewer"].calls) == 0  # reviewer skipped (already approved)
+        assert build.compile_calls >= 1
+
+    def test_fast_path_not_triggered_when_fixer_changed_code(self, tmp_path: Path):
+        """review --fix resume edge case: fixer changed code in a previous session
+        (fixer_changed_code=True), reviewer approves this session — build must still run."""
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_build=True,
+            run_tests=True,
+        )
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            build_synced=True,
+            review_diff=_REVIEW_DIFF,
+            fixer_changed_code=True,
+        )
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert build.compile_calls >= 1
+
+    def test_fast_path_not_triggered_in_run_mode_resume(self, tmp_path: Path):
+        """Run-mode resume: implementer ran in previous session (files pre-exist), reviewer
+        approves in this session — build must still run (code not yet CI-validated)."""
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_build=True,
+            run_tests=True,
+        )
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        # No review_diff — this is a run-mode task, not a review task
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=True)
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert build.compile_calls >= 1
+
+
+# ---------------------------------------------------------------------------
+# Tests — build tool factory
+# ---------------------------------------------------------------------------
+
+
+class TestBuildToolFactory:
+    def test_python_platform_creates_python_tool(self, tmp_path: Path):
+        sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        tool = _build_tool(sandbox, tmp_path, {"project": {"build_tool": "python"}, "build": {}})
+        assert isinstance(tool, PythonTool)
+
+    def test_default_platform_creates_gradle_tool(self, tmp_path: Path):
+        sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        tool = _build_tool(sandbox, tmp_path, {"project": {}, "build": {}})
+        assert isinstance(tool, AndroidGradleTool)
+
+    def test_python_tool_uses_configured_commands(self, tmp_path: Path):
+        sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        config = {
+            "project": {"build_tool": "python"},
+            "build": {"compile_command": "mypy .", "test_command": "pytest -v", "timeout": 120},
+        }
+        tool = _build_tool(sandbox, tmp_path, config)
+        assert isinstance(tool, PythonTool)
+        assert tool._compile_command == "mypy ."
+        assert tool._test_command == "pytest -v"
+        assert tool._timeout == 120
+
+    def test_cargo_platform_creates_cargo_tool(self, tmp_path: Path):
+        sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        tool = _build_tool(sandbox, tmp_path, {"project": {"build_tool": "cargo"}, "build": {}})
+        assert isinstance(tool, CargoTool)
+
+    def test_cargo_tool_uses_configured_commands(self, tmp_path: Path):
+        sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        config = {
+            "project": {"build_tool": "cargo"},
+            "build": {
+                "compile_command": "cargo check --workspace",
+                "test_command": "cargo test --workspace",
+                "timeout": 300,
+            },
+        }
+        tool = _build_tool(sandbox, tmp_path, config)
+        assert isinstance(tool, CargoTool)
+        assert tool._compile_command == "cargo check --workspace"
+        assert tool._test_command == "cargo test --workspace"
+        assert tool._timeout == 300
+
+    def test_gradle_jvm_creates_jvm_tool(self, tmp_path: Path):
+        from tools.gradle_jvm_tool import JvmGradleTool
+
+        sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        tool = _build_tool(sandbox, tmp_path, {"project": {"build_tool": "gradle-jvm"}, "build": {}})
+        assert isinstance(tool, JvmGradleTool)
+
+    def test_gradle_jvm_uses_configured_tasks(self, tmp_path: Path):
+        from tools.gradle_jvm_tool import JvmGradleTool
+
+        sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        config = {
+            "project": {"build_tool": "gradle-jvm"},
+            "build": {"compile_task": "compileKotlin", "test_task": "test", "compile_timeout": 300},
+        }
+        tool = _build_tool(sandbox, tmp_path, config)
+        assert isinstance(tool, JvmGradleTool)
+        assert tool._compile_task == "compileKotlin"
+        assert tool._compile_timeout == 300
+
+    def test_maven_creates_maven_tool(self, tmp_path: Path):
+        from tools.maven_tool import MavenTool
+
+        sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        tool = _build_tool(sandbox, tmp_path, {"project": {"build_tool": "maven"}, "build": {}})
+        assert isinstance(tool, MavenTool)
+
+    def test_maven_uses_configured_commands(self, tmp_path: Path):
+        from tools.maven_tool import MavenTool
+
+        sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        config = {
+            "project": {"build_tool": "maven"},
+            "build": {"compile_command": "mvn compile -q", "test_command": "mvn test -q"},
+        }
+        tool = _build_tool(sandbox, tmp_path, config)
+        assert isinstance(tool, MavenTool)
+        assert tool._compile_command == "mvn compile -q"
+        assert tool._test_command == "mvn test -q"
+
+
+# ---------------------------------------------------------------------------
+# Tests — fix_command in check config
+# ---------------------------------------------------------------------------
+
+_CHECK_WITH_FIX = [
+    {"name": "ruff-format", "command": "ruff format --check .", "fix_command": "ruff format .", "timeout": 60}
+]
+_CHECK_WITH_FIX_GRADLE = [
+    {
+        "name": "ktlint-format",
+        "command": "./gradlew ktlintCheck",
+        "fix_command": "./gradlew ktlintFormat",
+        "timeout": 600,
+    }
+]
+_CHECK_WITHOUT_FIX = [{"name": "ruff-check", "command": "ruff check .", "timeout": 60}]
+_CHECK_WITH_FIX_NO_TIMEOUT = [
+    {"name": "ruff-format", "command": "ruff format --check .", "fix_command": "ruff format ."}
+]
+
+
+def _make_orch_with_checks(
+    tmp_path: Path, checks: list, **config_kwargs
+) -> tuple[Orchestrator, dict[str, StubAgent], StubBuildTool]:
+    project_config = {"project": {"build_tool": "python"}, "build": {"checks": checks}}
+    config = OrchestratorConfig(
+        project_root=tmp_path,
+        allowed_write_paths=["."],
+        allowed_read_paths=["."],
+        project_config=project_config,
+        run_build=True,
+        run_tests=False,
+        run_checks=True,
+        **config_kwargs,
+    )
+    store = JsonStateStore(tmp_path / "state")
+    orch = Orchestrator(config=config, llm=StubLLMClient(), state_store=store)
+    stubs = {
+        name: StubAgent(name=name)
+        for name in ["analyst", "planner", "implementer", "reviewer", "security_reviewer", "test_writer", "fixer"]
+    }
+
+    def _default_reviewer(state: TaskState) -> None:
+        state.review_approved = True
+        state.review_issues = []
+
+    def _default_security_reviewer(state: TaskState) -> None:
+        state.security_approved = True
+        state.review_issues = []
+
+    stubs["reviewer"].side_effect = _default_reviewer
+    stubs["security_reviewer"].side_effect = _default_security_reviewer
+
+    orch._agents = stubs  # type: ignore[assignment]
+    build = StubBuildTool()
+    orch._tools["build"] = build
+    return orch, stubs, build
+
+
+class TestOrchestratorFixCommand:
+    def _checks_ready(self, orch: Orchestrator) -> None:
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=True)
+
+    def test_autofix_called_when_check_fails(self, tmp_path: Path):
+        orch, _, build = _make_orch_with_checks(tmp_path, _CHECK_WITH_FIX)
+        build.check_results = {"ruff-format": [False, True], "ruff-format_autofix": [True]}
+        self._checks_ready(orch)
+        orch.run(task_id="t1")
+        assert "ruff-format_autofix" in build.check_calls
+
+    def test_check_rerun_after_autofix_success(self, tmp_path: Path):
+        orch, _, build = _make_orch_with_checks(tmp_path, _CHECK_WITH_FIX)
+        build.check_results = {"ruff-format": [False, True], "ruff-format_autofix": [True]}
+        self._checks_ready(orch)
+        orch.run(task_id="t1")
+        assert build.check_calls.count("ruff-format") == 2
+
+    def test_task_done_without_fixer_when_autofix_passes(self, tmp_path: Path):
+        orch, stubs, build = _make_orch_with_checks(tmp_path, _CHECK_WITH_FIX)
+        build.check_results = {"ruff-format": [False, True], "ruff-format_autofix": [True]}
+        self._checks_ready(orch)
+        result = orch.run(task_id="t1")
+        assert result.done
+        assert len(stubs["fixer"].calls) == 0
+
+    def test_autofix_failure_falls_through_to_fixer(self, tmp_path: Path):
+        orch, stubs, build = _make_orch_with_checks(tmp_path, _CHECK_WITH_FIX, max_iterations=2)
+        build.check_results = {"ruff-format": [False], "ruff-format_autofix": [False]}
+        self._checks_ready(orch)
+        orch.run(task_id="t1")
+        assert len(stubs["fixer"].calls) >= 1
+
+    def test_no_fix_command_calls_fixer_on_failure(self, tmp_path: Path):
+        orch, stubs, build = _make_orch_with_checks(tmp_path, _CHECK_WITHOUT_FIX, max_iterations=2)
+        build.check_success = False
+        self._checks_ready(orch)
+        orch.run(task_id="t1")
+        assert len(stubs["fixer"].calls) >= 1
+        assert "ruff-check_autofix" not in build.check_calls
+
+    def test_fix_command_timeout_not_forwarded_when_absent(self, tmp_path: Path):
+        orch, _, build = _make_orch_with_checks(tmp_path, _CHECK_WITH_FIX_NO_TIMEOUT)
+        build.check_results = {"ruff-format": [False, True], "ruff-format_autofix": [True]}
+        self._checks_ready(orch)
+        orch.run(task_id="t1")
+        autofix_cfg = next(cfg for name, cfg in build.check_configs if name == "ruff-format_autofix")
+        assert "timeout" not in autofix_cfg
+
+    def test_fix_command_works_for_gradle_check(self, tmp_path: Path):
+        orch, stubs, build = _make_orch_with_checks(tmp_path, _CHECK_WITH_FIX_GRADLE)
+        build.check_results = {"ktlint-format": [False, True], "ktlint-format_autofix": [True]}
+        self._checks_ready(orch)
+        result = orch.run(task_id="t1")
+        assert "ktlint-format_autofix" in build.check_calls
+        assert result.done
+        assert len(stubs["fixer"].calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests — OrchestratorConfig defaults (__post_init__ None guards)
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorConfigDefaults:
+    def test_none_write_paths_defaults_to_empty_list(self, tmp_path: Path):
+        cfg = OrchestratorConfig(project_root=tmp_path, allowed_write_paths=None)
+        assert cfg.allowed_write_paths == []
+
+    def test_none_read_paths_defaults_to_dot(self, tmp_path: Path):
+        cfg = OrchestratorConfig(project_root=tmp_path, allowed_read_paths=None)
+        assert cfg.allowed_read_paths == ["."]
+
+    def test_none_project_config_defaults_to_empty_dict(self, tmp_path: Path):
+        cfg = OrchestratorConfig(project_root=tmp_path, project_config=None)
+        assert cfg.project_config == {}
+
+
+# ---------------------------------------------------------------------------
+# Tests — run() error paths
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorRunErrors:
+    def test_task_not_found_raises_value_error(self, tmp_path: Path):
+        import pytest
+
+        orch, _, _ = _make_orchestrator(tmp_path)
+        with pytest.raises(ValueError, match="Task not found"):
+            orch.run(task_id="nonexistent")
+
+    def test_no_args_raises_value_error(self, tmp_path: Path):
+        import pytest
+
+        orch, _, _ = _make_orchestrator(tmp_path)
+        with pytest.raises(ValueError):
+            orch.run()
+
+
+# ---------------------------------------------------------------------------
+# Tests — presync phase
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorPresync:
+    def test_presync_success_sets_presync_done(self, tmp_path: Path):
+        orch, _, _ = _make_orchestrator(tmp_path, run_presync=True, run_build=False)
+        _save_state(orch)
+        orch.run(task_id="t1")
+        assert orch._store.load("t1").presync_done is True
+
+    def test_presync_failure_is_non_fatal_analyst_still_runs(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(tmp_path, run_presync=True, run_build=False)
+        build.presync_success = False
+        _save_state(orch)
+        orch.run(task_id="t1")
+        assert len(stubs["analyst"].calls) >= 1
+
+    def test_presync_failure_still_sets_presync_done(self, tmp_path: Path):
+        orch, _, build = _make_orchestrator(tmp_path, run_presync=True, run_build=False)
+        build.presync_success = False
+        _save_state(orch)
+        orch.run(task_id="t1")
+        assert orch._store.load("t1").presync_done is True
+
+    def test_presync_skipped_on_resume(self, tmp_path: Path):
+        orch, _, build = _make_orchestrator(tmp_path, run_presync=True, run_build=False)
+        _save_state(orch, presync_done=True)
+        orch.run(task_id="t1")
+        assert build.presync_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests — planner failure abort
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorPlannerAbort:
+    def test_planner_failure_aborts_task(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=True, run_build=False)
+        stubs["planner"].side_effect = lambda s: setattr(s, "failed", True)
+        _save_state(orch, implementation_prompt="p")
+        result = orch.run(task_id="t1")
+        assert result.failed
+        assert len(stubs["implementer"].calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests — _run_agent exception handling
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorAgentException:
+    def test_agent_exception_sets_failed(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_build=False)
+        stubs["analyst"].raise_exception = RuntimeError("unexpected crash")
+        _save_state(orch)
+        result = orch.run(task_id="t1")
+        assert result.failed
+
+    def test_agent_exception_recorded_in_history(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_build=False)
+        stubs["analyst"].raise_exception = RuntimeError("crash")
+        _save_state(orch)
+        result = orch.run(task_id="t1")
+        assert any(h.get("action") == "error" for h in result.history)
+
+
+# ---------------------------------------------------------------------------
+# Tests — _run_tests and _sync failure paths
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorTestsAndSyncFailure:
+    def test_test_failure_appends_to_test_errors(self, tmp_path: Path):
+        orch, _, build = _make_orchestrator(tmp_path, run_build=True, run_tests=True, max_iterations=1)
+        build.test_success = False
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=True)
+        result = orch.run(task_id="t1")
+        assert result.test_errors
+        assert result.test_status == "failed"
+
+    def test_sync_failure_appends_to_errors(self, tmp_path: Path):
+        orch, _, build = _make_orchestrator(tmp_path, run_build=True, max_iterations=1)
+        build.sync_success = False
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=False)
+        result = orch.run(task_id="t1")
+        assert result.errors
+
+
+# ---------------------------------------------------------------------------
+# Tests — _build_tool xcodebuild factory
+# ---------------------------------------------------------------------------
+
+
+class TestBuildToolFactoryXcode:
+    def test_xcodebuild_creates_xcode_tool(self, tmp_path: Path):
+        from tools.xcode_tool import XcodeTool
+
+        sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        tool = _build_tool(sandbox, tmp_path, {"project": {"build_tool": "xcodebuild"}, "build": {}})
+        assert isinstance(tool, XcodeTool)
+
+    def test_xcodebuild_uses_configured_scheme(self, tmp_path: Path):
+        from tools.xcode_tool import XcodeTool
+
+        sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        config = {
+            "project": {"build_tool": "xcodebuild"},
+            "build": {"scheme": "MyApp", "destination": "generic/platform=iOS"},
+        }
+        tool = _build_tool(sandbox, tmp_path, config)
+        assert isinstance(tool, XcodeTool)
+        assert tool._scheme == "MyApp"
+
+
+# ---------------------------------------------------------------------------
+# Tests — _fmt_elapsed
+# ---------------------------------------------------------------------------
+
+
+class TestFmtElapsed:
+    def test_seconds_under_60(self):
+        assert _fmt_elapsed(45.7) == "46s"
+
+    def test_zero_seconds(self):
+        assert _fmt_elapsed(0.0) == "0s"
+
+    def test_exactly_60_seconds(self):
+        assert _fmt_elapsed(60.0) == "1m 00s"
+
+    def test_minutes_format(self):
+        assert _fmt_elapsed(125.0) == "2m 05s"

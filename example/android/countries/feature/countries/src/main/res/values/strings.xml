@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="countries_title">Countries</string>
+    <string name="countries_retry">Retry</string>
+    <string name="countries_error">Failed to load countries</string>
+</resources>

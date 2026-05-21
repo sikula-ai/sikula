@@ -1,0 +1,671 @@
+"""Tests for agents/reviewer_agent.py — ReviewerAgent."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from agents.base_agent import AGENT_SECURITY_PREFIX
+from agents.reviewer_agent import ReviewerAgent, _MAX_DIFF_CHARS
+from tests.conftest import StubLLMClient
+from core.state import TaskState
+from tools.base_tool import ToolResult
+
+
+def _make_state(**kwargs) -> TaskState:
+    defaults = {
+        "task_id": "t1",
+        "task_description": "Add login screen",
+        "implementation_prompt": "Create LoginActivity with email/password fields",
+        "files_changed": ["app/src/LoginActivity.kt"],
+    }
+    defaults.update(kwargs)
+    return TaskState(**defaults)
+
+
+def _make_agent(
+    llm: StubLLMClient,
+    file_tool=None,
+    git_tool=None,
+    project_config: dict | None = None,
+) -> ReviewerAgent:
+    tools: dict = {}
+    if file_tool is not None:
+        tools["file"] = file_tool
+    if git_tool is not None:
+        tools["git"] = git_tool
+    return ReviewerAgent(llm=llm, tools=tools, project_config=project_config or {})
+
+
+class TestReviewerAgentGuards:
+    def test_no_implementation_prompt_returns_failure(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state(implementation_prompt=None)
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        result = agent.run(state)
+        assert not result.success
+        assert "implementation prompt" in result.message.lower()
+
+    def test_no_files_changed_returns_failure(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state(files_changed=[])
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        result = agent.run(state)
+        assert not result.success
+        assert "changed files" in result.message.lower()
+
+    def test_no_file_tool_returns_failure(self, stub_llm: StubLLMClient):
+        state = _make_state()
+        agent = _make_agent(stub_llm)
+        result = agent.run(state)
+        assert not result.success
+        assert "FileTool" in result.message
+
+
+class TestReviewerAgentApproval:
+    def test_approved_output_sets_flag(self, stub_llm: StubLLMClient, file_tool, git_tool):
+        stub_llm.readonly_result = "Callers verified: none\nAPPROVED"
+        state = _make_state()
+        state.review_issues = ["leftover issue from previous pass"]
+        agent = _make_agent(stub_llm, file_tool=file_tool, git_tool=git_tool)
+        result = agent.run(state)
+        assert result.success
+        assert state.review_approved is True
+        assert state.review_issues == []
+
+    def test_approved_case_insensitive(self, stub_llm: StubLLMClient, file_tool, git_tool):
+        stub_llm.readonly_result = "approved"
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool, git_tool=git_tool)
+        agent.run(state)
+        assert state.review_approved is True
+
+    @pytest.mark.parametrize(
+        "decorated",
+        [
+            "**APPROVED**",
+            "## APPROVED",
+            "> APPROVED",
+            "[APPROVED]",
+            "1. APPROVED",
+            "__APPROVED__",
+        ],
+    )
+    def test_approved_detected_regardless_of_decoration(
+        self, decorated: str, stub_llm: StubLLMClient, file_tool, git_tool
+    ):
+        stub_llm.readonly_result = f"{decorated}"
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool, git_tool=git_tool)
+        agent.run(state)
+        assert state.review_approved is True
+
+    def test_approved_mid_output_does_not_approve(self, stub_llm: StubLLMClient, file_tool, git_tool):
+        stub_llm.readonly_result = (
+            "Callers verified: none\nAPPROVED\n\n## Issues\n\n### Missing null check\nFile: x\nFix: y"
+        )
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool, git_tool=git_tool)
+        result = agent.run(state)
+        assert not result.success
+        assert state.review_approved is False
+
+    def test_issues_output_sets_review_issues(self, stub_llm: StubLLMClient, file_tool, git_tool):
+        issues = "## Issues\n\n### Missing null check\nFile: app/Login.kt\nProblem: x\nFix: y"
+        stub_llm.readonly_result = issues
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool, git_tool=git_tool)
+        result = agent.run(state)
+        assert not result.success
+        assert state.review_approved is False
+        assert issues in state.review_issues
+
+    def test_output_appended_to_review_history(self, stub_llm: StubLLMClient, file_tool, git_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool, git_tool=git_tool)
+        agent.run(state)
+        assert "APPROVED" in state.review_cycle_records[0]["reviewer_output"]
+
+    def test_approved_logged(self, stub_llm: StubLLMClient, file_tool, git_tool, caplog):
+        import logging
+
+        stub_llm.readonly_result = "Callers verified.\n\nAPPROVED"
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool, git_tool=git_tool)
+        with caplog.at_level(logging.INFO, logger="agents.reviewer_agent"):
+            agent.run(state)
+        assert any("Review approved" in r.message for r in caplog.records)
+
+    def test_issues_logged(self, stub_llm: StubLLMClient, file_tool, git_tool, caplog):
+        import logging
+
+        issues = "## Issues\n\n### Missing null check\nFile: x\nFix: y"
+        stub_llm.readonly_result = issues
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool, git_tool=git_tool)
+        with caplog.at_level(logging.INFO, logger="agents.reviewer_agent"):
+            agent.run(state)
+        assert any("Review issues" in r.message for r in caplog.records)
+
+    def test_record_added_on_approval(self, stub_llm: StubLLMClient, file_tool, git_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool, git_tool=git_tool)
+        agent.run(state)
+        assert any(e["action"] == "review" and e["result"] == "approved" for e in state.history)
+
+
+class TestReviewerAgentErrors:
+    def test_llm_error_returns_failure(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_error = RuntimeError("LLM timeout")
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        result = agent.run(state)
+        assert not result.success
+        assert "LLM timeout" in result.message
+
+    def test_llm_error_recorded_in_state(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_error = RuntimeError("LLM timeout")
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        assert any(e["action"] == "review_failed" for e in state.history)
+
+    def test_empty_output_returns_failure(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = ""
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        result = agent.run(state)
+        assert not result.success
+        assert "empty" in result.message
+
+
+class TestReviewerAgentDiff:
+    def test_diff_included_in_prompt(self, stub_llm: StubLLMClient, file_tool, git_tool, tmp_project: Path):
+        (tmp_project / "src" / "main.py").write_text("# changed\n")
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool, git_tool=git_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "main.py" in prompt
+
+    def test_diff_unavailable_fallback_message(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        # No git_tool — diff will be unavailable
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "diff not available" in prompt
+
+    def test_long_diff_truncated(self, stub_llm: StubLLMClient, file_tool, git_tool):
+        stub_llm.readonly_result = "APPROVED"
+        big_diff = "+" + "x" * (_MAX_DIFF_CHARS + 1000)
+        git_tool.diff_head = MagicMock(return_value=ToolResult(success=True, output=big_diff))
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool, git_tool=git_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "truncated" in prompt
+
+    def test_review_diff_state_used_when_set(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(review_diff="+ added line from PR diff")
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        assert "added line from PR diff" in stub_llm.readonly_calls[0]
+
+    def test_review_diff_state_truncated(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        big_diff = "+" + "x" * (_MAX_DIFF_CHARS + 500)
+        state = _make_state(review_diff=big_diff)
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        assert "truncated" in stub_llm.readonly_calls[0]
+
+    def test_review_diff_state_does_not_call_git_tool(self, stub_llm: StubLLMClient, file_tool, git_tool):
+        stub_llm.readonly_result = "APPROVED"
+        git_tool.diff_head = MagicMock(return_value=ToolResult(success=True, output="should not appear"))
+        state = _make_state(review_diff="+ added line from PR diff")
+        agent = _make_agent(stub_llm, file_tool=file_tool, git_tool=git_tool)
+        agent.run(state)
+        git_tool.diff_head.assert_not_called()
+
+    def test_review_diff_empty_string_uses_fallback_message(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(review_diff="")
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        assert "diff not available" in stub_llm.readonly_calls[0]
+
+
+class TestReviewerAgentPrompt:
+    def test_tech_stack_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        config = {"project": {"platform": "Android", "language": "Kotlin"}}
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        assert "Android / Kotlin" in stub_llm.readonly_calls[0]
+
+    def test_guidelines_content_in_prompt(self, stub_llm: StubLLMClient, file_tool, tmp_project: Path):
+        stub_llm.readonly_result = "APPROVED"
+        (tmp_project / "src" / "arch.md").write_text("# Architecture rules\n")
+        config = {"guidelines": {"context_files": ["src/arch.md"]}}
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "src/arch.md" in prompt
+        assert "# Architecture rules" in prompt
+
+
+class TestReviewerAgentHistory:
+    def test_previous_reviews_included_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.review_cycle_records = [
+            {
+                "reviewer": "reviewer",
+                "reviewer_output": "## Issues\n\n### Missing null check\nFile: x\nProblem: p\nFix: f",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            }
+        ]
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Your previous reviews of this task" in prompt
+        assert "Missing null check" in prompt
+        assert "[Review 1]" in prompt
+
+    def test_multiple_reviews_numbered(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.review_cycle_records = [
+            {
+                "reviewer": "reviewer",
+                "reviewer_output": "First issue",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            },
+            {
+                "reviewer": "reviewer",
+                "reviewer_output": "Second issue",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            },
+        ]
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "[Review 1]" in prompt
+        assert "[Review 2]" in prompt
+        assert "First issue" in prompt
+        assert "Second issue" in prompt
+
+    def test_security_reviews_excluded_from_reviewer_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.review_cycle_records = [
+            {
+                "reviewer": "security_reviewer",
+                "reviewer_output": "## Security Issues\n\n### Hardcoded key",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            }
+        ]
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Your previous reviews of this task" not in prompt
+        assert "Hardcoded key" not in prompt
+
+    def test_no_history_section_when_review_history_empty(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Your previous reviews of this task" not in prompt
+
+    def test_test_files_written_included_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.test_files_written = ["tests/LoginTest.kt", "tests/AuthTest.kt"]
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Files written by the test writer agent" in prompt
+        assert "tests/LoginTest.kt" in prompt
+        assert "tests/AuthTest.kt" in prompt
+
+    def test_prompt_tells_reviewer_not_to_block_on_test_files(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Test files are not reviewer-owned output" in prompt
+        assert "Do not review test files for correctness" in prompt
+        assert "Do not block approval because a test" in prompt
+        assert "report the production-code issue, not a" in prompt
+
+    def test_review_diff_without_review_mode_keeps_pipeline_test_policy(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(review_diff="+ changed test")
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Test files are not reviewer-owned output" in prompt
+        assert "Test files are branch-owned output" not in prompt
+
+    @pytest.mark.parametrize("review_mode", ["review_report", "review_fix"])
+    def test_review_mode_tells_reviewer_to_review_changed_tests(
+        self, review_mode: str, stub_llm: StubLLMClient, file_tool
+    ):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(review_mode=review_mode, review_diff="+ changed test")
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Test files are branch-owned output in `sikula review` mode" in prompt
+        assert "Review changed test files" in prompt
+        assert "stale fixtures" in prompt
+        assert "Test files are not reviewer-owned output" not in prompt
+        assert "Do not review test files for correctness" not in prompt
+
+    def test_review_mode_test_writer_files_are_still_reviewed(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(review_mode="review_fix", review_diff="+ changed test")
+        state.test_files_written = ["tests/LoginTest.kt"]
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Files written by the test writer agent" in prompt
+        assert "tests/LoginTest.kt" in prompt
+        assert "Still review their correctness" in prompt
+        assert "relevance in review mode" in prompt
+
+    def test_no_test_files_written_section_when_empty(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        assert "Files written by the test writer agent" not in stub_llm.readonly_calls[0]
+
+    def test_mixed_history_includes_only_reviewer_entries(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.review_cycle_records = [
+            {
+                "reviewer": "reviewer",
+                "reviewer_output": "Reviewer issue A",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            },
+            {
+                "reviewer": "security_reviewer",
+                "reviewer_output": "Security issue B",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            },
+            {
+                "reviewer": "reviewer",
+                "reviewer_output": "Reviewer issue C",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            },
+        ]
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Reviewer issue A" in prompt
+        assert "Reviewer issue C" in prompt
+        assert "Security issue B" not in prompt
+        assert "[Review 1]" in prompt
+        assert "[Review 2]" in prompt
+        assert "[Review 3]" not in prompt
+
+
+class TestReviewerAgentPlanContext:
+    def test_step_context_appended_when_plan_set(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.plan = ["Step A", "Step B"]
+        state.current_step = 1
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "step 2 of 2" in prompt.lower()
+        assert "Step B" in prompt
+        assert "CURRENT STEP REVIEW SCOPE" in prompt
+
+    def test_step_scope_precedes_full_task_context(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.plan = ["Step A", "Step B"]
+        state.current_step = 0
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert prompt.index("CURRENT STEP REVIEW SCOPE") < prompt.index("Task description:")
+        assert "Do NOT report work that belongs only to future planned steps." in prompt
+        assert "  - Step B" in prompt
+
+    def test_plan_history_includes_only_current_step_reviews(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.plan = ["Step A", "Step B"]
+        state.current_step = 1
+        state.review_cycle_records = [
+            {
+                "reviewer": "reviewer",
+                "step": 0,
+                "reviewer_output": "Old step issue",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            },
+            {
+                "reviewer": "reviewer",
+                "step": 1,
+                "reviewer_output": "Current step issue",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            },
+        ]
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Current step issue" in prompt
+        assert "Old step issue" not in prompt
+
+    def test_no_step_context_without_plan(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Step context" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Review cycle record
+# ---------------------------------------------------------------------------
+
+
+class TestReviewerAgentCycleRecord:
+    def test_record_reviewer_field(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        assert state.review_cycle_records[0]["reviewer"] == "reviewer"
+
+    def test_record_approved_true_on_approval(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        assert state.review_cycle_records[0]["approved"] is True
+
+    def test_record_approved_false_on_issues(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "## Issues\n\n### Missing null check\nFile: x\nProblem: p\nFix: f"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        assert state.review_cycle_records[0]["approved"] is False
+
+    def test_record_stores_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        assert state.task_description in state.review_cycle_records[0]["reviewer_prompt"]
+
+    def test_second_review_sees_first_output_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        # Simulate two review rounds: first returns issues, second approves.
+        # The second reviewer must see the first output in its prompt.
+        stub_llm.readonly_result = "## Issues\n\n### Missing null check\nFile: x\nProblem: p\nFix: f"
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        stub_llm.readonly_result = "APPROVED"
+        agent.run(state)
+        second_prompt = state.review_cycle_records[1]["reviewer_prompt"]
+        assert "Missing null check" in second_prompt
+        assert "Your previous reviews of this task" in second_prompt
+
+    def test_record_stores_step_default(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        assert state.review_cycle_records[0]["step"] == 0
+
+    def test_record_stores_step_from_state(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.current_step = 2
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        assert state.review_cycle_records[0]["step"] == 2
+
+    def test_record_stores_build_iteration_default(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        assert state.review_cycle_records[0]["build_iteration"] == 0
+
+    def test_record_stores_build_iteration_from_state(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.build_iterations = 2
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        assert state.review_cycle_records[0]["build_iteration"] == 2
+
+    def test_record_stores_review_iteration_default(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        assert state.review_cycle_records[0]["review_iteration"] == 0
+
+    def test_record_stores_review_iteration_from_state(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.review_iterations = 2
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        assert state.review_cycle_records[0]["review_iteration"] == 2
+
+    def test_review_iteration_reflects_orchestrator_increment_between_rounds(self, stub_llm: StubLLMClient, file_tool):
+        # Simulates orchestrator: reviewer runs (review_iterations=0), issues found,
+        # orchestrator increments review_iterations to 1, reviewer runs again.
+        # First record must show 0, second must show 1.
+        stub_llm.readonly_result = "## Issues\n\n### Missing null check\nFile: x\nProblem: p\nFix: f"
+        state = _make_state()
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        state.review_iterations = 1  # orchestrator increments before next review
+        stub_llm.readonly_result = "APPROVED"
+        agent.run(state)
+        assert state.review_cycle_records[0]["review_iteration"] == 0
+        assert state.review_cycle_records[1]["review_iteration"] == 1
+
+
+class TestReviewerAgentExtraRules:
+    def test_extra_rules_included_in_prompt(self, stub_llm: StubLLMClient, file_tool, tmp_project: Path):
+        stub_llm.readonly_result = "APPROVED"
+        (tmp_project / "reviewer_rules.md").write_text("Always verify null safety.")
+        config = {"reviewer": {"extra_rules": "reviewer_rules.md"}}
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Always verify null safety." in prompt
+        assert "Project-specific rules" in prompt
+
+    def test_extra_rules_absent_when_not_configured(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        assert "Project-specific rules" not in stub_llm.readonly_calls[0]
+
+
+class TestReviewerAgentSecurityPrefix:
+    def test_security_prefix_prepended(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        assert stub_llm.readonly_calls[0].startswith(AGENT_SECURITY_PREFIX)
+
+
+class TestReviewerAgentApprovalContractPrompt:
+    def test_prompt_requires_final_approved_line(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "The final non-empty line must be exactly APPROVED" in prompt
+        assert "will trigger another fix/review loop" in prompt
+        assert "Do not include APPROVED when reporting issues" in prompt
+
+
+class TestReviewerAgentDesignCompliance:
+    def test_design_compliance_criterion_always_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        assert "Design compliance" in stub_llm.readonly_calls[0]
+
+    def test_skip_instruction_present_when_no_design_files(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(implementation_prompt="Create LoginActivity with email/password fields")
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Skip this check if no design files" in prompt
+        assert "Files referenced in the task" not in prompt
+
+    def test_design_files_section_passed_to_reviewer_when_present(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(
+            implementation_prompt=(
+                "Create LoginActivity\n\n"
+                "---\n\nFiles referenced in the task:\n\n"
+                "Design/login.png — shows login screen with email/password fields"
+            )
+        )
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Files referenced in the task" in prompt
+        assert "login.png" in prompt

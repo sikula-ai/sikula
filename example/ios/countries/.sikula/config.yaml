@@ -1,0 +1,185 @@
+# Sikula iOS Example — orchestrator configuration
+#
+# This file is a fully commented example config for an iOS/Xcode project.
+# Copy and adapt it for your own project.
+#
+# Run from the project directory: sikula run .sikula/tasks/<task-file>
+# Or with explicit config from anywhere:
+#   sikula --config example/ios/countries/.sikula/config.yaml run .sikula/tasks/<task-file>
+
+project:
+  name: example-countries-ios
+  root_path: .
+  build_tool: xcodebuild
+
+  # Tech stack — injected into agent prompts (analyst, implementer, reviewer, security reviewer,
+  # fixer, test writer). Adapt these values to match your project.
+  # platform: target platform — carries implicit architectural context for agents beyond the
+  #           language (e.g. lifecycle, DI patterns, platform security model).
+  platform: iOS
+  language: Swift
+  ui: SwiftUI (iOS 17, @Observable)
+
+sandbox:
+  # Production write scope for implementer and production-code fixer passes.
+  # These paths are prompt constraints, not a provider-independent hard sandbox.
+  # Sikula audits detected file changes after write-capable agent calls and records
+  # write_path_warning if a change is outside the active write scope.
+  allowed_write_paths:
+    - Countries/
+
+  # Directories the TestWriterAgent may write to.
+  # The agent is further restricted to test source roots (CountriesTests/) via its prompt.
+  allowed_test_write_paths:
+    - CountriesTests/
+
+  # Directories agents may READ from. "." means the entire project root.
+  allowed_read_paths:
+    - .
+
+  # Maximum number of build+fix cycles before the task is aborted.
+  max_iterations: 10
+
+  # Maximum number of review+implement-fix cycles per review pass.
+  max_review_iterations: 3
+
+  # Maximum number of security-review+fix cycles (independent of max_review_iterations).
+  # Defaults to max_review_iterations if not set.
+  max_security_review_iterations: 3
+
+tasks:
+  state_dir: .sikula/state/
+
+# Default LLM settings — apply to all agents unless overridden under agents: below.
+# Built-in provider values: codex, claude, gemini, opencode.
+# To use another provider, change provider/model, for example:
+#   provider: claude
+#   model: claude-sonnet-4-6
+llm:
+  provider: codex
+  model: gpt-5.3-codex       # Default model for planner, implementer, test writer, and fixer.
+  max_tokens: 16000          # Used only by API-based providers; CLI-backed providers may ignore this.
+  agent_timeout: 1800        # Seconds to wait for a single agent call before timing out.
+
+# Per-agent LLM overrides — any field omitted falls back to llm: above.
+# Analyst, reviewer, and security reviewer benefit most from a stronger model.
+# Implementer and fixer work from precise prompts — a faster model is usually sufficient.
+# Increase agent_timeout for implementer/fixer on large codebases.
+agents:
+  analyst:
+    llm:
+      model: gpt-5.5           # Stronger model: analyst output determines the entire task outcome.
+  reviewer:
+    llm:
+      model: gpt-5.5           # Stronger model: thoroughness matters more than speed here.
+  security_reviewer:
+    llm:
+      model: gpt-5.5           # Stronger model: must reliably detect subtle security issues.
+# planner:
+#   llm:
+#     model: gpt-5.5
+# implementer:
+#   llm:
+#     agent_timeout: 2400      # Increase if the implementer times out on large tasks.
+# test_writer:
+#   llm:
+#     agent_timeout: 2400
+# fixer:
+#   llm:
+#     model: gpt-5.4-mini     # Faster/cheaper model — fixer works from explicit error output.
+
+# Run PlannerAgent after the analyst.
+# For small/focused tasks it outputs SINGLE_PASS and the loop runs unchanged.
+# For larger tasks it breaks the prompt into 2–N ordered steps. Build timing is
+# controlled by run_build_per_step below.
+# Maximum number of steps is controlled by planner.max_steps below.
+run_planner: true
+
+# No presync needed — iOS projects have no separate source-generation phase.
+# Set to true to run SPM dependency resolution before the analyst (useful for large dependency trees).
+# To run Sourcery, SwiftGen, Apollo, or similar tools, override generate_sources() in XcodeTool.
+run_presync: false
+
+# Run build/fix loop after each individual step (true) vs once after all steps (false).
+# Leave false for iOS — partial implementations may not compile until all steps are done.
+run_build_per_step: false
+
+# Run ReviewerAgent after each implement pass.
+# Checks completeness, logical correctness, semantic consistency, dead members,
+# and shared function scope. Issues feed back to the implementer.
+run_review: true
+
+# Run SecurityReviewerAgent after the review phase.
+# This is independent of run_review; if run_review is false, security review still runs
+# unless run_security_review is also false.
+# Blocking issues (hardcoded secrets, injection, missing auth, weak crypto, PII in logs)
+# halt the pipeline and feed back to the implementer.
+# Non-blocking warnings are logged in state but do not block.
+run_security_review: true
+
+# Enable compile/test/check validation and the build/fix loop.
+# Set false to skip compile/test/check validation for this run.
+run_build: true
+
+# Run TestWriterAgent after review/security phases complete.
+# Instructed to stay within allowed_test_write_paths and avoid production code.
+run_test_writing: true
+
+# Run BuildTool.run_tests() after each passing build.
+# Requires run_build: true
+run_tests: true
+
+# Run named quality checks after tests pass.
+# No checks configured — add them under build.checks and set run_checks: true to enable.
+# Example: SwiftLint is shown as a commented entry in the build section below.
+# Requires run_build: true
+run_checks: false
+
+# iOS / Xcode build settings (XcodeTool-specific).
+build:
+  # Xcode scheme to build and test.
+  scheme: Countries
+
+  # xcodebuild destination for compile_check().
+  # generic/platform=iOS Simulator builds without needing a booted simulator.
+  destination: "generic/platform=iOS Simulator"
+
+  # xcodebuild destination for run_tests().
+  # Requires a matching simulator to be available — adjust name to match your installed simulators
+  # (run: xcrun simctl list devices to see what's available).
+  test_destination: "platform=iOS Simulator,OS=latest,name=iPhone 16"
+
+  # Timeouts in seconds for each xcodebuild step.
+  compile_timeout: 1800
+  test_timeout: 1800
+
+  # Named quality checks run after tests when run_checks: true.
+  # Example: add SwiftLint as a check:
+  # checks:
+  #   - name: swiftlint
+  #     command: "swiftlint lint --strict"
+  #     timeout: 300
+
+# Security context — injected into the security reviewer's prompt to focus the audit on
+# threats relevant to this project.
+security:
+  context: Mobile app. Displays public country data from a remote REST API — no auth, no PII, no financial data. Navigation arguments and API responses are the main untrusted inputs.
+
+# Project guidelines — injected into all agent prompts.
+guidelines:
+  # Files loaded as project context. List paths relative to project root.
+  context_files:
+    - guidelines.md
+
+  # Maximum characters read from each guidelines file.
+  max_file_chars: 30000
+
+# Planner configuration.
+planner:
+  # Maximum number of steps the planner may produce.
+  max_steps: 6
+
+# Test writer configuration.
+test_writer:
+  # Minimum branch+line coverage target for new/changed code (percentage).
+  coverage_target: 80

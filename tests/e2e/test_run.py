@@ -1,0 +1,507 @@
+"""E2E tests for the sikula run command using FakeLLMClient."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from sikula import cmd_run
+
+
+# ---------------------------------------------------------------------------
+# Helpers (defined inline — no cross-package imports needed)
+# ---------------------------------------------------------------------------
+
+
+def _cfg(project_root: Path) -> dict:
+    return {
+        "project": {
+            "name": "test-project",
+            "build_tool": "python",
+            "root_path": str(project_root),
+            "language": "Python",
+        },
+        "sandbox": {
+            "allowed_write_paths": ["src/"],
+            "allowed_test_write_paths": ["tests_proj/"],
+            "allowed_read_paths": ["."],
+            "max_iterations": 3,
+            "max_review_iterations": 2,
+            "max_security_review_iterations": 2,
+        },
+        "tasks": {"state_dir": str(project_root / ".sikula" / "state")},
+        "build": {"compile_command": "python3 -m compileall -q .", "test_command": "python3 -m pytest", "timeout": 120},
+        "guidelines": {"context_files": [], "max_file_chars": 3000},
+        "run_planner": True,
+        "run_presync": False,
+        "run_build": False,
+        "run_build_per_step": False,
+        "run_review": True,
+        "run_security_review": True,
+        "run_test_writing": False,
+        "run_tests": False,
+        "run_checks": False,
+        "planner": {"max_steps": 4},
+    }
+
+
+def _args(**kwargs) -> argparse.Namespace:
+    defaults: dict = {
+        "task_file": None,
+        "task_file_pos": None,
+        "task_id": None,
+        "no_isolate": True,
+        "reset_failed": False,
+        "build": None,
+        "presync": None,
+        "presync_clean": None,
+        "planner": None,
+        "review": None,
+        "security_review": None,
+        "test_writing": None,
+        "tests": None,
+        "build_per_step": None,
+        "checks": None,
+        "agent_model": None,
+        "agent_provider": None,
+        "agent_timeout": None,
+    }
+    defaults.update(kwargs)
+    return argparse.Namespace(**defaults)
+
+
+def _invoke(project: Path, task_file: Path, fake, **kwargs) -> int:
+    """Call cmd_run with a patched LLM. Returns the SystemExit code."""
+    with patch("core.llm_client.create_llm_client", return_value=fake):
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_run(_args(task_file=str(task_file), **kwargs), _cfg(project))
+    return exc_info.value.code
+
+
+def _task(project: Path, text: str) -> Path:
+    d = project / ".sikula" / "tasks"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / "task.md"
+    f.write_text(text)
+    return f
+
+
+@pytest.fixture(autouse=True)
+def _run_from_project_root(git_project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(git_project)
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+class TestSinglePassRun:
+    def test_happy_path_exits_0(self, git_project: Path, fake_llm):
+        fake = fake_llm(
+            agent_responses=[
+                {"src/calculator.py": "def add(a, b):\n    return a + b\n\ndef subtract(a, b):\n    return a - b\n"}
+            ]
+        )
+        assert _invoke(git_project, _task(git_project, "Add a subtract function."), fake) == 0
+
+    def test_state_is_done(self, git_project: Path, fake_llm):
+        fake = fake_llm(
+            agent_responses=[{"src/calculator.py": "def add(a, b): return a + b\ndef multiply(a, b): return a * b\n"}]
+        )
+        _invoke(git_project, _task(git_project, "Add multiply."), fake)
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.done is True
+        assert state.failed is False
+
+    def test_files_changed_recorded(self, git_project: Path, fake_llm):
+        fake = fake_llm(agent_responses=[{"src/calculator.py": "def add(a, b): return a + b\n"}])
+        _invoke(git_project, _task(git_project, "Tweak calculator."), fake)
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert "src/calculator.py" in state.files_changed
+
+    def test_history_records_key_phases(self, git_project: Path, fake_llm):
+        fake = fake_llm(agent_responses=[{"src/calculator.py": "def add(a, b): return a + b\n"}])
+        _invoke(git_project, _task(git_project, "Tweak calculator."), fake)
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        actions = [h["action"] for h in state.history]
+        assert "analyze" in actions
+        assert "plan" in actions
+        assert "implement" in actions
+        assert "review" in actions
+
+    def test_file_written_to_project_dir(self, git_project: Path, fake_llm):
+        new_content = "def add(a, b): return a + b\ndef divide(a, b): return a / b\n"
+        fake = fake_llm(agent_responses=[{"src/calculator.py": new_content}])
+        _invoke(git_project, _task(git_project, "Add divide."), fake)
+        assert (git_project / "src" / "calculator.py").read_text() == new_content
+
+    def test_no_changes_fails(self, git_project: Path, fake_llm):
+        """Single-pass implementer that writes nothing → task fails."""
+        fake = fake_llm(agent_responses=[])  # run_agent returns ([], "")
+        assert _invoke(git_project, _task(git_project, "Do nothing."), fake) == 1
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        assert store.load(store.list_tasks()[0]).failed is True
+
+
+class TestMultiStepRun:
+    def test_two_step_plan_completes(self, git_project: Path, fake_llm):
+        fake = fake_llm(
+            generate_response="1. Add subtract function\n2. Add multiply function",
+            agent_responses=[
+                {"src/calculator.py": "def add(a, b): return a + b\ndef subtract(a, b): return a - b\n"},
+                {
+                    "src/calculator.py": "def add(a, b): return a + b\ndef subtract(a, b): return a - b\ndef multiply(a, b): return a * b\n"
+                },
+            ],
+        )
+        assert _invoke(git_project, _task(git_project, "Add subtract and multiply."), fake) == 0
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.done is True
+        assert len(state.plan) == 2
+
+    def test_step_with_no_changes_is_skipped_not_aborted(self, git_project: Path, fake_llm):
+        """A multi-step step that writes no files is skipped (not a fatal abort)."""
+        fake = fake_llm(
+            generate_response="1. Verify existing code\n2. Add subtract function",
+            agent_responses=[
+                {},  # step 1: no changes → step_skipped
+                {"src/calculator.py": "def add(a, b): return a + b\ndef subtract(a, b): return a - b\n"},
+            ],
+        )
+        assert _invoke(git_project, _task(git_project, "Add subtract."), fake) == 0
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.done is True
+        assert any(h["action"] == "step_skipped" for h in state.history)
+
+
+_REVIEW_ISSUES = (
+    "## Issues\n\n### Missing docstring\nFile: src/calculator.py\nProblem: no docstring\nFix: add docstring"
+)
+
+_SECURITY_BLOCKING = (
+    "## Security Issues\n\n### Unvalidated input\n"
+    "File: src/calculator.py\nProblem: no input validation\nFix: validate inputs"
+)
+
+_CALC_V1 = "def add(a, b): return a + b\ndef subtract(a, b): return a - b\n"
+_CALC_V2 = 'def add(a, b):\n    """Add two numbers."""\n    return a + b\ndef subtract(a, b):\n    """Subtract b from a."""\n    return a - b\n'
+
+
+class TestReviewRejectionCycle:
+    def test_review_rejection_triggers_fix_and_reapproval(self, git_project: Path, seq_fake_llm):
+        """Reviewer rejects once → implementer fix runs → reviewer approves → done."""
+        # run_readonly_agent call order: analyst, reviewer(initial), reviewer(after fix), security
+        fake = seq_fake_llm(
+            readonly_responses=[
+                "Add subtract and improve docstrings.",  # analyst → implementation_prompt
+                _REVIEW_ISSUES,  # reviewer — initial rejection
+                "APPROVED",  # reviewer — after fix
+                "APPROVED",  # security reviewer
+            ],
+            agent_responses=[
+                {"src/calculator.py": _CALC_V1},  # implementer initial
+                {"src/calculator.py": _CALC_V2},  # implementer review fix
+            ],
+        )
+
+        with patch("core.llm_client.create_llm_client", return_value=fake):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_file=str(_task(git_project, "Add subtract with docstrings."))), _cfg(git_project))
+
+        assert exc_info.value.code == 0
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.done is True
+        assert state.review_approved is True
+        actions = [h["action"] for h in state.history]
+        assert actions.count("review") >= 2  # reviewer ran at least twice
+        assert actions.count("implement") >= 2  # initial + fix
+
+    def test_max_review_iterations_fails_task(self, git_project: Path, seq_fake_llm):
+        """Reviewer always rejects → max_review_iterations reached → task fails."""
+        # max_review_iterations=2 → 2 fix attempts → 3 reviewer runs before abort
+        fake = seq_fake_llm(
+            readonly_responses=[
+                "Implement feature.",  # analyst
+                _REVIEW_ISSUES,  # reviewer run 1
+                _REVIEW_ISSUES,  # reviewer run 2 (after fix 1)
+                _REVIEW_ISSUES,  # reviewer run 3 (after fix 2) → triggers abort
+            ],
+            agent_responses=[
+                {"src/calculator.py": _CALC_V1},  # initial
+                {"src/calculator.py": _CALC_V1},  # fix 1
+                {"src/calculator.py": _CALC_V1},  # fix 2
+            ],
+        )
+
+        with patch("core.llm_client.create_llm_client", return_value=fake):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_file=str(_task(git_project, "Improve calculator."))), _cfg(git_project))
+
+        assert exc_info.value.code == 1
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.failed is True
+        assert state.done is False
+        actions = [h["action"] for h in state.history]
+        assert "abort" in actions
+
+
+class TestSecurityReviewBlocking:
+    def test_security_blocking_triggers_fix_and_reapproval(self, git_project: Path, seq_fake_llm):
+        """Security review blocks → implementer fix → code re-review → security approves → done."""
+        # run_readonly_agent call order:
+        # analyst, code reviewer, security(blocking), code reviewer(re-run), security(approved)
+        fake = seq_fake_llm(
+            readonly_responses=[
+                "Implement secure calculator feature.",  # analyst
+                "APPROVED",  # code reviewer initial
+                _SECURITY_BLOCKING,  # security reviewer — blocking
+                "APPROVED",  # code reviewer after security fix
+                "APPROVED",  # security reviewer after fix
+            ],
+            agent_responses=[
+                {"src/calculator.py": _CALC_V1},  # implementer initial
+                {"src/calculator.py": _CALC_V2},  # implementer security fix
+            ],
+        )
+
+        with patch("core.llm_client.create_llm_client", return_value=fake):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_file=str(_task(git_project, "Add secure subtract."))), _cfg(git_project))
+
+        assert exc_info.value.code == 0
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.done is True
+        assert state.security_approved is True
+        assert state.review_approved is True
+        # Code review ran at least twice (initial + after security fix)
+        code_reviews = [r for r in state.review_cycle_records if r["reviewer"] == "reviewer"]
+        security_reviews = [r for r in state.review_cycle_records if r["reviewer"] == "security_reviewer"]
+        assert len(code_reviews) >= 2
+        assert len(security_reviews) >= 2
+
+
+class TestSecurityReviewTimeout:
+    def test_max_security_review_iterations_fails_task(self, git_project: Path, seq_fake_llm):
+        """Security reviewer always blocks → max_security_review_iterations reached → task fails."""
+        # max_security_review_iterations=2 → 2 fix attempts before abort (same semantics as review loop):
+        #   block 1 (iterations=0, 0<2 → fix 1), block 2 (iterations=1, 1<2 → fix 2),
+        #   block 3 (iterations=2, 2>=2 → abort)
+        # call order: analyst, review, security(block1), review, security(block2), review, security(block3 → abort)
+        fake = seq_fake_llm(
+            readonly_responses=[
+                "Implement feature.",  # analyst
+                "APPROVED",  # code reviewer initial
+                _SECURITY_BLOCKING,  # security reviewer block 1 → fix 1
+                "APPROVED",  # code reviewer after fix 1
+                _SECURITY_BLOCKING,  # security reviewer block 2 → fix 2
+                "APPROVED",  # code reviewer after fix 2
+                _SECURITY_BLOCKING,  # security reviewer block 3 → abort (iterations=2 >= max=2)
+            ],
+            agent_responses=[
+                {"src/calculator.py": _CALC_V1},  # implementer initial
+                {"src/calculator.py": _CALC_V1},  # implementer security fix 1
+                {"src/calculator.py": _CALC_V1},  # implementer security fix 2
+            ],
+        )
+
+        with patch("core.llm_client.create_llm_client", return_value=fake):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_file=str(_task(git_project, "Add secure feature."))), _cfg(git_project))
+
+        assert exc_info.value.code == 1
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.failed is True
+        assert state.done is False
+        actions = [h["action"] for h in state.history]
+        assert "abort" in actions
+
+
+class TestAgentException:
+    def test_implementer_exception_fails_task(self, git_project: Path):
+        """An unexpected (non-RuntimeError) exception from an agent sets state.failed=True."""
+        from core.llm_client import LLMClient as _LLMClient
+
+        class _CrashingLLM(_LLMClient):
+            def generate(self, system, user):
+                return "SINGLE_PASS"
+
+            def run_readonly_agent(self, prompt, cwd):
+                return "Implement something."
+
+            def run_agent(self, prompt, cwd):
+                raise ValueError("Simulated unexpected crash in implementer")
+
+        with patch("core.llm_client.create_llm_client", return_value=_CrashingLLM()):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_file=str(_task(git_project, "Do something."))), _cfg(git_project))
+
+        assert exc_info.value.code == 1
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.failed is True
+        actions = [h["action"] for h in state.history]
+        assert "error" in actions
+
+
+class TestAllStepsSkipped:
+    def test_all_steps_skipped_fails_task(self, git_project: Path, seq_fake_llm):
+        """Multi-step where every step writes nothing → task fails (consistent with single-pass)."""
+        fake = seq_fake_llm(
+            readonly_responses=["Implement two steps."],  # analyst only; review never runs for skipped steps
+            generate_responses=["1. Step one\n2. Step two"],  # planner → 2-step plan
+            agent_responses=[],  # both implementer calls write nothing → step_skipped
+        )
+
+        with patch("core.llm_client.create_llm_client", return_value=fake):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_file=str(_task(git_project, "Multi-step that does nothing."))), _cfg(git_project))
+
+        assert exc_info.value.code == 1
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.failed is True
+        assert state.done is False
+        assert state.files_changed == []
+        actions = [h["action"] for h in state.history]
+        assert "abort" in actions
+
+
+class TestWorktreeIsolation:
+    def test_isolated_run_commits_to_branch(self, git_project: Path, fake_llm, capsys):
+        """no_isolate=False: task runs in a worktree, commits on success, removes worktree."""
+        import subprocess
+
+        fake = fake_llm(
+            agent_responses=[{"src/calculator.py": "def add(a, b): return a + b\ndef subtract(a, b): return a - b\n"}]
+        )
+        with patch("core.llm_client.create_llm_client", return_value=fake):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(
+                    _args(task_file=str(_task(git_project, "Add subtract function.")), no_isolate=False),
+                    _cfg(git_project),
+                )
+        assert exc_info.value.code == 0
+
+        # worktree directory removed after successful finalize
+        worktrees_dir = git_project / ".sikula" / "worktrees"
+        if worktrees_dir.exists():
+            assert not any(worktrees_dir.iterdir())
+
+        # a sikula/* branch was created in the repo
+        result = subprocess.run(["git", "branch"], capture_output=True, text=True, cwd=git_project)
+        assert "sikula/" in result.stdout
+
+        # summary output includes branch name
+        out = capsys.readouterr().out
+        assert "Branch:" in out
+
+    def test_isolated_run_preserves_worktree_on_failure(self, git_project: Path, fake_llm):
+        """no_isolate=False: on failure the worktree is kept for inspection/resume."""
+        fake = fake_llm(agent_responses=[])  # no changes → failed
+
+        with patch("core.llm_client.create_llm_client", return_value=fake):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_file=str(_task(git_project, "Do nothing.")), no_isolate=False), _cfg(git_project))
+        assert exc_info.value.code == 1
+
+        # worktree directory preserved
+        worktrees_dir = git_project / ".sikula" / "worktrees"
+        assert worktrees_dir.exists()
+        assert any(True for _ in worktrees_dir.iterdir())
+
+
+class TestResumeRun:
+    def test_reset_failed_then_resumes_to_completion(self, git_project: Path, fake_llm):
+        """--reset-failed clears the failed flag and the task runs to completion (covers line 565)."""
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        failed = store.create("Add a subtract function.")
+        failed.failed = True
+        failed.plan_decided = True
+        failed.files_changed = ["src/calculator.py"]  # non-empty → skip git-diff in reset
+        store.save(failed)
+
+        fake = fake_llm()  # no more writing needed — review/security only
+
+        with patch("core.llm_client.create_llm_client", return_value=fake):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_id=failed.task_id, reset_failed=True), _cfg(git_project))
+
+        assert exc_info.value.code == 0
+        state = store.load(failed.task_id)
+        assert state.done is True
+        assert state.failed is False
+
+    def test_partially_done_task_can_be_resumed(self, git_project: Path, fake_llm):
+        """Resume a task where analyst + planner ran but implementer did not."""
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+
+        partial = store.create("Add a subtract function.")
+        partial.implementation_prompt = "Add subtract(a, b) to src/calculator.py."
+        partial.plan_decided = True  # planner ran; no plan list → single-pass
+        store.save(partial)
+
+        fake = fake_llm(
+            agent_responses=[{"src/calculator.py": "def add(a, b): return a + b\ndef subtract(a, b): return a - b\n"}]
+        )
+
+        with patch("core.llm_client.create_llm_client", return_value=fake):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_id=partial.task_id), _cfg(git_project))
+
+        assert exc_info.value.code == 0
+        state = store.load(partial.task_id)
+        assert state.done is True
+        assert "src/calculator.py" in state.files_changed

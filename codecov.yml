@@ -1,0 +1,15 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 80%
+        informational: true   # never blocks merge; coverage is advisory
+    patch:
+      default:
+        target: 90%
+        informational: true
+
+comment:
+  layout: "diff, files"
+  behavior: default
+  require_changes: true     # only comment when coverage changes

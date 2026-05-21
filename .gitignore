@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.claude/settings.local.json
+.DS_Store
+*.xcuserdata/
+xcuserdata/
+project.xcworkspace/
+DerivedData/
+
+# Test coverage
+.coverage
+htmlcov/

@@ -1,0 +1,921 @@
+"""LLM abstraction layer.
+
+LLMClient defines three operations:
+  generate(system, user) -> str           — single-shot text generation; used by PlannerAgent
+  run_readonly_agent(prompt, cwd) -> str  — autonomous agent with read-only tools; returns text output
+  run_agent(prompt, cwd) -> tuple[list[str], str] — autonomous agent with file tools;
+                                              returns (changed file paths, agent text output)
+
+Implementations:
+  CodexClient    — provider: "codex"     — uses the codex CLI
+  ClaudeClient   — provider: "claude"    — uses the claude CLI
+  GeminiClient   — provider: "gemini"    — uses the gemini CLI
+  OpenCodeClient — provider: "opencode"  — uses the opencode CLI (model: "provider/model")
+
+To add another provider subclass LLMClient and register it in create_llm_client().
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import subprocess
+import tempfile
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Iterator
+
+log = logging.getLogger(__name__)
+
+# Delays (seconds) between successive retry attempts: attempt 1→2, 2→3, 3→4.
+# Total attempts = len(_RETRY_DELAYS) + 1.
+_RETRY_DELAYS: tuple[int, ...] = (30, 60, 120)
+_MAX_RETRY_ERROR_CHARS = 1000
+_RETRY_ERROR_HEAD_CHARS = 350
+
+RetryObserver = Callable[[dict[str, object]], None]
+
+
+@dataclass
+class LLMConfig:
+    provider: str = "codex"
+    model: str = "gpt-5.3-codex"
+    max_tokens: int = 16000  # used by API-based providers; CLI-backed providers may ignore this
+    temperature: float = 0.0
+    agent_timeout: int = 1800  # seconds; applies to run_agent and run_readonly_agent
+    retry_observer: RetryObserver | None = None
+
+
+def _git_snapshot(cwd: Path) -> dict[str, str]:
+    """Return {relative_path: sha256(content)} for all files modified or added vs HEAD.
+
+    Hashing content (not just tracking presence) means a file that was already dirty
+    before the agent ran is still detected as changed if the agent modifies it further.
+    """
+    modified = subprocess.run(
+        ["git", "diff", "--name-only", "--relative", "HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    result: dict[str, str] = {}
+    for line in (modified.stdout + "\n" + untracked.stdout).splitlines():
+        path = line.strip()
+        if not path:
+            continue
+        try:
+            content = (cwd / path).read_bytes()
+            result[path] = hashlib.sha256(content).hexdigest()
+        except (FileNotFoundError, IsADirectoryError):
+            result[path] = ""
+    return result
+
+
+def _retry_error_message(exc: Exception) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    if len(message) > _MAX_RETRY_ERROR_CHARS:
+        tail_chars = _MAX_RETRY_ERROR_CHARS - _RETRY_ERROR_HEAD_CHARS
+        message = message[:_RETRY_ERROR_HEAD_CHARS] + "\n... [truncated] ...\n" + message[-tail_chars:]
+    return message
+
+
+def _notify_retry(
+    config: LLMConfig,
+    operation: str,
+    attempt: int,
+    max_attempts: int,
+    delay_s: int,
+    exc: Exception,
+) -> None:
+    if not config.retry_observer:
+        return
+    try:
+        config.retry_observer(
+            {
+                "provider": config.provider,
+                "model": config.model,
+                "operation": operation,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "delay_s": delay_s,
+                "error": _retry_error_message(exc),
+                "error_type": exc.__class__.__name__,
+            }
+        )
+    except Exception:
+        log.exception("LLM retry observer failed")
+
+
+def _call_with_retry(label: str, fn, config: LLMConfig | None = None, operation: str | None = None):
+    """Call fn() and retry on RuntimeError or TimeoutExpired with exponential backoff."""
+    total = len(_RETRY_DELAYS) + 1
+    last_exc: Exception | None = None
+    for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+        try:
+            return fn()
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            last_exc = exc
+            if delay is None:
+                break
+            log.warning(
+                "%s failed (attempt %d/%d): %s — retrying in %ds",
+                label,
+                attempt + 1,
+                total,
+                exc,
+                delay,
+            )
+            if config is not None:
+                _notify_retry(config, operation or label, attempt + 1, total, delay, exc)
+            time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
+
+
+class LLMClient:
+    """Abstract LLM client. All agents talk to this interface."""
+
+    def set_retry_observer(self, observer: RetryObserver | None) -> RetryObserver | None:
+        config = getattr(self, "_config", None)
+        if config is not None and hasattr(config, "retry_observer"):
+            previous = config.retry_observer
+            config.retry_observer = observer
+            return previous
+        previous = getattr(self, "_retry_observer", None)
+        self._retry_observer = observer
+        return previous
+
+    def generate(self, system: str, user: str) -> str:
+        raise NotImplementedError
+
+    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+        """Run as an autonomous agent with read-only tools in `cwd`. Returns text output."""
+        raise NotImplementedError
+
+    def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
+        """Run as an autonomous agent with file tools in `cwd`.
+
+        Returns (changed_file_paths, agent_text_output). Text output is best-effort
+        and may be an empty string for providers that do not support structured output
+        in write-agent mode.
+        """
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# Claude via CLI
+# ---------------------------------------------------------------------------
+
+
+def _add_git_exclude_entry(cwd: Path, entry: str, comment: str) -> None:
+    exclude = _git_exclude_file(cwd)
+    if exclude is None:
+        return
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    existing = exclude.read_text() if exclude.exists() else ""
+    if entry not in existing:
+        with exclude.open("a") as f:
+            f.write(f"\n# {comment}\n{entry}\n")
+
+
+def _claude_write_settings(cwd: Path) -> Path:
+    """Write .claude/settings.json into the worktree and return its path.
+
+    When inside a git repository, uses git's info/exclude so .claude/ stays out
+    of git diff without touching any tracked file (e.g. the project's own
+    .gitignore). Works in both regular repos and worktrees via _git_exclude_file.
+
+    Settings are built with absolute paths — "~/" does not expand in JSON and
+    "." is not reliably resolved by the Seatbelt/bubblewrap sandbox.
+    The returned path is passed via --settings so Sikula's workspace boundary does not
+    rely on project-level Claude settings.
+    """
+    # denyWrite blocks the home directory and filesystem root at the OS level
+    # (Seatbelt on macOS, bubblewrap on Linux); allowWrite restricts writes to
+    # the project working directory only.
+    settings = {
+        "sandbox": {
+            "enabled": True,
+            "filesystem": {
+                "denyWrite": [str(Path.home()) + "/", "//"],
+                "allowWrite": [str(cwd)],
+            },
+        }
+    }
+    claude_dir = cwd / ".claude"
+    claude_dir.mkdir(exist_ok=True)
+    settings_path = claude_dir / "settings.json"
+    settings_path.write_text(json.dumps(settings, indent=2))
+
+    _add_git_exclude_entry(cwd, ".claude/", "Sikula Claude settings")
+
+    return settings_path
+
+
+class ClaudeClient(LLMClient):
+    """Calls Claude via the `claude -p` CLI. Requires Claude Code to be installed and authenticated."""
+
+    def __init__(self, config: LLMConfig) -> None:
+        self._config = config
+
+    def generate(self, system: str, user: str) -> str:
+        prompt = f"{system}\n\n{user}"
+        log.info(f"Calling LLM ({self._config.model}, ~{len(prompt) // 4} tokens) — waiting for response...")
+
+        def _call():
+            result = subprocess.run(
+                ["claude", "-p", prompt, "--model", self._config.model],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"claude CLI error: {result.stderr.strip() or 'non-zero exit'}")
+            return result.stdout.strip()
+
+        return _call_with_retry("generate", _call, self._config, "generate")
+
+    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+        """Run Claude with read-only tools as an autonomous agent. Returns text output."""
+        settings_path = _claude_write_settings(cwd)
+        log.info(f"Running Claude read-only agent ({self._config.model}) — waiting for completion...")
+
+        def _call():
+            result = subprocess.run(
+                [
+                    "claude",
+                    "-p",
+                    prompt,
+                    "--model",
+                    self._config.model,
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--settings",
+                    str(settings_path),
+                    "--allowedTools",
+                    "Read,Bash(grep *),Bash(find *),Bash(ls *),LS,Glob",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+                timeout=self._config.agent_timeout,
+            )
+            if result.returncode != 0:
+                err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
+                raise RuntimeError(f"claude agent error: {err}")
+            return result.stdout.strip()
+
+        return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
+
+    def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
+        """Run Claude with file tools as an autonomous agent. Returns changed file paths."""
+        settings_path = _claude_write_settings(cwd)
+        before = _git_snapshot(cwd)
+        log.info(f"Running Claude agent ({self._config.model}) — waiting for completion...")
+
+        total = len(_RETRY_DELAYS) + 1
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+            try:
+                result = subprocess.run(
+                    [
+                        "claude",
+                        "-p",
+                        prompt,
+                        "--model",
+                        self._config.model,
+                        # acceptEdits: auto-approves file edits; --settings passes Sikula's
+                        # generated sandbox config explicitly.
+                        "--permission-mode",
+                        "acceptEdits",
+                        "--settings",
+                        str(settings_path),
+                        # Bash: read-only commands + git rm for file deletion (tracked by git,
+                        # reversible, scoped to the git working tree).
+                        "--allowedTools",
+                        "Read,Edit,Write,Bash(grep *),Bash(find *),Bash(ls *),Bash(git rm *),LS,Glob",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    cwd=cwd,
+                    timeout=self._config.agent_timeout,
+                )
+                if result.returncode != 0:
+                    err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
+                    raise RuntimeError(f"claude agent error: {err}")
+                after = _git_snapshot(cwd)
+                changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
+                return changed, result.stdout.strip()
+            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                last_exc = exc
+                if delay is None:
+                    break
+                # Retry is safe only when the agent has not yet modified any files.
+                # Partial changes on disk would cause a second run to operate on a
+                # corrupted intermediate state.
+                if _git_snapshot(cwd) != before:  # any content change means partial write
+                    log.warning("Agent failed after partial file changes — not retrying")
+                    break
+                log.warning(
+                    "Agent call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1,
+                    total,
+                    exc,
+                    delay,
+                )
+                _notify_retry(self._config, "run_agent", attempt + 1, total, delay, exc)
+                time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# opencode via CLI
+# ---------------------------------------------------------------------------
+
+_OPENCODE_READONLY_AGENT = "sikula-readonly"
+_OPENCODE_IMPLEMENTER_AGENT = "sikula-implementer"
+
+_OPENCODE_READONLY_CONFIG = """\
+---
+description: Read-only agent for Sikula analysis and review tasks
+mode: all
+permission:
+  bash: deny
+  edit: deny
+  webfetch: deny
+  websearch: deny
+  task: deny
+  todowrite: deny
+  skill: deny
+---
+"""
+
+_OPENCODE_IMPLEMENTER_CONFIG = """\
+---
+description: Implementation agent for Sikula code changes
+mode: all
+permission:
+  webfetch: deny
+  websearch: deny
+  task: deny
+  todowrite: deny
+  skill: deny
+---
+"""
+
+
+def _git_exclude_file(cwd: Path) -> Path | None:
+    """Return the path to git's info/exclude for a git working directory.
+
+    Uses git rev-parse --git-common-dir which correctly resolves the common git
+    directory from any subdirectory, including worktrees and nested paths.
+    Returns None when cwd is not inside a git repository.
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    if result.returncode == 0:
+        common_dir = Path(result.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = (cwd / common_dir).resolve()
+        return common_dir / "info" / "exclude"
+    return None
+
+
+@contextmanager
+def _opencode_agent_env() -> Iterator[dict[str, str]]:
+    """Yield an environment that exposes Sikula OpenCode agents without writing into the repo."""
+    with tempfile.TemporaryDirectory(prefix="sikula-opencode-") as tmp:
+        config_dir = Path(tmp)
+        agent_dir = config_dir / "agent"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        (agent_dir / f"{_OPENCODE_READONLY_AGENT}.md").write_text(_OPENCODE_READONLY_CONFIG)
+        (agent_dir / f"{_OPENCODE_IMPLEMENTER_AGENT}.md").write_text(_OPENCODE_IMPLEMENTER_CONFIG)
+        env = os.environ.copy()
+        env["OPENCODE_CONFIG_DIR"] = str(config_dir)
+        yield env
+
+
+def _opencode_parse_text(output: str) -> str:
+    """Extract assistant text from opencode --format json NDJSON output.
+
+    Each line is a JSON event; text events carry the model's response chunks.
+    Raises RuntimeError if the output contains a session error event.
+    """
+    parts = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "text":
+            text = event.get("part", {}).get("text", "").strip()
+            if text:
+                parts.append(text)
+        elif event.get("type") == "error":
+            err = event.get("error", {})
+            if isinstance(err, dict):
+                msg = (err.get("data", {}) or {}).get("message") or err.get("name") or str(err)
+            else:
+                msg = str(err)
+            raise RuntimeError(f"opencode error: {msg}")
+    return "\n".join(parts)
+
+
+def _opencode_error(result: subprocess.CompletedProcess[str]) -> str:
+    """Return the most useful error text from an opencode subprocess result."""
+    stderr = result.stderr.strip()
+    if stderr:
+        return stderr
+    stdout = result.stdout.strip()
+    if stdout:
+        try:
+            _opencode_parse_text(stdout)
+        except RuntimeError as exc:
+            return str(exc)
+        return stdout
+    return "non-zero exit"
+
+
+class OpenCodeClient(LLMClient):
+    """Calls opencode via the `opencode run` CLI.
+
+    Requires opencode to be installed and authenticated.
+    Model must be in provider/model format, e.g. openai/gpt-5.3-codex.
+    """
+
+    def __init__(self, config: LLMConfig) -> None:
+        self._config = config
+
+    def generate(self, system: str, user: str) -> str:
+        prompt = f"{system}\n\n{user}"
+        log.info(
+            f"Calling LLM via opencode ({self._config.model}, ~{len(prompt) // 4} tokens) — waiting for response..."
+        )
+
+        def _call():
+            result = subprocess.run(
+                [
+                    "opencode",
+                    "run",
+                    "--model",
+                    self._config.model,
+                    "--format",
+                    "json",
+                ],
+                capture_output=True,
+                input=prompt,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"opencode CLI error: {_opencode_error(result)}")
+            text = _opencode_parse_text(result.stdout)
+            if not text:
+                raise RuntimeError("opencode returned no text output")
+            return text
+
+        return _call_with_retry("generate", _call, self._config, "generate")
+
+    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+        log.info(f"Running opencode read-only agent ({self._config.model}) — waiting for completion...")
+
+        def _call():
+            with _opencode_agent_env() as env:
+                result = subprocess.run(
+                    [
+                        "opencode",
+                        "run",
+                        "--dir",
+                        str(cwd),
+                        "--model",
+                        self._config.model,
+                        "--agent",
+                        _OPENCODE_READONLY_AGENT,
+                        "--format",
+                        "json",
+                    ],
+                    capture_output=True,
+                    input=prompt,
+                    text=True,
+                    cwd=cwd,
+                    env=env,
+                    timeout=self._config.agent_timeout,
+                )
+            if result.returncode != 0:
+                raise RuntimeError(f"opencode agent error: {_opencode_error(result)}")
+            text = _opencode_parse_text(result.stdout)
+            if not text:
+                raise RuntimeError("opencode returned no text output")
+            return text
+
+        return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
+
+    def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
+        before = _git_snapshot(cwd)
+        log.info(f"Running opencode agent ({self._config.model}) — waiting for completion...")
+
+        total = len(_RETRY_DELAYS) + 1
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+            try:
+                with _opencode_agent_env() as env:
+                    result = subprocess.run(
+                        [
+                            "opencode",
+                            "run",
+                            "--dir",
+                            str(cwd),
+                            "--model",
+                            self._config.model,
+                            "--agent",
+                            _OPENCODE_IMPLEMENTER_AGENT,
+                            "--format",
+                            "json",
+                        ],
+                        capture_output=True,
+                        input=prompt,
+                        text=True,
+                        cwd=cwd,
+                        env=env,
+                        timeout=self._config.agent_timeout,
+                    )
+                if result.returncode != 0:
+                    raise RuntimeError(f"opencode agent error: {_opencode_error(result)}")
+                after = _git_snapshot(cwd)
+                changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
+                try:
+                    text = _opencode_parse_text(result.stdout)
+                except RuntimeError:
+                    text = ""
+                return changed, text
+            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                last_exc = exc
+                if delay is None:
+                    break
+                if _git_snapshot(cwd) != before:
+                    log.warning("Agent failed after partial file changes — not retrying")
+                    break
+                log.warning(
+                    "Agent call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1,
+                    total,
+                    exc,
+                    delay,
+                )
+                _notify_retry(self._config, "run_agent", attempt + 1, total, delay, exc)
+                time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Gemini via CLI
+# ---------------------------------------------------------------------------
+
+_GEMINI_SETTINGS_READONLY = {
+    "tools": {
+        # tools.core is a full allowlist — anything not listed is DENY.
+        # update_topic is a built-in meta-tool for session context; model calls it on unexpected
+        # events (build errors, test failures). Harmless; must be allowed to avoid tool errors.
+        "core": [
+            "read_file",
+            "read_many_files",
+            "glob",
+            "grep_search",
+            "list_directory",
+            "update_topic",
+        ]
+    }
+}
+
+_GEMINI_SETTINGS_IMPLEMENTER = {
+    "tools": {
+        # tools.core is a full allowlist — anything not listed is DENY.
+        # update_topic: see comment in _GEMINI_SETTINGS_READONLY above.
+        "core": [
+            "read_file",
+            "read_many_files",
+            "glob",
+            "grep_search",
+            "list_directory",
+            "write_file",
+            "replace",
+            "run_shell_command",
+            "update_topic",
+        ]
+    }
+}
+
+
+def _gemini_write_settings(cwd: Path, settings: dict) -> None:
+    """Write .gemini/settings.json into the worktree and hide it from git.
+
+    When inside a git repository, uses git's info/exclude so .gemini/ stays out
+    of git diff without touching any tracked file (e.g. the project's own
+    .gitignore). Works in both regular repos and worktrees via _git_exclude_file.
+    """
+    gemini_dir = cwd / ".gemini"
+    gemini_dir.mkdir(exist_ok=True)
+    (gemini_dir / "settings.json").write_text(json.dumps(settings, indent=2))
+
+    _add_git_exclude_entry(cwd, ".gemini/", "Sikula Gemini settings")
+
+
+def _gemini_parse_response(output: str) -> str:
+    """Parse JSON output from gemini --output-format json.
+
+    Raises RuntimeError if the response contains an error field.
+    Falls back to returning raw output if JSON parsing fails.
+    """
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError:
+        return output.strip()
+    if data.get("error"):
+        err = data["error"]
+        msg = err.get("message") or str(err) if isinstance(err, dict) else str(err)
+        raise RuntimeError(f"gemini error: {msg}")
+    text = data.get("response", "").strip()
+    if not text:
+        raise RuntimeError("gemini returned no text output")
+    return text
+
+
+class GeminiClient(LLMClient):
+    """Calls Gemini via the `gemini -p` CLI.
+
+    Requires gemini to be installed and authenticated.
+    Model must be a valid Gemini model ID, e.g. gemini-2.5-pro.
+    """
+
+    def __init__(self, config: LLMConfig) -> None:
+        self._config = config
+
+    def _cmd(self, prompt: str, extra: list[str] | None = None) -> list[str]:
+        return [
+            "gemini",
+            "-p",
+            prompt,
+            "--skip-trust",
+            "--model",
+            self._config.model,
+            *(extra or []),
+            "--output-format",
+            "json",
+        ]
+
+    def generate(self, system: str, user: str) -> str:
+        prompt = f"{system}\n\n{user}"
+        log.info(f"Calling LLM via Gemini ({self._config.model}, ~{len(prompt) // 4} tokens) — waiting for response...")
+
+        def _call():
+            result = subprocess.run(
+                self._cmd(prompt),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"gemini CLI error: {result.stderr.strip() or 'non-zero exit'}")
+            return _gemini_parse_response(result.stdout)
+
+        return _call_with_retry("generate", _call, self._config, "generate")
+
+    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+        _gemini_write_settings(cwd, _GEMINI_SETTINGS_READONLY)
+        log.info(f"Running Gemini read-only agent ({self._config.model}) — waiting for completion...")
+
+        def _call():
+            result = subprocess.run(
+                self._cmd(prompt, ["--approval-mode", "yolo"]),
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+                timeout=self._config.agent_timeout,
+            )
+            if result.returncode != 0:
+                err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
+                raise RuntimeError(f"gemini agent error: {err}")
+            return _gemini_parse_response(result.stdout)
+
+        return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
+
+    def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
+        _gemini_write_settings(cwd, _GEMINI_SETTINGS_IMPLEMENTER)
+        before = _git_snapshot(cwd)
+        log.info(f"Running Gemini agent ({self._config.model}) — waiting for completion...")
+
+        total = len(_RETRY_DELAYS) + 1
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+            try:
+                result = subprocess.run(
+                    self._cmd(prompt, ["--approval-mode", "yolo"]),
+                    capture_output=True,
+                    text=True,
+                    cwd=cwd,
+                    timeout=self._config.agent_timeout,
+                )
+                if result.returncode != 0:
+                    err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
+                    raise RuntimeError(f"gemini agent error: {err}")
+                after = _git_snapshot(cwd)
+                changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
+                try:
+                    text = _gemini_parse_response(result.stdout)
+                except RuntimeError:
+                    text = ""
+                return changed, text
+            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                last_exc = exc
+                if delay is None:
+                    break
+                if _git_snapshot(cwd) != before:
+                    log.warning("Agent failed after partial file changes — not retrying")
+                    break
+                log.warning(
+                    "Agent call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1,
+                    total,
+                    exc,
+                    delay,
+                )
+                _notify_retry(self._config, "run_agent", attempt + 1, total, delay, exc)
+                time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# CodexClient
+# ---------------------------------------------------------------------------
+
+
+def _codex_parse_text(output: str) -> str:
+    """Extract assistant text from codex exec --json JSONL output.
+
+    Collects text from item.completed events (type=agent_message).
+    Raises RuntimeError on error/turn.failed events or when no text was produced.
+    """
+    parts: list[str] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        etype = event.get("type")
+        if etype == "item.completed":
+            item = event.get("item", {})
+            if item.get("type") == "agent_message":
+                text = item.get("text", "").strip()
+                if text:
+                    parts.append(text)
+        elif etype == "turn.failed":
+            err = event.get("error") or event.get("data", "")
+            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            raise RuntimeError(f"codex turn failed: {msg}")
+        elif etype == "error":
+            raw = event.get("message") or event.get("data", "")
+            try:
+                inner = json.loads(raw) if isinstance(raw, str) else raw
+                msg = (inner.get("error") or {}).get("message") or str(raw)
+            except (json.JSONDecodeError, AttributeError):
+                msg = str(raw)
+            raise RuntimeError(f"codex error: {msg}")
+    if not parts:
+        raise RuntimeError("codex returned no text output")
+    return "\n".join(parts)
+
+
+class CodexClient(LLMClient):
+    """Calls Codex via the `codex exec` CLI.
+
+    Requires codex to be installed and authenticated (codex login).
+    """
+
+    def __init__(self, config: LLMConfig) -> None:
+        self._config = config
+
+    def _exec_cmd(self, sandbox: str, prompt: str) -> list[str]:
+        return [
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--json",
+            "--sandbox",
+            sandbox,
+            "-m",
+            self._config.model,
+            prompt,
+        ]
+
+    def generate(self, system: str, user: str) -> str:
+        prompt = f"{system}\n\n{user}"
+        log.info(f"Calling LLM via Codex ({self._config.model}, ~{len(prompt) // 4} tokens) — waiting for response...")
+
+        def _call():
+            result = subprocess.run(
+                self._exec_cmd("read-only", prompt),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"codex CLI error: {result.stderr.strip() or 'non-zero exit'}")
+            return _codex_parse_text(result.stdout)
+
+        return _call_with_retry("generate", _call, self._config, "generate")
+
+    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+        log.info(f"Running Codex read-only agent ({self._config.model}) — waiting for completion...")
+
+        def _call():
+            result = subprocess.run(
+                self._exec_cmd("read-only", prompt),
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+                timeout=self._config.agent_timeout,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"codex agent error: {result.stderr.strip() or 'non-zero exit'}")
+            return _codex_parse_text(result.stdout)
+
+        return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
+
+    def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
+        before = _git_snapshot(cwd)
+        log.info(f"Running Codex agent ({self._config.model}) — waiting for completion...")
+
+        total = len(_RETRY_DELAYS) + 1
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+            try:
+                result = subprocess.run(
+                    self._exec_cmd("workspace-write", prompt),
+                    capture_output=True,
+                    text=True,
+                    cwd=cwd,
+                    timeout=self._config.agent_timeout,
+                )
+                if result.returncode != 0:
+                    err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
+                    raise RuntimeError(f"codex agent error: {err}")
+                after = _git_snapshot(cwd)
+                changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
+                try:
+                    text = _codex_parse_text(result.stdout)
+                except RuntimeError:
+                    text = ""
+                return changed, text
+            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                last_exc = exc
+                if delay is None:
+                    break
+                if _git_snapshot(cwd) != before:
+                    log.warning("Agent failed after partial file changes — not retrying")
+                    break
+                log.warning(
+                    "Agent call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1,
+                    total,
+                    exc,
+                    delay,
+                )
+                _notify_retry(self._config, "run_agent", attempt + 1, total, delay, exc)
+                time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+
+def create_llm_client(config: LLMConfig) -> LLMClient:
+    if config.provider == "codex":
+        return CodexClient(config)
+    if config.provider == "claude":
+        return ClaudeClient(config)
+    if config.provider == "gemini":
+        return GeminiClient(config)
+    if config.provider == "opencode":
+        return OpenCodeClient(config)
+    raise ValueError(f"Unknown LLM provider: {config.provider!r}. Add it to llm_client.py.")

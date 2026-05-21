@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+import logging
+import subprocess
+from pathlib import Path
+
+from tools.base_tool import BuildTool, Sandbox, ToolResult
+
+log = logging.getLogger(__name__)
+
+_BUILD_CONFIG_SUFFIXES = (".gradle", ".gradle.kts", ".properties", ".toml")
+_BUILD_CONFIG_DIRS = ("gradle/", "buildsrc/", "build-logic/")
+
+_DEFAULT_SYNC_TIMEOUT = 1800
+_DEFAULT_COMPILE_TIMEOUT = 1800
+_DEFAULT_TEST_TIMEOUT = 1800
+
+
+class GradleBaseTool(BuildTool):
+    """Shared Gradle mechanics for all Gradle-based build tools.
+
+    Subclass this for each Gradle platform variant (Android, JVM backend, …).
+    Provides _run(), _run_shell(), run_check(), and is_build_config_file().
+    """
+
+    def __init__(
+        self,
+        sandbox: Sandbox,
+        project_root: Path,
+        sync_timeout: int = _DEFAULT_SYNC_TIMEOUT,
+        compile_timeout: int = _DEFAULT_COMPILE_TIMEOUT,
+        test_timeout: int = _DEFAULT_TEST_TIMEOUT,
+    ) -> None:
+        super().__init__(sandbox)
+        self._root = project_root.resolve()
+        self._gradlew = self._root / "gradlew"
+        self._sync_timeout = sync_timeout
+        self._compile_timeout = compile_timeout
+        self._test_timeout = test_timeout
+
+    def _run(self, *args: str, timeout: int = 300) -> ToolResult:
+        log.info(f"$ {self._gradlew} {' '.join(args)}  [cwd: {self._root}]  (timeout {timeout}s)")
+        try:
+            r = subprocess.run(
+                [str(self._gradlew), *args],
+                capture_output=True,
+                text=True,
+                cwd=self._root,
+                timeout=timeout,
+            )
+            output = r.stdout + r.stderr
+            if r.returncode != 0:
+                return ToolResult(success=False, output=output, error=output[-4000:])
+            return ToolResult(success=True, output=output)
+        except subprocess.TimeoutExpired:
+            return ToolResult(success=False, output="", error="Gradle timed out")
+        except Exception as e:
+            return ToolResult(success=False, output="", error=str(e))
+
+    def _run_shell(self, command: str, timeout: int = 300) -> ToolResult:
+        log.info(f"$ {command}  [cwd: {self._root}]  (timeout {timeout}s)")
+        try:
+            r = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                cwd=self._root,
+                timeout=timeout,
+            )
+            output = r.stdout + r.stderr
+            if r.returncode != 0:
+                return ToolResult(success=False, output=output, error=output[-4000:])
+            return ToolResult(success=True, output=output)
+        except subprocess.TimeoutExpired:
+            return ToolResult(success=False, output="", error=f"Command timed out: {command}")
+        except Exception as e:
+            return ToolResult(success=False, output="", error=str(e))
+
+    def run_check(self, name: str, task_config: dict) -> ToolResult:
+        command = task_config.get("command", name)
+        timeout = int(task_config.get("timeout", self._compile_timeout))
+        return self._run_shell(command, timeout=timeout)
+
+    def is_build_config_file(self, path: str) -> bool:
+        p = path.replace("\\", "/").lower()
+        return any(p.endswith(s) for s in _BUILD_CONFIG_SUFFIXES) or any(d in p for d in _BUILD_CONFIG_DIRS)

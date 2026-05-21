@@ -1,0 +1,17 @@
+[
+  {"code": "DEU", "name": "Germany", "capital": "Berlin", "region": "Europe", "population": 83200000, "area": 357114.0},
+  {"code": "FRA", "name": "France", "capital": "Paris", "region": "Europe", "population": 67000000, "area": 543965.0},
+  {"code": "GBR", "name": "United Kingdom", "capital": "London", "region": "Europe", "population": 67220000, "area": 242495.0},
+  {"code": "ESP", "name": "Spain", "capital": "Madrid", "region": "Europe", "population": 47415000, "area": 505990.0},
+  {"code": "ITA", "name": "Italy", "capital": "Rome", "region": "Europe", "population": 59110000, "area": 301340.0},
+  {"code": "USA", "name": "United States", "capital": "Washington D.C.", "region": "Americas", "population": 331000000, "area": 9833520.0},
+  {"code": "BRA", "name": "Brazil", "capital": "Brasília", "region": "Americas", "population": 215353593, "area": 8515767.0},
+  {"code": "CAN", "name": "Canada", "capital": "Ottawa", "region": "Americas", "population": 38250000, "area": 9984670.0},
+  {"code": "MEX", "name": "Mexico", "capital": "Mexico City", "region": "Americas", "population": 126705138, "area": 1964375.0},
+  {"code": "ARG", "name": "Argentina", "capital": "Buenos Aires", "region": "Americas", "population": 45376763, "area": 2780400.0},
+  {"code": "JPN", "name": "Japan", "capital": "Tokyo", "region": "Asia", "population": 125700000, "area": 377930.0},
+  {"code": "CHN", "name": "China", "capital": "Beijing", "region": "Asia", "population": 1412600000, "area": 9596960.0},
+  {"code": "IND", "name": "India", "capital": "New Delhi", "region": "Asia", "population": 1380004385, "area": 3287590.0},
+  {"code": "AUS", "name": "Australia", "capital": "Canberra", "region": "Oceania", "population": 25690000, "area": 7692024.0},
+  {"code": "NGA", "name": "Nigeria", "capital": "Abuja", "region": "Africa", "population": 218541212, "area": 923768.0}
+]

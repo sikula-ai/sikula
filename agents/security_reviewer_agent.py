@@ -1,0 +1,296 @@
+"""Security reviewer agent — checks implementation for security vulnerabilities.
+
+Runs after the review phase, before test writing. With the default reviewer enabled,
+this means after reviewer approval; if review is disabled, security review still runs
+unless it is disabled separately.
+- BLOCKING issues are fed back to the implementer via a fix pass; the review loop
+  and security review then re-run. Pipeline does not advance until security passes.
+- WARNING issues are recorded in review_cycle_records and do not block the pipeline.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from datetime import datetime, timezone
+
+from agents.base_agent import (
+    AGENT_SECURITY_PREFIX,
+    AgentResult,
+    BaseAgent,
+    gather_guidelines as _gather_guidelines,
+    load_extra_rules as _load_extra_rules,
+    tech_stack as _tech_stack,
+)
+from core.state import TaskState
+
+log = logging.getLogger(__name__)
+
+_MAX_DIFF_CHARS = 40_000
+
+_SYSTEM_SECURITY = """\
+You are a senior application security engineer specializing in {tech_stack}.
+Your job is to identify security vulnerabilities introduced by this code change.
+
+Project guidelines:
+{guidelines_context}{security_context}
+
+You will receive:
+1. The original task description
+2. The implementation prompt the developer followed
+3. The list of files changed
+4. A git diff of all changes
+
+Review steps:
+1. Read the task description and implementation prompt to understand what was changed and why.
+   If a CURRENT STEP SECURITY SCOPE section is present, this is a multi-step task.
+   Review security only for the current step and already changed code needed to reason
+   about its data flows. Do not report missing future planned steps as security issues.
+2. Examine the diff. Use your Read tool to read each changed file in full for context.
+3. Identify trust boundaries in the changed code: where does untrusted data enter (user input,
+   network responses, file contents, IPC, deserialized data) and trace it through to
+   security-sensitive operations (file I/O, queries, crypto, auth checks, shell commands).
+   A new function that passes untrusted data to an existing vulnerable operation is a new
+   vulnerability — read surrounding code when needed to establish the full data flow.
+4. Check for security issues introduced by this change. Do not report pre-existing issues
+   in unchanged code.
+
+BLOCKING issues — always blocking regardless of context:
+- Hardcoded credentials, API keys, tokens, passwords, or secrets in source code
+- Injection vulnerabilities: SQL injection, command injection, LDAP injection, or similar
+  — any case where unsanitised external input reaches a security-sensitive operation
+- Missing or bypassable authentication / authorisation checks on operations that require them
+- Use of broken or weak cryptographic algorithms for security-sensitive operations
+  (e.g. MD5 or SHA-1 for password hashing, ECB mode encryption)
+- Logging or exposing sensitive personal data (passwords, tokens, PII) in plaintext
+- Path traversal — user-controlled input used to construct file or resource paths without
+  validation, allowing access outside the intended directory or resource scope
+- Disabled or missing TLS certificate validation in code that makes network connections
+  (e.g. accepting all certificates, ignoring hostname verification, suppressing TLS errors)
+
+WARNING issues — non-blocking; use your judgement based on context:
+- Insecure default values that could be dangerous in production
+- Missing input validation on public API boundaries
+- Potential information leakage in error messages or stack traces
+- Security-relevant events not logged (failed authentication, access to sensitive resources)
+- Overly broad permissions or scopes granted by the change
+- Any other security concern that does not clearly fall into the BLOCKING category
+
+If previous security reviews of this task are included at the end of this prompt,
+maintain consistency: do not reverse a judgment unless the implementation has genuinely
+changed to address the specific issue you raised. If the vulnerability is still present,
+repeat the same issue. If it was fixed but a new one introduced, report the new one only.
+For multi-step tasks, maintain consistency only for security issues that are in scope
+for the current step.
+
+Output exactly one of:
+- If no issues were found: a "Security checks:" summary line describing the trust boundaries
+  you traced and what was verified (untrusted inputs, sensitive operations, credentials,
+  TLS, injection vectors, PII), followed by the single word APPROVED on its own line.
+  For an all-clear approval, the final non-empty line must be exactly APPROVED.
+  An all-clear approval without this exact final line is treated as a security review
+  failure and will trigger another fix/review loop.
+  Example:
+    Security checks: countryCode from navigation arg reaches API URL via Retrofit — no
+    injection risk (Retrofit encodes path params). No credentials, TLS issues, weak crypto,
+    PII logging, or path traversal found.
+    APPROVED
+- One or both of the following sections (include only sections that apply):
+  Do not include APPROVED when reporting security issues or warnings.
+  Warnings are non-blocking: warning-only output is accepted and recorded, but it is
+  not an all-clear approval.
+
+## Security Issues
+
+### <short title>
+File: <relative path>
+Problem: <what the vulnerability is>
+Fix: <concrete remediation — name the specific API, function, or pattern to use, not just the general principle>
+
+## Warnings
+
+### <short title>
+File: <relative path>
+Concern: <what the concern is>
+Suggestion: <recommended improvement>
+
+Report only issues introduced by the current change. Do not report style issues,
+performance concerns, or pre-existing problems in unchanged code.\
+"""
+
+_USER_SECURITY = """\
+Task description:
+{task_description}
+
+---
+Implementation prompt:
+{implementation_prompt}
+
+---
+Files changed:
+{files_changed}
+
+---
+Git diff (modified files vs HEAD):
+{diff}
+
+Perform the security review.\
+"""
+
+_STEP_SECURITY_SCOPE = """\
+---
+CURRENT STEP SECURITY SCOPE:
+Step context: This security review covers step {step_num} of {total_steps}: "{step_description}"
+
+Review security for the current step and any already changed code needed to trace its
+data flows. Future planned steps are context only:
+{future_steps}
+Do NOT report missing future planned steps as security issues.\
+"""
+
+
+class SecurityReviewerAgent(BaseAgent):
+    name = "security_reviewer"
+
+    def run(self, state: TaskState) -> AgentResult:
+        if not state.implementation_prompt:
+            return AgentResult(success=False, message="No implementation prompt in state")
+        if not state.files_changed:
+            return AgentResult(success=False, message="No changed files to review")
+
+        file_tool = self.tools.get("file")
+        git_tool = self.tools.get("git")
+        if not file_tool:
+            return AgentResult(success=False, message="FileTool not available")
+
+        diff = ""
+        if state.review_diff is not None:
+            diff = state.review_diff[:_MAX_DIFF_CHARS]
+            if len(state.review_diff) > _MAX_DIFF_CHARS:
+                diff += "\n... (diff truncated)"
+        elif git_tool:
+            result = git_tool.diff_head()
+            if result.success and result.output.strip():
+                diff = result.output[:_MAX_DIFF_CHARS]
+                if len(result.output) > _MAX_DIFF_CHARS:
+                    diff += "\n... (diff truncated)"
+        if not diff:
+            diff = "(diff not available — use Read tool to inspect changed files)"
+
+        raw_context = self.project_config.get("security", {}).get("context", "").strip()
+        security_context = f"\n\nProject security context:\n{raw_context}" if raw_context else ""
+
+        step_scope = ""
+        if state.plan:
+            step_idx = state.current_step
+            future_steps = state.plan[step_idx + 1 :]
+            future_text = "\n".join(f"  - {step}" for step in future_steps) if future_steps else "  - none"
+            step_scope = _STEP_SECURITY_SCOPE.format(
+                step_num=step_idx + 1,
+                total_steps=len(state.plan),
+                step_description=state.plan[step_idx],
+                future_steps=future_text,
+            )
+
+        full_prompt = (
+            _SYSTEM_SECURITY.format(
+                tech_stack=_tech_stack(self.project_config),
+                guidelines_context=_gather_guidelines(self.project_config, file_tool),
+                security_context=security_context,
+            )
+            + _load_extra_rules(self.project_config, self.name, file_tool)
+            + "\n\n"
+            + step_scope
+            + ("\n\n" if step_scope else "")
+            + _USER_SECURITY.format(
+                task_description=state.task_description,
+                implementation_prompt=state.implementation_prompt,
+                files_changed="\n".join(f"  - {f}" for f in state.files_changed),
+                diff=diff,
+            )
+        )
+
+        security_history = []
+        for record in state.review_cycle_records:
+            if record["reviewer"] != "security_reviewer":
+                continue
+            if state.plan and record.get("step") != state.current_step:
+                continue
+            security_history.append(record["reviewer_output"])
+        if security_history:
+            history_text = "\n\n---\n".join(f"[Security Review {i + 1}]\n{r}" for i, r in enumerate(security_history))
+            full_prompt += (
+                f"\n\n---\nYour previous security reviews of this task (maintain consistency):\n{history_text}"
+            )
+
+        full_prompt = AGENT_SECURITY_PREFIX + full_prompt
+
+        try:
+            output = self.llm.run_readonly_agent(full_prompt, cwd=file_tool._root)
+        except RuntimeError as e:
+            msg = str(e)
+            state.record(self.name, "review_failed", msg[:500])
+            return AgentResult(success=False, message=msg[:200])
+
+        if not output:
+            return AgentResult(success=False, message="Security reviewer produced empty output")
+
+        has_blocking = "## Security Issues" in output
+        has_warnings = "## Warnings" in output
+        last_line = next((ln for ln in reversed(output.splitlines()) if ln.strip()), "")
+        has_approved = re.sub(r"[^A-Za-z]", "", last_line).upper() == "APPROVED"
+
+        state.review_cycle_records.append(
+            {
+                "reviewer": "security_reviewer",
+                "step": state.current_step,
+                "build_iteration": state.build_iterations,
+                "security_review_iteration": state.security_review_iterations,
+                "reviewer_prompt": full_prompt,
+                "reviewer_output": output,
+                "approved": not has_blocking and (has_approved or has_warnings),
+                "has_warnings": has_warnings,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+        if has_warnings:
+            log.info("Security warnings (non-blocking):\n%s", output)
+
+        if has_blocking:
+            state.security_approved = False
+            state.review_issues = [output]
+            state.review_approved = False
+            state.record(self.name, "review", f"blocking issues ({len(output)} chars)")
+            log.warning("Security review — blocking issues:\n%s", output)
+            return AgentResult(
+                success=False,
+                message="Security review found blocking issues",
+                data={"issues": output},
+            )
+
+        if not has_approved and not has_warnings:
+            state.security_approved = False
+            state.review_issues = [output]
+            state.review_approved = False
+            state.record(self.name, "review", f"unexpected output — no APPROVED signal ({len(output)} chars)")
+            log.warning("Security review — unexpected output, treating as blocking:\n%s", output)
+            return AgentResult(
+                success=False,
+                message="Security review produced unexpected output (no APPROVED signal)",
+                data={"issues": output},
+            )
+
+        state.security_approved = True
+        state.review_issues.clear()
+        if has_warnings:
+            state.record(self.name, "review", f"warnings only ({len(output)} chars)")
+            return AgentResult(
+                success=True,
+                message="Security review passed with warnings",
+                data={"warnings": output},
+            )
+
+        state.record(self.name, "review", "approved")
+        log.info(f"Security review approved:\n{output}")
+        return AgentResult(success=True, message="Security review approved")
