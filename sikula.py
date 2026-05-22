@@ -73,6 +73,39 @@ _BASE = Path(__file__).parent
 _SUPPORTED_BUILD_TOOLS = {"cargo", "gradle-android", "gradle-jvm", "maven", "xcodebuild", "python"}
 
 
+def _git_output(args: list[str], cwd: Path) -> str | None:
+    try:
+        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _is_git_checkout(path: Path = _BASE) -> bool:
+    return _git_output(["rev-parse", "--is-inside-work-tree"], path) == "true"
+
+
+def _dev_version_suffix(path: Path = _BASE) -> str:
+    if not _is_git_checkout(path):
+        return ""
+    branch = _git_output(["branch", "--show-current"], path)
+    commit = _git_output(["rev-parse", "--short", "HEAD"], path)
+    parts = [re.sub(r"[^A-Za-z0-9.]+", ".", p).strip(".") for p in (branch, commit) if p]
+    return "-dev" + (f"+{'.'.join(parts)}" if parts else "")
+
+
+def _sikula_version() -> str:
+    try:
+        base_version = _pkg_version("sikula")
+    except PackageNotFoundError:
+        base_version = "dev"
+    if base_version == "dev":
+        return "dev"
+    return base_version + _dev_version_suffix()
+
+
 def _resolve_task_path(task_file: str, project_root: Path) -> Path | None:
     """Return the resolved Path for a task file, or None if not found.
 
@@ -2030,16 +2063,11 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    try:
-        _version = _pkg_version("sikula")
-    except PackageNotFoundError:
-        _version = "dev"
-
     parser = argparse.ArgumentParser(
         description="Sikula",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {_version}")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {_sikula_version()}")
     parser.add_argument(
         "--config",
         default=None,
