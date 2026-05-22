@@ -7,15 +7,91 @@ subclass StateStore and swap it in sikula.py — nothing else needs to change.
 from __future__ import annotations
 
 import json
+import platform
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Optional
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _short_text(text: str | None, limit: int = 1000) -> str | None:
+    if not text:
+        return None
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def runtime_metadata_snapshot() -> dict:
+    try:
+        sikula_version = version("sikula")
+    except PackageNotFoundError:
+        sikula_version = "unknown"
+    return {
+        "sikula_version": sikula_version,
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "system": platform.system(),
+        "machine": platform.machine(),
+    }
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _terminal_result(state: "TaskState") -> str:
+    if state.done:
+        return "done"
+    if state.failed:
+        return "failed"
+    return "incomplete"
+
+
+def _final_summary(state: "TaskState") -> dict:
+    created_at = _parse_iso(state.created_at)
+    finished_at = _parse_iso(state.finished_at)
+    summary: dict = {
+        "result": _terminal_result(state),
+        "task_id": state.task_id,
+        "branch": state.worktree_branch,
+        "commit": state.result_commit,
+        "build_attempts": state.build_iterations,
+        "build_status": state.build_status,
+        "test_status": state.test_status,
+        "check_status": state.check_status,
+        "files_changed_count": len(state.files_changed),
+        "test_files_written_count": len(state.test_files_written),
+        "validation_records_count": len(state.validation_cycle_records),
+        "validation_failures_count": sum(
+            1 for entry in state.validation_cycle_records if entry.get("status") == "failed"
+        ),
+        "fix_attempts": len(state.fix_cycle_records),
+        "review_records_count": len(state.review_cycle_records),
+        "reviewer_runs": sum(1 for entry in state.review_cycle_records if entry.get("reviewer") == "reviewer"),
+        "security_reviewer_runs": sum(
+            1 for entry in state.review_cycle_records if entry.get("reviewer") == "security_reviewer"
+        ),
+        "test_writer_runs": len(state.test_write_records),
+        "llm_retries": sum(1 for entry in state.history if entry.get("action") == "llm_retry"),
+        "history_events_count": len(state.history),
+        "created_at": state.created_at,
+        "finished_at": state.finished_at,
+    }
+    if created_at and finished_at:
+        summary["wall_elapsed_s"] = round((finished_at - created_at).total_seconds(), 1)
+    return summary
 
 
 SCHEMA_VERSION = 1
@@ -61,11 +137,14 @@ class TaskState:
     review_cycle_records: list[dict] = field(default_factory=list)
     test_write_records: list[dict] = field(default_factory=list)
     fix_cycle_records: list[dict] = field(default_factory=list)
+    validation_cycle_records: list[dict] = field(default_factory=list)
     task_file: Optional[str] = None
     worktree_path: Optional[str] = None
     worktree_branch: Optional[str] = None
     worktree_base: Optional[str] = None
     history: list[dict] = field(default_factory=list)
+    runtime_metadata: dict = field(default_factory=dict)
+    final_summary: dict = field(default_factory=dict)
     done: bool = False
     failed: bool = False
     finished_at: Optional[str] = None
@@ -96,6 +175,30 @@ class TaskState:
             entry["error"] = error
         self.history.append(entry)
 
+    def record_validation(
+        self,
+        phase: str,
+        status: str,
+        elapsed_s: float | None = None,
+        error: str | None = None,
+        check_name: str | None = None,
+    ) -> None:
+        entry: dict = {
+            "phase": phase,
+            "status": status,
+            "build_iteration": self.build_iterations,
+            "step": self.current_step,
+            "timestamp": _now(),
+        }
+        if check_name:
+            entry["check_name"] = check_name
+        if elapsed_s is not None:
+            entry["elapsed_s"] = round(elapsed_s, 1)
+        error_excerpt = _short_text(error)
+        if error_excerpt:
+            entry["error_excerpt"] = error_excerpt
+        self.validation_cycle_records.append(entry)
+
 
 # ---------------------------------------------------------------------------
 # Abstract store
@@ -118,6 +221,7 @@ class StateStore:
     def create(self, task_description: str) -> TaskState:
         task_id = uuid.uuid4().hex
         state = TaskState(task_id=task_id, task_description=task_description)
+        state.runtime_metadata = runtime_metadata_snapshot()
         self.save(state)
         return state
 
@@ -155,6 +259,8 @@ class JsonStateStore(StateStore):
         self._dir.mkdir(parents=True, exist_ok=True)
         if (state.done or state.failed) and not state.finished_at:
             state.finished_at = _now()
+        if state.done or state.failed:
+            state.final_summary = _final_summary(state)
         state.updated_at = _now()
         self._path(state.task_id).write_text(json.dumps(asdict(state), indent=2))
 

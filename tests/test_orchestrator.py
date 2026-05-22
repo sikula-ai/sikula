@@ -332,6 +332,49 @@ class TestOrchestratorBuildLoop:
         assert result.test_status == "success"
         assert result.check_status == "skipped"
 
+    def test_validation_records_capture_successful_build_test_and_skipped_checks(self, tmp_path: Path):
+        orch, _, _ = _make_orchestrator(tmp_path, run_build=True, run_tests=True, run_checks=True)
+        self._build_ready(orch)
+
+        result = orch.run(task_id="t1")
+
+        phases = [(r["phase"], r["status"]) for r in result.validation_cycle_records]
+        assert ("build", "success") in phases
+        assert ("test", "success") in phases
+        assert ("check", "skipped") in phases
+        assert all(r["build_iteration"] == 1 for r in result.validation_cycle_records)
+
+    def test_validation_records_capture_failed_build_error_excerpt(self, tmp_path: Path):
+        orch, _, build = _make_orchestrator(tmp_path, run_build=True, max_iterations=1)
+        build.compile_success = False
+        self._build_ready(orch)
+
+        result = orch.run(task_id="t1")
+
+        build_records = [r for r in result.validation_cycle_records if r["phase"] == "build"]
+        assert build_records[-1]["status"] == "failed"
+        assert build_records[-1]["error_excerpt"] == "compile failed"
+
+    def test_validation_records_capture_configured_check_name(self, tmp_path: Path):
+        orch, _, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=False,
+            run_checks=True,
+        )
+        orch._config.project_config["build"] = {"checks": [{"name": "ruff", "command": "ruff check ."}]}
+        self._build_ready(orch)
+
+        result = orch.run(task_id="t1")
+
+        check_records = [r for r in result.validation_cycle_records if r["phase"] == "check"]
+        assert len(check_records) == 1
+        assert check_records[0]["status"] == "success"
+        assert check_records[0]["build_iteration"] == 1
+        assert check_records[0]["step"] == 0
+        assert check_records[0]["check_name"] == "ruff"
+        assert "timestamp" in check_records[0]
+
 
 # ---------------------------------------------------------------------------
 # Tests — review loop
@@ -1370,12 +1413,44 @@ class TestOrchestratorFixCommand:
         assert result.done
         assert len(stubs["fixer"].calls) == 0
 
+    def test_validation_records_include_autofix_attempt(self, tmp_path: Path):
+        orch, _, build = _make_orch_with_checks(tmp_path, _CHECK_WITH_FIX)
+        build.check_results = {"ruff-format": [False, True], "ruff-format_autofix": [True]}
+        self._checks_ready(orch)
+
+        result = orch.run(task_id="t1")
+
+        check_records = [(r["phase"], r["status"], r.get("check_name")) for r in result.validation_cycle_records]
+        assert ("check", "failed", "ruff-format") in check_records
+        assert ("check_autofix", "success", "ruff-format") in check_records
+        assert ("check", "success", "ruff-format") in check_records
+
     def test_autofix_failure_falls_through_to_fixer(self, tmp_path: Path):
         orch, stubs, build = _make_orch_with_checks(tmp_path, _CHECK_WITH_FIX, max_iterations=2)
         build.check_results = {"ruff-format": [False], "ruff-format_autofix": [False]}
         self._checks_ready(orch)
         orch.run(task_id="t1")
         assert len(stubs["fixer"].calls) >= 1
+
+    def test_validation_records_do_not_duplicate_check_failure_when_autofix_fails(self, tmp_path: Path):
+        orch, _, build = _make_orch_with_checks(tmp_path, _CHECK_WITH_FIX, max_iterations=1)
+        build.check_results = {"ruff-format": [False], "ruff-format_autofix": [False]}
+        self._checks_ready(orch)
+
+        result = orch.run(task_id="t1")
+
+        check_failures = [
+            r
+            for r in result.validation_cycle_records
+            if r["phase"] == "check" and r["status"] == "failed" and r.get("check_name") == "ruff-format"
+        ]
+        autofix_failures = [
+            r
+            for r in result.validation_cycle_records
+            if r["phase"] == "check_autofix" and r["status"] == "failed" and r.get("check_name") == "ruff-format"
+        ]
+        assert len(check_failures) == 1
+        assert len(autofix_failures) == 1
 
     def test_no_fix_command_calls_fixer_on_failure(self, tmp_path: Path):
         orch, stubs, build = _make_orch_with_checks(tmp_path, _CHECK_WITHOUT_FIX, max_iterations=2)

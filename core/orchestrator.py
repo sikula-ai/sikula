@@ -621,6 +621,7 @@ class Orchestrator:
         state.presync_done = True
         if result.success:
             state.record("orchestrator", "presync", "ok", elapsed_s=elapsed_s)
+            state.record_validation("presync", "success", elapsed_s=elapsed_s)
             log.info("Pre-analyze sync OK (%s)", _fmt_elapsed(elapsed_s))
         else:
             state.record(
@@ -630,6 +631,7 @@ class Orchestrator:
                 elapsed_s=elapsed_s,
                 error=result.error[-500:],
             )
+            state.record_validation("presync", "failed", elapsed_s=elapsed_s, error=result.error)
             log.warning(
                 "Pre-analyze sync failed (%s) — analyst will proceed with sources available in build/: %s",
                 _fmt_elapsed(elapsed_s),
@@ -674,6 +676,7 @@ class Orchestrator:
                     continue
             else:
                 state.test_status = "skipped"
+                state.record_validation("test", "skipped")
 
             if self._config.run_checks:
                 if not self._run_checks(state):
@@ -683,6 +686,7 @@ class Orchestrator:
                     continue
             else:
                 state.check_status = "skipped"
+                state.record_validation("check", "skipped")
 
             # Passing build (and tests/checks if enabled)
             if set_done:
@@ -886,6 +890,7 @@ class Orchestrator:
         checks = self._config.project_config.get("build", {}).get("checks", [])
         if not checks:
             state.check_status = "skipped"
+            state.record_validation("check", "skipped")
             self._store.save(state)
             return True
         all_passed = True
@@ -896,26 +901,49 @@ class Orchestrator:
             result = build_tool.run_check(name, check)
             elapsed_s = time.perf_counter() - t0
             fix_command = check.get("fix_command")
+            skip_final_failure_validation = False
             if not result.success and fix_command:
+                state.record_validation(
+                    "check", "failed", elapsed_s=elapsed_s, error=result.error or result.output, check_name=name
+                )
                 log.info(f"Check {name} failed — running fix_command: {fix_command}")
                 fix_cfg: dict = {"command": fix_command}
                 if "timeout" in check:
                     fix_cfg["timeout"] = check["timeout"]
+                t0 = time.perf_counter()
                 fix_result = build_tool.run_check(f"{name}_autofix", fix_cfg)
+                fix_elapsed_s = time.perf_counter() - t0
                 state.record("orchestrator", f"check_{name}_autofix", "success" if fix_result.success else "failed")
+                state.record_validation(
+                    "check_autofix",
+                    "success" if fix_result.success else "failed",
+                    elapsed_s=fix_elapsed_s,
+                    error=fix_result.error,
+                    check_name=name,
+                )
                 if fix_result.success:
                     t0 = time.perf_counter()
                     result = build_tool.run_check(name, check)
                     elapsed_s = time.perf_counter() - t0
                 else:
+                    skip_final_failure_validation = True
                     log.warning(f"Auto-fix for {name} failed: {fix_result.error[-500:]}")
             if result.success:
                 log.info(f"Check {name} OK ({_fmt_elapsed(elapsed_s)})")
                 state.record("orchestrator", f"check_{name}", "success", elapsed_s=elapsed_s)
+                state.record_validation("check", "success", elapsed_s=elapsed_s, check_name=name)
             else:
                 log.error(f"Check {name} failed ({_fmt_elapsed(elapsed_s)}):\n{result.error[-2000:]}")
                 state.check_errors.append(f"[{name}]\n{result.output}")
                 state.record("orchestrator", f"check_{name}", "failed", elapsed_s=elapsed_s)
+                if not skip_final_failure_validation:
+                    state.record_validation(
+                        "check",
+                        "failed",
+                        elapsed_s=elapsed_s,
+                        error=result.error or result.output,
+                        check_name=name,
+                    )
                 all_passed = False
         state.check_status = "success" if all_passed else "failed"
         self._store.save(state)
@@ -932,10 +960,12 @@ class Orchestrator:
             state.test_errors.append(result.error[-3000:])
             state.test_status = "failed"
             state.record("orchestrator", "test", "failed", elapsed_s=elapsed_s)
+            state.record_validation("test", "failed", elapsed_s=elapsed_s, error=result.error)
             return False
         log.info(f"Tests OK ({_fmt_elapsed(elapsed_s)})")
         state.test_status = "success"
         state.record("orchestrator", "test", "success", elapsed_s=elapsed_s)
+        state.record_validation("test", "success", elapsed_s=elapsed_s)
         return True
 
     def _sync(self, state: TaskState) -> bool:
@@ -947,9 +977,11 @@ class Orchestrator:
         if result.success:
             state.build_synced = True
             state.record("orchestrator", "sync", "ok", elapsed_s=elapsed_s)
+            state.record_validation("sync", "success", elapsed_s=elapsed_s)
             log.info(f"Build sync OK ({_fmt_elapsed(elapsed_s)})")
         else:
             state.record("orchestrator", "sync", "failed", elapsed_s=elapsed_s)
+            state.record_validation("sync", "failed", elapsed_s=elapsed_s, error=result.error)
             log.error(f"Build sync failed ({_fmt_elapsed(elapsed_s)}):\n{result.error[-2000:]}")
             state.errors.append(result.error[-3000:])
         self._store.save(state)
@@ -963,6 +995,9 @@ class Orchestrator:
         elapsed_s = time.perf_counter() - t0
         state.build_status = "success" if result.success else "failed"
         state.record("orchestrator", "build", state.build_status, elapsed_s=elapsed_s)
+        state.record_validation(
+            "build", state.build_status, elapsed_s=elapsed_s, error=None if result.success else result.error
+        )
         if not result.success:
             log.error(f"Build failed ({_fmt_elapsed(elapsed_s)}):\n{result.error[-2000:]}")
             state.errors.append(result.error[-3000:])

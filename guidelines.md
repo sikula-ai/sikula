@@ -208,11 +208,17 @@ Every agent that invokes an LLM must append one record per invocation to the app
 | `FixerAgent` | `state.fix_cycle_records` |
 | `ReviewerAgent`, `SecurityReviewerAgent` | `state.review_cycle_records` |
 | `TestWriterAgent` | `state.test_write_records` |
+| Orchestrator validation phases | `state.validation_cycle_records` |
 
-Each record must include at minimum: the agent's prompt, LLM output (`None` on exception),
-files written, timestamp, and the correlation keys needed to locate the record within the
-pipeline: `step`, `build_iteration` (`state.build_iterations`), `review_iteration`
-(`state.review_iterations`), `security_review_iteration` (`state.security_review_iterations`).
+Each agent record must include at minimum: the agent's prompt, LLM output (`None` on
+exception), files written, timestamp, and the correlation keys needed to locate the record
+within the pipeline: `step`, `build_iteration` (`state.build_iterations`),
+`review_iteration` (`state.review_iterations`), `security_review_iteration`
+(`state.security_review_iterations`).
+
+Validation records are orchestrator-owned and use a smaller shape: `phase`, `status`,
+`build_iteration`, `step`, `timestamp`, optional `elapsed_s`, optional `check_name`, and
+short `error_excerpt` on failure.
 
 Records are append-only and must not drive pipeline control flow — stop/continue decisions
 belong in dedicated state fields (`review_approved`, `security_approved`, `failed`, etc.).
@@ -354,6 +360,7 @@ instantiated only there and injected via constructor.
 | `files_changed` | Append-only; never clear outside the orchestrator |
 | `errors`, `test_errors`, `check_errors` | Cleared by the fixer after a fix pass |
 | `history` | Append-only via `state.record()`; never cleared; permanent audit log |
+| `validation_cycle_records` | Append-only via the orchestrator; never used for pipeline control flow |
 | `done`, `failed` | Set by the orchestrator only; never set in an agent |
 
 ---
