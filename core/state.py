@@ -79,10 +79,9 @@ def _final_summary(state: "TaskState") -> dict:
         ),
         "fix_attempts": len(state.fix_cycle_records),
         "review_records_count": len(state.review_cycle_records),
-        "reviewer_runs": sum(1 for entry in state.review_cycle_records if entry.get("reviewer") == "reviewer"),
-        "security_reviewer_runs": sum(
-            1 for entry in state.review_cycle_records if entry.get("reviewer") == "security_reviewer"
-        ),
+        "security_review_records_count": len(state.security_review_cycle_records),
+        "reviewer_runs": len(state.review_cycle_records),
+        "security_reviewer_runs": len(state.security_review_cycle_records),
         "test_writer_runs": len(state.test_write_records),
         "llm_retries": sum(1 for entry in state.history if entry.get("action") == "llm_retry"),
         "history_events_count": len(state.history),
@@ -94,7 +93,43 @@ def _final_summary(state: "TaskState") -> dict:
     return summary
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+
+def _without_reviewer_field(record: dict) -> dict:
+    normalized = dict(record)
+    normalized.pop("reviewer", None)
+    return normalized
+
+
+def _migrate_review_cycle_records(data: dict) -> None:
+    review_records = data.get("review_cycle_records")
+    existing_security_records = data.get("security_review_cycle_records")
+    security_records = existing_security_records if isinstance(existing_security_records, list) else []
+
+    normalized_reviews = []
+    migrated_security_reviews = []
+    if not isinstance(review_records, list):
+        review_records = []
+
+    for record in review_records:
+        if not isinstance(record, dict):
+            normalized_reviews.append(record)
+            continue
+
+        reviewer = record.get("reviewer")
+        normalized_record = _without_reviewer_field(record)
+        if reviewer == "security_reviewer":
+            migrated_security_reviews.append(normalized_record)
+        else:
+            normalized_reviews.append(normalized_record)
+
+    normalized_security_records = [
+        _without_reviewer_field(record) if isinstance(record, dict) else record for record in security_records
+    ]
+
+    data["review_cycle_records"] = normalized_reviews
+    data["security_review_cycle_records"] = normalized_security_records + migrated_security_reviews
 
 
 @dataclass
@@ -135,6 +170,7 @@ class TaskState:
     # Structured observability records — one entry per agent invocation; never read for pipeline decisions
     implement_cycle_records: list[dict] = field(default_factory=list)
     review_cycle_records: list[dict] = field(default_factory=list)
+    security_review_cycle_records: list[dict] = field(default_factory=list)
     test_write_records: list[dict] = field(default_factory=list)
     fix_cycle_records: list[dict] = field(default_factory=list)
     validation_cycle_records: list[dict] = field(default_factory=list)
@@ -249,6 +285,23 @@ class JsonStateStore(StateStore):
         # Migrate field renamed in refactor: gradle_synced → build_synced
         if "gradle_synced" in data and "build_synced" not in data:
             data["build_synced"] = data.pop("gradle_synced")
+        original_schema_version = data.get("schema_version", 1)
+        has_legacy_review_records = any(
+            isinstance(record, dict) and "reviewer" in record for record in data.get("review_cycle_records", [])
+        )
+        has_legacy_security_records = any(
+            isinstance(record, dict) and "reviewer" in record
+            for record in data.get("security_review_cycle_records", [])
+        )
+        if (
+            original_schema_version < 2
+            or "security_review_cycle_records" not in data
+            or has_legacy_review_records
+            or has_legacy_security_records
+        ):
+            _migrate_review_cycle_records(data)
+        if original_schema_version < SCHEMA_VERSION:
+            data["schema_version"] = SCHEMA_VERSION
         # --- end migrations ---
         # Drop unknown fields (forward-compat with state files from older versions)
         known = {f.name for f in TaskState.__dataclass_fields__.values()}

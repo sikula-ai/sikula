@@ -535,9 +535,8 @@ class TestOrchestratorSecurityLoop:
         )
 
         def security_warning_effect(state: TaskState) -> None:
-            state.review_cycle_records.append(
+            state.security_review_cycle_records.append(
                 {
-                    "reviewer": "security_reviewer",
                     "reviewer_output": "## Warnings\n\n### Missing audit log\nConcern: low-risk observability gap",
                     "approved": True,
                     "has_warnings": True,
@@ -552,8 +551,7 @@ class TestOrchestratorSecurityLoop:
         assert result.done
         assert not result.failed
         assert len(stubs["implementer"].calls) == 0
-        assert result.review_cycle_records[-1]["reviewer"] == "security_reviewer"
-        assert result.review_cycle_records[-1]["has_warnings"] is True
+        assert result.security_review_cycle_records[-1]["has_warnings"] is True
 
 
 # ---------------------------------------------------------------------------

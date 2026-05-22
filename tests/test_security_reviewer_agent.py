@@ -160,7 +160,7 @@ class TestSecurityReviewerWarnings:
         stub_llm.readonly_result = output
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.review_cycle_records[-1]["has_warnings"] is True
+        assert state.security_review_cycle_records[-1]["has_warnings"] is True
 
     def test_warnings_set_security_approved(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = self._warning_output()
@@ -219,11 +219,12 @@ class TestSecurityReviewerUnexpectedOutput:
 
 
 class TestSecurityReviewerState:
-    def test_output_appended_to_review_cycle_records(self, stub_llm: StubLLMClient, file_tool):
+    def test_output_appended_to_security_review_cycle_records(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert any(r["reviewer"] == "security_reviewer" for r in state.review_cycle_records)
+        assert len(state.security_review_cycle_records) == 1
+        assert "reviewer" not in state.security_review_cycle_records[0]
 
     def test_approved_logged(self, stub_llm: StubLLMClient, file_tool, caplog):
         import logging
@@ -287,9 +288,8 @@ class TestSecurityReviewerHistory:
     def test_previous_security_reviews_included_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
-        state.review_cycle_records = [
+        state.security_review_cycle_records = [
             {
-                "reviewer": "security_reviewer",
                 "reviewer_output": "## Security Issues\n\n### Hardcoded key\nFile: x",
                 "reviewer_prompt": None,
                 "approved": False,
@@ -306,9 +306,8 @@ class TestSecurityReviewerHistory:
     def test_security_prefix_stripped_in_history(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
-        state.review_cycle_records = [
+        state.security_review_cycle_records = [
             {
-                "reviewer": "security_reviewer",
                 "reviewer_output": "Some security finding",
                 "reviewer_prompt": None,
                 "approved": False,
@@ -325,7 +324,6 @@ class TestSecurityReviewerHistory:
         state = _make_state()
         state.review_cycle_records = [
             {
-                "reviewer": "reviewer",
                 "reviewer_output": "## Issues\n\n### Missing null check",
                 "reviewer_prompt": None,
                 "approved": False,
@@ -348,9 +346,8 @@ class TestSecurityReviewerHistory:
     def test_multiple_security_reviews_numbered(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
-        state.review_cycle_records = [
+        state.security_review_cycle_records = [
             {
-                "reviewer": "security_reviewer",
                 "reviewer_output": "First security finding",
                 "reviewer_prompt": None,
                 "approved": False,
@@ -358,21 +355,21 @@ class TestSecurityReviewerHistory:
                 "timestamp": "",
             },
             {
-                "reviewer": "reviewer",
-                "reviewer_output": "Reviewer issue (should be excluded)",
-                "reviewer_prompt": None,
-                "approved": False,
-                "has_warnings": False,
-                "timestamp": "",
-            },
-            {
-                "reviewer": "security_reviewer",
                 "reviewer_output": "Second security finding",
                 "reviewer_prompt": None,
                 "approved": False,
                 "has_warnings": False,
                 "timestamp": "",
             },
+        ]
+        state.review_cycle_records = [
+            {
+                "reviewer_output": "Reviewer issue (should be excluded)",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            }
         ]
         _make_agent(stub_llm, file_tool=file_tool).run(state)
         prompt = stub_llm.readonly_calls[0]
@@ -387,9 +384,8 @@ class TestSecurityReviewerHistory:
         state = _make_state()
         state.plan = ["Step A", "Step B"]
         state.current_step = 1
-        state.review_cycle_records = [
+        state.security_review_cycle_records = [
             {
-                "reviewer": "security_reviewer",
                 "step": 0,
                 "reviewer_output": "Old step security finding",
                 "reviewer_prompt": None,
@@ -398,7 +394,6 @@ class TestSecurityReviewerHistory:
                 "timestamp": "",
             },
             {
-                "reviewer": "security_reviewer",
                 "step": 1,
                 "reviewer_output": "Current step security finding",
                 "reviewer_prompt": None,
@@ -468,47 +463,47 @@ class TestSecurityReviewerDiff:
 
 
 class TestSecurityReviewerCycleRecord:
-    def test_record_reviewer_field(self, stub_llm: StubLLMClient, file_tool):
+    def test_record_has_no_reviewer_field(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.review_cycle_records[0]["reviewer"] == "security_reviewer"
+        assert "reviewer" not in state.security_review_cycle_records[0]
 
     def test_record_approved_true_on_approval(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.review_cycle_records[0]["approved"] is True
+        assert state.security_review_cycle_records[0]["approved"] is True
 
     def test_record_approved_true_on_warnings_only(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "## Warnings\n\n### Minor concern\nFile: x\nConcern: y\nSuggestion: z"
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.review_cycle_records[0]["approved"] is True
+        assert state.security_review_cycle_records[0]["approved"] is True
 
     def test_record_approved_false_on_blocking(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "## Security Issues\n\n### Hardcoded key\nFile: x\nProblem: p\nFix: f"
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.review_cycle_records[0]["approved"] is False
+        assert state.security_review_cycle_records[0]["approved"] is False
 
     def test_record_has_warnings_true(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "## Warnings\n\n### Minor concern\nFile: x\nConcern: y\nSuggestion: z"
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.review_cycle_records[0]["has_warnings"] is True
+        assert state.security_review_cycle_records[0]["has_warnings"] is True
 
     def test_record_has_warnings_false_on_approval(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.review_cycle_records[0]["has_warnings"] is False
+        assert state.security_review_cycle_records[0]["has_warnings"] is False
 
     def test_record_stores_prompt(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.task_description in state.review_cycle_records[0]["reviewer_prompt"]
+        assert state.task_description in state.security_review_cycle_records[0]["reviewer_prompt"]
 
     def test_second_security_review_sees_first_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "## Security Issues\n\n### Hardcoded key\nFile: x\nProblem: p\nFix: f"
@@ -517,7 +512,7 @@ class TestSecurityReviewerCycleRecord:
         agent.run(state)
         stub_llm.readonly_result = "APPROVED"
         agent.run(state)
-        second_prompt = state.review_cycle_records[1]["reviewer_prompt"]
+        second_prompt = state.security_review_cycle_records[1]["reviewer_prompt"]
         assert "Hardcoded key" in second_prompt
         assert "Your previous security reviews of this task" in second_prompt
 
@@ -525,40 +520,40 @@ class TestSecurityReviewerCycleRecord:
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.review_cycle_records[0]["step"] == 0
+        assert state.security_review_cycle_records[0]["step"] == 0
 
     def test_record_stores_step_from_state(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
         state.current_step = 2
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.review_cycle_records[0]["step"] == 2
+        assert state.security_review_cycle_records[0]["step"] == 2
 
     def test_record_stores_build_iteration_default(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.review_cycle_records[0]["build_iteration"] == 0
+        assert state.security_review_cycle_records[0]["build_iteration"] == 0
 
     def test_record_stores_build_iteration_from_state(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
         state.build_iterations = 3
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.review_cycle_records[0]["build_iteration"] == 3
+        assert state.security_review_cycle_records[0]["build_iteration"] == 3
 
     def test_record_stores_security_review_iteration_default(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.review_cycle_records[0]["security_review_iteration"] == 0
+        assert state.security_review_cycle_records[0]["security_review_iteration"] == 0
 
     def test_record_stores_security_review_iteration_from_state(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
         state.security_review_iterations = 2
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.review_cycle_records[0]["security_review_iteration"] == 2
+        assert state.security_review_cycle_records[0]["security_review_iteration"] == 2
 
     def test_security_review_iteration_reflects_orchestrator_increment_between_rounds(
         self, stub_llm: StubLLMClient, file_tool
@@ -573,8 +568,8 @@ class TestSecurityReviewerCycleRecord:
         state.security_review_iterations = 1  # orchestrator increments before next security review
         stub_llm.readonly_result = "APPROVED"
         agent.run(state)
-        assert state.review_cycle_records[0]["security_review_iteration"] == 0
-        assert state.review_cycle_records[1]["security_review_iteration"] == 1
+        assert state.security_review_cycle_records[0]["security_review_iteration"] == 0
+        assert state.security_review_cycle_records[1]["security_review_iteration"] == 1
 
 
 class TestSecurityReviewerAgentExtraRules:

@@ -266,7 +266,6 @@ class TestReviewerAgentHistory:
         state = _make_state()
         state.review_cycle_records = [
             {
-                "reviewer": "reviewer",
                 "reviewer_output": "## Issues\n\n### Missing null check\nFile: x\nProblem: p\nFix: f",
                 "reviewer_prompt": None,
                 "approved": False,
@@ -286,7 +285,6 @@ class TestReviewerAgentHistory:
         state = _make_state()
         state.review_cycle_records = [
             {
-                "reviewer": "reviewer",
                 "reviewer_output": "First issue",
                 "reviewer_prompt": None,
                 "approved": False,
@@ -294,7 +292,6 @@ class TestReviewerAgentHistory:
                 "timestamp": "",
             },
             {
-                "reviewer": "reviewer",
                 "reviewer_output": "Second issue",
                 "reviewer_prompt": None,
                 "approved": False,
@@ -313,9 +310,8 @@ class TestReviewerAgentHistory:
     def test_security_reviews_excluded_from_reviewer_prompt(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
-        state.review_cycle_records = [
+        state.security_review_cycle_records = [
             {
-                "reviewer": "security_reviewer",
                 "reviewer_output": "## Security Issues\n\n### Hardcoded key",
                 "reviewer_prompt": None,
                 "approved": False,
@@ -407,7 +403,6 @@ class TestReviewerAgentHistory:
         state = _make_state()
         state.review_cycle_records = [
             {
-                "reviewer": "reviewer",
                 "reviewer_output": "Reviewer issue A",
                 "reviewer_prompt": None,
                 "approved": False,
@@ -415,21 +410,21 @@ class TestReviewerAgentHistory:
                 "timestamp": "",
             },
             {
-                "reviewer": "security_reviewer",
-                "reviewer_output": "Security issue B",
-                "reviewer_prompt": None,
-                "approved": False,
-                "has_warnings": False,
-                "timestamp": "",
-            },
-            {
-                "reviewer": "reviewer",
                 "reviewer_output": "Reviewer issue C",
                 "reviewer_prompt": None,
                 "approved": False,
                 "has_warnings": False,
                 "timestamp": "",
             },
+        ]
+        state.security_review_cycle_records = [
+            {
+                "reviewer_output": "Security issue B",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            }
         ]
         agent = _make_agent(stub_llm, file_tool=file_tool)
         agent.run(state)
@@ -474,7 +469,6 @@ class TestReviewerAgentPlanContext:
         state.current_step = 1
         state.review_cycle_records = [
             {
-                "reviewer": "reviewer",
                 "step": 0,
                 "reviewer_output": "Old step issue",
                 "reviewer_prompt": None,
@@ -483,7 +477,6 @@ class TestReviewerAgentPlanContext:
                 "timestamp": "",
             },
             {
-                "reviewer": "reviewer",
                 "step": 1,
                 "reviewer_output": "Current step issue",
                 "reviewer_prompt": None,
@@ -513,11 +506,11 @@ class TestReviewerAgentPlanContext:
 
 
 class TestReviewerAgentCycleRecord:
-    def test_record_reviewer_field(self, stub_llm: StubLLMClient, file_tool):
+    def test_record_has_no_reviewer_field(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
-        assert state.review_cycle_records[0]["reviewer"] == "reviewer"
+        assert "reviewer" not in state.review_cycle_records[0]
 
     def test_record_approved_true_on_approval(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"

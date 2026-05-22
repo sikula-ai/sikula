@@ -605,7 +605,7 @@ file that was already dirty before the run is still detected as changed if the a
 - `state.files_changed` — list of all files modified so far
 - diff (capped at 40 000 chars) — `state.review_diff` when set (`cmd_review()` sets the initial `git diff base...branch`; `review --fix` refreshes it before reviewer/security-reviewer calls); otherwise obtained live via `GitTool.diff_head()` (`git diff HEAD`)
 - project guidelines content pre-loaded from `guidelines.context_files` (same mechanism as analyst; capped at `guidelines.max_file_chars` per file; truncated files include a Read-tool marker)
-- previous reviewer outputs from `state.review_cycle_records` (filtered to `reviewer == "reviewer"`) — passed as numbered history so the agent maintains consistent judgments across iterations and does not reverse a finding unless the code genuinely changed
+- previous reviewer outputs from `state.review_cycle_records` — passed as numbered history so the agent maintains consistent judgments across iterations and does not reverse a finding unless the code genuinely changed
 - `state.test_files_written` — list of files written by the test writer agent; if non-empty, passed to the reviewer so generated tests are not flagged as scope violations. In normal `sikula run` mode, these files are not reviewer-owned output. In `sikula review` mode, changed test files are reviewed as normal branch output.
 
 The agent reads the diff, then uses its `Read` tool to inspect any changed file in full.
@@ -627,7 +627,7 @@ assertions, misleading expectations, or material missing tests may be reported a
 review issues.
 
 **Output written to state:**
-- Approved: `state.review_approved = True`, `state.review_issues` cleared; output includes a structured verification summary — `Completeness:`, `Correctness:`, and `Callers verified:` lines, each omitted when not applicable — followed by `APPROVED` on its own line; record appended to `state.review_cycle_records` with `reviewer = "reviewer"`, `approved = True`
+- Approved: `state.review_approved = True`, `state.review_issues` cleared; output includes a structured verification summary — `Completeness:`, `Correctness:`, and `Callers verified:` lines, each omitted when not applicable — followed by `APPROVED` on its own line; record appended to `state.review_cycle_records` with `approved = True`
 - Issues found: `state.review_issues` populated with structured issue list; `state.review_approved` stays `False`; record appended with `approved = False`
 
 **Re-review after fixer:** if `FixerAgent` changes any file, the orchestrator resets
@@ -651,7 +651,7 @@ means after reviewer approval; if `run_review: false`, it still runs unless
 - diff (capped at 40 000 chars) — `state.review_diff` when set; otherwise `GitTool.diff_head()` (same priority and refresh behavior as ReviewerAgent)
 - project guidelines content pre-loaded from `guidelines.context_files` (same mechanism as analyst; capped at `guidelines.max_file_chars` per file; truncated files include a Read-tool marker)
 - `security.context` from the project config — optional free-text description of what the application does, what data it handles, and who the users are; injected into the system prompt to focus the audit on relevant threat categories; omitted from the prompt when blank
-- previous security reviewer outputs from `state.review_cycle_records` (filtered to `reviewer == "security_reviewer"`) — passed as numbered history for consistency across security review iterations
+- previous security reviewer outputs from `state.security_review_cycle_records` — passed as numbered history for consistency across security review iterations
 
 **What it checks (changed code only — pre-existing issues are ignored):**
 - *Blocking:* hardcoded credentials/tokens/secrets; injection vulnerabilities (SQL, command,
@@ -665,12 +665,12 @@ means after reviewer approval; if `run_review: false`, it still runs unless
 **Output written to state:**
 - All-clear approval: `state.security_approved = True`; `state.review_issues` cleared;
   output includes a `Security checks:` summary listing the categories examined, followed by
-  `APPROVED` on its own line; record appended to `state.review_cycle_records` with
-  `reviewer = "security_reviewer"`, `approved = True`, and `has_warnings = False`
+  `APPROVED` on its own line; record appended to `state.security_review_cycle_records` with
+  `approved = True` and `has_warnings = False`
 - Warnings only: `state.security_approved = True`; `state.review_issues` cleared; output
   contains `## Warnings` and no `## Security Issues`; record appended with
   `approved = True` and `has_warnings = True`. Warnings are stored in
-  `review_cycle_records` and do not trigger a fix pass.
+  `security_review_cycle_records` and do not trigger a fix pass.
 - Blocking issues: `state.security_approved = False`; `state.review_issues` populated with
   security issue list; `state.review_approved` reset to `False` → implementer fix pass runs,
   then review loop re-runs, then security review re-runs; record appended with `approved = False`
@@ -812,7 +812,7 @@ findings. Review and redact state files before sharing them outside your project
 |---|---|---|---|
 | `task_id` | `str` | `StateStore.create()` | 32-char hex UUID (`uuid4().hex`), used to resume tasks |
 | `task_description` | `str` | caller | Original plain-text task |
-| `schema_version` | `int` | `StateStore.create()` | State file schema version; used by `JsonStateStore.load()` to run migrations before constructing `TaskState`; current value is `SCHEMA_VERSION = 1` |
+| `schema_version` | `int` | `StateStore.create()` | State file schema version; used by `JsonStateStore.load()` to run migrations before constructing `TaskState`; current value is `SCHEMA_VERSION = 2` |
 | `task_file` | `str \| None` | `cmd_run()` in `sikula.py` | Basename of the task file (e.g. `add-login.md`); set on first run via `--task-file`; used by `status` for display; `None` for tasks created before this field was added or when resuming via `--task-id` only |
 | `config_snapshot` | `dict` | Orchestrator | Effective run configuration captured on first run (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, and per-agent `provider`/`model`/`agent_timeout`. Visible in `show <task_id>`. |
 | `analyst_prompt` | `str \| None` | AnalystAgent | Full assembled prompt sent to the analyst LLM (system + user sections, including inlined guidelines content); stored before the LLM call so it captures the exact input even on exception; enables post-run analysis of analyst behaviour |
@@ -838,7 +838,8 @@ findings. Review and redact state files before sharing them outside your project
 | `review_mode` | `str \| None` | `cmd_review()` in `sikula.py` | Review task kind: `"review_report"` for report-only review (not resumable) or `"review_fix"` for `sikula review --fix` (resumable via `sikula run --task-id`) |
 | `review_base_branch` | `str \| None` | `cmd_review()` in `sikula.py` | Base branch used to refresh `review_diff` in `"review_fix"` mode. Report-only review keeps the original frozen diff; review-fix refreshes against the merge base before reviewer/security-reviewer calls so fixes are reviewed against the current branch state. |
 | `implement_cycle_records` | `list[dict]` | ImplementerAgent | Structured observability — one entry per implementer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = post-fixer pass N — possible when `run_build_per_step: true` and review/security loop runs inside fix phase), `review_iteration` (`0` = initial or security fix; `>0` = review fix pass N), `security_review_iteration` (`0` = initial or review fix; `>0` = security fix pass N), `step_description`, `implementer_prompt`, `implementer_output` (`None` on exception), `files_written`, `timestamp`; both iteration counters `== 0` and `build_iteration == 0` means initial implementation; never read for pipeline decisions. **Correlation note:** to find the reviewer record that triggered this implementer, look for a `review_cycle_records` entry with the same `step`, `build_iteration`, and `review_iteration: N-1` |
-| `review_cycle_records` | `list[dict]` | ReviewerAgent / SecurityReviewerAgent | Structured observability — one entry per reviewer invocation: `reviewer` (`"reviewer"` or `"security_reviewer"`), `step`, `build_iteration` (`0` = pre-build; `>0` = post-fixer pass N), `review_iteration` (ReviewerAgent only — fix-pass index within this step's review loop), `security_review_iteration` (SecurityReviewerAgent only — fix-pass index within this step's security review loop), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by each reviewer to retrieve its own prior outputs for context. **Correlation note:** a reviewer record with `review_iteration: N` that found issues triggered the implementer record with `review_iteration: N+1` — the orchestrator increments the counter before calling the implementer |
+| `review_cycle_records` | `list[dict]` | ReviewerAgent | Structured observability — one entry per reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = post-fixer pass N), `review_iteration` (fix-pass index within this step's review loop), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the reviewer to retrieve its own prior outputs for context. **Correlation note:** a reviewer record with `review_iteration: N` that found issues triggered the implementer record with `review_iteration: N+1` — the orchestrator increments the counter before calling the implementer |
+| `security_review_cycle_records` | `list[dict]` | SecurityReviewerAgent | Structured observability — one entry per security reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = post-fixer pass N), `security_review_iteration` (fix-pass index within this step's security review loop), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the security reviewer to retrieve its own prior outputs for context. **Migration note:** state files from schema version 1 stored security reviewer entries inside `review_cycle_records` with `reviewer = "security_reviewer"`; `JsonStateStore.load()` moves them here and removes the redundant `reviewer` field. |
 | `test_write_records` | `list[dict]` | TestWriterAgent | Structured observability — one entry per test-writer invocation: `step`, `build_iteration` (0 = before first build; >0 = after fixer pass N), `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
 | `fix_cycle_records` | `list[dict]` | FixerAgent | Structured observability — one entry per fixer invocation after a failed sync/build/test/check attempt: `build_iteration` (globally unique, never resets), `step`, `errors_before` snapshot (build/test/check), `fixer_prompt`, `fixer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
 | `validation_cycle_records` | `list[dict]` | Orchestrator | Structured observability — one entry per presync/sync/build/test/check outcome with `phase`, `status`, `build_iteration`, `step`, `timestamp`, optional `elapsed_s`, optional `check_name`, and a short `error_excerpt` on failure; never read for pipeline decisions |

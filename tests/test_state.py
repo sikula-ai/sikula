@@ -74,6 +74,7 @@ class TestJsonStateStore:
         record_keys = [
             "implement_cycle_records",
             "review_cycle_records",
+            "security_review_cycle_records",
             "test_write_records",
             "fix_cycle_records",
         ]
@@ -132,6 +133,62 @@ class TestJsonStateStore:
         assert loaded.validation_cycle_records == []
         assert loaded.runtime_metadata == {}
         assert loaded.final_summary == {}
+
+    def test_load_migrates_mixed_review_cycle_records(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="oldreview1", task_description="old review task")
+        store.save(state)
+        path = tmp_path / "oldreview1.json"
+        data = json.loads(path.read_text())
+        data["schema_version"] = 1
+        data.pop("security_review_cycle_records", None)
+        data["review_cycle_records"] = [
+            {
+                "reviewer": "reviewer",
+                "reviewer_output": "APPROVED",
+                "approved": True,
+            },
+            {
+                "reviewer": "security_reviewer",
+                "reviewer_output": "## Warnings\n\n### Minor",
+                "approved": True,
+                "has_warnings": True,
+            },
+        ]
+        path.write_text(json.dumps(data))
+
+        loaded = store.load("oldreview1")
+
+        assert loaded is not None
+        assert loaded.schema_version == state_module.SCHEMA_VERSION
+        assert len(loaded.review_cycle_records) == 1
+        assert loaded.review_cycle_records[0]["reviewer_output"] == "APPROVED"
+        assert "reviewer" not in loaded.review_cycle_records[0]
+        assert len(loaded.security_review_cycle_records) == 1
+        assert loaded.security_review_cycle_records[0]["has_warnings"] is True
+        assert "reviewer" not in loaded.security_review_cycle_records[0]
+
+    def test_load_cleans_partially_migrated_security_review_records(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="partialreview1", task_description="partial review task")
+        store.save(state)
+        path = tmp_path / "partialreview1.json"
+        data = json.loads(path.read_text())
+        data["schema_version"] = state_module.SCHEMA_VERSION
+        data["security_review_cycle_records"] = [
+            {
+                "reviewer": "security_reviewer",
+                "reviewer_output": "APPROVED",
+                "approved": True,
+            }
+        ]
+        path.write_text(json.dumps(data))
+
+        loaded = store.load("partialreview1")
+
+        assert loaded is not None
+        assert len(loaded.security_review_cycle_records) == 1
+        assert "reviewer" not in loaded.security_review_cycle_records[0]
 
     def test_final_summary_handles_failed_state_with_invalid_timestamps(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
@@ -326,3 +383,18 @@ class TestJsonStateStore:
         assert loaded.final_summary["reviewer_runs"] == 0
         assert loaded.final_summary["security_reviewer_runs"] == 0
         assert loaded.final_summary["llm_retries"] == 1
+
+    def test_final_summary_counts_review_records_separately(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="summary_reviews", task_description="summary reviews task", done=True)
+        state.review_cycle_records.append({"reviewer_output": "APPROVED", "approved": True})
+        state.security_review_cycle_records.append({"reviewer_output": "APPROVED", "approved": True})
+
+        store.save(state)
+        loaded = store.load("summary_reviews")
+
+        assert loaded is not None
+        assert loaded.final_summary["review_records_count"] == 1
+        assert loaded.final_summary["security_review_records_count"] == 1
+        assert loaded.final_summary["reviewer_runs"] == 1
+        assert loaded.final_summary["security_reviewer_runs"] == 1

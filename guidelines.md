@@ -206,7 +206,8 @@ Every agent that invokes an LLM must append one record per invocation to the app
 |-------|------|
 | `ImplementerAgent` | `state.implement_cycle_records` |
 | `FixerAgent` | `state.fix_cycle_records` |
-| `ReviewerAgent`, `SecurityReviewerAgent` | `state.review_cycle_records` |
+| `ReviewerAgent` | `state.review_cycle_records` |
+| `SecurityReviewerAgent` | `state.security_review_cycle_records` |
 | `TestWriterAgent` | `state.test_write_records` |
 | Orchestrator validation phases | `state.validation_cycle_records` |
 
@@ -459,7 +460,7 @@ python3 -m ruff format .
 - **Never** put platform-specific logic (Gradle tasks, Kotlin patterns, Android layer names) in agents, orchestrator, or LLM client code — it belongs only in `BuildTool` subclasses and `.sikula/config.yaml`.
 - **Never** set `state.done` or `state.failed` in an agent — these are orchestrator-only fields.
 - **Never** clear or modify past entries in `state.history` — it is a permanent audit log.
-- **Never** use `state.implement_cycle_records`, `state.fix_cycle_records`, `state.review_cycle_records`, or `state.test_write_records` to drive pipeline control flow — they are observability records only.
+- **Never** use `state.implement_cycle_records`, `state.fix_cycle_records`, `state.review_cycle_records`, `state.security_review_cycle_records`, or `state.test_write_records` to drive pipeline control flow — they are observability records only.
 - **Always** add `from __future__ import annotations` immediately after the optional
   module docstring and before all other imports.
 - **Always** add type hints to every function signature.
