@@ -16,6 +16,8 @@ _fmt_time = _sikula._fmt_time
 _build_tool_class = _sikula._build_tool_class
 _reset_failed_state = _sikula._reset_failed_state
 _print_review_summary = _sikula._print_review_summary
+_dev_version_suffix = _sikula._dev_version_suffix
+_sikula_version = _sikula._sikula_version
 cmd_run = _sikula.cmd_run
 cmd_show = _sikula.cmd_show
 cmd_status = _sikula.cmd_status
@@ -1074,3 +1076,32 @@ class TestMain:
                 with p1, p2, p3:
                     with patch("sikula.cmd_status"):
                         main()
+
+
+class TestVersionLabel:
+    def test_dev_version_suffix_is_empty_outside_git_checkout(self, tmp_path: Path):
+        assert _dev_version_suffix(tmp_path) == ""
+
+    def test_dev_version_suffix_includes_branch_and_commit_for_git_checkout(self, tmp_path: Path):
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=tmp_path, check=True, capture_output=True)
+        (tmp_path / "README.md").write_text("test")
+        subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "checkout", "-b", "feature/test-version"], cwd=tmp_path, check=True, capture_output=True)
+
+        suffix = _dev_version_suffix(tmp_path)
+
+        assert suffix.startswith("-dev+feature.test.version.")
+
+    def test_sikula_version_appends_dev_suffix_to_installed_version(self):
+        with patch("sikula._pkg_version", return_value="1.2.3"):
+            with patch("sikula._dev_version_suffix", return_value="-dev+branch.abc123"):
+                assert _sikula_version() == "1.2.3-dev+branch.abc123"
+
+    def test_sikula_version_returns_dev_when_package_is_not_installed(self):
+        from importlib.metadata import PackageNotFoundError
+
+        with patch("sikula._pkg_version", side_effect=PackageNotFoundError):
+            assert _sikula_version() == "dev"
