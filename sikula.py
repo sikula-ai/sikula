@@ -74,7 +74,10 @@ _SUPPORTED_BUILD_TOOLS = {"cargo", "gradle-android", "gradle-jvm", "maven", "xco
 
 
 def _git_output(args: list[str], cwd: Path) -> str | None:
-    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    except OSError:
+        return None
     if result.returncode != 0:
         return None
     return result.stdout.strip() or None

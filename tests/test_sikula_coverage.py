@@ -1082,6 +1082,10 @@ class TestVersionLabel:
     def test_dev_version_suffix_is_empty_outside_git_checkout(self, tmp_path: Path):
         assert _dev_version_suffix(tmp_path) == ""
 
+    def test_dev_version_suffix_is_empty_when_git_is_missing(self, tmp_path: Path):
+        with patch("sikula.subprocess.run", side_effect=FileNotFoundError):
+            assert _dev_version_suffix(tmp_path) == ""
+
     def test_dev_version_suffix_includes_branch_and_commit_for_git_checkout(self, tmp_path: Path):
         subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
         subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=tmp_path, check=True, capture_output=True)
@@ -1099,6 +1103,11 @@ class TestVersionLabel:
         with patch("sikula._pkg_version", return_value="1.2.3"):
             with patch("sikula._dev_version_suffix", return_value="-dev+branch.abc123"):
                 assert _sikula_version() == "1.2.3-dev+branch.abc123"
+
+    def test_sikula_version_omits_dev_suffix_when_git_is_missing(self):
+        with patch("sikula._pkg_version", return_value="1.2.3"):
+            with patch("sikula.subprocess.run", side_effect=FileNotFoundError):
+                assert _sikula_version() == "1.2.3"
 
     def test_sikula_version_returns_dev_when_package_is_not_installed(self):
         from importlib.metadata import PackageNotFoundError
