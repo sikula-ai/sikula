@@ -14,6 +14,14 @@ When reporting a bug, attaching the task state JSON (`sikula show <task-id>`) is
 Pull requests require a signed Contributor License Agreement — see [CLA.md](CLA.md).
 The maintainer will provide signing instructions before a contribution is merged.
 
+## AI-assisted contributions
+
+AI-assisted tools such as Codex, ChatGPT, Claude, GitHub Copilot, or similar tools are allowed when preparing contributions.
+
+You are responsible for what you submit. Review AI-assisted changes before opening a PR, and do not submit third-party code, confidential information, secrets, or material you do not have the rights to contribute under the Sikula CLA.
+
+Maintainers may also use AI-assisted tools to review pull requests, suggest fixes, and prepare patches. Human maintainers make the final merge decision.
+
 ## Setup
 
 ```bash
