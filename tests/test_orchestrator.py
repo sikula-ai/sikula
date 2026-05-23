@@ -54,6 +54,7 @@ class StubBuildTool:
         self.test_success = True
         self.check_success = True
         self.presync_success = True
+        self.compile_results: list[bool] = []
         self.check_results: dict[str, list[bool]] = {}
         self.build_config_files: set[str] = set()
         self.sync_calls = 0
@@ -75,9 +76,11 @@ class StubBuildTool:
 
     def compile_check(self) -> ToolResult:
         self.compile_calls += 1
-        return ToolResult(
-            success=self.compile_success, output="", error="" if self.compile_success else "compile failed"
-        )
+        if self.compile_results:
+            success = self.compile_results.pop(0)
+        else:
+            success = self.compile_success
+        return ToolResult(success=success, output="", error="" if success else "compile failed")
 
     def run_tests(self) -> ToolResult:
         self.test_calls += 1
@@ -869,7 +872,7 @@ class TestOrchestratorInterruptResume:
         assert result.done is True
         assert saved.done is True
         assert saved.failed is False
-        assert len(stubs["reviewer"].calls) == 1
+        assert len(stubs["reviewer"].calls) == 2
         assert len(stubs["implementer"].calls) == 0
 
     def test_step_loop_resume_reruns_current_step(self, tmp_path: Path):
@@ -956,6 +959,197 @@ class TestOrchestratorInterruptResume:
         assert result.done
         assert len(stubs["implementer"].calls) == 1  # only step 1, not step 0 again
 
+    def test_multi_step_run_gets_final_full_task_review_before_final_build(self, tmp_path: Path, caplog):
+        import logging
+
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=True,
+            run_build_per_step=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+
+        review_scopes: list[str] = []
+
+        def reviewer_effect(state: TaskState) -> None:
+            review_scopes.append(state.active_scope or "step")
+            state.review_approved = True
+            state.review_issues.clear()
+
+        def implementer_effect(state: TaskState) -> None:
+            state.files_changed.append(f"src/step{state.current_step}.py")
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].side_effect = implementer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: add parser", "Step 2: add evaluator"],
+            plan_decided=True,
+        )
+
+        with caplog.at_level(logging.INFO, logger="core.orchestrator"):
+            result = orch.run(task_id="t1")
+
+        assert result.done
+        assert result.plan_completed is True
+        assert result.final_full_task_review_done is True
+        assert review_scopes == ["step", "step", "final_full_task"]
+        assert build.compile_calls == 1
+        messages = [record.message for record in caplog.records]
+        assert "--- Phase: final full-task gate ---" in messages
+        assert "--- Phase: final full-task review (initial) ---" in messages
+
+    def test_deferred_final_build_fixer_reruns_review_in_final_scope(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=True,
+            run_build_per_step=False,
+            run_security_review=False,
+            run_test_writing=False,
+            max_iterations=3,
+        )
+        build.compile_results = [False, True]
+        review_scopes: list[str] = []
+
+        def reviewer_effect(state: TaskState) -> None:
+            review_scopes.append(state.active_scope or "step")
+            state.review_approved = True
+            state.review_issues.clear()
+
+        def implementer_effect(state: TaskState) -> None:
+            state.files_changed.append(f"src/step{state.current_step}.py")
+
+        def fixer_effect(state: TaskState) -> None:
+            state.files_changed.append("src/final_build_fix.py")
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].side_effect = implementer_effect
+        stubs["fixer"].side_effect = fixer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: add parser", "Step 2: add evaluator"],
+            plan_decided=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert result.final_full_task_review_done is True
+        assert review_scopes == ["step", "step", "final_full_task", "final_full_task"]
+        assert build.compile_calls == 2
+
+    def test_build_per_step_fixer_review_stays_step_scoped_before_final_gate(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=True,
+            run_build_per_step=True,
+            run_security_review=False,
+            run_test_writing=False,
+            max_iterations=6,
+        )
+        build.compile_results = [False, True, True, True]
+        review_scopes: list[str] = []
+
+        def reviewer_effect(state: TaskState) -> None:
+            review_scopes.append(state.active_scope or "step")
+            state.review_approved = True
+            state.review_issues.clear()
+
+        def implementer_effect(state: TaskState) -> None:
+            state.files_changed.append(f"src/step{state.current_step}.py")
+
+        def fixer_effect(state: TaskState) -> None:
+            state.files_changed.append(f"src/step{state.current_step}_build_fix.py")
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].side_effect = implementer_effect
+        stubs["fixer"].side_effect = fixer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: add parser", "Step 2: add evaluator"],
+            plan_decided=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert result.final_full_task_review_done is True
+        assert review_scopes == ["step", "step", "step", "final_full_task"]
+        assert build.compile_calls == 4
+        build_records = [r for r in result.validation_cycle_records if r["phase"] == "build"]
+        assert build_records[-1]["scope"] == "final_full_task"
+
+    def test_final_gate_completes_when_optional_agents_are_disabled(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+
+        def implementer_effect(state: TaskState) -> None:
+            state.files_changed.append(f"src/step{state.current_step}.py")
+
+        stubs["implementer"].side_effect = implementer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: add parser", "Step 2: add evaluator"],
+            plan_decided=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert result.plan_completed is True
+        assert result.final_full_task_review_done is True
+        assert len(stubs["reviewer"].calls) == 0
+        assert len(stubs["security_reviewer"].calls) == 0
+        assert len(stubs["test_writer"].calls) == 0
+
+    def test_plan_completed_resume_skips_last_step_and_runs_final_gate(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+        review_scopes: list[str] = []
+
+        def reviewer_effect(state: TaskState) -> None:
+            review_scopes.append(state.active_scope or "step")
+            state.review_approved = True
+            state.review_issues.clear()
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: add parser", "Step 2: add evaluator"],
+            plan_decided=True,
+            plan_completed=True,
+            current_step=1,
+            step_implemented=True,
+            files_changed=["src/step0.py", "src/step1.py"],
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert len(stubs["implementer"].calls) == 0
+        assert review_scopes == ["final_full_task"]
+        assert result.final_full_task_review_done is True
+
 
 # ---------------------------------------------------------------------------
 # Tests — preexisting-changes fast-path (review --fix with no fixer needed)
@@ -974,6 +1168,41 @@ def _git_diff_refresh_subprocess(cmd, **kwargs):
 
 
 class TestOrchestratorPreexistingChangesFastPath:
+    def test_review_fix_without_plan_stays_task_scoped(self, tmp_path: Path, monkeypatch):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_security_review=False,
+            run_test_writing=False,
+            run_build=False,
+        )
+        monkeypatch.setattr(subprocess, "run", _git_diff_refresh_subprocess)
+        review_scopes: list[str] = []
+
+        def reviewer_effect(state: TaskState) -> None:
+            review_scopes.append(state.active_scope or ("step" if state.plan else "task"))
+            state.review_approved = True
+            state.review_issues.clear()
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            review_diff=_REVIEW_DIFF,
+            review_mode="review_fix",
+            review_base_branch="main",
+            worktree_base=str(tmp_path),
+            plan_decided=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert review_scopes == ["task"]
+        assert result.plan_completed is False
+        assert result.final_full_task_review_done is False
+
     def test_review_fix_refreshes_review_diff_before_review(self, tmp_path: Path, monkeypatch):
         orch, stubs, _ = _make_orchestrator(
             tmp_path,

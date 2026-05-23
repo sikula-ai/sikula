@@ -280,7 +280,7 @@ Build behaviour is controlled by `run_build_per_step` (default: `false`):
 | `run_build_per_step` | Build timing |
 |---|---|
 | `false` (default) | Build/fix loop runs **once after the last step** — avoids repeated builds while the task is still being assembled |
-| `true` | Build/fix loop runs after **each individual step** — use when you want every step physically built |
+| `true` | Build/fix loop runs after **each individual step**, and the final full-task build/fix loop still runs after all steps complete — use when you want every step physically built |
 
 Planner steps are still expected to be compile-safe after all preceding steps: a step
 must include immediate dependencies for anything it introduces or references (for example
@@ -299,11 +299,24 @@ Deferred build is a performance choice, not permission for obviously uncompilabl
        Phase 5: build/fix loop  (only if run_build_per_step: true)
        → state.history: {"agent": "orchestrator", "action": "step_done", "result": "Step N/M"}
        → advance state.current_step
-   → after last step: build/fix loop (if run_build: true and run_build_per_step: false)
+   → after last step: state.plan_completed = True
+   → final full-task review/security/test gate
+      prompt includes "FINAL FULL-TASK ..." scope — agents run one whole-task pass
+      against the original task and do not restrict findings to the last step
+   → final build/fix loop (if run_build: true)
    → on success state.done = True
 ```
 
 The `step_start` / `step_done` markers in `state.history` make the JSON audit log unambiguous — every agent action between a pair of markers belongs to that step.
+
+After the last step completes, `plan_completed` guards resume so the final step is not
+re-run just because the final review/build phase was interrupted. The final full-task
+gate resets review/security/test-write flags and reruns those agents over the complete
+planned task. If the final build/fix loop later invokes `FixerAgent`, the follow-up
+review, security review, and test writer also run with `active_scope = "final_full_task"`;
+they are not scoped to the last planned step. When `run_build_per_step: true`, step-local
+build/fix reviews remain step-scoped while they are still inside `_run_single_step()`;
+the final full-task gate still runs after all steps complete.
 
 Note: `step_start` is recorded at the top of the while loop, before idempotency checks. On resume, the current step gets a second `step_start` entry in the history; this is harmless — all idempotency guards still work correctly.
 
@@ -517,6 +530,10 @@ Output written to state:
   production and its definition is removed.
 - *Completeness* — for every file listed in Required Changes, the agent reads the full file
   before finalising the change list; grep results alone are not sufficient.
+- *Structured input contracts* — for parsers, validators, expression engines, schemas, DSLs,
+  config loaders, and rule engines, the implementation prompt must include accepted inputs,
+  rejected inputs, expected result types for typed contexts, scope rules, literal handling, and
+  whether failures belong in validation or runtime.
 
 ---
 
@@ -617,6 +634,12 @@ New files (not in the diff) are read directly via their paths in `state.files_ch
 3. *Semantic consistency* — do remaining callers of modified symbols still make sense given the task intent?
 4. *Dead members* — for every type that had members removed, are all remaining members still referenced in production code?
 5. *Shared function scope* — for any shared function or extension modified, greps for all callers in production code independently, reads each out-of-scope caller file, and verifies behavior is unchanged. Scope expansion claims in the implementation prompt ("this caller is intentionally affected") are verified against the task description — if the caller's screen or feature is not mentioned there, it is an unintended side effect and reported as an issue.
+6. *Structured input contracts* — for parser, validator, expression engine, schema, DSL,
+   config loader, or rule engine changes, verifies production validation enforces the full
+   contract, including expected result types, rejected invalid shapes, unknown names,
+   forbidden values, and scope/forward-reference violations. A validator that only checks
+   syntax or known names when the task requires typed/shape-specific validation is a
+   production correctness issue.
 
 Test-file policy is mode-specific. In normal `sikula run` mode, test files are not
 reviewer-owned output; the reviewer does not block approval because tests are stale,
@@ -713,6 +736,9 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
    and null/absent paths for every nullable value involved in the change
    - Explicit testing requirements from `state.task_description` are honored; in multi-step
      tasks, `CURRENT STEP` is the primary scope signal and tests for future steps are not added
+   - Parser, validator, expression engine, schema, DSL, config loader, and rule engine
+     changes get a positive/negative contract matrix, including wrong expected result type
+     rejection when typed contexts exist
 4. Uses parametric tests when the project uses them anywhere in the test suite and the fit
    is natural — even if the specific file being edited does not currently use them;
    parametric structure takes precedence over mirroring the existing file; when multiple
@@ -837,12 +863,12 @@ findings. Review and redact state files before sharing them outside your project
 | `review_diff` | `str \| None` | `cmd_review()` in `sikula.py` / Orchestrator | PR-style diff passed to ReviewerAgent and SecurityReviewerAgent; initially set to `git diff base...branch` (three-dot) in `sikula review` mode; refreshed in `"review_fix"` mode before reviewer/security-reviewer calls so uncommitted fixes are included; `None` in standard `sikula run` flow (agents fall back to `GitTool.diff_head()`) |
 | `review_mode` | `str \| None` | `cmd_review()` in `sikula.py` | Review task kind: `"review_report"` for report-only review (not resumable) or `"review_fix"` for `sikula review --fix` (resumable via `sikula run --task-id`) |
 | `review_base_branch` | `str \| None` | `cmd_review()` in `sikula.py` | Base branch used to refresh `review_diff` in `"review_fix"` mode. Report-only review keeps the original frozen diff; review-fix refreshes against the merge base before reviewer/security-reviewer calls so fixes are reviewed against the current branch state. |
-| `implement_cycle_records` | `list[dict]` | ImplementerAgent | Structured observability — one entry per implementer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = post-fixer pass N — possible when `run_build_per_step: true` and review/security loop runs inside fix phase), `review_iteration` (`0` = initial or security fix; `>0` = review fix pass N), `security_review_iteration` (`0` = initial or review fix; `>0` = security fix pass N), `step_description`, `implementer_prompt`, `implementer_output` (`None` on exception), `files_written`, `timestamp`; both iteration counters `== 0` and `build_iteration == 0` means initial implementation; never read for pipeline decisions. **Correlation note:** to find the reviewer record that triggered this implementer, look for a `review_cycle_records` entry with the same `step`, `build_iteration`, and `review_iteration: N-1` |
-| `review_cycle_records` | `list[dict]` | ReviewerAgent | Structured observability — one entry per reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = post-fixer pass N), `review_iteration` (fix-pass index within this step's review loop), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the reviewer to retrieve its own prior outputs for context. **Correlation note:** a reviewer record with `review_iteration: N` that found issues triggered the implementer record with `review_iteration: N+1` — the orchestrator increments the counter before calling the implementer |
-| `security_review_cycle_records` | `list[dict]` | SecurityReviewerAgent | Structured observability — one entry per security reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = post-fixer pass N), `security_review_iteration` (fix-pass index within this step's security review loop), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the security reviewer to retrieve its own prior outputs for context. **Migration note:** state files from schema version 1 stored security reviewer entries inside `review_cycle_records` with `reviewer = "security_reviewer"`; `JsonStateStore.load()` moves them here and removes the redundant `reviewer` field. |
-| `test_write_records` | `list[dict]` | TestWriterAgent | Structured observability — one entry per test-writer invocation: `step`, `build_iteration` (0 = before first build; >0 = after fixer pass N), `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
-| `fix_cycle_records` | `list[dict]` | FixerAgent | Structured observability — one entry per fixer invocation after a failed sync/build/test/check attempt: `build_iteration` (globally unique, never resets), `step`, `errors_before` snapshot (build/test/check), `fixer_prompt`, `fixer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
-| `validation_cycle_records` | `list[dict]` | Orchestrator | Structured observability — one entry per presync/sync/build/test/check outcome with `phase`, `status`, `build_iteration`, `step`, `timestamp`, optional `elapsed_s`, optional `check_name`, and a short `error_excerpt` on failure; never read for pipeline decisions |
+| `implement_cycle_records` | `list[dict]` | ImplementerAgent | Structured observability — one entry per implementer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = post-fixer pass N — possible when `run_build_per_step: true` and review/security loop runs inside fix phase), `review_iteration` (`0` = initial or security fix; `>0` = review fix pass N), `security_review_iteration` (`0` = initial or review fix; `>0` = security fix pass N), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `step_description`, `implementer_prompt`, `implementer_output` (`None` on exception), `files_written`, `timestamp`; both iteration counters `== 0` and `build_iteration == 0` means initial implementation; never read for pipeline decisions. **Correlation note:** to find the reviewer record that triggered this implementer, look for a `review_cycle_records` entry with the same `step`, `build_iteration`, and `review_iteration: N-1` |
+| `review_cycle_records` | `list[dict]` | ReviewerAgent | Structured observability — one entry per reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = post-fixer pass N), `review_iteration` (fix-pass index within this step's review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, reviewer history is limited to earlier final full-task reviews, not step-scoped reviews. **Correlation note:** a reviewer record with `review_iteration: N` that found issues triggered the implementer record with `review_iteration: N+1` — the orchestrator increments the counter before calling the implementer |
+| `security_review_cycle_records` | `list[dict]` | SecurityReviewerAgent | Structured observability — one entry per security reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = post-fixer pass N), `security_review_iteration` (fix-pass index within this step's security review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the security reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, security history is limited to earlier final full-task security reviews. **Migration note:** state files from schema version 1 stored security reviewer entries inside `review_cycle_records` with `reviewer = "security_reviewer"`; `JsonStateStore.load()` moves them here and removes the redundant `reviewer` field. |
+| `test_write_records` | `list[dict]` | TestWriterAgent | Structured observability — one entry per test-writer invocation: `step`, `build_iteration` (0 = before first build; >0 = after fixer pass N), `scope`, `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
+| `fix_cycle_records` | `list[dict]` | FixerAgent | Structured observability — one entry per fixer invocation after a failed sync/build/test/check attempt: `build_iteration` (globally unique, never resets), `step`, `scope`, `errors_before` snapshot (build/test/check), `fixer_prompt`, `fixer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
+| `validation_cycle_records` | `list[dict]` | Orchestrator | Structured observability — one entry per presync/sync/build/test/check outcome with `phase`, `status`, `build_iteration`, `step`, `timestamp`, optional `scope`, optional `elapsed_s`, optional `check_name`, and a short `error_excerpt` on failure; never read for pipeline decisions |
 | `test_files_written` | `list[str]` | TestWriterAgent | Cumulative list of all files written by the test writer agent across all runs; never cleared; passed to ReviewerAgent so it does not flag those files as implementer scope violations. In normal `sikula run`, these files are not reviewer-owned output; in `sikula review`, changed test files are reviewed as branch output. |
 | `fixer_changed_code` | `bool` | Orchestrator | Set True when FixerAgent writes files; cleared after the following build validates successfully; used by `sikula review` fast-exit: if fixer didn't touch code, no re-build needed |
 | `tests_up_to_date` | `bool` | TestWriterAgent / Orchestrator | Set True after test write; reset to False when Fixer changes files; guards redundant re-runs |
@@ -858,6 +884,9 @@ findings. Review and redact state files before sharing them outside your project
 | `finished_at` | `str \| None` | `JsonStateStore.save()` | ISO-8601 UTC timestamp set once when the task first reaches a terminal `done` or `failed` state; not overwritten by later saves |
 | `plan` | `list[str]` | PlannerAgent | Ordered step descriptions; empty = single-pass mode |
 | `plan_decided` | `bool` | PlannerAgent | Set True after any successful planner decision (SINGLE_PASS or split); guards re-run on resume; not set on planner failure (allows retry) |
+| `plan_completed` | `bool` | Orchestrator | Set True after the final planned step completes its step-scoped implement/review/security/test-write phase. On resume, skips the step loop and continues with the final full-task gate/build instead of rerunning the last step. |
+| `active_scope` | `str \| None` | Orchestrator | Transient/persisted scope signal for agent prompts. `None` means normal single-pass or current-step behavior; `"final_full_task"` means all planned steps are complete and review/security/test-writer/implementer-fix prompts must evaluate the complete task instead of the last step. |
+| `final_full_task_review_done` | `bool` | Orchestrator | Set True after the final full-task reviewer/security/test-writer gate has completed for the current files. Reset when final-scope fixer changes code, then set True again after the post-fix final-scope review/security/test pass. |
 | `current_step` | `int` | Orchestrator | Index into `plan`; advances after each step completes its implement/review/security/test-write phases. With `run_build_per_step: true`, each step also passes build/fix before advancing; otherwise build/fix is deferred until all steps are complete. |
 | `step_implemented` | `bool` | Orchestrator | Set True after implementer succeeds for the current step; reset on step transition; guards re-runs on resume |
 | `pid` | `int \| None` | `Orchestrator.run()` | PID of the orchestrator process; set at the start of every run (including resume); used by `sikula status` to detect interrupted tasks — if the PID is no longer running, status shows `INTERRUPTED` |
@@ -907,7 +936,7 @@ These keys enable or disable orchestration phases. All default to `true` except 
 | `run_build` | `true` | Enable the build/fix loop (`compile_check` + optional `run_tests`) |
 | `run_tests` | `true` | Run `BuildTool.run_tests()` after each passing build (requires `run_build: true`) |
 | `run_checks` | `true` | Run named quality checks (`build.checks`) after tests pass; failures feed the fixer like build/test failures |
-| `run_build_per_step` | `false` | Run build/fix loop after each step instead of once after all steps complete |
+| `run_build_per_step` | `false` | Also run build/fix loop after each planned step; the final full-task build/fix loop still runs when `run_build: true` |
 
 #### `build` config keys — PythonTool (`project.build_tool: python`)
 

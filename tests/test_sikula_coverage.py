@@ -538,6 +538,35 @@ class TestCmdStatusLabels:
         cfg = self._make_state(tmp_path, "t1", plan_decided=True, files_changed=["a.py"])
         assert "reviewing" in self._run(cfg, capsys)
 
+    def test_final_review_label(self, tmp_path: Path, capsys):
+        cfg = self._make_state(
+            tmp_path, "t1", plan_decided=True, files_changed=["a.py"], active_scope="final_full_task"
+        )
+        assert "final review" in self._run(cfg, capsys)
+
+    def test_final_security_review_label(self, tmp_path: Path, capsys):
+        cfg = self._make_state(
+            tmp_path,
+            "t1",
+            plan_decided=True,
+            files_changed=["a.py"],
+            active_scope="final_full_task",
+            review_approved=True,
+        )
+        assert "final security review" in self._run(cfg, capsys)
+
+    def test_final_test_writing_label(self, tmp_path: Path, capsys):
+        cfg = self._make_state(
+            tmp_path,
+            "t1",
+            plan_decided=True,
+            files_changed=["a.py"],
+            active_scope="final_full_task",
+            review_approved=True,
+            security_approved=True,
+        )
+        assert "final test writing" in self._run(cfg, capsys)
+
     def test_analyzing_label(self, tmp_path: Path, capsys):
         cfg = self._make_state(tmp_path, "t1", presync_done=True)
         assert "analyzing" in self._run(cfg, capsys)

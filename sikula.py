@@ -1027,18 +1027,19 @@ def _status_label(state) -> str:
         return "CLEANED"
     if state.pid and not _pid_running(state.pid):
         return "INTERRUPTED"
+    final_scope = state.active_scope == "final_full_task"
     if state.build_status == "failed":
-        return "build failed"
+        return "final build failed" if final_scope else "build failed"
     if state.build_iterations and state.build_status != "success":
-        return "building"
+        return "final building" if final_scope else "building"
     if state.tests_up_to_date:
-        return "testing"
+        return "final validation" if final_scope else "testing"
     if state.security_approved:
-        return "writing tests"
+        return "final test writing" if final_scope else "writing tests"
     if state.review_approved:
-        return "security review"
+        return "final security review" if final_scope else "security review"
     if state.files_changed:
-        return "reviewing"
+        return "final review" if final_scope else "reviewing"
     if state.plan_decided:
         return "implementing"
     if state.presync_done:

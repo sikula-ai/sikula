@@ -259,6 +259,16 @@ class TestReviewerAgentPrompt:
         assert "src/arch.md" in prompt
         assert "# Architecture rules" in prompt
 
+    def test_structured_input_contract_checks_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Structured input contracts" in prompt
+        assert "expected result type mismatches" in prompt
+        assert "validates" in prompt
+        assert "API that does not know the expected result type" in prompt
+
 
 class TestReviewerAgentHistory:
     def test_previous_reviews_included_in_prompt(self, stub_llm: StubLLMClient, file_tool):
@@ -490,6 +500,52 @@ class TestReviewerAgentPlanContext:
         prompt = stub_llm.readonly_calls[0]
         assert "Current step issue" in prompt
         assert "Old step issue" not in prompt
+
+    def test_final_full_task_scope_replaces_step_scope(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.plan = ["Step A", "Step B"]
+        state.current_step = 1
+        state.active_scope = "final_full_task"
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "FINAL FULL-TASK REVIEW SCOPE" in prompt
+        assert "Step context: This review covers step" not in prompt
+        assert "Do not restrict findings to the last planned step." in prompt
+        assert state.review_cycle_records[0]["scope"] == "final_full_task"
+
+    def test_final_full_task_history_includes_only_final_reviews(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.plan = ["Step A", "Step B"]
+        state.current_step = 1
+        state.active_scope = "final_full_task"
+        state.review_cycle_records = [
+            {
+                "step": 1,
+                "scope": "step",
+                "reviewer_output": "Last step issue",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            },
+            {
+                "step": 1,
+                "scope": "final_full_task",
+                "reviewer_output": "Final review issue",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            },
+        ]
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Final review issue" in prompt
+        assert "Last step issue" not in prompt
 
     def test_no_step_context_without_plan(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"

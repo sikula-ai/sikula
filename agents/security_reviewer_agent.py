@@ -46,6 +46,8 @@ Review steps:
    If a CURRENT STEP SECURITY SCOPE section is present, this is a multi-step task.
    Review security only for the current step and already changed code needed to reason
    about its data flows. Do not report missing future planned steps as security issues.
+   If a FINAL FULL-TASK SECURITY SCOPE section is present, all planned steps are complete.
+   Review security across the complete changed branch, not just the last planned step.
 2. Examine the diff. Use your Read tool to read each changed file in full for context.
 3. Identify trust boundaries in the changed code: where does untrusted data enter (user input,
    network responses, file contents, IPC, deserialized data) and trace it through to
@@ -148,6 +150,23 @@ data flows. Future planned steps are context only:
 Do NOT report missing future planned steps as security issues.\
 """
 
+_FINAL_FULL_TASK_SECURITY_SCOPE = """\
+---
+FINAL FULL-TASK SECURITY SCOPE:
+Review security across the complete diff and complete original task.
+Do not restrict findings to the last planned step.
+Trace trust boundaries through all changed production code and any changed tests/config
+that affect security-sensitive behavior.\
+"""
+
+_SCOPE_FINAL_FULL_TASK = "final_full_task"
+
+
+def _scope(state: TaskState) -> str:
+    if state.active_scope:
+        return state.active_scope
+    return "step" if state.plan else "task"
+
 
 class SecurityReviewerAgent(BaseAgent):
     name = "security_reviewer"
@@ -181,7 +200,9 @@ class SecurityReviewerAgent(BaseAgent):
         security_context = f"\n\nProject security context:\n{raw_context}" if raw_context else ""
 
         step_scope = ""
-        if state.plan:
+        if state.active_scope == _SCOPE_FINAL_FULL_TASK:
+            step_scope = _FINAL_FULL_TASK_SECURITY_SCOPE
+        elif state.plan:
             step_idx = state.current_step
             future_steps = state.plan[step_idx + 1 :]
             future_text = "\n".join(f"  - {step}" for step in future_steps) if future_steps else "  - none"
@@ -218,8 +239,12 @@ class SecurityReviewerAgent(BaseAgent):
         for record in security_records:
             if record.get("reviewer") not in (None, "security_reviewer"):
                 continue
-            if state.plan and record.get("step") != state.current_step:
-                continue
+            if state.active_scope == _SCOPE_FINAL_FULL_TASK:
+                if record.get("scope") != _SCOPE_FINAL_FULL_TASK:
+                    continue
+            elif state.plan:
+                if record.get("scope") == _SCOPE_FINAL_FULL_TASK or record.get("step") != state.current_step:
+                    continue
             security_history.append(record["reviewer_output"])
         if security_history:
             history_text = "\n\n---\n".join(f"[Security Review {i + 1}]\n{r}" for i, r in enumerate(security_history))
@@ -249,6 +274,7 @@ class SecurityReviewerAgent(BaseAgent):
                 "step": state.current_step,
                 "build_iteration": state.build_iterations,
                 "security_review_iteration": state.security_review_iterations,
+                "scope": _scope(state),
                 "reviewer_prompt": full_prompt,
                 "reviewer_output": output,
                 "approved": not has_blocking and (has_approved or has_warnings),

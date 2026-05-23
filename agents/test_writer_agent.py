@@ -72,6 +72,18 @@ TESTING RULES:
 - Follow the nullability conventions of the project. Null paths must be tested explicitly —
   never hide them behind unsafe unwrapping. If the project guidelines define specific rules
   for null handling in tests, follow them exactly.
+- Parser, validator, expression engine, schema, DSL, config loader, and rule engine changes
+  require a positive/negative contract matrix. For every public parse, validate, evaluate,
+  or load API touched by the change, cover at least one accepted valid input and every
+  materially different rejected input class introduced or affected by the change. Include
+  malformed syntax/literals, unknown identifiers or functions, invalid shapes, forbidden
+  values, empty/both/none alternatives, scope or forward-reference violations, and literal
+  division-by-zero where applicable.
+- If expressions, rules, conditions, or config fields are used in typed contexts, test the
+  expected result type explicitly. Cover success for the valid type and rejection for wrong
+  result types, such as a boolean value where a numeric value is required or a numeric value
+  where a boolean condition is required. Do not rely on tests that only prove syntax or
+  variable-name validation.
 - For UI code, test through stable seams such as view models, public routing/state objects,
   rendered UI testing APIs already used by the project, or other project-standard test
   helpers. Do NOT write brittle tests that inspect UI framework internals, opaque view trees,
@@ -88,6 +100,8 @@ ORIGINAL TASK DESCRIPTION:
 Use the original task description to honor explicit testing requirements.
 For multi-step tasks, use CURRENT STEP as the primary scope signal. Do not add
 tests for future steps that are not implemented yet.
+If a FINAL FULL-TASK TEST SCOPE section is present, all planned steps are complete.
+Write or update tests for the complete task, not just the last planned step.
 
 FILES CHANGED (production code):
 {files_changed}
@@ -104,6 +118,8 @@ YOUR TASK:
    - The new or changed behaviour introduced by this implementation
    - Edge cases and error paths visible from the public interface
    - Null / absent paths for every nullable value involved in the change
+   - Structured input contract cases for parser/validator/expression/DSL/config/schema
+     changes, including wrong expected result type rejection where typed contexts exist
    - Any existing test that now tests a changed contract — update it to match
 4. Parametric table completeness: when the change adds or modifies handling of an enum
    value or sealed class case, find ALL existing parametric test tables that enumerate
@@ -127,9 +143,22 @@ behaviour difference), output a brief explanation and make no file changes.
 """
 
 _DEFAULT_CONTEXT_FILES = ["README.md"]
+_SCOPE_FINAL_FULL_TASK = "final_full_task"
+
+
+def _scope(state: TaskState) -> str:
+    if state.active_scope:
+        return state.active_scope
+    return "step" if state.plan else "task"
 
 
 def _step_scope(state: TaskState) -> str:
+    if state.active_scope == _SCOPE_FINAL_FULL_TASK:
+        return (
+            "\nFINAL FULL-TASK TEST SCOPE:\n"
+            "All planned steps have been implemented. Cover the complete original task and "
+            "the complete current diff. Do not restrict tests to the last planned step.\n"
+        )
     if not state.plan:
         return ""
     step_idx = state.current_step
@@ -199,6 +228,7 @@ class TestWriterAgent(BaseAgent):
                 {
                     "step": state.current_step,
                     "build_iteration": state.build_iterations,
+                    "scope": _scope(state),
                     "test_writer_prompt": prompt,
                     "test_writer_output": None,
                     "files_written": [],
@@ -212,6 +242,7 @@ class TestWriterAgent(BaseAgent):
             {
                 "step": state.current_step,
                 "build_iteration": state.build_iterations,
+                "scope": _scope(state),
                 "test_writer_prompt": prompt,
                 "test_writer_output": agent_output,
                 "files_written": list(changed),
