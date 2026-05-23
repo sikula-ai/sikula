@@ -65,6 +65,18 @@ def _phase_scope_label(state: TaskState) -> str:
     return "final full-task " if state.active_scope == _SCOPE_FINAL_FULL_TASK else ""
 
 
+def _build_loop_key(state: TaskState) -> str:
+    if state.active_scope == _SCOPE_FINAL_FULL_TASK or state.plan_completed:
+        return _SCOPE_FINAL_FULL_TASK
+    if state.plan:
+        return f"step:{state.current_step}"
+    return "task"
+
+
+def _build_loop_attempts_used(state: TaskState) -> int:
+    return max(0, state.build_iterations - state.build_loop_start_iteration)
+
+
 @dataclass
 class OrchestratorConfig:
     project_root: Path
@@ -701,33 +713,41 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _run_build_fix_loop(self, state: TaskState, set_done: bool) -> bool:
-        """Sync → build → test → fix until passing or max_iterations reached.
+        """Sync → build → test → fix until passing or this loop reaches max_iterations.
 
         set_done=True  — sets state.done on success (single-pass mode)
         set_done=False — returns True on success without touching state.done (step-loop mode)
         """
-        while not state.failed and state.build_iterations < self._config.max_iterations:
+        loop_key = _build_loop_key(state)
+        if state.build_loop_key != loop_key:
+            state.build_loop_key = loop_key
+            state.build_loop_start_iteration = state.build_iterations
+            self._store.save(state)
+
+        while not state.failed and _build_loop_attempts_used(state) < self._config.max_iterations:
             state.build_iterations += 1
+            loop_attempt = _build_loop_attempts_used(state)
+            progress = f"{loop_attempt}/{self._config.max_iterations}"
 
             if not state.build_synced:
-                log.info(f"--- Phase: sync ({state.build_iterations}/{self._config.max_iterations}) ---")
+                log.info(f"--- Phase: sync ({progress}) ---")
                 if not self._sync(state):
-                    if not self._run_fix_phase(state):
+                    if not self._run_fix_phase(state, progress):
                         return False
                     self._store.save(state)
                     continue
 
-            log.info(f"--- Phase: build ({state.build_iterations}/{self._config.max_iterations}) ---")
+            log.info(f"--- Phase: build ({progress}) ---")
             if not self._build(state):
-                if not self._run_fix_phase(state):
+                if not self._run_fix_phase(state, progress):
                     return False
                 self._store.save(state)
                 continue
 
             if self._config.run_tests:
-                log.info(f"--- Phase: test ({state.build_iterations}/{self._config.max_iterations}) ---")
+                log.info(f"--- Phase: test ({progress}) ---")
                 if not self._run_tests(state):
-                    if not self._run_fix_phase(state):
+                    if not self._run_fix_phase(state, progress):
                         return False
                     self._store.save(state)
                     continue
@@ -736,8 +756,8 @@ class Orchestrator:
                 state.record_validation("test", "skipped")
 
             if self._config.run_checks:
-                if not self._run_checks(state):
-                    if not self._run_fix_phase(state):
+                if not self._run_checks(state, progress):
+                    if not self._run_fix_phase(state, progress):
                         return False
                     self._store.save(state)
                     continue
@@ -746,17 +766,19 @@ class Orchestrator:
                 state.record_validation("check", "skipped")
 
             # Passing build (and tests/checks if enabled)
+            state.build_loop_key = None
+            state.build_loop_start_iteration = 0
             if set_done:
                 state.done = True
-                self._store.save(state)
+            self._store.save(state)
             return True
 
         if not state.failed:
             log.error(
-                "Reached max build iterations (%d) without a passing build — task failed",
+                "Reached max build iterations (%d) for current build/fix loop without a passing build — task failed",
                 self._config.max_iterations,
             )
-            state.record("orchestrator", "abort", "max build iterations reached")
+            state.record("orchestrator", "abort", "max build iterations reached for current build/fix loop")
             state.failed = True
         self._store.save(state)
         return False
@@ -872,9 +894,9 @@ class Orchestrator:
             )
             state.failed = True
 
-    def _run_fix_phase(self, state: TaskState) -> bool:
+    def _run_fix_phase(self, state: TaskState, progress: str) -> bool:
         """Run fixer, update sync/review/test flags. Returns True to continue, False if failed."""
-        log.info(f"--- Phase: fix ({state.build_iterations}/{self._config.max_iterations}) ---")
+        log.info(f"--- Phase: fix ({progress}) ---")
         fixer_result = self._run_agent("fixer", state)
         if state.failed:
             return False
@@ -948,7 +970,7 @@ class Orchestrator:
         result = self._run_agent("test_writer", state)
         return bool((result.data or {}).get("files_written"))
 
-    def _run_checks(self, state: TaskState) -> bool:
+    def _run_checks(self, state: TaskState, progress: str) -> bool:
         """Run all configured quality checks in order. Returns True only if all pass."""
         build_tool: BuildTool = self._tools["build"]
         checks = self._config.project_config.get("build", {}).get("checks", [])
@@ -960,7 +982,7 @@ class Orchestrator:
         all_passed = True
         for check in checks:
             name = check.get("name", "check")
-            log.info(f"--- Phase: check/{name} ({state.build_iterations}/{self._config.max_iterations}) ---")
+            log.info(f"--- Phase: check/{name} ({progress}) ---")
             t0 = time.perf_counter()
             result = build_tool.run_check(name, check)
             elapsed_s = time.perf_counter() - t0

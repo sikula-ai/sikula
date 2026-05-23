@@ -158,6 +158,8 @@ class TestResetFailedState:
         s.review_iterations = 3
         s.security_review_iterations = 2
         s.build_iterations = 5
+        s.build_loop_key = "task"
+        s.build_loop_start_iteration = 2
         s.errors = ["err"]
         s.test_errors = ["terr"]
         s.check_errors = ["cherr"]
@@ -170,6 +172,8 @@ class TestResetFailedState:
         assert loaded.review_iterations == 0
         assert loaded.security_review_iterations == 0
         assert loaded.build_iterations == 0
+        assert loaded.build_loop_key is None
+        assert loaded.build_loop_start_iteration == 0
         assert loaded.errors == []
         assert loaded.test_errors == []
         assert loaded.check_errors == []

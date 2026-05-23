@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Multi-step `sikula run` now performs a final full-task reviewer/security/test-writer gate after all step-scoped validations complete, so the finished branch gets one whole-task pass against the original task before final validation.
 - Build/fix follow-up reviews in the final multi-step phase now stay in full-task scope after fixer changes, while per-step build/fix reviews remain scoped to the current step.
 - Resuming a task after all planned steps completed now continues with the final full-task gate/build instead of rerunning the last step.
+- Per-step build/fix loops no longer consume the final full-task build budget when `run_build_per_step` is enabled; `max_iterations` now applies to each active build/fix loop while `build_iterations` remains a total audit counter.
 
 ## [0.1.0] - 2026-05-21
 

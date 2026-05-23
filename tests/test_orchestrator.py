@@ -298,6 +298,25 @@ class TestOrchestratorBuildLoop:
         assert result.failed
         assert result.build_iterations == 2
 
+    def test_active_build_loop_budget_survives_resume(self, tmp_path: Path):
+        orch, _, build = _make_orchestrator(tmp_path, run_build=True, max_iterations=2)
+        build.compile_success = False
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            build_synced=True,
+            build_iterations=1,
+            build_loop_key="task",
+            build_loop_start_iteration=0,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed
+        assert result.build_iterations == 2
+        assert build.compile_calls == 1
+
     def test_sync_skipped_when_already_synced(self, tmp_path: Path):
         orch, _, build = _make_orchestrator(tmp_path, run_build=True)
         self._build_ready(orch)
@@ -1085,6 +1104,37 @@ class TestOrchestratorInterruptResume:
         assert build.compile_calls == 4
         build_records = [r for r in result.validation_cycle_records if r["phase"] == "build"]
         assert build_records[-1]["scope"] == "final_full_task"
+
+    def test_build_per_step_budget_does_not_starve_final_build(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=True,
+            run_build_per_step=True,
+            run_security_review=False,
+            run_test_writing=False,
+            max_iterations=2,
+        )
+
+        def implementer_effect(state: TaskState) -> None:
+            state.files_changed.append(f"src/step{state.current_step}.py")
+
+        stubs["implementer"].side_effect = implementer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: add parser", "Step 2: add evaluator"],
+            plan_decided=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert not result.failed
+        assert result.build_iterations == 3
+        assert build.compile_calls == 3
+        build_records = [r for r in result.validation_cycle_records if r["phase"] == "build"]
+        assert [r.get("scope") for r in build_records] == [None, None, "final_full_task"]
 
     def test_final_gate_completes_when_optional_agents_are_disabled(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(

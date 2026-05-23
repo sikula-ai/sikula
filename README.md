@@ -413,9 +413,9 @@ run_build_per_step: false  # build/fix once after all steps (true = after each s
 
 Every `run_*` key (and `build.presync_clean`) can be overridden per-run without editing the YAML. Flag omitted = use config value.
 
-The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or `sandbox.max_iterations` is reached. In multi-step runs, `implement → review → security review → test write` runs for each planned step, then a final full-task gate runs before final build/fix validation. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags.
+The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or the active build/fix loop reaches `sandbox.max_iterations`. In multi-step runs, `implement → review → security review → test write` runs for each planned step, then a final full-task gate runs before final build/fix validation. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags.
 
-`run_build_per_step: true` runs the build/fix loop after each individual step; multi-step runs still get the final full-task gate and final build/fix loop after all planned steps complete. Leave it `false` unless you explicitly want every step physically built; planner steps should still keep immediate compile dependencies together, such as resource or localization keys, route/API/command constants, service registrations, and interface implementations. Build-fix reviews during per-step builds stay scoped to that step; build-fix reviews in the final phase are scoped to the complete task, not the last planned step. See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed description of the planner and the step loop.
+`run_build_per_step: true` runs the build/fix loop after each individual step; multi-step runs still get the final full-task gate and final build/fix loop after all planned steps complete. Each per-step loop and the final full-task loop gets its own `max_iterations` budget, while `build_iterations` remains a total audit counter. Leave it `false` unless you explicitly want every step physically built; planner steps should still keep immediate compile dependencies together, such as resource or localization keys, route/API/command constants, service registrations, and interface implementations. Build-fix reviews during per-step builds stay scoped to that step; build-fix reviews in the final phase are scoped to the complete task, not the last planned step. See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed description of the planner and the step loop.
 
 The **sync** step calls `BuildTool.sync()` once before the first build and again whenever the fixer changes a build-config file. It resolves dependencies and generates any required sources. A sync failure is treated like a build failure — the error is passed to the fixer and the loop continues.
 
@@ -732,7 +732,7 @@ covers files reported by the provider's `run_agent()` result.
 | `allowed_write_paths` | ImplementerAgent, FixerAgent (build errors) | Production source directories agents may write to |
 | `allowed_test_write_paths` | TestWriterAgent, FixerAgent (test failures, check errors) | Test source directories; agents may write here when fixing test failures or check violations (e.g. detekt) |
 | `allowed_read_paths` | ImplementerAgent, FixerAgent, TestWriterAgent | Directories agents may read from (prompt constraint); `"."` means the entire project root |
-| `max_iterations` | Orchestrator build/fix loop | Max build+fix cycles before task is aborted |
+| `max_iterations` | Orchestrator build/fix loop | Max attempts per active build/fix loop before the task is aborted |
 | `max_review_iterations` | Orchestrator review loop | Max review+implement-fix cycles before task is aborted |
 | `max_security_review_iterations` | Orchestrator security review loop | Max security-review+fix cycles (independent of `max_review_iterations`); default equals `max_review_iterations` if not set |
 
@@ -834,7 +834,7 @@ contracts are auditable in task state.
 | Compile check (`BuildTool.compile_check()`) — task configurable via `build.compile_task` | ✓ |
 | Build, sync, and test timeouts configurable per project via `build.sync_timeout` / `build.compile_timeout` / `build.test_timeout` | ✓ |
 | Re-sync when fixer changes build-config files (`BuildTool.is_build_config_file()`) | ✓ |
-| Automatic build/fix loop with `sandbox.max_iterations` | ✓ |
+| Automatic build/fix loop with `sandbox.max_iterations` applied per active build/fix loop | ✓ |
 | Guard: implementer failure aborts before build loop (no false `done: true`) | ✓ |
 | Git worktree isolation — each run works in a dedicated branch (`sikula/<task-stem>-<task-id>`) and worktree; on success changes are auto-committed and worktree removed; on failure worktree preserved for resume; `.sikula/worktrees/` auto-added to `.git/info/exclude` (local, not committed); parallel runs never conflict; `--no-isolate` to skip | ✓ |
 | Standalone PR review (`sikula review`) — code + security review on an existing branch via `git diff base...branch` with an explicit PR/task description as scope; report-only (read-only, exits 0/1) or `--fix` to apply corrections and commit them to the branch; per-agent model/provider/timeout and `extra_rules` overrides supported in both modes | ✓ |

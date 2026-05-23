@@ -153,7 +153,9 @@ class TaskState:
     final_full_task_review_done: bool = False
     files_changed: list[str] = field(default_factory=list)
     build_synced: bool = False
-    build_iterations: int = 0  # counts only build/fix cycles; guarded by max_iterations
+    build_iterations: int = 0  # total build/fix attempts across all build loops
+    build_loop_key: Optional[str] = None
+    build_loop_start_iteration: int = 0
     build_status: Optional[str] = None
     errors: list[str] = field(default_factory=list)
     test_errors: list[str] = field(default_factory=list)

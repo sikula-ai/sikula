@@ -266,14 +266,14 @@ Orchestrator.run()
       │        security review reruns (Phase 3.5)             │
       │        test write reruns (Phase 4)                    │
       │                                                       │
-      │  repeat until state.done or build_iterations ≥       │
-      │              config.max_iterations                    │
+      │  repeat until state.done or current build/fix loop   │
+      │              reaches config.max_iterations            │
       └──────────────────────────────────────────────────────┘
 ```
 
 **Step loop** (`state.plan` is non-empty — when `run_planner: true` and plan parsed successfully):
 
-Per-step flags (`step_implemented`, `review_approved`, `review_issues`, `review_iterations`, `security_approved`, `security_review_iterations`, `tests_up_to_date`) reset on each step transition. `files_changed` and `build_iterations` accumulate across all steps.
+Per-step flags (`step_implemented`, `review_approved`, `review_issues`, `review_iterations`, `security_approved`, `security_review_iterations`, `tests_up_to_date`) reset on each step transition. `files_changed` and `build_iterations` accumulate across all steps. `max_iterations` is applied per active build/fix loop, not globally across the whole task, so per-step builds do not consume the final full-task build budget.
 
 Build behaviour is controlled by `run_build_per_step` (default: `false`):
 
@@ -847,7 +847,9 @@ findings. Review and redact state files before sharing them outside your project
 | `presync_done` | `bool` | Orchestrator | Set True after Phase 0 presync attempt (success or failure); guards re-run on resume |
 | `files_changed` | `list[str]` | Implementer / Fixer | Paths touched so far; used by orchestrator for build-config re-sync detection |
 | `build_synced` | `bool` | Orchestrator | Guards unnecessary re-syncs; reset when build-config files change |
-| `build_iterations` | `int` | Orchestrator | Counts build/fix cycles only; guarded by `config.max_iterations` |
+| `build_iterations` | `int` | Orchestrator | Total build/fix attempts across the task; used as an audit/correlation counter in validation and agent records |
+| `build_loop_key` | `str \| None` | Orchestrator | Active build/fix loop identity (`"task"`, `"step:N"`, or `"final_full_task"`); persisted so resume keeps the same loop budget |
+| `build_loop_start_iteration` | `int` | Orchestrator | Global `build_iterations` value at the start of the active build/fix loop; `config.max_iterations` is enforced relative to this value |
 | `build_status` | `str \| None` | Orchestrator | `"success"` or `"failed"` |
 | `test_status` | `str \| None` | Orchestrator | Final test phase outcome: `"success"`, `"failed"`, or `"skipped"`; `None` until the test phase is reached |
 | `check_status` | `str \| None` | Orchestrator | Final configured-check phase outcome: `"success"`, `"failed"`, or `"skipped"`; `None` until the check phase is reached |
@@ -880,7 +882,7 @@ findings. Review and redact state files before sharing them outside your project
 | `runtime_metadata` | `dict` | `StateStore.create()` / `cmd_review()` | Runtime snapshot captured when the task state is created: Sikula package version when available, Python version, platform, system, and machine. Used for later debugging only |
 | `final_summary` | `dict` | `JsonStateStore.save()` | Compact terminal summary written when `done` or `failed` is reached: result, branch, commit, build/test/check status, counts for files, validation records, fix attempts, review records, test-writer runs, LLM retries, history events, timestamps, and wall elapsed time when available |
 | `done` | `bool` | Orchestrator | Set True on passing build or after implement (no-build mode) |
-| `failed` | `bool` | Orchestrator | Hard abort: set True on review timeout, build iteration limit reached, or unhandled agent exception; loop exits immediately. Use `--reset-failed` CLI flag to clear this and resume; the flag also resets `review_iterations`, `security_review_iterations`, and `build_iterations` to 0, clears `errors`/`test_errors`/`check_errors` (prevents stale error blobs from appearing in the fixer's prompt on the first resumed iteration), and auto-populates `files_changed` from `git diff` if empty. Sync, build, and check failures are NOT hard aborts — they store the error and run the fixer |
+| `failed` | `bool` | Orchestrator | Hard abort: set True on review timeout, active build/fix loop iteration limit reached, or unhandled agent exception; loop exits immediately. Use `--reset-failed` CLI flag to clear this and resume; the flag also resets `review_iterations`, `security_review_iterations`, `build_iterations`, and active build-loop markers, clears `errors`/`test_errors`/`check_errors` (prevents stale error blobs from appearing in the fixer's prompt on the first resumed iteration), and auto-populates `files_changed` from `git diff` if empty. Sync, build, and check failures are NOT hard aborts — they store the error and run the fixer |
 | `finished_at` | `str \| None` | `JsonStateStore.save()` | ISO-8601 UTC timestamp set once when the task first reaches a terminal `done` or `failed` state; not overwritten by later saves |
 | `plan` | `list[str]` | PlannerAgent | Ordered step descriptions; empty = single-pass mode |
 | `plan_decided` | `bool` | PlannerAgent | Set True after any successful planner decision (SINGLE_PASS or split); guards re-run on resume; not set on planner failure (allows retry) |
