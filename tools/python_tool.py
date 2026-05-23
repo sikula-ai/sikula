@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from tools.base_tool import BuildTool, Sandbox, ToolResult
+from tools.base_tool import BuildTool, Sandbox, ToolResult, tool_error_excerpt
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ class PythonTool(BuildTool):
             )
             output = r.stdout + r.stderr
             if r.returncode not in (0, 5):  # pytest exit 5 = no tests collected
-                return ToolResult(success=False, output=output, error=output[-4000:])
+                return ToolResult(success=False, output=output, error=tool_error_excerpt(output))
             return ToolResult(success=True, output=output)
         except subprocess.TimeoutExpired:
             return ToolResult(success=False, output="", error=f"Command timed out: {command}")

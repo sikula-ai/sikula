@@ -46,6 +46,7 @@ from agents.planner_agent import PlannerAgent
 from agents.reviewer_agent import ReviewerAgent
 from agents.security_reviewer_agent import SecurityReviewerAgent
 from agents.test_writer_agent import TestWriterAgent
+from core.diagnostics import diagnostic_excerpt
 from core.llm_client import LLMClient
 from core.retry_history import llm_retry_history
 from core.state import StateStore, TaskState
@@ -59,6 +60,8 @@ from tools.python_tool import PythonTool
 log = logging.getLogger(__name__)
 
 _SCOPE_FINAL_FULL_TASK = "final_full_task"
+_FIXER_ERROR_LIMIT = 6000
+_LOG_ERROR_LIMIT = 2000
 
 
 def _phase_scope_label(state: TaskState) -> str:
@@ -698,13 +701,13 @@ class Orchestrator:
                 "presync",
                 "failed",
                 elapsed_s=elapsed_s,
-                error=result.error[-500:],
+                error=diagnostic_excerpt(result.error, limit=500),
             )
             state.record_validation("presync", "failed", elapsed_s=elapsed_s, error=result.error)
             log.warning(
                 "Pre-analyze sync failed (%s) — analyst will proceed with sources available in build/: %s",
                 _fmt_elapsed(elapsed_s),
-                result.error[-200:],
+                diagnostic_excerpt(result.error, limit=200),
             )
         self._store.save(state)
 
@@ -1013,14 +1016,15 @@ class Orchestrator:
                     elapsed_s = time.perf_counter() - t0
                 else:
                     skip_final_failure_validation = True
-                    log.warning(f"Auto-fix for {name} failed: {fix_result.error[-500:]}")
+                    log.warning(f"Auto-fix for {name} failed: {diagnostic_excerpt(fix_result.error, limit=500)}")
             if result.success:
                 log.info(f"Check {name} OK ({_fmt_elapsed(elapsed_s)})")
                 state.record("orchestrator", f"check_{name}", "success", elapsed_s=elapsed_s)
                 state.record_validation("check", "success", elapsed_s=elapsed_s, check_name=name)
             else:
-                log.error(f"Check {name} failed ({_fmt_elapsed(elapsed_s)}):\n{result.error[-2000:]}")
-                state.check_errors.append(f"[{name}]\n{result.output}")
+                check_error = diagnostic_excerpt(result.error or result.output, limit=_FIXER_ERROR_LIMIT)
+                log.error(f"Check {name} failed ({_fmt_elapsed(elapsed_s)}):\n{check_error}")
+                state.check_errors.append(f"[{name}]\n{check_error}")
                 state.record("orchestrator", f"check_{name}", "failed", elapsed_s=elapsed_s)
                 if not skip_final_failure_validation:
                     state.record_validation(
@@ -1042,8 +1046,11 @@ class Orchestrator:
         result = build_tool.run_tests()
         elapsed_s = time.perf_counter() - t0
         if not result.success:
-            log.error(f"Tests failed ({_fmt_elapsed(elapsed_s)}):\n{result.error[-2000:]}")
-            state.test_errors.append(result.error[-3000:])
+            test_error = diagnostic_excerpt(result.error, limit=_FIXER_ERROR_LIMIT)
+            log.error(
+                f"Tests failed ({_fmt_elapsed(elapsed_s)}):\n{diagnostic_excerpt(result.error, limit=_LOG_ERROR_LIMIT)}"
+            )
+            state.test_errors.append(test_error)
             state.test_status = "failed"
             state.record("orchestrator", "test", "failed", elapsed_s=elapsed_s)
             state.record_validation("test", "failed", elapsed_s=elapsed_s, error=result.error)
@@ -1068,8 +1075,11 @@ class Orchestrator:
         else:
             state.record("orchestrator", "sync", "failed", elapsed_s=elapsed_s)
             state.record_validation("sync", "failed", elapsed_s=elapsed_s, error=result.error)
-            log.error(f"Build sync failed ({_fmt_elapsed(elapsed_s)}):\n{result.error[-2000:]}")
-            state.errors.append(result.error[-3000:])
+            log.error(
+                f"Build sync failed ({_fmt_elapsed(elapsed_s)}):\n"
+                f"{diagnostic_excerpt(result.error, limit=_LOG_ERROR_LIMIT)}"
+            )
+            state.errors.append(diagnostic_excerpt(result.error, limit=_FIXER_ERROR_LIMIT))
         self._store.save(state)
         return result.success
 
@@ -1085,8 +1095,10 @@ class Orchestrator:
             "build", state.build_status, elapsed_s=elapsed_s, error=None if result.success else result.error
         )
         if not result.success:
-            log.error(f"Build failed ({_fmt_elapsed(elapsed_s)}):\n{result.error[-2000:]}")
-            state.errors.append(result.error[-3000:])
+            log.error(
+                f"Build failed ({_fmt_elapsed(elapsed_s)}):\n{diagnostic_excerpt(result.error, limit=_LOG_ERROR_LIMIT)}"
+            )
+            state.errors.append(diagnostic_excerpt(result.error, limit=_FIXER_ERROR_LIMIT))
             return False
         log.info(f"Build OK ({_fmt_elapsed(elapsed_s)})")
         state.fixer_changed_code = False

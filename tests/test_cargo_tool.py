@@ -52,6 +52,26 @@ class TestCargoToolRun:
         assert not result.success
         assert "test test_foo ... FAILED" in result.error
 
+    def test_long_test_output_keeps_failure_block_not_only_tail(self, tmp_path: Path):
+        tool = _make_tool(tmp_path)
+        output = (
+            "Compiling workspace\n"
+            + "".join(f"build line {i}\n" for i in range(300))
+            + "thread 'test_rejects_wrong_result_type' panicked at assertion failed\n"
+            + "failures:\n"
+            + "    test_rejects_wrong_result_type\n"
+            + "".join(f"Running unrelated test binary {i}\n" for i in range(500))
+            + "error: test failed, to rerun pass `-p example_crate --test validation_tests`\n"
+        )
+        with patch(
+            "tools.cargo_tool.subprocess.run",
+            return_value=_mock_run(returncode=101, stdout=output, stderr=""),
+        ):
+            result = tool.run_tests()
+        assert not result.success
+        assert "test_rejects_wrong_result_type" in result.error
+        assert "error: test failed" in result.error
+
     def test_timeout_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
         with patch("tools.cargo_tool.subprocess.run", side_effect=__import__("subprocess").TimeoutExpired("cmd", 1)):

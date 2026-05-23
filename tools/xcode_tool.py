@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from tools.base_tool import BuildTool, Sandbox, ToolResult
+from tools.base_tool import BuildTool, Sandbox, ToolResult, tool_error_excerpt
 
 log = logging.getLogger(__name__)
 
@@ -108,7 +108,7 @@ class XcodeTool(BuildTool):
             " failed (",
         )
         lines = [line for line in output.splitlines() if any(k in line for k in keywords)]
-        return "\n".join(lines)[-4000:] if lines else output[-4000:]
+        return tool_error_excerpt("\n".join(lines), limit=4000) if lines else tool_error_excerpt(output, limit=4000)
 
     @staticmethod
     def _extract_xcresult_test_failures(result_bundle_path: Path) -> str:
@@ -167,7 +167,7 @@ class XcodeTool(BuildTool):
                 parts = [p for p in (test_case, location, message) if p]
                 if parts:
                     failures.append(" - ".join(parts))
-        return "\n".join(failures)[-4000:]
+        return tool_error_excerpt("\n".join(failures), limit=4000)
 
     @staticmethod
     def _xc_values(value: object) -> list[dict]:

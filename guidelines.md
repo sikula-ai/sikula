@@ -220,7 +220,9 @@ within the pipeline: `step`, `build_iteration` (`state.build_iterations`),
 
 Validation records are orchestrator-owned and use a smaller shape: `phase`, `status`,
 `build_iteration`, `step`, `timestamp`, optional `scope`, optional `elapsed_s`, optional
-`check_name`, and short `error_excerpt` on failure.
+`check_name`, and diagnostic `error_excerpt` on failure. Error excerpts must preserve
+failure-marker blocks from long command output instead of storing only the final tail; the
+fixer needs the concrete compiler diagnostic, failing test, assertion, traceback, or tool error.
 
 Records are append-only and must not drive pipeline control flow — stop/continue decisions
 belong in dedicated state fields (`review_approved`, `security_approved`, `failed`, etc.).

@@ -15,6 +15,8 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Optional
 
+from core.diagnostics import diagnostic_excerpt
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -23,9 +25,7 @@ def _now() -> str:
 def _short_text(text: str | None, limit: int = 1000) -> str | None:
     if not text:
         return None
-    if len(text) <= limit:
-        return text
-    return text[-limit:]
+    return diagnostic_excerpt(text, limit=limit)
 
 
 def runtime_metadata_snapshot() -> dict:
