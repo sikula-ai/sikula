@@ -39,6 +39,8 @@ from core.state import TaskState
 log = logging.getLogger(__name__)
 
 _MAX_DIFF_CHARS = 40_000
+_MAX_FIXER_HISTORY_CHARS = 6_000
+_MAX_FIXER_RECORD_CHARS = 1_200
 
 _SYSTEM_REVIEW = """\
 You are a senior {tech_stack} software engineer performing a focused code review.
@@ -175,6 +177,13 @@ You may use test files only as evidence of a production-code correctness problem
 When a test file reveals a real problem, report the production-code issue, not a
 test-file issue.
 
+Exception: if changed test files or recent test-failure fixer records indicate that a
+contract-bearing test was deleted, relaxed, or changed to a different rejected input
+class, use that as evidence to re-check the production contract. If the original task,
+implementation prompt, project guidelines, or structured input contract still requires
+the weakened behaviour, report the production-code issue. Do not report a standalone
+test-file issue in normal `sikula run` mode.
+
 If the prompt lists files written by the test writer agent, those files are legitimate
 pipeline output and must NOT be flagged as scope violations, regardless of any
 implementation prompt constraints about test file changes.\
@@ -184,8 +193,9 @@ _BRANCH_REVIEW_TEST_POLICY = """\
 Test files are branch-owned output in `sikula review` mode. Review changed test files
 in the diff like any other changed file: stale fixtures, incorrect assertions,
 misleading expectations, brittle tests that no longer validate the changed behavior,
-and tests that assert the wrong contract are review issues. Report test-file issues
-directly when they affect whether the branch is safe to merge.
+tests that assert the wrong contract, and negative tests changed to easier/different
+invalid fixtures are review issues. Report test-file issues directly when they affect
+whether the branch is safe to merge.
 
 You may also report missing or insufficient tests when the branch changes behavior that
 should be covered and the gap is material to the review description. Do not demand
@@ -252,6 +262,29 @@ def _test_review_policy(state: TaskState) -> str:
     return _PIPELINE_TEST_REVIEW_POLICY
 
 
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n... (truncated)"
+
+
+def _test_failure_fix_history(state: TaskState) -> str:
+    records: list[str] = []
+    for idx, record in enumerate(state.fix_cycle_records, start=1):
+        errors_before = record.get("errors_before") or {}
+        if not errors_before.get("test"):
+            continue
+        files = record.get("files_written") or []
+        files_text = ", ".join(files) if files else "(none)"
+        output = (record.get("fixer_output") or "").strip() or "(no fixer output captured)"
+        output = _truncate(output, _MAX_FIXER_RECORD_CHARS)
+        records.append(f"[Test-failure fix {idx}]\nFiles written: {files_text}\nFixer output:\n{output}")
+
+    if not records:
+        return ""
+    return _truncate("\n\n".join(records[-3:]), _MAX_FIXER_HISTORY_CHARS)
+
+
 class ReviewerAgent(BaseAgent):
     name = "reviewer"
 
@@ -314,6 +347,14 @@ class ReviewerAgent(BaseAgent):
         if state.test_files_written:
             files_list = "\n".join(f"  - {f}" for f in state.test_files_written)
             full_prompt += f"\n\n---\nFiles written by the test writer agent (not subject to implementer constraints):\n{files_list}"
+
+        test_failure_fix_history = _test_failure_fix_history(state)
+        if test_failure_fix_history:
+            full_prompt += (
+                "\n\n---\nRecent test-failure fixer records. Use this only to audit whether "
+                "a test failure fix weakened a task, guideline, or structured input contract:\n"
+                f"{test_failure_fix_history}"
+            )
 
         reviewer_history = []
         for record in state.review_cycle_records:

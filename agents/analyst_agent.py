@@ -71,8 +71,10 @@ Steps:
       caught during validation or may occur at runtime. If the codebase has separate
       generic and expected-type validation APIs, state which API each context must use.
       Do not stop at syntax or known-name checks when the task requires a typed or
-      shape-specific contract. Write a ⚠️ WARNING for any missing contract detail the
-      implementer must verify before changing code.
+      shape-specific contract. Put these details in a clearly labelled structured
+      contract section or subsection; keep it semantic and platform-neutral unless the
+      existing codebase exposes platform-specific contract names. Write a ⚠️ WARNING for
+      any missing contract detail the implementer must verify before changing code.
       String resources: for every user-visible string introduced by the task, include
       the exact key and value in the implementation prompt. Determine them from:
         (1) explicit string definitions in the task description — use keys and values
@@ -111,7 +113,8 @@ Steps:
    6. Acceptance criteria: what a correct implementation looks like. For parser,
       validator, expression engine, schema, DSL, config loader, or rule engine changes,
       include explicit accepted and rejected cases, including wrong expected result type
-      cases when typed contexts exist.
+      cases when typed contexts exist. Distinguish materially different rejected input
+      classes instead of listing one generic invalid example.
 
 Output only the implementation prompt — no preamble, no explanation of your steps.\
 """
