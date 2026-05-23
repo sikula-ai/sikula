@@ -7,9 +7,11 @@ subclass StateStore and swap it in sikula.py — nothing else needs to change.
 from __future__ import annotations
 
 import json
+import platform
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Optional
 
@@ -18,7 +20,116 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-SCHEMA_VERSION = 1
+def _short_text(text: str | None, limit: int = 1000) -> str | None:
+    if not text:
+        return None
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def runtime_metadata_snapshot() -> dict:
+    try:
+        sikula_version = version("sikula")
+    except PackageNotFoundError:
+        sikula_version = "unknown"
+    return {
+        "sikula_version": sikula_version,
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "system": platform.system(),
+        "machine": platform.machine(),
+    }
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _terminal_result(state: "TaskState") -> str:
+    if state.done:
+        return "done"
+    if state.failed:
+        return "failed"
+    return "incomplete"
+
+
+def _final_summary(state: "TaskState") -> dict:
+    created_at = _parse_iso(state.created_at)
+    finished_at = _parse_iso(state.finished_at)
+    summary: dict = {
+        "result": _terminal_result(state),
+        "task_id": state.task_id,
+        "branch": state.worktree_branch,
+        "commit": state.result_commit,
+        "build_attempts": state.build_iterations,
+        "build_status": state.build_status,
+        "test_status": state.test_status,
+        "check_status": state.check_status,
+        "files_changed_count": len(state.files_changed),
+        "test_files_written_count": len(state.test_files_written),
+        "validation_records_count": len(state.validation_cycle_records),
+        "validation_failures_count": sum(
+            1 for entry in state.validation_cycle_records if entry.get("status") == "failed"
+        ),
+        "fix_attempts": len(state.fix_cycle_records),
+        "review_records_count": len(state.review_cycle_records),
+        "security_review_records_count": len(state.security_review_cycle_records),
+        "reviewer_runs": len(state.review_cycle_records),
+        "security_reviewer_runs": len(state.security_review_cycle_records),
+        "test_writer_runs": len(state.test_write_records),
+        "llm_retries": sum(1 for entry in state.history if entry.get("action") == "llm_retry"),
+        "history_events_count": len(state.history),
+        "created_at": state.created_at,
+        "finished_at": state.finished_at,
+    }
+    if created_at and finished_at:
+        summary["wall_elapsed_s"] = round((finished_at - created_at).total_seconds(), 1)
+    return summary
+
+
+SCHEMA_VERSION = 2
+
+
+def _without_reviewer_field(record: dict) -> dict:
+    normalized = dict(record)
+    normalized.pop("reviewer", None)
+    return normalized
+
+
+def _migrate_review_cycle_records(data: dict) -> None:
+    review_records = data.get("review_cycle_records")
+    existing_security_records = data.get("security_review_cycle_records")
+    security_records = existing_security_records if isinstance(existing_security_records, list) else []
+
+    normalized_reviews = []
+    migrated_security_reviews = []
+    if not isinstance(review_records, list):
+        review_records = []
+
+    for record in review_records:
+        if not isinstance(record, dict):
+            normalized_reviews.append(record)
+            continue
+
+        reviewer = record.get("reviewer")
+        normalized_record = _without_reviewer_field(record)
+        if reviewer == "security_reviewer":
+            migrated_security_reviews.append(normalized_record)
+        else:
+            normalized_reviews.append(normalized_record)
+
+    normalized_security_records = [
+        _without_reviewer_field(record) if isinstance(record, dict) else record for record in security_records
+    ]
+
+    data["review_cycle_records"] = normalized_reviews
+    data["security_review_cycle_records"] = normalized_security_records + migrated_security_reviews
 
 
 @dataclass
@@ -59,13 +170,17 @@ class TaskState:
     # Structured observability records — one entry per agent invocation; never read for pipeline decisions
     implement_cycle_records: list[dict] = field(default_factory=list)
     review_cycle_records: list[dict] = field(default_factory=list)
+    security_review_cycle_records: list[dict] = field(default_factory=list)
     test_write_records: list[dict] = field(default_factory=list)
     fix_cycle_records: list[dict] = field(default_factory=list)
+    validation_cycle_records: list[dict] = field(default_factory=list)
     task_file: Optional[str] = None
     worktree_path: Optional[str] = None
     worktree_branch: Optional[str] = None
     worktree_base: Optional[str] = None
     history: list[dict] = field(default_factory=list)
+    runtime_metadata: dict = field(default_factory=dict)
+    final_summary: dict = field(default_factory=dict)
     done: bool = False
     failed: bool = False
     finished_at: Optional[str] = None
@@ -96,6 +211,30 @@ class TaskState:
             entry["error"] = error
         self.history.append(entry)
 
+    def record_validation(
+        self,
+        phase: str,
+        status: str,
+        elapsed_s: float | None = None,
+        error: str | None = None,
+        check_name: str | None = None,
+    ) -> None:
+        entry: dict = {
+            "phase": phase,
+            "status": status,
+            "build_iteration": self.build_iterations,
+            "step": self.current_step,
+            "timestamp": _now(),
+        }
+        if check_name:
+            entry["check_name"] = check_name
+        if elapsed_s is not None:
+            entry["elapsed_s"] = round(elapsed_s, 1)
+        error_excerpt = _short_text(error)
+        if error_excerpt:
+            entry["error_excerpt"] = error_excerpt
+        self.validation_cycle_records.append(entry)
+
 
 # ---------------------------------------------------------------------------
 # Abstract store
@@ -118,6 +257,7 @@ class StateStore:
     def create(self, task_description: str) -> TaskState:
         task_id = uuid.uuid4().hex
         state = TaskState(task_id=task_id, task_description=task_description)
+        state.runtime_metadata = runtime_metadata_snapshot()
         self.save(state)
         return state
 
@@ -145,6 +285,23 @@ class JsonStateStore(StateStore):
         # Migrate field renamed in refactor: gradle_synced → build_synced
         if "gradle_synced" in data and "build_synced" not in data:
             data["build_synced"] = data.pop("gradle_synced")
+        original_schema_version = data.get("schema_version", 1)
+        has_legacy_review_records = any(
+            isinstance(record, dict) and "reviewer" in record for record in data.get("review_cycle_records", [])
+        )
+        has_legacy_security_records = any(
+            isinstance(record, dict) and "reviewer" in record
+            for record in data.get("security_review_cycle_records", [])
+        )
+        if (
+            original_schema_version < 2
+            or "security_review_cycle_records" not in data
+            or has_legacy_review_records
+            or has_legacy_security_records
+        ):
+            _migrate_review_cycle_records(data)
+        if original_schema_version < SCHEMA_VERSION:
+            data["schema_version"] = SCHEMA_VERSION
         # --- end migrations ---
         # Drop unknown fields (forward-compat with state files from older versions)
         known = {f.name for f in TaskState.__dataclass_fields__.values()}
@@ -155,6 +312,8 @@ class JsonStateStore(StateStore):
         self._dir.mkdir(parents=True, exist_ok=True)
         if (state.done or state.failed) and not state.finished_at:
             state.finished_at = _now()
+        if state.done or state.failed:
+            state.final_summary = _final_summary(state)
         state.updated_at = _now()
         self._path(state.task_id).write_text(json.dumps(asdict(state), indent=2))
 

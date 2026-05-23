@@ -206,13 +206,20 @@ Every agent that invokes an LLM must append one record per invocation to the app
 |-------|------|
 | `ImplementerAgent` | `state.implement_cycle_records` |
 | `FixerAgent` | `state.fix_cycle_records` |
-| `ReviewerAgent`, `SecurityReviewerAgent` | `state.review_cycle_records` |
+| `ReviewerAgent` | `state.review_cycle_records` |
+| `SecurityReviewerAgent` | `state.security_review_cycle_records` |
 | `TestWriterAgent` | `state.test_write_records` |
+| Orchestrator validation phases | `state.validation_cycle_records` |
 
-Each record must include at minimum: the agent's prompt, LLM output (`None` on exception),
-files written, timestamp, and the correlation keys needed to locate the record within the
-pipeline: `step`, `build_iteration` (`state.build_iterations`), `review_iteration`
-(`state.review_iterations`), `security_review_iteration` (`state.security_review_iterations`).
+Each agent record must include at minimum: the agent's prompt, LLM output (`None` on
+exception), files written, timestamp, and the correlation keys needed to locate the record
+within the pipeline: `step`, `build_iteration` (`state.build_iterations`),
+`review_iteration` (`state.review_iterations`), `security_review_iteration`
+(`state.security_review_iterations`).
+
+Validation records are orchestrator-owned and use a smaller shape: `phase`, `status`,
+`build_iteration`, `step`, `timestamp`, optional `elapsed_s`, optional `check_name`, and
+short `error_excerpt` on failure.
 
 Records are append-only and must not drive pipeline control flow — stop/continue decisions
 belong in dedicated state fields (`review_approved`, `security_approved`, `failed`, etc.).
@@ -354,6 +361,7 @@ instantiated only there and injected via constructor.
 | `files_changed` | Append-only; never clear outside the orchestrator |
 | `errors`, `test_errors`, `check_errors` | Cleared by the fixer after a fix pass |
 | `history` | Append-only via `state.record()`; never cleared; permanent audit log |
+| `validation_cycle_records` | Append-only via the orchestrator; never used for pipeline control flow |
 | `done`, `failed` | Set by the orchestrator only; never set in an agent |
 
 ---
@@ -452,7 +460,7 @@ python3 -m ruff format .
 - **Never** put platform-specific logic (Gradle tasks, Kotlin patterns, Android layer names) in agents, orchestrator, or LLM client code — it belongs only in `BuildTool` subclasses and `.sikula/config.yaml`.
 - **Never** set `state.done` or `state.failed` in an agent — these are orchestrator-only fields.
 - **Never** clear or modify past entries in `state.history` — it is a permanent audit log.
-- **Never** use `state.implement_cycle_records`, `state.fix_cycle_records`, `state.review_cycle_records`, or `state.test_write_records` to drive pipeline control flow — they are observability records only.
+- **Never** use `state.implement_cycle_records`, `state.fix_cycle_records`, `state.review_cycle_records`, `state.security_review_cycle_records`, or `state.test_write_records` to drive pipeline control flow — they are observability records only.
 - **Always** add `from __future__ import annotations` immediately after the optional
   module docstring and before all other imports.
 - **Always** add type hints to every function signature.

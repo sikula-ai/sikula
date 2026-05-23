@@ -5,7 +5,7 @@ this means after reviewer approval; if review is disabled, security review still
 unless it is disabled separately.
 - BLOCKING issues are fed back to the implementer via a fix pass; the review loop
   and security review then re-run. Pipeline does not advance until security passes.
-- WARNING issues are recorded in review_cycle_records and do not block the pipeline.
+- WARNING issues are recorded in security_review_cycle_records and do not block the pipeline.
 """
 
 from __future__ import annotations
@@ -211,8 +211,12 @@ class SecurityReviewerAgent(BaseAgent):
         )
 
         security_history = []
-        for record in state.review_cycle_records:
-            if record["reviewer"] != "security_reviewer":
+        security_records = list(state.security_review_cycle_records)
+        security_records.extend(
+            record for record in state.review_cycle_records if record.get("reviewer") == "security_reviewer"
+        )
+        for record in security_records:
+            if record.get("reviewer") not in (None, "security_reviewer"):
                 continue
             if state.plan and record.get("step") != state.current_step:
                 continue
@@ -240,9 +244,8 @@ class SecurityReviewerAgent(BaseAgent):
         last_line = next((ln for ln in reversed(output.splitlines()) if ln.strip()), "")
         has_approved = re.sub(r"[^A-Za-z]", "", last_line).upper() == "APPROVED"
 
-        state.review_cycle_records.append(
+        state.security_review_cycle_records.append(
             {
-                "reviewer": "security_reviewer",
                 "step": state.current_step,
                 "build_iteration": state.build_iterations,
                 "security_review_iteration": state.security_review_iterations,

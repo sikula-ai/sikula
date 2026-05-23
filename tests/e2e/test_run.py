@@ -313,10 +313,8 @@ class TestSecurityReviewBlocking:
         assert state.security_approved is True
         assert state.review_approved is True
         # Code review ran at least twice (initial + after security fix)
-        code_reviews = [r for r in state.review_cycle_records if r["reviewer"] == "reviewer"]
-        security_reviews = [r for r in state.review_cycle_records if r["reviewer"] == "security_reviewer"]
-        assert len(code_reviews) >= 2
-        assert len(security_reviews) >= 2
+        assert len(state.review_cycle_records) >= 2
+        assert len(state.security_review_cycle_records) >= 2
 
 
 class TestSecurityReviewTimeout:

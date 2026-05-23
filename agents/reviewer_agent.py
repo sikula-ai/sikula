@@ -281,7 +281,7 @@ class ReviewerAgent(BaseAgent):
 
         reviewer_history = []
         for record in state.review_cycle_records:
-            if record["reviewer"] != "reviewer":
+            if record.get("reviewer") not in (None, "reviewer"):
                 continue
             if state.plan and record.get("step") != state.current_step:
                 continue
@@ -307,7 +307,6 @@ class ReviewerAgent(BaseAgent):
 
         state.review_cycle_records.append(
             {
-                "reviewer": "reviewer",
                 "step": state.current_step,
                 "build_iteration": state.build_iterations,
                 "review_iteration": state.review_iterations,

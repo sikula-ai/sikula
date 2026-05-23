@@ -1263,7 +1263,7 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
     """Checkout an existing branch in a worktree and run code + security review."""
     import uuid
 
-    from core.state import JsonStateStore, TaskState
+    from core.state import JsonStateStore, TaskState, runtime_metadata_snapshot
 
     build_tool = cfg.get("project", {}).get("build_tool")
     if args.fix and build_tool not in _SUPPORTED_BUILD_TOOLS:
@@ -1402,6 +1402,7 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
         worktree_path=str(worktree_project_root),
         worktree_base=str(worktree_base),
         worktree_branch=branch,
+        runtime_metadata=runtime_metadata_snapshot(),
     )
     store.save(state)
     task_label = Path(args.description_file).name if args.description_file else description.splitlines()[0][:60]
