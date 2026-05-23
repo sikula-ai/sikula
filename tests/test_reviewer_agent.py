@@ -8,9 +8,17 @@ from unittest.mock import MagicMock
 import pytest
 
 from agents.base_agent import AGENT_SECURITY_PREFIX
-from agents.reviewer_agent import ReviewerAgent, _MAX_DIFF_CHARS
+from agents.reviewer_agent import (
+    ReviewerAgent,
+    _MAX_DIFF_CHARS,
+)
 from tests.conftest import StubLLMClient
 from core.state import TaskState
+from core.validation_coverage import (
+    extract_validation_commands,
+    validation_command_coverage,
+    validation_commands_equivalent,
+)
 from tools.base_tool import ToolResult
 
 
@@ -278,6 +286,151 @@ class TestReviewerAgentPrompt:
         prompt = stub_llm.readonly_calls[0]
         assert "contract-bearing test was deleted, relaxed" in prompt
         assert "report the production-code issue" in prompt
+
+    def test_validation_pipeline_context_covers_task_commands(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(
+            task_description=(
+                "Add config validation.\n\n"
+                "Acceptance criteria:\n"
+                "- Run `cargo fmt --all -- --check`.\n"
+                "- Run `cargo test --workspace --all-features`.\n"
+            )
+        )
+        config = {
+            "project": {"build_tool": "cargo"},
+            "build": {
+                "test_command": "cargo test --workspace --all-features",
+                "checks": [
+                    {
+                        "name": "fmt",
+                        "command": "cargo fmt --all -- --check",
+                        "fix_command": "cargo fmt --all",
+                    }
+                ],
+            },
+        }
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+
+        assert "Configured validation pipeline" in prompt
+        assert "`cargo fmt --all -- --check` -> covered by check/fmt (exact)" in prompt
+        assert "`cargo test --workspace --all-features` -> covered by test/tests (exact)" in prompt
+        assert "do not ask the implementer to run it manually" in prompt
+
+    def test_validation_pipeline_context_marks_near_match_uncovered(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(
+            task_description=(
+                "Add config validation.\n\nAcceptance criteria:\n- Run `cargo test --workspace --all-features`.\n"
+            )
+        )
+        config = {
+            "project": {"build_tool": "cargo"},
+            "build": {"test_command": "cargo test"},
+        }
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+
+        assert (
+            "`cargo test --workspace --all-features` -> not covered by configured pipeline "
+            "(nearest test/tests: `cargo test`; same command family)"
+        ) in prompt
+        assert "`cargo test --workspace --all-features` -> covered" not in prompt
+
+    def test_validation_pipeline_context_marks_uncovered_task_command(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(
+            task_description="Add export support. Acceptance: run `cargo run -p codegen_tool -- fixtures/`."
+        )
+        config = {
+            "project": {"build_tool": "cargo"},
+            "build": {
+                "test_command": "cargo test",
+                "checks": [{"name": "fmt", "command": "cargo fmt --check"}],
+            },
+        }
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+
+        assert "`cargo run -p codegen_tool -- fixtures/` -> not covered by configured pipeline" in prompt
+        assert "report a Validation Coverage Gap" in prompt
+
+    def test_validation_pipeline_context_respects_disabled_checks(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(task_description="Format the project. Run `ruff format --check .`.")
+        config = {
+            "run_checks": False,
+            "project": {"build_tool": "python"},
+            "build": {"checks": [{"name": "ruff-format", "command": "ruff format --check ."}]},
+        }
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+
+        assert "checks=off" in prompt
+        assert "check/ruff-format" not in prompt
+        assert "`ruff format --check .` -> not covered by configured pipeline" in prompt
+
+    def test_report_only_review_does_not_claim_pipeline_will_run(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(
+            review_mode="review_report",
+            task_description="Review branch. Run `cargo test --workspace` before merge.",
+        )
+        config = {
+            "project": {"build_tool": "cargo"},
+            "build": {"test_command": "cargo test --workspace"},
+        }
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+
+        assert "build=off, tests=off, checks=off" in prompt
+        assert "`cargo test --workspace` -> not covered by configured pipeline" in prompt
+
+    def test_validation_command_extraction_is_limited_to_command_like_text(self):
+        text = (
+            "Use `ConfigDocument` and `parse_config`.\n"
+            "Document `npm test` in README.\n"
+            "make sure validation still passes.\n"
+            "go through parser edge cases.\n"
+            "- `cargo run -p codegen_tool -- fixtures/` should keep passing for committed fixtures.\n"
+            "```yaml\ncommand: npm test\n```\n"
+            "```markdown\nnpm test\n```\n"
+            "Run: `cargo test --workspace`\n"
+            "```bash\n$ ruff check .\n# comment\n```\n"
+        )
+
+        assert extract_validation_commands(text) == [
+            "cargo run -p codegen_tool -- fixtures/",
+            "cargo test --workspace",
+            "ruff check .",
+        ]
+
+    def test_validation_command_matching_keeps_scripts_and_targets_distinct(self):
+        assert not validation_commands_equivalent("npm run lint", "npm run test")[0]
+        assert not validation_commands_equivalent("pnpm run lint", "pnpm run test")[0]
+        assert not validation_commands_equivalent("python scripts/check.py", "python scripts/test.py")[0]
+        assert not validation_commands_equivalent(
+            "xcodebuild test -scheme App",
+            "xcodebuild test -scheme AppTests",
+        )[0]
+
+    def test_validation_command_coverage_requires_exact_command(self):
+        configured = [{"phase": "test", "name": "tests", "command": "cargo test"}]
+
+        covered, match_kind, nearest = validation_command_coverage(
+            "cargo test --workspace --all-features",
+            configured,
+        )
+
+        assert not covered
+        assert match_kind == "same command family"
+        assert nearest == configured[0]
 
 
 class TestReviewerAgentHistory:

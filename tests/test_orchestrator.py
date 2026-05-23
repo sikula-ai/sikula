@@ -130,11 +130,12 @@ def _make_orchestrator(
     tmp_path: Path,
     **config_kwargs,
 ) -> tuple[Orchestrator, dict[str, StubAgent], StubBuildTool]:
+    project_config = config_kwargs.pop("project_config", {"project": {"build_tool": "python"}})
     config = OrchestratorConfig(
         project_root=tmp_path,
         allowed_write_paths=["."],
         allowed_read_paths=["."],
-        project_config={"project": {"build_tool": "python"}},
+        project_config=project_config,
         **config_kwargs,
     )
     store = JsonStateStore(tmp_path / "state")
@@ -179,6 +180,78 @@ def _save_state(orch: Orchestrator, **kwargs) -> TaskState:
 
 
 class TestOrchestratorLoop:
+    def test_agents_receive_effective_pipeline_flags(self, tmp_path: Path):
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            allowed_write_paths=["."],
+            allowed_read_paths=["."],
+            run_build=True,
+            run_tests=True,
+            run_checks=False,
+            project_config={
+                "project": {"build_tool": "python"},
+                "run_checks": True,
+                "build": {"checks": [{"name": "ruff", "command": "ruff check ."}]},
+            },
+        )
+
+        orch = Orchestrator(config=config, llm=StubLLMClient(), state_store=JsonStateStore(tmp_path / "state"))
+
+        effective = orch._agents["reviewer"].project_config["__sikula_effective_pipeline"]
+        assert effective == {"run_build": True, "run_tests": True, "run_checks": False}
+
+    def test_uncovered_task_validation_command_fails_before_agents(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=True,
+            run_checks=True,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "build": {
+                    "test_command": "cargo test",
+                    "checks": [{"name": "fmt", "command": "cargo fmt --check"}],
+                },
+            },
+        )
+
+        result = orch.run(
+            task_description="Add export support. Acceptance: run `cargo run -p codegen_tool -- fixtures/`."
+        )
+
+        assert result.failed
+        assert not stubs["analyst"].calls
+        assert any(
+            entry["action"] == "abort" and "validation coverage gap" in entry["result"] for entry in result.history
+        )
+        assert any(
+            entry["phase"] == "validation_coverage" and entry["status"] == "failed"
+            for entry in result.validation_cycle_records
+        )
+
+    def test_near_match_task_validation_command_fails_before_agents(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=True,
+            run_checks=True,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "build": {"test_command": "cargo test"},
+            },
+        )
+
+        result = orch.run(task_description="Update config loader. Run `cargo test --workspace --all-features`.")
+
+        assert result.failed
+        assert not stubs["analyst"].calls
+        assert any(
+            entry["phase"] == "validation_coverage"
+            and entry["status"] == "failed"
+            and "cargo test --workspace --all-features" in entry.get("error_excerpt", "")
+            for entry in result.validation_cycle_records
+        )
+
     def test_done_task_skips_all_agents(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path)
         _save_state(orch, done=True)

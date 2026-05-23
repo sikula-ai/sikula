@@ -630,6 +630,9 @@ file that was already dirty before the run is still detected as changed if the a
 - recent test-failure fixer records from `state.fix_cycle_records` — only records whose
   `errors_before.test` is non-empty are summarized, so the reviewer can audit whether a
   test-failure fix weakened a task, guideline, or structured input contract.
+- effective configured validation pipeline — compile/test/check commands that the
+  orchestrator will run, including `fix_command` entries, plus task-described validation
+  commands extracted from `state.task_description` and marked as covered or not covered.
 
 The agent reads the diff, then uses its `Read` tool to inspect any changed file in full.
 New files (not in the diff) are read directly via their paths in `state.files_changed`.
@@ -651,6 +654,14 @@ New files (not in the diff) are read directly via their paths in `state.files_ch
    records show that a task/guideline/structured-contract test was deleted, relaxed, or
    changed to a different invalid fixture, the reviewer uses that as evidence to re-check
    the production contract and reports the production issue when it still exists.
+8. *Validation command coverage* — explicit validation commands in task descriptions are
+   treated as acceptance criteria for the configured validation pipeline. The reviewer does not block
+   merely because a covered command has not yet run during review; the build/test/check
+   loop owns execution. If a task-described command is not covered by configured
+   compile/test/check commands, the run fails as a validation coverage gap before the
+   agent loop. A same-tool-family command with materially different flags, targets,
+   scripts, packages, schemes, or paths is reported as a near match, not accepted as
+   coverage. Report-only review may still report the same gap as a review issue.
 
 Test-file policy is mode-specific. In normal `sikula run` mode, test files are not
 reviewer-owned output; the reviewer does not block approval because tests are stale,
@@ -1090,6 +1101,17 @@ checks:
 When a check fails and `fix_command` is set, the orchestrator runs the fix immediately instead of calling the fixer agent. If the fix succeeds, the check re-runs. If the re-run passes, the task proceeds as if the check had passed on the first try — the fixer agent is never called. If the fix fails or the re-run still fails, the error is treated as a normal check failure and the fixer agent runs on the next loop iteration.
 
 Use `fix_command` only for deterministic, idempotent formatters (e.g. `ruff format`, `ktlint --format`, `./gradlew spotlessApply`) — not for linters or checks that require human judgment.
+
+Do not rely on task descriptions to execute validation commands. Agents may mention or
+review them, but only configured build/test/check commands are executable pipeline steps.
+When the task text requires a validation command that is not represented by the effective
+pipeline config, Sikula reports a validation coverage gap instead of asking an agent to run
+the command manually. A command from the same tool family is only a diagnostic near match
+when flags, targets, scripts, packages, schemes, or paths differ. This is not fixed inside
+the current task worktree: update
+the Sikula config file used for the run (default `.sikula/config.yaml`, or the file passed
+with `--config`) or the task and rerun so the effective pipeline is loaded with the right
+command set.
 
 #### `planner` config keys
 

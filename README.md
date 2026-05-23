@@ -155,6 +155,20 @@ Sikula runs the reviewer and security reviewer as independent agents — neither
 
 The build loop closes the other gap: code that doesn't compile or pass enabled tests and checks is not accepted as a successful result. The fixer iterates until it does, or the task fails explicitly so you know what to fix.
 
+Task descriptions often mention validation commands such as formatters, linters, tests,
+or report generators. Sikula treats those as acceptance criteria for the configured
+pipeline, not as shell commands for agents to run manually. The reviewer sees the
+effective build/test/check commands from the Sikula config file (auto-discovered
+`.sikula/config.yaml` by default, or the file passed with `--config`). That configured
+validation pipeline is what Sikula can execute. Validation command coverage is the
+preflight/reviewer check that task-described commands are represented by that pipeline.
+If a task command is not covered there, it is reported as a validation coverage gap so
+you can add the same command to the effective build/test/check config or adjust the task
+before rerunning. A generic command from the same tool family is not enough when the
+task specifies materially different flags, targets, scripts, packages, schemes, or paths.
+Sikula does not ask the implementer to edit the pipeline config inside the current
+task, because the effective pipeline is loaded before the agent loop starts.
+
 ## When Sikula fits
 
 - **Well-defined tasks** — adding a screen, an endpoint, a refactor with clear scope; the analyst reads your codebase and the reviewer verifies the implementer stayed on task
@@ -413,7 +427,7 @@ run_build_per_step: false  # build/fix once after all steps (true = after each s
 
 Every `run_*` key (and `build.presync_clean`) can be overridden per-run without editing the YAML. Flag omitted = use config value.
 
-The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or the active build/fix loop reaches `sandbox.max_iterations`. In multi-step runs, `implement → review → security review → test write` runs for each planned step, then a final full-task gate runs before final build/fix validation. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags.
+The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or the active build/fix loop reaches `sandbox.max_iterations`. In multi-step runs, `implement → review → security review → test write` runs for each planned step, then a final full-task gate runs before final build/fix validation. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags. Commands written in a task description are not executed directly from task text; put executable validation commands in the effective Sikula config file so the pipeline can run and audit the same flags, targets, scripts, packages, schemes, and paths.
 
 `run_build_per_step: true` runs the build/fix loop after each individual step; multi-step runs still get the final full-task gate and final build/fix loop after all planned steps complete. Each per-step loop and the final full-task loop gets its own `max_iterations` budget, while `build_iterations` remains a total audit counter. Leave it `false` unless you explicitly want every step physically built; planner steps should still keep immediate compile dependencies together, such as resource or localization keys, route/API/command constants, service registrations, and interface implementations. Build-fix reviews during per-step builds stay scoped to that step; build-fix reviews in the final phase are scoped to the complete task, not the last planned step. See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed description of the planner and the step loop.
 
