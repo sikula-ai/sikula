@@ -6,7 +6,7 @@
 
 Sikula is a stateful software engineering pipeline for real codebases, powered by specialized AI agents.
 
-`sikula run` reads your codebase, writes the code, fixes build, test, and check failures, and iterates until done — committing the result to a dedicated branch. From the outside, it behaves as a single agent. Inside, it's a pipeline of specialized ones: analyst → planner → implementer → reviewer → security reviewer → test writer → build/fix loop. The reviewer and security reviewer do not receive the implementer's reasoning — they review the task description, analyst prompt, changed files, and diff independently.
+`sikula run` reads your codebase, writes the code, fixes build, test, and check failures, and iterates until done — committing the result to a dedicated branch. From the outside, it behaves as a single agent. Inside, it's a pipeline of specialized ones: analyst → planner → implementer → reviewer → security reviewer → test writer → build/fix loop. For multi-step tasks, implement/review/security/test phases run per step, then a final full-task gate checks the finished branch before final validation. The reviewer and security reviewer do not receive the implementer's reasoning — they review the task description, analyst prompt, changed files, and diff independently.
 
 `sikula review` reviews an existing branch — report-only, or with `--fix` to apply corrections through the same build and fix loop.
 
@@ -18,26 +18,35 @@ Sikula is a stateful software engineering pipeline for real codebases, powered b
 Task description
       │
       ▼
-  Analyst ──────────── reads codebase, produces implementation prompt
+  Analyst ───────────── reads codebase, produces implementation prompt
       │
       ▼
-  Planner ──────────── single-pass or splits into ordered steps
+  Planner ───────────── SINGLE_PASS or ordered steps
+      │
+      ├─ SINGLE_PASS
+      │     │
+      │     ▼
+      │  Implementer ◄────────── reviewer/security issues
+      │     │
+      │     ▼
+      │  Reviewer → Security Reviewer → Test Writer
+      │
+      └─ MULTI-STEP
+            │
+            ▼
+         for each planned step:
+           Implementer → Reviewer → Security Reviewer → Test Writer
+            │
+            ▼
+         Final full-task gate:
+           Reviewer → Security Reviewer → Test Writer
+
       │
       ▼
- Implementer ◄──────────────────────────────────────────────────┐
-      │                                                         │
-      ▼                                                         │
-  Reviewer (independent) ──── issues ───────────────────────────┤
-      │ approved                                                │
-      ▼                                                         │
-Security Reviewer (independent) ── blocking issues ─────────────┘
-      │ approved
-      ▼
- Test Writer ─────── writes/updates unit tests
-      │
-      ▼
- Build / Fix loop ── compile → test → checks → fixer → repeat
-      │
+ Build / Fix loop ── compile → test → checks → fixer
+      │                         │
+      │                         └─ if fixer changes files:
+      │                              rerun review/security/test in current scope
       ▼
   ✓ Branch ready for human review
 ```
@@ -125,7 +134,7 @@ git diff main...sikula/<branch-name>
 - **Resumable long-running work** — interrupted isolated tasks keep their worktree and can resume from completed phases instead of starting over
 - **Independent review loops** — reviewer and security reviewer run separately from the implementer; blocking issues go back through the implementation loop before the task can finish
 - **Build-aware execution** — Sikula compiles, tests, runs configured checks, and feeds failures to a fixer until the task passes or fails explicitly
-- **Precise scope control** — the analyst reads your codebase before writing the implementation prompt; the reviewer verifies call sites, completeness, and scope drift before code reaches you
+- **Precise scope control** — the analyst reads your codebase before writing the implementation prompt; the reviewer verifies call sites, structured input contracts, completeness, and scope drift before code reaches you
 - **Fits existing git and CI workflows** — output is a normal git branch and commit, ready for human review and whatever CI you already run
 - **Stack-flexible core** — Android, iOS, JVM, Python, and Rust are supported through platform-specific build tools; the orchestration stays the same
 - **Configurable and transparent** — each phase can be enabled or disabled, each agent can use a different model/provider, and every run is inspectable with `sikula show <task-id>`
@@ -365,9 +374,9 @@ sikula --config /path/to/.sikula/config.yaml run my_task.md
 | `analyst` | Reads the codebase and task; produces an implementation prompt with exact file paths |
 | `planner` | Decides whether to run single-pass or split the task into ordered steps |
 | `implementer` | Writes the code changes |
-| `reviewer` | Read-only review for correctness, completeness, and dead code; issues are fed back to the implementer |
+| `reviewer` | Read-only review for correctness, completeness, structured input contracts, and dead code; issues are fed back to the implementer |
 | `security_reviewer` | Read-only security review; blocking issues are fed back to the implementer; warnings are logged only |
-| `test_writer` | Writes or updates unit tests after review/security phases complete |
+| `test_writer` | Writes or updates unit tests after review/security phases complete, including positive/negative contract cases for parsers and validators |
 | `fixer` | Fixes build, test, and check failures |
 
 **A few common one-off overrides** (without editing the config YAML — see the full flag reference below):
@@ -399,14 +408,14 @@ run_test_writing:   true   # write/update unit tests after review/security phase
 run_build:          true   # compile check; enables compile/test/check validation and fix loop
 run_tests:          true   # run unit tests after each passing build
 run_checks:         true   # run quality checks (lint, detekt, …) after tests; failures feed the fixer
-run_build_per_step: false  # build/fix once after all steps (true = after each step — see note below)
+run_build_per_step: false  # build/fix once after all steps (true = after each step plus final build)
 ```
 
 Every `run_*` key (and `build.presync_clean`) can be overridden per-run without editing the YAML. Flag omitted = use config value.
 
-The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or `sandbox.max_iterations` is reached. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags.
+The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or the active build/fix loop reaches `sandbox.max_iterations`. In multi-step runs, `implement → review → security review → test write` runs for each planned step, then a final full-task gate runs before final build/fix validation. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags.
 
-`run_build_per_step: true` runs the build/fix loop after each individual step instead of once after all steps. Leave it `false` unless you explicitly want every step physically built; planner steps should still keep immediate compile dependencies together, such as resource or localization keys, route/API/command constants, service registrations, and interface implementations. See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed description of the planner and the step loop.
+`run_build_per_step: true` runs the build/fix loop after each individual step; multi-step runs still get the final full-task gate and final build/fix loop after all planned steps complete. Each per-step loop and the final full-task loop gets its own `max_iterations` budget, while `build_iterations` remains a total audit counter. Leave it `false` unless you explicitly want every step physically built; planner steps should still keep immediate compile dependencies together, such as resource or localization keys, route/API/command constants, service registrations, and interface implementations. Build-fix reviews during per-step builds stay scoped to that step; build-fix reviews in the final phase are scoped to the complete task, not the last planned step. See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed description of the planner and the step loop.
 
 The **sync** step calls `BuildTool.sync()` once before the first build and again whenever the fixer changes a build-config file. It resolves dependencies and generates any required sources. A sync failure is treated like a build failure — the error is passed to the fixer and the loop continues.
 
@@ -431,7 +440,7 @@ The **sync** step calls `BuildTool.sync()` once before the first build and again
 | `--security-review` / `--no-security-review` | `run_security_review` | Enable/disable security reviewer |
 | `--test-writing` / `--no-test-writing` | `run_test_writing` | Enable/disable test writer |
 | `--tests` / `--no-tests` | `run_tests` | Enable/disable running tests after build |
-| `--build-per-step` / `--no-build-per-step` | `run_build_per_step` | Build after each step vs once after all steps |
+| `--build-per-step` / `--no-build-per-step` | `run_build_per_step` | Also build/fix after each step; final full-task build still runs |
 | `--checks` / `--no-checks` | `run_checks` | Enable/disable quality checks after tests |
 
 **Per-agent LLM flags** (repeatable; `agent` accepts `_` or `-`; valid agents: `analyst`, `planner`, `implementer`, `reviewer`, `security_reviewer`, `test_writer`, `fixer`):
@@ -723,7 +732,7 @@ covers files reported by the provider's `run_agent()` result.
 | `allowed_write_paths` | ImplementerAgent, FixerAgent (build errors) | Production source directories agents may write to |
 | `allowed_test_write_paths` | TestWriterAgent, FixerAgent (test failures, check errors) | Test source directories; agents may write here when fixing test failures or check violations (e.g. detekt) |
 | `allowed_read_paths` | ImplementerAgent, FixerAgent, TestWriterAgent | Directories agents may read from (prompt constraint); `"."` means the entire project root |
-| `max_iterations` | Orchestrator build/fix loop | Max build+fix cycles before task is aborted |
+| `max_iterations` | Orchestrator build/fix loop | Max attempts per active build/fix loop before the task is aborted |
 | `max_review_iterations` | Orchestrator review loop | Max review+implement-fix cycles before task is aborted |
 | `max_security_review_iterations` | Orchestrator security review loop | Max security-review+fix cycles (independent of `max_review_iterations`); default equals `max_review_iterations` if not set |
 
@@ -800,16 +809,16 @@ contracts are auditable in task state.
 | Analyst prompt requires reading each affected file in full before finalising the change list (not just grep hits) | ✓ |
 | Analyst prompt excludes test file changes — test changes are omitted from the implementation prompt and handled by the test writer | ✓ |
 | Guidelines context: analyst, reviewer, and security reviewer receive file content pre-loaded from `guidelines.context_files` (`guidelines.max_file_chars` controls per-file limit; truncated files include a marker instructing the agent to use Read tool for full content); implementer, fixer, and test writer receive filenames and read content via tools | ✓ |
-| Planner agent — triage + split (`run_planner: true`): for small/focused tasks outputs `SINGLE_PASS` and flow is unchanged; for larger tasks breaks the prompt into 2–N ordered steps; each step runs implement→review→security review→test phases, and build/fix runs per step or once after all steps depending on `run_build_per_step` | ✓ |
+| Planner agent — triage + split (`run_planner: true`): for small/focused tasks outputs `SINGLE_PASS` and flow is unchanged; for larger tasks breaks the prompt into 2–N ordered steps; each step runs implement→review→security review→test phases, then a final full-task gate gives the finished branch one whole-task pass against the original task before final validation; build/fix always runs in the final phase when `run_build` is enabled, and can also run per step with `run_build_per_step` | ✓ |
 | Implementer agent — runs LLM as autonomous agent; navigates codebase with file tools, writes changes directly; changed files detected via git diff | ✓ |
 | Implementer, fixer, test writer: receive project guidelines filenames from `guidelines.context_files`; read content via tools | ✓ |
 | Implementer prompt requires transitive dead-code cleanup — symbols that become unreferenced in production code after the change should be removed; test-only references are ignored | ✓ |
 | Per-agent LLM config — each agent can use a different model/provider via `agents.<name>.llm:` in the project YAML | ✓ |
 | Per-agent project-specific rules (`extra_rules`) — plain Markdown file appended to the agent's system prompt under `## Project-specific rules` with explicit priority statement; supported for `reviewer`, `security_reviewer`, `test_writer`, `planner`; active in all modes that invoke the respective agent; path stored in `config_snapshot` | ✓ |
-| Reviewer agent — read-only review after implement, before build; checks completeness, logical correctness, semantic consistency, dead members, and shared function scope; task description is sole scope authority — implementation prompt claims ("caller X intentionally affected") are verified against it; for shared functions greps callers independently and reads each out-of-scope caller file; in normal `sikula run`, test files are handled by the test writer/build loop and only production issues block approval; in `sikula review`, changed test files are reviewed as branch output; issues are fed back to implementer during the main review loop; test-writer changes in `review --fix` get one final validation pass | ✓ |
+| Reviewer agent — read-only review after implement, before build; checks completeness, logical correctness, semantic consistency, dead members, and shared function scope; task description is sole scope authority — implementation prompt claims ("caller X intentionally affected") are verified against it; for shared functions greps callers independently and reads each out-of-scope caller file; in normal `sikula run`, test files are handled by the test writer/build loop and only production issues block approval; in multi-step `sikula run`, step reviews are current-step scoped but the final gate reviews the whole task; in `sikula review`, changed test files are reviewed as branch output; issues are fed back to implementer during the main review loop; test-writer changes in `review --fix` get one final validation pass | ✓ |
 | Review loop: enabled via `run_review`; iteration limit via `sandbox.max_review_iterations`; timeout aborts task | ✓ |
 | Security reviewer agent — read-only security review after the review phase (`run_security_review: true`; independent of `run_review`); blocking issues (hardcoded secrets, injection, missing auth, weak crypto, PII in logs, path traversal, disabled/missing TLS validation) feed back to implementer; warnings are recorded in `state.security_review_cycle_records` and do not block; reruns after every fixer pass | ✓ |
-| Test writer agent — writes/updates unit tests after review/security phases complete (`run_test_writing: true`); receives the original task description to honor explicit testing requirements, scoped by `CURRENT STEP` in multi-step tasks; instructed to stay within `sandbox.allowed_test_write_paths` and avoid production code | ✓ |
+| Test writer agent — writes/updates unit tests after review/security phases complete (`run_test_writing: true`); receives the original task description to honor explicit testing requirements, scoped by `CURRENT STEP` during planned steps and by the complete task in the final multi-step gate; instructed to stay within `sandbox.allowed_test_write_paths` and avoid production code | ✓ |
 | Test writer prompt requires existing test conventions (framework, assertions, naming), explicit null-path coverage, caller checks for modified functions, and parametric/data-driven tests when the project already uses them and the fit is natural | ✓ |
 | Test writer prompt target is configurable via `test_writer.coverage_target` (default: 90%) | ✓ |
 | Test writer agent reruns after any fixer pass that changes files | ✓ |
@@ -825,7 +834,7 @@ contracts are auditable in task state.
 | Compile check (`BuildTool.compile_check()`) — task configurable via `build.compile_task` | ✓ |
 | Build, sync, and test timeouts configurable per project via `build.sync_timeout` / `build.compile_timeout` / `build.test_timeout` | ✓ |
 | Re-sync when fixer changes build-config files (`BuildTool.is_build_config_file()`) | ✓ |
-| Automatic build/fix loop with `sandbox.max_iterations` | ✓ |
+| Automatic build/fix loop with `sandbox.max_iterations` applied per active build/fix loop | ✓ |
 | Guard: implementer failure aborts before build loop (no false `done: true`) | ✓ |
 | Git worktree isolation — each run works in a dedicated branch (`sikula/<task-stem>-<task-id>`) and worktree; on success changes are auto-committed and worktree removed; on failure worktree preserved for resume; `.sikula/worktrees/` auto-added to `.git/info/exclude` (local, not committed); parallel runs never conflict; `--no-isolate` to skip | ✓ |
 | Standalone PR review (`sikula review`) — code + security review on an existing branch via `git diff base...branch` with an explicit PR/task description as scope; report-only (read-only, exits 0/1) or `--fix` to apply corrections and commit them to the branch; per-agent model/provider/timeout and `extra_rules` overrides supported in both modes | ✓ |

@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from core.llm_client import LLMClient
 from sikula import cmd_run
 
 
@@ -181,6 +182,164 @@ class TestMultiStepRun:
         state = store.load(store.list_tasks()[0])
         assert state.done is True
         assert len(state.plan) == 2
+
+    def test_final_full_task_review_can_reject_after_step_reviews_approved(self, git_project: Path):
+        class FinalReviewRejectsFake(LLMClient):
+            def __init__(self) -> None:
+                self.agent_calls = 0
+                self.fixed = False
+                self.final_rejected = False
+                self.reviewer_prompts: list[str] = []
+
+            def generate(self, system, user):
+                return "1. Add subtract function\n2. Add multiply function"
+
+            def run_readonly_agent(self, prompt, cwd):
+                if "Your job: analyze a feature or bug task" in prompt:
+                    return "Add subtract(a, b) and multiply(a, b) to src/calculator.py."
+                if "Your job: verify that a task implementation is complete" in prompt:
+                    self.reviewer_prompts.append(prompt)
+                    if "\nFINAL FULL-TASK REVIEW SCOPE:\n" in prompt and not self.fixed:
+                        self.final_rejected = True
+                        return (
+                            "## Issues\n\n"
+                            "### Incorrect multiplication\n"
+                            "File: src/calculator.py\n"
+                            "Problem: multiply(a, b) returns a + b, so the completed task is wrong.\n"
+                            "Fix: return a * b from multiply(a, b)."
+                        )
+                    return "APPROVED"
+                if "Your job is to identify security vulnerabilities" in prompt:
+                    return "Security checks: no external inputs or sensitive operations introduced.\nAPPROVED"
+                return "APPROVED"
+
+            def run_agent(self, prompt, cwd):
+                calculator = cwd / "src" / "calculator.py"
+                if "REVIEW ISSUES TO FIX:" in prompt:
+                    self.fixed = True
+                    calculator.write_text(
+                        "def add(a, b): return a + b\n"
+                        "def subtract(a, b): return a - b\n"
+                        "def multiply(a, b): return a * b\n"
+                    )
+                    return ["src/calculator.py"], "fixed multiply implementation"
+
+                self.agent_calls += 1
+                if self.agent_calls == 1:
+                    calculator.write_text("def add(a, b): return a + b\ndef subtract(a, b): return a - b\n")
+                    return ["src/calculator.py"], "added subtract"
+
+                calculator.write_text(
+                    "def add(a, b): return a + b\ndef subtract(a, b): return a - b\ndef multiply(a, b): return a + b\n"
+                )
+                return ["src/calculator.py"], "added multiply with incorrect implementation"
+
+        fake = FinalReviewRejectsFake()
+        assert _invoke(git_project, _task(git_project, "Add subtract and multiply."), fake) == 0
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.done is True
+        assert state.final_full_task_review_done is True
+        assert fake.final_rejected is True
+        assert [r["scope"] for r in state.review_cycle_records] == [
+            "step",
+            "step",
+            "final_full_task",
+            "final_full_task",
+        ]
+        assert state.review_cycle_records[2]["approved"] is False
+        assert state.review_cycle_records[3]["approved"] is True
+        assert state.implement_cycle_records[-1]["scope"] == "final_full_task"
+        assert "def multiply(a, b): return a * b" in (git_project / "src" / "calculator.py").read_text()
+
+    def test_final_build_fixer_review_runs_in_full_task_scope(self, git_project: Path):
+        class FinalBuildFixFake(LLMClient):
+            def __init__(self) -> None:
+                self.agent_calls = 0
+                self.reviewer_prompts: list[str] = []
+                self.security_prompts: list[str] = []
+
+            def generate(self, system, user):
+                return "1. Add subtract function\n2. Add multiply function"
+
+            def run_readonly_agent(self, prompt, cwd):
+                if "Your job: analyze a feature or bug task" in prompt:
+                    return "Add subtract(a, b) and multiply(a, b) to src/calculator.py."
+                if "Your job: verify that a task implementation is complete" in prompt:
+                    self.reviewer_prompts.append(prompt)
+                    return "APPROVED"
+                if "Your job is to identify security vulnerabilities" in prompt:
+                    self.security_prompts.append(prompt)
+                    return "Security checks: no external inputs or sensitive operations introduced.\nAPPROVED"
+                return "APPROVED"
+
+            def run_agent(self, prompt, cwd):
+                self.agent_calls += 1
+                calculator = cwd / "src" / "calculator.py"
+                if "BUILD ERRORS:" in prompt:
+                    calculator.write_text(
+                        "def add(a, b):\n"
+                        "    return a + b\n\n"
+                        "def subtract(a, b):\n"
+                        "    return a - b\n\n"
+                        "def multiply(a, b):\n"
+                        "    return a * b\n"
+                    )
+                    return ["src/calculator.py"], "fixed syntax after final build"
+                if self.agent_calls == 1:
+                    calculator.write_text("def add(a, b):\n    return a + b\n\ndef subtract(a, b):\n    return a - b\n")
+                    return ["src/calculator.py"], "added subtract"
+                calculator.write_text(
+                    "def add(a, b):\n"
+                    "    return a + b\n\n"
+                    "def subtract(a, b):\n"
+                    "    return a - b\n\n"
+                    "def multiply(a, b)\n"
+                    "    return a * b\n"
+                )
+                return ["src/calculator.py"], "added multiply with syntax error"
+
+        fake = FinalBuildFixFake()
+        cfg = _cfg(git_project)
+        cfg["run_build"] = True
+        cfg["run_tests"] = False
+        cfg["run_checks"] = False
+
+        with patch("core.llm_client.create_llm_client", return_value=fake):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_file=str(_task(git_project, "Add subtract and multiply."))), cfg)
+
+        assert exc_info.value.code == 0
+        assert len(fake.reviewer_prompts) == 4
+        assert "\nCURRENT STEP REVIEW SCOPE:\n" in fake.reviewer_prompts[0]
+        assert "\nCURRENT STEP REVIEW SCOPE:\n" in fake.reviewer_prompts[1]
+        assert "\nFINAL FULL-TASK REVIEW SCOPE:\n" in fake.reviewer_prompts[2]
+        assert "\nFINAL FULL-TASK REVIEW SCOPE:\n" in fake.reviewer_prompts[3]
+        assert len(fake.security_prompts) == 4
+        assert "\nFINAL FULL-TASK SECURITY SCOPE:\n" in fake.security_prompts[2]
+        assert "\nFINAL FULL-TASK SECURITY SCOPE:\n" in fake.security_prompts[3]
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.done is True
+        assert state.plan_completed is True
+        assert state.final_full_task_review_done is True
+        assert [r["scope"] for r in state.review_cycle_records] == [
+            "step",
+            "step",
+            "final_full_task",
+            "final_full_task",
+        ]
+        assert any(
+            r["phase"] == "build" and r["status"] == "failed" and r.get("scope") == "final_full_task"
+            for r in state.validation_cycle_records
+        )
+        assert "def multiply(a, b):" in (git_project / "src" / "calculator.py").read_text()
 
     def test_step_with_no_changes_is_skipped_not_aborted(self, git_project: Path, fake_llm):
         """A multi-step step that writes no files is skipped (not a fatal abort)."""

@@ -66,6 +66,12 @@ _CHECK_TEST_CONSTRAINT = """\
 _DEFAULT_CONTEXT_FILES = ["README.md"]
 
 
+def _scope(state: TaskState) -> str:
+    if state.active_scope:
+        return state.active_scope
+    return "step" if state.plan else "task"
+
+
 def _test_constraint(state: TaskState) -> str:
     if state.errors:
         return _BUILD_TEST_CONSTRAINT
@@ -134,6 +140,7 @@ class FixerAgent(BaseAgent):
                 {
                     "build_iteration": state.build_iterations,
                     "step": state.current_step,
+                    "scope": _scope(state),
                     "errors_before": errors_snapshot,
                     "fixer_prompt": prompt,
                     "fixer_output": None,
@@ -147,6 +154,7 @@ class FixerAgent(BaseAgent):
             {
                 "build_iteration": state.build_iterations,
                 "step": state.current_step,
+                "scope": _scope(state),
                 "errors_before": errors_snapshot,
                 "fixer_prompt": prompt,
                 "fixer_output": fixer_output,

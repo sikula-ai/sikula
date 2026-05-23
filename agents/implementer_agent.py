@@ -77,6 +77,14 @@ Focus ONLY on the changes described in CURRENT STEP above.
 Do NOT implement future steps — they will be handled in separate passes.\
 """
 
+_FINAL_FULL_TASK_SECTION = """\
+
+FINAL FULL-TASK PHASE:
+All planned steps have been implemented. Fix issues against the complete original task,
+the implementation prompt, and the complete current diff. Do NOT restrict changes to
+the last planned step.\
+"""
+
 _REVIEW_FIX_SECTION = """\
 
 REVIEW ISSUES TO FIX:
@@ -87,6 +95,14 @@ proceeding — the task requirements above still apply in full.
 """
 
 _DEFAULT_CONTEXT_FILES = ["README.md"]
+
+_SCOPE_FINAL_FULL_TASK = "final_full_task"
+
+
+def _scope(state: TaskState) -> str:
+    if state.active_scope:
+        return state.active_scope
+    return "step" if state.plan else "task"
 
 
 class ImplementerAgent(BaseAgent):
@@ -108,13 +124,15 @@ class ImplementerAgent(BaseAgent):
         tech_stack = _tech_stack(self.project_config)
 
         step_section = ""
-        if state.plan:
+        if state.plan and state.active_scope != _SCOPE_FINAL_FULL_TASK:
             step_idx = state.current_step
             step_section = _STEP_SECTION.format(
                 step_num=step_idx + 1,
                 total_steps=len(state.plan),
                 step_description=state.plan[step_idx],
             )
+        elif state.active_scope == _SCOPE_FINAL_FULL_TASK:
+            step_section = _FINAL_FULL_TASK_SECTION
 
         review_fix_section = ""
         if state.review_issues:
@@ -130,7 +148,11 @@ class ImplementerAgent(BaseAgent):
             review_fix_section=review_fix_section,
         )
 
-        step_description = state.plan[state.current_step] if state.plan else None
+        step_description = (
+            state.plan[state.current_step]
+            if state.plan and state.active_scope != _SCOPE_FINAL_FULL_TASK and state.current_step < len(state.plan)
+            else None
+        )
 
         try:
             changed, agent_output = self.llm.run_agent(prompt, cwd=file_tool._root)
@@ -143,6 +165,7 @@ class ImplementerAgent(BaseAgent):
                     "build_iteration": state.build_iterations,
                     "review_iteration": state.review_iterations,
                     "security_review_iteration": state.security_review_iterations,
+                    "scope": _scope(state),
                     "step_description": step_description,
                     "implementer_prompt": prompt,
                     "implementer_output": None,
@@ -158,6 +181,7 @@ class ImplementerAgent(BaseAgent):
                 "build_iteration": state.build_iterations,
                 "review_iteration": state.review_iterations,
                 "security_review_iteration": state.security_review_iterations,
+                "scope": _scope(state),
                 "step_description": step_description,
                 "implementer_prompt": prompt,
                 "implementer_output": agent_output,

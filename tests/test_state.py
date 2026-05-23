@@ -125,6 +125,8 @@ class TestJsonStateStore:
         data.pop("validation_cycle_records", None)
         data.pop("runtime_metadata", None)
         data.pop("final_summary", None)
+        data.pop("build_loop_key", None)
+        data.pop("build_loop_start_iteration", None)
         path.write_text(json.dumps(data))
 
         loaded = store.load("oldobs1")
@@ -133,6 +135,8 @@ class TestJsonStateStore:
         assert loaded.validation_cycle_records == []
         assert loaded.runtime_metadata == {}
         assert loaded.final_summary == {}
+        assert loaded.build_loop_key is None
+        assert loaded.build_loop_start_iteration == 0
 
     def test_load_migrates_mixed_review_cycle_records(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)

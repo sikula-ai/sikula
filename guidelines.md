@@ -215,11 +215,12 @@ Each agent record must include at minimum: the agent's prompt, LLM output (`None
 exception), files written, timestamp, and the correlation keys needed to locate the record
 within the pipeline: `step`, `build_iteration` (`state.build_iterations`),
 `review_iteration` (`state.review_iterations`), `security_review_iteration`
-(`state.security_review_iterations`).
+(`state.security_review_iterations`), and `scope` (`"task"`, `"step"`, or
+`"final_full_task"` when the agent runs after all planned steps).
 
 Validation records are orchestrator-owned and use a smaller shape: `phase`, `status`,
-`build_iteration`, `step`, `timestamp`, optional `elapsed_s`, optional `check_name`, and
-short `error_excerpt` on failure.
+`build_iteration`, `step`, `timestamp`, optional `scope`, optional `elapsed_s`, optional
+`check_name`, and short `error_excerpt` on failure.
 
 Records are append-only and must not drive pipeline control flow — stop/continue decisions
 belong in dedicated state fields (`review_approved`, `security_approved`, `failed`, etc.).
@@ -230,6 +231,7 @@ state.implement_cycle_records.append({
     "build_iteration": state.build_iterations,
     "review_iteration": state.review_iterations,
     "security_review_iteration": state.security_review_iterations,
+    "scope": state.active_scope or ("step" if state.plan else "task"),
     "implementer_prompt": prompt,
     "implementer_output": output,  # None on exception
     "files_written": changed,
@@ -265,6 +267,7 @@ and leave control flow to the orchestrator.
 Each agent has a fixed scope — crossing it silently breaks the pipeline:
 
 - **`AnalystAgent`** must not suggest or generate test file changes — test changes are exclusively the domain of `TestWriterAgent`.
+- **`AnalystAgent`, `ReviewerAgent`, and `TestWriterAgent`** must preserve structured input contracts: parser, validator, expression engine, DSL, config, schema, and rule-engine changes need explicit accepted/rejected cases and expected-result-type handling when typed contexts exist.
 - **`TestWriterAgent`** must only write to paths within `sandbox.allowed_test_write_paths`; production source files are off-limits.
 - **`FixerAgent`** write paths depend on error type: when `state.errors` is non-empty (build failure), only `allowed_write_paths` (production). When only `state.test_errors` or `state.check_errors` are set, the fixer uses `allowed_test_write_paths` — it may need to fix test code directly.
 - **`ReviewerAgent` and `SecurityReviewerAgent`** must never write files — use `run_readonly_agent()` only.

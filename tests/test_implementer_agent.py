@@ -273,6 +273,19 @@ class TestImplementerAgentPrompt:
         assert "step 2 of 2" in prompt.lower()
         assert "Step B" in prompt
 
+    def test_final_full_task_scope_omits_current_step(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        state.plan = ["Step A", "Step B"]
+        state.current_step = 1
+        state.active_scope = "final_full_task"
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "FINAL FULL-TASK PHASE" in prompt
+        assert "CURRENT STEP" not in prompt
+        assert "Do NOT restrict changes to" in prompt
+        assert state.implement_cycle_records[0]["scope"] == "final_full_task"
+        assert state.implement_cycle_records[0]["step_description"] is None
+
     def test_no_step_context_without_plan(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)

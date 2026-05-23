@@ -63,6 +63,16 @@ Steps:
             read the relevant definitions.
       If neither source provides a complete answer, write a ⚠️ WARNING for each missing
       piece — the implementer must verify before implementing.
+      Structured input contract: when the task touches a parser, validator, expression
+      engine, schema, DSL, config loader, rule engine, or any code accepting structured
+      user/project input, include the full validation contract in the implementation
+      prompt. Identify accepted inputs, rejected inputs, expected result types for each
+      context, variable/function scope, literal handling, and whether errors must be
+      caught during validation or may occur at runtime. If the codebase has separate
+      generic and expected-type validation APIs, state which API each context must use.
+      Do not stop at syntax or known-name checks when the task requires a typed or
+      shape-specific contract. Write a ⚠️ WARNING for any missing contract detail the
+      implementer must verify before changing code.
       String resources: for every user-visible string introduced by the task, include
       the exact key and value in the implementation prompt. Determine them from:
         (1) explicit string definitions in the task description — use keys and values
@@ -98,7 +108,10 @@ Steps:
       whether it exists solely to support the behaviour the task is eliminating. If
       yes, it is also in scope — add it to Required Changes and continue the dead
       code sweep from there.
-   6. Acceptance criteria: what a correct implementation looks like
+   6. Acceptance criteria: what a correct implementation looks like. For parser,
+      validator, expression engine, schema, DSL, config loader, or rule engine changes,
+      include explicit accepted and rejected cases, including wrong expected result type
+      cases when typed contexts exist.
 
 Output only the implementation prompt — no preamble, no explanation of your steps.\
 """

@@ -78,6 +78,8 @@ def _final_summary(state: "TaskState") -> dict:
             1 for entry in state.validation_cycle_records if entry.get("status") == "failed"
         ),
         "fix_attempts": len(state.fix_cycle_records),
+        "plan_completed": state.plan_completed,
+        "final_full_task_review_done": state.final_full_task_review_done,
         "review_records_count": len(state.review_cycle_records),
         "security_review_records_count": len(state.security_review_cycle_records),
         "reviewer_runs": len(state.review_cycle_records),
@@ -144,11 +146,16 @@ class TaskState:
     presync_done: bool = False
     plan: list[str] = field(default_factory=list)
     plan_decided: bool = False
+    plan_completed: bool = False
     current_step: int = 0
     step_implemented: bool = False
+    active_scope: Optional[str] = None
+    final_full_task_review_done: bool = False
     files_changed: list[str] = field(default_factory=list)
     build_synced: bool = False
-    build_iterations: int = 0  # counts only build/fix cycles; guarded by max_iterations
+    build_iterations: int = 0  # total build/fix attempts across all build loops
+    build_loop_key: Optional[str] = None
+    build_loop_start_iteration: int = 0
     build_status: Optional[str] = None
     errors: list[str] = field(default_factory=list)
     test_errors: list[str] = field(default_factory=list)
@@ -226,6 +233,8 @@ class TaskState:
             "step": self.current_step,
             "timestamp": _now(),
         }
+        if self.active_scope:
+            entry["scope"] = self.active_scope
         if check_name:
             entry["check_name"] = check_name
         if elapsed_s is not None:

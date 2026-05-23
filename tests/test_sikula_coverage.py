@@ -158,6 +158,8 @@ class TestResetFailedState:
         s.review_iterations = 3
         s.security_review_iterations = 2
         s.build_iterations = 5
+        s.build_loop_key = "task"
+        s.build_loop_start_iteration = 2
         s.errors = ["err"]
         s.test_errors = ["terr"]
         s.check_errors = ["cherr"]
@@ -170,6 +172,8 @@ class TestResetFailedState:
         assert loaded.review_iterations == 0
         assert loaded.security_review_iterations == 0
         assert loaded.build_iterations == 0
+        assert loaded.build_loop_key is None
+        assert loaded.build_loop_start_iteration == 0
         assert loaded.errors == []
         assert loaded.test_errors == []
         assert loaded.check_errors == []
@@ -537,6 +541,35 @@ class TestCmdStatusLabels:
     def test_reviewing_label(self, tmp_path: Path, capsys):
         cfg = self._make_state(tmp_path, "t1", plan_decided=True, files_changed=["a.py"])
         assert "reviewing" in self._run(cfg, capsys)
+
+    def test_final_review_label(self, tmp_path: Path, capsys):
+        cfg = self._make_state(
+            tmp_path, "t1", plan_decided=True, files_changed=["a.py"], active_scope="final_full_task"
+        )
+        assert "final review" in self._run(cfg, capsys)
+
+    def test_final_security_review_label(self, tmp_path: Path, capsys):
+        cfg = self._make_state(
+            tmp_path,
+            "t1",
+            plan_decided=True,
+            files_changed=["a.py"],
+            active_scope="final_full_task",
+            review_approved=True,
+        )
+        assert "final security review" in self._run(cfg, capsys)
+
+    def test_final_test_writing_label(self, tmp_path: Path, capsys):
+        cfg = self._make_state(
+            tmp_path,
+            "t1",
+            plan_decided=True,
+            files_changed=["a.py"],
+            active_scope="final_full_task",
+            review_approved=True,
+            security_approved=True,
+        )
+        assert "final test writing" in self._run(cfg, capsys)
 
     def test_analyzing_label(self, tmp_path: Path, capsys):
         cfg = self._make_state(tmp_path, "t1", presync_done=True)

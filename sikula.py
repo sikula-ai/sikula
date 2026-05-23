@@ -750,6 +750,8 @@ def _reset_failed_state(task_id: str, cfg: dict, store) -> None:
     state.review_iterations = 0
     state.security_review_iterations = 0
     state.build_iterations = 0
+    state.build_loop_key = None
+    state.build_loop_start_iteration = 0
     # Clear pending error blobs so the fixer doesn't see stale errors from before the
     # failure if the build re-fails on the first resumed iteration.
     state.errors.clear()
@@ -996,7 +998,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
         print(f"Total time:      {_fmt_time(total_s)}")
     if longest_s > 0:
         print(f"Longest phase:   {longest_label} ({_fmt_time(longest_s)})")
-    print(f"Build attempts:  {state.build_iterations}/{max_iter}")
+    print(f"Build attempts:  {state.build_iterations} total (max {max_iter}/loop)")
     print(f"Total phases:    {len(state.history)}")
     if state.worktree_branch:
         print(f"Branch:          {state.worktree_branch}")
@@ -1027,18 +1029,19 @@ def _status_label(state) -> str:
         return "CLEANED"
     if state.pid and not _pid_running(state.pid):
         return "INTERRUPTED"
+    final_scope = state.active_scope == "final_full_task"
     if state.build_status == "failed":
-        return "build failed"
+        return "final build failed" if final_scope else "build failed"
     if state.build_iterations and state.build_status != "success":
-        return "building"
+        return "final building" if final_scope else "building"
     if state.tests_up_to_date:
-        return "testing"
+        return "final validation" if final_scope else "testing"
     if state.security_approved:
-        return "writing tests"
+        return "final test writing" if final_scope else "writing tests"
     if state.review_approved:
-        return "security review"
+        return "final security review" if final_scope else "security review"
     if state.files_changed:
-        return "reviewing"
+        return "final review" if final_scope else "reviewing"
     if state.plan_decided:
         return "implementing"
     if state.presync_done:

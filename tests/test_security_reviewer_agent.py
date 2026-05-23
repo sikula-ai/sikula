@@ -283,6 +283,19 @@ class TestSecurityReviewerPrompt:
         assert "Do NOT report missing future planned steps as security issues." in prompt
         assert "  - Step B" in prompt
 
+    def test_final_full_task_security_scope_replaces_step_scope(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.plan = ["Step A", "Step B"]
+        state.current_step = 1
+        state.active_scope = "final_full_task"
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "FINAL FULL-TASK SECURITY SCOPE" in prompt
+        assert "Step context: This security review covers step" not in prompt
+        assert "Do not restrict findings to the last planned step." in prompt
+        assert state.security_review_cycle_records[0]["scope"] == "final_full_task"
+
 
 class TestSecurityReviewerHistory:
     def test_previous_security_reviews_included_in_prompt(self, stub_llm: StubLLMClient, file_tool):
@@ -406,6 +419,37 @@ class TestSecurityReviewerHistory:
         prompt = stub_llm.readonly_calls[0]
         assert "Current step security finding" in prompt
         assert "Old step security finding" not in prompt
+
+    def test_final_scope_history_includes_only_final_security_reviews(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.plan = ["Step A", "Step B"]
+        state.current_step = 1
+        state.active_scope = "final_full_task"
+        state.security_review_cycle_records = [
+            {
+                "step": 1,
+                "scope": "step",
+                "reviewer_output": "Last step security finding",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            },
+            {
+                "step": 1,
+                "scope": "final_full_task",
+                "reviewer_output": "Final security finding",
+                "reviewer_prompt": None,
+                "approved": False,
+                "has_warnings": False,
+                "timestamp": "",
+            },
+        ]
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Final security finding" in prompt
+        assert "Last step security finding" not in prompt
 
 
 class TestSecurityReviewerDiff:

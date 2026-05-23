@@ -212,6 +212,14 @@ class TestTestWriterAgentPrompt:
         assert "Do NOT write brittle tests" in prompt
         assert "opaque view trees" in prompt
 
+    def test_structured_input_contract_matrix_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state(implementation_prompt="Update expression validator")
+        _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "positive/negative contract matrix" in prompt
+        assert "expected result type" in prompt
+        assert "wrong expected result type rejection" in prompt
+
     def test_single_pass_prompt_has_no_current_step(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
@@ -230,6 +238,20 @@ class TestTestWriterAgentPrompt:
         assert "use CURRENT STEP as the primary scope signal" in prompt
         assert "Do not add" in prompt
         assert "tests for future steps" in prompt
+
+    def test_final_full_task_prompt_replaces_current_step_scope(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state(
+            task_description="Add login flow. Add tests for locked accounts.",
+            plan=["Create UI", "Add locked-account validation"],
+            current_step=1,
+            active_scope="final_full_task",
+        )
+        _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "FINAL FULL-TASK TEST SCOPE" in prompt
+        assert "CURRENT STEP:" not in prompt
+        assert "Do not restrict tests to the last planned step." in prompt
+        assert state.test_write_records[0]["scope"] == "final_full_task"
 
     def test_step_scope_handles_out_of_range_current_step(self):
         state = _make_state(plan=["Create UI"], current_step=3)

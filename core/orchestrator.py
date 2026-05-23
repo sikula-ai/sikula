@@ -23,8 +23,10 @@ Loop phases:
                 build-config files changed; triggers re-review + re-test-write if files changed
 
 If state.plan is populated (by PlannerAgent), phases 2-4 run once per step before advancing.
-Phase 5 runs per step only when run_build_per_step is true; otherwise it runs once after
-all planned steps complete. If state.plan is empty, a single pass through phases 2-5 is used.
+After the last step, review/security/test-writing rerun once in final full-task scope so the
+complete diff is checked against the original task. Phase 5 runs per step only when
+run_build_per_step is true; a final full-task build/fix loop still runs after all planned
+steps complete. If state.plan is empty, a single pass through phases 2-5 is used.
 """
 
 from __future__ import annotations
@@ -55,6 +57,24 @@ from tools.gradle_android_tool import AndroidGradleTool
 from tools.python_tool import PythonTool
 
 log = logging.getLogger(__name__)
+
+_SCOPE_FINAL_FULL_TASK = "final_full_task"
+
+
+def _phase_scope_label(state: TaskState) -> str:
+    return "final full-task " if state.active_scope == _SCOPE_FINAL_FULL_TASK else ""
+
+
+def _build_loop_key(state: TaskState) -> str:
+    if state.active_scope == _SCOPE_FINAL_FULL_TASK or state.plan_completed:
+        return _SCOPE_FINAL_FULL_TASK
+    if state.plan:
+        return f"step:{state.current_step}"
+    return "task"
+
+
+def _build_loop_attempts_used(state: TaskState) -> int:
+    return max(0, state.build_iterations - state.build_loop_start_iteration)
 
 
 @dataclass
@@ -494,8 +514,13 @@ class Orchestrator:
     def _run_step_loop(self, state: TaskState) -> None:
         """Iterate over steps in state.plan, running the full implement→build cycle per step."""
         total_steps = len(state.plan)
+        if state.plan_completed:
+            self._run_after_plan_completed(state)
+            return
+
         while state.current_step < total_steps and not state.failed:
             step_idx = state.current_step
+            state.active_scope = None
             step_label = f"Step {step_idx + 1}/{total_steps}: {state.plan[step_idx]}"
             log.info("--- %s ---", step_label[:100])
             state.record("orchestrator", "step_start", step_label)
@@ -519,24 +544,68 @@ class Orchestrator:
                 state.tests_up_to_date = False
                 self._store.save(state)
             else:
-                # All steps implemented, reviewed, and tests written
-                if not state.files_changed:
-                    log.error("All steps were skipped — no file changes produced — task failed")
-                    state.record("orchestrator", "abort", "all steps skipped — no file changes")
-                    state.failed = True
-                    self._store.save(state)
-                    return
-                if self._config.run_build and not self._config.run_build_per_step:
-                    # Deferred build: run the build/fix loop once after all steps
-                    log.info("--- Phase: build/fix (after all steps) ---")
-                    self._run_build_fix_loop(state, set_done=True)
-                else:
-                    if not self._config.run_build:
-                        state.test_status = "skipped"
-                        state.check_status = "skipped"
-                    state.done = True
-                    self._store.save(state)
+                state.plan_completed = True
+                state.final_full_task_review_done = False
+                self._store.save(state)
+                self._run_after_plan_completed(state)
                 return  # last step complete — exit step loop regardless of outcome
+
+    def _run_after_plan_completed(self, state: TaskState) -> None:
+        """Run whole-task gates that apply after every planned step has completed."""
+        if not state.files_changed:
+            log.error("All steps were skipped — no file changes produced — task failed")
+            state.record("orchestrator", "abort", "all steps skipped — no file changes")
+            state.failed = True
+            self._store.save(state)
+            return
+
+        if not state.final_full_task_review_done:
+            self._run_final_full_task_gate(state)
+            if state.failed:
+                self._store.save(state)
+                return
+
+        if not self._config.run_build:
+            state.test_status = "skipped"
+            state.check_status = "skipped"
+            state.done = True
+            self._store.save(state)
+            return
+
+        state.active_scope = _SCOPE_FINAL_FULL_TASK
+        self._store.save(state)
+        log.info("--- Phase: final build/fix (after all steps) ---")
+        self._run_build_fix_loop(state, set_done=True)
+
+    def _run_final_full_task_gate(self, state: TaskState) -> None:
+        """Review/security/test the complete planned task before final validation."""
+        state.active_scope = _SCOPE_FINAL_FULL_TASK
+        log.info("--- Phase: final full-task gate ---")
+        if self._config.run_review:
+            state.review_approved = False
+            state.review_issues.clear()
+            state.review_iterations = 0
+        if self._config.run_security_review:
+            state.security_approved = False
+            state.security_review_iterations = 0
+        if self._config.run_test_writing:
+            state.tests_up_to_date = False
+        self._store.save(state)
+
+        self._run_review_loop(state)
+        if state.failed:
+            return
+
+        self._run_security_review_and_fix_loop(state)
+        if state.failed:
+            return
+
+        self._run_test_write_phase(state)
+        if state.failed:
+            return
+
+        state.final_full_task_review_done = True
+        self._store.save(state)
 
     def _run_single_step(self, state: TaskState, step_idx: int) -> bool:
         """Run one step: implement → review → test write → build/fix. Returns True on success."""
@@ -644,33 +713,41 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _run_build_fix_loop(self, state: TaskState, set_done: bool) -> bool:
-        """Sync → build → test → fix until passing or max_iterations reached.
+        """Sync → build → test → fix until passing or this loop reaches max_iterations.
 
         set_done=True  — sets state.done on success (single-pass mode)
         set_done=False — returns True on success without touching state.done (step-loop mode)
         """
-        while not state.failed and state.build_iterations < self._config.max_iterations:
+        loop_key = _build_loop_key(state)
+        if state.build_loop_key != loop_key:
+            state.build_loop_key = loop_key
+            state.build_loop_start_iteration = state.build_iterations
+            self._store.save(state)
+
+        while not state.failed and _build_loop_attempts_used(state) < self._config.max_iterations:
             state.build_iterations += 1
+            loop_attempt = _build_loop_attempts_used(state)
+            progress = f"{loop_attempt}/{self._config.max_iterations}"
 
             if not state.build_synced:
-                log.info(f"--- Phase: sync ({state.build_iterations}/{self._config.max_iterations}) ---")
+                log.info(f"--- Phase: sync ({progress}) ---")
                 if not self._sync(state):
-                    if not self._run_fix_phase(state):
+                    if not self._run_fix_phase(state, progress):
                         return False
                     self._store.save(state)
                     continue
 
-            log.info(f"--- Phase: build ({state.build_iterations}/{self._config.max_iterations}) ---")
+            log.info(f"--- Phase: build ({progress}) ---")
             if not self._build(state):
-                if not self._run_fix_phase(state):
+                if not self._run_fix_phase(state, progress):
                     return False
                 self._store.save(state)
                 continue
 
             if self._config.run_tests:
-                log.info(f"--- Phase: test ({state.build_iterations}/{self._config.max_iterations}) ---")
+                log.info(f"--- Phase: test ({progress}) ---")
                 if not self._run_tests(state):
-                    if not self._run_fix_phase(state):
+                    if not self._run_fix_phase(state, progress):
                         return False
                     self._store.save(state)
                     continue
@@ -679,8 +756,8 @@ class Orchestrator:
                 state.record_validation("test", "skipped")
 
             if self._config.run_checks:
-                if not self._run_checks(state):
-                    if not self._run_fix_phase(state):
+                if not self._run_checks(state, progress):
+                    if not self._run_fix_phase(state, progress):
                         return False
                     self._store.save(state)
                     continue
@@ -689,17 +766,19 @@ class Orchestrator:
                 state.record_validation("check", "skipped")
 
             # Passing build (and tests/checks if enabled)
+            state.build_loop_key = None
+            state.build_loop_start_iteration = 0
             if set_done:
                 state.done = True
-                self._store.save(state)
+            self._store.save(state)
             return True
 
         if not state.failed:
             log.error(
-                "Reached max build iterations (%d) without a passing build — task failed",
+                "Reached max build iterations (%d) for current build/fix loop without a passing build — task failed",
                 self._config.max_iterations,
             )
-            state.record("orchestrator", "abort", "max build iterations reached")
+            state.record("orchestrator", "abort", "max build iterations reached for current build/fix loop")
             state.failed = True
         self._store.save(state)
         return False
@@ -716,7 +795,7 @@ class Orchestrator:
         # Each fix always gets a follow-up review — abort only after reviewing the last fix.
         while not state.review_approved and not state.failed:
             label = "initial" if state.review_iterations == 0 else f"after fix {state.review_iterations}/{max_fixes}"
-            log.info(f"--- Phase: review ({label}) ---")
+            log.info(f"--- Phase: {_phase_scope_label(state)}review ({label}) ---")
             if not self._refresh_review_fix_diff(state):
                 return
             self._run_agent("reviewer", state)
@@ -735,7 +814,8 @@ class Orchestrator:
             if state.review_iterations >= max_fixes:
                 break
             state.review_iterations += 1
-            log.info(f"--- Phase: implement (review fix {state.review_iterations}/{max_fixes}) ---")
+            scope = _phase_scope_label(state)
+            log.info(f"--- Phase: implement ({scope}review fix {state.review_iterations}/{max_fixes}) ---")
             self._run_agent("implementer", state)
             self._session_code_changed = True
             if state.failed:
@@ -770,7 +850,7 @@ class Orchestrator:
                 if state.security_review_iterations == 0
                 else f"after fix {state.security_review_iterations}/{max_iter}"
             )
-            log.info(f"--- Phase: security review ({sec_label}) ---")
+            log.info(f"--- Phase: {_phase_scope_label(state)}security review ({sec_label}) ---")
             if not self._refresh_review_fix_diff(state):
                 return
             self._run_agent("security_reviewer", state)
@@ -790,7 +870,8 @@ class Orchestrator:
             state.security_review_iterations += 1
             state.review_approved = False
             state.review_iterations = 0
-            log.info(f"--- Phase: implement (security fix {state.security_review_iterations}/{max_iter}) ---")
+            scope = _phase_scope_label(state)
+            log.info(f"--- Phase: implement ({scope}security fix {state.security_review_iterations}/{max_iter}) ---")
             self._run_agent("implementer", state)
             self._session_code_changed = True
             if state.failed:
@@ -813,9 +894,9 @@ class Orchestrator:
             )
             state.failed = True
 
-    def _run_fix_phase(self, state: TaskState) -> bool:
+    def _run_fix_phase(self, state: TaskState, progress: str) -> bool:
         """Run fixer, update sync/review/test flags. Returns True to continue, False if failed."""
-        log.info(f"--- Phase: fix ({state.build_iterations}/{self._config.max_iterations}) ---")
+        log.info(f"--- Phase: fix ({progress}) ---")
         fixer_result = self._run_agent("fixer", state)
         if state.failed:
             return False
@@ -834,6 +915,8 @@ class Orchestrator:
             state.review_iterations = 0
             state.security_review_iterations = 0
             state.tests_up_to_date = False
+            if state.active_scope == _SCOPE_FINAL_FULL_TASK:
+                state.final_full_task_review_done = False
             self._store.save(state)
             self._run_review_loop(state)
             if state.failed:
@@ -847,6 +930,9 @@ class Orchestrator:
             self._review_fix_review_test_changes(state, test_files_changed)
             if state.failed:
                 return False
+            if state.active_scope == _SCOPE_FINAL_FULL_TASK:
+                state.final_full_task_review_done = True
+                self._store.save(state)
         return True
 
     def _run_agent(self, name: str, state: TaskState):
@@ -880,11 +966,11 @@ class Orchestrator:
     def _run_test_write_phase(self, state: TaskState) -> bool:
         if not self._config.run_test_writing or state.tests_up_to_date:
             return False
-        log.info("--- Phase: test write ---")
+        log.info(f"--- Phase: {_phase_scope_label(state)}test write ---")
         result = self._run_agent("test_writer", state)
         return bool((result.data or {}).get("files_written"))
 
-    def _run_checks(self, state: TaskState) -> bool:
+    def _run_checks(self, state: TaskState, progress: str) -> bool:
         """Run all configured quality checks in order. Returns True only if all pass."""
         build_tool: BuildTool = self._tools["build"]
         checks = self._config.project_config.get("build", {}).get("checks", [])
@@ -896,7 +982,7 @@ class Orchestrator:
         all_passed = True
         for check in checks:
             name = check.get("name", "check")
-            log.info(f"--- Phase: check/{name} ({state.build_iterations}/{self._config.max_iterations}) ---")
+            log.info(f"--- Phase: check/{name} ({progress}) ---")
             t0 = time.perf_counter()
             result = build_tool.run_check(name, check)
             elapsed_s = time.perf_counter() - t0

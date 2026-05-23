@@ -874,7 +874,7 @@ class TestCmdRunStateStore:
         assert "This task is already complete; no work was run." in out
         assert "Previous run:" in out
         assert "Longest phase:" in out
-        assert "Build attempts:  2/10" in out
+        assert "Build attempts:  2 total (max 10/loop)" in out
         assert "Total time:" not in out
 
     def test_task_id_terminal_failed_prints_reset_failed_hint(self, tmp_path: Path, capsys):
@@ -907,7 +907,7 @@ class TestCmdRunStateStore:
         assert "sikula run --task-id abc123 --reset-failed" in out
         assert "Previous run:" in out
         assert "Longest phase:" in out
-        assert "Build attempts:  10/10" in out
+        assert "Build attempts:  10 total (max 10/loop)" in out
         assert "Total time:" not in out
 
     def test_task_id_resume_refuses_cleaned_isolated_task(self, tmp_path: Path, capsys):

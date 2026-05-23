@@ -9,7 +9,10 @@ Runs after ImplementerAgent, before the build loop. Checks:
      still referenced in production code?
   5. Shared function scope — for any shared function/extension modified, are all callers
      outside the task scope still behaving correctly in their own context?
-  6. Design compliance — if design/spec files are present in the implementation prompt,
+  6. Structured input contracts — for parsers, validators, expression engines, DSLs,
+     configs, schemas, or rule engines, are accepted/rejected inputs and typed contexts
+     enforced by production validation?
+  7. Design compliance — if design/spec files are present in the implementation prompt,
      verify that the UI implementation matches the design.
 
 Returns approved (success=True) or issues (success=False + state.review_issues populated).
@@ -61,6 +64,9 @@ Review steps:
      in this review. The full task description remains product context, but missing
      future planned steps are not review issues unless they make the current step
      uncompilable or logically incorrect.
+   - If a FINAL FULL-TASK REVIEW SCOPE section is present, all planned steps are
+     complete. Review the complete branch against the original task description and
+     implementation prompt. Do not restrict findings to the last planned step.
    - The implementation prompt defines what the developer planned and how. It is
      authoritative for required changes only. Any claims it makes about out-of-scope code
      ("caller X is unaffected", "no other files need changes", "this caller is
@@ -72,7 +78,7 @@ Review steps:
 2. Examine the diff. Use your Read tool to read each changed file in full for context.
    For any file listed as changed that does not appear in the diff (new file), read it
    with your Read tool.
-3. Evaluate five things only:
+3. Evaluate these things only:
    a. Completeness — did the implementation cover everything the prompt required?
    b. Logical correctness — are all changed call sites, data handlers, and control flows
       correct? Look for cases where data is fetched or received but discarded, handlers
@@ -107,6 +113,17 @@ Review steps:
       implementation against them. Verify that layout, component hierarchy, text labels,
       and visible states match the design. Report any discrepancy as an issue.
       Skip this check if no design files are present in the implementation prompt.
+   h. Structured input contracts — if the task changes a parser, validator, expression
+      engine, schema, DSL, config loader, rule engine, or any code that accepts structured
+      user/project input, verify that production validation enforces the full contract,
+      not just syntax or known names. Check accepted and rejected cases: malformed input,
+      unknown identifiers/functions, invalid shapes, forbidden values, scope or forward
+      reference violations, and expected result type mismatches (for example a boolean
+      value used where a numeric value is required, or a numeric value used where a
+      boolean condition is required). If validation is supposed to reject a case but the
+      implementation accepts it until runtime, silently treats it as valid, or validates
+      it through an API that does not know the expected result type, report it as a
+      production correctness issue.
 
 {test_review_policy}
 
@@ -211,6 +228,23 @@ Future planned steps are context only:
 If previous reviews mention future-step gaps, ignore them unless they also break the current step.\
 """
 
+_FINAL_FULL_TASK_REVIEW_SCOPE = """\
+---
+FINAL FULL-TASK REVIEW SCOPE:
+Review the complete diff against the original task description and implementation prompt.
+Do not restrict findings to the last planned step.
+Verify that all acceptance criteria from the original task survived task splitting.
+Report completeness, correctness, and unintended side-effect issues anywhere in the changed branch.\
+"""
+
+_SCOPE_FINAL_FULL_TASK = "final_full_task"
+
+
+def _scope(state: TaskState) -> str:
+    if state.active_scope:
+        return state.active_scope
+    return "step" if state.plan else "task"
+
 
 def _test_review_policy(state: TaskState) -> str:
     if state.review_mode in {"review_report", "review_fix"}:
@@ -247,7 +281,9 @@ class ReviewerAgent(BaseAgent):
             diff = "(diff not available — use Read tool to inspect changed files)"
 
         step_scope = ""
-        if state.plan:
+        if state.active_scope == _SCOPE_FINAL_FULL_TASK:
+            step_scope = _FINAL_FULL_TASK_REVIEW_SCOPE
+        elif state.plan:
             step_idx = state.current_step
             future_steps = state.plan[step_idx + 1 :]
             future_text = "\n".join(f"  - {step}" for step in future_steps) if future_steps else "  - none"
@@ -283,8 +319,12 @@ class ReviewerAgent(BaseAgent):
         for record in state.review_cycle_records:
             if record.get("reviewer") not in (None, "reviewer"):
                 continue
-            if state.plan and record.get("step") != state.current_step:
-                continue
+            if state.active_scope == _SCOPE_FINAL_FULL_TASK:
+                if record.get("scope") != _SCOPE_FINAL_FULL_TASK:
+                    continue
+            elif state.plan:
+                if record.get("scope") == _SCOPE_FINAL_FULL_TASK or record.get("step") != state.current_step:
+                    continue
             reviewer_history.append(record["reviewer_output"])
         if reviewer_history:
             history_text = "\n\n---\n".join(f"[Review {i + 1}]\n{r}" for i, r in enumerate(reviewer_history))
@@ -310,6 +350,7 @@ class ReviewerAgent(BaseAgent):
                 "step": state.current_step,
                 "build_iteration": state.build_iterations,
                 "review_iteration": state.review_iterations,
+                "scope": _scope(state),
                 "reviewer_prompt": full_prompt,
                 "reviewer_output": output,
                 "approved": approved,
