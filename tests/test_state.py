@@ -76,6 +76,7 @@ class TestJsonStateStore:
             "review_cycle_records",
             "security_review_cycle_records",
             "test_write_records",
+            "testability_gaps",
             "fix_cycle_records",
         ]
         first = keys.index(record_keys[0])
@@ -125,6 +126,7 @@ class TestJsonStateStore:
         data.pop("validation_cycle_records", None)
         data.pop("runtime_metadata", None)
         data.pop("final_summary", None)
+        data.pop("testability_gaps", None)
         data.pop("build_loop_key", None)
         data.pop("build_loop_start_iteration", None)
         path.write_text(json.dumps(data))
@@ -135,8 +137,38 @@ class TestJsonStateStore:
         assert loaded.validation_cycle_records == []
         assert loaded.runtime_metadata == {}
         assert loaded.final_summary == {}
+        assert loaded.testability_gaps == []
         assert loaded.build_loop_key is None
         assert loaded.build_loop_start_iteration == 0
+
+    def test_record_testability_gap_captures_scope_and_metadata(self):
+        state = TaskState(
+            task_id="gap1",
+            task_description="gap task",
+            current_step=2,
+            build_iterations=3,
+            active_scope="final_full_task",
+        )
+        state.record_testability_gap(
+            "test_writer",
+            "TESTABILITY GAP:\ntarget: share sheet",
+            target="share sheet",
+            reason="no UI harness",
+            recommended_action="add UI tests",
+            risk="medium",
+        )
+
+        assert len(state.testability_gaps) == 1
+        gap = state.testability_gaps[0]
+        assert gap["source"] == "test_writer"
+        assert gap["step"] == 2
+        assert gap["build_iteration"] == 3
+        assert gap["scope"] == "final_full_task"
+        assert gap["target"] == "share sheet"
+        assert gap["reason"] == "no UI harness"
+        assert gap["recommended_action"] == "add UI tests"
+        assert gap["risk"] == "medium"
+        assert state.history[-1]["action"] == "testability_gap"
 
     def test_load_migrates_mixed_review_cycle_records(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
@@ -386,7 +418,19 @@ class TestJsonStateStore:
         assert loaded.final_summary["validation_failures_count"] == 0
         assert loaded.final_summary["reviewer_runs"] == 0
         assert loaded.final_summary["security_reviewer_runs"] == 0
+        assert loaded.final_summary["testability_gaps_count"] == 0
         assert loaded.final_summary["llm_retries"] == 1
+
+    def test_final_summary_counts_testability_gaps(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="summary_gaps", task_description="summary gaps task", done=True)
+        state.record_testability_gap("test_writer", "TESTABILITY GAP:\ntarget: native share")
+
+        store.save(state)
+        loaded = store.load("summary_gaps")
+
+        assert loaded is not None
+        assert loaded.final_summary["testability_gaps_count"] == 1
 
     def test_final_summary_counts_review_records_separately(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)

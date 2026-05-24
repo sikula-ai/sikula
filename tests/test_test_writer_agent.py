@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from agents.base_agent import AGENT_SECURITY_PREFIX
-from agents.test_writer_agent import TestWriterAgent, _MAX_DIFF_CHARS, _step_scope
+from agents.test_writer_agent import TestWriterAgent, _MAX_DIFF_CHARS, _parse_testability_gaps, _step_scope
 from tests.conftest import StubLLMClient
 from core.state import TaskState
 from tools.base_tool import ToolResult
@@ -146,6 +146,42 @@ class TestTestWriterAgentSuccess:
         warning = next(e for e in state.history if e["action"] == "write_path_warning")
         assert warning["agent"] == "test_writer"
         assert "src/Login.kt" in warning["result"]
+
+    def test_testability_gap_records_warning_by_default(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = []
+        stub_llm.agent_output = (
+            "TESTABILITY GAP:\n"
+            "target: share sheet opens\n"
+            "reason: no UI test harness\n"
+            "recommended_action: add UI test helper\n"
+            "risk: medium\n"
+        )
+        state = _make_state(active_scope="final_full_task", build_iterations=4)
+        result = _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
+        assert result.success
+        assert state.failed is False
+        assert state.tests_up_to_date is True
+        assert len(state.testability_gaps) == 1
+        gap = state.testability_gaps[0]
+        assert gap["source"] == "test_writer"
+        assert gap["scope"] == "final_full_task"
+        assert gap["build_iteration"] == 4
+        assert gap["target"] == "share sheet opens"
+        assert gap["reason"] == "no UI test harness"
+        assert gap["recommended_action"] == "add UI test helper"
+        assert gap["risk"] == "medium"
+        assert any(e["action"] == "testability_gap" for e in state.history)
+
+    def test_testability_gap_can_fail_by_policy(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = []
+        stub_llm.agent_output = "TESTABILITY GAP:\ntarget: login UI\nreason: no UI harness\nrisk: high\n"
+        state = _make_state()
+        config = {**_config_with_test_paths(), "test_writer": {"testability_gap_policy": "fail"}}
+        result = _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        assert not result.success
+        assert state.failed is True
+        assert state.tests_up_to_date is True
+        assert len(state.testability_gaps) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +327,42 @@ class TestTestWriterAgentDiff:
             state
         )
         assert "truncated" in stub_llm.agent_calls[0]
+
+
+class TestTestabilityGapParsing:
+    def test_extracts_structured_gap(self):
+        gaps = _parse_testability_gaps(
+            "TESTABILITY GAP:\n"
+            "target: native share sheet\n"
+            "reason: no UI test harness\n"
+            "recommended_action: add UI harness\n"
+            "risk: medium\n"
+        )
+        assert gaps == [
+            {
+                "message": (
+                    "TESTABILITY GAP:\n"
+                    "target: native share sheet\n"
+                    "reason: no UI test harness\n"
+                    "recommended_action: add UI harness\n"
+                    "risk: medium"
+                ),
+                "target": "native share sheet",
+                "reason": "no UI test harness",
+                "recommended_action": "add UI harness",
+                "risk": "medium",
+            }
+        ]
+
+    def test_extracts_multiple_gaps(self):
+        gaps = _parse_testability_gaps(
+            "TESTABILITY GAP:\ntarget: native share\nreason: no UI harness\n\n"
+            "TESTABILITY GAP:\ntarget: deep link\nreason: no navigation test helper\n"
+        )
+        assert [gap["target"] for gap in gaps] == ["native share", "deep link"]
+
+    def test_no_marker_returns_empty(self):
+        assert _parse_testability_gaps("No test changes needed.") == []
 
 
 # ---------------------------------------------------------------------------

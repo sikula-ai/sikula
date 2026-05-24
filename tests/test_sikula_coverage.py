@@ -650,6 +650,13 @@ class TestPrintReviewSummary:
         out = capsys.readouterr().out
         assert "APPROVED" in out
 
+    def test_testability_gaps_are_visible(self, capsys):
+        s = self._make_state(review_approved=True, security_approved=True)
+        s.record_testability_gap("test_writer", "TESTABILITY GAP:\ntarget: native share")
+        _print_review_summary(s, "feature/x", "main", 10.0)
+        out = capsys.readouterr().out
+        assert "Testability gaps: 1" in out
+
 
 # ---------------------------------------------------------------------------
 # cmd_review error branches

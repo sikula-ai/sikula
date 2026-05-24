@@ -85,6 +85,7 @@ def _final_summary(state: "TaskState") -> dict:
         "reviewer_runs": len(state.review_cycle_records),
         "security_reviewer_runs": len(state.security_review_cycle_records),
         "test_writer_runs": len(state.test_write_records),
+        "testability_gaps_count": len(state.testability_gaps),
         "llm_retries": sum(1 for entry in state.history if entry.get("action") == "llm_retry"),
         "history_events_count": len(state.history),
         "created_at": state.created_at,
@@ -179,6 +180,7 @@ class TaskState:
     review_cycle_records: list[dict] = field(default_factory=list)
     security_review_cycle_records: list[dict] = field(default_factory=list)
     test_write_records: list[dict] = field(default_factory=list)
+    testability_gaps: list[dict] = field(default_factory=list)
     fix_cycle_records: list[dict] = field(default_factory=list)
     validation_cycle_records: list[dict] = field(default_factory=list)
     task_file: Optional[str] = None
@@ -217,6 +219,36 @@ class TaskState:
         if error:
             entry["error"] = error
         self.history.append(entry)
+
+    def record_testability_gap(
+        self,
+        source: str,
+        message: str,
+        target: str | None = None,
+        reason: str | None = None,
+        recommended_action: str | None = None,
+        risk: str | None = None,
+    ) -> None:
+        message_excerpt = _short_text(message, limit=2000) or ""
+        entry: dict = {
+            "source": source,
+            "step": self.current_step,
+            "build_iteration": self.build_iterations,
+            "message": message_excerpt,
+            "timestamp": _now(),
+        }
+        if self.active_scope:
+            entry["scope"] = self.active_scope
+        if target:
+            entry["target"] = target
+        if reason:
+            entry["reason"] = reason
+        if recommended_action:
+            entry["recommended_action"] = recommended_action
+        if risk:
+            entry["risk"] = risk
+        self.testability_gaps.append(entry)
+        self.record(source, "testability_gap", message_excerpt[:500])
 
     def record_validation(
         self,

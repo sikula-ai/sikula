@@ -691,6 +691,7 @@ def build_orchestrator(cfg: dict, overrides: dict | None = None, state_store=Non
             "allowed_read_paths": sandbox.get("allowed_read_paths", ["."]),
         },
         "build": cfg.get("build", {}),
+        "test_writer": cfg.get("test_writer", {}),
         "agents": {name: _agent_snapshot(name) for name in sorted(_VALID_AGENTS)},
     }
 
@@ -1008,6 +1009,8 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
             print(f"  {f}")
     if state.errors:
         print(f"Errors:          {len(state.errors)} remaining (see: sikula show {state.task_id})")
+    if getattr(state, "testability_gaps", []):
+        print(f"Testability gaps: {len(state.testability_gaps)} (see: sikula show {state.task_id})")
 
     sys.exit(0 if state.done else 1)
 
@@ -1252,6 +1255,8 @@ def _print_review_summary(
     print(f"{'=' * 60}")
     approved = state.review_approved and (state.security_approved if run_security_review else True)
     print(f"Result:  {'APPROVED' if approved else 'ISSUES FOUND'}")
+    if getattr(state, "testability_gaps", []):
+        print(f"Testability gaps: {len(state.testability_gaps)}")
     print(f"\nState ID: {state.task_id}  (sikula show {state.task_id})")
 
 
@@ -1501,6 +1506,7 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
                 "allowed_test_write_paths": sandbox_cfg.get("allowed_test_write_paths", []),
                 "allowed_read_paths": sandbox_cfg.get("allowed_read_paths", ["."]),
             },
+            "test_writer": cfg.get("test_writer", {}),
             "agents": {name: _review_agent_snapshot(name) for name in ("reviewer", "security_reviewer")},
         }
         store.save(state)
@@ -1737,7 +1743,11 @@ planner:
   max_steps: 6
 
 test_writer:
+  # Minimum branch+line coverage target for new/changed code (percentage).
   coverage_target: 90
+  # What to do when safe tests require missing project seams/infrastructure:
+  # warn = record a visible audit warning; fail = fail the task.
+  testability_gap_policy: warn
 """
 
 
