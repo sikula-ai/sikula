@@ -34,6 +34,11 @@ def _make_agent(llm: StubLLMClient, file_tool=None, project_config: dict | None 
     return FixerAgent(llm=llm, tools=tools, project_config=project_config or {})
 
 
+class _FakeBuildTool:
+    def is_build_config_file(self, path: str) -> bool:
+        return path.endswith((".gradle", ".gradle.kts", "pyproject.toml"))
+
+
 # ---------------------------------------------------------------------------
 # Guard conditions
 # ---------------------------------------------------------------------------
@@ -277,6 +282,8 @@ class TestFixerAgentWritePaths:
         prompt = stub_llm.agent_calls[0]
         assert "src/, tests/" in prompt
         assert "fix production code instead of weakening the test" in prompt
+        assert "malformed generated test or test harness assumption" in prompt
+        assert "Treat build files" in prompt
         assert "TEST FAILURE TRIAGE:" in prompt
         assert "classification: production_defect | stale_test | malformed_test | unclear" in prompt
         assert "chosen_fix: production_code | test_code" in prompt
@@ -359,6 +366,31 @@ class TestFixerAgentTestFailureProductionGate:
         assert result.success
         assert state.test_errors == []
 
+    def test_malformed_test_triage_cannot_change_build_config_under_broad_test_path(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
+        stub_llm.agent_result = ["feature/countries/build.gradle.kts"]
+        stub_llm.agent_output = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: malformed_test\n"
+            "contract_affected: none\n"
+            "chosen_fix: production_code\n"
+        )
+        config = {
+            "sandbox": {
+                "allowed_write_paths": ["feature/countries/"],
+                "allowed_test_write_paths": ["feature/countries/"],
+            }
+        }
+        state = _make_state()
+        state.test_errors = ["test failed because source-inspection paths are relative to cwd"]
+        agent = _make_agent(stub_llm, file_tool=file_tool, project_config=config)
+        agent.tools["build"] = _FakeBuildTool()
+        result = agent.run(state)
+        assert not result.success
+        assert state.failed is True
+        assert "build.gradle.kts" in result.message
+
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -426,6 +458,51 @@ class TestTestFailureProductionWrites:
     def test_returns_files_outside_test_paths(self):
         sandbox = {"allowed_test_write_paths": ["tests/"]}
         assert _test_failure_production_writes(["src/Login.kt", "tests/LoginTest.kt"], sandbox) == ["src/Login.kt"]
+
+    def test_broad_module_test_path_treats_build_config_as_production(self):
+        sandbox = {"allowed_test_write_paths": ["feature/countries/"]}
+        assert _test_failure_production_writes(
+            ["feature/countries/build.gradle.kts"],
+            sandbox,
+            _FakeBuildTool(),
+        ) == ["feature/countries/build.gradle.kts"]
+
+    def test_broad_module_test_path_allows_src_test_files(self):
+        sandbox = {"allowed_test_write_paths": ["feature/countries/"]}
+        assert (
+            _test_failure_production_writes(
+                ["feature/countries/src/test/kotlin/CountriesRepositoryTest.kt"],
+                sandbox,
+                _FakeBuildTool(),
+            )
+            == []
+        )
+
+    def test_specific_test_root_allows_test_fixtures(self):
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert (
+            _test_failure_production_writes(
+                ["tests/fixtures/pyproject.toml"],
+                sandbox,
+                _FakeBuildTool(),
+            )
+            == []
+        )
+
+    def test_concatenated_tests_root_allows_test_fixtures(self):
+        sandbox = {"allowed_test_write_paths": ["CountryTests/"]}
+        assert _test_failure_production_writes(["CountryTests/Fixtures/country.json"], sandbox) == []
+
+    def test_root_test_path_still_treats_non_test_source_as_production(self):
+        sandbox = {"allowed_test_write_paths": ["."]}
+        assert _test_failure_production_writes(["src/Login.kt"], sandbox) == ["src/Login.kt"]
+
+    def test_test_marker_does_not_match_unrelated_segment_suffixes(self):
+        sandbox = {"allowed_test_write_paths": ["."]}
+        assert _test_failure_production_writes(
+            ["src/latest/Login.kt", "src/main/kotlin/Latest.kt"],
+            sandbox,
+        ) == ["src/latest/Login.kt", "src/main/kotlin/Latest.kt"]
 
     def test_no_test_paths_treats_all_changed_files_as_production(self):
         assert _test_failure_production_writes(["src/Login.kt"], {}) == ["src/Login.kt"]

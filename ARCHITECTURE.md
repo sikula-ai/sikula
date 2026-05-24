@@ -794,6 +794,14 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
    production code independently (does not rely on the implementation prompt's caller list);
    for callers not in `files_changed`, checks whether existing tests cover their path through
    the modified function and adds tests if not
+10. Prefers behaviour tests through public APIs, public state, public routing contracts,
+    command outputs, or project-standard test helpers. Source-file inspection is a
+    last-resort fallback only; such tests must resolve paths without relying on the runner's
+    current working directory and must not require production source, build configuration,
+    dependency declarations, runtime configuration, or pipeline settings to change merely
+    so the test can pass. If meaningful coverage requires new test infrastructure outside
+    the test write scope, the agent reports a `TESTABILITY GAP` instead of adding brittle
+    source-inspection tests.
 
 **Output written to state:**
 - `state.tests_up_to_date = True` — set on success regardless of whether files changed
@@ -844,6 +852,13 @@ whether the chosen fix changed production code or test code. Sikula enforces thi
 production writes from test-failure fixes: missing triage, copied placeholder triage, or any
 classification other than `production_defect` with `chosen_fix: production_code` marks the task
 failed before the pipeline can accept the change.
+This audit does not rely only on `allowed_test_write_paths`: when a project uses broad test
+write roots, such as a platform module directory that contains both production and test
+sources, Sikula still treats non-test artifacts under that root as production writes. Build
+files, dependency manifests, project/workspace files, generated-source config, and runtime
+configuration therefore cannot be used to make malformed generated tests pass unless the
+fixer explicitly classifies the failure as a production defect and chooses a production-code
+fix.
 
 **Mechanism:** calls `LLMClient.run_agent(prompt, cwd=project_root)`.
 The agent reads the error output, locates relevant files, and applies fixes directly — no file

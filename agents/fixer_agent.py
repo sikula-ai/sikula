@@ -8,7 +8,9 @@ limited to errors the build system or test runner reports.
 
 from __future__ import annotations
 
+import posixpath
 from datetime import datetime, timezone
+from typing import Any
 
 from agents.base_agent import (
     AgentResult,
@@ -69,6 +71,14 @@ _TEST_TEST_CONSTRAINT = """\
   input/output contract, fix production code instead of weakening the test
 - Modify tests only when the test is malformed, stale, or inconsistent with the accepted contract
 - If you choose test_code, explain which accepted contract the test conflicts with
+- If the failure is caused by a malformed generated test or test harness assumption
+  (for example current-working-directory assumptions, brittle source-file inspection,
+  invalid test doubles, or unavailable test APIs), fix the test or test helper. Do not
+  change production source, build configuration, runtime configuration, dependency
+  declarations, or pipeline settings merely to satisfy a malformed test.
+- Treat build files, dependency manifests, project/workspace files, generated-source config,
+  and runtime configuration as production code for this triage. Changing them for a test
+  failure requires `classification: production_defect` and `chosen_fix: production_code`.
 - Do not delete, relax, or rewrite assertions just to make the run green"""
 
 _CHECK_TEST_CONSTRAINT = """\
@@ -76,6 +86,45 @@ _CHECK_TEST_CONSTRAINT = """\
 - Fix ONLY the files named in the check errors — nothing else"""
 
 _DEFAULT_CONTEXT_FILES = ["README.md"]
+_TEST_PATH_MARKERS = {
+    "__tests__",
+    "acceptancetest",
+    "acceptancetests",
+    "androidtest",
+    "commontest",
+    "commontests",
+    "e2etest",
+    "e2etests",
+    "functionaltest",
+    "functionaltests",
+    "integrationtest",
+    "integrationtests",
+    "spec",
+    "specs",
+    "sharedtest",
+    "sharedtests",
+    "test",
+    "testfixtures",
+    "tests",
+    "unittest",
+    "unittests",
+    "uitest",
+    "uitests",
+}
+_TEST_FILE_SUFFIXES = (
+    ".spec.js",
+    ".spec.jsx",
+    ".spec.ts",
+    ".spec.tsx",
+    ".test.js",
+    ".test.jsx",
+    ".test.ts",
+    ".test.tsx",
+    "_spec.py",
+    "_test.py",
+    "_tests.py",
+)
+_TEST_FILE_PREFIXES = ("test_",)
 
 
 def _scope(state: TaskState) -> str:
@@ -105,11 +154,73 @@ def _write_paths_for_state(state: TaskState, sandbox: dict) -> list[str]:
     return paths
 
 
-def _test_failure_production_writes(changed: list[str], sandbox: dict) -> list[str]:
+def _normalize_project_path(path: str) -> str:
+    return posixpath.normpath(str(path).replace("\\", "/")).lower()
+
+
+def _path_parts(path: str) -> list[str]:
+    normalized = _normalize_project_path(path)
+    return [part for part in normalized.split("/") if part and part != "."]
+
+
+def _is_test_path_marker(part: str) -> bool:
+    return part in _TEST_PATH_MARKERS or part.endswith(("tests", "_test", "_tests", "-test", "-tests"))
+
+
+def _root_is_test_specific(root: str) -> bool:
+    return any(_is_test_path_marker(part) for part in _path_parts(root))
+
+
+def _path_is_under_root(path: str, root: str) -> bool:
+    normalized_path = _normalize_project_path(path)
+    normalized_root = _normalize_project_path(root).rstrip("/")
+    if normalized_root in ("", "."):
+        return True
+    return normalized_path == normalized_root or normalized_path.startswith(f"{normalized_root}/")
+
+
+def _is_under_specific_test_root(path: str, roots: list[str]) -> bool:
+    return any(_root_is_test_specific(root) and _path_is_under_root(path, root) for root in roots)
+
+
+def _looks_like_test_artifact(path: str) -> bool:
+    parts = _path_parts(path)
+    if any(_is_test_path_marker(part) for part in parts[:-1]):
+        return True
+    if not parts:
+        return False
+    filename = parts[-1]
+    return filename.startswith(_TEST_FILE_PREFIXES) or filename.endswith(_TEST_FILE_SUFFIXES)
+
+
+def _is_build_config_file(build_tool: Any, path: str) -> bool:
+    if not build_tool or not hasattr(build_tool, "is_build_config_file"):
+        return False
+    try:
+        return bool(build_tool.is_build_config_file(path))
+    except Exception:
+        return False
+
+
+def _test_failure_production_writes(changed: list[str], sandbox: dict, build_tool: Any = None) -> list[str]:
     test_paths = sandbox.get("allowed_test_write_paths", [])
     if not test_paths:
         return list(changed)
-    return _paths_outside_allowed(changed, test_paths)
+    outside_test_paths = set(_paths_outside_allowed(changed, test_paths))
+    production: list[str] = []
+    for path in changed:
+        if path in outside_test_paths:
+            production.append(path)
+            continue
+        if _is_under_specific_test_root(path, test_paths):
+            continue
+        if _looks_like_test_artifact(path):
+            continue
+        if _is_build_config_file(build_tool, path):
+            production.append(path)
+            continue
+        production.append(path)
+    return production
 
 
 def _triage_field(output: str, field: str) -> str:
@@ -208,7 +319,7 @@ class FixerAgent(BaseAgent):
         )
 
         if state.test_errors and not state.errors and not state.check_errors:
-            production_writes = _test_failure_production_writes(changed, sandbox)
+            production_writes = _test_failure_production_writes(changed, sandbox, self.tools.get("build"))
             if production_writes and not _has_valid_production_test_failure_triage(fixer_output):
                 for p in changed:
                     if p not in state.files_changed:

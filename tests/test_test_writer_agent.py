@@ -212,6 +212,15 @@ class TestTestWriterAgentPrompt:
         assert "Do NOT write brittle tests" in prompt
         assert "opaque view trees" in prompt
 
+    def test_source_inspection_fallback_guard_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state(implementation_prompt="Add navigation contract")
+        _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "Source-file inspection tests are a last-resort" in prompt
+        assert "do not depend on the test runner's current working directory" in prompt
+        assert "TESTABILITY GAP:" in prompt
+        assert "build configuration" in prompt
+
     def test_structured_input_contract_matrix_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state(implementation_prompt="Update expression validator")
         _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)

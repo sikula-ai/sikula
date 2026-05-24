@@ -92,6 +92,17 @@ TESTING RULES:
   helpers. Do NOT write brittle tests that inspect UI framework internals, opaque view trees,
   reflection-only private storage, or component type-name strings unless the existing test
   suite already uses that exact pattern for the same UI framework.
+- Prefer behaviour tests through public APIs, public state, public routing contracts, command
+  outputs, or project-standard test helpers. Source-file inspection tests are a last-resort
+  fallback for contracts that cannot be observed through the available test infrastructure.
+  If you use source inspection, keep it self-contained: resolve paths robustly from the test
+  file or repository root, do not depend on the test runner's current working directory, and
+  do not require production source, build configuration, dependency declarations, runtime
+  configuration, or pipeline settings to change just so the inspection test can pass.
+- If meaningful behaviour coverage would require adding new test infrastructure that is
+  outside the test write scope, do not create brittle source-inspection tests as a substitute.
+  Output `TESTABILITY GAP:` with the missing infrastructure or seam and make no file changes
+  for that gap.
 
 WHAT WAS IMPLEMENTED:
 {implementation_prompt}
