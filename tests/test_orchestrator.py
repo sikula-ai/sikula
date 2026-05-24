@@ -1878,6 +1878,33 @@ class TestOrchestratorTestsAndSyncFailure:
         assert result.test_errors
         assert result.test_status == "failed"
 
+    def test_test_failure_preserves_middle_failure_diagnostics(self, tmp_path: Path):
+        orch, _, build = _make_orchestrator(tmp_path, run_build=True, run_tests=True, max_iterations=1)
+        failure_output = (
+            "Compiling workspace\n"
+            + "".join(f"build line {i}\n" for i in range(160))
+            + "thread 'test_rejects_wrong_result_type' panicked at assertion failed\n"
+            + "left: Ok(ParsedConfig)\n"
+            + "right: Err(ValidationError)\n"
+            + "failures:\n"
+            + "    test_rejects_wrong_result_type\n"
+            + "".join(f"Running unrelated test binary {i}\n" for i in range(260))
+            + "error: test failed, to rerun pass `-p example_crate --test validation_tests`\n"
+        )
+
+        def failing_tests() -> ToolResult:
+            build.test_calls += 1
+            return ToolResult(success=False, output=failure_output, error=failure_output)
+
+        build.run_tests = failing_tests
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=True)
+
+        result = orch.run(task_id="t1")
+
+        assert "test_rejects_wrong_result_type" in result.test_errors[-1]
+        test_records = [r for r in result.validation_cycle_records if r["phase"] == "test"]
+        assert "test_rejects_wrong_result_type" in test_records[-1]["error_excerpt"]
+
     def test_sync_failure_appends_to_errors(self, tmp_path: Path):
         orch, _, build = _make_orchestrator(tmp_path, run_build=True, max_iterations=1)
         build.sync_success = False

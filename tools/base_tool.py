@@ -13,12 +13,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from core.diagnostics import diagnostic_excerpt
+
+
+_TOOL_ERROR_LIMIT = 8000
+
 
 @dataclass
 class ToolResult:
     success: bool
     output: str
     error: str = ""
+
+
+def tool_error_excerpt(output: str, limit: int = _TOOL_ERROR_LIMIT) -> str:
+    return diagnostic_excerpt(output, limit=limit)
 
 
 class Sandbox:
