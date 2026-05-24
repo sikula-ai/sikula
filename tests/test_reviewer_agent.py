@@ -17,6 +17,7 @@ from core.state import TaskState
 from core.validation_coverage import (
     configured_validation_commands,
     extract_validation_commands,
+    validation_coverage_gaps,
     validation_command_coverage,
     validation_commands_equivalent,
 )
@@ -412,7 +413,18 @@ class TestReviewerAgentPrompt:
             "ruff check .",
         ]
 
+    def test_validation_command_extraction_handles_shell_edge_cases(self):
+        text = "`cargo test`,\n```bash\npytest\npython 'unterminated\nswift evolve\n```\n"
+
+        assert extract_validation_commands(text) == [
+            "cargo test",
+            "pytest",
+            "python 'unterminated",
+        ]
+
     def test_validation_command_matching_keeps_scripts_and_targets_distinct(self):
+        assert validation_commands_equivalent("`cargo test`", "cargo test") == (True, "exact")
+        assert not validation_commands_equivalent("", "cargo test")[0]
         assert not validation_commands_equivalent("npm run lint", "npm run test")[0]
         assert not validation_commands_equivalent("pnpm run lint", "pnpm run test")[0]
         assert not validation_commands_equivalent("python scripts/check.py", "python scripts/test.py")[0]
@@ -420,7 +432,38 @@ class TestReviewerAgentPrompt:
             "xcodebuild test -scheme App",
             "xcodebuild test -scheme AppTests",
         )[0]
+        assert not validation_commands_equivalent(
+            "xcodebuild test -scheme=App",
+            "xcodebuild test -scheme Other",
+        )[0]
         assert not validation_commands_equivalent("./gradlew testDebugUnitTest", "./gradlew lintDebug")[0]
+
+    def test_validation_command_matching_covers_platform_command_signatures(self):
+        same_family_commands = [
+            ("python -m ruff check .", "ruff check src"),
+            ("python -m pytest tests", "pytest tests/unit"),
+            ("cargo doc", "cargo doc --no-deps"),
+            ("swiftlint lint", "swiftlint lint --strict"),
+            ("swift test", "swift test --parallel"),
+            ("bun run test", "bun run test --coverage"),
+            ("yarn run test", "yarn run test --watch"),
+            ("yarn test", "yarn test --watch"),
+            ("npx eslint .", "npx eslint src"),
+            ("go test ./...", "go test ./pkg"),
+            ("dotnet test", "dotnet test --no-build"),
+        ]
+
+        for left, right in same_family_commands:
+            assert validation_commands_equivalent(left, right) == (True, "same command family")
+
+        distinct_commands = [
+            ("python -m mypy src", "python -m pyright src"),
+            ("cargo run --bin app", "cargo run --bin app -- --help"),
+            ("make test", "make test-ci"),
+        ]
+
+        for left, right in distinct_commands:
+            assert not validation_commands_equivalent(left, right)[0]
 
     def test_validation_command_coverage_requires_exact_command(self):
         configured = [{"phase": "test", "name": "tests", "command": "cargo test"}]
@@ -433,6 +476,32 @@ class TestReviewerAgentPrompt:
         assert not covered
         assert match_kind == "same command family"
         assert nearest == configured[0]
+
+    def test_validation_command_coverage_uses_first_near_match(self):
+        configured = [
+            {"phase": "test", "name": "tests", "command": "cargo test"},
+            {"phase": "test", "name": "all-tests", "command": "cargo test --all-features"},
+        ]
+
+        covered, match_kind, nearest = validation_command_coverage(
+            "cargo test --workspace",
+            configured,
+        )
+
+        assert not covered
+        assert match_kind == "same command family"
+        assert nearest == configured[0]
+
+    def test_validation_command_coverage_ignores_autofix_commands(self):
+        configured = [
+            {"phase": "check_autofix", "name": "format autofix", "command": "ruff format ."},
+        ]
+
+        covered, match_kind, nearest = validation_command_coverage("ruff format .", configured)
+
+        assert not covered
+        assert match_kind == ""
+        assert nearest is None
 
     def test_validation_command_coverage_treats_build_wrappers_as_exact_aliases(self):
         configured = [
@@ -476,16 +545,60 @@ class TestReviewerAgentPrompt:
         assert maven_match_kind == "same command family"
         assert maven_nearest == configured[1]
 
-    def test_configured_gradle_validation_defaults_use_wrapper_command(self):
+    def test_validation_command_coverage_keeps_wrapper_paths_strict(self):
+        configured = [{"phase": "test", "name": "tests", "command": "gradle testDebugUnitTest"}]
+
+        covered, match_kind, nearest = validation_command_coverage(
+            "/opt/gradle/bin/gradlew testDebugUnitTest",
+            configured,
+        )
+
+        assert not covered
+        assert match_kind == "same command family"
+        assert nearest == configured[0]
+
+    def test_configured_validation_defaults_use_expected_commands(self):
         state = _make_state()
 
         android_commands = configured_validation_commands({"project": {"build_tool": "gradle-android"}}, state)
         jvm_commands = configured_validation_commands({"project": {"build_tool": "gradle-jvm"}}, state)
+        xcode_commands = configured_validation_commands({"project": {"build_tool": "xcodebuild"}}, state)
 
         assert {"phase": "build", "name": "compile", "command": "./gradlew compileDebugKotlin"} in android_commands
         assert {"phase": "test", "name": "tests", "command": "./gradlew testDebugUnitTest"} in android_commands
         assert {"phase": "build", "name": "compile", "command": "./gradlew classes"} in jvm_commands
         assert {"phase": "test", "name": "tests", "command": "./gradlew test"} in jvm_commands
+        assert {"phase": "build", "name": "compile", "command": "xcodebuild build -scheme Countries"} in xcode_commands
+        assert {"phase": "test", "name": "tests", "command": "xcodebuild test -scheme Countries"} in xcode_commands
+
+    def test_configured_validation_commands_ignore_invalid_checks(self):
+        state = _make_state()
+        config = {
+            "project": {"build_tool": "python"},
+            "build": {
+                "checks": [
+                    "ruff check .",
+                    {"name": "missing-command"},
+                    {"name": "format", "fix_command": "ruff format ."},
+                ]
+            },
+        }
+
+        commands = configured_validation_commands(config, state)
+
+        assert {"phase": "check", "name": "missing-command", "command": ""} not in commands
+        assert {"phase": "check_autofix", "name": "format autofix", "command": "ruff format ."} in commands
+
+    def test_validation_coverage_gaps_reports_only_uncovered_commands(self):
+        state = _make_state(
+            task_description=("Run `cargo test --workspace` and `cargo run -p codegen_tool -- fixtures/` before merge.")
+        )
+        config = {
+            "project": {"build_tool": "cargo"},
+            "build": {"test_command": "cargo test --workspace"},
+        }
+
+        assert validation_coverage_gaps(config, state) == ["cargo run -p codegen_tool -- fixtures/"]
 
 
 class TestReviewerAgentHistory:
