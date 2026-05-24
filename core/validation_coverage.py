@@ -43,6 +43,8 @@ _VALIDATION_BLOCK_HEADING_RE = re.compile(
     r"^(?:verification|validation|checks?|tests?|test plan|acceptance|before merge)$",
     re.IGNORECASE,
 )
+_PACKAGE_SCRIPT_SHORTCUT_MANAGERS = {"npm", "pnpm", "yarn"}
+_PACKAGE_SCRIPT_SHORTCUTS = {"test"}
 
 
 def _shell_tokens(command: str) -> list[str]:
@@ -63,7 +65,7 @@ def _normalize_command(command: str) -> str:
     return command.rstrip(",;:")
 
 
-def _looks_like_validation_command(command: str) -> bool:
+def _looks_like_validation_command(command: str, *, reject_prose: bool = False) -> bool:
     normalized = _normalize_command(command)
     if not normalized or "\n" in normalized:
         return False
@@ -72,7 +74,7 @@ def _looks_like_validation_command(command: str) -> bool:
     tokens = _shell_tokens(normalized)
     if len(tokens) < 2:
         return True
-    if any(token.lower().strip(".,;:") in _PROSE_MARKERS for token in tokens[1:]):
+    if reject_prose and any(token.lower().strip(".,;:") in _PROSE_MARKERS for token in tokens[1:]):
         return False
     first = tokens[0].removeprefix("./").rsplit("/", 1)[-1]
     second = tokens[1].lower()
@@ -88,9 +90,13 @@ def _looks_like_validation_command(command: str) -> bool:
 def extract_validation_commands(text: str) -> list[str]:
     commands: list[str] = []
 
-    def add(command: str) -> None:
+    def add(command: str, *, reject_prose: bool = False) -> None:
         normalized = _normalize_command(command)
-        if normalized and _looks_like_validation_command(normalized) and normalized not in commands:
+        if (
+            normalized
+            and _looks_like_validation_command(normalized, reject_prose=reject_prose)
+            and normalized not in commands
+        ):
             commands.append(normalized)
 
     in_code_fence = False
@@ -133,10 +139,10 @@ def extract_validation_commands(text: str) -> list[str]:
         if ":" in stripped:
             prefix, _, rest = stripped.partition(":")
             if _VALIDATION_CONTEXT_RE.search(prefix) and "`" not in rest:
-                add(rest)
+                add(rest, reject_prose=True)
         if stripped.startswith("$") or (in_validation_command_block and not has_inline_command):
             before_count = len(commands)
-            add(stripped)
+            add(stripped, reject_prose=not stripped.startswith("$"))
             if len(commands) == before_count and not opens_validation_block:
                 in_validation_command_block = False
         if opens_validation_block:
@@ -154,6 +160,16 @@ def _option_value(tokens: list[str], names: set[str]) -> str:
             if token.startswith(prefix):
                 return token[len(prefix) :]
     return ""
+
+
+def _package_script_signature(manager: str, tokens: list[str]) -> tuple[str, ...]:
+    subcommand = tokens[1] if len(tokens) >= 2 else ""
+    if subcommand == "run":
+        script = next((token for token in tokens[2:] if not token.startswith("-")), "")
+        return (manager, "run", script)
+    if manager in _PACKAGE_SCRIPT_SHORTCUT_MANAGERS and subcommand in _PACKAGE_SCRIPT_SHORTCUTS:
+        return (manager, "run", subcommand)
+    return (manager, subcommand)
 
 
 def _command_signature(command: str) -> tuple[str, ...]:
@@ -216,19 +232,8 @@ def _command_signature(command: str) -> tuple[str, ...]:
     if basename == "swift" and len(tokens) >= 2:
         return ("swift", tokens[1])
 
-    if basename in {"npm", "pnpm", "bun"}:
-        subcommand = tokens[1] if len(tokens) >= 2 else ""
-        if subcommand == "run":
-            script = next((token for token in tokens[2:] if not token.startswith("-")), "")
-            return (basename, "run", script)
-        return (basename, subcommand)
-
-    if basename == "yarn":
-        subcommand = tokens[1] if len(tokens) >= 2 else ""
-        if subcommand == "run":
-            script = next((token for token in tokens[2:] if not token.startswith("-")), "")
-            return ("yarn", "run", script)
-        return ("yarn", subcommand)
+    if basename in {"npm", "pnpm", "bun", "yarn"}:
+        return _package_script_signature(basename, tokens)
 
     if basename in {"npx", "go", "dotnet", "make"}:
         subcommand = next((token for token in tokens[1:] if not token.startswith("-")), "")
@@ -248,6 +253,9 @@ def _exact_command_key(command: str) -> tuple[str, ...]:
             tokens[0] = "gradle"
         elif executable in {"mvnw", "mvn"}:
             tokens[0] = "mvn"
+        elif executable in _PACKAGE_SCRIPT_SHORTCUT_MANAGERS and len(tokens) >= 2:
+            if tokens[1] in _PACKAGE_SCRIPT_SHORTCUTS:
+                tokens[1:2] = ["run", tokens[1]]
     return tuple(tokens)
 
 

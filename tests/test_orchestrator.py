@@ -275,6 +275,43 @@ class TestOrchestratorLoop:
         assert stubs["analyst"].calls
         assert not any(entry["phase"] == "validation_coverage" for entry in result.validation_cycle_records)
 
+    def test_package_script_shortcut_validation_command_is_covered_before_agents(self, tmp_path: Path):
+        cases = [
+            (
+                tmp_path / "npm",
+                {"name": "npm-tests", "command": "npm run test"},
+                "Update package. Run `npm test`.",
+            ),
+            (
+                tmp_path / "yarn",
+                {"name": "yarn-tests", "command": "yarn run test"},
+                "Update package. Run `yarn test`.",
+            ),
+        ]
+
+        for root, check, task_description in cases:
+            root.mkdir()
+            orch, stubs, _ = _make_orchestrator(
+                root,
+                run_build=True,
+                run_tests=False,
+                run_checks=True,
+                project_config={
+                    "project": {"build_tool": "python"},
+                    "build": {
+                        "compile_command": "ruff check .",
+                        "checks": [check],
+                    },
+                },
+            )
+            stubs["implementer"].side_effect = lambda state: state.files_changed.append("src/main.py")
+
+            result = orch.run(task_description=task_description)
+
+            assert not result.failed
+            assert stubs["analyst"].calls
+            assert not any(entry["phase"] == "validation_coverage" for entry in result.validation_cycle_records)
+
     def test_wrapper_alias_validation_command_is_covered_before_agents(self, tmp_path: Path):
         cases = [
             (

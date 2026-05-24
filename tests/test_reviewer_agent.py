@@ -416,6 +416,7 @@ class TestReviewerAgentPrompt:
     def test_validation_command_extraction_handles_shell_edge_cases(self):
         text = (
             "`cargo test`,\n"
+            "`python should`,\n"
             "$ ruff check .\n"
             "Verification:\n"
             "pytest\n"
@@ -428,6 +429,7 @@ class TestReviewerAgentPrompt:
 
         assert extract_validation_commands(text) == [
             "cargo test",
+            "python should",
             "ruff check .",
             "pytest",
             "python 'unterminated",
@@ -468,6 +470,7 @@ class TestReviewerAgentPrompt:
         assert validation_commands_equivalent("`cargo test`", "cargo test") == (True, "exact")
         assert not validation_commands_equivalent("", "cargo test")[0]
         assert not validation_commands_equivalent("npm run lint", "npm run test")[0]
+        assert not validation_commands_equivalent("npm run lint", "npm test")[0]
         assert not validation_commands_equivalent("pnpm run lint", "pnpm run test")[0]
         assert not validation_commands_equivalent("python scripts/check.py", "python scripts/test.py")[0]
         assert not validation_commands_equivalent(
@@ -507,6 +510,18 @@ class TestReviewerAgentPrompt:
         for left, right in distinct_commands:
             assert not validation_commands_equivalent(left, right)[0]
 
+    def test_validation_command_matching_treats_package_script_shortcuts_as_exact_aliases(self):
+        aliases = [
+            ("npm test", "npm run test"),
+            ("npm test -- --watch", "npm run test -- --watch"),
+            ("pnpm test", "pnpm run test"),
+            ("yarn test", "yarn run test"),
+            ("yarn test --watch", "yarn run test --watch"),
+        ]
+
+        for left, right in aliases:
+            assert validation_commands_equivalent(left, right) == (True, "exact")
+
     def test_validation_command_coverage_requires_exact_command(self):
         configured = [{"phase": "test", "name": "tests", "command": "cargo test"}]
 
@@ -544,6 +559,28 @@ class TestReviewerAgentPrompt:
         assert not covered
         assert match_kind == ""
         assert nearest is None
+
+    def test_validation_command_coverage_keeps_package_script_flags_strict(self):
+        configured = [
+            {"phase": "check", "name": "npm-tests", "command": "npm run test"},
+            {"phase": "check", "name": "yarn-tests", "command": "yarn run test"},
+        ]
+
+        npm_covered, npm_match_kind, npm_nearest = validation_command_coverage(
+            "npm test -- --watch",
+            configured,
+        )
+        yarn_covered, yarn_match_kind, yarn_nearest = validation_command_coverage(
+            "yarn test --watch",
+            configured,
+        )
+
+        assert not npm_covered
+        assert npm_match_kind == "same command family"
+        assert npm_nearest == configured[0]
+        assert not yarn_covered
+        assert yarn_match_kind == "same command family"
+        assert yarn_nearest == configured[1]
 
     def test_validation_command_coverage_treats_build_wrappers_as_exact_aliases(self):
         configured = [
