@@ -414,12 +414,54 @@ class TestReviewerAgentPrompt:
         ]
 
     def test_validation_command_extraction_handles_shell_edge_cases(self):
-        text = "`cargo test`,\n```bash\npytest\npython 'unterminated\nswift evolve\n```\n"
+        text = (
+            "`cargo test`,\n"
+            "$ ruff check .\n"
+            "Verification:\n"
+            "pytest\n"
+            "python parser should reject invalid input\n"
+            "```bash\n"
+            "python 'unterminated\n"
+            "swift evolve\n"
+            "```\n"
+        )
 
         assert extract_validation_commands(text) == [
             "cargo test",
+            "ruff check .",
             "pytest",
             "python 'unterminated",
+        ]
+
+    def test_validation_command_extraction_ignores_prose_starting_with_tool_names(self):
+        text = (
+            "python parser should reject invalid quoted strings.\n"
+            "cargo features should remain optional.\n"
+            "npm package should stay private.\n"
+            "Run and report results for:\n"
+            "cargo test --workspace\n"
+            "cargo clippy should not be described as prose here.\n"
+        )
+
+        assert extract_validation_commands(text) == [
+            "cargo test --workspace",
+        ]
+
+    def test_validation_command_extraction_supports_validation_block_headings(self):
+        text = (
+            "## Verification\ncargo test --workspace\nruff check .\nImplementation notes:\npytest remains configured.\n"
+        )
+
+        assert extract_validation_commands(text) == [
+            "cargo test --workspace",
+            "ruff check .",
+        ]
+
+    def test_validation_command_extraction_supports_prompted_bare_commands(self):
+        text = "$ pytest tests/unit\n"
+
+        assert extract_validation_commands(text) == [
+            "pytest tests/unit",
         ]
 
     def test_validation_command_matching_keeps_scripts_and_targets_distinct(self):

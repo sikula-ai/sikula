@@ -21,10 +21,28 @@ _VALIDATION_COMMAND_RE = re.compile(
     r")(?:\s|$)"
 )
 _VALIDATION_CONTEXT_RE = re.compile(
-    r"\b(run|verify|validate|validation|check|test|format|lint|acceptance|before merge)\b",
+    r"\b(run|verify|verification|validate|validation|check|test|format|lint|acceptance|before merge)\b",
     re.IGNORECASE,
 )
 _SHELL_FENCE_LANGS = {"", "bash", "sh", "shell", "zsh", "console", "terminal"}
+_PROSE_MARKERS = {
+    "are",
+    "can",
+    "cannot",
+    "can't",
+    "could",
+    "is",
+    "must",
+    "need",
+    "needs",
+    "should",
+    "will",
+    "would",
+}
+_VALIDATION_BLOCK_HEADING_RE = re.compile(
+    r"^(?:verification|validation|checks?|tests?|test plan|acceptance|before merge)$",
+    re.IGNORECASE,
+)
 
 
 def _shell_tokens(command: str) -> list[str]:
@@ -54,6 +72,8 @@ def _looks_like_validation_command(command: str) -> bool:
     tokens = _shell_tokens(normalized)
     if len(tokens) < 2:
         return True
+    if any(token.lower().strip(".,;:") in _PROSE_MARKERS for token in tokens[1:]):
+        return False
     first = tokens[0].removeprefix("./").rsplit("/", 1)[-1]
     second = tokens[1].lower()
     if first == "make" and second in {"sure", "certain"}:
@@ -75,8 +95,12 @@ def extract_validation_commands(text: str) -> list[str]:
 
     in_code_fence = False
     code_fence_is_shell = False
+    in_validation_command_block = False
     for line in text.splitlines():
         stripped = line.strip()
+        if not stripped:
+            in_validation_command_block = False
+            continue
         if stripped.startswith("```"):
             if in_code_fence:
                 in_code_fence = False
@@ -97,6 +121,12 @@ def extract_validation_commands(text: str) -> list[str]:
         starts_with_inline_command = bool(re.match(r"`[^`\n]+`", stripped))
         context_text = re.sub(r"`[^`\n]+`", "", stripped)
         has_validation_context = bool(_VALIDATION_CONTEXT_RE.search(context_text))
+        heading = stripped.lstrip("#").strip().rstrip(":")
+        opens_validation_block = (
+            not has_inline_command
+            and has_validation_context
+            and (stripped.endswith(":") or _VALIDATION_BLOCK_HEADING_RE.fullmatch(heading) is not None)
+        )
         if has_validation_context or starts_with_inline_command:
             for match in re.finditer(r"`([^`\n]+)`", stripped):
                 add(match.group(1))
@@ -104,8 +134,13 @@ def extract_validation_commands(text: str) -> list[str]:
             prefix, _, rest = stripped.partition(":")
             if _VALIDATION_CONTEXT_RE.search(prefix) and "`" not in rest:
                 add(rest)
-        if not has_inline_command:
+        if stripped.startswith("$") or (in_validation_command_block and not has_inline_command):
+            before_count = len(commands)
             add(stripped)
+            if len(commands) == before_count and not opens_validation_block:
+                in_validation_command_block = False
+        if opens_validation_block:
+            in_validation_command_block = True
 
     return commands
 
