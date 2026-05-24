@@ -14,6 +14,7 @@ from core.state import JsonStateStore, TaskState
 from tools.base_tool import Sandbox, ToolResult
 from tools.cargo_tool import CargoTool
 from tools.gradle_android_tool import AndroidGradleTool
+from tools.node_tool import NodeTool
 from tools.python_tool import PythonTool
 
 
@@ -2129,6 +2130,31 @@ class TestBuildToolFactory:
         assert tool._compile_command == "cargo check --workspace"
         assert tool._test_command == "cargo test --workspace"
         assert tool._timeout == 300
+
+    def test_node_platform_creates_node_tool(self, tmp_path: Path):
+        sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        tool = _build_tool(sandbox, tmp_path, {"project": {"build_tool": "node"}, "build": {}})
+        assert isinstance(tool, NodeTool)
+
+    def test_node_tool_uses_configured_commands(self, tmp_path: Path):
+        sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        config = {
+            "project": {"build_tool": "node"},
+            "build": {
+                "package_manager": "pnpm",
+                "sync_command": "pnpm install --offline",
+                "compile_command": "pnpm typecheck",
+                "test_command": "pnpm test",
+                "timeout": 240,
+            },
+        }
+        tool = _build_tool(sandbox, tmp_path, config)
+        assert isinstance(tool, NodeTool)
+        assert tool._package_manager == "pnpm"
+        assert tool._sync_command == "pnpm install --offline"
+        assert tool._compile_command == "pnpm typecheck"
+        assert tool._test_command == "pnpm test"
+        assert tool._compile_timeout == 240
 
     def test_gradle_jvm_creates_jvm_tool(self, tmp_path: Path):
         from tools.gradle_jvm_tool import JvmGradleTool

@@ -25,6 +25,7 @@
 | `AndroidGradleTool` | `tools/gradle_android_tool.py` | `BuildTool` implementation for Android / Gradle |
 | `JvmGradleTool` | `tools/gradle_jvm_tool.py` | `BuildTool` implementation for JVM backends (Spring Boot, Quarkus, Micronaut, …) |
 | `MavenTool` | `tools/maven_tool.py` | `BuildTool` implementation for Maven projects; auto-detects `./mvnw` |
+| `NodeTool` | `tools/node_tool.py` | `BuildTool` implementation for Node.js / TypeScript / JavaScript projects; detects npm/pnpm/yarn/bun |
 | `PythonTool` | `tools/python_tool.py` | `BuildTool` implementation for Python / pytest |
 | `CargoTool` | `tools/cargo_tool.py` | `BuildTool` implementation for Rust / Cargo |
 | `XcodeTool` | `tools/xcode_tool.py` | `BuildTool` implementation for iOS / Xcode |
@@ -1004,7 +1005,7 @@ Everything else (assemble, …) are platform-specific extras on the subclass.
 | Key | Required | Default | Description |
 |---|---|---|---|
 | `project.root_path` | no | `"."` | Project root; `"."` (the default) resolves to the directory containing `.sikula/config.yaml`; use an absolute path only when the config lives outside the project tree |
-| `project.build_tool` | no | `"gradle-android"` | Selects the `BuildTool` implementation: `"gradle-android"` → `AndroidGradleTool`; `"gradle-jvm"` → `JvmGradleTool`; `"maven"` → `MavenTool`; `"python"` → `PythonTool`; `"cargo"` → `CargoTool`; `"xcodebuild"` → `XcodeTool` |
+| `project.build_tool` | no | `"gradle-android"` | Selects the `BuildTool` implementation: `"gradle-android"` → `AndroidGradleTool`; `"gradle-jvm"` → `JvmGradleTool`; `"maven"` → `MavenTool`; `"node"` → `NodeTool`; `"python"` → `PythonTool`; `"cargo"` → `CargoTool`; `"xcodebuild"` → `XcodeTool` |
 | `project.platform` | no | — | Target platform (e.g. `Android`, `iOS`); injected into agent prompts as part of tech stack |
 | `project.language` | no | — | Tech stack language (e.g. `Kotlin`, `Python`); injected into agent prompts |
 | `project.ui` | no | — | UI framework (e.g. `Jetpack Compose`); injected into agent prompts |
@@ -1047,6 +1048,33 @@ All keys live under `build:` in `.sikula/config.yaml`.
 | `test_command` | `cargo test` | Shell command run by `run_tests()`. Use `cargo test --workspace` for workspace projects |
 | `timeout` | `600` | Timeout in seconds for all CargoTool operations (compile, test, check). Rust compilation is slower than interpreted languages — 600 s is a safe default |
 | `checks` | `[]` | List of named quality checks run when `run_checks: true`. Keys: `name` (display name), `command` (shell command), `timeout` (seconds, defaults to `build.timeout` = 600), optional `fix_command`. Example: `{name: clippy, command: "cargo clippy -- -D warnings", timeout: 120}` |
+
+#### `build` config keys — NodeTool (`project.build_tool: node`)
+
+All keys live under `build:` in `.sikula/config.yaml`.
+
+`sikula init` detects the package manager from lockfiles or `package.json#packageManager`,
+then chooses package-script defaults in this order:
+
+- compile/type-check: `typecheck`, `type-check`, `check-types`, `check`, `build`; when no script exists but `tsconfig*.json` exists, it falls back to `tsc --noEmit` through the package manager.
+- tests: `test`
+- checks: `lint` and a non-mutating format check script such as `format:check`, with `fix_command` set only when a separate formatter script exists.
+
+| Key | Default | Description |
+|---|---|---|
+| `package_manager` | auto-detected `npm`, `pnpm`, `yarn`, or `bun` | Package manager used only for default command generation; explicit command fields always win |
+| `sync_command` | lockfile-aware install (`npm ci`, `pnpm install --frozen-lockfile`, `yarn install --frozen-lockfile`, `bun install --frozen-lockfile`; plain `install` when no matching lockfile exists) | Shell command run by `sync()` |
+| `compile_command` | detected package script, `tsc --noEmit`, or build script fallback | Shell command run by `compile_check()`. Common values: `npm run typecheck`, `pnpm typecheck`, `yarn typecheck`, `npm run build` |
+| `test_command` | package-manager test command (`npm test`, `pnpm test`, `yarn test`, `bun run test`) | Shell command run by `run_tests()` |
+| `sync_timeout` | `600` | Timeout in seconds for `sync()` |
+| `compile_timeout` | `600` | Timeout in seconds for `compile_check()` |
+| `test_timeout` | `600` | Timeout in seconds for `run_tests()` |
+| `checks` | detected non-mutating package scripts, otherwise `[]` | Named quality checks. Keys: `name`, `command`, `timeout`, optional `fix_command`. Example: `{name: lint, command: "npm run lint", timeout: 120}` |
+
+`is_build_config_file` triggers on `package.json`, lockfiles, workspace files
+(`pnpm-workspace.yaml`, `lerna.json`, `rush.json`), `tsconfig*.json`, `jsconfig.json`,
+common framework/tool config files (`vite.config.*`, `next.config.*`, `eslint.config.*`,
+`vitest.config.*`, etc.), files under `.yarn/`, and files under `patches/`.
 
 #### `build` config keys — XcodeTool (`project.build_tool: xcodebuild`)
 
@@ -1123,7 +1151,7 @@ All keys live under `build:` in `.sikula/config.yaml`.
 
 #### `fix_command` in check entries (all BuildTools)
 
-Any check entry may include an optional `fix_command` key — a shell command run automatically when the check fails, before the fixer agent is considered. All BuildTools (PythonTool, AndroidGradleTool, JvmGradleTool, MavenTool, CargoTool, XcodeTool) support it: the orchestrator calls `run_check(f"{name}_autofix", {"command": fix_command})`, forwarding `timeout` only when the check entry explicitly sets it; otherwise the BuildTool falls back to its own default.
+Any check entry may include an optional `fix_command` key — a shell command run automatically when the check fails, before the fixer agent is considered. All BuildTools (PythonTool, AndroidGradleTool, JvmGradleTool, MavenTool, NodeTool, CargoTool, XcodeTool) support it: the orchestrator calls `run_check(f"{name}_autofix", {"command": fix_command})`, forwarding `timeout` only when the check entry explicitly sets it; otherwise the BuildTool falls back to its own default.
 
 ```yaml
 # PythonTool example

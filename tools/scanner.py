@@ -9,6 +9,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from tools.node_tool import (
+    default_node_checks,
+    default_node_compile_command,
+    default_node_sync_command,
+    default_node_test_command,
+    detect_node_language,
+    detect_node_package_manager,
+    read_node_package_scripts,
+)
+
 # (trigger_files, build_tool, language, platform)
 # Priority order: first match wins when resolving ambiguity.
 # When adding a new platform: add an entry here, add path detection helpers below,
@@ -27,6 +37,7 @@ _SIGNATURES: list[tuple[list[str], str, str, str | None]] = [
         "Android",
     ),
     (["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "tox.ini"], "python", "Python", None),
+    (["package.json"], "node", "JavaScript", None),
 ]
 
 _GUIDELINE_CANDIDATES = [
@@ -77,6 +88,11 @@ class ScanResult:
     guidelines_files: list[str] = field(default_factory=list)
     ambiguous_tools: list[str] = field(default_factory=list)
     xcode_scheme: str | None = None
+    package_manager: str | None = None
+    node_sync_command: str | None = None
+    node_compile_command: str | None = None
+    node_test_command: str | None = None
+    node_checks: list[dict[str, str | int]] = field(default_factory=list)
     write_paths: list[str] = field(default_factory=list)
     test_write_paths: list[str] = field(default_factory=list)
 
@@ -131,6 +147,14 @@ def _detect_python_paths(root: Path) -> tuple[list[str], list[str]]:
     return ([f"{src}/"] if src else ["src/"]), ([f"{tests}/"] if tests else ["tests/"])
 
 
+def _detect_node_paths(root: Path) -> tuple[list[str], list[str]]:
+    source_candidates = ("src", "app", "pages", "components", "lib", "server", "client", "packages", "apps")
+    test_candidates = ("tests", "test", "__tests__", "spec", "e2e", "cypress")
+    write_dirs = [f"{d}/" for d in source_candidates if (root / d).is_dir()]
+    test_dirs = [f"{d}/" for d in test_candidates if (root / d).is_dir()]
+    return (write_dirs or ["src/"]), (test_dirs or ["tests/"])
+
+
 def scan(root: Path) -> ScanResult:
     result = ScanResult()
     detected: list[tuple[str, str, str | None]] = []
@@ -183,5 +207,15 @@ def scan(root: Path) -> ScanResult:
         result.test_write_paths = ["src/", "tests/"] if (root / "tests").is_dir() else ["src/"]
     elif result.build_tool == "python":
         result.write_paths, result.test_write_paths = _detect_python_paths(root)
+    elif result.build_tool == "node":
+        scripts = read_node_package_scripts(root)
+        package_manager = detect_node_package_manager(root)
+        result.language = detect_node_language(root)
+        result.package_manager = package_manager
+        result.node_sync_command = default_node_sync_command(root, package_manager)
+        result.node_compile_command = default_node_compile_command(root, package_manager, scripts)
+        result.node_test_command = default_node_test_command(package_manager, scripts)
+        result.node_checks = default_node_checks(package_manager, scripts)
+        result.write_paths, result.test_write_paths = _detect_node_paths(root)
 
     return result

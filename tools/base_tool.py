@@ -4,7 +4,7 @@ Sandbox is shared across all tool instances and enforces the whitelist from conf
 BaseTool subclasses must call sandbox.check_read() / check_write() before any I/O.
 
 BuildTool is the abstract interface for platform-specific build systems.
-Implement it for each platform (AndroidGradleTool for Android, XcodeTool for iOS, …).
+Implement it for each platform (AndroidGradleTool for Android, NodeTool for Node.js, XcodeTool for iOS, …).
 """
 
 from __future__ import annotations

@@ -580,6 +580,27 @@ class TestReviewerAgentPrompt:
         for left, right in aliases:
             assert validation_commands_equivalent(left, right) == (True, "exact")
 
+    def test_node_configured_validation_commands_include_build_test_and_checks(self):
+        state = _make_state()
+        config = {
+            "project": {"build_tool": "node"},
+            "build": {
+                "package_manager": "pnpm",
+                "compile_command": "pnpm typecheck",
+                "test_command": "pnpm test",
+                "checks": [{"name": "lint", "command": "pnpm lint", "fix_command": "pnpm format"}],
+            },
+        }
+
+        commands = configured_validation_commands(config, state)
+
+        assert commands == [
+            {"phase": "build", "name": "compile", "command": "pnpm typecheck"},
+            {"phase": "test", "name": "tests", "command": "pnpm test"},
+            {"phase": "check", "name": "lint", "command": "pnpm lint"},
+            {"phase": "check_autofix", "name": "lint autofix", "command": "pnpm format"},
+        ]
+
     def test_validation_command_coverage_requires_exact_command(self):
         configured = [{"phase": "test", "name": "tests", "command": "cargo test"}]
 

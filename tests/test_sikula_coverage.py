@@ -97,6 +97,11 @@ class TestBuildToolClass:
 
         assert _build_tool_class({"project": {"build_tool": "python"}}) is PythonTool
 
+    def test_node(self):
+        from tools.node_tool import NodeTool
+
+        assert _build_tool_class({"project": {"build_tool": "node"}}) is NodeTool
+
     def test_gradle_android(self):
         from tools.gradle_android_tool import AndroidGradleTool
 

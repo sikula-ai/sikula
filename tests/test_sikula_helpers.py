@@ -255,7 +255,7 @@ class TestGenerateConfig:
         assert "run_presync: true" in cfg
 
     def test_non_gradle_has_presync_false(self):
-        for tool, lang in [("cargo", "Rust"), ("python", "Python"), ("xcodebuild", "Swift")]:
+        for tool, lang in [("cargo", "Rust"), ("python", "Python"), ("node", "TypeScript"), ("xcodebuild", "Swift")]:
             cfg = self._cfg(build_tool=tool, language=lang)
             assert "run_presync: false" in cfg
 
@@ -338,6 +338,26 @@ class TestGenerateConfig:
         cfg = self._cfg(build_tool="maven", language="Java")
         assert "compile_timeout:" in cfg
         assert "test_timeout:" in cfg
+
+    def test_node_build_section_uses_detected_commands(self):
+        cfg = self._cfg(
+            build_tool="node",
+            language="TypeScript",
+            node_package_manager="pnpm",
+            node_sync_command="pnpm install --frozen-lockfile",
+            node_compile_command="pnpm typecheck",
+            node_test_command="pnpm test",
+            node_checks=[{"name": "lint", "command": "pnpm lint", "timeout": 120}],
+        )
+        assert "package_manager: pnpm" in cfg
+        assert 'sync_command: "pnpm install --frozen-lockfile"' in cfg
+        assert 'compile_command: "pnpm typecheck"' in cfg
+        assert 'test_command: "pnpm test"' in cfg
+        assert 'command: "pnpm lint"' in cfg
+
+    def test_node_build_section_has_empty_checks_when_none_detected(self):
+        cfg = self._cfg(build_tool="node", language="JavaScript")
+        assert "checks: []" in cfg
 
     def test_unknown_build_tool_generates_todo_build_section(self):
         cfg = self._cfg(build_tool=None, language=None)

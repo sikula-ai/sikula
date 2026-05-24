@@ -321,6 +321,15 @@ def _default_compile_command(project_config: dict) -> str | None:
         return str(build.get("compile_command") or "cargo check")
     if build_tool == "python":
         return str(build.get("compile_command") or "ruff check .")
+    if build_tool == "node":
+        package_manager = str(build.get("package_manager") or "npm")
+        if package_manager == "npm":
+            default = "npm run build"
+        elif package_manager == "bun":
+            default = "bun run build"
+        else:
+            default = f"{package_manager} build"
+        return str(build.get("compile_command") or default)
     if build_tool == "maven":
         return str(build.get("compile_command") or "mvn compile")
     if build_tool == "gradle-jvm":
@@ -337,6 +346,10 @@ def _default_test_command(project_config: dict) -> str | None:
         return str(build.get("test_command") or "cargo test")
     if build_tool == "python":
         return str(build.get("test_command") or "pytest")
+    if build_tool == "node":
+        package_manager = str(build.get("package_manager") or "npm")
+        default = "bun run test" if package_manager == "bun" else f"{package_manager} test"
+        return str(build.get("test_command") or default)
     if build_tool == "maven":
         return str(build.get("test_command") or "mvn test")
     if build_tool == "gradle-jvm":
