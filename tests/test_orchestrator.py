@@ -130,11 +130,12 @@ def _make_orchestrator(
     tmp_path: Path,
     **config_kwargs,
 ) -> tuple[Orchestrator, dict[str, StubAgent], StubBuildTool]:
+    project_config = config_kwargs.pop("project_config", {"project": {"build_tool": "python"}})
     config = OrchestratorConfig(
         project_root=tmp_path,
         allowed_write_paths=["."],
         allowed_read_paths=["."],
-        project_config={"project": {"build_tool": "python"}},
+        project_config=project_config,
         **config_kwargs,
     )
     store = JsonStateStore(tmp_path / "state")
@@ -179,6 +180,237 @@ def _save_state(orch: Orchestrator, **kwargs) -> TaskState:
 
 
 class TestOrchestratorLoop:
+    def test_agents_receive_effective_pipeline_flags(self, tmp_path: Path):
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            allowed_write_paths=["."],
+            allowed_read_paths=["."],
+            run_build=True,
+            run_tests=True,
+            run_checks=False,
+            project_config={
+                "project": {"build_tool": "python"},
+                "run_checks": True,
+                "build": {"checks": [{"name": "ruff", "command": "ruff check ."}]},
+            },
+        )
+
+        orch = Orchestrator(config=config, llm=StubLLMClient(), state_store=JsonStateStore(tmp_path / "state"))
+
+        effective = orch._agents["reviewer"].project_config["__sikula_effective_pipeline"]
+        assert effective == {"run_build": True, "run_tests": True, "run_checks": False}
+
+    def test_uncovered_task_validation_command_fails_before_agents(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=True,
+            run_checks=True,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "build": {
+                    "test_command": "cargo test",
+                    "checks": [{"name": "fmt", "command": "cargo fmt --check"}],
+                },
+            },
+        )
+
+        result = orch.run(
+            task_description="Add export support. Acceptance: run `cargo run -p codegen_tool -- fixtures/`."
+        )
+
+        assert result.failed
+        assert not stubs["analyst"].calls
+        assert any(
+            entry["action"] == "abort" and "validation coverage gap" in entry["result"] for entry in result.history
+        )
+        assert any(
+            entry["phase"] == "validation_coverage" and entry["status"] == "failed"
+            for entry in result.validation_cycle_records
+        )
+
+    def test_near_match_task_validation_command_fails_before_agents(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=True,
+            run_checks=True,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "build": {"test_command": "cargo test"},
+            },
+        )
+
+        result = orch.run(task_description="Update config loader. Run `cargo test --workspace --all-features`.")
+
+        assert result.failed
+        assert not stubs["analyst"].calls
+        assert any(
+            entry["phase"] == "validation_coverage"
+            and entry["status"] == "failed"
+            and "cargo test --workspace --all-features" in entry.get("error_excerpt", "")
+            for entry in result.validation_cycle_records
+        )
+
+    def test_validation_heading_with_blank_separator_fails_before_agents(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=True,
+            run_checks=True,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "build": {"test_command": "cargo test"},
+            },
+        )
+
+        result = orch.run(task_description="## Verification\n\ncargo test --workspace --all-features\n")
+
+        assert result.failed
+        assert not stubs["analyst"].calls
+        assert any(
+            entry["phase"] == "validation_coverage"
+            and entry["status"] == "failed"
+            and "cargo test --workspace --all-features" in entry.get("error_excerpt", "")
+            for entry in result.validation_cycle_records
+        )
+
+    def test_unknown_review_mode_does_not_skip_validation_coverage_preflight(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=True,
+            run_checks=True,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "build": {"test_command": "cargo test"},
+            },
+        )
+        state = _save_state(
+            orch,
+            review_mode="unknown",
+        )
+        state.task_description = "Update parser. Run `cargo test --workspace --all-features`."
+        orch._store.save(state)
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed
+        assert not stubs["analyst"].calls
+        assert any(entry["phase"] == "validation_coverage" for entry in result.validation_cycle_records)
+
+    def test_prose_starting_with_tool_name_does_not_fail_validation_coverage(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=True,
+            run_checks=True,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "build": {"test_command": "cargo test"},
+            },
+        )
+        stubs["implementer"].side_effect = lambda state: state.files_changed.append("src/main.rs")
+
+        result = orch.run(
+            task_description=(
+                "python parser should reject invalid quoted strings.\n"
+                "cargo features should remain optional.\n"
+                "- `cargo` features should remain optional."
+            )
+        )
+
+        assert not result.failed
+        assert stubs["analyst"].calls
+        assert not any(entry["phase"] == "validation_coverage" for entry in result.validation_cycle_records)
+
+    def test_python_module_validation_command_is_covered_before_agents(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=True,
+            run_checks=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "build": {"test_command": "python3 -m pytest"},
+            },
+        )
+        stubs["implementer"].side_effect = lambda state: state.files_changed.append("src/main.py")
+
+        result = orch.run(task_description="Update parser. Run `pytest`.")
+
+        assert not result.failed
+        assert stubs["analyst"].calls
+        assert not any(entry["phase"] == "validation_coverage" for entry in result.validation_cycle_records)
+
+    def test_package_script_shortcut_validation_command_is_covered_before_agents(self, tmp_path: Path):
+        cases = [
+            (
+                tmp_path / "npm",
+                {"name": "npm-tests", "command": "npm run test"},
+                "Update package. Run `npm test`.",
+            ),
+            (
+                tmp_path / "yarn",
+                {"name": "yarn-tests", "command": "yarn run test"},
+                "Update package. Run `yarn test`.",
+            ),
+        ]
+
+        for root, check, task_description in cases:
+            root.mkdir()
+            orch, stubs, _ = _make_orchestrator(
+                root,
+                run_build=True,
+                run_tests=False,
+                run_checks=True,
+                project_config={
+                    "project": {"build_tool": "python"},
+                    "build": {
+                        "compile_command": "ruff check .",
+                        "checks": [check],
+                    },
+                },
+            )
+            stubs["implementer"].side_effect = lambda state: state.files_changed.append("src/main.py")
+
+            result = orch.run(task_description=task_description)
+
+            assert not result.failed
+            assert stubs["analyst"].calls
+            assert not any(entry["phase"] == "validation_coverage" for entry in result.validation_cycle_records)
+
+    def test_wrapper_alias_validation_command_is_covered_before_agents(self, tmp_path: Path):
+        cases = [
+            (
+                tmp_path / "gradle",
+                {"project": {"build_tool": "gradle-android"}, "build": {}},
+                "Update UI. Run `./gradlew testDebugUnitTest`.",
+            ),
+            (
+                tmp_path / "maven",
+                {"project": {"build_tool": "maven"}, "build": {}},
+                "Update API. Run `./mvnw test`.",
+            ),
+        ]
+
+        for root, project_config, task_description in cases:
+            root.mkdir()
+            orch, stubs, _ = _make_orchestrator(
+                root,
+                run_build=True,
+                run_tests=True,
+                run_checks=True,
+                project_config=project_config,
+            )
+            stubs["implementer"].side_effect = lambda state: state.files_changed.append("src/Main")
+
+            result = orch.run(task_description=task_description)
+
+            assert not result.failed
+            assert stubs["analyst"].calls
+            assert not any(entry["phase"] == "validation_coverage" for entry in result.validation_cycle_records)
+
     def test_done_task_skips_all_agents(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path)
         _save_state(orch, done=True)
@@ -1252,6 +1484,38 @@ class TestOrchestratorPreexistingChangesFastPath:
         assert review_scopes == ["task"]
         assert result.plan_completed is False
         assert result.final_full_task_review_done is False
+
+    def test_review_fix_skips_validation_coverage_preflight_abort(self, tmp_path: Path, monkeypatch):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_security_review=False,
+            run_test_writing=False,
+            run_build=False,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "build": {"test_command": "cargo test"},
+            },
+        )
+        monkeypatch.setattr(subprocess, "run", _git_diff_refresh_subprocess)
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.rs"],
+            review_diff=_REVIEW_DIFF,
+            review_mode="review_fix",
+            review_base_branch="main",
+            worktree_base=str(tmp_path),
+            plan_decided=True,
+        )
+        state.task_description = "Review branch.\n\n## Verification\n\ncargo test --workspace --all-features\n"
+        orch._store.save(state)
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert stubs["reviewer"].calls
+        assert not any(entry["phase"] == "validation_coverage" for entry in result.validation_cycle_records)
 
     def test_review_fix_refreshes_review_diff_before_review(self, tmp_path: Path, monkeypatch):
         orch, stubs, _ = _make_orchestrator(

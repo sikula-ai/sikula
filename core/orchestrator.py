@@ -31,6 +31,7 @@ steps complete. If state.plan is empty, a single pass through phases 2-5 is used
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import subprocess
@@ -50,6 +51,7 @@ from core.diagnostics import diagnostic_excerpt
 from core.llm_client import LLMClient
 from core.retry_history import llm_retry_history
 from core.state import StateStore, TaskState
+from core.validation_coverage import INTERNAL_PIPELINE_CONFIG_KEY, validation_coverage_gaps
 from tools.base_tool import BuildTool, Sandbox
 from tools.file_tool import FileTool
 from tools.git_tool import GitTool
@@ -211,7 +213,13 @@ class Orchestrator:
             "build": _build_tool(sandbox, root, config.project_config),
         }
 
-        pc = config.project_config
+        pc = copy.deepcopy(config.project_config)
+        pc[INTERNAL_PIPELINE_CONFIG_KEY] = {
+            "run_build": config.run_build,
+            "run_tests": config.run_tests,
+            "run_checks": config.run_checks,
+        }
+        self._agent_project_config = pc
         _llm = lambda name: (agent_llms or {}).get(name, llm)  # noqa: E731
 
         self._session_code_changed = False
@@ -279,6 +287,9 @@ class Orchestrator:
             state.config_snapshot = self._config_snapshot
             self._store.save(state)
 
+        if self._abort_on_validation_coverage_gaps(state):
+            return
+
         # Phase 0: presync — generate sources before analyze (run_presync: true only)
         # Skipped on resume if already attempted. Failure is a warning, not an abort —
         # analyst proceeds with whatever is in build/ from prior builds.
@@ -310,6 +321,29 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _abort_on_validation_coverage_gaps(self, state: TaskState) -> bool:
+        if state.review_mode in {"review_report", "review_fix"}:
+            return False
+
+        gaps = validation_coverage_gaps(self._agent_project_config, state)
+        if not gaps:
+            return False
+
+        commands = ", ".join(f"`{command}`" for command in gaps)
+        msg = (
+            "validation coverage gap: task-described validation command(s) are not covered "
+            f"by the effective configured pipeline: {commands}. Update the Sikula config file "
+            "used for this run (default .sikula/config.yaml, or the file passed with --config) "
+            "or the task description and rerun; this cannot be fixed inside the current task "
+            "worktree because the orchestrator already loaded the effective pipeline config."
+        )
+        log.error(msg)
+        state.record("orchestrator", "abort", msg)
+        state.record_validation("validation_coverage", "failed", error=msg)
+        state.failed = True
+        self._store.save(state)
+        return True
 
     def _worktree_dirty_files(self, state: TaskState) -> list[str]:
         """Return project-root-relative paths of uncommitted changes in the worktree.

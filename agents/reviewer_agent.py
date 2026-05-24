@@ -35,6 +35,12 @@ from agents.base_agent import (
     tech_stack as _tech_stack,
 )
 from core.state import TaskState
+from core.validation_coverage import (
+    configured_validation_commands,
+    extract_validation_commands,
+    pipeline_flags,
+    validation_command_coverage,
+)
 
 log = logging.getLogger(__name__)
 
@@ -126,6 +132,24 @@ Review steps:
       implementation accepts it until runtime, silently treats it as valid, or validates
       it through an API that does not know the expected result type, report it as a
       production correctness issue.
+   i. Validation command coverage — task descriptions often include commands such as
+      formatters, linters, tests, or project report commands. Treat those as acceptance
+      criteria for Sikula's configured validation pipeline, not as commands that you or the
+      implementer must run manually. Use the "Configured validation pipeline" section:
+      - If a task-described validation command is covered by the configured pipeline,
+        do not block approval merely because that command has not run during review;
+        the orchestrator will run it in the build/test/check phase.
+      - In normal `sikula run` mode, if a task-described validation command is not covered,
+        report a "Validation Coverage Gap" issue. This is not implementer-fixable inside
+        the current task; the operator must update the effective Sikula config file
+        (default `.sikula/config.yaml`, or the file passed with `--config`) or adjust
+        the task, then rerun with an effective pipeline that covers the command.
+      - In `sikula review` modes, validation commands may come from PR/review text rather
+        than a run task contract. Treat their coverage as informational; do not report a
+        Validation Coverage Gap solely because a command is not covered.
+      - You may still report a real correctness/completeness problem that is visible in
+        code. Do not turn deterministic formatter/linter state into a review-loop blocker
+        when it is covered by the configured pipeline.
 
 {test_review_policy}
 
@@ -268,6 +292,72 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + "\n... (truncated)"
 
 
+def _validation_pipeline_context(project_config: dict, state: TaskState) -> str:
+    flags = pipeline_flags(project_config, state)
+    configured_commands = configured_validation_commands(project_config, state)
+    task_commands = extract_validation_commands(state.task_description or "")
+    review_mode = state.review_mode in {"review_report", "review_fix"}
+    description_label = "review description" if review_mode else "task description"
+
+    lines = [
+        "---",
+        "Configured validation pipeline:",
+        (
+            f"- Effective phases: build={'on' if flags['run_build'] else 'off'}, "
+            f"tests={'on' if flags['run_build'] and flags['run_tests'] else 'off'}, "
+            f"checks={'on' if flags['run_build'] and flags['run_checks'] else 'off'}"
+        ),
+    ]
+    if review_mode:
+        lines.append(
+            "- Review mode: validation command coverage is informational because review text describes "
+            "branch scope, not a `sikula run` task contract."
+        )
+    if configured_commands:
+        lines.append("- Commands Sikula will run from config:")
+        for command in configured_commands:
+            lines.append(f"  - {command['phase']}/{command['name']}: `{command['command']}`")
+    else:
+        lines.append("- Commands Sikula will run from config: none")
+
+    if task_commands:
+        lines.append(f"- Validation commands found in {description_label}:")
+        for task_command in task_commands:
+            covered, match_kind, configured_command = validation_command_coverage(task_command, configured_commands)
+            if covered and configured_command:
+                coverage = f"covered by {configured_command['phase']}/{configured_command['name']} ({match_kind})"
+            elif configured_command:
+                coverage = (
+                    "not covered by configured pipeline "
+                    f"(nearest {configured_command['phase']}/{configured_command['name']}: "
+                    f"`{configured_command['command']}`; {match_kind})"
+                )
+            else:
+                coverage = "not covered by configured pipeline"
+            lines.append(f"  - `{task_command}` -> {coverage}")
+        if review_mode:
+            lines.append(
+                "In review mode, do not report a Validation Coverage Gap solely because a review-text "
+                "command is not covered by the configured pipeline. Use this only as verification context, "
+                "and report concrete code correctness or completeness issues instead."
+            )
+        else:
+            lines.append(
+                "If a task command is not covered, report a Validation Coverage Gap. A command from the same "
+                "tool family with different flags, targets, scripts, packages, schemes, or paths is only a "
+                "near match, not coverage. This is not implementer-fixable inside the current task. If it is "
+                "covered, do not ask the implementer to run it manually."
+            )
+    else:
+        lines.append(f"- Validation commands found in {description_label}: none")
+        lines.append(
+            "Do not create review issues only because generic project guidelines mention validation commands; "
+            "configured build/test/check phases own those commands."
+        )
+
+    return "\n".join(lines)
+
+
 def _test_failure_fix_history(state: TaskState) -> str:
     records: list[str] = []
     for idx, record in enumerate(state.fix_cycle_records, start=1):
@@ -337,6 +427,8 @@ class ReviewerAgent(BaseAgent):
             + "\n\n"
             + step_scope
             + ("\n\n" if step_scope else "")
+            + _validation_pipeline_context(self.project_config, state)
+            + "\n\n"
             + _USER_REVIEW.format(
                 task_description=state.task_description,
                 implementation_prompt=state.implementation_prompt,

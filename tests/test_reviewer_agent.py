@@ -8,9 +8,19 @@ from unittest.mock import MagicMock
 import pytest
 
 from agents.base_agent import AGENT_SECURITY_PREFIX
-from agents.reviewer_agent import ReviewerAgent, _MAX_DIFF_CHARS
+from agents.reviewer_agent import (
+    ReviewerAgent,
+    _MAX_DIFF_CHARS,
+)
 from tests.conftest import StubLLMClient
 from core.state import TaskState
+from core.validation_coverage import (
+    configured_validation_commands,
+    extract_validation_commands,
+    validation_coverage_gaps,
+    validation_command_coverage,
+    validation_commands_equivalent,
+)
 from tools.base_tool import ToolResult
 
 
@@ -278,6 +288,454 @@ class TestReviewerAgentPrompt:
         prompt = stub_llm.readonly_calls[0]
         assert "contract-bearing test was deleted, relaxed" in prompt
         assert "report the production-code issue" in prompt
+
+    def test_validation_pipeline_context_covers_task_commands(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(
+            task_description=(
+                "Add config validation.\n\n"
+                "Acceptance criteria:\n"
+                "- Run `cargo fmt --all -- --check`.\n"
+                "- Run `cargo test --workspace --all-features`.\n"
+            )
+        )
+        config = {
+            "project": {"build_tool": "cargo"},
+            "build": {
+                "test_command": "cargo test --workspace --all-features",
+                "checks": [
+                    {
+                        "name": "fmt",
+                        "command": "cargo fmt --all -- --check",
+                        "fix_command": "cargo fmt --all",
+                    }
+                ],
+            },
+        }
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+
+        assert "Configured validation pipeline" in prompt
+        assert "`cargo fmt --all -- --check` -> covered by check/fmt (exact)" in prompt
+        assert "`cargo test --workspace --all-features` -> covered by test/tests (exact)" in prompt
+        assert "do not ask the implementer to run it manually" in prompt
+
+    def test_validation_pipeline_context_marks_near_match_uncovered(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(
+            task_description=(
+                "Add config validation.\n\nAcceptance criteria:\n- Run `cargo test --workspace --all-features`.\n"
+            )
+        )
+        config = {
+            "project": {"build_tool": "cargo"},
+            "build": {"test_command": "cargo test"},
+        }
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+
+        assert (
+            "`cargo test --workspace --all-features` -> not covered by configured pipeline "
+            "(nearest test/tests: `cargo test`; same command family)"
+        ) in prompt
+        assert "`cargo test --workspace --all-features` -> covered" not in prompt
+
+    def test_validation_pipeline_context_marks_uncovered_task_command(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(
+            task_description="Add export support. Acceptance: run `cargo run -p codegen_tool -- fixtures/`."
+        )
+        config = {
+            "project": {"build_tool": "cargo"},
+            "build": {
+                "test_command": "cargo test",
+                "checks": [{"name": "fmt", "command": "cargo fmt --check"}],
+            },
+        }
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+
+        assert "`cargo run -p codegen_tool -- fixtures/` -> not covered by configured pipeline" in prompt
+        assert "report a Validation Coverage Gap" in prompt
+
+    def test_validation_pipeline_context_respects_disabled_checks(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(task_description="Format the project. Run `ruff format --check .`.")
+        config = {
+            "run_checks": False,
+            "project": {"build_tool": "python"},
+            "build": {"checks": [{"name": "ruff-format", "command": "ruff format --check ."}]},
+        }
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+
+        assert "checks=off" in prompt
+        assert "check/ruff-format" not in prompt
+        assert "`ruff format --check .` -> not covered by configured pipeline" in prompt
+
+    def test_report_only_review_does_not_claim_pipeline_will_run(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(
+            review_mode="review_report",
+            task_description="Review branch. Run `cargo test --workspace` before merge.",
+        )
+        config = {
+            "project": {"build_tool": "cargo"},
+            "build": {"test_command": "cargo test --workspace"},
+        }
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+
+        assert "build=off, tests=off, checks=off" in prompt
+        assert "Validation commands found in review description" in prompt
+        assert "`cargo test --workspace` -> not covered by configured pipeline" in prompt
+        assert "In review mode, do not report a Validation Coverage Gap" in prompt
+
+    def test_review_fix_validation_commands_are_informational(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(
+            review_mode="review_fix",
+            task_description="Review branch. Run `cargo test --workspace --all-features` before merge.",
+        )
+        config = {
+            "project": {"build_tool": "cargo"},
+            "build": {"test_command": "cargo test"},
+        }
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+
+        assert "Review mode: validation command coverage is informational" in prompt
+        assert "Validation commands found in review description" in prompt
+        assert (
+            "`cargo test --workspace --all-features` -> not covered by configured pipeline "
+            "(nearest test/tests: `cargo test`; same command family)"
+        ) in prompt
+        assert "In review mode, do not report a Validation Coverage Gap" in prompt
+
+    def test_validation_command_extraction_is_limited_to_command_like_text(self):
+        text = (
+            "Use `ConfigDocument` and `parse_config`.\n"
+            "Document `npm test` in README.\n"
+            "make sure validation still passes.\n"
+            "go through parser edge cases.\n"
+            "- `cargo` features should remain optional.\n"
+            "- `npm` package metadata should remain private.\n"
+            "- `cargo run -p codegen_tool -- fixtures/` should keep passing for committed fixtures.\n"
+            "```yaml\ncommand: npm test\n```\n"
+            "```markdown\nnpm test\n```\n"
+            "Run: `cargo test --workspace`\n"
+            "```bash\n$ ruff check .\n# comment\n```\n"
+        )
+
+        assert extract_validation_commands(text) == [
+            "cargo run -p codegen_tool -- fixtures/",
+            "cargo test --workspace",
+            "ruff check .",
+        ]
+
+    def test_validation_command_extraction_handles_shell_edge_cases(self):
+        text = (
+            "`cargo test`,\n"
+            "`python should`,\n"
+            "$ ruff check .\n"
+            "Verification:\n"
+            "pytest\n"
+            "python parser should reject invalid input\n"
+            "```bash\n"
+            "python 'unterminated\n"
+            "swift evolve\n"
+            "```\n"
+        )
+
+        assert extract_validation_commands(text) == [
+            "cargo test",
+            "python should",
+            "ruff check .",
+            "pytest",
+            "python 'unterminated",
+        ]
+
+    def test_validation_command_extraction_ignores_prose_starting_with_tool_names(self):
+        text = (
+            "python parser should reject invalid quoted strings.\n"
+            "cargo features should remain optional.\n"
+            "npm package should stay private.\n"
+            "Run and report results for:\n"
+            "cargo test --workspace\n"
+            "cargo clippy should not be described as prose here.\n"
+        )
+
+        assert extract_validation_commands(text) == [
+            "cargo test --workspace",
+        ]
+
+    def test_validation_command_extraction_supports_validation_block_headings(self):
+        text = (
+            "## Verification\n"
+            "\n"
+            "cargo test --workspace\n"
+            "\n"
+            "ruff check .\n"
+            "Implementation notes:\n"
+            "pytest remains configured.\n"
+        )
+
+        assert extract_validation_commands(text) == [
+            "cargo test --workspace",
+            "ruff check .",
+        ]
+
+    def test_validation_command_extraction_preserves_validation_block_across_blank_separators(self):
+        text = "## Verification\n\n\ncargo test --workspace\n"
+
+        assert extract_validation_commands(text) == ["cargo test --workspace"]
+
+    def test_validation_command_extraction_closes_validation_block_on_non_command_content(self):
+        text = "## Verification\n\nNotes:\ncargo test --workspace\n"
+
+        assert extract_validation_commands(text) == []
+
+    def test_validation_command_extraction_supports_prompted_bare_commands(self):
+        text = "$ pytest tests/unit\n"
+
+        assert extract_validation_commands(text) == [
+            "pytest tests/unit",
+        ]
+
+    def test_validation_command_extraction_rejects_bare_tool_names(self):
+        text = "Run `cargo` and `npm` prose checks, but `pytest` before merge.\n"
+
+        assert extract_validation_commands(text) == ["pytest"]
+
+    def test_validation_command_matching_keeps_scripts_and_targets_distinct(self):
+        assert validation_commands_equivalent("`cargo test`", "cargo test") == (True, "exact")
+        assert not validation_commands_equivalent("", "cargo test")[0]
+        assert not validation_commands_equivalent("npm run lint", "npm run test")[0]
+        assert not validation_commands_equivalent("npm run lint", "npm test")[0]
+        assert not validation_commands_equivalent("pnpm run lint", "pnpm run test")[0]
+        assert not validation_commands_equivalent("python scripts/check.py", "python scripts/test.py")[0]
+        assert not validation_commands_equivalent(
+            "xcodebuild test -scheme App",
+            "xcodebuild test -scheme AppTests",
+        )[0]
+        assert not validation_commands_equivalent(
+            "xcodebuild test -scheme=App",
+            "xcodebuild test -scheme Other",
+        )[0]
+        assert not validation_commands_equivalent("./gradlew testDebugUnitTest", "./gradlew lintDebug")[0]
+
+    def test_validation_command_matching_covers_platform_command_signatures(self):
+        same_family_commands = [
+            ("python -m ruff check .", "ruff check src"),
+            ("python -m pytest tests", "pytest tests/unit"),
+            ("cargo doc", "cargo doc --no-deps"),
+            ("swiftlint lint", "swiftlint lint --strict"),
+            ("swift test", "swift test --parallel"),
+            ("bun run test", "bun run test --coverage"),
+            ("yarn run test", "yarn run test --watch"),
+            ("yarn test", "yarn test --watch"),
+            ("npx eslint .", "npx eslint src"),
+            ("go test ./...", "go test ./pkg"),
+            ("dotnet test", "dotnet test --no-build"),
+        ]
+
+        for left, right in same_family_commands:
+            assert validation_commands_equivalent(left, right) == (True, "same command family")
+
+        distinct_commands = [
+            ("python -m mypy src", "python -m pyright src"),
+            ("cargo run --bin app", "cargo run --bin app -- --help"),
+            ("make test", "make test-ci"),
+        ]
+
+        for left, right in distinct_commands:
+            assert not validation_commands_equivalent(left, right)[0]
+
+    def test_validation_command_matching_treats_package_script_shortcuts_as_exact_aliases(self):
+        aliases = [
+            ("npm test", "npm run test"),
+            ("npm test -- --watch", "npm run test -- --watch"),
+            ("pnpm test", "pnpm run test"),
+            ("yarn test", "yarn run test"),
+            ("yarn test --watch", "yarn run test --watch"),
+        ]
+
+        for left, right in aliases:
+            assert validation_commands_equivalent(left, right) == (True, "exact")
+
+    def test_validation_command_matching_treats_python_module_forms_as_exact_aliases(self):
+        aliases = [
+            ("python -m pytest tests/unit", "pytest tests/unit"),
+            ("python3 -m pytest", "pytest"),
+            ("python -m ruff check .", "ruff check ."),
+            ("python3 -m ruff format --check .", "ruff format --check ."),
+        ]
+
+        for left, right in aliases:
+            assert validation_commands_equivalent(left, right) == (True, "exact")
+
+    def test_validation_command_coverage_requires_exact_command(self):
+        configured = [{"phase": "test", "name": "tests", "command": "cargo test"}]
+
+        covered, match_kind, nearest = validation_command_coverage(
+            "cargo test --workspace --all-features",
+            configured,
+        )
+
+        assert not covered
+        assert match_kind == "same command family"
+        assert nearest == configured[0]
+
+    def test_validation_command_coverage_uses_first_near_match(self):
+        configured = [
+            {"phase": "test", "name": "tests", "command": "cargo test"},
+            {"phase": "test", "name": "all-tests", "command": "cargo test --all-features"},
+        ]
+
+        covered, match_kind, nearest = validation_command_coverage(
+            "cargo test --workspace",
+            configured,
+        )
+
+        assert not covered
+        assert match_kind == "same command family"
+        assert nearest == configured[0]
+
+    def test_validation_command_coverage_ignores_autofix_commands(self):
+        configured = [
+            {"phase": "check_autofix", "name": "format autofix", "command": "ruff format ."},
+        ]
+
+        covered, match_kind, nearest = validation_command_coverage("ruff format .", configured)
+
+        assert not covered
+        assert match_kind == ""
+        assert nearest is None
+
+    def test_validation_command_coverage_keeps_package_script_flags_strict(self):
+        configured = [
+            {"phase": "check", "name": "npm-tests", "command": "npm run test"},
+            {"phase": "check", "name": "yarn-tests", "command": "yarn run test"},
+        ]
+
+        npm_covered, npm_match_kind, npm_nearest = validation_command_coverage(
+            "npm test -- --watch",
+            configured,
+        )
+        yarn_covered, yarn_match_kind, yarn_nearest = validation_command_coverage(
+            "yarn test --watch",
+            configured,
+        )
+
+        assert not npm_covered
+        assert npm_match_kind == "same command family"
+        assert npm_nearest == configured[0]
+        assert not yarn_covered
+        assert yarn_match_kind == "same command family"
+        assert yarn_nearest == configured[1]
+
+    def test_validation_command_coverage_treats_build_wrappers_as_exact_aliases(self):
+        configured = [
+            {"phase": "test", "name": "gradle-tests", "command": "gradle testDebugUnitTest"},
+            {"phase": "test", "name": "maven-tests", "command": "mvn test"},
+        ]
+
+        gradle_covered, gradle_match_kind, _ = validation_command_coverage(
+            "./gradlew testDebugUnitTest",
+            configured,
+        )
+        maven_covered, maven_match_kind, _ = validation_command_coverage(
+            "./mvnw test",
+            configured,
+        )
+
+        assert gradle_covered
+        assert gradle_match_kind == "exact"
+        assert maven_covered
+        assert maven_match_kind == "exact"
+
+    def test_validation_command_coverage_keeps_wrapper_flags_strict(self):
+        configured = [
+            {"phase": "test", "name": "gradle-tests", "command": "gradle testDebugUnitTest"},
+            {"phase": "test", "name": "maven-tests", "command": "mvn test"},
+        ]
+
+        covered, match_kind, nearest = validation_command_coverage(
+            "./gradlew testDebugUnitTest --stacktrace",
+            configured,
+        )
+        maven_covered, maven_match_kind, maven_nearest = validation_command_coverage(
+            "./mvnw test -DskipITs",
+            configured,
+        )
+
+        assert not covered
+        assert match_kind == "same command family"
+        assert nearest == configured[0]
+        assert not maven_covered
+        assert maven_match_kind == "same command family"
+        assert maven_nearest == configured[1]
+
+    def test_validation_command_coverage_keeps_wrapper_paths_strict(self):
+        configured = [{"phase": "test", "name": "tests", "command": "gradle testDebugUnitTest"}]
+
+        covered, match_kind, nearest = validation_command_coverage(
+            "/opt/gradle/bin/gradlew testDebugUnitTest",
+            configured,
+        )
+
+        assert not covered
+        assert match_kind == "same command family"
+        assert nearest == configured[0]
+
+    def test_configured_validation_defaults_use_expected_commands(self):
+        state = _make_state()
+
+        android_commands = configured_validation_commands({"project": {"build_tool": "gradle-android"}}, state)
+        jvm_commands = configured_validation_commands({"project": {"build_tool": "gradle-jvm"}}, state)
+        xcode_commands = configured_validation_commands({"project": {"build_tool": "xcodebuild"}}, state)
+
+        assert {"phase": "build", "name": "compile", "command": "./gradlew compileDebugKotlin"} in android_commands
+        assert {"phase": "test", "name": "tests", "command": "./gradlew testDebugUnitTest"} in android_commands
+        assert {"phase": "build", "name": "compile", "command": "./gradlew classes"} in jvm_commands
+        assert {"phase": "test", "name": "tests", "command": "./gradlew test"} in jvm_commands
+        assert {"phase": "build", "name": "compile", "command": "xcodebuild build -scheme Countries"} in xcode_commands
+        assert {"phase": "test", "name": "tests", "command": "xcodebuild test -scheme Countries"} in xcode_commands
+
+    def test_configured_validation_commands_ignore_invalid_checks(self):
+        state = _make_state()
+        config = {
+            "project": {"build_tool": "python"},
+            "build": {
+                "checks": [
+                    "ruff check .",
+                    {"name": "missing-command"},
+                    {"name": "format", "fix_command": "ruff format ."},
+                ]
+            },
+        }
+
+        commands = configured_validation_commands(config, state)
+
+        assert {"phase": "check", "name": "missing-command", "command": ""} not in commands
+        assert {"phase": "check_autofix", "name": "format autofix", "command": "ruff format ."} in commands
+
+    def test_validation_coverage_gaps_reports_only_uncovered_commands(self):
+        state = _make_state(
+            task_description=("Run `cargo test --workspace` and `cargo run -p codegen_tool -- fixtures/` before merge.")
+        )
+        config = {
+            "project": {"build_tool": "cargo"},
+            "build": {"test_command": "cargo test --workspace"},
+        }
+
+        assert validation_coverage_gaps(config, state) == ["cargo run -p codegen_tool -- fixtures/"]
 
 
 class TestReviewerAgentHistory:
