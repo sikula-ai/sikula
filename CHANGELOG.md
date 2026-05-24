@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Validation command extraction treats only explicit validation contexts as commands, including command lists under validation headings with Markdown blank separator lines, so prose that happens to start with a known tool name or mentions a bare tool name in backticks does not trigger pre-agent validation coverage failures.
 - Validation command coverage treats Gradle/Maven wrapper spelling, Python module forms, and npm/pnpm/Yarn `test` script shortcuts as equivalent for otherwise identical commands, while same-tool-family commands with materially different flags, targets, scripts, packages, schemes, or paths remain uncovered; near matches are included only as diagnostic context before agents run.
 - `sikula review` modes now treat validation commands found in PR/review text as informational branch-verification context instead of hard preflight validation coverage gates.
+- After build/test/check failures, fixer changes are validated by build/test/check again before stale reviewer, security reviewer, and test-writer gates rerun; if those gates change files, Sikula performs another deterministic validation pass before accepting the task or step.
 
 ### Fixed
 - Multi-step `sikula run` now performs a final full-task reviewer/security/test-writer gate after all step-scoped validations complete, so the finished branch gets one whole-task pass against the original task before final validation.

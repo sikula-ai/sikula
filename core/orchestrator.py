@@ -20,7 +20,8 @@ Loop phases:
        test   — BuildTool.run_tests() (run_tests only); runs after a passing build
        checks — BuildTool.run_check() per entry in build.checks (run_checks only); runs after tests
        fix    — FixerAgent; runs after build, test, or check failure; triggers re-sync if
-                build-config files changed; triggers re-review + re-test-write if files changed
+                build-config files changed; marks review/security/test writing stale if files
+                changed. Semantic gates run after deterministic validation is green.
 
 If state.plan is populated (by PlannerAgent), phases 2-4 run once per step before advancing.
 After the last step, review/security/test-writing rerun once in final full-task scope so the
@@ -80,6 +81,10 @@ def _build_loop_key(state: TaskState) -> str:
 
 def _build_loop_attempts_used(state: TaskState) -> int:
     return max(0, state.build_iterations - state.build_loop_start_iteration)
+
+
+def _build_loop_active_for_current_scope(state: TaskState) -> bool:
+    return bool(state.build_loop_key) and state.build_loop_key == _build_loop_key(state)
 
 
 @dataclass
@@ -494,6 +499,10 @@ class Orchestrator:
                     self._store.save(state)
                     return
 
+        if self._config.run_build and (state.fixer_changed_code or _build_loop_active_for_current_scope(state)):
+            self._run_build_fix_loop(state, set_done=True)
+            return
+
         # Phase 3: review loop
         self._run_review_loop(state)
         if state.failed:
@@ -596,6 +605,13 @@ class Orchestrator:
             self._store.save(state)
             return
 
+        if self._config.run_build and (state.fixer_changed_code or _build_loop_active_for_current_scope(state)):
+            state.active_scope = _SCOPE_FINAL_FULL_TASK
+            self._store.save(state)
+            log.info("--- Phase: final build/fix (resume active loop) ---")
+            self._run_build_fix_loop(state, set_done=True)
+            return
+
         if not state.final_full_task_review_done:
             self._run_final_full_task_gate(state)
             if state.failed:
@@ -682,6 +698,13 @@ class Orchestrator:
                     return True
             state.step_implemented = True
             self._store.save(state)
+
+        if (
+            self._config.run_build
+            and self._config.run_build_per_step
+            and (state.fixer_changed_code or _build_loop_active_for_current_scope(state))
+        ):
+            return self._run_build_fix_loop(state, set_done=False)
 
         # Review loop for this step
         self._run_review_loop(state)
@@ -802,6 +825,13 @@ class Orchestrator:
                 state.check_status = "skipped"
                 state.record_validation("check", "skipped")
 
+            gates_changed = self._run_post_validation_semantic_gates(state)
+            if state.failed:
+                return False
+            if gates_changed:
+                self._store.save(state)
+                continue
+
             # Passing build (and tests/checks if enabled)
             state.build_loop_key = None
             state.build_loop_start_iteration = 0
@@ -853,10 +883,15 @@ class Orchestrator:
             state.review_iterations += 1
             scope = _phase_scope_label(state)
             log.info(f"--- Phase: implement ({scope}review fix {state.review_iterations}/{max_fixes}) ---")
-            self._run_agent("implementer", state)
+            implementer_result = self._run_agent("implementer", state)
             self._session_code_changed = True
             if state.failed:
                 return
+            self._mark_build_sync_stale_if_needed(
+                (implementer_result.data or {}).get("files_written", []),
+                "review fix",
+                state,
+            )
             state.tests_up_to_date = False
             self._store.save(state)
 
@@ -909,10 +944,15 @@ class Orchestrator:
             state.review_iterations = 0
             scope = _phase_scope_label(state)
             log.info(f"--- Phase: implement ({scope}security fix {state.security_review_iterations}/{max_iter}) ---")
-            self._run_agent("implementer", state)
+            implementer_result = self._run_agent("implementer", state)
             self._session_code_changed = True
             if state.failed:
                 return
+            self._mark_build_sync_stale_if_needed(
+                (implementer_result.data or {}).get("files_written", []),
+                "security fix",
+                state,
+            )
             state.tests_up_to_date = False
             self._store.save(state)
             self._run_review_loop(state)
@@ -940,10 +980,7 @@ class Orchestrator:
         # Use files reported by this fixer call — not a set-diff on state.files_changed, which
         # would miss re-edits of files already in the list (skipped by fixer dedup on line 127).
         fixer_files = set((fixer_result.data or {}).get("files_written", []))
-        build_tool: BuildTool = self._tools["build"]
-        if any(build_tool.is_build_config_file(f) for f in fixer_files):
-            log.info("Fixer changed build-config files — will re-sync before next build")
-            state.build_synced = False
+        self._mark_build_sync_stale_if_needed(fixer_files, "fixer", state)
         if fixer_files:
             self._session_code_changed = True
             state.fixer_changed_code = True
@@ -955,22 +992,60 @@ class Orchestrator:
             if state.active_scope == _SCOPE_FINAL_FULL_TASK:
                 state.final_full_task_review_done = False
             self._store.save(state)
-            self._run_review_loop(state)
-            if state.failed:
-                return False
-            self._run_security_review_and_fix_loop(state)
-            if state.failed:
-                return False
-            test_files_changed = self._run_test_write_phase(state)
-            if state.failed:
-                return False
-            self._review_fix_review_test_changes(state, test_files_changed)
-            if state.failed:
-                return False
-            if state.active_scope == _SCOPE_FINAL_FULL_TASK:
-                state.final_full_task_review_done = True
-                self._store.save(state)
         return True
+
+    def _semantic_gates_pending(self, state: TaskState) -> bool:
+        return (
+            (self._config.run_review and not state.review_approved)
+            or (self._config.run_security_review and not state.security_approved)
+            or (self._config.run_test_writing and not state.tests_up_to_date)
+        )
+
+    def _run_post_validation_semantic_gates(self, state: TaskState) -> bool:
+        """Run stale semantic gates after build/test/check pass.
+
+        Returns True when a gate may have changed files, requiring another deterministic
+        validation pass before the task or step can be accepted.
+        """
+        if not self._semantic_gates_pending(state):
+            return False
+
+        review_fixes_before = state.review_iterations
+        security_fixes_before = state.security_review_iterations
+
+        log.info(f"--- Phase: {_phase_scope_label(state)}post-validation semantic gates ---")
+        self._run_review_loop(state)
+        if state.failed:
+            return False
+
+        self._run_security_review_and_fix_loop(state)
+        if state.failed:
+            return False
+
+        test_files_changed = self._run_test_write_phase(state)
+        if state.failed:
+            return False
+        self._review_fix_review_test_changes(state, test_files_changed)
+        if state.failed:
+            return False
+
+        if state.active_scope == _SCOPE_FINAL_FULL_TASK:
+            state.final_full_task_review_done = True
+            self._store.save(state)
+
+        return (
+            state.review_iterations > review_fixes_before
+            or state.security_review_iterations > security_fixes_before
+            or test_files_changed
+        )
+
+    def _mark_build_sync_stale_if_needed(self, files_written, source: str, state: TaskState) -> None:
+        if not files_written:
+            return
+        build_tool: BuildTool = self._tools["build"]
+        if any(build_tool.is_build_config_file(f) for f in files_written):
+            log.info("%s changed build-config files — will re-sync before next build", source.capitalize())
+            state.build_synced = False
 
     def _run_agent(self, name: str, state: TaskState):
         from agents.base_agent import AgentResult
@@ -1005,7 +1080,9 @@ class Orchestrator:
             return False
         log.info(f"--- Phase: {_phase_scope_label(state)}test write ---")
         result = self._run_agent("test_writer", state)
-        return bool((result.data or {}).get("files_written"))
+        files_written = (result.data or {}).get("files_written", [])
+        self._mark_build_sync_stale_if_needed(files_written, "test writer", state)
+        return bool(files_written)
 
     def _run_checks(self, state: TaskState, progress: str) -> bool:
         """Run all configured quality checks in order. Returns True only if all pass."""
