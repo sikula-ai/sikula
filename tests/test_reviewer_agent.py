@@ -453,13 +453,29 @@ class TestReviewerAgentPrompt:
 
     def test_validation_command_extraction_supports_validation_block_headings(self):
         text = (
-            "## Verification\ncargo test --workspace\nruff check .\nImplementation notes:\npytest remains configured.\n"
+            "## Verification\n"
+            "\n"
+            "cargo test --workspace\n"
+            "\n"
+            "ruff check .\n"
+            "Implementation notes:\n"
+            "pytest remains configured.\n"
         )
 
         assert extract_validation_commands(text) == [
             "cargo test --workspace",
             "ruff check .",
         ]
+
+    def test_validation_command_extraction_preserves_validation_block_across_blank_separators(self):
+        text = "## Verification\n\n\ncargo test --workspace\n"
+
+        assert extract_validation_commands(text) == ["cargo test --workspace"]
+
+    def test_validation_command_extraction_closes_validation_block_on_non_command_content(self):
+        text = "## Verification\n\nNotes:\ncargo test --workspace\n"
+
+        assert extract_validation_commands(text) == []
 
     def test_validation_command_extraction_supports_prompted_bare_commands(self):
         text = "$ pytest tests/unit\n"

@@ -252,6 +252,29 @@ class TestOrchestratorLoop:
             for entry in result.validation_cycle_records
         )
 
+    def test_validation_heading_with_blank_separator_fails_before_agents(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=True,
+            run_checks=True,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "build": {"test_command": "cargo test"},
+            },
+        )
+
+        result = orch.run(task_description="## Verification\n\ncargo test --workspace --all-features\n")
+
+        assert result.failed
+        assert not stubs["analyst"].calls
+        assert any(
+            entry["phase"] == "validation_coverage"
+            and entry["status"] == "failed"
+            and "cargo test --workspace --all-features" in entry.get("error_excerpt", "")
+            for entry in result.validation_cycle_records
+        )
+
     def test_prose_starting_with_tool_name_does_not_fail_validation_coverage(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
             tmp_path,

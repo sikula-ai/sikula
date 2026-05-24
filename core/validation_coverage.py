@@ -108,7 +108,6 @@ def extract_validation_commands(text: str) -> list[str]:
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
-            in_validation_command_block = False
             continue
         if stripped.startswith("```"):
             if in_code_fence:

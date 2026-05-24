@@ -15,7 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Security reviewer audit entries are stored in `security_review_cycle_records`, separate from code reviewer entries, with schema migration for existing state files.
 - Analyst, reviewer, and test-writer prompts now explicitly cover parser/validator/DSL/config/schema contracts, including expected-result-type validation, materially different negative contract cases, and validation-vs-runtime failure phase.
 - Reviewer prompts now include the effective configured validation pipeline and validation command coverage, so uncovered task-described commands are reported as validation coverage gaps instead of being treated as manual agent commands or implementer-fixable code issues.
-- Validation command extraction now only treats explicit validation contexts as commands, so prose that happens to start with a known tool name or mentions a bare tool name in backticks does not trigger pre-agent validation coverage failures.
+- Validation command extraction treats only explicit validation contexts as commands, including command lists under validation headings with Markdown blank separator lines, so prose that happens to start with a known tool name or mentions a bare tool name in backticks does not trigger pre-agent validation coverage failures.
 - Validation command coverage treats Gradle/Maven wrapper spelling, Python module forms, and npm/pnpm/Yarn `test` script shortcuts as equivalent for otherwise identical commands, while same-tool-family commands with materially different flags, targets, scripts, packages, schemes, or paths remain uncovered; near matches are included only as diagnostic context before agents run.
 
 ### Fixed

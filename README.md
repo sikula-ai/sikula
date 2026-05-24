@@ -164,8 +164,8 @@ validation pipeline is what Sikula can execute. Validation command coverage is t
 preflight/reviewer check that task-described commands are represented by that pipeline.
 To make a command count as task-described validation, write it explicitly: in backticks,
 in a shell code fence, with a `$` prompt, or as a command list under a heading/prefix such
-as `Verification:` or `Run:`. Bare tool names such as `cargo` or `npm` are not treated as
-validation commands.
+as `Verification:` or `Run:`; Markdown blank separator lines after the heading are allowed.
+Bare tool names such as `cargo` or `npm` are not treated as validation commands.
 If a task command is not covered there, it is reported as a validation coverage gap so
 you can add the same command to the effective build/test/check config or adjust the task
 before rerunning. A generic command from the same tool family is not enough when the

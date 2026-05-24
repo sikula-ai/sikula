@@ -1110,9 +1110,10 @@ Do not rely on task descriptions to execute validation commands. Agents may ment
 review them, but only configured build/test/check commands are executable pipeline steps.
 Validation command extraction is intentionally explicit: commands are recognized from
 backticks, shell code fences, `$`-prompted lines, or command lists under validation-oriented
-headings/prefixes such as `Verification:` or `Run:`. Prose that happens to start with a
-tool name is not treated as a command, and bare tool names such as `cargo` or `npm` are
-not treated as executable validation commands.
+headings/prefixes such as `Verification:` or `Run:`; Markdown blank separator lines after
+the heading are allowed. Prose that happens to start with a tool name is not treated as a
+command, and bare tool names such as `cargo` or `npm` are not treated as executable
+validation commands.
 When the task text requires a validation command that is not represented by the effective
 pipeline config, Sikula reports a validation coverage gap instead of asking an agent to run
 the command manually. A command from the same tool family is only a diagnostic near match
