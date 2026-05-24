@@ -400,6 +400,8 @@ class TestReviewerAgentPrompt:
             "Document `npm test` in README.\n"
             "make sure validation still passes.\n"
             "go through parser edge cases.\n"
+            "- `cargo` features should remain optional.\n"
+            "- `npm` package metadata should remain private.\n"
             "- `cargo run -p codegen_tool -- fixtures/` should keep passing for committed fixtures.\n"
             "```yaml\ncommand: npm test\n```\n"
             "```markdown\nnpm test\n```\n"
@@ -466,6 +468,11 @@ class TestReviewerAgentPrompt:
             "pytest tests/unit",
         ]
 
+    def test_validation_command_extraction_rejects_bare_tool_names(self):
+        text = "Run `cargo` and `npm` prose checks, but `pytest` before merge.\n"
+
+        assert extract_validation_commands(text) == ["pytest"]
+
     def test_validation_command_matching_keeps_scripts_and_targets_distinct(self):
         assert validation_commands_equivalent("`cargo test`", "cargo test") == (True, "exact")
         assert not validation_commands_equivalent("", "cargo test")[0]
@@ -517,6 +524,17 @@ class TestReviewerAgentPrompt:
             ("pnpm test", "pnpm run test"),
             ("yarn test", "yarn run test"),
             ("yarn test --watch", "yarn run test --watch"),
+        ]
+
+        for left, right in aliases:
+            assert validation_commands_equivalent(left, right) == (True, "exact")
+
+    def test_validation_command_matching_treats_python_module_forms_as_exact_aliases(self):
+        aliases = [
+            ("python -m pytest tests/unit", "pytest tests/unit"),
+            ("python3 -m pytest", "pytest"),
+            ("python -m ruff check .", "ruff check ."),
+            ("python3 -m ruff format --check .", "ruff format --check ."),
         ]
 
         for left, right in aliases:

@@ -267,9 +267,30 @@ class TestOrchestratorLoop:
 
         result = orch.run(
             task_description=(
-                "python parser should reject invalid quoted strings.\ncargo features should remain optional."
+                "python parser should reject invalid quoted strings.\n"
+                "cargo features should remain optional.\n"
+                "- `cargo` features should remain optional."
             )
         )
+
+        assert not result.failed
+        assert stubs["analyst"].calls
+        assert not any(entry["phase"] == "validation_coverage" for entry in result.validation_cycle_records)
+
+    def test_python_module_validation_command_is_covered_before_agents(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=True,
+            run_checks=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "build": {"test_command": "python3 -m pytest"},
+            },
+        )
+        stubs["implementer"].side_effect = lambda state: state.files_changed.append("src/main.py")
+
+        result = orch.run(task_description="Update parser. Run `pytest`.")
 
         assert not result.failed
         assert stubs["analyst"].calls

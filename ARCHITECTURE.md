@@ -662,7 +662,8 @@ New files (not in the diff) are read directly via their paths in `state.files_ch
    agent loop. A same-tool-family command with materially different flags, targets,
    scripts, packages, schemes, or paths is reported as a near match, not accepted as
    coverage. Gradle/Maven wrapper spelling for the same invocation (`./gradlew` vs
-   `gradle`, `./mvnw` vs `mvn`) and npm/pnpm/Yarn `test` script shortcuts (`npm test`
+   `gradle`, `./mvnw` vs `mvn`), Python module forms (`python -m pytest` vs `pytest`,
+   `python -m ruff` vs `ruff`), and npm/pnpm/Yarn `test` script shortcuts (`npm test`
    vs `npm run test`, etc.) are accepted as coverage. Report-only review may still
    report the same gap as a review issue.
 
@@ -1110,14 +1111,16 @@ review them, but only configured build/test/check commands are executable pipeli
 Validation command extraction is intentionally explicit: commands are recognized from
 backticks, shell code fences, `$`-prompted lines, or command lists under validation-oriented
 headings/prefixes such as `Verification:` or `Run:`. Prose that happens to start with a
-tool name is not treated as a command.
+tool name is not treated as a command, and bare tool names such as `cargo` or `npm` are
+not treated as executable validation commands.
 When the task text requires a validation command that is not represented by the effective
 pipeline config, Sikula reports a validation coverage gap instead of asking an agent to run
 the command manually. A command from the same tool family is only a diagnostic near match
 when flags, targets, scripts, packages, schemes, or paths differ. Gradle/Maven wrapper
 spelling for the same invocation (`./gradlew` vs `gradle`, `./mvnw` vs `mvn`) is accepted
-as coverage, as are npm/pnpm/Yarn `test` script shortcuts (`npm test` vs `npm run test`,
-etc.). This is not fixed inside
+as coverage, as are Python module forms (`python -m pytest` vs `pytest`,
+`python -m ruff` vs `ruff`) and npm/pnpm/Yarn `test` script shortcuts (`npm test` vs
+`npm run test`, etc.). This is not fixed inside
 the current task worktree: update
 the Sikula config file used for the run (default `.sikula/config.yaml`, or the file passed
 with `--config`) or the task and rerun so the effective pipeline is loaded with the right

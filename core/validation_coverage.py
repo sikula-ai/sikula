@@ -45,6 +45,8 @@ _VALIDATION_BLOCK_HEADING_RE = re.compile(
 )
 _PACKAGE_SCRIPT_SHORTCUT_MANAGERS = {"npm", "pnpm", "yarn"}
 _PACKAGE_SCRIPT_SHORTCUTS = {"test"}
+_STANDALONE_VALIDATION_COMMANDS = {"pytest", "swiftlint"}
+_PYTHON_MODULE_ALIASES = {"pytest", "ruff"}
 
 
 def _shell_tokens(command: str) -> list[str]:
@@ -73,7 +75,8 @@ def _looks_like_validation_command(command: str, *, reject_prose: bool = False) 
         return False
     tokens = _shell_tokens(normalized)
     if len(tokens) < 2:
-        return True
+        first = tokens[0].removeprefix("./").rsplit("/", 1)[-1]
+        return first in _STANDALONE_VALIDATION_COMMANDS
     if reject_prose and any(token.lower().strip(".,;:") in _PROSE_MARKERS for token in tokens[1:]):
         return False
     first = tokens[0].removeprefix("./").rsplit("/", 1)[-1]
@@ -249,6 +252,10 @@ def _exact_command_key(command: str) -> tuple[str, ...]:
 
     executable = tokens[0].removeprefix("./")
     if "/" not in executable:
+        if executable in {"python", "python3"} and len(tokens) >= 3 and tokens[1] == "-m":
+            module = tokens[2]
+            if module in _PYTHON_MODULE_ALIASES:
+                tokens = [module, *tokens[3:]]
         if executable in {"gradlew", "gradle"}:
             tokens[0] = "gradle"
         elif executable in {"mvnw", "mvn"}:
