@@ -15,6 +15,7 @@ from agents.base_agent import (
     BaseAgent,
     AGENT_SECURITY_PREFIX,
     guidelines_files as _guidelines_files,
+    paths_outside_allowed as _paths_outside_allowed,
     record_write_path_warnings as _record_write_path_warnings,
     tech_stack as _tech_stack,
 )
@@ -56,11 +57,22 @@ _BUILD_TEST_CONSTRAINT = """\
   (e.g. `test/`, `__tests__/`, `spec/`), regardless of what the errors say"""
 
 _TEST_TEST_CONSTRAINT = """\
-- You MAY create and modify test files — that is the purpose of this fix
-- NEVER modify production source files to make tests pass; only fix the test code"""
+- You MAY create and modify test files
+- You MAY modify production source files when a failing test exposes a production defect
+- First decide whether the failure is caused by production behaviour or by an incorrect/stale test
+- Start your final response with:
+  TEST FAILURE TRIAGE:
+  classification: production_defect | stale_test | malformed_test | unclear
+  contract_affected: <task/guideline/structured contract, or none>
+  chosen_fix: production_code | test_code
+- If a test encodes the original task, implementation prompt, project guidelines, or a structured
+  input/output contract, fix production code instead of weakening the test
+- Modify tests only when the test is malformed, stale, or inconsistent with the accepted contract
+- If you choose test_code, explain which accepted contract the test conflicts with
+- Do not delete, relax, or rewrite assertions just to make the run green"""
 
 _CHECK_TEST_CONSTRAINT = """\
-- You MAY modify test files if the check errors explicitly reference them
+- You MAY modify production or test files if the check errors explicitly reference them
 - Fix ONLY the files named in the check errors — nothing else"""
 
 _DEFAULT_CONTEXT_FILES = ["README.md"]
@@ -79,6 +91,43 @@ def _test_constraint(state: TaskState) -> str:
         return _TEST_TEST_CONSTRAINT
     # check_errors (detekt/lint) can reference test or production files — allow both
     return _CHECK_TEST_CONSTRAINT
+
+
+def _write_paths_for_state(state: TaskState, sandbox: dict) -> list[str]:
+    if state.errors:
+        return sandbox.get("allowed_write_paths", [])
+
+    paths: list[str] = []
+    for key in ("allowed_write_paths", "allowed_test_write_paths"):
+        for path in sandbox.get(key, []):
+            if path not in paths:
+                paths.append(path)
+    return paths
+
+
+def _test_failure_production_writes(changed: list[str], sandbox: dict) -> list[str]:
+    test_paths = sandbox.get("allowed_test_write_paths", [])
+    if not test_paths:
+        return list(changed)
+    return _paths_outside_allowed(changed, test_paths)
+
+
+def _triage_field(output: str, field: str) -> str:
+    prefix = f"{field.lower()}:"
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith(prefix):
+            return stripped.split(":", 1)[1].strip().lower()
+    return ""
+
+
+def _has_valid_production_test_failure_triage(output: str) -> bool:
+    if "test failure triage:" not in output.lower():
+        return False
+    return (
+        _triage_field(output, "classification") == "production_defect"
+        and _triage_field(output, "chosen_fix") == "production_code"
+    )
 
 
 def _errors_section(state: TaskState) -> str:
@@ -104,12 +153,7 @@ class FixerAgent(BaseAgent):
             return AgentResult(success=False, message="FileTool not available")
 
         sandbox = self.project_config.get("sandbox", {})
-        if not state.errors and (state.test_errors or state.check_errors):
-            # Fixing test failures or check violations — check errors (e.g. detekt) can reference
-            # test files, so the agent needs write access to test directories
-            allowed_write_paths = sandbox.get("allowed_test_write_paths") or sandbox.get("allowed_write_paths", [])
-        else:
-            allowed_write_paths = sandbox.get("allowed_write_paths", [])
+        allowed_write_paths = _write_paths_for_state(state, sandbox)
         allowed_str = ", ".join(allowed_write_paths) if allowed_write_paths else "(not configured)"
         allowed_read_paths = sandbox.get("allowed_read_paths", ["."])
         allowed_read_str = ", ".join(allowed_read_paths)
@@ -162,6 +206,25 @@ class FixerAgent(BaseAgent):
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
+
+        if state.test_errors and not state.errors and not state.check_errors:
+            production_writes = _test_failure_production_writes(changed, sandbox)
+            if production_writes and not _has_valid_production_test_failure_triage(fixer_output):
+                for p in changed:
+                    if p not in state.files_changed:
+                        state.files_changed.append(p)
+                msg = (
+                    "Test-failure fixer changed production files without explicit "
+                    "production_defect triage: "
+                    f"{production_writes}"
+                )
+                state.record(self.name, "fix_failed", msg)
+                state.failed = True
+                return AgentResult(
+                    success=False,
+                    message=msg[:200],
+                    data={"files_written": changed},
+                )
 
         if not changed:
             msg = "Agent made no file changes"

@@ -219,6 +219,8 @@ class TestTestWriterAgentPrompt:
         assert "positive/negative contract matrix" in prompt
         assert "expected result type" in prompt
         assert "wrong expected result type rejection" in prompt
+        assert "Preserve the contract dimension" in prompt
+        assert "parse/load validation" in prompt
 
     def test_single_pass_prompt_has_no_current_step(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state()

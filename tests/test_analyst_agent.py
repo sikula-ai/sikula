@@ -111,6 +111,10 @@ class TestAnalystAgentRun:
         assert "Structured input contract" in task_state.analyst_prompt
         assert "expected result types" in task_state.analyst_prompt
         assert "generic and expected-type validation APIs" in task_state.analyst_prompt
+        assert "clearly labelled structured" in task_state.analyst_prompt
+        assert "platform-neutral" in task_state.analyst_prompt
+        assert "materially different rejected input" in task_state.analyst_prompt
+        assert "classes" in task_state.analyst_prompt
 
 
 class TestAnalystGatherGuidelines:

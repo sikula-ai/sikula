@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 from agents.base_agent import AGENT_SECURITY_PREFIX
-from agents.fixer_agent import FixerAgent, _errors_section, _guidelines_files, _tech_stack, _test_constraint
+from agents.fixer_agent import (
+    FixerAgent,
+    _errors_section,
+    _guidelines_files,
+    _has_valid_production_test_failure_triage,
+    _tech_stack,
+    _test_constraint,
+    _test_failure_production_writes,
+    _write_paths_for_state,
+)
 from tests.conftest import StubLLMClient
 from core.state import TaskState
 
@@ -259,13 +268,18 @@ class TestFixerAgentFixCycleRecord:
 
 
 class TestFixerAgentWritePaths:
-    def test_test_only_errors_use_test_write_paths(self, stub_llm: StubLLMClient, file_tool):
+    def test_test_only_errors_use_production_and_test_write_paths(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["tests/LoginTest.kt"]
         config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
         state = _make_state()
         state.test_errors = ["assertion failed"]
         _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
-        assert "tests/" in stub_llm.agent_calls[0]
+        prompt = stub_llm.agent_calls[0]
+        assert "src/, tests/" in prompt
+        assert "fix production code instead of weakening the test" in prompt
+        assert "TEST FAILURE TRIAGE:" in prompt
+        assert "classification: production_defect | stale_test | malformed_test | unclear" in prompt
+        assert "chosen_fix: production_code | test_code" in prompt
 
     def test_build_errors_use_production_write_paths(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["src/Login.kt"]
@@ -285,21 +299,65 @@ class TestFixerAgentWritePaths:
         prompt = stub_llm.agent_calls[0]
         assert "NEVER create or modify unit tests" in prompt
 
-    def test_check_errors_use_test_write_paths(self, stub_llm: StubLLMClient, file_tool):
+    def test_check_errors_use_production_and_test_write_paths(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["tests/LoginTest.kt"]
         config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
         state = _make_state()
         state.check_errors = ["detekt: unused import"]
         _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
         prompt = stub_llm.agent_calls[0]
-        assert "tests/" in prompt
-        assert "MAY modify test files" in prompt
+        assert "src/, tests/" in prompt
+        assert "MAY modify production or test files" in prompt
 
     def test_no_network_write_agent_prepended(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state()
         state.errors = ["compile error"]
         _make_agent(stub_llm, file_tool=file_tool).run(state)
         assert stub_llm.agent_calls[0].startswith(AGENT_SECURITY_PREFIX)
+
+
+class TestFixerAgentTestFailureProductionGate:
+    def test_test_failure_production_fix_requires_explicit_triage(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["src/Login.kt"]
+        stub_llm.agent_output = "Fixed production code without the required triage."
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        assert not result.success
+        assert state.failed is True
+        assert state.test_errors == ["assertion failed"]
+        assert "src/Login.kt" in state.files_changed
+        assert any(e["action"] == "fix_failed" for e in state.history)
+
+    def test_test_failure_production_fix_with_valid_triage_succeeds(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["src/Login.kt"]
+        stub_llm.agent_output = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: production_defect\n"
+            "contract_affected: login validation\n"
+            "chosen_fix: production_code\n"
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        assert result.success
+        assert state.failed is False
+        assert state.test_errors == []
+        assert "src/Login.kt" in state.files_changed
+
+    def test_test_failure_test_only_fix_does_not_require_production_triage(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["tests/LoginTest.kt"]
+        stub_llm.agent_output = (
+            "TEST FAILURE TRIAGE:\nclassification: stale_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        assert result.success
+        assert state.test_errors == []
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +370,8 @@ class TestTestConstraint:
         state = _make_state()
         state.test_errors = ["assertion failed"]
         assert "MAY create and modify test files" in _test_constraint(state)
+        assert "fix production code instead of weakening the test" in _test_constraint(state)
+        assert "TEST FAILURE TRIAGE:" in _test_constraint(state)
 
     def test_build_errors_block_test_modification(self):
         state = _make_state()
@@ -321,19 +381,77 @@ class TestTestConstraint:
     def test_check_errors_allow_test_modification(self):
         state = _make_state()
         state.check_errors = ["lint error"]
-        assert "MAY modify test files" in _test_constraint(state)
+        assert "MAY modify production or test files" in _test_constraint(state)
 
     def test_check_errors_with_test_errors_allow_test_modification(self):
         state = _make_state()
         state.check_errors = ["lint error"]
         state.test_errors = ["assertion failed"]
-        assert "MAY modify test files" in _test_constraint(state)
+        assert "MAY modify production or test files" in _test_constraint(state)
 
     def test_mixed_errors_block_test_modification(self):
         state = _make_state()
         state.errors = ["compile error"]
         state.test_errors = ["assertion failed"]
         assert "NEVER create or modify unit tests" in _test_constraint(state)
+
+
+class TestWritePathsForState:
+    def test_build_errors_use_only_production_paths(self):
+        state = _make_state()
+        state.errors = ["compile error"]
+        sandbox = {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}
+        assert _write_paths_for_state(state, sandbox) == ["src/"]
+
+    def test_test_failures_use_production_and_test_paths(self):
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        sandbox = {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}
+        assert _write_paths_for_state(state, sandbox) == ["src/", "tests/"]
+
+    def test_check_errors_use_production_and_test_paths(self):
+        state = _make_state()
+        state.check_errors = ["fmt failed"]
+        sandbox = {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}
+        assert _write_paths_for_state(state, sandbox) == ["src/", "tests/"]
+
+    def test_test_failure_write_paths_are_deduplicated(self):
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        sandbox = {"allowed_write_paths": ["."], "allowed_test_write_paths": ["."]}
+        assert _write_paths_for_state(state, sandbox) == ["."]
+
+
+class TestTestFailureProductionWrites:
+    def test_returns_files_outside_test_paths(self):
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert _test_failure_production_writes(["src/Login.kt", "tests/LoginTest.kt"], sandbox) == ["src/Login.kt"]
+
+    def test_no_test_paths_treats_all_changed_files_as_production(self):
+        assert _test_failure_production_writes(["src/Login.kt"], {}) == ["src/Login.kt"]
+
+
+class TestProductionTestFailureTriage:
+    def test_valid_triage_allows_production_fix(self):
+        output = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: production_defect\n"
+            "contract_affected: structured contract\n"
+            "chosen_fix: production_code\n"
+        )
+        assert _has_valid_production_test_failure_triage(output)
+
+    def test_template_placeholder_is_not_valid_triage(self):
+        output = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: production_defect | stale_test | malformed_test | unclear\n"
+            "chosen_fix: production_code | test_code\n"
+        )
+        assert not _has_valid_production_test_failure_triage(output)
+
+    def test_test_code_triage_does_not_allow_production_fix(self):
+        output = "TEST FAILURE TRIAGE:\nclassification: stale_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        assert not _has_valid_production_test_failure_triage(output)
 
 
 class TestErrorsSection:

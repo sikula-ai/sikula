@@ -269,6 +269,16 @@ class TestReviewerAgentPrompt:
         assert "validates" in prompt
         assert "API that does not know the expected result type" in prompt
 
+    def test_pipeline_prompt_allows_contract_test_weakening_as_production_evidence(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "contract-bearing test was deleted, relaxed" in prompt
+        assert "report the production-code issue" in prompt
+
 
 class TestReviewerAgentHistory:
     def test_previous_reviews_included_in_prompt(self, stub_llm: StubLLMClient, file_tool):
@@ -386,6 +396,7 @@ class TestReviewerAgentHistory:
         assert "Test files are branch-owned output in `sikula review` mode" in prompt
         assert "Review changed test files" in prompt
         assert "stale fixtures" in prompt
+        assert "negative tests changed to easier/different" in prompt
         assert "Test files are not reviewer-owned output" not in prompt
         assert "Do not review test files for correctness" not in prompt
 
@@ -407,6 +418,37 @@ class TestReviewerAgentHistory:
         agent = _make_agent(stub_llm, file_tool=file_tool)
         agent.run(state)
         assert "Files written by the test writer agent" not in stub_llm.readonly_calls[0]
+
+    def test_test_failure_fixer_records_included_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.fix_cycle_records = [
+            {
+                "errors_before": {"build": [], "test": ["assertion failed"], "check": []},
+                "files_written": ["tests/LoginTest.kt"],
+                "fixer_output": "TEST FAILURE TRIAGE:\nclassification: stale_test",
+            }
+        ]
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Recent test-failure fixer records" in prompt
+        assert "tests/LoginTest.kt" in prompt
+        assert "classification: stale_test" in prompt
+
+    def test_build_only_fixer_records_not_included_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.fix_cycle_records = [
+            {
+                "errors_before": {"build": ["compile error"], "test": [], "check": []},
+                "files_written": ["src/Login.kt"],
+                "fixer_output": "fixed compile error",
+            }
+        ]
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        assert "Recent test-failure fixer records" not in stub_llm.readonly_calls[0]
 
     def test_mixed_history_includes_only_reviewer_entries(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"

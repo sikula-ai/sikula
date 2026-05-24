@@ -78,12 +78,15 @@ TESTING RULES:
   materially different rejected input class introduced or affected by the change. Include
   malformed syntax/literals, unknown identifiers or functions, invalid shapes, forbidden
   values, empty/both/none alternatives, scope or forward-reference violations, and literal
-  division-by-zero where applicable.
+  division-by-zero where applicable. Preserve the contract dimension being tested: do not
+  replace one rejected input class with a different invalid fixture just because it is easier
+  to make pass.
 - If expressions, rules, conditions, or config fields are used in typed contexts, test the
   expected result type explicitly. Cover success for the valid type and rejection for wrong
   result types, such as a boolean value where a numeric value is required or a numeric value
   where a boolean condition is required. Do not rely on tests that only prove syntax or
-  variable-name validation.
+  variable-name validation. When observable through the public API, assert whether rejection
+  belongs to parse/load validation, semantic validation, or runtime evaluation.
 - For UI code, test through stable seams such as view models, public routing/state objects,
   rendered UI testing APIs already used by the project, or other project-standard test
   helpers. Do NOT write brittle tests that inspect UI framework internals, opaque view trees,

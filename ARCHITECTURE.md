@@ -533,7 +533,10 @@ Output written to state:
 - *Structured input contracts* — for parsers, validators, expression engines, schemas, DSLs,
   config loaders, and rule engines, the implementation prompt must include accepted inputs,
   rejected inputs, expected result types for typed contexts, scope rules, literal handling, and
-  whether failures belong in validation or runtime.
+  whether failures belong in validation or runtime. These details stay semantic and
+  platform-neutral unless the existing codebase exposes platform-specific contract names.
+  Acceptance criteria distinguish materially different rejected input classes instead of
+  relying on one generic invalid example.
 
 ---
 
@@ -624,6 +627,9 @@ file that was already dirty before the run is still detected as changed if the a
 - project guidelines content pre-loaded from `guidelines.context_files` (same mechanism as analyst; capped at `guidelines.max_file_chars` per file; truncated files include a Read-tool marker)
 - previous reviewer outputs from `state.review_cycle_records` — passed as numbered history so the agent maintains consistent judgments across iterations and does not reverse a finding unless the code genuinely changed
 - `state.test_files_written` — list of files written by the test writer agent; if non-empty, passed to the reviewer so generated tests are not flagged as scope violations. In normal `sikula run` mode, these files are not reviewer-owned output. In `sikula review` mode, changed test files are reviewed as normal branch output.
+- recent test-failure fixer records from `state.fix_cycle_records` — only records whose
+  `errors_before.test` is non-empty are summarized, so the reviewer can audit whether a
+  test-failure fix weakened a task, guideline, or structured input contract.
 
 The agent reads the diff, then uses its `Read` tool to inspect any changed file in full.
 New files (not in the diff) are read directly via their paths in `state.files_changed`.
@@ -640,14 +646,19 @@ New files (not in the diff) are read directly via their paths in `state.files_ch
    forbidden values, and scope/forward-reference violations. A validator that only checks
    syntax or known names when the task requires typed/shape-specific validation is a
    production correctness issue.
+7. *Contract-bearing test weakening* — in normal `sikula run`, changed tests are still not
+   reviewed as standalone output, but if changed test files or recent test-failure fixer
+   records show that a task/guideline/structured-contract test was deleted, relaxed, or
+   changed to a different invalid fixture, the reviewer uses that as evidence to re-check
+   the production contract and reports the production issue when it still exists.
 
 Test-file policy is mode-specific. In normal `sikula run` mode, test files are not
 reviewer-owned output; the reviewer does not block approval because tests are stale,
 missing, or need fixture updates, and may use tests only as evidence of a production
 correctness problem. In `sikula review` mode, changed test files are branch-owned
 output and are reviewed like any other changed file; stale fixtures, incorrect
-assertions, misleading expectations, or material missing tests may be reported as
-review issues.
+assertions, misleading expectations, negative tests changed to easier/different
+invalid fixtures, or material missing tests may be reported as review issues.
 
 **Output written to state:**
 - Approved: `state.review_approved = True`, `state.review_issues` cleared; output includes a structured verification summary — `Completeness:`, `Correctness:`, and `Callers verified:` lines, each omitted when not applicable — followed by `APPROVED` on its own line; record appended to `state.review_cycle_records` with `approved = True`
@@ -738,7 +749,11 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
      tasks, `CURRENT STEP` is the primary scope signal and tests for future steps are not added
    - Parser, validator, expression engine, schema, DSL, config loader, and rule engine
      changes get a positive/negative contract matrix, including wrong expected result type
-     rejection when typed contexts exist
+     rejection when typed contexts exist; rejected input classes must stay distinct, so a
+     malformed-shape case cannot be replaced with a different invalid fixture merely because
+     it is easier to make pass
+   - When observable through the public API, tests assert whether rejection belongs to
+     parse/load validation, semantic validation, or runtime evaluation
 4. Uses parametric tests when the project uses them anywhere in the test suite and the fit
    is natural — even if the specific file being edited does not currently use them;
    parametric structure takes precedence over mirroring the existing file; when multiple
@@ -774,8 +789,8 @@ reviewed once as a final validation gate and do not trigger another test-writing
 | Error type | `allowed_write_paths` used in prompt | Test files |
 |---|---|---|
 | Build errors (`state.errors` non-empty) | `sandbox.allowed_write_paths` (production dirs) | Off-limits |
-| Test failures only (`state.test_errors` non-empty, `state.errors` and `state.check_errors` both empty) | `sandbox.allowed_test_write_paths` (test dirs) | May create/modify; production files off-limits |
-| Check errors only (`state.check_errors` non-empty, `state.errors` empty) | `sandbox.allowed_test_write_paths` (test dirs) | May modify if explicitly named in the check errors |
+| Test failures only (`state.test_errors` non-empty, `state.errors` and `state.check_errors` both empty) | `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May modify production or test files; must fix production when the failing test encodes the original task, implementation prompt, project guidelines, or a structured contract. If production files are changed, fixer output must explicitly classify the failure as `production_defect` and choose `production_code`; otherwise the task fails for audit. |
+| Check errors only (`state.check_errors` non-empty, `state.errors` empty) | `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May modify production or test files if explicitly named in the check errors |
 
 **Input:**
 - `state.errors[-3:]` — last three build error blobs (if non-empty, labelled "BUILD ERRORS")
@@ -786,7 +801,17 @@ reviewed once as a final validation gate and do not trigger another test-writing
 - write-path allowlist from project config — see constraint table above
 - project guidelines filenames from `guidelines.context_files` — fixer reads content via its tools so fixes follow architecture conventions
 
-Both error sources are included in the same prompt when present; in normal flow at most one is non-empty at a time (build errors are cleared by a passing build before tests run).
+Both error sources are included in the same prompt when present; in normal flow at most one
+is non-empty at a time (build errors are cleared by a passing build before tests run).
+For test failures, the fixer is explicitly told to decide whether the failure is caused by
+production behaviour or by an incorrect/stale test. It must not delete, relax, or rewrite
+assertions just to make the run green. Its final response for test failures must begin with
+`TEST FAILURE TRIAGE`, classifying the failure as `production_defect`, `stale_test`,
+`malformed_test`, or `unclear`, naming the affected contract when present, and stating
+whether the chosen fix changed production code or test code. Sikula enforces this for
+production writes from test-failure fixes: missing triage, copied placeholder triage, or any
+classification other than `production_defect` with `chosen_fix: production_code` marks the task
+failed before the pipeline can accept the change.
 
 **Mechanism:** calls `LLMClient.run_agent(prompt, cwd=project_root)`.
 The agent reads the error output, locates relevant files, and applies fixes directly — no file
@@ -797,6 +822,9 @@ content pre-loaded in the prompt.
 **Output written to state:**
 - `state.files_changed` — new paths appended (existing entries kept)
 - `state.errors`, `state.test_errors`, and `state.check_errors` — all cleared after agent runs successfully
+- `state.fix_cycle_records` — stores the fixer prompt, output, errors snapshot, files written,
+  scope, and build iteration; reviewer prompts summarize recent test-failure records for
+  contract-weakening audit.
 
 **Re-sync trigger:** orchestrator calls `BuildTool.is_build_config_file()` on each newly
 changed file. If any match, `state.build_synced = False` is set so sync runs before the
