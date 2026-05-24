@@ -392,7 +392,31 @@ class TestReviewerAgentPrompt:
         prompt = stub_llm.readonly_calls[0]
 
         assert "build=off, tests=off, checks=off" in prompt
+        assert "Validation commands found in review description" in prompt
         assert "`cargo test --workspace` -> not covered by configured pipeline" in prompt
+        assert "In review mode, do not report a Validation Coverage Gap" in prompt
+
+    def test_review_fix_validation_commands_are_informational(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(
+            review_mode="review_fix",
+            task_description="Review branch. Run `cargo test --workspace --all-features` before merge.",
+        )
+        config = {
+            "project": {"build_tool": "cargo"},
+            "build": {"test_command": "cargo test"},
+        }
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+
+        assert "Review mode: validation command coverage is informational" in prompt
+        assert "Validation commands found in review description" in prompt
+        assert (
+            "`cargo test --workspace --all-features` -> not covered by configured pipeline "
+            "(nearest test/tests: `cargo test`; same command family)"
+        ) in prompt
+        assert "In review mode, do not report a Validation Coverage Gap" in prompt
 
     def test_validation_command_extraction_is_limited_to_command_like_text(self):
         text = (

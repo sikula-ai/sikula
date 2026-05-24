@@ -160,23 +160,27 @@ or report generators. Sikula treats those as acceptance criteria for the configu
 pipeline, not as shell commands for agents to run manually. The reviewer sees the
 effective build/test/check commands from the Sikula config file (auto-discovered
 `.sikula/config.yaml` by default, or the file passed with `--config`). That configured
-validation pipeline is what Sikula can execute. Validation command coverage is the
-preflight/reviewer check that task-described commands are represented by that pipeline.
+validation pipeline is what Sikula can execute. For `sikula run`, validation command
+coverage is the preflight/reviewer check that task-described commands are represented by
+that pipeline.
 To make a command count as task-described validation, write it explicitly: in backticks,
 in a shell code fence, with a `$` prompt, or as a command list under a heading/prefix such
 as `Verification:` or `Run:`; Markdown blank separator lines after the heading are allowed.
 Bare tool names such as `cargo` or `npm` are not treated as validation commands.
-If a task command is not covered there, it is reported as a validation coverage gap so
-you can add the same command to the effective build/test/check config or adjust the task
-before rerunning. A generic command from the same tool family is not enough when the
-task specifies materially different flags, targets, scripts, packages, schemes, or paths.
+If a `sikula run` task command is not covered there, it is reported as a validation
+coverage gap so you can add the same command to the effective build/test/check config or
+adjust the task before rerunning. In `sikula review` modes, commands found in PR/review
+text are informational branch-verification context and do not preflight-abort review/fix.
+A generic command from the same tool family is not enough when the task specifies
+materially different flags, targets, scripts, packages, schemes, or paths.
 Gradle/Maven wrapper spelling for the same invocation (`./gradlew` vs `gradle`,
 `./mvnw` vs `mvn`) is treated as equivalent, as are Python module forms
 (`python -m pytest` vs `pytest`, `python -m ruff` vs `ruff`) and npm/pnpm/Yarn
 `test` script shortcuts (`npm test` vs `npm run test`, etc.); different tasks,
 scripts, goals, or flags are not.
-Sikula does not ask the implementer to edit the pipeline config inside the current
-task, because the effective pipeline is loaded before the agent loop starts.
+For run-task validation coverage gaps, Sikula does not ask the implementer to edit the
+pipeline config inside the current task, because the effective pipeline is loaded before
+the agent loop starts.
 
 ## When Sikula fits
 

@@ -275,6 +275,30 @@ class TestOrchestratorLoop:
             for entry in result.validation_cycle_records
         )
 
+    def test_unknown_review_mode_does_not_skip_validation_coverage_preflight(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=True,
+            run_checks=True,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "build": {"test_command": "cargo test"},
+            },
+        )
+        state = _save_state(
+            orch,
+            review_mode="unknown",
+        )
+        state.task_description = "Update parser. Run `cargo test --workspace --all-features`."
+        orch._store.save(state)
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed
+        assert not stubs["analyst"].calls
+        assert any(entry["phase"] == "validation_coverage" for entry in result.validation_cycle_records)
+
     def test_prose_starting_with_tool_name_does_not_fail_validation_coverage(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
             tmp_path,
@@ -1460,6 +1484,38 @@ class TestOrchestratorPreexistingChangesFastPath:
         assert review_scopes == ["task"]
         assert result.plan_completed is False
         assert result.final_full_task_review_done is False
+
+    def test_review_fix_skips_validation_coverage_preflight_abort(self, tmp_path: Path, monkeypatch):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_security_review=False,
+            run_test_writing=False,
+            run_build=False,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "build": {"test_command": "cargo test"},
+            },
+        )
+        monkeypatch.setattr(subprocess, "run", _git_diff_refresh_subprocess)
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.rs"],
+            review_diff=_REVIEW_DIFF,
+            review_mode="review_fix",
+            review_base_branch="main",
+            worktree_base=str(tmp_path),
+            plan_decided=True,
+        )
+        state.task_description = "Review branch.\n\n## Verification\n\ncargo test --workspace --all-features\n"
+        orch._store.save(state)
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert stubs["reviewer"].calls
+        assert not any(entry["phase"] == "validation_coverage" for entry in result.validation_cycle_records)
 
     def test_review_fix_refreshes_review_diff_before_review(self, tmp_path: Path, monkeypatch):
         orch, stubs, _ = _make_orchestrator(

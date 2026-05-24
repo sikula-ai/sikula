@@ -657,10 +657,12 @@ New files (not in the diff) are read directly via their paths in `state.files_ch
 8. *Validation command coverage* — explicit validation commands in task descriptions are
    treated as acceptance criteria for the configured validation pipeline. The reviewer does not block
    merely because a covered command has not yet run during review; the build/test/check
-   loop owns execution. If a task-described command is not covered by configured
-   compile/test/check commands, the run fails as a validation coverage gap before the
-   agent loop. A same-tool-family command with materially different flags, targets,
-   scripts, packages, schemes, or paths is reported as a near match, not accepted as
+   loop owns execution. If a `sikula run` task-described command is not covered by
+   configured compile/test/check commands, the run fails as a validation coverage gap
+   before the agent loop. In `sikula review` modes, commands found in PR/review text are
+   informational branch-verification context and do not preflight-abort review/fix. A
+   same-tool-family command with materially different flags, targets, scripts, packages,
+   schemes, or paths is reported as a near match, not accepted as
    coverage. Gradle/Maven wrapper spelling for the same invocation (`./gradlew` vs
    `gradle`, `./mvnw` vs `mvn`), Python module forms (`python -m pytest` vs `pytest`,
    `python -m ruff` vs `ruff`), and npm/pnpm/Yarn `test` script shortcuts (`npm test`
@@ -1114,18 +1116,19 @@ headings/prefixes such as `Verification:` or `Run:`; Markdown blank separator li
 the heading are allowed. Prose that happens to start with a tool name is not treated as a
 command, and bare tool names such as `cargo` or `npm` are not treated as executable
 validation commands.
-When the task text requires a validation command that is not represented by the effective
-pipeline config, Sikula reports a validation coverage gap instead of asking an agent to run
-the command manually. A command from the same tool family is only a diagnostic near match
-when flags, targets, scripts, packages, schemes, or paths differ. Gradle/Maven wrapper
-spelling for the same invocation (`./gradlew` vs `gradle`, `./mvnw` vs `mvn`) is accepted
+When `sikula run` task text requires a validation command that is not represented by the
+effective pipeline config, Sikula reports a validation coverage gap instead of asking an
+agent to run the command manually. In `sikula review` modes, commands found in PR/review
+text are informational branch-verification context and do not preflight-abort review/fix.
+A command from the same tool family is only a diagnostic near match when flags, targets,
+scripts, packages, schemes, or paths differ. Gradle/Maven wrapper spelling for the same
+invocation (`./gradlew` vs `gradle`, `./mvnw` vs `mvn`) is accepted
 as coverage, as are Python module forms (`python -m pytest` vs `pytest`,
 `python -m ruff` vs `ruff`) and npm/pnpm/Yarn `test` script shortcuts (`npm test` vs
-`npm run test`, etc.). This is not fixed inside
-the current task worktree: update
-the Sikula config file used for the run (default `.sikula/config.yaml`, or the file passed
-with `--config`) or the task and rerun so the effective pipeline is loaded with the right
-command set.
+`npm run test`, etc.). Run-task validation coverage gaps are not fixed inside the current
+task worktree: update the Sikula config file used for the run (default `.sikula/config.yaml`,
+or the file passed with `--config`) or the task and rerun so the effective pipeline is
+loaded with the right command set.
 
 #### `planner` config keys
 

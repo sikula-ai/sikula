@@ -323,6 +323,9 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _abort_on_validation_coverage_gaps(self, state: TaskState) -> bool:
+        if state.review_mode in {"review_report", "review_fix"}:
+            return False
+
         gaps = validation_coverage_gaps(self._agent_project_config, state)
         if not gaps:
             return False
