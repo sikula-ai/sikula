@@ -671,9 +671,10 @@ New files (not in the diff) are read directly via their paths in `state.files_ch
    schemes, or paths is reported as a near match, not accepted as
    coverage. Gradle/Maven wrapper spelling for the same invocation (`./gradlew` vs
    `gradle`, `./mvnw` vs `mvn`), Python module forms (`python -m pytest` vs `pytest`,
-   `python -m ruff` vs `ruff`), and npm/pnpm/Yarn `test` script shortcuts (`npm test`
-   vs `npm run test`, etc.) are accepted as coverage. Report-only review may still
-   report the same gap as a review issue.
+   `python -m ruff` vs `ruff`), the npm `test` shortcut (`npm test` vs `npm run test`),
+   and pnpm/Yarn package-script shorthands for common validation scripts (`pnpm typecheck`
+   vs `pnpm run typecheck`, `yarn lint` vs `yarn run lint`) are accepted as coverage.
+   Report-only review may still report the same gap as a review issue.
 
 Test-file policy is mode-specific. In normal `sikula run` mode, test files are not
 reviewer-owned output; the reviewer does not block approval because tests are stale,
@@ -1189,11 +1190,12 @@ A command from the same tool family is only a diagnostic near match when flags, 
 scripts, packages, schemes, or paths differ. Gradle/Maven wrapper spelling for the same
 invocation (`./gradlew` vs `gradle`, `./mvnw` vs `mvn`) is accepted
 as coverage, as are Python module forms (`python -m pytest` vs `pytest`,
-`python -m ruff` vs `ruff`) and npm/pnpm/Yarn `test` script shortcuts (`npm test` vs
-`npm run test`, etc.). Run-task validation coverage gaps are not fixed inside the current
-task worktree: update the Sikula config file used for the run (default `.sikula/config.yaml`,
-or the file passed with `--config`) or the task and rerun so the effective pipeline is
-loaded with the right command set.
+`python -m ruff` vs `ruff`), the npm `test` shortcut (`npm test` vs `npm run test`),
+and pnpm/Yarn package-script shorthands for common validation scripts (`pnpm typecheck`
+vs `pnpm run typecheck`, `yarn lint` vs `yarn run lint`). Run-task validation coverage
+gaps are not fixed inside the current task worktree: update the Sikula config file used
+for the run (default `.sikula/config.yaml`, or the file passed with `--config`) or the
+task and rerun so the effective pipeline is loaded with the right command set.
 
 #### `planner` config keys
 

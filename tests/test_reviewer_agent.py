@@ -562,12 +562,25 @@ class TestReviewerAgentPrompt:
             ("npm test", "npm run test"),
             ("npm test -- --watch", "npm run test -- --watch"),
             ("pnpm test", "pnpm run test"),
+            ("pnpm typecheck", "pnpm run typecheck"),
+            ("pnpm format:check", "pnpm run format:check"),
             ("yarn test", "yarn run test"),
             ("yarn test --watch", "yarn run test --watch"),
+            ("yarn typecheck", "yarn run typecheck"),
         ]
 
         for left, right in aliases:
             assert validation_commands_equivalent(left, right) == (True, "exact")
+
+    def test_validation_command_matching_treats_node_script_flags_strictly(self):
+        assert validation_commands_equivalent("pnpm typecheck --watch", "pnpm run typecheck") == (
+            True,
+            "same command family",
+        )
+        assert validation_commands_equivalent("yarn lint --fix", "yarn run lint") == (
+            True,
+            "same command family",
+        )
 
     def test_validation_command_matching_treats_python_module_forms_as_exact_aliases(self):
         aliases = [
@@ -599,6 +612,22 @@ class TestReviewerAgentPrompt:
             {"phase": "test", "name": "tests", "command": "pnpm test"},
             {"phase": "check", "name": "lint", "command": "pnpm lint"},
             {"phase": "check_autofix", "name": "lint autofix", "command": "pnpm format"},
+        ]
+
+    def test_node_configured_validation_commands_use_detected_defaults(self, tmp_path):
+        (tmp_path / "pnpm-lock.yaml").write_text("")
+        (tmp_path / "package.json").write_text('{"scripts": {"typecheck": "tsc --noEmit", "test": "vitest run"}}')
+        state = _make_state()
+        config = {
+            "project": {"build_tool": "node", "root_path": str(tmp_path)},
+            "build": {},
+        }
+
+        commands = configured_validation_commands(config, state)
+
+        assert commands[:2] == [
+            {"phase": "build", "name": "compile", "command": "pnpm typecheck"},
+            {"phase": "test", "name": "tests", "command": "pnpm test"},
         ]
 
     def test_validation_command_coverage_requires_exact_command(self):

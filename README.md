@@ -176,9 +176,10 @@ A generic command from the same tool family is not enough when the task specifie
 materially different flags, targets, scripts, packages, schemes, or paths.
 Gradle/Maven wrapper spelling for the same invocation (`./gradlew` vs `gradle`,
 `./mvnw` vs `mvn`) is treated as equivalent, as are Python module forms
-(`python -m pytest` vs `pytest`, `python -m ruff` vs `ruff`) and npm/pnpm/Yarn
-`test` script shortcuts (`npm test` vs `npm run test`, etc.); different tasks,
-scripts, goals, or flags are not.
+(`python -m pytest` vs `pytest`, `python -m ruff` vs `ruff`), the npm `test`
+shortcut (`npm test` vs `npm run test`), and pnpm/Yarn package-script shorthands
+for common validation scripts (`pnpm typecheck` vs `pnpm run typecheck`,
+`yarn lint` vs `yarn run lint`). Different tasks, scripts, goals, or flags are not.
 For run-task validation coverage gaps, Sikula does not ask the implementer to edit the
 pipeline config inside the current task, because the effective pipeline is loaded before
 the agent loop starts.

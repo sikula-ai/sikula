@@ -253,6 +253,28 @@ class TestOrchestratorLoop:
             for entry in result.validation_cycle_records
         )
 
+    def test_node_detected_script_defaults_cover_task_validation_commands(self, tmp_path: Path):
+        (tmp_path / "pnpm-lock.yaml").write_text("")
+        (tmp_path / "package.json").write_text('{"scripts": {"typecheck": "tsc --noEmit", "test": "vitest run"}}')
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=True,
+            run_checks=True,
+            project_config={
+                "project": {"build_tool": "node", "root_path": str(tmp_path)},
+                "build": {},
+            },
+        )
+        stubs["implementer"].side_effect = lambda state: state.files_changed.append("src/index.ts")
+
+        result = orch.run(task_description="## Verification\n\npnpm run typecheck\npnpm test\n")
+
+        assert result.done
+        assert not result.failed
+        assert stubs["analyst"].calls
+        assert not any(entry["phase"] == "validation_coverage" for entry in result.validation_cycle_records)
+
     def test_validation_heading_with_blank_separator_fails_before_agents(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
             tmp_path,
