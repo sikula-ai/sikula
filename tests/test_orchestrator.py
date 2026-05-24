@@ -252,6 +252,37 @@ class TestOrchestratorLoop:
             for entry in result.validation_cycle_records
         )
 
+    def test_wrapper_alias_validation_command_is_covered_before_agents(self, tmp_path: Path):
+        cases = [
+            (
+                tmp_path / "gradle",
+                {"project": {"build_tool": "gradle-android"}, "build": {}},
+                "Update UI. Run `./gradlew testDebugUnitTest`.",
+            ),
+            (
+                tmp_path / "maven",
+                {"project": {"build_tool": "maven"}, "build": {}},
+                "Update API. Run `./mvnw test`.",
+            ),
+        ]
+
+        for root, project_config, task_description in cases:
+            root.mkdir()
+            orch, stubs, _ = _make_orchestrator(
+                root,
+                run_build=True,
+                run_tests=True,
+                run_checks=True,
+                project_config=project_config,
+            )
+            stubs["implementer"].side_effect = lambda state: state.files_changed.append("src/Main")
+
+            result = orch.run(task_description=task_description)
+
+            assert not result.failed
+            assert stubs["analyst"].calls
+            assert not any(entry["phase"] == "validation_coverage" for entry in result.validation_cycle_records)
+
     def test_done_task_skips_all_agents(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path)
         _save_state(orch, done=True)

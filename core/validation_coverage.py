@@ -202,10 +202,26 @@ def _command_signature(command: str) -> tuple[str, ...]:
     return (basename,)
 
 
+def _exact_command_key(command: str) -> tuple[str, ...]:
+    tokens = _shell_tokens(_normalize_command(command))
+    if not tokens:
+        return ()
+
+    executable = tokens[0].removeprefix("./")
+    if "/" not in executable:
+        if executable in {"gradlew", "gradle"}:
+            tokens[0] = "gradle"
+        elif executable in {"mvnw", "mvn"}:
+            tokens[0] = "mvn"
+    return tuple(tokens)
+
+
 def validation_commands_equivalent(task_command: str, pipeline_command: str) -> tuple[bool, str]:
     task_normalized = _normalize_command(task_command)
     pipeline_normalized = _normalize_command(pipeline_command)
-    if task_normalized == pipeline_normalized:
+    if task_normalized == pipeline_normalized or _exact_command_key(task_normalized) == _exact_command_key(
+        pipeline_normalized
+    ):
         return True, "exact"
     task_signature = _command_signature(task_normalized)
     pipeline_signature = _command_signature(pipeline_normalized)
@@ -259,10 +275,10 @@ def _default_compile_command(project_config: dict) -> str | None:
     if build_tool == "maven":
         return str(build.get("compile_command") or "mvn compile")
     if build_tool == "gradle-jvm":
-        return f"gradle {build.get('compile_task') or 'classes'}"
+        return f"./gradlew {build.get('compile_task') or 'classes'}"
     if build_tool == "xcodebuild":
         return f"xcodebuild build -scheme {build.get('scheme') or 'Countries'}"
-    return f"gradle {build.get('compile_task') or 'compileDebugKotlin'}"
+    return f"./gradlew {build.get('compile_task') or 'compileDebugKotlin'}"
 
 
 def _default_test_command(project_config: dict) -> str | None:
@@ -275,10 +291,10 @@ def _default_test_command(project_config: dict) -> str | None:
     if build_tool == "maven":
         return str(build.get("test_command") or "mvn test")
     if build_tool == "gradle-jvm":
-        return f"gradle {build.get('test_task') or 'test'}"
+        return f"./gradlew {build.get('test_task') or 'test'}"
     if build_tool == "xcodebuild":
         return f"xcodebuild test -scheme {build.get('scheme') or 'Countries'}"
-    return f"gradle {build.get('test_task') or 'testDebugUnitTest'}"
+    return f"./gradlew {build.get('test_task') or 'testDebugUnitTest'}"
 
 
 def configured_validation_commands(project_config: dict, state: TaskState) -> list[dict[str, str]]:

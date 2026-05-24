@@ -661,7 +661,9 @@ New files (not in the diff) are read directly via their paths in `state.files_ch
    compile/test/check commands, the run fails as a validation coverage gap before the
    agent loop. A same-tool-family command with materially different flags, targets,
    scripts, packages, schemes, or paths is reported as a near match, not accepted as
-   coverage. Report-only review may still report the same gap as a review issue.
+   coverage. Gradle/Maven wrapper spelling for the same invocation (`./gradlew` vs
+   `gradle`, `./mvnw` vs `mvn`) is accepted as coverage. Report-only review may still
+   report the same gap as a review issue.
 
 Test-file policy is mode-specific. In normal `sikula run` mode, test files are not
 reviewer-owned output; the reviewer does not block approval because tests are stale,
@@ -1107,7 +1109,9 @@ review them, but only configured build/test/check commands are executable pipeli
 When the task text requires a validation command that is not represented by the effective
 pipeline config, Sikula reports a validation coverage gap instead of asking an agent to run
 the command manually. A command from the same tool family is only a diagnostic near match
-when flags, targets, scripts, packages, schemes, or paths differ. This is not fixed inside
+when flags, targets, scripts, packages, schemes, or paths differ. Gradle/Maven wrapper
+spelling for the same invocation (`./gradlew` vs `gradle`, `./mvnw` vs `mvn`) is accepted
+as coverage. This is not fixed inside
 the current task worktree: update
 the Sikula config file used for the run (default `.sikula/config.yaml`, or the file passed
 with `--config`) or the task and rerun so the effective pipeline is loaded with the right

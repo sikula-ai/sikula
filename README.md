@@ -166,6 +166,8 @@ If a task command is not covered there, it is reported as a validation coverage 
 you can add the same command to the effective build/test/check config or adjust the task
 before rerunning. A generic command from the same tool family is not enough when the
 task specifies materially different flags, targets, scripts, packages, schemes, or paths.
+Gradle/Maven wrapper spelling for the same invocation (`./gradlew` vs `gradle`,
+`./mvnw` vs `mvn`) is treated as equivalent; different tasks, goals, or flags are not.
 Sikula does not ask the implementer to edit the pipeline config inside the current
 task, because the effective pipeline is loaded before the agent loop starts.
 

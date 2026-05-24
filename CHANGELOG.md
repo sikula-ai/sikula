@@ -15,7 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Security reviewer audit entries are stored in `security_review_cycle_records`, separate from code reviewer entries, with schema migration for existing state files.
 - Analyst, reviewer, and test-writer prompts now explicitly cover parser/validator/DSL/config/schema contracts, including expected-result-type validation, materially different negative contract cases, and validation-vs-runtime failure phase.
 - Reviewer prompts now include the effective configured validation pipeline and validation command coverage, so uncovered task-described commands are reported as validation coverage gaps instead of being treated as manual agent commands or implementer-fixable code issues.
-- Validation command coverage treats same-tool-family commands with materially different flags, targets, scripts, packages, schemes, or paths as uncovered; near matches are included only as diagnostic context before agents run.
+- Validation command coverage treats Gradle/Maven wrapper spelling as equivalent for otherwise identical commands, while same-tool-family commands with materially different flags, targets, scripts, packages, schemes, or paths remain uncovered; near matches are included only as diagnostic context before agents run.
 
 ### Fixed
 - Multi-step `sikula run` now performs a final full-task reviewer/security/test-writer gate after all step-scoped validations complete, so the finished branch gets one whole-task pass against the original task before final validation.

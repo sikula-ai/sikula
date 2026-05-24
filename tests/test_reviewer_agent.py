@@ -15,6 +15,7 @@ from agents.reviewer_agent import (
 from tests.conftest import StubLLMClient
 from core.state import TaskState
 from core.validation_coverage import (
+    configured_validation_commands,
     extract_validation_commands,
     validation_command_coverage,
     validation_commands_equivalent,
@@ -419,6 +420,7 @@ class TestReviewerAgentPrompt:
             "xcodebuild test -scheme App",
             "xcodebuild test -scheme AppTests",
         )[0]
+        assert not validation_commands_equivalent("./gradlew testDebugUnitTest", "./gradlew lintDebug")[0]
 
     def test_validation_command_coverage_requires_exact_command(self):
         configured = [{"phase": "test", "name": "tests", "command": "cargo test"}]
@@ -431,6 +433,59 @@ class TestReviewerAgentPrompt:
         assert not covered
         assert match_kind == "same command family"
         assert nearest == configured[0]
+
+    def test_validation_command_coverage_treats_build_wrappers_as_exact_aliases(self):
+        configured = [
+            {"phase": "test", "name": "gradle-tests", "command": "gradle testDebugUnitTest"},
+            {"phase": "test", "name": "maven-tests", "command": "mvn test"},
+        ]
+
+        gradle_covered, gradle_match_kind, _ = validation_command_coverage(
+            "./gradlew testDebugUnitTest",
+            configured,
+        )
+        maven_covered, maven_match_kind, _ = validation_command_coverage(
+            "./mvnw test",
+            configured,
+        )
+
+        assert gradle_covered
+        assert gradle_match_kind == "exact"
+        assert maven_covered
+        assert maven_match_kind == "exact"
+
+    def test_validation_command_coverage_keeps_wrapper_flags_strict(self):
+        configured = [
+            {"phase": "test", "name": "gradle-tests", "command": "gradle testDebugUnitTest"},
+            {"phase": "test", "name": "maven-tests", "command": "mvn test"},
+        ]
+
+        covered, match_kind, nearest = validation_command_coverage(
+            "./gradlew testDebugUnitTest --stacktrace",
+            configured,
+        )
+        maven_covered, maven_match_kind, maven_nearest = validation_command_coverage(
+            "./mvnw test -DskipITs",
+            configured,
+        )
+
+        assert not covered
+        assert match_kind == "same command family"
+        assert nearest == configured[0]
+        assert not maven_covered
+        assert maven_match_kind == "same command family"
+        assert maven_nearest == configured[1]
+
+    def test_configured_gradle_validation_defaults_use_wrapper_command(self):
+        state = _make_state()
+
+        android_commands = configured_validation_commands({"project": {"build_tool": "gradle-android"}}, state)
+        jvm_commands = configured_validation_commands({"project": {"build_tool": "gradle-jvm"}}, state)
+
+        assert {"phase": "build", "name": "compile", "command": "./gradlew compileDebugKotlin"} in android_commands
+        assert {"phase": "test", "name": "tests", "command": "./gradlew testDebugUnitTest"} in android_commands
+        assert {"phase": "build", "name": "compile", "command": "./gradlew classes"} in jvm_commands
+        assert {"phase": "test", "name": "tests", "command": "./gradlew test"} in jvm_commands
 
 
 class TestReviewerAgentHistory:
