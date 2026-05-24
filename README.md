@@ -99,13 +99,13 @@ sikula init --provider codex --model gpt-5.5 --guidelines  # adjust provider/mod
 
 ```bash
 # Pick the example closest to your stack:
-#   Android:  example/android/countries/.sikula/config.yaml
-#   iOS:      example/ios/countries/.sikula/config.yaml
-#   JVM/Gradle: example/jvm/countries-gradle/.sikula/config.yaml
-#   JVM/Maven:  example/jvm/countries-maven/.sikula/config.yaml
-#   Node/TS/JS: run `sikula init` in the project to detect package scripts
-#   Rust:       example/rust/countries/.sikula/config.yaml
-#   Python:   .sikula/config.yaml  (this repo)
+#   Android:     example/android/countries/.sikula/config.yaml
+#   iOS:         example/ios/countries/.sikula/config.yaml
+#   JVM/Gradle:  example/jvm/countries-gradle/.sikula/config.yaml
+#   JVM/Maven:   example/jvm/countries-maven/.sikula/config.yaml
+#   Node/React:  example/node/countries-react/.sikula/config.yaml
+#   Rust:        example/rust/countries/.sikula/config.yaml
+#   Python:      .sikula/config.yaml  (this repo)
 cp <example-config> my-project/.sikula/config.yaml
 # update: project name, allowed_write_paths, build tasks, guidelines.context_files
 ```
@@ -306,7 +306,7 @@ sikula run .sikula/tasks/status-emoji-icons.md
 
 ## 3. Try an example
 
-The repo ships five runnable example projects — each a countries browser or API built around the same domain data:
+The repo ships six runnable example projects — each a countries browser or API built around the same domain data:
 
 | Example | Stack | Data source | Config |
 |---|---|---|---|
@@ -314,6 +314,7 @@ The repo ships five runnable example projects — each a countries browser or AP
 | `example/ios/countries/` | Swift, SwiftUI (iOS 17+), `@Observable` | [REST Countries API](https://restcountries.com) | `example/ios/countries/.sikula/config.yaml` |
 | `example/jvm/countries-gradle/` | Kotlin, Spring Boot, Gradle | local JSON dataset sourced from REST Countries | `example/jvm/countries-gradle/.sikula/config.yaml` |
 | `example/jvm/countries-maven/` | Kotlin, Spring Boot, Maven | local JSON dataset sourced from REST Countries | `example/jvm/countries-maven/.sikula/config.yaml` |
+| `example/node/countries-react/` | TypeScript, React, Vite | local TypeScript dataset sourced from REST Countries | `example/node/countries-react/.sikula/config.yaml` |
 | `example/rust/countries/` | Rust, Ratatui | local JSON file | `example/rust/countries/.sikula/config.yaml` |
 
 Each example ships with ready-to-run task files. The Android and iOS tasks share the same specifications — the same task description drives both platforms; Sikula's agents handle the platform-specific implementation:
@@ -335,6 +336,14 @@ The Rust CLI ships its own set of tasks suited to a local-data command-line tool
 | `.sikula/tasks/add-neighbours.md` | Shows neighbouring countries for a given country |
 
 The Rust example also ships with ready-to-use `extra_rules` files in `example/rust/countries/.sikula/`. They are commented out in the config by default — uncomment the `reviewer`, `security_reviewer`, `test_writer`, and `planner` blocks in `example/rust/countries/.sikula/config.yaml` to activate them and see project-specific rules in action.
+
+The Node/React example ships a TypeScript web UI with Vitest and React Testing Library already configured:
+
+| Task file | What it does |
+|---|---|
+| `.sikula/tasks/add-search-by-name.md` | Adds a country name search control |
+| `.sikula/tasks/add-country-detail-view.md` | Adds a country detail view with browser and in-app back navigation |
+| `.sikula/tasks/format-population.md` | Formats the population number with B/M/K suffixes |
 
 The JVM examples ship the same Spring Boot REST API and the same task set in both build systems. Use the Gradle or Maven variant depending on the backend stack you want to test:
 

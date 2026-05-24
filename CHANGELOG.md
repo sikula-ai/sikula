@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Multi-step task state now records `plan_completed`, `active_scope`, `final_full_task_review_done`, and per-record scope metadata so final whole-task validation is auditable and resume-safe.
 - Test writer `TESTABILITY GAP` reports are now captured as first-class `testability_gaps` state records and surfaced in terminal summaries, with `test_writer.testability_gap_policy: fail` for teams that want missing safe test seams to block tasks.
 - Built-in `node` BuildTool support for Node.js / TypeScript / JavaScript projects, including npm/pnpm/yarn/bun detection, package-script based init defaults, and Node build-config resync detection.
+- Runnable TypeScript React/Vite countries example under `example/node/countries-react/`, with Sikula config, project guidelines, Vitest/Testing Library coverage, and ready-to-run tasks.
 
 ### Changed
 - `sikula --version` now appends a development suffix with branch and commit when run from a git checkout, making editable installs distinguishable from packaged releases.
