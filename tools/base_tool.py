@@ -71,7 +71,7 @@ class BuildTool(BaseTool):
     """Abstract interface for platform build systems.
 
     Implement one subclass per platform and register it as the "build" tool
-    in Orchestrator.__init__(). The orchestrator loop calls only these six
+    in Orchestrator.__init__(). The orchestrator loop calls only these core
     methods — everything else is platform-specific extras on the subclass.
 
     To add a new platform:
@@ -138,6 +138,15 @@ class BuildTool(BaseTool):
         Each platform subclass defines its own patterns.
         """
         raise NotImplementedError
+
+    def is_test_only_change(self, path: str, before: str | None, after: str | None) -> bool:
+        """Return True when a production-looking path contains only test-only edits.
+
+        This hook is used only as a narrow exception to the fixer's test-failure
+        production-write guard. The default is conservative: platforms must opt in
+        with syntax-aware logic for mixed source/test files.
+        """
+        return False
 
     @staticmethod
     def env_files() -> list[str]:

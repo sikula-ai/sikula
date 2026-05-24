@@ -862,6 +862,12 @@ files, dependency manifests, project/workspace files, generated-source config, a
 configuration therefore cannot be used to make malformed generated tests pass unless the
 fixer explicitly classifies the failure as a production defect and chooses a production-code
 fix.
+For mixed source/test files, the production-write audit may ask the active `BuildTool`
+whether the fixer's incremental before/after diff is test-only. This is opt-in and fail-closed:
+the default hook returns `False`, and platform subclasses must use syntax-aware checks. Cargo
+currently recognizes only edits inside an already-existing Rust `#[cfg(test)] mod tests`
+block; creating a new inline test block or changing any production hunk remains a production
+write.
 
 **Mechanism:** calls `LLMClient.run_agent(prompt, cwd=project_root)`.
 The agent reads the error output, locates relevant files, and applies fixes directly — no file
@@ -978,7 +984,7 @@ findings. Review and redact state files before sharing them outside your project
 
 ## BuildTool interface (`tools/base_tool.py`)
 
-The orchestrator loop calls exactly six methods on the registered `"build"` tool.
+The orchestrator loop calls a small fixed interface on the registered `"build"` tool.
 `env_files()` is a static method called by `cmd_run()` and `cmd_review --fix` in `sikula.py` when creating a worktree.
 Everything else (assemble, …) are platform-specific extras on the subclass.
 
@@ -990,6 +996,7 @@ Everything else (assemble, …) are platform-specific extras on the subclass.
 | `run_tests()` | Run the project unit test suite | `./gradlew <build.test_task>` — task is configurable per project (see below) |
 | `run_check(name, task_config)` | Run a named quality check (lint, detekt, …). `task_config` is the opaque dict from `build.checks[i]` in the project YAML — the orchestrator passes it through unchanged; each BuildTool subclass interprets it. | `task_config["command"]` is the shell command to run (falls back to `name` if absent). `task_config["timeout"]` overrides the compile timeout. Uses `_run_shell()` — identical interface to PythonTool. |
 | `is_build_config_file(path)` | True if the file affects the build graph | `*.gradle`, `*.gradle.kts`, `*.properties`, `*.toml`, `gradle/`, `buildSrc/`, `build-logic/` |
+| `is_test_only_change(path, before, after)` | Optional conservative hook for mixed source/test files during test-failure fixer audit. Default returns `False`; platform subclasses may return `True` only when syntax-aware diff analysis proves the fixer changed test-only code. | Cargo treats edits limited to an already-existing Rust `#[cfg(test)] mod tests` block as test-only. |
 | `env_files()` *(static)* | Filenames of gitignored files that must be present for the build; copied from the original project root to each new worktree. Default returns `[]`. | `["local.properties"]` (SDK path) |
 
 #### `project` config keys
