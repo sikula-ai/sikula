@@ -262,9 +262,14 @@ Orchestrator.run()
       │        state.review_approved = False                  │
       │        state.security_approved = False                │
       │        state.tests_up_to_date = False                 │
-      │        review loop reruns (Phase 3)  ◄────────────── ┤
+      │        continue build/test/check validation first     │
+      │                                                       │
+      │      after build/test/check are green again:          │
+      │        review loop reruns (Phase 3)                   │
       │        security review reruns (Phase 3.5)             │
       │        test write reruns (Phase 4)                    │
+      │        if those gates changed files → continue        │
+      │        build/test/check validation before accepting   │
       │                                                       │
       │  repeat until state.done or current build/fix loop   │
       │              reaches config.max_iterations            │
@@ -682,7 +687,9 @@ invalid fixtures, or material missing tests may be reported as review issues.
 - Issues found: `state.review_issues` populated with structured issue list; `state.review_approved` stays `False`; record appended with `approved = False`
 
 **Re-review after fixer:** if `FixerAgent` changes any file, the orchestrator resets
-`state.review_approved = False` and re-runs the review loop before the next build.
+`state.review_approved = False` and first reruns deterministic build/test/check
+validation. The review loop reruns after validation is green; if review fixes change
+files, build/test/check validation runs again before the task or step can be accepted.
 In `review --fix`, test-writer changes receive one final validation-only reviewer
 pass; rejection fails the task rather than feeding another fix cycle.
 
@@ -731,14 +738,16 @@ means after reviewer approval; if `run_review: false`, it still runs unless
 **Iteration limit:** uses `config.max_security_review_iterations` (independent of `config.max_review_iterations`); timeout sets `state.failed = True`.
 
 **Reset after fixer:** if `FixerAgent` changes any file, `state.security_approved` is reset
-to `False` and the security review re-runs after the review loop.
+to `False`. After build/test/check validation is green again, the security review re-runs
+after the review loop.
 
 ---
 
 ### TestWriterAgent (`agents/test_writer_agent.py`)
 
-Runs after the review loop is approved (Phase 4), and again after any fixer pass that
-changes files. Skipped when `run_test_writing: false` or `state.tests_up_to_date` is already set.
+Runs after the review loop is approved (Phase 4), and again after fixer changes once
+deterministic build/test/check validation is green. Skipped when `run_test_writing: false`
+or `state.tests_up_to_date` is already set.
 
 **Write scope:** the prompt restricts the agent to directories listed under
 `sandbox.allowed_test_write_paths` and explicitly forbids production source edits.
@@ -785,17 +794,30 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
    production code independently (does not rely on the implementation prompt's caller list);
    for callers not in `files_changed`, checks whether existing tests cover their path through
    the modified function and adds tests if not
+10. Prefers behaviour tests through public APIs, public state, public routing contracts,
+    command outputs, or project-standard test helpers. Source-file inspection is a
+    last-resort fallback only; such tests must resolve paths without relying on the runner's
+    current working directory and must not require production source, build configuration,
+    dependency declarations, runtime configuration, or pipeline settings to change merely
+    so the test can pass. If meaningful coverage requires new test infrastructure outside
+    the test write scope, the agent reports a structured `TESTABILITY GAP` instead of
+    adding brittle source-inspection tests. Sikula records the gap in
+    `state.testability_gaps`; by default it is a visible warning, or a blocking failure when
+    `test_writer.testability_gap_policy: fail` is configured.
 
 **Output written to state:**
 - `state.tests_up_to_date = True` — set on success regardless of whether files changed
 - `state.files_changed` — test file paths appended (de-duplicated)
 - `state.test_files_written` — same paths also appended here (de-duplicated); used by ReviewerAgent to exempt these files from scope violation checks. In `sikula review` mode, the files are still reviewed for correctness and relevance.
 - `state.test_write_records` — one record appended per invocation with `step`, `build_iteration`, `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, and `timestamp`
+- `state.testability_gaps` — one record per `TESTABILITY GAP` reported by the test writer, with `source`, `step`, `build_iteration`, optional `scope`, the raw gap message, and any parsed `target`, `reason`, `recommended_action`, and `risk` fields. `tests_up_to_date` still becomes `True`; the gap means the test writer did all it safely could for the current diff, not that full behaviour coverage exists.
 
 **Reset after fixer:** if `FixerAgent` changes any file, the orchestrator resets
-`state.tests_up_to_date = False` and re-runs the test write phase after the review loop
-(only when `run_test_writing: true`). In `review --fix`, test-writer changes are
-reviewed once as a final validation gate and do not trigger another test-writing loop.
+`state.tests_up_to_date = False`. After build/test/check validation is green again,
+the test write phase reruns after review/security gates (only when `run_test_writing: true`).
+If the test writer changes files, build/test/check validation runs again. In `review --fix`,
+test-writer changes are reviewed once as a final validation gate and do not trigger another
+test-writing loop.
 
 ---
 
@@ -833,6 +855,13 @@ whether the chosen fix changed production code or test code. Sikula enforces thi
 production writes from test-failure fixes: missing triage, copied placeholder triage, or any
 classification other than `production_defect` with `chosen_fix: production_code` marks the task
 failed before the pipeline can accept the change.
+This audit does not rely only on `allowed_test_write_paths`: when a project uses broad test
+write roots, such as a platform module directory that contains both production and test
+sources, Sikula still treats non-test artifacts under that root as production writes. Build
+files, dependency manifests, project/workspace files, generated-source config, and runtime
+configuration therefore cannot be used to make malformed generated tests pass unless the
+fixer explicitly classifies the failure as a production defect and chooses a production-code
+fix.
 
 **Mechanism:** calls `LLMClient.run_agent(prompt, cwd=project_root)`.
 The agent reads the error output, locates relevant files, and applies fixes directly — no file
@@ -889,7 +918,7 @@ findings. Review and redact state files before sharing them outside your project
 | `task_description` | `str` | caller | Original plain-text task |
 | `schema_version` | `int` | `StateStore.create()` | State file schema version; used by `JsonStateStore.load()` to run migrations before constructing `TaskState`; current value is `SCHEMA_VERSION = 2` |
 | `task_file` | `str \| None` | `cmd_run()` in `sikula.py` | Basename of the task file (e.g. `add-login.md`); set on first run via `--task-file`; used by `status` for display; `None` for tasks created before this field was added or when resuming via `--task-id` only |
-| `config_snapshot` | `dict` | Orchestrator | Effective run configuration captured on first run (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, and per-agent `provider`/`model`/`agent_timeout`. Visible in `show <task_id>`. |
+| `config_snapshot` | `dict` | Orchestrator | Effective run configuration captured on first run (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. Visible in `show <task_id>`. |
 | `analyst_prompt` | `str \| None` | AnalystAgent | Full assembled prompt sent to the analyst LLM (system + user sections, including inlined guidelines content); stored before the LLM call so it captures the exact input even on exception; enables post-run analysis of analyst behaviour |
 | `planner_prompt` | `str \| None` | PlannerAgent | Full assembled prompt sent to the planner LLM (system + user sections); stored before the LLM call; `None` when `run_planner: false` or planner not yet reached |
 | `implementation_prompt` | `str \| None` | AnalystAgent | Structured prompt fed to ImplementerAgent; the analyst's key output |
@@ -914,15 +943,16 @@ findings. Review and redact state files before sharing them outside your project
 | `review_diff` | `str \| None` | `cmd_review()` in `sikula.py` / Orchestrator | PR-style diff passed to ReviewerAgent and SecurityReviewerAgent; initially set to `git diff base...branch` (three-dot) in `sikula review` mode; refreshed in `"review_fix"` mode before reviewer/security-reviewer calls so uncommitted fixes are included; `None` in standard `sikula run` flow (agents fall back to `GitTool.diff_head()`) |
 | `review_mode` | `str \| None` | `cmd_review()` in `sikula.py` | Review task kind: `"review_report"` for report-only review (not resumable) or `"review_fix"` for `sikula review --fix` (resumable via `sikula run --task-id`) |
 | `review_base_branch` | `str \| None` | `cmd_review()` in `sikula.py` | Base branch used to refresh `review_diff` in `"review_fix"` mode. Report-only review keeps the original frozen diff; review-fix refreshes against the merge base before reviewer/security-reviewer calls so fixes are reviewed against the current branch state. |
-| `implement_cycle_records` | `list[dict]` | ImplementerAgent | Structured observability — one entry per implementer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = post-fixer pass N — possible when `run_build_per_step: true` and review/security loop runs inside fix phase), `review_iteration` (`0` = initial or security fix; `>0` = review fix pass N), `security_review_iteration` (`0` = initial or review fix; `>0` = security fix pass N), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `step_description`, `implementer_prompt`, `implementer_output` (`None` on exception), `files_written`, `timestamp`; both iteration counters `== 0` and `build_iteration == 0` means initial implementation; never read for pipeline decisions. **Correlation note:** to find the reviewer record that triggered this implementer, look for a `review_cycle_records` entry with the same `step`, `build_iteration`, and `review_iteration: N-1` |
-| `review_cycle_records` | `list[dict]` | ReviewerAgent | Structured observability — one entry per reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = post-fixer pass N), `review_iteration` (fix-pass index within this step's review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, reviewer history is limited to earlier final full-task reviews, not step-scoped reviews. **Correlation note:** a reviewer record with `review_iteration: N` that found issues triggered the implementer record with `review_iteration: N+1` — the orchestrator increments the counter before calling the implementer |
-| `security_review_cycle_records` | `list[dict]` | SecurityReviewerAgent | Structured observability — one entry per security reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = post-fixer pass N), `security_review_iteration` (fix-pass index within this step's security review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the security reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, security history is limited to earlier final full-task security reviews. **Migration note:** state files from schema version 1 stored security reviewer entries inside `review_cycle_records` with `reviewer = "security_reviewer"`; `JsonStateStore.load()` moves them here and removes the redundant `reviewer` field. |
-| `test_write_records` | `list[dict]` | TestWriterAgent | Structured observability — one entry per test-writer invocation: `step`, `build_iteration` (0 = before first build; >0 = after fixer pass N), `scope`, `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
+| `implement_cycle_records` | `list[dict]` | ImplementerAgent | Structured observability — one entry per implementer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = review/security fix after a post-fixer validation pass), `review_iteration` (`0` = initial or security fix; `>0` = review fix pass N), `security_review_iteration` (`0` = initial or review fix; `>0` = security fix pass N), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `step_description`, `implementer_prompt`, `implementer_output` (`None` on exception), `files_written`, `timestamp`; both iteration counters `== 0` and `build_iteration == 0` means initial implementation; never read for pipeline decisions. **Correlation note:** to find the reviewer record that triggered this implementer, look for a `review_cycle_records` entry with the same `step`, `build_iteration`, and `review_iteration: N-1` |
+| `review_cycle_records` | `list[dict]` | ReviewerAgent | Structured observability — one entry per reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = after a post-fixer validation pass), `review_iteration` (fix-pass index within this step's review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, reviewer history is limited to earlier final full-task reviews, not step-scoped reviews. **Correlation note:** a reviewer record with `review_iteration: N` that found issues triggered the implementer record with `review_iteration: N+1` — the orchestrator increments the counter before calling the implementer |
+| `security_review_cycle_records` | `list[dict]` | SecurityReviewerAgent | Structured observability — one entry per security reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = after a post-fixer validation pass), `security_review_iteration` (fix-pass index within this step's security review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the security reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, security history is limited to earlier final full-task security reviews. **Migration note:** state files from schema version 1 stored security reviewer entries inside `review_cycle_records` with `reviewer = "security_reviewer"`; `JsonStateStore.load()` moves them here and removes the redundant `reviewer` field. |
+| `test_write_records` | `list[dict]` | TestWriterAgent | Structured observability — one entry per test-writer invocation: `step`, `build_iteration` (`0` = before first build; `>0` = after a post-fixer validation pass), `scope`, `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
+| `testability_gaps` | `list[dict]` | TestWriterAgent | Structured audit signal for behaviour the test writer could not safely cover with available project seams/infrastructure. Entries include `source`, `step`, `build_iteration`, optional `scope`, `message`, `timestamp`, and optional parsed `target`, `reason`, `recommended_action`, and `risk`. Default policy is warning-only; `test_writer.testability_gap_policy: fail` turns reported gaps into task failures. |
 | `fix_cycle_records` | `list[dict]` | FixerAgent | Structured observability — one entry per fixer invocation after a failed sync/build/test/check attempt: `build_iteration` (globally unique, never resets), `step`, `scope`, `errors_before` snapshot (build/test/check), `fixer_prompt`, `fixer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
 | `validation_cycle_records` | `list[dict]` | Orchestrator | Structured observability — one entry per presync/sync/build/test/check outcome with `phase`, `status`, `build_iteration`, `step`, `timestamp`, optional `scope`, optional `elapsed_s`, optional `check_name`, and a diagnostic `error_excerpt` on failure; excerpts preserve failure-marker blocks from long tool output instead of storing only the final tail; never read for pipeline decisions |
 | `test_files_written` | `list[str]` | TestWriterAgent | Cumulative list of all files written by the test writer agent across all runs; never cleared; passed to ReviewerAgent so it does not flag those files as implementer scope violations. In normal `sikula run`, these files are not reviewer-owned output; in `sikula review`, changed test files are reviewed as branch output. |
-| `fixer_changed_code` | `bool` | Orchestrator | Set True when FixerAgent writes files; cleared after the following build validates successfully; used by `sikula review` fast-exit: if fixer didn't touch code, no re-build needed |
-| `tests_up_to_date` | `bool` | TestWriterAgent / Orchestrator | Set True after test write; reset to False when Fixer changes files; guards redundant re-runs |
+| `fixer_changed_code` | `bool` | Orchestrator | Set True when FixerAgent writes files; used on resume to continue deterministic build/test/check validation before stale semantic gates rerun; cleared after the following compile check succeeds |
+| `tests_up_to_date` | `bool` | TestWriterAgent / Orchestrator | Set True after test write; reset to False when Fixer changes files; after validation is green, guards redundant test-writer re-runs |
 | `worktree_path` | `str \| None` | `cmd_run()` / `cmd_review()` in `sikula.py` | Absolute path of the effective project root within the worktree — equals `worktree_base` when `root_path` is itself a git root, or `worktree_base/<rel>` for subdirectory projects; used as `cwd` by all agents; `None` for `--no-isolate` runs |
 | `worktree_base` | `str \| None` | `cmd_run()` / `cmd_review()` in `sikula.py` | Absolute path of the git worktree root (where `git add/commit/worktree remove` run); equals `worktree_path` when project is its own git root; `None` for `--no-isolate` runs |
 | `worktree_branch` | `str \| None` | `cmd_run()` / `cmd_review()` in `sikula.py` | Branch name for the worktree; `sikula/<stem>-<task_id>` for `cmd_run()`; the existing PR branch name for `cmd_review()`; `None` for `--no-isolate` runs |
@@ -1162,6 +1192,7 @@ All keys live under `test_writer:` in `.sikula/config.yaml`.
 | Key | Default | Description |
 |---|---|---|
 | `coverage_target` | `90` | Minimum branch+line coverage % the agent must aim for on new/changed code |
+| `testability_gap_policy` | `warn` | `warn` records visible `TESTABILITY GAP` entries and allows the task to continue; `fail` records the same entries and fails the task |
 | `extra_rules` | — | Path (relative to project root) to a Markdown file appended to the test writer's prompt as `## Project-specific rules`. Use for project-specific testing conventions: required test doubles, naming patterns, mandatory parametric table rules. Note: unlike the analyst, reviewer, and security reviewer, the test writer does not have guidelines content pre-loaded — it reads `guidelines.context_files` via its file tools. `extra_rules` is the correct configuration point for test-specific conventions that the test writer should apply without needing to read the full guidelines. |
 
 ---

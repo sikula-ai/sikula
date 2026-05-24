@@ -170,3 +170,6 @@ planner:
 test_writer:
   # Minimum branch+line coverage target for new/changed code (percentage).
   coverage_target: 90
+  # What to do when safe tests require missing project seams/infrastructure:
+  # warn = record a visible audit warning; fail = fail the task.
+  testability_gap_policy: warn

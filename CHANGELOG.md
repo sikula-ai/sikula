@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 - Task state observability now includes validation-cycle records for presync, sync, build, test, and quality-check outcomes, plus runtime metadata and a compact terminal summary for completed or failed tasks.
 - Multi-step task state now records `plan_completed`, `active_scope`, `final_full_task_review_done`, and per-record scope metadata so final whole-task validation is auditable and resume-safe.
+- Test writer `TESTABILITY GAP` reports are now captured as first-class `testability_gaps` state records and surfaced in terminal summaries, with `test_writer.testability_gap_policy: fail` for teams that want missing safe test seams to block tasks.
 
 ### Changed
 - `sikula --version` now appends a development suffix with branch and commit when run from a git checkout, making editable installs distinguishable from packaged releases.
@@ -18,6 +19,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Validation command extraction treats only explicit validation contexts as commands, including command lists under validation headings with Markdown blank separator lines, so prose that happens to start with a known tool name or mentions a bare tool name in backticks does not trigger pre-agent validation coverage failures.
 - Validation command coverage treats Gradle/Maven wrapper spelling, Python module forms, and npm/pnpm/Yarn `test` script shortcuts as equivalent for otherwise identical commands, while same-tool-family commands with materially different flags, targets, scripts, packages, schemes, or paths remain uncovered; near matches are included only as diagnostic context before agents run.
 - `sikula review` modes now treat validation commands found in PR/review text as informational branch-verification context instead of hard preflight validation coverage gates.
+- After build/test/check failures, fixer changes are validated by build/test/check again before stale reviewer, security reviewer, and test-writer gates rerun; if those gates change files, Sikula performs another deterministic validation pass before accepting the task or step.
+- Test-writer prompts prefer behaviour tests through public seams and make source-file inspection a last-resort fallback that must not depend on current working directory or require build/config changes to pass.
 
 ### Fixed
 - Multi-step `sikula run` now performs a final full-task reviewer/security/test-writer gate after all step-scoped validations complete, so the finished branch gets one whole-task pass against the original task before final validation.
@@ -25,6 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Build, test, sync, and check failure excerpts now preserve diagnostic blocks from the middle of long command output, so fixer prompts and validation records do not lose the concrete failing test, assertion, compiler error, or stack trace when tool output continues after the failure.
 - Reviewer loops no longer need to block on deterministic formatter/linter/test commands that are already covered by the configured build/test/check pipeline; the orchestrator remains responsible for executing those commands and any configured `fix_command`.
 - Test-failure fixer prompts now allow production fixes when a failing test encodes the task, project guidelines, or a structured contract, require production-vs-test triage in the saved fixer output, fail the task when production writes lack explicit `production_defect` + `production_code` triage, and give the reviewer that recent triage so weakened contract tests can be treated as evidence of production defects.
+- Test-failure fixer audit treats non-test artifacts under broad test write roots, including build configuration and dependency manifests, as production writes so malformed generated tests cannot be fixed by changing project/build configuration without production-defect triage.
 - Resuming a task after all planned steps completed now continues with the final full-task gate/build instead of rerunning the last step.
 - Per-step build/fix loops no longer consume the final full-task build budget when `run_build_per_step` is enabled; `max_iterations` now applies to each active build/fix loop while `build_iterations` remains a total audit counter.
 

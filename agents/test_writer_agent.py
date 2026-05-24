@@ -25,6 +25,8 @@ log = logging.getLogger(__name__)
 
 _MAX_DIFF_CHARS = 40_000
 _DEFAULT_COVERAGE_TARGET = 90
+_TESTABILITY_GAP_MARKER = "TESTABILITY GAP:"
+_TESTABILITY_GAP_POLICY_FAIL = "fail"
 
 _AGENT_PROMPT = """\
 You are writing unit tests for a {tech_stack} codebase.
@@ -92,6 +94,21 @@ TESTING RULES:
   helpers. Do NOT write brittle tests that inspect UI framework internals, opaque view trees,
   reflection-only private storage, or component type-name strings unless the existing test
   suite already uses that exact pattern for the same UI framework.
+- Prefer behaviour tests through public APIs, public state, public routing contracts, command
+  outputs, or project-standard test helpers. Source-file inspection tests are a last-resort
+  fallback for contracts that cannot be observed through the available test infrastructure.
+  If you use source inspection, keep it self-contained: resolve paths robustly from the test
+  file or repository root, do not depend on the test runner's current working directory, and
+  do not require production source, build configuration, dependency declarations, runtime
+  configuration, or pipeline settings to change just so the inspection test can pass.
+- If meaningful behaviour coverage would require adding new test infrastructure that is
+  outside the test write scope, do not create brittle source-inspection tests as a substitute.
+  Output the following block and make no file changes for that gap:
+  TESTABILITY GAP:
+  target: <behaviour or contract that remains untested>
+  reason: <missing seam, missing test harness, unavailable helper, etc.>
+  recommended_action: <project-level test infrastructure or seam needed>
+  risk: low | medium | high
 
 WHAT WAS IMPLEMENTED:
 {implementation_prompt}
@@ -168,6 +185,43 @@ def _step_scope(state: TaskState) -> str:
     if step_idx < 0 or step_idx >= len(state.plan):
         return "\nCURRENT STEP:\n(unknown — current_step is outside the plan)\n"
     return f"\nCURRENT STEP:\nStep {step_idx + 1}/{len(state.plan)}: {state.plan[step_idx]}\n"
+
+
+def _parse_testability_gaps(output: str | None) -> list[dict]:
+    if not output or _TESTABILITY_GAP_MARKER.lower() not in output.lower():
+        return []
+
+    gaps: list[dict] = []
+    current: list[str] = []
+    for line in output.splitlines():
+        if line.strip().lower().startswith(_TESTABILITY_GAP_MARKER.lower()):
+            if current:
+                gaps.append(_gap_from_lines(current))
+            current = [line]
+            continue
+        if current:
+            current.append(line)
+    if current:
+        gaps.append(_gap_from_lines(current))
+    return gaps
+
+
+def _gap_from_lines(lines: list[str]) -> dict:
+    message = "\n".join(lines).strip()
+    gap = {"message": message}
+    for line in lines[1:]:
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        normalized_key = key.strip().lower().replace(" ", "_")
+        if normalized_key in {"target", "reason", "recommended_action", "risk"}:
+            gap[normalized_key] = value.strip()
+    return gap
+
+
+def _testability_gap_policy(project_config: dict) -> str:
+    policy = str(project_config.get("test_writer", {}).get("testability_gap_policy", "warn")).strip().lower()
+    return _TESTABILITY_GAP_POLICY_FAIL if policy == _TESTABILITY_GAP_POLICY_FAIL else "warn"
 
 
 class TestWriterAgent(BaseAgent):
@@ -252,6 +306,16 @@ class TestWriterAgent(BaseAgent):
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
+        gaps = _parse_testability_gaps(agent_output)
+        for gap in gaps:
+            state.record_testability_gap(
+                self.name,
+                gap["message"],
+                target=gap.get("target"),
+                reason=gap.get("reason"),
+                recommended_action=gap.get("recommended_action"),
+                risk=gap.get("risk"),
+            )
         state.tests_up_to_date = True
         if changed:
             state.files_changed.extend(p for p in changed if p not in state.files_changed)
@@ -264,11 +328,24 @@ class TestWriterAgent(BaseAgent):
                 allowed_test_write_paths,
                 "allowed_test_write_paths",
             )
+            if gaps and _testability_gap_policy(self.project_config) == _TESTABILITY_GAP_POLICY_FAIL:
+                state.failed = True
+                msg = f"Testability gap reported by test writer ({len(gaps)} gap(s))"
+                return AgentResult(
+                    success=False,
+                    message=msg,
+                    data={"files_written": changed, "testability_gaps": gaps},
+                )
             return AgentResult(
                 success=True,
                 message=f"Tests written/updated in {len(changed)} file(s): {changed}",
-                data={"files_written": changed},
+                data={"files_written": changed, "testability_gaps": gaps},
             )
 
         state.record(self.name, "test_write", "no changes needed")
-        return AgentResult(success=True, message="No test changes needed")
+        if gaps and _testability_gap_policy(self.project_config) == _TESTABILITY_GAP_POLICY_FAIL:
+            state.failed = True
+            msg = f"Testability gap reported by test writer ({len(gaps)} gap(s))"
+            return AgentResult(success=False, message=msg, data={"testability_gaps": gaps})
+        data = {"testability_gaps": gaps} if gaps else {}
+        return AgentResult(success=True, message="No test changes needed", data=data)
