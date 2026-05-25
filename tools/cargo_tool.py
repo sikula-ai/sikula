@@ -92,6 +92,67 @@ def _rust_brace_delta(line: str, in_block_comment: bool) -> tuple[int, bool]:
     return delta, in_block_comment
 
 
+def _rust_code_line(line: str, in_block_comment: bool) -> tuple[str, bool]:
+    code: list[str] = []
+    index = 0
+    while index < len(line):
+        if in_block_comment:
+            end = line.find("*/", index)
+            if end == -1:
+                return "".join(code), True
+            in_block_comment = False
+            index = end + 2
+            continue
+
+        if line.startswith("//", index):
+            break
+        if line.startswith("/*", index):
+            in_block_comment = True
+            index += 2
+            continue
+
+        raw_end = _rust_raw_string_end(line, index)
+        if raw_end is not None:
+            code.append(" ")
+            index = raw_end
+            continue
+
+        ch = line[index]
+        if ch == '"':
+            code.append(" ")
+            index += 1
+            escaped = False
+            while index < len(line):
+                current = line[index]
+                if current == '"' and not escaped:
+                    index += 1
+                    break
+                escaped = current == "\\" and not escaped
+                if current != "\\":
+                    escaped = False
+                index += 1
+            continue
+        if ch == "'":
+            if index + 2 < len(line) and line[index + 2] == "'":
+                code.append(" ")
+                index += 3
+                continue
+            if index + 3 < len(line) and line[index + 1] == "\\" and line[index + 3] == "'":
+                code.append(" ")
+                index += 4
+                continue
+
+        code.append(ch)
+        index += 1
+
+    return "".join(code), in_block_comment
+
+
+def _rust_is_cfg_test_attr(code_line: str) -> bool:
+    stripped = code_line.strip()
+    return stripped.startswith("#") and bool(_RUST_CFG_TEST_RE.match(stripped))
+
+
 def _rust_test_module_ranges(content: str) -> list[tuple[int, int]]:
     lines = content.splitlines()
     deltas: list[int] = []
@@ -102,13 +163,15 @@ def _rust_test_module_ranges(content: str) -> list[tuple[int, int]]:
 
     ranges: list[tuple[int, int]] = []
     pending_cfg_test = False
+    in_block_comment = False
     index = 0
     while index < len(lines):
         line = lines[index]
-        stripped = line.strip()
+        code_line, in_block_comment = _rust_code_line(line, in_block_comment)
+        stripped = code_line.strip()
         line_number = index + 1
 
-        if _RUST_CFG_TEST_RE.search(line):
+        if _rust_is_cfg_test_attr(code_line):
             pending_cfg_test = True
             index += 1
             continue
@@ -117,7 +180,7 @@ def _rust_test_module_ranges(content: str) -> list[tuple[int, int]]:
             if not stripped or stripped.startswith("#["):
                 index += 1
                 continue
-            if _RUST_TEST_MODULE_RE.search(line) and "{" in line:
+            if _RUST_TEST_MODULE_RE.search(code_line) and "{" in code_line:
                 depth = deltas[index]
                 end_index = index + 1
                 while depth > 0 and end_index < len(lines):

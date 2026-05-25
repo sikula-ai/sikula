@@ -220,6 +220,78 @@ mod tests {
 
         assert tool.is_test_only_change("src/lib.rs", before, after) is True
 
+    def test_rejects_commented_cfg_test_marker_before_production_module(self):
+        tool = _make_tool(Path("."))
+        before = """\
+pub fn add_one(value: i32) -> i32 {
+    value + 1
+}
+
+// #[cfg(test)]
+mod tests {
+    pub fn helper() -> i32 {
+        add_one(1)
+    }
+}
+"""
+        after = before.replace("add_one(1)", "add_one(2)")
+
+        assert tool.is_test_only_change("src/lib.rs", before, after) is False
+
+    def test_rejects_string_cfg_test_marker_before_production_module(self):
+        tool = _make_tool(Path("."))
+        before = """\
+pub fn add_one(value: i32) -> i32 {
+    value + 1
+}
+
+const MARKER: &str = "#[cfg(test)]";
+mod tests {
+    pub fn helper() -> i32 {
+        add_one(1)
+    }
+}
+"""
+        after = before.replace("add_one(1)", "add_one(2)")
+
+        assert tool.is_test_only_change("src/lib.rs", before, after) is False
+
+    def test_rejects_block_commented_cfg_test_marker_before_production_module(self):
+        tool = _make_tool(Path("."))
+        before = """\
+pub fn add_one(value: i32) -> i32 {
+    value + 1
+}
+
+/* #[cfg(test)] */
+mod tests {
+    pub fn helper() -> i32 {
+        add_one(1)
+    }
+}
+"""
+        after = before.replace("add_one(1)", "add_one(2)")
+
+        assert tool.is_test_only_change("src/lib.rs", before, after) is False
+
+    def test_rejects_raw_string_cfg_test_marker_before_production_module(self):
+        tool = _make_tool(Path("."))
+        before = """\
+pub fn add_one(value: i32) -> i32 {
+    value + 1
+}
+
+const MARKER: &str = r#"#[cfg(test)]"#;
+mod tests {
+    pub fn helper() -> i32 {
+        add_one(1)
+    }
+}
+"""
+        after = before.replace("add_one(1)", "add_one(2)")
+
+        assert tool.is_test_only_change("src/lib.rs", before, after) is False
+
     def test_rejects_production_changes_in_rust_source(self):
         tool = _make_tool(Path("."))
         before = """\
