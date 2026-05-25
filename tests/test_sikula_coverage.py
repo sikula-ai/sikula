@@ -973,6 +973,24 @@ guidelines:
             cmd_init(self._args())
         assert "scheme" in capsys.readouterr().out
 
+    def test_node_package_manager_printed_and_todo_emitted(self, tmp_path: Path, monkeypatch, capsys):
+        (tmp_path / ".git").mkdir()
+        monkeypatch.chdir(tmp_path)
+        scan_result = self._scan_result(
+            build_tool="node",
+            language="TypeScript",
+            package_manager="pnpm",
+            node_sync_command="pnpm install --frozen-lockfile",
+            node_compile_command="pnpm typecheck",
+            node_test_command="pnpm test",
+            node_checks=[],
+        )
+        with patch("tools.scanner.scan", return_value=scan_result):
+            cmd_init(self._args())
+        out = capsys.readouterr().out
+        assert "package manager: pnpm" in out
+        assert "build.sync_command / compile_command / test_command" in out
+
     def test_todos_for_gradle_build_tool(self, tmp_path: Path, monkeypatch, capsys):
         (tmp_path / ".git").mkdir()
         monkeypatch.chdir(tmp_path)

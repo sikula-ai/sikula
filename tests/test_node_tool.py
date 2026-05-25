@@ -13,8 +13,13 @@ from tools.node_tool import (
     _BUILD_CONFIG_FILES,
     default_node_checks,
     default_node_compile_command,
+    default_node_sync_command,
+    default_node_test_command,
     detect_node_language,
     detect_node_package_manager,
+    node_script_command,
+    node_test_command,
+    node_tsc_command,
     read_node_package_scripts,
 )
 
@@ -71,6 +76,10 @@ class TestNodePackageMetadata:
         _write_package_json(tmp_path, "{")
         assert read_node_package_scripts(tmp_path) == {}
 
+    def test_non_object_scripts_are_ignored(self, tmp_path: Path):
+        _write_package_json(tmp_path, '{"scripts": "npm test"}')
+        assert read_node_package_scripts(tmp_path) == {}
+
     def test_detects_typescript_from_dependency(self, tmp_path: Path):
         _write_package_json(tmp_path, '{"devDependencies": {"typescript": "^5.0.0"}}')
         assert detect_node_language(tmp_path) == "TypeScript"
@@ -98,6 +107,25 @@ class TestNodeDefaultCommands:
     def test_compile_uses_tsc_when_tsconfig_exists_without_scripts(self, tmp_path: Path):
         (tmp_path / "tsconfig.json").write_text("{}")
         assert default_node_compile_command(tmp_path, "npm", {}) == "npx tsc --noEmit"
+
+    def test_command_helpers_cover_package_manager_variants(self):
+        assert node_script_command("bun", "build") == "bun run build"
+        assert node_script_command("custompm", "build") == "custompm run build"
+        assert node_test_command("bun") == "bun run test"
+        assert node_test_command("custompm") == "custompm test"
+        assert node_tsc_command("pnpm") == "pnpm exec tsc --noEmit"
+        assert node_tsc_command("yarn") == "yarn tsc --noEmit"
+        assert node_tsc_command("bun") == "bunx tsc --noEmit"
+        assert node_tsc_command("custompm") == "npx tsc --noEmit"
+        assert default_node_test_command("bun", {"test": "bun test"}) == "bun run test"
+
+    def test_bun_sync_command_uses_frozen_lockfile_when_present(self, tmp_path: Path):
+        assert default_node_sync_command(tmp_path, "bun") == "bun install"
+        (tmp_path / "bun.lock").write_text("")
+        assert default_node_sync_command(tmp_path, "bun") == "bun install --frozen-lockfile"
+
+    def test_unknown_sync_command_falls_back_to_install(self, tmp_path: Path):
+        assert default_node_sync_command(tmp_path, "custompm") == "custompm install"
 
     def test_checks_include_lint_and_format_autofix(self):
         checks = default_node_checks(
@@ -258,6 +286,13 @@ class TestNodeToolIsBuildConfigFile:
         assert tool.is_build_config_file(".yarn/releases/yarn-4.0.0.cjs") is True
         assert tool.is_build_config_file("patches/example.patch") is True
 
+    def test_recognizes_package_level_patch_dirs(self, tmp_path: Path):
+        package = tmp_path / "packages" / "web"
+        package.mkdir(parents=True)
+        (package / "package.json").write_text("{}")
+        tool = _make_tool(tmp_path)
+        assert tool.is_build_config_file("packages/web/patches/example.patch") is True
+
     def test_rejects_source_file(self):
         tool = _make_tool(Path("."))
         assert tool.is_build_config_file("src/App.tsx") is False
@@ -265,3 +300,6 @@ class TestNodeToolIsBuildConfigFile:
     def test_rejects_partial_match(self):
         tool = _make_tool(Path("."))
         assert tool.is_build_config_file("not-package.json") is False
+        assert tool.is_build_config_file("src/dispatches/applyPatch.ts") is False
+        assert tool.is_build_config_file("src/patches/applyPatch.ts") is False
+        assert tool.is_build_config_file("src/yarn.locked.ts") is False

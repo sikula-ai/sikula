@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from tools.base_tool import BuildTool, Sandbox, ToolResult, tool_error_excerpt
@@ -64,7 +64,6 @@ _BUILD_CONFIG_PREFIXES = (
     "vue.config.",
     "webpack.config.",
 )
-_BUILD_CONFIG_DIRS = (".yarn/", "patches/")
 
 _DEFAULT_SYNC_TIMEOUT = 600
 _DEFAULT_COMPILE_TIMEOUT = 600
@@ -277,9 +276,22 @@ class NodeTool(BuildTool):
 
     def is_build_config_file(self, path: str) -> bool:
         p = path.replace("\\", "/")
-        name = Path(p).name
+        path_parts = tuple(part for part in PurePosixPath(p).parts if part not in {"", ".", "/"})
+        name = path_parts[-1] if path_parts else ""
         return (
             name in _BUILD_CONFIG_FILES
             or name.startswith(_BUILD_CONFIG_PREFIXES)
-            or any(directory in p for directory in _BUILD_CONFIG_DIRS)
+            or self._is_build_config_dir_path(path_parts)
         )
+
+    def _is_build_config_dir_path(self, path_parts: tuple[str, ...]) -> bool:
+        for index, part in enumerate(path_parts[:-1]):
+            if part == ".yarn":
+                return True
+            if part == "patches":
+                package_root_parts = path_parts[:index]
+                if not package_root_parts:
+                    return True
+                if (self._root.joinpath(*package_root_parts) / "package.json").exists():
+                    return True
+        return False

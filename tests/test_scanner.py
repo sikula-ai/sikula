@@ -91,6 +91,15 @@ class TestScanBuildTool:
         assert "python" in result.ambiguous_tools
         assert "node" in result.ambiguous_tools
 
+    def test_xcode_takes_priority_over_node_when_both_present(self, tmp_path: Path):
+        (tmp_path / "MyApp.xcodeproj").mkdir()
+        (tmp_path / "package.json").write_text('{"scripts": {"build": "vite build"}}')
+        result = scan(tmp_path)
+        assert result.build_tool == "xcodebuild"
+        assert result.language == "Swift"
+        assert result.platform == "iOS"
+        assert result.ambiguous_tools == ["xcodebuild", "node"]
+
     def test_detects_xcode_from_xcodeproj(self, tmp_path: Path):
         (tmp_path / "MyApp.xcodeproj").mkdir()
         result = scan(tmp_path)

@@ -355,6 +355,31 @@ class TestGenerateConfig:
         assert 'test_command: "pnpm test"' in cfg
         assert 'command: "pnpm lint"' in cfg
 
+    def test_node_build_section_includes_detected_check_fix_command(self):
+        cfg = self._cfg(
+            build_tool="node",
+            language="TypeScript",
+            node_package_manager="npm",
+            node_checks=[
+                {
+                    "name": "format",
+                    "command": "npm run format:check",
+                    "fix_command": "npm run format",
+                    "timeout": 60,
+                }
+            ],
+        )
+        assert 'command: "npm run format:check"' in cfg
+        assert 'fix_command: "npm run format"' in cfg
+        assert "timeout: 60" in cfg
+
+    def test_node_build_section_uses_bun_defaults_when_commands_missing(self):
+        cfg = self._cfg(build_tool="node", language="TypeScript", node_package_manager="bun")
+        assert "package_manager: bun" in cfg
+        assert 'sync_command: "bun install --frozen-lockfile"' in cfg
+        assert 'compile_command: "bun run build"' in cfg
+        assert 'test_command: "bun run test"' in cfg
+
     def test_node_build_section_has_empty_checks_when_none_detected(self):
         cfg = self._cfg(build_tool="node", language="JavaScript")
         assert "checks: []" in cfg

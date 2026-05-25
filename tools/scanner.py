@@ -158,11 +158,18 @@ def _detect_node_paths(root: Path) -> tuple[list[str], list[str]]:
 def scan(root: Path) -> ScanResult:
     result = ScanResult()
     detected: list[tuple[str, str, str | None]] = []
+    detected_node: list[tuple[str, str, str | None]] = []
     xcodeproj_name: str | None = None
 
     for triggers, tool, lang, platform in _SIGNATURES:
         if any((root / f).exists() for f in triggers):
-            detected.append((tool, lang, platform))
+            match = (tool, lang, platform)
+            if tool == "node":
+                # package.json is often auxiliary tooling in native projects.
+                # Keep it detectable, but let native project files win ambiguity.
+                detected_node.append(match)
+            else:
+                detected.append(match)
 
     try:
         for entry in root.iterdir():
@@ -175,6 +182,8 @@ def scan(root: Path) -> ScanResult:
                 break
     except PermissionError:
         pass
+
+    detected.extend(detected_node)
 
     if len(detected) == 1:
         result.build_tool, result.language, result.platform = detected[0]

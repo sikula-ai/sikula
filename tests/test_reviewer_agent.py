@@ -630,6 +630,30 @@ class TestReviewerAgentPrompt:
             {"phase": "test", "name": "tests", "command": "pnpm test"},
         ]
 
+    @pytest.mark.parametrize(
+        ("package_manager", "compile_command", "test_command"),
+        [
+            ("npm", "npm run build", "npm test"),
+            ("bun", "bun run build", "bun run test"),
+            ("pnpm", "pnpm build", "pnpm test"),
+        ],
+    )
+    def test_node_configured_validation_commands_fall_back_without_root_path(
+        self, package_manager: str, compile_command: str, test_command: str
+    ):
+        state = _make_state()
+        config = {
+            "project": {"build_tool": "node"},
+            "build": {"package_manager": package_manager},
+        }
+
+        commands = configured_validation_commands(config, state)
+
+        assert commands[:2] == [
+            {"phase": "build", "name": "compile", "command": compile_command},
+            {"phase": "test", "name": "tests", "command": test_command},
+        ]
+
     def test_validation_command_coverage_requires_exact_command(self):
         configured = [{"phase": "test", "name": "tests", "command": "cargo test"}]
 
