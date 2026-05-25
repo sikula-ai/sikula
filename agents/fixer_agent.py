@@ -9,10 +9,12 @@ limited to errors the build system or test runner reports.
 from __future__ import annotations
 
 import posixpath
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from agents.base_agent import (
     AgentResult,
@@ -59,6 +61,29 @@ IMPLEMENTATION THAT WAS APPLIED:
 _BUILD_TEST_CONSTRAINT = """\
 - NEVER create or modify unit tests — no files under any test source directory
   (e.g. `test/`, `__tests__/`, `spec/`), regardless of what the errors say"""
+
+_TEST_ORIGIN_VALIDATION_CONSTRAINT = """\
+- These build/check errors appear to originate from test files or test targets
+- You MAY create and modify test files
+- You MAY modify production source files only when the test-origin validation failure exposes
+  a production defect
+- First decide whether the failure is caused by production behaviour or by an incorrect/stale test
+- Start your final response with:
+  TEST FAILURE TRIAGE:
+  classification: production_defect | stale_test | malformed_test | unclear
+  contract_affected: <task/guideline/structured contract, or none>
+  chosen_fix: production_code | test_code
+- If a test encodes the original task, implementation prompt, project guidelines, or a structured
+  input/output contract, fix production code instead of weakening the test
+- Modify tests only when the test is malformed, stale, or inconsistent with the accepted contract
+- If you choose test_code, explain which accepted contract the test conflicts with
+- If the failure is caused by a malformed generated test or test harness assumption, fix the
+  test or test helper. Do not change production source, build configuration, runtime
+  configuration, dependency declarations, or pipeline settings merely to satisfy a malformed test.
+- Treat build files, dependency manifests, project/workspace files, generated-source config,
+  and runtime configuration as production code for this triage. Changing them for a test-origin
+  validation failure requires `classification: production_defect` and `chosen_fix: production_code`.
+- Do not delete, relax, or rewrite assertions just to make the run green"""
 
 _TEST_TEST_CONSTRAINT = """\
 - You MAY create and modify test files
@@ -127,6 +152,46 @@ _TEST_FILE_SUFFIXES = (
     "_tests.py",
 )
 _TEST_FILE_PREFIXES = ("test_",)
+_VALIDATION_PATH_EXTENSIONS = (
+    "c",
+    "cc",
+    "cpp",
+    "cs",
+    "cts",
+    "go",
+    "gradle",
+    "h",
+    "hpp",
+    "java",
+    "js",
+    "json",
+    "jsx",
+    "kt",
+    "kts",
+    "m",
+    "mm",
+    "mts",
+    "php",
+    "py",
+    "rb",
+    "rs",
+    "scala",
+    "swift",
+    "toml",
+    "ts",
+    "tsx",
+    "xml",
+    "yaml",
+    "yml",
+)
+_VALIDATION_PATH_RE = re.compile(
+    r"(?P<path>(?:file://)?(?:[A-Za-z]:)?(?:[^:\s'\"`<>()\[\]{}]+[\\/])+"
+    r"[^:\s'\"`<>()\[\]{}]+\.(?:" + "|".join(re.escape(ext) for ext in _VALIDATION_PATH_EXTENSIONS) + r"))"
+    r"|(?P<file>\b[^:\s'\"`<>()\[\]{}\\/]+\.(?:"
+    + "|".join(re.escape(ext) for ext in _VALIDATION_PATH_EXTENSIONS)
+    + r")\b)",
+    re.IGNORECASE,
+)
 
 
 def _scope(state: TaskState) -> str:
@@ -135,7 +200,9 @@ def _scope(state: TaskState) -> str:
     return "step" if state.plan else "task"
 
 
-def _test_constraint(state: TaskState) -> str:
+def _test_constraint(state: TaskState, *, test_origin_validation: bool = False) -> str:
+    if test_origin_validation:
+        return _TEST_ORIGIN_VALIDATION_CONSTRAINT
     if state.errors:
         return _BUILD_TEST_CONSTRAINT
     if state.test_errors and not state.check_errors:
@@ -144,8 +211,8 @@ def _test_constraint(state: TaskState) -> str:
     return _CHECK_TEST_CONSTRAINT
 
 
-def _write_paths_for_state(state: TaskState, sandbox: dict) -> list[str]:
-    if state.errors:
+def _write_paths_for_state(state: TaskState, sandbox: dict, *, test_origin_validation: bool = False) -> list[str]:
+    if state.errors and not test_origin_validation:
         return sandbox.get("allowed_write_paths", [])
 
     paths: list[str] = []
@@ -193,6 +260,57 @@ def _looks_like_test_artifact(path: str) -> bool:
         return False
     filename = parts[-1]
     return filename.startswith(_TEST_FILE_PREFIXES) or filename.endswith(_TEST_FILE_SUFFIXES)
+
+
+def _project_relative_error_path(path: str, project_root: Path | None = None) -> str:
+    cleaned = unquote(path.strip().strip("\"'`<>").rstrip(".,;"))
+    if cleaned.lower().startswith("file://"):
+        cleaned = cleaned[7:]
+    cleaned = cleaned.replace("\\", "/")
+    if project_root:
+        try:
+            candidate = Path(cleaned)
+            if candidate.is_absolute():
+                cleaned = candidate.resolve().relative_to(project_root.resolve()).as_posix()
+        except (OSError, ValueError):
+            pass
+    return posixpath.normpath(cleaned)
+
+
+def _validation_error_paths(errors: list[str], project_root: Path | None = None) -> list[str]:
+    paths: list[str] = []
+    for error in errors:
+        for match in _VALIDATION_PATH_RE.finditer(error):
+            raw_path = match.group("path") or match.group("file")
+            if not raw_path:
+                continue
+            path = _project_relative_error_path(raw_path, project_root)
+            if path not in paths:
+                paths.append(path)
+    return paths
+
+
+def _is_test_origin_path(path: str, sandbox: dict) -> bool:
+    return _is_under_specific_test_root(path, sandbox.get("allowed_test_write_paths", [])) or _looks_like_test_artifact(
+        path
+    )
+
+
+def _is_test_origin_validation_failure(state: TaskState, sandbox: dict, project_root: Path | None = None) -> bool:
+    if state.test_errors:
+        return False
+    if not state.errors and not state.check_errors:
+        return False
+    paths = _validation_error_paths([*state.errors, *state.check_errors], project_root)
+    if not paths:
+        return False
+    return all(_is_test_origin_path(path, sandbox) for path in paths)
+
+
+def _uses_test_failure_triage(state: TaskState, sandbox: dict, project_root: Path | None = None) -> bool:
+    return (
+        bool(state.test_errors) and not state.errors and not state.check_errors
+    ) or _is_test_origin_validation_failure(state, sandbox, project_root)
 
 
 def _is_build_config_file(build_tool: Any, path: str) -> bool:
@@ -355,7 +473,15 @@ class FixerAgent(BaseAgent):
             return AgentResult(success=False, message="FileTool not available")
 
         sandbox = self.project_config.get("sandbox", {})
-        allowed_write_paths = _write_paths_for_state(state, sandbox)
+        agent_cwd = Path(file_tool._root)
+        test_origin_validation = _is_test_origin_validation_failure(state, sandbox, agent_cwd)
+        uses_test_failure_triage = _uses_test_failure_triage(state, sandbox, agent_cwd)
+        triage_scope = None
+        if test_origin_validation:
+            triage_scope = "test_origin_validation"
+        elif uses_test_failure_triage:
+            triage_scope = "test_failure"
+        allowed_write_paths = _write_paths_for_state(state, sandbox, test_origin_validation=test_origin_validation)
         allowed_str = ", ".join(allowed_write_paths) if allowed_write_paths else "(not configured)"
         allowed_read_paths = sandbox.get("allowed_read_paths", ["."])
         allowed_read_str = ", ".join(allowed_read_paths)
@@ -365,7 +491,7 @@ class FixerAgent(BaseAgent):
             guidelines_files=_guidelines_files(self.project_config),
             allowed_read_paths=allowed_read_str,
             allowed_write_paths=allowed_str,
-            test_constraint=_test_constraint(state),
+            test_constraint=_test_constraint(state, test_origin_validation=test_origin_validation),
             task_description=state.task_description,
             implementation_prompt=state.implementation_prompt or "(not available)",
             errors_section=_errors_section(state),
@@ -376,46 +502,43 @@ class FixerAgent(BaseAgent):
             "test": list(state.test_errors),
             "check": list(state.check_errors),
         }
-        agent_cwd = Path(file_tool._root)
-        dirty_before = (
-            _git_dirty_text_snapshot(agent_cwd)
-            if state.test_errors and not state.errors and not state.check_errors
-            else {}
-        )
+        dirty_before = _git_dirty_text_snapshot(agent_cwd) if uses_test_failure_triage else {}
 
         try:
             changed, fixer_output = self.llm.run_agent(prompt, cwd=agent_cwd)
         except RuntimeError as e:
             msg = str(e)
             state.record(self.name, "fix_failed", msg[:500])
-            state.fix_cycle_records.append(
-                {
-                    "build_iteration": state.build_iterations,
-                    "step": state.current_step,
-                    "scope": _scope(state),
-                    "errors_before": errors_snapshot,
-                    "fixer_prompt": prompt,
-                    "fixer_output": None,
-                    "files_written": [],
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-            return AgentResult(success=False, message=msg[:200])
-
-        state.fix_cycle_records.append(
-            {
+            record = {
                 "build_iteration": state.build_iterations,
                 "step": state.current_step,
                 "scope": _scope(state),
                 "errors_before": errors_snapshot,
                 "fixer_prompt": prompt,
-                "fixer_output": fixer_output,
-                "files_written": changed,
+                "fixer_output": None,
+                "files_written": [],
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-        )
+            if triage_scope:
+                record["triage_scope"] = triage_scope
+            state.fix_cycle_records.append(record)
+            return AgentResult(success=False, message=msg[:200])
 
-        if state.test_errors and not state.errors and not state.check_errors:
+        record = {
+            "build_iteration": state.build_iterations,
+            "step": state.current_step,
+            "scope": _scope(state),
+            "errors_before": errors_snapshot,
+            "fixer_prompt": prompt,
+            "fixer_output": fixer_output,
+            "files_written": changed,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if triage_scope:
+            record["triage_scope"] = triage_scope
+        state.fix_cycle_records.append(record)
+
+        if uses_test_failure_triage:
             before_contents = _changed_text_contents_before(agent_cwd, changed, dirty_before)
             after_contents = _changed_text_contents_after(agent_cwd, changed)
             production_writes = _test_failure_production_writes(
@@ -429,8 +552,9 @@ class FixerAgent(BaseAgent):
                 for p in changed:
                     if p not in state.files_changed:
                         state.files_changed.append(p)
+                failure_kind = "test-origin validation" if test_origin_validation else "test-failure"
                 msg = (
-                    "Test-failure fixer changed production files without explicit "
+                    f"{failure_kind.capitalize()} fixer changed production files without explicit "
                     "production_defect triage: "
                     f"{production_writes}"
                 )

@@ -964,9 +964,27 @@ class TestReviewerAgentHistory:
         agent = _make_agent(stub_llm, file_tool=file_tool)
         agent.run(state)
         prompt = stub_llm.readonly_calls[0]
-        assert "Recent test-failure fixer records" in prompt
+        assert "Recent test-related fixer records" in prompt
         assert "tests/LoginTest.kt" in prompt
         assert "classification: stale_test" in prompt
+
+    def test_test_origin_validation_fixer_records_included_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.fix_cycle_records = [
+            {
+                "errors_before": {"build": ["tests/LoginTest.kt:12: compile error"], "test": [], "check": []},
+                "files_written": ["tests/LoginTest.kt"],
+                "fixer_output": "TEST FAILURE TRIAGE:\nclassification: malformed_test",
+                "triage_scope": "test_origin_validation",
+            }
+        ]
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Recent test-related fixer records" in prompt
+        assert "Test-origin validation fix" in prompt
+        assert "classification: malformed_test" in prompt
 
     def test_build_only_fixer_records_not_included_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
@@ -980,7 +998,7 @@ class TestReviewerAgentHistory:
         ]
         agent = _make_agent(stub_llm, file_tool=file_tool)
         agent.run(state)
-        assert "Recent test-failure fixer records" not in stub_llm.readonly_calls[0]
+        assert "Recent test-related fixer records" not in stub_llm.readonly_calls[0]
 
     def test_mixed_history_includes_only_reviewer_entries(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"

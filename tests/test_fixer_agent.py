@@ -14,9 +14,11 @@ from agents.fixer_agent import (
     _git_dirty_text_snapshot,
     _guidelines_files,
     _has_valid_production_test_failure_triage,
+    _is_test_origin_validation_failure,
     _tech_stack,
     _test_constraint,
     _test_failure_production_writes,
+    _validation_error_paths,
     _write_paths_for_state,
 )
 from tests.conftest import StubLLMClient
@@ -307,6 +309,34 @@ class TestFixerAgentWritePaths:
         _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
         assert "src/" in stub_llm.agent_calls[0]
 
+    def test_build_errors_from_test_files_use_test_triage_scope(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["tests/countryFilters.test.ts"]
+        stub_llm.agent_output = (
+            "TEST FAILURE TRIAGE:\nclassification: malformed_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.errors = ["tests/countryFilters.test.ts(14,39): error TS2322: Type '\"   \"' is not assignable"]
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "src/, tests/" in prompt
+        assert "test-origin validation failure" in prompt
+        assert "TEST FAILURE TRIAGE:" in prompt
+        assert state.fix_cycle_records[0]["triage_scope"] == "test_origin_validation"
+
+    def test_build_errors_from_mixed_production_and_test_files_use_production_scope(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
+        stub_llm.agent_result = ["src/Login.kt"]
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.errors = [
+            "src/Login.kt:10: error: incompatible type\ntests/LoginTest.kt:5: note: required by generated test"
+        ]
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "NEVER create or modify unit tests" in prompt
+
     def test_mixed_errors_use_production_write_paths(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["src/Login.kt"]
         config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
@@ -402,6 +432,54 @@ class TestFixerAgentTestFailureProductionGate:
         assert state.failed is True
         assert "build.gradle.kts" in result.message
 
+    def test_test_origin_build_failure_production_fix_requires_explicit_triage(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
+        stub_llm.agent_result = ["src/domain/countryFilters.ts"]
+        stub_llm.agent_output = "Widened the type to satisfy the generated test."
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.errors = ["tests/countryFilters.test.ts(14,39): error TS2322: Type '\"   \"' is not assignable"]
+        result = _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        assert not result.success
+        assert state.failed is True
+        assert state.errors == ["tests/countryFilters.test.ts(14,39): error TS2322: Type '\"   \"' is not assignable"]
+        assert "test-origin validation" in result.message.lower()
+        assert "src/domain/countryFilters.ts" in state.files_changed
+
+    def test_test_origin_build_failure_production_fix_with_valid_triage_succeeds(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
+        stub_llm.agent_result = ["src/domain/countryFilters.ts"]
+        stub_llm.agent_output = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: production_defect\n"
+            "contract_affected: filter API accepts blank input\n"
+            "chosen_fix: production_code\n"
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.errors = ["tests/countryFilters.test.ts(14,39): error TS2322: Type '\"   \"' is not assignable"]
+        result = _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        assert result.success
+        assert state.failed is False
+        assert state.errors == []
+        assert "src/domain/countryFilters.ts" in state.files_changed
+        assert state.fix_cycle_records[0]["triage_scope"] == "test_origin_validation"
+
+    def test_test_origin_check_failure_production_fix_requires_explicit_triage(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
+        stub_llm.agent_result = ["src/Login.kt"]
+        stub_llm.agent_output = "Changed production code for a lint failure in a test."
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.check_errors = ["[lint]\ntests/LoginTest.kt:12:5: no-explicit-any"]
+        result = _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        assert not result.success
+        assert state.failed is True
+        assert "test-origin validation" in result.message.lower()
+
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -420,6 +498,14 @@ class TestTestConstraint:
         state = _make_state()
         state.errors = ["compile error"]
         assert "NEVER create or modify unit tests" in _test_constraint(state)
+
+    def test_test_origin_validation_allows_test_modification_with_triage(self):
+        state = _make_state()
+        state.errors = ["tests/LoginTest.kt:12: error: unresolved reference"]
+        constraint = _test_constraint(state, test_origin_validation=True)
+        assert "test-origin validation failure" in constraint
+        assert "MAY create and modify test files" in constraint
+        assert "TEST FAILURE TRIAGE:" in constraint
 
     def test_check_errors_allow_test_modification(self):
         state = _make_state()
@@ -445,6 +531,12 @@ class TestWritePathsForState:
         state.errors = ["compile error"]
         sandbox = {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}
         assert _write_paths_for_state(state, sandbox) == ["src/"]
+
+    def test_test_origin_build_errors_use_production_and_test_paths(self):
+        state = _make_state()
+        state.errors = ["tests/LoginTest.kt:12: error: unresolved reference"]
+        sandbox = {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}
+        assert _write_paths_for_state(state, sandbox, test_origin_validation=True) == ["src/", "tests/"]
 
     def test_test_failures_use_production_and_test_paths(self):
         state = _make_state()
@@ -587,6 +679,61 @@ class TestProductionTestFailureTriage:
     def test_test_code_triage_does_not_allow_production_fix(self):
         output = "TEST FAILURE TRIAGE:\nclassification: stale_test\ncontract_affected: none\nchosen_fix: test_code\n"
         assert not _has_valid_production_test_failure_triage(output)
+
+
+class TestTestOriginValidationDetection:
+    def test_extracts_platform_neutral_validation_paths(self, tmp_project: Path):
+        errors = [
+            "tests/countryFilters.test.ts(14,39): error TS2322",
+            "e: file:///tmp/project/feature/src/test/kotlin/LoginTest.kt: (8, 5) unresolved reference",
+            'File "/tmp/project/tests/test_app.py", line 12, in test_login',
+            "/tmp/project/CountriesTests/CountryRowTests.swift:10: error: cannot find Country",
+        ]
+        assert _validation_error_paths(errors, tmp_project) == [
+            "tests/countryFilters.test.ts",
+            "/tmp/project/feature/src/test/kotlin/LoginTest.kt",
+            "/tmp/project/tests/test_app.py",
+            "/tmp/project/CountriesTests/CountryRowTests.swift",
+        ]
+
+    def test_detects_test_origin_build_failure_from_test_path(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = ["tests/countryFilters.test.ts(14,39): error TS2322"]
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_detects_test_origin_build_failure_from_platform_test_path(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = ["feature/countries/src/test/kotlin/LoginTest.kt:8: unresolved reference"]
+        sandbox = {"allowed_test_write_paths": ["feature/countries/"]}
+        assert _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_detects_test_origin_check_failure_from_test_path(self, tmp_project: Path):
+        state = _make_state()
+        state.check_errors = ["[lint]\nCountriesTests/CountryRowTests.swift:10: warning: unused value"]
+        sandbox = {"allowed_test_write_paths": ["CountriesTests/"]}
+        assert _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_rejects_mixed_test_and_production_validation_paths(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = [
+            "src/domain/countryFilters.ts:12: error TS2322\ntests/countryFilters.test.ts:8: note: from test"
+        ]
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_rejects_validation_errors_without_paths(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = ["Compilation failed with 1 error"]
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_rejects_existing_test_errors_to_preserve_current_test_failure_path(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = ["tests/LoginTest.kt:12: error"]
+        state.test_errors = ["assertion failed"]
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
 
 
 class TestErrorsSection:

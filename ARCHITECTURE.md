@@ -633,9 +633,10 @@ file that was already dirty before the run is still detected as changed if the a
 - project guidelines content pre-loaded from `guidelines.context_files` (same mechanism as analyst; capped at `guidelines.max_file_chars` per file; truncated files include a Read-tool marker)
 - previous reviewer outputs from `state.review_cycle_records` — passed as numbered history so the agent maintains consistent judgments across iterations and does not reverse a finding unless the code genuinely changed
 - `state.test_files_written` — list of files written by the test writer agent; if non-empty, passed to the reviewer so generated tests are not flagged as scope violations. In normal `sikula run` mode, these files are not reviewer-owned output. In `sikula review` mode, changed test files are reviewed as normal branch output.
-- recent test-failure fixer records from `state.fix_cycle_records` — only records whose
-  `errors_before.test` is non-empty are summarized, so the reviewer can audit whether a
-  test-failure fix weakened a task, guideline, or structured input contract.
+- recent test-related fixer records from `state.fix_cycle_records` — records whose
+  `errors_before.test` is non-empty or whose `triage_scope` marks a test-origin validation
+  fix are summarized, so the reviewer can audit whether a fix weakened a task, guideline,
+  or structured input contract.
 - effective configured validation pipeline — compile/test/check commands that the
   orchestrator will run, including `fix_command` entries, plus task-described validation
   commands extracted from `state.task_description` and marked as covered or not covered.
@@ -830,6 +831,7 @@ test-writing loop.
 | Error type | `allowed_write_paths` used in prompt | Test files |
 |---|---|---|
 | Build errors (`state.errors` non-empty) | `sandbox.allowed_write_paths` (production dirs) | Off-limits |
+| Build/check errors whose diagnostic paths all point at test files or test targets | `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May modify production or test files with the same production-vs-test triage required for test failures. If diagnostics name production paths too, or name no paths at all, Sikula falls back to the normal build/check scope. |
 | Test failures only (`state.test_errors` non-empty, `state.errors` and `state.check_errors` both empty) | `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May modify production or test files; must fix production when the failing test encodes the original task, implementation prompt, project guidelines, or a structured contract. If production files are changed, fixer output must explicitly classify the failure as `production_defect` and choose `production_code`; otherwise the task fails for audit. |
 | Check errors only (`state.check_errors` non-empty, `state.errors` empty) | `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May modify production or test files if explicitly named in the check errors |
 
@@ -848,13 +850,14 @@ Build, test, sync, and check error blobs are diagnostic excerpts, not plain tail
 preserves failure-marker blocks from long command output so the fixer still sees the concrete
 compiler diagnostic, failing test, assertion, panic, traceback, or tool error even when the
 build tool prints many lines after the failure.
-For test failures, the fixer is explicitly told to decide whether the failure is caused by
+For test failures, and for build/check failures whose diagnostics point only at test files or
+test targets, the fixer is explicitly told to decide whether the failure is caused by
 production behaviour or by an incorrect/stale test. It must not delete, relax, or rewrite
-assertions just to make the run green. Its final response for test failures must begin with
-`TEST FAILURE TRIAGE`, classifying the failure as `production_defect`, `stale_test`,
-`malformed_test`, or `unclear`, naming the affected contract when present, and stating
-whether the chosen fix changed production code or test code. Sikula enforces this for
-production writes from test-failure fixes: missing triage, copied placeholder triage, or any
+assertions just to make the run green. Its final response for these test-origin failures must
+begin with `TEST FAILURE TRIAGE`, classifying the failure as `production_defect`,
+`stale_test`, `malformed_test`, or `unclear`, naming the affected contract when present, and
+stating whether the chosen fix changed production code or test code. Sikula enforces this for
+production writes from test-origin fixes: missing triage, copied placeholder triage, or any
 classification other than `production_defect` with `chosen_fix: production_code` marks the task
 failed before the pipeline can accept the change.
 This audit does not rely only on `allowed_test_write_paths`: when a project uses broad test
@@ -881,8 +884,8 @@ content pre-loaded in the prompt.
 - `state.files_changed` — new paths appended (existing entries kept)
 - `state.errors`, `state.test_errors`, and `state.check_errors` — all cleared after agent runs successfully
 - `state.fix_cycle_records` — stores the fixer prompt, output, errors snapshot, files written,
-  scope, and build iteration; reviewer prompts summarize recent test-failure records for
-  contract-weakening audit.
+  scope, build iteration, and optional `triage_scope`; reviewer prompts summarize recent
+  test-related records for contract-weakening audit.
 
 **Re-sync trigger:** orchestrator calls `BuildTool.is_build_config_file()` on each newly
 changed file. If any match, `state.build_synced = False` is set so sync runs before the
@@ -956,7 +959,7 @@ findings. Review and redact state files before sharing them outside your project
 | `security_review_cycle_records` | `list[dict]` | SecurityReviewerAgent | Structured observability — one entry per security reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = after a post-fixer validation pass), `security_review_iteration` (fix-pass index within this step's security review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the security reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, security history is limited to earlier final full-task security reviews. **Migration note:** state files from schema version 1 stored security reviewer entries inside `review_cycle_records` with `reviewer = "security_reviewer"`; `JsonStateStore.load()` moves them here and removes the redundant `reviewer` field. |
 | `test_write_records` | `list[dict]` | TestWriterAgent | Structured observability — one entry per test-writer invocation: `step`, `build_iteration` (`0` = before first build; `>0` = after a post-fixer validation pass), `scope`, `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
 | `testability_gaps` | `list[dict]` | TestWriterAgent | Structured audit signal for behaviour the test writer could not safely cover with available project seams/infrastructure. Entries include `source`, `step`, `build_iteration`, optional `scope`, `message`, `timestamp`, and optional parsed `target`, `reason`, `recommended_action`, and `risk`. Default policy is warning-only; `test_writer.testability_gap_policy: fail` turns reported gaps into task failures. |
-| `fix_cycle_records` | `list[dict]` | FixerAgent | Structured observability — one entry per fixer invocation after a failed sync/build/test/check attempt: `build_iteration` (globally unique, never resets), `step`, `scope`, `errors_before` snapshot (build/test/check), `fixer_prompt`, `fixer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
+| `fix_cycle_records` | `list[dict]` | FixerAgent | Structured observability — one entry per fixer invocation after a failed sync/build/test/check attempt: `build_iteration` (globally unique, never resets), `step`, `scope`, `errors_before` snapshot (build/test/check), `fixer_prompt`, `fixer_output` (`None` on exception), `files_written`, optional `triage_scope` (`test_failure` or `test_origin_validation`), `timestamp`; never read for pipeline decisions |
 | `validation_cycle_records` | `list[dict]` | Orchestrator | Structured observability — one entry per presync/sync/build/test/check outcome with `phase`, `status`, `build_iteration`, `step`, `timestamp`, optional `scope`, optional `elapsed_s`, optional `check_name`, and a diagnostic `error_excerpt` on failure; excerpts preserve failure-marker blocks from long tool output instead of storing only the final tail; never read for pipeline decisions |
 | `test_files_written` | `list[str]` | TestWriterAgent | Cumulative list of all files written by the test writer agent across all runs; never cleared; passed to ReviewerAgent so it does not flag those files as implementer scope violations. In normal `sikula run`, these files are not reviewer-owned output; in `sikula review`, changed test files are reviewed as branch output. |
 | `fixer_changed_code` | `bool` | Orchestrator | Set True when FixerAgent writes files; used on resume to continue deterministic build/test/check validation before stale semantic gates rerun; cleared after the following compile check succeeds |
