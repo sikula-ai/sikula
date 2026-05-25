@@ -257,6 +257,17 @@ class TestTestWriterAgentPrompt:
         assert "TESTABILITY GAP:" in prompt
         assert "build configuration" in prompt
 
+    def test_entry_point_failure_path_coverage_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state(implementation_prompt="Add detail navigation")
+        _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "Map changed behaviour through its production entry points" in prompt
+        assert "If multiple entry points reach the same changed operation" in prompt
+        assert "cover each entry point separately" in prompt
+        assert "promises, futures" in prompt
+        assert "observable failure/error path through the entry point" in prompt
+        assert "report a TESTABILITY GAP" in prompt
+
     def test_structured_input_contract_matrix_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state(implementation_prompt="Update expression validator")
         _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)

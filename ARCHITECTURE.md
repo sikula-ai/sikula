@@ -647,21 +647,29 @@ New files (not in the diff) are read directly via their paths in `state.files_ch
 **What it checks:**
 1. *Completeness* — did the implementation cover everything the prompt required?
 2. *Logical correctness* — are changed call sites, handlers, and data flows correct?
-3. *Semantic consistency* — do remaining callers of modified symbols still make sense given the task intent?
-4. *Dead members* — for every type that had members removed, are all remaining members still referenced in production code?
-5. *Shared function scope* — for any shared function or extension modified, greps for all callers in production code independently, reads each out-of-scope caller file, and verifies behavior is unchanged. Scope expansion claims in the implementation prompt ("this caller is intentionally affected") are verified against the task description — if the caller's screen or feature is not mentioned there, it is an unintended side effect and reported as an issue.
-6. *Structured input contracts* — for parser, validator, expression engine, schema, DSL,
+3. *Entry-point and async boundary consistency* — for changed behavior, identifies
+   production entry points such as UI handlers, API/route handlers, CLI commands,
+   lifecycle hooks, callbacks, queue/background jobs, timers, observers, and equivalent
+   platform entry points. If multiple entry points call the same operation, each must
+   handle success, failure, cancellation/absence where applicable, state transitions,
+   and side effects correctly in its own context. Fire-and-forget async/deferred work
+   (promises, futures, coroutines, tasks, threads, callbacks, queued work, etc.) must
+   either have an observed error path or be explicitly safe to ignore.
+4. *Semantic consistency* — do remaining callers of modified symbols still make sense given the task intent?
+5. *Dead members* — for every type that had members removed, are all remaining members still referenced in production code?
+6. *Shared function scope* — for any shared function or extension modified, greps for all callers in production code independently, reads each out-of-scope caller file, and verifies behavior is unchanged. Scope expansion claims in the implementation prompt ("this caller is intentionally affected") are verified against the task description — if the caller's screen or feature is not mentioned there, it is an unintended side effect and reported as an issue.
+7. *Structured input contracts* — for parser, validator, expression engine, schema, DSL,
    config loader, or rule engine changes, verifies production validation enforces the full
    contract, including expected result types, rejected invalid shapes, unknown names,
    forbidden values, and scope/forward-reference violations. A validator that only checks
    syntax or known names when the task requires typed/shape-specific validation is a
    production correctness issue.
-7. *Contract-bearing test weakening* — in normal `sikula run`, changed tests are still not
+8. *Contract-bearing test weakening* — in normal `sikula run`, changed tests are still not
    reviewed as standalone output, but if changed test files or recent test-failure fixer
    records show that a task/guideline/structured-contract test was deleted, relaxed, or
    changed to a different invalid fixture, the reviewer uses that as evidence to re-check
    the production contract and reports the production issue when it still exists.
-8. *Validation command coverage* — explicit validation commands in task descriptions are
+9. *Validation command coverage* — explicit validation commands in task descriptions are
    treated as acceptance criteria for the configured validation pipeline. The reviewer does not block
    merely because a covered command has not yet run during review; the build/test/check
    loop owns execution. If a `sikula run` task-described command is not covered by
@@ -776,6 +784,15 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
    and null/absent paths for every nullable value involved in the change
    - Explicit testing requirements from `state.task_description` are honored; in multi-step
      tasks, `CURRENT STEP` is the primary scope signal and tests for future steps are not added
+   - When multiple production entry points reach the same changed operation and have
+     distinct error handling, state transitions, cancellation/absence handling, or side
+     effects, each entry point is tested separately. This is platform-neutral: entry
+     points include UI handlers, API/route handlers, CLI commands, lifecycle hooks,
+     callbacks, queue/background jobs, timers, observers, and equivalent framework hooks.
+   - Async/deferred work started from an entry point is tested through observable success
+     and failure paths when the project's existing test infrastructure can do so. If the
+     failure path requires new infrastructure outside the test write scope, the test writer
+     reports a `TESTABILITY GAP` instead of adding brittle source-inspection tests.
    - Parser, validator, expression engine, schema, DSL, config loader, and rule engine
      changes get a positive/negative contract matrix, including wrong expected result type
      rejection when typed contexts exist; rejected input classes must stay distinct, so a
@@ -831,8 +848,8 @@ test-writing loop.
 | Error type | `allowed_write_paths` used in prompt | Test files |
 |---|---|---|
 | Build errors (`state.errors` non-empty) | `sandbox.allowed_write_paths` (production dirs) | Off-limits |
-| Build/check errors whose diagnostic references all point at test files or recognized test targets | `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May modify production or test files with the same production-vs-test triage required for test failures. If diagnostics name production paths or targets too, or name no paths or recognized targets at all, Sikula falls back to the normal build/check scope. |
-| Test failures only (`state.test_errors` non-empty, `state.errors` and `state.check_errors` both empty) | `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May modify production or test files; must fix production when the failing test encodes the original task, implementation prompt, project guidelines, or a structured contract. If production files are changed, fixer output must explicitly classify the failure as `production_defect` and choose `production_code`; otherwise the task fails for audit. |
+| Build/check errors whose diagnostic references all point at test files or recognized test targets | First pass: `sandbox.allowed_test_write_paths`. Second pass, only after no-change `production_defect` + `production_code` triage: `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May repair malformed/stale tests in the first pass. Production writes during the first pass fail the task. If diagnostics name production paths or targets too, or name no paths or recognized targets at all, Sikula falls back to the normal build/check scope. |
+| Test failures only (`state.test_errors` non-empty, `state.errors` and `state.check_errors` both empty) | First pass: `sandbox.allowed_test_write_paths`. Second pass, only after no-change `production_defect` + `production_code` triage: `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May repair malformed/stale tests in the first pass. If the failing test encodes the original task, implementation prompt, project guidelines, or a structured contract, the first pass must report a production defect without changing files so the separate production-enabled pass can fix it. |
 | Check errors only (`state.check_errors` non-empty, `state.errors` empty) | `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May modify production or test files if explicitly named in the check errors |
 
 **Input:**
@@ -854,14 +871,16 @@ For test failures, and for build/check failures whose diagnostics reference only
 or recognized test targets, the fixer is explicitly told to decide whether the failure is
 caused by production behaviour or by an incorrect/stale test. Target-only diagnostics are
 matched conservatively: unknown, production, or mixed production/test references fall back to
-the normal build/check scope. The fixer must not delete, relax, or rewrite
-assertions just to make the run green. Its final response for these test-origin failures must
-begin with `TEST FAILURE TRIAGE`, classifying the failure as `production_defect`,
-`stale_test`, `malformed_test`, or `unclear`, naming the affected contract when present, and
-stating whether the chosen fix changed production code or test code. Sikula enforces this for
-production writes from test-origin fixes: missing triage, copied placeholder triage, or any
-classification other than `production_defect` with `chosen_fix: production_code` marks the task
-failed before the pipeline can accept the change.
+the normal build/check scope. The first pass is test-only: production source, build
+configuration, runtime configuration, dependency declarations, and pipeline settings are not
+allowed outputs for that pass. The fixer must not delete, relax, or rewrite assertions just to
+make the run green. Its final response for these test-origin failures must begin with
+`TEST FAILURE TRIAGE`, classifying the failure as `production_defect`, `stale_test`,
+`malformed_test`, or `unclear`, naming the affected contract when present, and stating whether
+the chosen fix is production code or test code. If it chooses `production_code`, it must leave
+files unchanged; Sikula then runs a second production-enabled fixer pass and records both
+passes. Production writes during the first pass, or a production-confirmed second pass that
+changes only tests, mark the task failed before the pipeline can accept the change.
 This audit does not rely only on `allowed_test_write_paths`: when a project uses broad test
 write roots, such as a platform module directory that contains both production and test
 sources, Sikula still treats non-test artifacts under that root as production writes. Build
@@ -886,8 +905,9 @@ content pre-loaded in the prompt.
 - `state.files_changed` — new paths appended (existing entries kept)
 - `state.errors`, `state.test_errors`, and `state.check_errors` — all cleared after agent runs successfully
 - `state.fix_cycle_records` — stores the fixer prompt, output, errors snapshot, files written,
-  scope, build iteration, and optional `triage_scope`; reviewer prompts summarize recent
-  test-related records for contract-weakening audit.
+  scope, build iteration, optional `triage_scope`, optional `triage_pass` (`test_only` or
+  `production_confirmed`), and optional `confirmed_test_failure_triage`; reviewer prompts
+  summarize recent test-related records for contract-weakening audit.
 
 **Re-sync trigger:** orchestrator calls `BuildTool.is_build_config_file()` on each newly
 changed file. If any match, `state.build_synced = False` is set so sync runs before the
@@ -965,7 +985,7 @@ Sikula processes at once is still unsupported.
 | `security_review_cycle_records` | `list[dict]` | SecurityReviewerAgent | Structured observability — one entry per security reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = after a post-fixer validation pass), `security_review_iteration` (fix-pass index within this step's security review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the security reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, security history is limited to earlier final full-task security reviews. **Migration note:** state files from schema version 1 stored security reviewer entries inside `review_cycle_records` with `reviewer = "security_reviewer"`; `JsonStateStore.load()` moves them here and removes the redundant `reviewer` field. |
 | `test_write_records` | `list[dict]` | TestWriterAgent | Structured observability — one entry per test-writer invocation: `step`, `build_iteration` (`0` = before first build; `>0` = after a post-fixer validation pass), `scope`, `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
 | `testability_gaps` | `list[dict]` | TestWriterAgent | Structured audit signal for behaviour the test writer could not safely cover with available project seams/infrastructure. Entries include `source`, `step`, `build_iteration`, optional `scope`, `message`, `timestamp`, and optional parsed `target`, `reason`, `recommended_action`, and `risk`. Default policy is warning-only; `test_writer.testability_gap_policy: fail` turns reported gaps into task failures. |
-| `fix_cycle_records` | `list[dict]` | FixerAgent | Structured observability — one entry per fixer invocation after a failed sync/build/test/check attempt: `build_iteration` (globally unique, never resets), `step`, `scope`, `errors_before` snapshot (build/test/check), `fixer_prompt`, `fixer_output` (`None` on exception), `files_written`, optional `triage_scope` (`test_failure` or `test_origin_validation`), `timestamp`; never read for pipeline decisions |
+| `fix_cycle_records` | `list[dict]` | FixerAgent | Structured observability — one entry per fixer invocation after a failed sync/build/test/check attempt: `build_iteration` (globally unique, never resets), `step`, `scope`, `errors_before` snapshot (build/test/check), `fixer_prompt`, `fixer_output` (`None` on exception), `files_written`, optional `triage_scope` (`test_failure` or `test_origin_validation`), optional `triage_pass` (`test_only` or `production_confirmed`), optional `confirmed_test_failure_triage`, `timestamp`; never read for pipeline decisions |
 | `validation_cycle_records` | `list[dict]` | Orchestrator | Structured observability — one entry per presync/sync/build/test/check outcome with `phase`, `status`, `build_iteration`, `step`, `timestamp`, optional `scope`, optional `elapsed_s`, optional `check_name`, and a diagnostic `error_excerpt` on failure; excerpts preserve failure-marker blocks from long tool output instead of storing only the final tail; never read for pipeline decisions |
 | `active_operation` | `dict \| None` | Orchestrator | Current long-running operation heartbeat for status visibility while an agent or validation command is blocked. Contains `phase`, optional `agent`, optional `scope`, `started_at`, `last_heartbeat_at`, `heartbeat_count`, optional `heartbeat_interval_seconds`, and optional `message`. Cleared when the operation completes; never drives pipeline decisions. |
 | `test_files_written` | `list[str]` | TestWriterAgent | Cumulative list of all files written by the test writer agent across all runs; never cleared; passed to ReviewerAgent so it does not flag those files as implementer scope violations. In normal `sikula run`, these files are not reviewer-owned output; in `sikula review`, changed test files are reviewed as branch output. |

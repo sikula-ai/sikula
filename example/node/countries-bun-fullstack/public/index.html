@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Countries</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">Bun full-stack example</p>
+          <h1>Countries</h1>
+        </div>
+        <div class="toolbar">
+          <label for="region-filter">Region</label>
+          <select id="region-filter">
+            <option value="">All regions</option>
+          </select>
+        </div>
+      </header>
+      <p id="countries-summary" class="summary">Loading countries...</p>
+      <p id="countries-empty" class="empty" hidden></p>
+      <ul id="countries-list" class="countries-list"></ul>
+    </main>
+    <script type="module" src="/assets/main.js"></script>
+  </body>
+</html>

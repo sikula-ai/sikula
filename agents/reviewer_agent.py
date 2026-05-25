@@ -3,16 +3,18 @@
 Runs after ImplementerAgent, before the build loop. Checks:
   1. Completeness  — did the implementation cover everything the prompt required?
   2. Logical correctness — are changed call sites, handlers, and data flows correct?
-  3. Semantic consistency — do remaining callers of modified symbols still make sense
+  3. Entry-point consistency — do user/API/event/CLI/background entry points that reach
+     the changed behavior handle success, errors, and state transitions correctly?
+  4. Semantic consistency — do remaining callers of modified symbols still make sense
      given the intent of the task?
-  4. Dead members — for every type that had members removed, are ALL remaining members
+  5. Dead members — for every type that had members removed, are ALL remaining members
      still referenced in production code?
-  5. Shared function scope — for any shared function/extension modified, are all callers
+  6. Shared function scope — for any shared function/extension modified, are all callers
      outside the task scope still behaving correctly in their own context?
-  6. Structured input contracts — for parsers, validators, expression engines, DSLs,
+  7. Structured input contracts — for parsers, validators, expression engines, DSLs,
      configs, schemas, or rule engines, are accepted/rejected inputs and typed contexts
      enforced by production validation?
-  7. Design compliance — if design/spec files are present in the implementation prompt,
+  8. Design compliance — if design/spec files are present in the implementation prompt,
      verify that the UI implementation matches the design.
 
 Returns approved (success=True) or issues (success=False + state.review_issues populated).
@@ -91,12 +93,23 @@ Review steps:
    b. Logical correctness — are all changed call sites, data handlers, and control flows
       correct? Look for cases where data is fetched or received but discarded, handlers
       that only partially process their input, or state updated inconsistently.
-   c. Semantic consistency — for any symbol whose callers were left unchanged, does each
+   c. Entry-point and async boundary consistency — for each changed behavior, identify
+      the production entry points that can reach it: user interaction handlers, API or
+      route handlers, CLI commands, lifecycle hooks, callbacks, queue/background job
+      handlers, timers, observers, or equivalent platform entry points. If multiple
+      entry points call the same operation, verify each one handles success, failures,
+      cancellation/absence where applicable, state transitions, and side effects in its
+      own context. If an entry point starts async or deferred work without awaiting or
+      otherwise observing the result (for example promises, futures, coroutines, tasks,
+      threads, callbacks, or queued work), verify errors are handled by a visible error
+      boundary or are explicitly safe to ignore. Report unhandled errors or inconsistent
+      state as production correctness issues.
+   d. Semantic consistency — for any symbol whose callers were left unchanged, does each
       remaining caller still make sense given the intent of the change?
-   d. Dead members — for every type (class, interface, …) that had any member removed in
+   e. Dead members — for every type (class, interface, …) that had any member removed in
       this change, grep for ALL remaining members of that type excluding test files and
       verify each still has at least one production caller. Report any that do not.
-   e. Shared function scope — for any shared function, extension, or utility modified by
+   f. Shared function scope — for any shared function, extension, or utility modified by
       this change: grep for ALL its callers in production code independently — do not rely
       on the implementation prompt's list of callers. For each caller that is not
       explicitly in scope of this task, read the caller file and verify that its behavior
@@ -110,18 +123,18 @@ Review steps:
       the task description. If the task description does not explicitly mention that
       caller's screen or feature, treat it as an unintended side effect and report it
       as an issue regardless of what the implementation prompt claims.
-   f. Unused parameters — for every production code function whose body was modified in
+   g. Unused parameters — for every production code function whose body was modified in
       this change, read the function body and verify that every parameter in its signature
       is still referenced within the body. A parameter no longer referenced after the
       change is dead code and must be removed from the signature regardless of whether its
       callers are in or out of scope. Report as an issue if any parameter is present in
       the signature but absent from the body. Do not apply this check to test files.
-   g. Design compliance — if the implementation prompt contains a "Files referenced in
+   h. Design compliance — if the implementation prompt contains a "Files referenced in
       the task" section with design mockups or specifications, compare the UI
       implementation against them. Verify that layout, component hierarchy, text labels,
       and visible states match the design. Report any discrepancy as an issue.
       Skip this check if no design files are present in the implementation prompt.
-   h. Structured input contracts — if the task changes a parser, validator, expression
+   i. Structured input contracts — if the task changes a parser, validator, expression
       engine, schema, DSL, config loader, rule engine, or any code that accepts structured
       user/project input, verify that production validation enforces the full contract,
       not just syntax or known names. Check accepted and rejected cases: malformed input,
@@ -132,7 +145,7 @@ Review steps:
       implementation accepts it until runtime, silently treats it as valid, or validates
       it through an API that does not know the expected result type, report it as a
       production correctness issue.
-   i. Validation command coverage — task descriptions often include commands such as
+   j. Validation command coverage — task descriptions often include commands such as
       formatters, linters, tests, or project report commands. Treat those as acceptance
       criteria for Sikula's configured validation pipeline, not as commands that you or the
       implementer must run manually. Use the "Configured validation pipeline" section:
@@ -370,10 +383,22 @@ def _test_related_fix_history(state: TaskState) -> str:
             continue
         files = record.get("files_written") or []
         files_text = ", ".join(files) if files else "(none)"
+        triage_pass = record.get("triage_pass")
+        triage_pass_text = f"\nTriage pass: {triage_pass}" if triage_pass else ""
+        confirmed_triage = (record.get("confirmed_test_failure_triage") or "").strip()
+        confirmed_triage_text = ""
+        if confirmed_triage:
+            confirmed_triage_text = "\nConfirmed production triage:\n" + _truncate(
+                confirmed_triage,
+                _MAX_FIXER_RECORD_CHARS,
+            )
         output = (record.get("fixer_output") or "").strip() or "(no fixer output captured)"
         output = _truncate(output, _MAX_FIXER_RECORD_CHARS)
         label = "Test-origin validation fix" if triage_scope == "test_origin_validation" else "Test-failure fix"
-        records.append(f"[{label} {idx}]\nFiles written: {files_text}\nFixer output:\n{output}")
+        records.append(
+            f"[{label} {idx}]\nFiles written: {files_text}"
+            f"{triage_pass_text}{confirmed_triage_text}\nFixer output:\n{output}"
+        )
 
     if not records:
         return ""
