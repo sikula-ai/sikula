@@ -70,7 +70,7 @@ from dotenv import load_dotenv
 _BASE = Path(__file__).parent
 # When adding a new platform: add it here, in _build_tool() in core/orchestrator.py,
 # in _generate_config() below, and in _SIGNATURES in tools/scanner.py.
-_SUPPORTED_BUILD_TOOLS = {"cargo", "gradle-android", "gradle-jvm", "maven", "xcodebuild", "python"}
+_SUPPORTED_BUILD_TOOLS = {"cargo", "gradle-android", "gradle-jvm", "maven", "node", "xcodebuild", "python"}
 
 
 def _git_output(args: list[str], cwd: Path) -> str | None:
@@ -305,6 +305,10 @@ def _build_tool_class(cfg: dict):
         from tools.cargo_tool import CargoTool
 
         return CargoTool
+    if platform == "node":
+        from tools.node_tool import NodeTool
+
+        return NodeTool
     if platform == "xcodebuild":
         from tools.xcode_tool import XcodeTool
 
@@ -1560,6 +1564,11 @@ def _generate_config(  # noqa: PLR0912
     write_paths: list[str] | None = None,
     test_write_paths: list[str] | None = None,
     xcode_scheme: str | None = None,
+    node_package_manager: str | None = None,
+    node_sync_command: str | None = None,
+    node_compile_command: str | None = None,
+    node_test_command: str | None = None,
+    node_checks: list[dict[str, str | int]] | None = None,
 ) -> str:
     if guidelines_files:
         guidelines_block = "  context_files:\n" + "\n".join(f"    - {f}" for f in guidelines_files)
@@ -1607,6 +1616,38 @@ build:
       command: "python3 -m ruff format --check ."
       fix_command: "python3 -m ruff format ."
       timeout: 60
+"""
+    elif build_tool == "node":
+        package_manager = node_package_manager or "npm"
+        sync_command = node_sync_command or (
+            "bun install --frozen-lockfile" if package_manager == "bun" else f"{package_manager} install"
+        )
+        compile_command = node_compile_command or (
+            "bun run build" if package_manager == "bun" else f"{package_manager} run build"
+        )
+        test_command = node_test_command or ("bun run test" if package_manager == "bun" else f"{package_manager} test")
+        checks = node_checks or []
+        if checks:
+            check_lines: list[str] = ["  checks:"]
+            for check in checks:
+                check_lines.append(f"    - name: {check['name']}")
+                check_lines.append(f'      command: "{check["command"]}"')
+                if "fix_command" in check:
+                    check_lines.append(f'      fix_command: "{check["fix_command"]}"')
+                check_lines.append(f"      timeout: {check.get('timeout', 120)}")
+            checks_block = "\n".join(check_lines)
+        else:
+            checks_block = "  checks: []"
+        build_section = f"""\
+build:
+  package_manager: {package_manager}
+  sync_command: "{sync_command}"
+  compile_command: "{compile_command}"
+  test_command: "{test_command}"
+  sync_timeout: 600
+  compile_timeout: 600
+  test_timeout: 600
+{checks_block}
 """
     elif build_tool == "gradle-android":
         build_section = """\
@@ -1944,6 +1985,8 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(f"  language   : {result.language}")
         if result.platform:
             print(f"  platform   : {result.platform}")
+        if result.build_tool == "node" and result.package_manager:
+            print(f"  package manager: {result.package_manager}")
     else:
         tech = "software"
         print("  No build tool detected — config will need manual setup.")
@@ -2004,12 +2047,19 @@ def cmd_init(args: argparse.Namespace) -> None:
         write_paths=result.write_paths or None,
         test_write_paths=result.test_write_paths or None,
         xcode_scheme=result.xcode_scheme,
+        node_package_manager=result.package_manager,
+        node_sync_command=result.node_sync_command,
+        node_compile_command=result.node_compile_command,
+        node_test_command=result.node_test_command,
+        node_checks=result.node_checks,
     )
     config_path.write_text(config)
 
     todos: list[str] = []
     if not result.build_tool:
-        todos.append("project.build_tool — set to: cargo / gradle-android / gradle-jvm / maven / xcodebuild / python")
+        todos.append(
+            "project.build_tool — set to: cargo / gradle-android / gradle-jvm / maven / node / xcodebuild / python"
+        )
     if not result.language:
         todos.append("project.language — set to your project's primary language")
     if result.build_tool in ("gradle-android", "xcodebuild"):
@@ -2027,6 +2077,11 @@ def cmd_init(args: argparse.Namespace) -> None:
         todos.append(
             "build.compile_task / build.test_task — verify the Gradle tasks (default: classes / test); "
             "run ./gradlew tasks to list available tasks"
+        )
+    if result.build_tool == "node":
+        todos.append(
+            "build.sync_command / compile_command / test_command — verify the package-manager commands match "
+            "your project scripts"
         )
     if result.build_tool == "xcodebuild" and not result.xcode_scheme:
         todos.append("build.scheme — set to your Xcode scheme name (run: xcodebuild -list)")

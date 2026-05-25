@@ -10,7 +10,7 @@ Sikula is a stateful software engineering pipeline for real codebases, powered b
 
 `sikula review` reviews an existing branch — report-only, or with `--fix` to apply corrections through the same build and fix loop.
 
-**Platforms:** Android/Gradle, JVM backends (Spring Boot, Quarkus, Micronaut)/Gradle, JVM backends/Maven, iOS/Xcode, Python, and Rust/Cargo are supported out of the box. The core orchestration and all agents are platform-neutral — supporting a new platform requires a `BuildTool` subclass and a project config YAML.
+**Platforms:** Android/Gradle, JVM backends (Spring Boot, Quarkus, Micronaut)/Gradle, JVM backends/Maven, Node.js/TypeScript/JavaScript, iOS/Xcode, Python, and Rust/Cargo are supported out of the box. The core orchestration and all agents are platform-neutral — supporting a new platform requires a `BuildTool` subclass and a project config YAML.
 
 **LLM providers:** Codex, Claude, Gemini, and OpenCode are built in. Authenticate via CLI login or an API key in `.env` — no vendor lock-in.
 
@@ -99,12 +99,13 @@ sikula init --provider codex --model gpt-5.5 --guidelines  # adjust provider/mod
 
 ```bash
 # Pick the example closest to your stack:
-#   Android:  example/android/countries/.sikula/config.yaml
-#   iOS:      example/ios/countries/.sikula/config.yaml
-#   JVM/Gradle: example/jvm/countries-gradle/.sikula/config.yaml
-#   JVM/Maven:  example/jvm/countries-maven/.sikula/config.yaml
-#   Rust:       example/rust/countries/.sikula/config.yaml
-#   Python:   .sikula/config.yaml  (this repo)
+#   Android:     example/android/countries/.sikula/config.yaml
+#   iOS:         example/ios/countries/.sikula/config.yaml
+#   JVM/Gradle:  example/jvm/countries-gradle/.sikula/config.yaml
+#   JVM/Maven:   example/jvm/countries-maven/.sikula/config.yaml
+#   Node/React:  example/node/countries-react/.sikula/config.yaml
+#   Rust:        example/rust/countries/.sikula/config.yaml
+#   Python:      .sikula/config.yaml  (this repo)
 cp <example-config> my-project/.sikula/config.yaml
 # update: project name, allowed_write_paths, build tasks, guidelines.context_files
 ```
@@ -136,7 +137,7 @@ git diff main...sikula/<branch-name>
 - **Build-aware execution** — Sikula compiles, tests, runs configured checks, and feeds failures to a fixer until the task passes or fails explicitly
 - **Precise scope control** — the analyst reads your codebase before writing the implementation prompt; the reviewer verifies call sites, structured input contracts, completeness, and scope drift before code reaches you
 - **Fits existing git and CI workflows** — output is a normal git branch and commit, ready for human review and whatever CI you already run
-- **Stack-flexible core** — Android, iOS, JVM, Python, and Rust are supported through platform-specific build tools; the orchestration stays the same
+- **Stack-flexible core** — Android, iOS, JVM, Node.js/TypeScript/JavaScript, Python, and Rust are supported through platform-specific build tools; the orchestration stays the same
 - **Configurable and transparent** — each phase can be enabled or disabled, each agent can use a different model/provider, and every run is inspectable with `sikula show <task-id>`
 
 ## Why a pipeline instead of a single agent?
@@ -175,9 +176,10 @@ A generic command from the same tool family is not enough when the task specifie
 materially different flags, targets, scripts, packages, schemes, or paths.
 Gradle/Maven wrapper spelling for the same invocation (`./gradlew` vs `gradle`,
 `./mvnw` vs `mvn`) is treated as equivalent, as are Python module forms
-(`python -m pytest` vs `pytest`, `python -m ruff` vs `ruff`) and npm/pnpm/Yarn
-`test` script shortcuts (`npm test` vs `npm run test`, etc.); different tasks,
-scripts, goals, or flags are not.
+(`python -m pytest` vs `pytest`, `python -m ruff` vs `ruff`), the npm `test`
+shortcut (`npm test` vs `npm run test`), and pnpm/Yarn package-script shorthands
+for common validation scripts (`pnpm typecheck` vs `pnpm run typecheck`,
+`yarn lint` vs `yarn run lint`). Different tasks, scripts, goals, or flags are not.
 For run-task validation coverage gaps, Sikula does not ask the implementer to edit the
 pipeline config inside the current task, because the effective pipeline is loaded before
 the agent loop starts.
@@ -188,7 +190,7 @@ the agent loop starts.
 - **Bug fixes** — describe the expected behaviour and where it breaks; the analyst locates the root cause and the full pipeline ensures the fix compiles, passes tests, and doesn't introduce regressions
 - **Incremental development** — stack tasks one on top of the other's branch; controlled scope and quality at every step
 - **Branch review** — use `sikula review` as an independent quality and security gate on any branch before merge
-- **Multi-platform** — the same task description (or a lightly adapted version) can drive implementations across platforms; the analyst reads each codebase independently and the implementer handles platform-specific details; run Android, iOS, and backend in parallel from one spec
+- **Multi-platform** — the same task description (or a lightly adapted version) can drive implementations across platforms; the analyst reads each codebase independently and the implementer handles platform-specific details; run Android, iOS, web, and backend in parallel from one spec
 
 ---
 
@@ -304,7 +306,7 @@ sikula run .sikula/tasks/status-emoji-icons.md
 
 ## 3. Try an example
 
-The repo ships five runnable example projects — each a countries browser or API built around the same domain data:
+The repo ships six runnable example projects — each a countries browser or API built around the same domain data:
 
 | Example | Stack | Data source | Config |
 |---|---|---|---|
@@ -312,6 +314,7 @@ The repo ships five runnable example projects — each a countries browser or AP
 | `example/ios/countries/` | Swift, SwiftUI (iOS 17+), `@Observable` | [REST Countries API](https://restcountries.com) | `example/ios/countries/.sikula/config.yaml` |
 | `example/jvm/countries-gradle/` | Kotlin, Spring Boot, Gradle | local JSON dataset sourced from REST Countries | `example/jvm/countries-gradle/.sikula/config.yaml` |
 | `example/jvm/countries-maven/` | Kotlin, Spring Boot, Maven | local JSON dataset sourced from REST Countries | `example/jvm/countries-maven/.sikula/config.yaml` |
+| `example/node/countries-react/` | TypeScript, React, Vite | local TypeScript dataset sourced from REST Countries | `example/node/countries-react/.sikula/config.yaml` |
 | `example/rust/countries/` | Rust, Ratatui | local JSON file | `example/rust/countries/.sikula/config.yaml` |
 
 Each example ships with ready-to-run task files. The Android and iOS tasks share the same specifications — the same task description drives both platforms; Sikula's agents handle the platform-specific implementation:
@@ -333,6 +336,14 @@ The Rust CLI ships its own set of tasks suited to a local-data command-line tool
 | `.sikula/tasks/add-neighbours.md` | Shows neighbouring countries for a given country |
 
 The Rust example also ships with ready-to-use `extra_rules` files in `example/rust/countries/.sikula/`. They are commented out in the config by default — uncomment the `reviewer`, `security_reviewer`, `test_writer`, and `planner` blocks in `example/rust/countries/.sikula/config.yaml` to activate them and see project-specific rules in action.
+
+The Node/React example ships a TypeScript web UI with Vitest and React Testing Library already configured:
+
+| Task file | What it does |
+|---|---|
+| `.sikula/tasks/add-search-by-name.md` | Adds a country name search control |
+| `.sikula/tasks/add-country-detail-view.md` | Adds a country detail view with browser and in-app back navigation |
+| `.sikula/tasks/format-population.md` | Formats the population number with B/M/K suffixes |
 
 The JVM examples ship the same Spring Boot REST API and the same task set in both build systems. Use the Gradle or Maven variant depending on the backend stack you want to test:
 
@@ -485,7 +496,7 @@ CLI values layer on top of `agents:` overrides in the project YAML.
 | Section | Key | Default | Description |
 |---|---|---|---|
 | `project` | `root_path` | `.` | Project root; `"."` (the default) resolves to the directory containing `.sikula/config.yaml`; use an absolute path only when the config lives outside the project tree |
-| `project` | `build_tool` | `"gradle-android"` | BuildTool selection: `"gradle-android"` (Android/Gradle), `"gradle-jvm"` (JVM backend/Gradle), `"maven"` (Maven), `"python"` (PythonTool), `"cargo"` (CargoTool), or `"xcodebuild"` (XcodeTool) |
+| `project` | `build_tool` | `"gradle-android"` | BuildTool selection: `"gradle-android"` (Android/Gradle), `"gradle-jvm"` (JVM backend/Gradle), `"maven"` (Maven), `"node"` (NodeTool for TypeScript/JavaScript), `"python"` (PythonTool), `"cargo"` (CargoTool), or `"xcodebuild"` (XcodeTool) |
 | `project` | `platform` | — | Target platform (e.g. `Android`, `iOS`); injected into agent prompts |
 | `project` | `language` | — | Tech stack language (e.g. `Kotlin`, `Python`); injected into agent prompts |
 | `project` | `ui` | — | UI framework (e.g. `Jetpack Compose`); injected into agent prompts |
@@ -860,7 +871,7 @@ contracts are auditable in task state.
 | Prompt persistence — full assembled prompts stored in state before each LLM call: `state.analyst_prompt`, `state.planner_prompt`, `state.implementation_prompt`; reviewer, security reviewer, and test writer prompts are stored per-cycle in their respective records; enables post-run audit of agent behaviour even if guidelines or `extra_rules` files change after the run; review/redact state JSON before sharing because it may contain source excerpts or other sensitive content | ✓ |
 | Sandbox — separate write whitelists for production (`allowed_write_paths`) and test (`allowed_test_write_paths`) code | ✓ |
 | Build sync (`BuildTool.sync()`) before first build | ✓ |
-| Compile check (`BuildTool.compile_check()`) — task configurable via `build.compile_task` | ✓ |
+| Compile check (`BuildTool.compile_check()`) — task configurable via platform-specific `build.compile_task` or `build.compile_command` | ✓ |
 | Build, sync, and test timeouts configurable per project via `build.sync_timeout` / `build.compile_timeout` / `build.test_timeout` | ✓ |
 | Re-sync when fixer changes build-config files (`BuildTool.is_build_config_file()`) | ✓ |
 | Automatic build/fix loop with `sandbox.max_iterations` applied per active build/fix loop | ✓ |
@@ -1053,8 +1064,8 @@ The orchestrator loop is platform-agnostic — all platform-specific logic is is
 `BuildTool` subclasses (`tools/base_tool.py`) and `.sikula/config.yaml` project configs.
 The build-loop methods (`generate_sources`, `sync`, `compile_check`, `run_tests`, `run_check`,
 `is_build_config_file`) and the conservative mixed-file audit hook (`is_test_only_change`) are
-defined on `BuildTool`; `AndroidGradleTool`, `JvmGradleTool`, `MavenTool`, `PythonTool`,
-`CargoTool`, and `XcodeTool` are the current implementations.
+defined on `BuildTool`; `AndroidGradleTool`, `JvmGradleTool`, `MavenTool`, `NodeTool`,
+`PythonTool`, `CargoTool`, and `XcodeTool` are the current implementations.
 
 | Platform | New file |
 |---|---|
@@ -1145,6 +1156,7 @@ Use coverage to check new or changed code where meaningful. Coverage is useful f
 | `tools/gradle_android_tool.py` | `AndroidGradleTool`: task configuration, `generate_sources` with presync clean, sync, compile, test |
 | `tools/gradle_jvm_tool.py` | `JvmGradleTool`: configurable tasks (classes/test), presync clean, inheritance from `GradleBaseTool` |
 | `tools/maven_tool.py` | `MavenTool`: `./mvnw` auto-detection, command construction, presync clean, `is_build_config_file` |
+| `tools/node_tool.py` | `NodeTool`: package-manager detection, package-script defaults, sync/compile/test/check command dispatch, `is_build_config_file` |
 | `tools/cargo_tool.py` | subprocess dispatch, timeout, task configuration, `is_build_config_file`, run_check |
 | `tools/xcode_tool.py` | subprocess dispatch, project args, compile/test task names, run_check, error extraction, `is_build_config_file` |
 | `tools/git_tool.py` | subprocess dispatch, diff/status/checkout/add/commit/worktree operations |

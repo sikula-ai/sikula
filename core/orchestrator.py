@@ -58,6 +58,7 @@ from tools.file_tool import FileTool
 from tools.git_tool import GitTool
 from tools.cargo_tool import CargoTool
 from tools.gradle_android_tool import AndroidGradleTool
+from tools.node_tool import NodeTool
 from tools.python_tool import PythonTool
 
 log = logging.getLogger(__name__)
@@ -133,6 +134,19 @@ def _build_tool(sandbox: Sandbox, root: Path, project_config: dict) -> BuildTool
             compile_command=build.get("compile_command", "cargo check"),
             test_command=build.get("test_command", "cargo test"),
             timeout=build.get("timeout", 600),
+        )
+    if platform == "node":
+        timeout = build.get("timeout")
+        return NodeTool(
+            sandbox,
+            root,
+            package_manager=build.get("package_manager"),
+            sync_command=build.get("sync_command"),
+            compile_command=build.get("compile_command"),
+            test_command=build.get("test_command"),
+            sync_timeout=build.get("sync_timeout", timeout or 600),
+            compile_timeout=build.get("compile_timeout", timeout or 600),
+            test_timeout=build.get("test_timeout", timeout or 600),
         )
     if platform == "xcodebuild":
         from tools.xcode_tool import XcodeTool

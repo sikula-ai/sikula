@@ -69,6 +69,37 @@ class TestScanBuildTool:
         result = scan(tmp_path)
         assert result.build_tool == "python"
 
+    def test_detects_node_from_package_json(self, tmp_path: Path):
+        (tmp_path / "package.json").write_text('{"scripts": {"build": "vite build", "test": "vitest run"}}')
+        result = scan(tmp_path)
+        assert result.build_tool == "node"
+        assert result.language == "JavaScript"
+        assert result.platform is None
+
+    def test_detects_node_typescript_from_tsconfig(self, tmp_path: Path):
+        (tmp_path / "package.json").write_text("{}")
+        (tmp_path / "tsconfig.json").write_text("{}")
+        result = scan(tmp_path)
+        assert result.build_tool == "node"
+        assert result.language == "TypeScript"
+
+    def test_python_takes_priority_over_node_when_both_present(self, tmp_path: Path):
+        (tmp_path / "pyproject.toml").write_text("")
+        (tmp_path / "package.json").write_text("{}")
+        result = scan(tmp_path)
+        assert result.build_tool == "python"
+        assert "python" in result.ambiguous_tools
+        assert "node" in result.ambiguous_tools
+
+    def test_xcode_takes_priority_over_node_when_both_present(self, tmp_path: Path):
+        (tmp_path / "MyApp.xcodeproj").mkdir()
+        (tmp_path / "package.json").write_text('{"scripts": {"build": "vite build"}}')
+        result = scan(tmp_path)
+        assert result.build_tool == "xcodebuild"
+        assert result.language == "Swift"
+        assert result.platform == "iOS"
+        assert result.ambiguous_tools == ["xcodebuild", "node"]
+
     def test_detects_xcode_from_xcodeproj(self, tmp_path: Path):
         (tmp_path / "MyApp.xcodeproj").mkdir()
         result = scan(tmp_path)
@@ -307,6 +338,39 @@ class TestScanWritePaths:
         result = scan(tmp_path)
         assert result.write_paths == ["src/"]
         assert result.test_write_paths == ["tests/"]
+
+    def test_node_detects_source_and_test_dirs(self, tmp_path: Path):
+        (tmp_path / "package.json").write_text("{}")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "components").mkdir()
+        (tmp_path / "tests").mkdir()
+        result = scan(tmp_path)
+        assert result.write_paths == ["src/", "components/"]
+        assert result.test_write_paths == ["tests/"]
+
+    def test_node_fallback_paths_when_no_dirs(self, tmp_path: Path):
+        (tmp_path / "package.json").write_text("{}")
+        result = scan(tmp_path)
+        assert result.write_paths == ["src/"]
+        assert result.test_write_paths == ["tests/"]
+
+    def test_node_records_package_manager_and_commands(self, tmp_path: Path):
+        (tmp_path / "pnpm-lock.yaml").write_text("")
+        (tmp_path / "package.json").write_text(
+            '{"scripts": {"typecheck": "tsc --noEmit", "test": "vitest run", "lint": "eslint ."}}'
+        )
+        result = scan(tmp_path)
+        assert result.package_manager == "pnpm"
+        assert result.node_sync_command == "pnpm install --frozen-lockfile"
+        assert result.node_compile_command == "pnpm typecheck"
+        assert result.node_test_command == "pnpm test"
+        assert result.node_checks == [{"name": "lint", "command": "pnpm lint", "timeout": 120}]
+
+    def test_node_sync_command_is_not_frozen_without_lockfile(self, tmp_path: Path):
+        (tmp_path / "package.json").write_text('{"packageManager": "pnpm@9.0.0"}')
+        result = scan(tmp_path)
+        assert result.package_manager == "pnpm"
+        assert result.node_sync_command == "pnpm install"
 
     def test_xcode_detects_source_dir_matching_project_name(self, tmp_path: Path):
         (tmp_path / "Countries.xcodeproj").mkdir()

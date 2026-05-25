@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from pathlib import Path
 
 from core.state import TaskState
 
@@ -45,6 +46,23 @@ _VALIDATION_BLOCK_HEADING_RE = re.compile(
 )
 _PACKAGE_SCRIPT_SHORTCUT_MANAGERS = {"npm", "pnpm", "yarn"}
 _PACKAGE_SCRIPT_SHORTCUTS = {"test"}
+_PACKAGE_RUN_SHORTHAND_MANAGERS = {"pnpm", "yarn"}
+_PACKAGE_RUN_SHORTHAND_SCRIPTS = {
+    "build",
+    "check",
+    "check-types",
+    "format",
+    "format-check",
+    "format:check",
+    "format:write",
+    "lint",
+    "prettier",
+    "prettier:check",
+    "prettier:write",
+    "test",
+    "type-check",
+    "typecheck",
+}
 _STANDALONE_VALIDATION_COMMANDS = {"pytest", "swiftlint"}
 _PYTHON_MODULE_ALIASES = {"pytest", "ruff"}
 
@@ -169,6 +187,8 @@ def _package_script_signature(manager: str, tokens: list[str]) -> tuple[str, ...
     if subcommand == "run":
         script = next((token for token in tokens[2:] if not token.startswith("-")), "")
         return (manager, "run", script)
+    if manager in _PACKAGE_RUN_SHORTHAND_MANAGERS and subcommand in _PACKAGE_RUN_SHORTHAND_SCRIPTS:
+        return (manager, "run", subcommand)
     if manager in _PACKAGE_SCRIPT_SHORTCUT_MANAGERS and subcommand in _PACKAGE_SCRIPT_SHORTCUTS:
         return (manager, "run", subcommand)
     return (manager, subcommand)
@@ -259,6 +279,12 @@ def _exact_command_key(command: str) -> tuple[str, ...]:
             tokens[0] = "gradle"
         elif executable in {"mvnw", "mvn"}:
             tokens[0] = "mvn"
+        elif (
+            executable in _PACKAGE_RUN_SHORTHAND_MANAGERS
+            and len(tokens) >= 2
+            and tokens[1] in _PACKAGE_RUN_SHORTHAND_SCRIPTS
+        ):
+            tokens[1:1] = ["run"]
         elif executable in _PACKAGE_SCRIPT_SHORTCUT_MANAGERS and len(tokens) >= 2:
             if tokens[1] in _PACKAGE_SCRIPT_SHORTCUTS:
                 tokens[1:2] = ["run", tokens[1]]
@@ -314,6 +340,28 @@ def pipeline_flags(project_config: dict, state: TaskState) -> dict[str, bool]:
     }
 
 
+def _project_root(project_config: dict) -> Path | None:
+    root_path = project_config.get("project", {}).get("root_path")
+    if not root_path:
+        return None
+    return Path(str(root_path))
+
+
+def _node_package_context(project_config: dict) -> tuple[Path, str, dict[str, str]] | None:
+    root = _project_root(project_config)
+    if root is None:
+        return None
+    build = project_config.get("build", {})
+    configured_package_manager = build.get("package_manager")
+    package_manager = str(configured_package_manager) if configured_package_manager else None
+
+    from tools.node_tool import detect_node_package_manager, read_node_package_scripts
+
+    detected_package_manager = detect_node_package_manager(root, package_manager)
+    scripts = read_node_package_scripts(root)
+    return root, detected_package_manager, scripts
+
+
 def _default_compile_command(project_config: dict) -> str | None:
     build_tool = project_config.get("project", {}).get("build_tool", "gradle-android")
     build = project_config.get("build", {})
@@ -321,6 +369,23 @@ def _default_compile_command(project_config: dict) -> str | None:
         return str(build.get("compile_command") or "cargo check")
     if build_tool == "python":
         return str(build.get("compile_command") or "ruff check .")
+    if build_tool == "node":
+        if build.get("compile_command"):
+            return str(build["compile_command"])
+        node_context = _node_package_context(project_config)
+        if node_context:
+            from tools.node_tool import default_node_compile_command
+
+            root, package_manager, scripts = node_context
+            return default_node_compile_command(root, package_manager, scripts)
+        package_manager = str(build.get("package_manager") or "npm")
+        if package_manager == "npm":
+            default = "npm run build"
+        elif package_manager == "bun":
+            default = "bun run build"
+        else:
+            default = f"{package_manager} build"
+        return default
     if build_tool == "maven":
         return str(build.get("compile_command") or "mvn compile")
     if build_tool == "gradle-jvm":
@@ -337,6 +402,18 @@ def _default_test_command(project_config: dict) -> str | None:
         return str(build.get("test_command") or "cargo test")
     if build_tool == "python":
         return str(build.get("test_command") or "pytest")
+    if build_tool == "node":
+        if build.get("test_command"):
+            return str(build["test_command"])
+        node_context = _node_package_context(project_config)
+        if node_context:
+            from tools.node_tool import default_node_test_command
+
+            _, package_manager, scripts = node_context
+            return default_node_test_command(package_manager, scripts)
+        package_manager = str(build.get("package_manager") or "npm")
+        default = "bun run test" if package_manager == "bun" else f"{package_manager} test"
+        return default
     if build_tool == "maven":
         return str(build.get("test_command") or "mvn test")
     if build_tool == "gradle-jvm":
