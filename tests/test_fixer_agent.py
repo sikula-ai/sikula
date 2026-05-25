@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 from agents.base_agent import AGENT_SECURITY_PREFIX
 from agents.fixer_agent import (
     FixerAgent,
+    _changed_text_contents_after,
+    _changed_text_contents_before,
     _errors_section,
+    _git_dirty_text_snapshot,
     _guidelines_files,
     _has_valid_production_test_failure_triage,
     _tech_stack,
@@ -37,6 +43,11 @@ def _make_agent(llm: StubLLMClient, file_tool=None, project_config: dict | None 
 class _FakeBuildTool:
     def is_build_config_file(self, path: str) -> bool:
         return path.endswith((".gradle", ".gradle.kts", "pyproject.toml"))
+
+
+class _FakeMixedSourceBuildTool(_FakeBuildTool):
+    def is_test_only_change(self, path: str, before: str | None, after: str | None) -> bool:
+        return path == "src/lib.rs" and before == "before" and after == "after"
 
 
 # ---------------------------------------------------------------------------
@@ -504,8 +515,55 @@ class TestTestFailureProductionWrites:
             sandbox,
         ) == ["src/latest/Login.kt", "src/main/kotlin/Latest.kt"]
 
+    def test_platform_test_only_change_allows_mixed_source_file(self):
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert (
+            _test_failure_production_writes(
+                ["src/lib.rs"],
+                sandbox,
+                _FakeMixedSourceBuildTool(),
+                {"src/lib.rs": "before"},
+                {"src/lib.rs": "after"},
+            )
+            == []
+        )
+
+    def test_platform_hook_does_not_override_build_config_files(self):
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert _test_failure_production_writes(
+            ["pyproject.toml"],
+            sandbox,
+            _FakeMixedSourceBuildTool(),
+            {"pyproject.toml": "before"},
+            {"pyproject.toml": "after"},
+        ) == ["pyproject.toml"]
+
     def test_no_test_paths_treats_all_changed_files_as_production(self):
         assert _test_failure_production_writes(["src/Login.kt"], {}) == ["src/Login.kt"]
+
+
+class TestFixerIncrementalContentSnapshots:
+    def test_before_contents_use_pre_fixer_dirty_worktree_state(self, tmp_project: Path):
+        path = tmp_project / "src" / "lib.rs"
+        path.write_text("pub fn value() -> i32 { 1 }\n")
+        subprocess.run(["git", "add", "."], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add rust source"],
+            cwd=tmp_project,
+            check=True,
+            capture_output=True,
+        )
+
+        path.write_text("pub fn value() -> i32 { 2 }\n")
+        dirty_before = _git_dirty_text_snapshot(tmp_project)
+        path.write_text("pub fn value() -> i32 { 2 }\n#[cfg(test)]\nmod tests {}\n")
+
+        assert _changed_text_contents_before(tmp_project, ["src/lib.rs"], dirty_before) == {
+            "src/lib.rs": "pub fn value() -> i32 { 2 }\n"
+        }
+        assert _changed_text_contents_after(tmp_project, ["src/lib.rs"]) == {
+            "src/lib.rs": "pub fn value() -> i32 { 2 }\n#[cfg(test)]\nmod tests {}\n"
+        }
 
 
 class TestProductionTestFailureTriage:

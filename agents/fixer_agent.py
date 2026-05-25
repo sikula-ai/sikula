@@ -9,7 +9,9 @@ limited to errors the build system or test runner reports.
 from __future__ import annotations
 
 import posixpath
+import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from agents.base_agent import (
@@ -202,16 +204,39 @@ def _is_build_config_file(build_tool: Any, path: str) -> bool:
         return False
 
 
-def _test_failure_production_writes(changed: list[str], sandbox: dict, build_tool: Any = None) -> list[str]:
+def _is_platform_test_only_change(
+    build_tool: Any,
+    path: str,
+    before_contents: dict[str, str | None] | None,
+    after_contents: dict[str, str | None] | None,
+) -> bool:
+    if not build_tool or not hasattr(build_tool, "is_test_only_change"):
+        return False
+    try:
+        return bool(
+            build_tool.is_test_only_change(
+                path,
+                (before_contents or {}).get(path),
+                (after_contents or {}).get(path),
+            )
+        )
+    except Exception:
+        return False
+
+
+def _test_failure_production_writes(
+    changed: list[str],
+    sandbox: dict,
+    build_tool: Any = None,
+    before_contents: dict[str, str | None] | None = None,
+    after_contents: dict[str, str | None] | None = None,
+) -> list[str]:
     test_paths = sandbox.get("allowed_test_write_paths", [])
     if not test_paths:
         return list(changed)
     outside_test_paths = set(_paths_outside_allowed(changed, test_paths))
     production: list[str] = []
     for path in changed:
-        if path in outside_test_paths:
-            production.append(path)
-            continue
         if _is_under_specific_test_root(path, test_paths):
             continue
         if _looks_like_test_artifact(path):
@@ -219,8 +244,74 @@ def _test_failure_production_writes(changed: list[str], sandbox: dict, build_too
         if _is_build_config_file(build_tool, path):
             production.append(path)
             continue
+        if _is_platform_test_only_change(build_tool, path, before_contents, after_contents):
+            continue
+        if path in outside_test_paths:
+            production.append(path)
+            continue
         production.append(path)
     return production
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text()
+    except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError):
+        return None
+
+
+def _git_dirty_paths(cwd: Path) -> list[str]:
+    modified = subprocess.run(
+        ["git", "diff", "--name-only", "--relative", "HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    if modified.returncode != 0 and untracked.returncode != 0:
+        return []
+    paths: list[str] = []
+    for line in (modified.stdout + "\n" + untracked.stdout).splitlines():
+        path = line.strip()
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _git_dirty_text_snapshot(cwd: Path) -> dict[str, str | None]:
+    return {path: _read_text(cwd / path) for path in _git_dirty_paths(cwd)}
+
+
+def _git_head_text(cwd: Path, path: str) -> str | None:
+    result = subprocess.run(
+        ["git", "show", f"HEAD:{path}"],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _changed_text_contents_before(
+    cwd: Path,
+    changed: list[str],
+    dirty_before: dict[str, str | None],
+) -> dict[str, str | None]:
+    contents: dict[str, str | None] = {}
+    for path in changed:
+        contents[path] = dirty_before[path] if path in dirty_before else _git_head_text(cwd, path)
+    return contents
+
+
+def _changed_text_contents_after(cwd: Path, changed: list[str]) -> dict[str, str | None]:
+    return {path: _read_text(cwd / path) for path in changed}
 
 
 def _triage_field(output: str, field: str) -> str:
@@ -285,9 +376,15 @@ class FixerAgent(BaseAgent):
             "test": list(state.test_errors),
             "check": list(state.check_errors),
         }
+        agent_cwd = Path(file_tool._root)
+        dirty_before = (
+            _git_dirty_text_snapshot(agent_cwd)
+            if state.test_errors and not state.errors and not state.check_errors
+            else {}
+        )
 
         try:
-            changed, fixer_output = self.llm.run_agent(prompt, cwd=file_tool._root)
+            changed, fixer_output = self.llm.run_agent(prompt, cwd=agent_cwd)
         except RuntimeError as e:
             msg = str(e)
             state.record(self.name, "fix_failed", msg[:500])
@@ -319,7 +416,15 @@ class FixerAgent(BaseAgent):
         )
 
         if state.test_errors and not state.errors and not state.check_errors:
-            production_writes = _test_failure_production_writes(changed, sandbox, self.tools.get("build"))
+            before_contents = _changed_text_contents_before(agent_cwd, changed, dirty_before)
+            after_contents = _changed_text_contents_after(agent_cwd, changed)
+            production_writes = _test_failure_production_writes(
+                changed,
+                sandbox,
+                self.tools.get("build"),
+                before_contents,
+                after_contents,
+            )
             if production_writes and not _has_valid_production_test_failure_triage(fixer_output):
                 for p in changed:
                     if p not in state.files_changed:

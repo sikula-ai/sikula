@@ -173,3 +173,187 @@ class TestCargoToolIsBuildConfigFile:
     def test_rejects_partial_match(self):
         tool = _make_tool(Path("."))
         assert tool.is_build_config_file("not-Cargo.toml") is False
+
+
+class TestCargoToolIsTestOnlyChange:
+    def test_allows_changes_inside_existing_cfg_test_module(self):
+        tool = _make_tool(Path("."))
+        before = """\
+pub fn add_one(value: i32) -> i32 {
+    value + 1
+}
+
+pub fn borrowed<'a>(value: &'a str) -> &'a str {
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds_one() {
+        assert_eq!(add_one(1), 2);
+    }
+}
+"""
+        after = before.replace("assert_eq!(add_one(1), 2);", "assert_eq!(add_one(2), 3);")
+
+        assert tool.is_test_only_change("src/lib.rs", before, after) is True
+
+    def test_allows_insertions_inside_existing_cfg_test_module(self):
+        tool = _make_tool(Path("."))
+        before = """\
+pub fn add_one(value: i32) -> i32 {
+    value + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+}
+"""
+        after = before.replace(
+            "    use super::*;\n",
+            "    use super::*;\n\n    #[test]\n    fn smoke() {\n        assert_eq!(add_one(1), 2);\n    }\n",
+        )
+
+        assert tool.is_test_only_change("src/lib.rs", before, after) is True
+
+    def test_rejects_commented_cfg_test_marker_before_production_module(self):
+        tool = _make_tool(Path("."))
+        before = """\
+pub fn add_one(value: i32) -> i32 {
+    value + 1
+}
+
+// #[cfg(test)]
+mod tests {
+    pub fn helper() -> i32 {
+        add_one(1)
+    }
+}
+"""
+        after = before.replace("add_one(1)", "add_one(2)")
+
+        assert tool.is_test_only_change("src/lib.rs", before, after) is False
+
+    def test_rejects_string_cfg_test_marker_before_production_module(self):
+        tool = _make_tool(Path("."))
+        before = """\
+pub fn add_one(value: i32) -> i32 {
+    value + 1
+}
+
+const MARKER: &str = "#[cfg(test)]";
+mod tests {
+    pub fn helper() -> i32 {
+        add_one(1)
+    }
+}
+"""
+        after = before.replace("add_one(1)", "add_one(2)")
+
+        assert tool.is_test_only_change("src/lib.rs", before, after) is False
+
+    def test_rejects_block_commented_cfg_test_marker_before_production_module(self):
+        tool = _make_tool(Path("."))
+        before = """\
+pub fn add_one(value: i32) -> i32 {
+    value + 1
+}
+
+/* #[cfg(test)] */
+mod tests {
+    pub fn helper() -> i32 {
+        add_one(1)
+    }
+}
+"""
+        after = before.replace("add_one(1)", "add_one(2)")
+
+        assert tool.is_test_only_change("src/lib.rs", before, after) is False
+
+    def test_rejects_raw_string_cfg_test_marker_before_production_module(self):
+        tool = _make_tool(Path("."))
+        before = """\
+pub fn add_one(value: i32) -> i32 {
+    value + 1
+}
+
+const MARKER: &str = r#"#[cfg(test)]"#;
+mod tests {
+    pub fn helper() -> i32 {
+        add_one(1)
+    }
+}
+"""
+        after = before.replace("add_one(1)", "add_one(2)")
+
+        assert tool.is_test_only_change("src/lib.rs", before, after) is False
+
+    def test_rejects_production_changes_in_rust_source(self):
+        tool = _make_tool(Path("."))
+        before = """\
+pub fn add_one(value: i32) -> i32 {
+    value + 1
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn smoke() {
+        assert!(true);
+    }
+}
+"""
+        after = before.replace("value + 1", "value + 2")
+
+        assert tool.is_test_only_change("src/lib.rs", before, after) is False
+
+    def test_rejects_mixed_production_and_test_changes(self):
+        tool = _make_tool(Path("."))
+        before = """\
+pub fn add_one(value: i32) -> i32 {
+    value + 1
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn smoke() {
+        assert_eq!(1, 1);
+    }
+}
+"""
+        after = before.replace("value + 1", "value + 2").replace("assert_eq!(1, 1);", "assert_eq!(2, 2);")
+
+        assert tool.is_test_only_change("src/lib.rs", before, after) is False
+
+    def test_rejects_new_inline_test_module(self):
+        tool = _make_tool(Path("."))
+        before = """\
+pub fn add_one(value: i32) -> i32 {
+    value + 1
+}
+"""
+        after = (
+            before
+            + """\
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn smoke() {
+        assert_eq!(1, 1);
+    }
+}
+"""
+        )
+
+        assert tool.is_test_only_change("src/lib.rs", before, after) is False
+
+    def test_rejects_non_rust_paths(self):
+        tool = _make_tool(Path("."))
+
+        assert tool.is_test_only_change("src/lib.py", "assert 1 == 1\n", "assert 2 == 2\n") is False

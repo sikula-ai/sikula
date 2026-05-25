@@ -854,7 +854,7 @@ contracts are auditable in task state.
 | Test runner — `BuildTool.run_tests()` after each passing build (`run_tests: true`); failures fed to fixer | ✓ |
 | Quality checks — `BuildTool.run_check(name, task_config)` for each entry in `build.checks` after tests pass (`run_checks: true`); failures fed to fixer like build errors; check list is platform-agnostic via opaque `task_config` dict; each check has `name`, `command`, `timeout`, and optional `fix_command` (auto-run before fixer on deterministic formatters) | ✓ |
 | Fixer agent — runs LLM as autonomous agent with build/test/check errors + task context + `implementation_prompt`; reads guidelines | ✓ |
-| Fixer: test-aware constraint — build errors: test files off-limits; test failures only: production and test files allowed, with explicit production-vs-test triage and instructions to fix production when a failing test encodes the task/project contract; production writes from test-failure fixes require `production_defect` + `production_code` triage or the task fails for audit, including non-test artifacts under broad test write roots such as module build files; check errors (no build errors): production or test files allowed if explicitly named in the errors | ✓ |
+| Fixer: test-aware constraint — build errors: test files off-limits; test failures only: production and test files allowed, with explicit production-vs-test triage and instructions to fix production when a failing test encodes the task/project contract; production writes from test-failure fixes require `production_defect` + `production_code` triage or the task fails for audit, including non-test artifacts under broad test write roots such as module build files; mixed source/test files require an opt-in `BuildTool.is_test_only_change()` proof, currently used by Cargo for existing Rust `#[cfg(test)] mod tests` blocks; check errors (no build errors): production or test files allowed if explicitly named in the errors | ✓ |
 | Fixer: uses `allowed_write_paths` for build errors and combines `allowed_write_paths` + `allowed_test_write_paths` when fixing test failures or check errors (no build errors) | ✓ |
 | Structured observability records — `implement_cycle_records`, `review_cycle_records`, `security_review_cycle_records`, `test_write_records`, `testability_gaps`, `fix_cycle_records` capture full context (prompt, output, errors snapshot, files written, timestamp, and correlation keys such as `step`, `build_iteration`, `review_iteration`, and `security_review_iteration`) for every agent invocation across all iterations; `validation_cycle_records` captures presync/sync/build/test/check outcomes with timing and diagnostic error excerpts that preserve failure blocks from long tool output; terminal states include `final_summary`; never cleared; visible in `show <task-id>` | ✓ |
 | Prompt persistence — full assembled prompts stored in state before each LLM call: `state.analyst_prompt`, `state.planner_prompt`, `state.implementation_prompt`; reviewer, security reviewer, and test writer prompts are stored per-cycle in their respective records; enables post-run audit of agent behaviour even if guidelines or `extra_rules` files change after the run; review/redact state JSON before sharing because it may contain source excerpts or other sensitive content | ✓ |
@@ -1051,9 +1051,10 @@ not write generated OpenCode files into the project or the original checkout.
 
 The orchestrator loop is platform-agnostic — all platform-specific logic is isolated in
 `BuildTool` subclasses (`tools/base_tool.py`) and `.sikula/config.yaml` project configs.
-The six methods the loop calls (`generate_sources`, `sync`, `compile_check`, `run_tests`,
-`run_check`, `is_build_config_file`) are defined as an abstract interface; `AndroidGradleTool`,
-`JvmGradleTool`, `MavenTool`, `PythonTool`, `CargoTool`, and `XcodeTool` are the current implementations.
+The build-loop methods (`generate_sources`, `sync`, `compile_check`, `run_tests`, `run_check`,
+`is_build_config_file`) and the conservative mixed-file audit hook (`is_test_only_change`) are
+defined on `BuildTool`; `AndroidGradleTool`, `JvmGradleTool`, `MavenTool`, `PythonTool`,
+`CargoTool`, and `XcodeTool` are the current implementations.
 
 | Platform | New file |
 |---|---|
