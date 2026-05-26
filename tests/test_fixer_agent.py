@@ -728,6 +728,13 @@ class TestTestOriginValidationDetection:
             "//pkg/countries:country_filters",
         ]
 
+    def test_does_not_extract_namespace_scope_as_gradle_target(self):
+        errors = [
+            "error[E0425]: cannot find function `foo::test` in this scope",
+            "note: candidate is `project::module::tests`",
+        ]
+        assert _validation_error_targets(errors) == []
+
     def test_detects_test_origin_build_failure_from_test_path(self, tmp_project: Path):
         state = _make_state()
         state.errors = ["tests/countryFilters.test.ts(14,39): error TS2322"]
@@ -828,6 +835,12 @@ class TestTestOriginValidationDetection:
     def test_rejects_url_shaped_bazel_target(self, tmp_project: Path):
         state = _make_state()
         state.errors = ["See https://ci.example.com/tests:unitTest for logs"]
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_rejects_namespace_scope_named_test(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = ["error[E0425]: cannot find function `foo::test` in this scope"]
         sandbox = {"allowed_test_write_paths": ["tests/"]}
         assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
 

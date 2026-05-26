@@ -197,7 +197,7 @@ _VALIDATION_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 _BAZEL_TARGET_RE = re.compile(r"(?<![\w/.\-:])(?P<target>(?:@[A-Za-z0-9_.-]+)?//[A-Za-z0-9_./+-]*:[A-Za-z0-9_.+-]+)")
-_GRADLE_TARGET_RE = re.compile(r"(?<![\w/.-])(?P<target>:(?:[A-Za-z][A-Za-z0-9_.-]*:)*[A-Za-z][A-Za-z0-9_.-]*)")
+_GRADLE_TARGET_RE = re.compile(r"(?<![\w/.\-:])(?P<target>:(?:[A-Za-z][A-Za-z0-9_.-]*:)*[A-Za-z][A-Za-z0-9_.-]*)")
 _TEST_TARGET_MARKERS = (
     "acceptancetest",
     "acceptancetests",
