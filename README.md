@@ -156,33 +156,9 @@ Sikula runs the reviewer and security reviewer as independent agents — neither
 
 The build loop closes the other gap: code that doesn't compile or pass enabled tests and checks is not accepted as a successful result. The fixer iterates until it does, or the task fails explicitly so you know what to fix.
 
-Task descriptions often mention validation commands such as formatters, linters, tests,
+Task descriptions may still name validation commands such as formatters, linters, tests,
 or report generators. Sikula treats those as acceptance criteria for the configured
-pipeline, not as shell commands for agents to run manually. The reviewer sees the
-effective build/test/check commands from the Sikula config file (auto-discovered
-`.sikula/config.yaml` by default, or the file passed with `--config`). That configured
-validation pipeline is what Sikula can execute. For `sikula run`, validation command
-coverage is the preflight/reviewer check that task-described commands are represented by
-that pipeline.
-To make a command count as task-described validation, write it explicitly: in backticks,
-in a shell code fence, with a `$` prompt, or as a command list under a heading/prefix such
-as `Verification:` or `Run:`; Markdown blank separator lines after the heading are allowed.
-Bare tool names such as `cargo` or `npm` are not treated as validation commands.
-If a `sikula run` task command is not covered there, it is reported as a validation
-coverage gap so you can add the same command to the effective build/test/check config or
-adjust the task before rerunning. In `sikula review` modes, commands found in PR/review
-text are informational branch-verification context and do not preflight-abort review/fix.
-A generic command from the same tool family is not enough when the task specifies
-materially different flags, targets, scripts, packages, schemes, or paths.
-Gradle/Maven wrapper spelling for the same invocation (`./gradlew` vs `gradle`,
-`./mvnw` vs `mvn`) is treated as equivalent, as are Python module forms
-(`python -m pytest` vs `pytest`, `python -m ruff` vs `ruff`), the npm `test`
-shortcut (`npm test` vs `npm run test`), and pnpm/Yarn package-script shorthands
-for common validation scripts (`pnpm typecheck` vs `pnpm run typecheck`,
-`yarn lint` vs `yarn run lint`). Different tasks, scripts, goals, or flags are not.
-For run-task validation coverage gaps, Sikula does not ask the implementer to edit the
-pipeline config inside the current task, because the effective pipeline is loaded before
-the agent loop starts.
+validation pipeline, not as arbitrary shell commands for agents to run manually.
 
 ## When Sikula fits
 
@@ -225,7 +201,7 @@ Run from the project root — Sikula scans the codebase, detects the build tool,
 ```bash
 cd my-project/
 
-# Basic setup — detects build tool, language, platform, source paths
+# Basic setup — detects build tool, language, platform, package manager, source paths
 sikula init
 
 # With LLM-generated guidelines — reads the codebase and writes .sikula/guidelines.md
@@ -236,8 +212,11 @@ sikula init --guidelines
 ```
 
 `sikula init` auto-detects:
-- Build tool and language (Gradle/Kotlin, Maven/JVM, Cargo/Rust, xcodebuild/Swift, Python)
-- Xcode scheme (for iOS projects)
+- Build tool, language, and platform family (Gradle Android/JVM, Maven/JVM,
+  Cargo/Rust, Xcode/Swift, Python, Node.js/TypeScript/JavaScript)
+- Node package manager (npm, pnpm, yarn, Bun) plus default sync/build/test/check
+  commands from package scripts
+- Xcode scheme when a shared iOS scheme is present
 - Source and test directories for `allowed_write_paths` and `allowed_test_write_paths`
 - Existing guidance/docs to include as guidelines context (`AGENTS.md`, `guidelines.md`,
   `.github/copilot-instructions.md`, `ARCHITECTURE.md`, `README.md`, `CONTRIBUTING.md`, etc.)
@@ -451,11 +430,17 @@ run_build_per_step: false  # build/fix once after all steps (true = after each s
 
 Every `run_*` key (and `build.presync_clean`) can be overridden per-run without editing the YAML. Flag omitted = use config value.
 
-The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or the active build/fix loop reaches `sandbox.max_iterations`. In multi-step runs, `implement → review → security review → test write` runs for each planned step, then a final full-task gate runs before final build/fix validation. After a build/test/check failure, the fixer can iterate directly against deterministic validation; reviewer, security reviewer, and test writer rerun only after build/test/check are green again, and any changes they make are validated by another build/test/check pass. If build/check diagnostics reference only test files or recognized test targets, the fixer may repair malformed or stale tests, but production writes still require explicit `production_defect` + `production_code` triage. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags. Commands written in a task description are not executed directly from task text; put executable validation commands in the effective Sikula config file so the pipeline can run and audit the same flags, targets, scripts, packages, schemes, and paths.
+The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or the active build/fix loop reaches `sandbox.max_iterations`. In multi-step runs, `implement → review → security review → test write` runs for each planned step, then a final full-task gate runs before final build/fix validation. After a build/test/check failure, the fixer can iterate directly against deterministic validation; reviewer, security reviewer, and test writer rerun only after build/test/check are green again, and any changes they make are validated by another build/test/check pass. If build/check diagnostics reference only test files or recognized test targets, the fixer may repair malformed or stale tests, but production writes still require explicit `production_defect` + `production_code` triage. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags.
 
 `run_build_per_step: true` runs the build/fix loop after each individual step; multi-step runs still get the final full-task gate and final build/fix loop after all planned steps complete. Each per-step loop and the final full-task loop gets its own `max_iterations` budget, while `build_iterations` remains a total audit counter. Leave it `false` unless you explicitly want every step physically built; planner steps should still keep immediate compile dependencies together, such as resource or localization keys, route/API/command constants, service registrations, and interface implementations. Build-fix reviews during per-step builds stay scoped to that step; build-fix reviews in the final phase are scoped to the complete task, not the last planned step. See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed description of the planner and the step loop.
 
 The **sync** step calls `BuildTool.sync()` once before the first build and again whenever the fixer changes a build-config file. It resolves dependencies and generates any required sources. A sync failure is treated like a build failure — the error is passed to the fixer and the loop continues.
+
+**Validation command coverage:** task descriptions often mention validation commands such as formatters, linters, tests, or report generators. Sikula treats those as acceptance criteria for the configured pipeline, not as shell commands for agents to run manually. The reviewer sees the effective build/test/check commands from the Sikula config file (auto-discovered `.sikula/config.yaml` by default, or the file passed with `--config`). That configured validation pipeline is what Sikula can execute. For `sikula run`, validation command coverage is the preflight/reviewer check that task-described commands are represented by that pipeline.
+
+To make a command count as task-described validation, write it explicitly: in backticks, in a shell code fence, with a `$` prompt, or as a command list under a heading/prefix such as `Verification:` or `Run:`; Markdown blank separator lines after the heading are allowed. Bare tool names such as `cargo` or `npm` are not treated as validation commands. If a `sikula run` task command is not covered there, it is reported as a validation coverage gap so you can add the same command to the effective build/test/check config or adjust the task before rerunning. In `sikula review` modes, commands found in PR/review text are informational branch-verification context and do not preflight-abort review/fix.
+
+A generic command from the same tool family is not enough when the task specifies materially different flags, targets, scripts, packages, schemes, or paths. Gradle/Maven wrapper spelling for the same invocation (`./gradlew` vs `gradle`, `./mvnw` vs `mvn`) is treated as equivalent, as are Python module forms (`python -m pytest` vs `pytest`, `python -m ruff` vs `ruff`), the npm `test` shortcut (`npm test` vs `npm run test`), and pnpm/Yarn package-script shorthands for common validation scripts (`pnpm typecheck` vs `pnpm run typecheck`, `yarn lint` vs `yarn run lint`). Different tasks, scripts, goals, or flags are not. For run-task validation coverage gaps, Sikula does not ask the implementer to edit the pipeline config inside the current task, because the effective pipeline is loaded before the agent loop starts.
 
 **Isolation (default on):** each run creates a git worktree in `.sikula/worktrees/<task-id>/` (under the git root) and a branch `sikula/<task-stem>-<task-id>`. On success the changes are committed to that branch and the worktree is removed. On failure the worktree is preserved for inspection and resume. `.sikula/worktrees/` is added to `.git/info/exclude` automatically on the first run (local, not committed). Use `--no-isolate` to run directly in the project directory without creating a branch.
 
@@ -831,64 +816,110 @@ Existing configs without an `agents:` block are unaffected.
 
 ---
 
-## Capabilities (current state)
+## Capabilities
 
-This table includes both hard orchestration behaviour and prompt-enforced agent
-contracts. Runtime sandbox details are documented separately in
-[Sandbox — what agents are allowed to do](#9-sandbox--what-agents-are-allowed-to-do); prompt
-contracts are auditable in task state.
+This section summarizes what Sikula currently does. Detailed orchestration, state, and
+sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
+[Sandbox - what agents are allowed to do](#9-sandbox--what-agents-are-allowed-to-do).
 
-| Capability | Status |
-|---|---|
-| `sikula init` — scans project, auto-detects build tool / language / platform / source paths / Xcode scheme, generates `.sikula/config.yaml` and `.sikula/tasks/`; TODOs printed for anything that needs manual input; `--guidelines` generates `.sikula/guidelines.md` via LLM analysis of the codebase | ✓ |
-| Auto-discovery of `.sikula/config.yaml` — walk up from CWD; `--config` to override | ✓ |
-| Read task from a text file | ✓ |
-| Pre-analyze sync (`run_presync: true`) — runs `BuildTool.generate_sources()` before the analyst to ensure build-generated sources (OpenAPI DTOs, KSP output, …) exist in `build/`; failure is non-fatal | ✓ |
-| Analyst agent — runs as read-only agent (Read/grep/find tools); browses codebase, then generates implementation prompt with exact file paths | ✓ |
-| Analyst prompt requires reading each affected file in full before finalising the change list (not just grep hits) | ✓ |
-| Analyst prompt excludes test file changes — test changes are omitted from the implementation prompt and handled by the test writer | ✓ |
-| Analyst prompt requires platform-neutral structured input contracts for parser/validator/expression/DSL/config/schema/rule-engine tasks, including accepted inputs, materially different rejected input classes, expected result types, scope rules, and validation-vs-runtime failure phase | ✓ |
-| Guidelines context: analyst, reviewer, and security reviewer receive file content pre-loaded from `guidelines.context_files` (`guidelines.max_file_chars` controls per-file limit; truncated files include a marker instructing the agent to use Read tool for full content); implementer, fixer, and test writer receive filenames and read content via tools | ✓ |
-| Planner agent — triage + split (`run_planner: true`): for small/focused tasks outputs `SINGLE_PASS` and flow is unchanged; for larger tasks breaks the prompt into 2–N ordered steps; each step runs implement→review→security review→test phases, then a final full-task gate gives the finished branch one whole-task pass against the original task before final validation; build/fix always runs in the final phase when `run_build` is enabled, and can also run per step with `run_build_per_step` | ✓ |
-| Implementer agent — runs LLM as autonomous agent; navigates codebase with file tools, writes changes directly; changed files detected via git diff | ✓ |
-| Implementer, fixer, test writer: receive project guidelines filenames from `guidelines.context_files`; read content via tools | ✓ |
-| Implementer prompt requires transitive dead-code cleanup — symbols that become unreferenced in production code after the change should be removed; test-only references are ignored | ✓ |
-| Per-agent LLM config — each agent can use a different model/provider via `agents.<name>.llm:` in the project YAML | ✓ |
-| Per-agent project-specific rules (`extra_rules`) — plain Markdown file appended to the agent's system prompt under `## Project-specific rules` with explicit priority statement; supported for `reviewer`, `security_reviewer`, `test_writer`, `planner`; active in all modes that invoke the respective agent; path stored in `config_snapshot` | ✓ |
-| Reviewer agent — read-only review after implement, before build; checks completeness, logical correctness, semantic consistency, dead members, shared function scope, and structured input contracts; task description is sole scope authority — implementation prompt claims ("caller X intentionally affected") are verified against it; for shared functions greps callers independently and reads each out-of-scope caller file; in normal `sikula run`, test files are handled by the test writer/build loop and only production issues block approval, but weakened contract-bearing tests are evidence for re-checking the production contract; in multi-step `sikula run`, step reviews are current-step scoped but the final gate reviews the whole task; in `sikula review`, changed test files are reviewed as branch output; issues are fed back to implementer during the main review loop; test-writer changes in `review --fix` get one final validation pass | ✓ |
-| Review loop: enabled via `run_review`; iteration limit via `sandbox.max_review_iterations`; timeout aborts task | ✓ |
-| Security reviewer agent — read-only security review after the review phase (`run_security_review: true`; independent of `run_review`); blocking issues (hardcoded secrets, injection, missing auth, weak crypto, PII in logs, path traversal, disabled/missing TLS validation) feed back to implementer; warnings are recorded in `state.security_review_cycle_records` and do not block; reruns after fixer changes once build/test/check validation is green | ✓ |
-| Test writer agent — writes/updates unit tests after review/security phases complete (`run_test_writing: true`); receives the original task description to honor explicit testing requirements, scoped by `CURRENT STEP` during planned steps and by the complete task in the final multi-step gate; instructed to stay within `sandbox.allowed_test_write_paths` and avoid production code; prefers behaviour tests through public seams, treats source-file inspection as a last-resort fallback, records visible testability gaps when safe tests require missing project infrastructure, and requires structured input changes to have positive/negative contract matrices that preserve the rejected input class being tested | ✓ |
-| Test writer prompt requires existing test conventions (framework, assertions, naming), explicit null-path coverage, caller checks for modified functions, and parametric/data-driven tests when the project already uses them and the fit is natural | ✓ |
-| Test writer prompt target is configurable via `test_writer.coverage_target` (default: 90%) | ✓ |
-| Test writer agent reruns after fixer changes once build/test/check validation is green; any test-writer changes trigger another validation pass | ✓ |
-| Test runner — `BuildTool.run_tests()` after each passing build (`run_tests: true`); failures fed to fixer | ✓ |
-| Quality checks — `BuildTool.run_check(name, task_config)` for each entry in `build.checks` after tests pass (`run_checks: true`); failures fed to fixer like build errors; check list is platform-agnostic via opaque `task_config` dict; each check has `name`, `command`, `timeout`, and optional `fix_command` (auto-run before fixer on deterministic formatters) | ✓ |
-| Fixer agent — runs LLM as autonomous agent with build/test/check errors + task context + `implementation_prompt`; reads guidelines | ✓ |
-| Fixer: test-aware constraint — build errors: test files off-limits unless diagnostics reference only test files or recognized test targets; test failures and test-origin validation failures allow production and test files, with explicit production-vs-test triage and instructions to fix production when a failing test encodes the task/project contract; production writes from these fixes require `production_defect` + `production_code` triage or the task fails for audit, including non-test artifacts under broad test write roots such as module build files; mixed source/test files require an opt-in `BuildTool.is_test_only_change()` proof, currently used by Cargo for existing Rust `#[cfg(test)] mod tests` blocks; check errors (no build errors): production or test files allowed if explicitly named in the errors | ✓ |
-| Fixer: uses `allowed_write_paths` for build errors and combines `allowed_write_paths` + `allowed_test_write_paths` when fixing test failures, check errors without build errors, or build/check diagnostics that reference only test files or recognized test targets | ✓ |
-| Structured observability records — `implement_cycle_records`, `review_cycle_records`, `security_review_cycle_records`, `test_write_records`, `testability_gaps`, `fix_cycle_records` capture full context (prompt, output, errors snapshot, files written, timestamp, triage scope where applicable, and correlation keys such as `step`, `build_iteration`, `review_iteration`, and `security_review_iteration`) for every agent invocation across all iterations; `validation_cycle_records` captures presync/sync/build/test/check outcomes with timing and diagnostic error excerpts that preserve failure blocks from long tool output; terminal states include `final_summary`; never cleared; visible in `show <task-id>` | ✓ |
-| Prompt persistence — full assembled prompts stored in state before each LLM call: `state.analyst_prompt`, `state.planner_prompt`, `state.implementation_prompt`; reviewer, security reviewer, and test writer prompts are stored per-cycle in their respective records; enables post-run audit of agent behaviour even if guidelines or `extra_rules` files change after the run; review/redact state JSON before sharing because it may contain source excerpts or other sensitive content | ✓ |
-| Sandbox — separate write whitelists for production (`allowed_write_paths`) and test (`allowed_test_write_paths`) code | ✓ |
-| Build sync (`BuildTool.sync()`) before first build | ✓ |
-| Compile check (`BuildTool.compile_check()`) — task configurable via platform-specific `build.compile_task` or `build.compile_command` | ✓ |
-| Build, sync, and test timeouts configurable per project via `build.sync_timeout` / `build.compile_timeout` / `build.test_timeout` | ✓ |
-| Re-sync when fixer changes build-config files (`BuildTool.is_build_config_file()`) | ✓ |
-| Automatic build/fix loop with `sandbox.max_iterations` applied per active build/fix loop | ✓ |
-| Guard: implementer failure aborts before build loop (no false `done: true`) | ✓ |
-| Git worktree isolation — each run works in a dedicated branch (`sikula/<task-stem>-<task-id>`) and worktree; on success changes are auto-committed and worktree removed; on failure worktree preserved for resume; `.sikula/worktrees/` auto-added to `.git/info/exclude` (local, not committed); parallel runs never conflict; `--no-isolate` to skip | ✓ |
-| Standalone PR review (`sikula review`) — code + security review on an existing branch via `git diff base...branch` with an explicit PR/task description as scope; report-only (read-only, exits 0/1) or `--fix` to apply corrections and commit them to the branch; per-agent model/provider/timeout and `extra_rules` overrides supported in both modes | ✓ |
-| JSON state persistence (resumable tasks via `run --task-id`) | ✓ |
-| Config snapshot — effective run settings (project name, all `run_*` flags, `sandbox.*` write/read paths, `build.*`, per-agent model/provider/timeout, per-agent `extra_rules` path when configured) persisted in `state.config_snapshot` on first run; never overwritten on resume | ✓ |
-| CLI: `run`, `review`, `status`, `show`, `cleanup`, `delete` | ✓ |
-| CLI per-run phase overrides — `--flag` / `--no-flag` for every `run_*` key and `build.presync_clean`; no YAML edit needed | ✓ |
-| CLI per-agent LLM overrides — `--agent-model`, `--agent-provider`, `--agent-timeout` (repeatable, `agent=value` syntax); available for both `run` and `review` | ✓ |
-| LLM via CLI — Codex, Claude, Gemini, and OpenCode providers invoke a local CLI; authentication follows the selected provider's CLI and environment configuration | ✓ |
-| Retry on LLM failure — up to 4 attempts (30 s / 60 s / 120 s backoff); retry attempts are recorded in task history as `llm_retry`; `run_agent` skips retry when partial file changes are detected | ✓ |
-| Write-scope audit warnings — write-capable agents are prompted with an active write scope; after each agent call, detected files outside that scope are recorded in task history as `write_path_warning` | ✓ |
+### Project Setup
 
----
+- `sikula init` scans a project, detects the build tool, language, platform family,
+  source/test paths, Node package manager, package-script validation defaults, and shared
+  Xcode scheme when present.
+- Generated project files include `.sikula/config.yaml`, `.sikula/tasks/`, and optional
+  LLM-generated `.sikula/guidelines.md` via `sikula init --guidelines`.
+- `.sikula/config.yaml` is auto-discovered by walking up from the current directory; use
+  `--config` to point Sikula at a specific config file.
+- Every run snapshots the effective config, including phase flags, sandbox paths,
+  build settings, test-writer settings, per-agent model/provider/timeout, and
+  configured `extra_rules` paths.
 
+### Run Pipeline
+
+- `sikula run` reads a task file and executes the configured pipeline:
+  pre-sync, analysis, optional planning, implementation, review, security review, test
+  writing, sync/build/test/check validation, and fixer loops.
+- The analyst and reviewer are read-only. The implementer, fixer, and test writer write
+  through sandboxed file tools and their changes are detected with `git diff`.
+- Multi-step tasks run implement/review/security/test phases per step, then a final
+  full-task gate reviews the finished branch against the original task before final
+  validation.
+- `run_build_per_step: true` also runs build/fix after each planned step. The final
+  full-task build/fix loop still runs afterward.
+- Build/test/check failures feed the fixer until validation passes or the active
+  build/fix loop reaches `sandbox.max_iterations`.
+- After fixer changes, stale reviewer, security reviewer, and test-writer gates rerun only
+  once deterministic validation is green again. Any files changed by those gates trigger
+  another validation pass.
+
+### Review Pipeline
+
+- `sikula review` runs reviewer and security reviewer against an existing branch using
+  `git diff base...branch` and an explicit PR/task description as scope.
+- Report-only review is read-only and exits success/failure without modifying the branch.
+- `sikula review --fix` applies corrections through the normal orchestrator loop and
+  commits successful fixes back to the reviewed branch.
+- In review mode, changed test files are treated as branch output and reviewed for
+  correctness and relevance. Test-writer changes made during `review --fix` get one final
+  reviewer/security validation pass.
+- Security reviewer blocking issues feed back to the implementer; security warnings are
+  recorded for audit and do not block by themselves.
+
+### Validation
+
+- Built-in BuildTools cover Android/Gradle, JVM/Gradle, Maven, Node.js/TypeScript/JavaScript,
+  Python, Rust/Cargo, and Xcode/Swift.
+- Validation can include sync, compile/typecheck, tests, and configured quality checks.
+  Check entries support `name`, `command`, `timeout`, and optional deterministic
+  `fix_command`.
+- Task-described validation commands are matched against the effective configured
+  build/test/check pipeline. In `sikula run`, uncovered commands fail as validation
+  coverage gaps; in `sikula review`, PR/review commands are informational context.
+- Testability gaps reported by the test writer are visible in task state. The default
+  policy is `warn`; `test_writer.testability_gap_policy: fail` makes them blocking.
+
+### Safety And Scope
+
+- Reviewer and security reviewer agents stay read-only.
+- The sandbox has separate production and test write allowlists:
+  `sandbox.allowed_write_paths` and `sandbox.allowed_test_write_paths`.
+- Test-origin fixer triage protects production writes. Test failures and test-origin
+  validation failures require explicit production-vs-test classification; production
+  writes from those fixes require `production_defect` plus `production_code` triage.
+- Build/check diagnostics that reference only test files or recognized test targets may
+  allow test repair. Unknown, production, or mixed diagnostics fall back to normal
+  build/check scope.
+- Mixed source/test files require an opt-in `BuildTool.is_test_only_change()` proof. The
+  default is fail-closed; Cargo currently proves edits limited to an existing Rust
+  `#[cfg(test)] mod tests` block.
+- Write-scope audit warnings are recorded when a write-capable agent changes files outside
+  its active prompt scope.
+
+### State And Auditability
+
+- Task state persists prompts, LLM outputs, files written, validation records, retry
+  records, testability gaps, security-review records, final summaries, and relevant
+  transition metadata.
+- `sikula show <task-id>` exposes the saved audit trail. Review/redact state JSON before
+  sharing because it may contain source excerpts or sensitive project context.
+- `sikula run --task-id <id>` resumes interrupted `run` and `review --fix` tasks.
+  Report-only `sikula review` is intentionally not resumed.
+- Isolated runs use a dedicated git branch and worktree. Successful tasks are committed
+  and cleaned up; failed tasks preserve the worktree for inspection and resume.
+- `status`, `show`, `cleanup`, and `delete` provide task-state and worktree management.
+
+### Configuration
+
+- Each phase can be enabled or disabled through config or per-run `--flag` /
+  `--no-flag` overrides.
+- Each agent can use its own LLM provider/model/timeout via `agents.<name>.llm` or
+  `--agent-model`, `--agent-provider`, and `--agent-timeout`.
+- Supported local CLI providers are Codex, Claude, Gemini, and OpenCode.
+- Project-specific `extra_rules` files are supported for reviewer, security reviewer,
+  test writer, and planner agents.
+- LLM failures are retried up to four times with backoff. Retry attempts are recorded in
+  task history, and retries stop when partial file changes are detected.
 
 ---
 
