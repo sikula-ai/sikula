@@ -19,6 +19,7 @@ from agents.fixer_agent import (
     _test_constraint,
     _test_failure_production_writes,
     _validation_error_paths,
+    _validation_error_targets,
     _write_paths_for_state,
 )
 from tests.conftest import StubLLMClient
@@ -696,6 +697,18 @@ class TestTestOriginValidationDetection:
             "/tmp/project/CountriesTests/CountryRowTests.swift",
         ]
 
+    def test_extracts_platform_neutral_validation_targets(self):
+        errors = [
+            "ERROR: //pkg/countries:country_filters_test failed to build",
+            "> Task :feature:countries:testDebugUnitTest FAILED",
+            "ERROR: //pkg/countries:country_filters failed to build",
+        ]
+        assert _validation_error_targets(errors) == [
+            "//pkg/countries:country_filters_test",
+            ":feature:countries:testDebugUnitTest",
+            "//pkg/countries:country_filters",
+        ]
+
     def test_detects_test_origin_build_failure_from_test_path(self, tmp_project: Path):
         state = _make_state()
         state.errors = ["tests/countryFilters.test.ts(14,39): error TS2322"]
@@ -714,11 +727,57 @@ class TestTestOriginValidationDetection:
         sandbox = {"allowed_test_write_paths": ["CountriesTests/"]}
         assert _is_test_origin_validation_failure(state, sandbox, tmp_project)
 
+    def test_detects_test_origin_build_failure_from_bazel_test_target(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = ["ERROR: //pkg/countries:country_filters_test failed to build"]
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_detects_test_origin_build_failure_from_gradle_test_target(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = ["> Task :feature:countries:testDebugUnitTest FAILED"]
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_test_target_build_failure_uses_test_triage_scope(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["tests/countryFilters.test.ts"]
+        stub_llm.agent_output = (
+            "TEST FAILURE TRIAGE:\nclassification: malformed_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.errors = ["ERROR: //pkg/countries:country_filters_test failed to build"]
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "src/, tests/" in prompt
+        assert "test-origin validation failure" in prompt
+        assert state.fix_cycle_records[0]["triage_scope"] == "test_origin_validation"
+
     def test_rejects_mixed_test_and_production_validation_paths(self, tmp_project: Path):
         state = _make_state()
         state.errors = [
             "src/domain/countryFilters.ts:12: error TS2322\ntests/countryFilters.test.ts:8: note: from test"
         ]
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_rejects_mixed_test_and_production_validation_targets(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = [
+            "ERROR: //pkg/countries:country_filters_test failed because //pkg/countries:country_filters failed"
+        ]
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_rejects_production_validation_target(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = ["> Task :feature:countries:compileDebugKotlin FAILED"]
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_rejects_non_test_spec_target(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = ["ERROR: //api:openapi_spec failed to build"]
         sandbox = {"allowed_test_write_paths": ["tests/"]}
         assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
 

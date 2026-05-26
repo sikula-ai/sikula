@@ -831,7 +831,7 @@ test-writing loop.
 | Error type | `allowed_write_paths` used in prompt | Test files |
 |---|---|---|
 | Build errors (`state.errors` non-empty) | `sandbox.allowed_write_paths` (production dirs) | Off-limits |
-| Build/check errors whose diagnostic paths all point at test files or test targets | `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May modify production or test files with the same production-vs-test triage required for test failures. If diagnostics name production paths too, or name no paths at all, Sikula falls back to the normal build/check scope. |
+| Build/check errors whose diagnostic references all point at test files or recognized test targets | `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May modify production or test files with the same production-vs-test triage required for test failures. If diagnostics name production paths or targets too, or name no paths or recognized targets at all, Sikula falls back to the normal build/check scope. |
 | Test failures only (`state.test_errors` non-empty, `state.errors` and `state.check_errors` both empty) | `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May modify production or test files; must fix production when the failing test encodes the original task, implementation prompt, project guidelines, or a structured contract. If production files are changed, fixer output must explicitly classify the failure as `production_defect` and choose `production_code`; otherwise the task fails for audit. |
 | Check errors only (`state.check_errors` non-empty, `state.errors` empty) | `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May modify production or test files if explicitly named in the check errors |
 
@@ -850,9 +850,11 @@ Build, test, sync, and check error blobs are diagnostic excerpts, not plain tail
 preserves failure-marker blocks from long command output so the fixer still sees the concrete
 compiler diagnostic, failing test, assertion, panic, traceback, or tool error even when the
 build tool prints many lines after the failure.
-For test failures, and for build/check failures whose diagnostics point only at test files or
-test targets, the fixer is explicitly told to decide whether the failure is caused by
-production behaviour or by an incorrect/stale test. It must not delete, relax, or rewrite
+For test failures, and for build/check failures whose diagnostics reference only test files
+or recognized test targets, the fixer is explicitly told to decide whether the failure is
+caused by production behaviour or by an incorrect/stale test. Target-only diagnostics are
+matched conservatively: unknown, production, or mixed production/test references fall back to
+the normal build/check scope. The fixer must not delete, relax, or rewrite
 assertions just to make the run green. Its final response for these test-origin failures must
 begin with `TEST FAILURE TRIAGE`, classifying the failure as `production_defect`,
 `stale_test`, `malformed_test`, or `unclear`, naming the affected contract when present, and

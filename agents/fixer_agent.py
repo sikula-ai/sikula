@@ -192,6 +192,26 @@ _VALIDATION_PATH_RE = re.compile(
     + r")\b)",
     re.IGNORECASE,
 )
+_BAZEL_TARGET_RE = re.compile(r"(?<![\w/.-])(?P<target>(?:@[A-Za-z0-9_.-]+)?//[A-Za-z0-9_./+-]*:[A-Za-z0-9_.+-]+)")
+_GRADLE_TARGET_RE = re.compile(r"(?<![\w/.-])(?P<target>:(?:[A-Za-z][A-Za-z0-9_.-]*:)*[A-Za-z][A-Za-z0-9_.-]*)")
+_TEST_TARGET_MARKERS = (
+    "acceptancetest",
+    "acceptancetests",
+    "androidtest",
+    "androidtests",
+    "e2etest",
+    "e2etests",
+    "functionaltest",
+    "functionaltests",
+    "integrationtest",
+    "integrationtests",
+    "test",
+    "tests",
+    "unittest",
+    "unittests",
+    "uitest",
+    "uitests",
+)
 
 
 def _scope(state: TaskState) -> str:
@@ -290,9 +310,42 @@ def _validation_error_paths(errors: list[str], project_root: Path | None = None)
     return paths
 
 
+def _validation_error_targets(errors: list[str]) -> list[str]:
+    targets: list[str] = []
+    for error in errors:
+        for regex in (_BAZEL_TARGET_RE, _GRADLE_TARGET_RE):
+            for match in regex.finditer(error):
+                target = match.group("target")
+                if target and target not in targets:
+                    targets.append(target)
+    return targets
+
+
 def _is_test_origin_path(path: str, sandbox: dict) -> bool:
     return _is_under_specific_test_root(path, sandbox.get("allowed_test_write_paths", [])) or _looks_like_test_artifact(
         path
+    )
+
+
+def _target_words(target: str) -> list[str]:
+    words: list[str] = []
+    for part in re.split(r"[^A-Za-z0-9]+", target.lower()):
+        if not part:
+            continue
+        words.append(part)
+        words.extend(word for word in re.findall(r"[a-z]+|\d+", part) if word != part)
+    return words
+
+
+def _is_test_origin_target(target: str) -> bool:
+    words = _target_words(target)
+    if not words:
+        return False
+    return any(
+        word in _TEST_TARGET_MARKERS
+        or word.endswith(("test", "tests"))
+        or any(marker in word for marker in _TEST_TARGET_MARKERS if marker not in {"test", "tests"})
+        for word in words
     )
 
 
@@ -301,10 +354,14 @@ def _is_test_origin_validation_failure(state: TaskState, sandbox: dict, project_
         return False
     if not state.errors and not state.check_errors:
         return False
-    paths = _validation_error_paths([*state.errors, *state.check_errors], project_root)
-    if not paths:
+    validation_errors = [*state.errors, *state.check_errors]
+    paths = _validation_error_paths(validation_errors, project_root)
+    targets = _validation_error_targets(validation_errors)
+    if not paths and not targets:
         return False
-    return all(_is_test_origin_path(path, sandbox) for path in paths)
+    return all(_is_test_origin_path(path, sandbox) for path in paths) and all(
+        _is_test_origin_target(target) for target in targets
+    )
 
 
 def _uses_test_failure_triage(state: TaskState, sandbox: dict, project_root: Path | None = None) -> bool:
