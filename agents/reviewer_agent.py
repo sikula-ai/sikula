@@ -201,7 +201,7 @@ You may use test files only as evidence of a production-code correctness problem
 When a test file reveals a real problem, report the production-code issue, not a
 test-file issue.
 
-Exception: if changed test files or recent test-failure fixer records indicate that a
+Exception: if changed test files or recent test-related fixer records indicate that a
 contract-bearing test was deleted, relaxed, or changed to a different rejected input
 class, use that as evidence to re-check the production contract. If the original task,
 implementation prompt, project guidelines, or structured input contract still requires
@@ -358,17 +358,22 @@ def _validation_pipeline_context(project_config: dict, state: TaskState) -> str:
     return "\n".join(lines)
 
 
-def _test_failure_fix_history(state: TaskState) -> str:
+_TEST_RELATED_FIX_TRIAGE_SCOPES = {"test_failure", "test_origin_validation"}
+
+
+def _test_related_fix_history(state: TaskState) -> str:
     records: list[str] = []
     for idx, record in enumerate(state.fix_cycle_records, start=1):
         errors_before = record.get("errors_before") or {}
-        if not errors_before.get("test"):
+        triage_scope = record.get("triage_scope")
+        if not errors_before.get("test") and triage_scope not in _TEST_RELATED_FIX_TRIAGE_SCOPES:
             continue
         files = record.get("files_written") or []
         files_text = ", ".join(files) if files else "(none)"
         output = (record.get("fixer_output") or "").strip() or "(no fixer output captured)"
         output = _truncate(output, _MAX_FIXER_RECORD_CHARS)
-        records.append(f"[Test-failure fix {idx}]\nFiles written: {files_text}\nFixer output:\n{output}")
+        label = "Test-origin validation fix" if triage_scope == "test_origin_validation" else "Test-failure fix"
+        records.append(f"[{label} {idx}]\nFiles written: {files_text}\nFixer output:\n{output}")
 
     if not records:
         return ""
@@ -440,12 +445,13 @@ class ReviewerAgent(BaseAgent):
             files_list = "\n".join(f"  - {f}" for f in state.test_files_written)
             full_prompt += f"\n\n---\nFiles written by the test writer agent (not subject to implementer constraints):\n{files_list}"
 
-        test_failure_fix_history = _test_failure_fix_history(state)
-        if test_failure_fix_history:
+        test_related_fix_history = _test_related_fix_history(state)
+        if test_related_fix_history:
             full_prompt += (
-                "\n\n---\nRecent test-failure fixer records. Use this only to audit whether "
-                "a test failure fix weakened a task, guideline, or structured input contract:\n"
-                f"{test_failure_fix_history}"
+                "\n\n---\nRecent test-related fixer records. Use this only to audit whether "
+                "a test or test-origin validation fix weakened a task, guideline, or structured "
+                "input contract:\n"
+                f"{test_related_fix_history}"
             )
 
         reviewer_history = []
