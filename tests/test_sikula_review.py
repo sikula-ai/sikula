@@ -145,6 +145,15 @@ class TestCmdReviewReportOnlyState:
         assert "run_security_review" in state.config_snapshot
         assert state.config_snapshot["run_security_review"] is True
 
+    def test_config_snapshot_contains_progress_heartbeat_config(self, tmp_path: Path):
+        state = _run_review(tmp_path, reviewer_approved=True)
+        assert state.config_snapshot["progress"] == {
+            "heartbeat_interval_seconds": 60,
+        }
+
+    def test_heartbeat_interval_treats_zero_as_disabled(self):
+        assert _sikula._heartbeat_interval_seconds({"progress": {"heartbeat_interval_seconds": 0}}) == 0
+
     def test_report_only_review_records_llm_retry_history(self, tmp_path: Path):
         class RetryReportingReviewAgent:
             def __init__(self) -> None:
@@ -184,6 +193,27 @@ class TestCmdReviewReportOnlyState:
         assert retry["delay_s"] == 30
         assert retry["error_type"] == "RuntimeError"
         assert state.history[1]["action"] == "review"
+
+    def test_report_only_review_records_active_operation_while_agent_runs(self, tmp_path: Path):
+        class ObservingReviewAgent:
+            def run(self, state: TaskState) -> AgentResult:
+                loaded = store.load(state.task_id)
+                assert loaded is not None
+                assert loaded.active_operation is not None
+                assert loaded.active_operation["phase"] == "agent"
+                assert loaded.active_operation["agent"] == "reviewer"
+                state.review_approved = True
+                state.record("reviewer", "review", "approved")
+                return AgentResult(success=True, message="approved")
+
+        state = TaskState(task_id="t1", task_description="review branch")
+        store = JsonStateStore(tmp_path / "state")
+
+        _run_review_agent_with_retry_history(ObservingReviewAgent(), "reviewer", state, store, 60)
+
+        loaded = store.load(state.task_id)
+        assert loaded is not None
+        assert loaded.active_operation is None
 
     def test_config_snapshot_contains_sandbox_paths(self, tmp_path: Path):
         state = _run_review(tmp_path, reviewer_approved=True)

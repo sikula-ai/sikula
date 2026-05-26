@@ -432,6 +432,16 @@ Every `run_*` key (and `build.presync_clean`) can be overridden per-run without 
 
 The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or the active build/fix loop reaches `sandbox.max_iterations`. In multi-step runs, `implement → review → security review → test write` runs for each planned step, then a final full-task gate runs before final build/fix validation. After a build/test/check failure, the fixer can iterate directly against deterministic validation; reviewer, security reviewer, and test writer rerun only after build/test/check are green again, and any changes they make are validated by another build/test/check pass. If build/check diagnostics reference only test files or recognized test targets, the fixer may repair malformed or stale tests, but production writes still require explicit `production_defect` + `production_code` triage. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags.
 
+Long-running phases publish an active-operation heartbeat while they are in progress.
+By default Sikula logs a "Still running" line every 60 seconds and updates task state
+so `sikula status --verbose` and `sikula status --json` can show the current agent
+or validation phase during long CI runs. Configure this under `progress:`:
+
+```yaml
+progress:
+  heartbeat_interval_seconds: 60  # set to 0 to disable
+```
+
 `run_build_per_step: true` runs the build/fix loop after each individual step; multi-step runs still get the final full-task gate and final build/fix loop after all planned steps complete. Each per-step loop and the final full-task loop gets its own `max_iterations` budget, while `build_iterations` remains a total audit counter. Leave it `false` unless you explicitly want every step physically built; planner steps should still keep immediate compile dependencies together, such as resource or localization keys, route/API/command constants, service registrations, and interface implementations. Build-fix reviews during per-step builds stay scoped to that step; build-fix reviews in the final phase are scoped to the complete task, not the last planned step. See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed description of the planner and the step loop.
 
 The **sync** step calls `BuildTool.sync()` once before the first build and again whenever the fixer changes a build-config file. It resolves dependencies and generates any required sources. A sync failure is treated like a build failure — the error is passed to the fixer and the loop continues.
@@ -493,6 +503,7 @@ CLI values layer on top of `agents:` overrides in the project YAML.
 | `test_writer` | `coverage_target` | `90` | Minimum branch+line coverage % for new/changed code |
 | `test_writer` | `testability_gap_policy` | `warn` | What to do when the test writer reports behaviour that cannot be safely tested with available seams/infra: `warn` records a visible audit warning; `fail` fails the task |
 | `test_writer` | `extra_rules` | — | Path to a Markdown file appended to the test writer's prompt. Use for project-specific testing conventions: required test doubles, naming patterns, parametric table rules. |
+| `progress` | `heartbeat_interval_seconds` | `60` | Seconds between heartbeat updates; `0` disables the heartbeat |
 | `guidelines` | `context_files` | `[]` | Files loaded as guidelines context into agent prompts (relative to project root); used by analyst, implementer, fixer, test writer, reviewer, and security reviewer |
 | `guidelines` | `max_file_chars` | — | Max characters read from each guidelines file |
 
@@ -634,7 +645,7 @@ sikula review \
 
 ```bash
 # List all tasks (sorted oldest → newest)
-# STATUS: DONE, FAILED, CLEANED, INTERRUPTED, or the current phase
+# STATUS: DONE, FAILED, CLEANED, INTERRUPTED, or the current phase/active heartbeat
 # STEP shows current planner step; BUILD shows build/fix iterations
 sikula status
 
@@ -669,7 +680,7 @@ Use `sikula run --task-id <task-id>` to resume the current task instead.
 `cleanup --force` and `delete --force` must be run from outside the worktree they
 would remove.
 
-The `config_snapshot` field in the state JSON records every effective setting used for the run: `project` name, all `run_*` flags (including `run_checks`), `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `sandbox.*` paths (`allowed_write_paths`, `allowed_test_write_paths`, `allowed_read_paths`), `build.*` settings (presync task, compile task, timeouts, `checks` list), and the resolved `provider`/`model`/`agent_timeout` for each agent. If `extra_rules` is configured for an agent, its path is also captured in the snapshot. It is written once at the start of the first run and never overwritten on resume, so it always reflects the original run's configuration.
+The `config_snapshot` field in the state JSON records every effective setting used for the run: `project` name, all `run_*` flags (including `run_checks`), `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.*` paths (`allowed_write_paths`, `allowed_test_write_paths`, `allowed_read_paths`), `build.*` settings (presync task, compile task, timeouts, `checks` list), and the resolved `provider`/`model`/`agent_timeout` for each agent. If `extra_rules` is configured for an agent, its path is also captured in the snapshot. It is written once at the start of the first run and never overwritten on resume, so it always reflects the original run's configuration.
 
 Terminal task state also records `finished_at`, `result_commit` when Sikula creates a commit, and final `test_status` / `check_status` values (`success`, `failed`, or `skipped`) for audit and debugging.
 

@@ -190,6 +190,7 @@ class TaskState:
     history: list[dict] = field(default_factory=list)
     runtime_metadata: dict = field(default_factory=dict)
     final_summary: dict = field(default_factory=dict)
+    active_operation: Optional[dict] = None
     done: bool = False
     failed: bool = False
     finished_at: Optional[str] = None
@@ -276,6 +277,45 @@ class TaskState:
             entry["error_excerpt"] = error_excerpt
         self.validation_cycle_records.append(entry)
 
+    def start_active_operation(
+        self,
+        phase: str,
+        agent: str | None = None,
+        scope: str | None = None,
+        message: str | None = None,
+        heartbeat_interval_seconds: int | None = None,
+    ) -> None:
+        timestamp = _now()
+        entry: dict = {
+            "phase": phase,
+            "started_at": timestamp,
+            "last_heartbeat_at": timestamp,
+            "heartbeat_count": 0,
+        }
+        if agent:
+            entry["agent"] = agent
+        if scope:
+            entry["scope"] = scope
+        if message:
+            entry["message"] = message
+        if heartbeat_interval_seconds is not None:
+            entry["heartbeat_interval_seconds"] = heartbeat_interval_seconds
+        self.active_operation = entry
+
+    def heartbeat_active_operation(self, message: str | None = None) -> dict | None:
+        if not self.active_operation:
+            return None
+        current = dict(self.active_operation)
+        current["last_heartbeat_at"] = _now()
+        current["heartbeat_count"] = int(current.get("heartbeat_count", 0)) + 1
+        if message:
+            current["message"] = message
+        self.active_operation = current
+        return current
+
+    def clear_active_operation(self) -> None:
+        self.active_operation = None
+
 
 # ---------------------------------------------------------------------------
 # Abstract store
@@ -295,6 +335,9 @@ class StateStore:
     def delete(self, task_id: str) -> None:
         raise NotImplementedError
 
+    def update_active_operation(self, task_id: str, active_operation: dict | None) -> None:
+        raise NotImplementedError
+
     def create(self, task_description: str) -> TaskState:
         task_id = uuid.uuid4().hex
         state = TaskState(task_id=task_id, task_description=task_description)
@@ -309,7 +352,10 @@ class StateStore:
 
 
 class JsonStateStore(StateStore):
-    """Stores each task as a <task_id>.json file. Concurrent access to different tasks is safe; running the same task_id twice concurrently is not."""
+    """Stores each task as a <task_id>.json file.
+
+    Concurrent access to different tasks is safe; running the same task_id twice concurrently is not.
+    """
 
     def __init__(self, state_dir: Path) -> None:
         self._dir = Path(state_dir)
@@ -365,3 +411,12 @@ class JsonStateStore(StateStore):
 
     def delete(self, task_id: str) -> None:
         self._path(task_id).unlink(missing_ok=True)
+
+    def update_active_operation(self, task_id: str, active_operation: dict | None) -> None:
+        path = self._path(task_id)
+        if not path.exists():
+            return
+        data = json.loads(path.read_text())
+        data["active_operation"] = active_operation
+        data["updated_at"] = _now()
+        path.write_text(json.dumps(data, indent=2))

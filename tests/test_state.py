@@ -259,6 +259,34 @@ class TestJsonStateStore:
         store.save(state)
         assert state.updated_at >= original_updated
 
+    def test_active_operation_roundtrip_and_update(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="active1", task_description="active task")
+        state.start_active_operation("agent", agent="reviewer", message="Running reviewer")
+        store.save(state)
+
+        loaded = store.load("active1")
+
+        assert loaded is not None
+        assert loaded.active_operation is not None
+        assert loaded.active_operation["phase"] == "agent"
+        assert loaded.active_operation["agent"] == "reviewer"
+
+        state.heartbeat_active_operation("Still reviewing")
+        store.update_active_operation(state.task_id, state.active_operation)
+        loaded = store.load("active1")
+
+        assert loaded is not None
+        assert loaded.active_operation is not None
+        assert loaded.active_operation["heartbeat_count"] == 1
+        assert loaded.active_operation["message"] == "Still reviewing"
+
+        store.update_active_operation(state.task_id, None)
+        loaded = store.load("active1")
+
+        assert loaded is not None
+        assert loaded.active_operation is None
+
     def test_list_tasks_returns_sorted(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
         for tid in ["ccc", "aaa", "bbb"]:

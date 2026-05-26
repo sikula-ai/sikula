@@ -48,6 +48,10 @@ sandbox:
 tasks:
   state_dir: .sikula/state/
 
+progress:
+  # Set to 0 to disable progress heartbeats.
+  heartbeat_interval_seconds: 60
+
 # Default LLM settings — apply to all agents unless overridden under agents: below.
 # Built-in provider values: codex, claude, gemini, opencode.
 llm:

@@ -653,6 +653,7 @@ def build_orchestrator(cfg: dict, overrides: dict | None = None, state_store=Non
     max_iterations = int(sandbox.get("max_iterations", 10))
     max_review_iterations = int(sandbox.get("max_review_iterations", 3))
     max_security_review_iterations = int(sandbox.get("max_security_review_iterations", max_review_iterations))
+    heartbeat_interval_seconds = _heartbeat_interval_seconds(cfg)
     if state_store is None:
         state_store = JsonStateStore(_resolve_state_dir(cfg))
 
@@ -689,6 +690,9 @@ def build_orchestrator(cfg: dict, overrides: dict | None = None, state_store=Non
         "max_iterations": max_iterations,
         "max_review_iterations": max_review_iterations,
         "max_security_review_iterations": max_security_review_iterations,
+        "progress": {
+            "heartbeat_interval_seconds": heartbeat_interval_seconds,
+        },
         "sandbox": {
             "allowed_write_paths": sandbox.get("allowed_write_paths", []),
             "allowed_test_write_paths": sandbox.get("allowed_test_write_paths", []),
@@ -716,6 +720,7 @@ def build_orchestrator(cfg: dict, overrides: dict | None = None, state_store=Non
             run_security_review=run_security_review,
             run_planner=run_planner,
             run_checks=run_checks,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
             project_config=cfg,
         ),
         llm=default_llm,
@@ -1034,8 +1039,12 @@ def _status_label(state) -> str:
         return "FAILED"
     if state.worktree_branch and not state.worktree_path:
         return "CLEANED"
+    if state.active_operation and _active_operation_is_fresh(state.active_operation):
+        return _active_operation_label(state.active_operation)
     if state.pid and not _pid_running(state.pid):
         return "INTERRUPTED"
+    if state.active_operation:
+        return _active_operation_label(state.active_operation)
     final_scope = state.active_scope == "final_full_task"
     if state.build_status == "failed":
         return "final build failed" if final_scope else "build failed"
@@ -1054,6 +1063,51 @@ def _status_label(state) -> str:
     if state.presync_done:
         return "analyzing"
     return "starting"
+
+
+def _active_operation_label(active_operation: dict) -> str:
+    agent = active_operation.get("agent")
+    if agent:
+        return str(agent)
+    phase = str(active_operation.get("phase", "running"))
+    if active_operation.get("scope") == "final_full_task":
+        return f"final {phase}"
+    return phase
+
+
+def _active_operation_is_fresh(active_operation: dict) -> bool:
+    last_heartbeat_at = active_operation.get("last_heartbeat_at")
+    try:
+        from datetime import datetime, timezone
+
+        last_heartbeat = datetime.fromisoformat(last_heartbeat_at)
+        if last_heartbeat.tzinfo is None:
+            last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
+        age_s = max(0, int((datetime.now(timezone.utc) - last_heartbeat.astimezone(timezone.utc)).total_seconds()))
+    except (TypeError, ValueError):
+        return False
+    interval_s = int(active_operation.get("heartbeat_interval_seconds") or 60)
+    return age_s <= max(120, interval_s * 2 + 10)
+
+
+def _active_operation_elapsed(active_operation: dict | None) -> str | None:
+    if not active_operation:
+        return None
+    started_at = active_operation.get("started_at")
+    try:
+        from datetime import datetime, timezone
+
+        started = datetime.fromisoformat(started_at)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        elapsed = max(0, int((datetime.now(timezone.utc) - started.astimezone(timezone.utc)).total_seconds()))
+    except (TypeError, ValueError):
+        return None
+    if elapsed < 60:
+        return f"{elapsed}s"
+    if elapsed < 3600:
+        return f"{elapsed // 60}m"
+    return f"{elapsed // 3600}h {elapsed % 3600 // 60}m"
 
 
 def _status_step(state) -> str:
@@ -1092,6 +1146,8 @@ def _status_next_action(state, status: str) -> str:
         return f"sikula show {state.task_id}"
     if status == "INTERRUPTED":
         return f"sikula run --task-id {state.task_id}"
+    if state.active_operation and _active_operation_is_fresh(state.active_operation):
+        return "wait"
     return "wait" if state.pid and _pid_running(state.pid) else f"sikula run --task-id {state.task_id}"
 
 
@@ -1100,7 +1156,7 @@ def _status_row(state) -> dict:
     task_label = state.task_file
     if not task_label:
         task_label = state.task_description.splitlines()[0][:60] if state.task_description else "(no description)"
-    return {
+    row = {
         "id": state.task_id,
         "status": status,
         "step": _status_step(state),
@@ -1110,6 +1166,10 @@ def _status_row(state) -> dict:
         "task": task_label,
         "next_action": _status_next_action(state, status),
     }
+    if state.active_operation and (status != "INTERRUPTED" or _active_operation_is_fresh(state.active_operation)):
+        row["active_operation"] = state.active_operation
+        row["active_elapsed"] = _active_operation_elapsed(state.active_operation)
+    return row
 
 
 def _status_matches(row: dict, filters: set[str]) -> bool:
@@ -1154,6 +1214,11 @@ def cmd_status(cfg: dict, args: argparse.Namespace | None = None) -> None:
                 f"{row['id']:<32}  {row['status']:<16}  {row['step']:>5}  "
                 f"{build_col:>5}  {row['updated_human']:>8}  {row['task']}"
             )
+            if row.get("active_operation"):
+                active = row["active_operation"]
+                elapsed = row.get("active_elapsed") or "-"
+                message = active.get("message") or row["status"]
+                print(f"{'':<32}  active: {message} ({elapsed})")
             print(f"{'':<32}  next: {row['next_action']}")
         return
     print(f"{'ID':<32}  {'STATUS':<16}  {'STEP':>5}  {'BUILD':>5}  {'UPDATED':>8}  TASK")
@@ -1264,11 +1329,28 @@ def _print_review_summary(
     print(f"\nState ID: {state.task_id}  (sikula show {state.task_id})")
 
 
-def _run_review_agent_with_retry_history(agent, name: str, state, store):
+def _heartbeat_interval_seconds(cfg: dict) -> int:
+    progress_cfg = cfg.get("progress", {})
+    heartbeat_interval_seconds = int(progress_cfg.get("heartbeat_interval_seconds", 60))
+    if heartbeat_interval_seconds <= 0:
+        heartbeat_interval_seconds = 0
+    return heartbeat_interval_seconds
+
+
+def _run_review_agent_with_retry_history(agent, name: str, state, store, heartbeat_interval_seconds: int = 0):
+    from core.progress import ActiveOperationHeartbeat
     from core.retry_history import llm_retry_history
 
-    with llm_retry_history(agent, name, state, store):
-        return agent.run(state)
+    with ActiveOperationHeartbeat(
+        store,
+        state,
+        phase="agent",
+        agent=name,
+        message=f"Running {name}",
+        interval_s=heartbeat_interval_seconds,
+    ):
+        with llm_retry_history(agent, name, state, store):
+            return agent.run(state)
 
 
 def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
@@ -1422,6 +1504,7 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
     t_start = time.time()
     cli_security_review = getattr(args, "security_review", None)
     run_security_review = cfg.get("run_security_review", True) if cli_security_review is None else cli_security_review
+    heartbeat_interval_seconds = _heartbeat_interval_seconds(cfg)
 
     base_llm_cfg = cfg.get("llm", {})
 
@@ -1505,6 +1588,9 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
         state.config_snapshot = {
             "project": cfg.get("project", {}).get("name"),
             "run_security_review": run_security_review,
+            "progress": {
+                "heartbeat_interval_seconds": heartbeat_interval_seconds,
+            },
             "sandbox": {
                 "allowed_write_paths": sandbox_cfg.get("allowed_write_paths", []),
                 "allowed_test_write_paths": sandbox_cfg.get("allowed_test_write_paths", []),
@@ -1525,13 +1611,19 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
 
         log.info("--- Phase: review ---")
         reviewer = ReviewerAgent(llm=_llm("reviewer"), tools=tools, project_config=cfg)
-        _run_review_agent_with_retry_history(reviewer, "reviewer", state, store)
+        _run_review_agent_with_retry_history(reviewer, "reviewer", state, store, heartbeat_interval_seconds)
         store.save(state)
 
         if state.review_approved and run_security_review:
             log.info("--- Phase: security review ---")
             security_reviewer = SecurityReviewerAgent(llm=_llm("security_reviewer"), tools=tools, project_config=cfg)
-            _run_review_agent_with_retry_history(security_reviewer, "security_reviewer", state, store)
+            _run_review_agent_with_retry_history(
+                security_reviewer,
+                "security_reviewer",
+                state,
+                store,
+                heartbeat_interval_seconds,
+            )
             store.save(state)
 
         approved = state.review_approved and (state.security_approved if run_security_review else True)
@@ -1711,7 +1803,10 @@ build:
     platform_line = f"  platform: {platform}\n" if platform else ""
     language_line = f"  language: {language}\n" if language else "  language: TODO\n"
     if build_tool == "gradle-android":
-        ui_line = "  # TODO: set ui to your UI framework — e.g. 'Jetpack Compose (Material 3)' or 'XML layouts'\n  # ui: Jetpack Compose (Material 3)\n"
+        ui_line = (
+            "  # TODO: set ui to your UI framework — e.g. 'Jetpack Compose (Material 3)' "
+            "or 'XML layouts'\n  # ui: Jetpack Compose (Material 3)\n"
+        )
     elif build_tool == "xcodebuild":
         ui_line = "  # TODO: set ui to your UI framework — e.g. 'SwiftUI' or 'UIKit'\n  # ui: SwiftUI\n"
     else:
@@ -1738,9 +1833,13 @@ sandbox:
     - .
   max_iterations: 10
   max_review_iterations: 3
+  max_security_review_iterations: 3
 
 tasks:
   state_dir: .sikula/state/
+
+progress:
+  heartbeat_interval_seconds: 60
 
 llm:
   provider: {provider or "codex"}{provider_comment}

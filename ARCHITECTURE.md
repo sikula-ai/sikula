@@ -931,7 +931,7 @@ findings. Review and redact state files before sharing them outside your project
 | `task_description` | `str` | caller | Original plain-text task |
 | `schema_version` | `int` | `StateStore.create()` | State file schema version; used by `JsonStateStore.load()` to run migrations before constructing `TaskState`; current value is `SCHEMA_VERSION = 2` |
 | `task_file` | `str \| None` | `cmd_run()` in `sikula.py` | Basename of the task file (e.g. `add-login.md`); set on first run via `--task-file`; used by `status` for display; `None` for tasks created before this field was added or when resuming via `--task-id` only |
-| `config_snapshot` | `dict` | Orchestrator | Effective run configuration captured on first run (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. Visible in `show <task_id>`. |
+| `config_snapshot` | `dict` | Orchestrator | Effective run configuration captured on first run (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. Visible in `show <task_id>`. |
 | `analyst_prompt` | `str \| None` | AnalystAgent | Full assembled prompt sent to the analyst LLM (system + user sections, including inlined guidelines content); stored before the LLM call so it captures the exact input even on exception; enables post-run analysis of analyst behaviour |
 | `planner_prompt` | `str \| None` | PlannerAgent | Full assembled prompt sent to the planner LLM (system + user sections); stored before the LLM call; `None` when `run_planner: false` or planner not yet reached |
 | `implementation_prompt` | `str \| None` | AnalystAgent | Structured prompt fed to ImplementerAgent; the analyst's key output |
@@ -963,6 +963,7 @@ findings. Review and redact state files before sharing them outside your project
 | `testability_gaps` | `list[dict]` | TestWriterAgent | Structured audit signal for behaviour the test writer could not safely cover with available project seams/infrastructure. Entries include `source`, `step`, `build_iteration`, optional `scope`, `message`, `timestamp`, and optional parsed `target`, `reason`, `recommended_action`, and `risk`. Default policy is warning-only; `test_writer.testability_gap_policy: fail` turns reported gaps into task failures. |
 | `fix_cycle_records` | `list[dict]` | FixerAgent | Structured observability — one entry per fixer invocation after a failed sync/build/test/check attempt: `build_iteration` (globally unique, never resets), `step`, `scope`, `errors_before` snapshot (build/test/check), `fixer_prompt`, `fixer_output` (`None` on exception), `files_written`, optional `triage_scope` (`test_failure` or `test_origin_validation`), `timestamp`; never read for pipeline decisions |
 | `validation_cycle_records` | `list[dict]` | Orchestrator | Structured observability — one entry per presync/sync/build/test/check outcome with `phase`, `status`, `build_iteration`, `step`, `timestamp`, optional `scope`, optional `elapsed_s`, optional `check_name`, and a diagnostic `error_excerpt` on failure; excerpts preserve failure-marker blocks from long tool output instead of storing only the final tail; never read for pipeline decisions |
+| `active_operation` | `dict \| None` | Orchestrator | Current long-running operation heartbeat for status visibility while an agent or validation command is blocked. Contains `phase`, optional `agent`, optional `scope`, `started_at`, `last_heartbeat_at`, `heartbeat_count`, optional `heartbeat_interval_seconds`, and optional `message`. Cleared when the operation completes; never drives pipeline decisions. |
 | `test_files_written` | `list[str]` | TestWriterAgent | Cumulative list of all files written by the test writer agent across all runs; never cleared; passed to ReviewerAgent so it does not flag those files as implementer scope violations. In normal `sikula run`, these files are not reviewer-owned output; in `sikula review`, changed test files are reviewed as branch output. |
 | `fixer_changed_code` | `bool` | Orchestrator | Set True when FixerAgent writes files; used on resume to continue deterministic build/test/check validation before stale semantic gates rerun; cleared after the following compile check succeeds |
 | `tests_up_to_date` | `bool` | TestWriterAgent / Orchestrator | Set True after test write; reset to False when Fixer changes files; after validation is green, guards redundant test-writer re-runs |
@@ -983,7 +984,7 @@ findings. Review and redact state files before sharing them outside your project
 | `final_full_task_review_done` | `bool` | Orchestrator | Set True after the final full-task reviewer/security/test-writer gate has completed for the current files. Reset when final-scope fixer changes code, then set True again after the post-fix final-scope review/security/test pass. |
 | `current_step` | `int` | Orchestrator | Index into `plan`; advances after each step completes its implement/review/security/test-write phases. With `run_build_per_step: true`, each step also passes build/fix before advancing; otherwise build/fix is deferred until all steps are complete. |
 | `step_implemented` | `bool` | Orchestrator | Set True after implementer succeeds for the current step; reset on step transition; guards re-runs on resume |
-| `pid` | `int \| None` | `Orchestrator.run()` | PID of the orchestrator process; set at the start of every run (including resume); used by `sikula status` to detect interrupted tasks — if the PID is no longer running, status shows `INTERRUPTED` |
+| `pid` | `int \| None` | `Orchestrator.run()` | PID of the orchestrator process; set at the start of every run (including resume); used by `sikula status` to detect interrupted tasks. A fresh `active_operation` heartbeat takes precedence when the PID is not visible across process namespaces; otherwise, if the PID is no longer running, status shows `INTERRUPTED`. |
 | `created_at` | `str` | `StateStore.create()` | ISO-8601 UTC timestamp set once at task creation; never overwritten |
 | `updated_at` | `str` | `JsonStateStore.save()` | ISO-8601 UTC timestamp refreshed on every save; reflects last mutation |
 
@@ -1032,6 +1033,14 @@ These keys enable or disable orchestration phases. All default to `true` except 
 | `run_tests` | `true` | Run `BuildTool.run_tests()` after each passing build (requires `run_build: true`) |
 | `run_checks` | `true` | Run named quality checks (`build.checks`) after tests pass; failures feed the fixer like build/test failures |
 | `run_build_per_step` | `false` | Also run build/fix loop after each planned step; the final full-task build/fix loop still runs when `run_build: true` |
+
+#### `progress` config keys
+
+Progress settings live under `progress:` in `.sikula/config.yaml`.
+
+| Key | Default | Description |
+|---|---|---|
+| `heartbeat_interval_seconds` | `60` | Seconds between heartbeat updates; `0` disables the heartbeat |
 
 #### `build` config keys — PythonTool (`project.build_tool: python`)
 

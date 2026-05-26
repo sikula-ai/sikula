@@ -181,6 +181,57 @@ def _save_state(orch: Orchestrator, **kwargs) -> TaskState:
 
 
 class TestOrchestratorLoop:
+    def test_run_agent_records_active_operation_while_agent_runs(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, heartbeat_interval_seconds=60)
+
+        def assert_active_operation(state: TaskState) -> None:
+            loaded = orch._store.load(state.task_id)
+            assert loaded is not None
+            assert loaded.active_operation is not None
+            assert loaded.active_operation["phase"] == "agent"
+            assert loaded.active_operation["agent"] == "analyst"
+
+        stubs["analyst"].side_effect = assert_active_operation
+        state = _save_state(orch)
+
+        result = orch._run_agent("analyst", state)
+        loaded = orch._store.load(state.task_id)
+
+        assert result.success
+        assert loaded is not None
+        assert loaded.active_operation is None
+
+    def test_run_agent_skips_active_operation_when_heartbeat_disabled(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, heartbeat_interval_seconds=0)
+
+        def assert_no_active_operation(state: TaskState) -> None:
+            loaded = orch._store.load(state.task_id)
+            assert loaded is not None
+            assert loaded.active_operation is None
+
+        stubs["analyst"].side_effect = assert_no_active_operation
+        state = _save_state(orch)
+
+        result = orch._run_agent("analyst", state)
+
+        assert result.success
+
+    def test_run_clears_stale_active_operation_on_resume(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, heartbeat_interval_seconds=0)
+        state = _save_state(orch, implementation_prompt="already analyzed")
+        state.start_active_operation("agent", agent="analyst", message="stale")
+        orch._store.save(state)
+
+        def assert_stale_operation_cleared(state: TaskState) -> None:
+            loaded = orch._store.load(state.task_id)
+            assert loaded is not None
+            assert loaded.active_operation is None
+            state.review_approved = True
+
+        stubs["implementer"].side_effect = assert_stale_operation_cleared
+
+        orch.run(task_id=state.task_id)
+
     def test_agents_receive_effective_pipeline_flags(self, tmp_path: Path):
         config = OrchestratorConfig(
             project_root=tmp_path,
