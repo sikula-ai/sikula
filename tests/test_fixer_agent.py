@@ -697,6 +697,25 @@ class TestTestOriginValidationDetection:
             "/tmp/project/CountriesTests/CountryRowTests.swift",
         ]
 
+    def test_extracts_path_like_validation_paths_with_unknown_extensions(self, tmp_project: Path):
+        errors = [
+            "tests/fixtures/login.snap:1: snapshot mismatch",
+            "schemas/public/service.proto:42: field number conflict",
+            "service.proto:43: field name conflict",
+        ]
+        assert _validation_error_paths(errors, tmp_project) == [
+            "tests/fixtures/login.snap",
+            "schemas/public/service.proto",
+            "service.proto",
+        ]
+
+    def test_does_not_extract_urls_as_validation_paths(self, tmp_project: Path):
+        errors = [
+            "See https://ci.example.com/tests/LoginTest.kt for logs",
+            "GET https://example.com:443/tests/login.test.ts failed",
+        ]
+        assert _validation_error_paths(errors, tmp_project) == []
+
     def test_extracts_platform_neutral_validation_targets(self):
         errors = [
             "ERROR: //pkg/countries:country_filters_test failed to build",
@@ -726,6 +745,12 @@ class TestTestOriginValidationDetection:
         state.check_errors = ["[lint]\nCountriesTests/CountryRowTests.swift:10: warning: unused value"]
         sandbox = {"allowed_test_write_paths": ["CountriesTests/"]}
         assert _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_rejects_absolute_test_path_outside_project_root(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = ["/tmp/external-project/tests/LoginTest.kt:12: unresolved reference"]
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
 
     def test_detects_test_origin_build_failure_from_bazel_test_target(self, tmp_project: Path):
         state = _make_state()
@@ -761,6 +786,20 @@ class TestTestOriginValidationDetection:
         sandbox = {"allowed_test_write_paths": ["tests/"]}
         assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
 
+    def test_rejects_mixed_test_and_unknown_extension_production_paths(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = [
+            "tests/fixtures/login.snap:1: snapshot mismatch\nschemas/public/service.proto:42: field conflict"
+        ]
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_rejects_mixed_test_and_bare_unknown_extension_production_paths(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = ["tests/fixtures/login.snap:1: snapshot mismatch\nservice.proto:42: field conflict"]
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
     def test_rejects_mixed_test_and_production_validation_targets(self, tmp_project: Path):
         state = _make_state()
         state.errors = [
@@ -772,6 +811,23 @@ class TestTestOriginValidationDetection:
     def test_rejects_production_validation_target(self, tmp_project: Path):
         state = _make_state()
         state.errors = ["> Task :feature:countries:compileDebugKotlin FAILED"]
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+        assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_rejects_non_test_targets_that_end_with_test_text(self, tmp_project: Path):
+        sandbox = {"allowed_test_write_paths": ["tests/"]}
+
+        state = _make_state()
+        state.errors = ["> Task :feature:latest FAILED"]
+        assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+        state = _make_state()
+        state.errors = ["ERROR: //events:contest failed to build"]
+        assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
+
+    def test_rejects_url_shaped_bazel_target(self, tmp_project: Path):
+        state = _make_state()
+        state.errors = ["See https://ci.example.com/tests:unitTest for logs"]
         sandbox = {"allowed_test_write_paths": ["tests/"]}
         assert not _is_test_origin_validation_failure(state, sandbox, tmp_project)
 

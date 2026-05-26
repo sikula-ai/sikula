@@ -185,14 +185,18 @@ _VALIDATION_PATH_EXTENSIONS = (
     "yml",
 )
 _VALIDATION_PATH_RE = re.compile(
-    r"(?P<path>(?:file://)?(?:[A-Za-z]:)?(?:[^:\s'\"`<>()\[\]{}]+[\\/])+"
-    r"[^:\s'\"`<>()\[\]{}]+\.(?:" + "|".join(re.escape(ext) for ext in _VALIDATION_PATH_EXTENSIONS) + r"))"
-    r"|(?P<file>\b[^:\s'\"`<>()\[\]{}\\/]+\.(?:"
+    # Path-like diagnostics with a directory separator are intentionally extension-neutral:
+    # production files such as schemas/*.proto must not be ignored in mixed test/prod errors.
+    r"(?<![\w./:-])(?P<path>(?:file://)?(?:[A-Za-z]:)?(?:[^:\s'\"`<>()\[\]{}]+[\\/])+"
+    r"[^:\s'\"`<>()\[\]{}\\/]+\.[A-Za-z0-9][A-Za-z0-9_.-]{0,31})"
+    r"|(?<![\w./:-])(?P<file>\b[^:\s'\"`<>()\[\]{}\\/]+\.(?:"
     + "|".join(re.escape(ext) for ext in _VALIDATION_PATH_EXTENSIONS)
-    + r")\b)",
+    + r")\b)"
+    r"|(?<![\w./:-])(?P<diag_file>\b[^:\s'\"`<>()\[\]{}\\/]+\.[A-Za-z0-9][A-Za-z0-9_.-]{0,31})"
+    r"(?=(?::\d+(?![/?#\w.-])|\(\d|,\s*line\b))",
     re.IGNORECASE,
 )
-_BAZEL_TARGET_RE = re.compile(r"(?<![\w/.-])(?P<target>(?:@[A-Za-z0-9_.-]+)?//[A-Za-z0-9_./+-]*:[A-Za-z0-9_.+-]+)")
+_BAZEL_TARGET_RE = re.compile(r"(?<![\w/.\-:])(?P<target>(?:@[A-Za-z0-9_.-]+)?//[A-Za-z0-9_./+-]*:[A-Za-z0-9_.+-]+)")
 _GRADLE_TARGET_RE = re.compile(r"(?<![\w/.-])(?P<target>:(?:[A-Za-z][A-Za-z0-9_.-]*:)*[A-Za-z][A-Za-z0-9_.-]*)")
 _TEST_TARGET_MARKERS = (
     "acceptancetest",
@@ -301,7 +305,7 @@ def _validation_error_paths(errors: list[str], project_root: Path | None = None)
     paths: list[str] = []
     for error in errors:
         for match in _VALIDATION_PATH_RE.finditer(error):
-            raw_path = match.group("path") or match.group("file")
+            raw_path = match.group("path") or match.group("file") or match.group("diag_file")
             if not raw_path:
                 continue
             path = _project_relative_error_path(raw_path, project_root)
@@ -322,6 +326,8 @@ def _validation_error_targets(errors: list[str]) -> list[str]:
 
 
 def _is_test_origin_path(path: str, sandbox: dict) -> bool:
+    if posixpath.isabs(path) or re.match(r"^[A-Za-z]:/", path):
+        return False
     return _is_under_specific_test_root(path, sandbox.get("allowed_test_write_paths", [])) or _looks_like_test_artifact(
         path
     )
@@ -329,11 +335,16 @@ def _is_test_origin_path(path: str, sandbox: dict) -> bool:
 
 def _target_words(target: str) -> list[str]:
     words: list[str] = []
-    for part in re.split(r"[^A-Za-z0-9]+", target.lower()):
+    for part in re.split(r"[^A-Za-z0-9]+", target):
         if not part:
             continue
-        words.append(part)
-        words.extend(word for word in re.findall(r"[a-z]+|\d+", part) if word != part)
+        lower_part = part.lower()
+        words.append(lower_part)
+        camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", part)
+        camel_split = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", camel_split)
+        words.extend(
+            token.lower() for token in re.split(r"[^A-Za-z0-9]+", camel_split) if token and token.lower() != lower_part
+        )
     return words
 
 
@@ -341,12 +352,7 @@ def _is_test_origin_target(target: str) -> bool:
     words = _target_words(target)
     if not words:
         return False
-    return any(
-        word in _TEST_TARGET_MARKERS
-        or word.endswith(("test", "tests"))
-        or any(marker in word for marker in _TEST_TARGET_MARKERS if marker not in {"test", "tests"})
-        for word in words
-    )
+    return any(word in _TEST_TARGET_MARKERS for word in words)
 
 
 def _is_test_origin_validation_failure(state: TaskState, sandbox: dict, project_root: Path | None = None) -> bool:
