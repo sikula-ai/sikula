@@ -288,6 +288,32 @@ class TestJsonStateStore:
         assert loaded is not None
         assert loaded.active_operation is None
 
+    def test_update_active_operation_ignores_missing_state_file(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+
+        store.update_active_operation("missing", {"phase": "agent"})
+
+        assert store.load("missing") is None
+
+    def test_atomic_write_cleans_temp_file_on_replace_failure(self, tmp_path: Path, monkeypatch):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="replacefail", task_description="replace failure")
+
+        def fail_replace(*args, **kwargs):
+            raise OSError("replace failed")
+
+        monkeypatch.setattr(state_module.os, "replace", fail_replace)
+
+        try:
+            store.save(state)
+        except OSError as exc:
+            assert str(exc) == "replace failed"
+        else:
+            raise AssertionError("expected replace failure")
+
+        assert list(tmp_path.glob("*.tmp")) == []
+        assert store.load("replacefail") is None
+
     def test_concurrent_save_and_active_operation_update_preserves_json_and_history(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
         state = TaskState(task_id="concurrent1", task_description="concurrent task")
