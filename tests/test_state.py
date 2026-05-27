@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 
@@ -286,6 +287,37 @@ class TestJsonStateStore:
 
         assert loaded is not None
         assert loaded.active_operation is None
+
+    def test_concurrent_save_and_active_operation_update_preserves_json_and_history(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="concurrent1", task_description="concurrent task")
+        state.start_active_operation("agent", agent="reviewer", message="Running reviewer")
+        store.save(state)
+
+        def save_retry_records() -> None:
+            for i in range(50):
+                state.record("reviewer", "llm_retry", f"retry {i}")
+                store.save(state)
+
+        def update_heartbeats() -> None:
+            for i in range(50):
+                state.heartbeat_active_operation(f"heartbeat {i}")
+                store.update_active_operation(state.task_id, state.active_operation)
+
+        threads = [threading.Thread(target=save_retry_records), threading.Thread(target=update_heartbeats)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        data = json.loads((tmp_path / "concurrent1.json").read_text())
+        loaded = store.load("concurrent1")
+
+        assert loaded is not None
+        assert len(loaded.history) == 50
+        assert data["history"][-1]["result"] == "retry 49"
+        assert data["active_operation"] is not None
+        assert data["active_operation"]["message"].startswith("heartbeat")
 
     def test_list_tasks_returns_sorted(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)

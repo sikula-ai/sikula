@@ -32,7 +32,7 @@
 | `InitAgent` | `agents/init_agent.py` | Generates `.sikula/guidelines.md` from codebase analysis; called by `cmd_init()` only — not part of the orchestrator loop |
 | `LLMClient` | `core/llm_client.py` | Abstract interface: `generate()` for single-shot text; `run_readonly_agent()` for read-only autonomous agents; `run_agent()` for autonomous file-editing agents |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
-| `JsonStateStore` | `core/state.py` | Stores each task as `<task_id>.json` in the configured state dir |
+| `JsonStateStore` | `core/state.py` | Stores each task as `<task_id>.json` in the configured state dir; serializes same-process access and writes via temp-file replacement so heartbeat updates and audit saves cannot interleave partial JSON writes |
 
 ---
 
@@ -924,6 +924,10 @@ Task state JSON is an audit/debug artefact and can contain sensitive project dat
 stores full LLM prompts and outputs, which may include task descriptions, source-code
 excerpts, inlined guidelines content, build/test/check output, and security-review
 findings. Review and redact state files before sharing them outside your project.
+`JsonStateStore` serializes reads/writes through one store instance and writes state
+files by replacing a completed temporary file, so heartbeat updates do not race with
+retry/audit saves in the same Sikula process. Running the same task from multiple
+Sikula processes at once is still unsupported.
 
 | Field | Type | Set by | Purpose |
 |---|---|---|---|
