@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 
@@ -258,6 +259,91 @@ class TestJsonStateStore:
         original_updated = state.updated_at
         store.save(state)
         assert state.updated_at >= original_updated
+
+    def test_active_operation_roundtrip_and_update(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="active1", task_description="active task")
+        state.start_active_operation("agent", agent="reviewer", message="Running reviewer")
+        store.save(state)
+
+        loaded = store.load("active1")
+
+        assert loaded is not None
+        assert loaded.active_operation is not None
+        assert loaded.active_operation["phase"] == "agent"
+        assert loaded.active_operation["agent"] == "reviewer"
+
+        state.heartbeat_active_operation("Still reviewing")
+        store.update_active_operation(state.task_id, state.active_operation)
+        loaded = store.load("active1")
+
+        assert loaded is not None
+        assert loaded.active_operation is not None
+        assert loaded.active_operation["heartbeat_count"] == 1
+        assert loaded.active_operation["message"] == "Still reviewing"
+
+        store.update_active_operation(state.task_id, None)
+        loaded = store.load("active1")
+
+        assert loaded is not None
+        assert loaded.active_operation is None
+
+    def test_update_active_operation_ignores_missing_state_file(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+
+        store.update_active_operation("missing", {"phase": "agent"})
+
+        assert store.load("missing") is None
+
+    def test_atomic_write_cleans_temp_file_on_replace_failure(self, tmp_path: Path, monkeypatch):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="replacefail", task_description="replace failure")
+
+        def fail_replace(*args, **kwargs):
+            raise OSError("replace failed")
+
+        monkeypatch.setattr(state_module.os, "replace", fail_replace)
+
+        try:
+            store.save(state)
+        except OSError as exc:
+            assert str(exc) == "replace failed"
+        else:
+            raise AssertionError("expected replace failure")
+
+        assert list(tmp_path.glob("*.tmp")) == []
+        assert store.load("replacefail") is None
+
+    def test_concurrent_save_and_active_operation_update_preserves_json_and_history(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="concurrent1", task_description="concurrent task")
+        state.start_active_operation("agent", agent="reviewer", message="Running reviewer")
+        store.save(state)
+
+        def save_retry_records() -> None:
+            for i in range(50):
+                state.record("reviewer", "llm_retry", f"retry {i}")
+                store.save(state)
+
+        def update_heartbeats() -> None:
+            for i in range(50):
+                state.heartbeat_active_operation(f"heartbeat {i}")
+                store.update_active_operation(state.task_id, state.active_operation)
+
+        threads = [threading.Thread(target=save_retry_records), threading.Thread(target=update_heartbeats)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        data = json.loads((tmp_path / "concurrent1.json").read_text())
+        loaded = store.load("concurrent1")
+
+        assert loaded is not None
+        assert len(loaded.history) == 50
+        assert data["history"][-1]["result"] == "retry 49"
+        assert data["active_operation"] is not None
+        assert data["active_operation"]["message"].startswith("heartbeat")
 
     def test_list_tasks_returns_sorted(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)

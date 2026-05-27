@@ -62,6 +62,48 @@ class TestCmdStatusInterrupted:
         out = capsys.readouterr().out
         assert "INTERRUPTED" in out
 
+    def test_interrupted_task_does_not_show_stale_active_operation(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        s = TaskState(task_id="t1", task_description="my task")
+        s.plan_decided = True
+        s.pid = 999999999
+        s.start_active_operation("agent", agent="reviewer", message="Running reviewer agent")
+        s.active_operation["last_heartbeat_at"] = "2024-01-01T00:00:00+00:00"
+        store.save(s)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=False, verbose=True, status_filter=[]))
+
+        out = capsys.readouterr().out
+        assert "INTERRUPTED" in out
+        assert "active: Running reviewer agent" not in out
+
+    def test_fresh_active_operation_wins_when_pid_is_not_visible(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        s = TaskState(task_id="t1", task_description="my task")
+        s.plan_decided = True
+        s.pid = 999999999
+        s.start_active_operation(
+            "agent",
+            agent="reviewer",
+            message="Running reviewer agent",
+            heartbeat_interval_seconds=15,
+        )
+        store.save(s)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=False, verbose=True, status_filter=[]))
+
+        out = capsys.readouterr().out
+        assert "reviewer" in out
+        assert "INTERRUPTED" not in out
+        assert "active: Running reviewer agent" in out
+        assert "next: wait" in out
+
     def test_in_progress_task_with_live_pid_shows_phase_status(self, tmp_path: Path, capsys):
         import os
         from core.state import JsonStateStore, TaskState
@@ -169,6 +211,23 @@ class TestCmdStatusOutput:
         out = capsys.readouterr().out
         assert "next: sikula run --task-id t1" in out
 
+    def test_verbose_status_includes_active_operation(self, tmp_path: Path, capsys):
+        import os
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        s = TaskState(task_id="t1", task_description="my task")
+        s.pid = os.getpid()
+        s.start_active_operation("agent", agent="reviewer", message="Running reviewer agent")
+        store.save(s)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=False, verbose=True, status_filter=[]))
+
+        out = capsys.readouterr().out
+        assert "reviewer" in out
+        assert "active: Running reviewer agent" in out
+
     def test_status_json_includes_derived_fields(self, tmp_path: Path, capsys):
         from core.state import JsonStateStore, TaskState
 
@@ -195,6 +254,25 @@ class TestCmdStatusOutput:
                 "next_action": "sikula run --task-id t1 --reset-failed",
             }
         ]
+
+    def test_status_json_includes_active_operation_when_present(self, tmp_path: Path, capsys):
+        import os
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        s = TaskState(task_id="t1", task_description="my task")
+        s.pid = os.getpid()
+        s.start_active_operation("agent", agent="test_writer", message="Running test writer")
+        store.save(s)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=True, verbose=False, status_filter=[]))
+
+        rows = json.loads(capsys.readouterr().out)
+        assert rows[0]["status"] == "test_writer"
+        assert rows[0]["active_operation"]["agent"] == "test_writer"
+        assert rows[0]["active_operation"]["message"] == "Running test writer"
+        assert rows[0]["active_elapsed"]
 
     def test_status_filters_are_or_filters(self, tmp_path: Path, capsys):
         from core.state import JsonStateStore, TaskState

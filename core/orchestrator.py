@@ -50,6 +50,7 @@ from agents.security_reviewer_agent import SecurityReviewerAgent
 from agents.test_writer_agent import TestWriterAgent
 from core.diagnostics import diagnostic_excerpt
 from core.llm_client import LLMClient
+from core.progress import ActiveOperationHeartbeat
 from core.retry_history import llm_retry_history
 from core.state import StateStore, TaskState
 from core.validation_coverage import INTERNAL_PIPELINE_CONFIG_KEY, validation_coverage_gaps
@@ -105,6 +106,7 @@ class OrchestratorConfig:
     run_security_review: bool = True
     run_checks: bool = True
     run_planner: bool = True
+    heartbeat_interval_seconds: int = 60
     project_config: dict = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -276,6 +278,7 @@ class Orchestrator:
 
         display = label or state.task_description.splitlines()[0][:60]
         log.info("Task %s — %s", state.task_id, display)
+        state.clear_active_operation()
         state.pid = os.getpid()
         self._store.save(state)
         self._loop(state)
@@ -759,7 +762,8 @@ class Orchestrator:
         log.info("--- Phase: presync (generating sources before analyze) ---")
         log.info("Running %s.generate_sources()...", build_tool.__class__.__name__)
         t0 = time.perf_counter()
-        result = build_tool.generate_sources()
+        with self._active_operation(state, phase="presync", message="Generating sources"):
+            result = build_tool.generate_sources()
         elapsed_s = time.perf_counter() - t0
         state.presync_done = True
         if result.success:
@@ -1069,8 +1073,14 @@ class Orchestrator:
         t0 = time.perf_counter()
         hist_len = len(state.history)
         try:
-            with llm_retry_history(agent, name, state, self._store):
-                result = agent.run(state)
+            with self._active_operation(
+                state,
+                phase="agent",
+                agent=name,
+                message=f"Running {name} agent",
+            ):
+                with llm_retry_history(agent, name, state, self._store):
+                    result = agent.run(state)
         except Exception as exc:
             elapsed_s = time.perf_counter() - t0
             log.error(f"{name} raised an unexpected error ({_fmt_elapsed(elapsed_s)}): {exc}")
@@ -1088,6 +1098,24 @@ class Orchestrator:
             log.error(f"{name} failed: {result.message} ({elapsed})")
         self._store.save(state)
         return result
+
+    def _active_operation(
+        self,
+        state: TaskState,
+        *,
+        phase: str,
+        agent: str | None = None,
+        message: str | None = None,
+    ) -> ActiveOperationHeartbeat:
+        return ActiveOperationHeartbeat(
+            self._store,
+            state,
+            phase=phase,
+            agent=agent,
+            scope=state.active_scope,
+            message=message,
+            interval_s=self._config.heartbeat_interval_seconds,
+        )
 
     def _run_test_write_phase(self, state: TaskState) -> bool:
         if not self._config.run_test_writing or state.tests_up_to_date:
@@ -1112,7 +1140,8 @@ class Orchestrator:
             name = check.get("name", "check")
             log.info(f"--- Phase: check/{name} ({progress}) ---")
             t0 = time.perf_counter()
-            result = build_tool.run_check(name, check)
+            with self._active_operation(state, phase="check", message=f"Running check/{name}"):
+                result = build_tool.run_check(name, check)
             elapsed_s = time.perf_counter() - t0
             fix_command = check.get("fix_command")
             skip_final_failure_validation = False
@@ -1125,7 +1154,12 @@ class Orchestrator:
                 if "timeout" in check:
                     fix_cfg["timeout"] = check["timeout"]
                 t0 = time.perf_counter()
-                fix_result = build_tool.run_check(f"{name}_autofix", fix_cfg)
+                with self._active_operation(
+                    state,
+                    phase="check_autofix",
+                    message=f"Running check/{name} autofix",
+                ):
+                    fix_result = build_tool.run_check(f"{name}_autofix", fix_cfg)
                 fix_elapsed_s = time.perf_counter() - t0
                 state.record("orchestrator", f"check_{name}_autofix", "success" if fix_result.success else "failed")
                 state.record_validation(
@@ -1137,7 +1171,8 @@ class Orchestrator:
                 )
                 if fix_result.success:
                     t0 = time.perf_counter()
-                    result = build_tool.run_check(name, check)
+                    with self._active_operation(state, phase="check", message=f"Running check/{name}"):
+                        result = build_tool.run_check(name, check)
                     elapsed_s = time.perf_counter() - t0
                 else:
                     skip_final_failure_validation = True
@@ -1168,7 +1203,8 @@ class Orchestrator:
         build_tool: BuildTool = self._tools["build"]
         log.info("Running tests...")
         t0 = time.perf_counter()
-        result = build_tool.run_tests()
+        with self._active_operation(state, phase="test", message="Running tests"):
+            result = build_tool.run_tests()
         elapsed_s = time.perf_counter() - t0
         if not result.success:
             test_error = diagnostic_excerpt(result.error, limit=_FIXER_ERROR_LIMIT)
@@ -1190,7 +1226,8 @@ class Orchestrator:
         build_tool: BuildTool = self._tools["build"]
         log.info(f"Running build sync ({build_tool.__class__.__name__}.sync()) — this may take a few minutes...")
         t0 = time.perf_counter()
-        result = build_tool.sync()
+        with self._active_operation(state, phase="sync", message="Running build sync"):
+            result = build_tool.sync()
         elapsed_s = time.perf_counter() - t0
         if result.success:
             state.build_synced = True
@@ -1212,7 +1249,8 @@ class Orchestrator:
         build_tool: BuildTool = self._tools["build"]
         log.info("Running compile check...")
         t0 = time.perf_counter()
-        result = build_tool.compile_check()
+        with self._active_operation(state, phase="build", message="Running compile check"):
+            result = build_tool.compile_check()
         elapsed_s = time.perf_counter() - t0
         state.build_status = "success" if result.success else "failed"
         state.record("orchestrator", "build", state.build_status, elapsed_s=elapsed_s)

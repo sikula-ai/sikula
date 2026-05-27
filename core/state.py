@@ -7,7 +7,10 @@ subclass StateStore and swap it in sikula.py — nothing else needs to change.
 from __future__ import annotations
 
 import json
+import os
 import platform
+import tempfile
+import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -190,6 +193,7 @@ class TaskState:
     history: list[dict] = field(default_factory=list)
     runtime_metadata: dict = field(default_factory=dict)
     final_summary: dict = field(default_factory=dict)
+    active_operation: Optional[dict] = None
     done: bool = False
     failed: bool = False
     finished_at: Optional[str] = None
@@ -276,6 +280,45 @@ class TaskState:
             entry["error_excerpt"] = error_excerpt
         self.validation_cycle_records.append(entry)
 
+    def start_active_operation(
+        self,
+        phase: str,
+        agent: str | None = None,
+        scope: str | None = None,
+        message: str | None = None,
+        heartbeat_interval_seconds: int | None = None,
+    ) -> None:
+        timestamp = _now()
+        entry: dict = {
+            "phase": phase,
+            "started_at": timestamp,
+            "last_heartbeat_at": timestamp,
+            "heartbeat_count": 0,
+        }
+        if agent:
+            entry["agent"] = agent
+        if scope:
+            entry["scope"] = scope
+        if message:
+            entry["message"] = message
+        if heartbeat_interval_seconds is not None:
+            entry["heartbeat_interval_seconds"] = heartbeat_interval_seconds
+        self.active_operation = entry
+
+    def heartbeat_active_operation(self, message: str | None = None) -> dict | None:
+        if not self.active_operation:
+            return None
+        current = dict(self.active_operation)
+        current["last_heartbeat_at"] = _now()
+        current["heartbeat_count"] = int(current.get("heartbeat_count", 0)) + 1
+        if message:
+            current["message"] = message
+        self.active_operation = current
+        return current
+
+    def clear_active_operation(self) -> None:
+        self.active_operation = None
+
 
 # ---------------------------------------------------------------------------
 # Abstract store
@@ -295,6 +338,9 @@ class StateStore:
     def delete(self, task_id: str) -> None:
         raise NotImplementedError
 
+    def update_active_operation(self, task_id: str, active_operation: dict | None) -> None:
+        raise NotImplementedError
+
     def create(self, task_description: str) -> TaskState:
         task_id = uuid.uuid4().hex
         state = TaskState(task_id=task_id, task_description=task_description)
@@ -309,59 +355,94 @@ class StateStore:
 
 
 class JsonStateStore(StateStore):
-    """Stores each task as a <task_id>.json file. Concurrent access to different tasks is safe; running the same task_id twice concurrently is not."""
+    """Stores each task as a <task_id>.json file.
+
+    Concurrent access through the same store instance is serialized. Running the same task_id from multiple Sikula
+    processes concurrently is not supported.
+    """
 
     def __init__(self, state_dir: Path) -> None:
         self._dir = Path(state_dir)
+        self._lock = threading.RLock()
 
     def _path(self, task_id: str) -> Path:
         return self._dir / f"{task_id}.json"
 
+    def _read_json(self, path: Path) -> dict:
+        return json.loads(path.read_text())
+
+    def _write_json(self, path: Path, data: dict) -> None:
+        self._dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=self._dir)
+        try:
+            with os.fdopen(fd, "w") as tmp:
+                tmp.write(json.dumps(data, indent=2))
+                tmp.write("\n")
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            os.replace(tmp_name, path)
+        except Exception:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
+
     def load(self, task_id: str) -> Optional[TaskState]:
-        p = self._path(task_id)
-        if not p.exists():
-            return None
-        data = json.loads(p.read_text())
-        # --- schema migrations (run in version order before TaskState is constructed) ---
-        # Migrate field renamed in refactor: gradle_synced → build_synced
-        if "gradle_synced" in data and "build_synced" not in data:
-            data["build_synced"] = data.pop("gradle_synced")
-        original_schema_version = data.get("schema_version", 1)
-        has_legacy_review_records = any(
-            isinstance(record, dict) and "reviewer" in record for record in data.get("review_cycle_records", [])
-        )
-        has_legacy_security_records = any(
-            isinstance(record, dict) and "reviewer" in record
-            for record in data.get("security_review_cycle_records", [])
-        )
-        if (
-            original_schema_version < 2
-            or "security_review_cycle_records" not in data
-            or has_legacy_review_records
-            or has_legacy_security_records
-        ):
-            _migrate_review_cycle_records(data)
-        if original_schema_version < SCHEMA_VERSION:
-            data["schema_version"] = SCHEMA_VERSION
-        # --- end migrations ---
-        # Drop unknown fields (forward-compat with state files from older versions)
-        known = {f.name for f in TaskState.__dataclass_fields__.values()}
-        data = {k: v for k, v in data.items() if k in known}
-        return TaskState(**data)
+        with self._lock:
+            p = self._path(task_id)
+            if not p.exists():
+                return None
+            data = self._read_json(p)
+            # --- schema migrations (run in version order before TaskState is constructed) ---
+            # Migrate field renamed in refactor: gradle_synced → build_synced
+            if "gradle_synced" in data and "build_synced" not in data:
+                data["build_synced"] = data.pop("gradle_synced")
+            original_schema_version = data.get("schema_version", 1)
+            has_legacy_review_records = any(
+                isinstance(record, dict) and "reviewer" in record for record in data.get("review_cycle_records", [])
+            )
+            has_legacy_security_records = any(
+                isinstance(record, dict) and "reviewer" in record
+                for record in data.get("security_review_cycle_records", [])
+            )
+            if (
+                original_schema_version < 2
+                or "security_review_cycle_records" not in data
+                or has_legacy_review_records
+                or has_legacy_security_records
+            ):
+                _migrate_review_cycle_records(data)
+            if original_schema_version < SCHEMA_VERSION:
+                data["schema_version"] = SCHEMA_VERSION
+            # --- end migrations ---
+            # Drop unknown fields (forward-compat with state files from older versions)
+            known = {f.name for f in TaskState.__dataclass_fields__.values()}
+            data = {k: v for k, v in data.items() if k in known}
+            return TaskState(**data)
 
     def save(self, state: TaskState) -> None:
-        self._dir.mkdir(parents=True, exist_ok=True)
-        if (state.done or state.failed) and not state.finished_at:
-            state.finished_at = _now()
-        if state.done or state.failed:
-            state.final_summary = _final_summary(state)
-        state.updated_at = _now()
-        self._path(state.task_id).write_text(json.dumps(asdict(state), indent=2))
+        with self._lock:
+            if (state.done or state.failed) and not state.finished_at:
+                state.finished_at = _now()
+            if state.done or state.failed:
+                state.final_summary = _final_summary(state)
+            state.updated_at = _now()
+            self._write_json(self._path(state.task_id), asdict(state))
 
     def list_tasks(self) -> list[str]:
-        if not self._dir.exists():
-            return []
-        return [p.stem for p in sorted(self._dir.glob("*.json"))]
+        with self._lock:
+            if not self._dir.exists():
+                return []
+            return [p.stem for p in sorted(self._dir.glob("*.json"))]
 
     def delete(self, task_id: str) -> None:
-        self._path(task_id).unlink(missing_ok=True)
+        with self._lock:
+            self._path(task_id).unlink(missing_ok=True)
+
+    def update_active_operation(self, task_id: str, active_operation: dict | None) -> None:
+        with self._lock:
+            path = self._path(task_id)
+            if not path.exists():
+                return
+            data = self._read_json(path)
+            data["active_operation"] = active_operation
+            data["updated_at"] = _now()
+            self._write_json(path, data)

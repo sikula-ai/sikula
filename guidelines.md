@@ -226,6 +226,8 @@ fixer needs the concrete compiler diagnostic, failing test, assertion, traceback
 
 Records are append-only and must not drive pipeline control flow — stop/continue decisions
 belong in dedicated state fields (`review_approved`, `security_approved`, `failed`, etc.).
+The same rule applies to `state.active_operation`: it is a transient progress
+heartbeat for status/CI visibility only and must not drive pipeline decisions.
 
 ```python
 state.implement_cycle_records.append({
