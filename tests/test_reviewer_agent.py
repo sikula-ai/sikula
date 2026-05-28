@@ -279,6 +279,17 @@ class TestReviewerAgentPrompt:
         assert "validates" in prompt
         assert "API that does not know the expected result type" in prompt
 
+    def test_entry_point_async_boundary_checks_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Entry-point and async boundary consistency" in prompt
+        assert "user interaction handlers, API or" in prompt
+        assert "entry points call the same operation" in prompt
+        assert "starts async or deferred work without awaiting" in prompt
+        assert "Report unhandled errors or inconsistent" in prompt
+
     def test_pipeline_prompt_allows_contract_test_weakening_as_production_evidence(
         self, stub_llm: StubLLMClient, file_tool
     ):
@@ -985,6 +996,32 @@ class TestReviewerAgentHistory:
         assert "Recent test-related fixer records" in prompt
         assert "Test-origin validation fix" in prompt
         assert "classification: malformed_test" in prompt
+
+    def test_confirmed_production_test_fixer_triage_included_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        state.fix_cycle_records = [
+            {
+                "errors_before": {"build": [], "test": ["assertion failed"], "check": []},
+                "files_written": ["src/Login.kt"],
+                "fixer_output": "Fixed the confirmed production defect.",
+                "triage_scope": "test_failure",
+                "triage_pass": "production_confirmed",
+                "confirmed_test_failure_triage": (
+                    "TEST FAILURE TRIAGE:\n"
+                    "classification: production_defect\n"
+                    "contract_affected: login validation\n"
+                    "chosen_fix: production_code\n"
+                ),
+            }
+        ]
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+        agent.run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Triage pass: production_confirmed" in prompt
+        assert "Confirmed production triage" in prompt
+        assert "classification: production_defect" in prompt
+        assert "src/Login.kt" in prompt
 
     def test_build_only_fixer_records_not_included_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"

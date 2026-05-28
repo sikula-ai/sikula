@@ -94,6 +94,19 @@ TESTING RULES:
   helpers. Do NOT write brittle tests that inspect UI framework internals, opaque view trees,
   reflection-only private storage, or component type-name strings unless the existing test
   suite already uses that exact pattern for the same UI framework.
+- Map changed behaviour through its production entry points before choosing tests:
+  user interaction handlers, API or route handlers, CLI commands, lifecycle hooks,
+  callbacks, queue/background job handlers, timers, observers, or equivalent platform
+  entry points. If multiple entry points reach the same changed operation and each has
+  its own error handling, state transition, cancellation/absence handling, or side
+  effect boundary, cover each entry point separately. Do not assume that testing a
+  shared helper through one entry point proves the other entry points are safe.
+- For async or deferred work started from an entry point (for example promises, futures,
+  coroutines, tasks, threads, callbacks, or queued work), cover the observable success
+  path and the observable failure/error path through the entry point when the project's
+  existing test infrastructure can do so. If meaningful failure-path coverage would
+  require new infrastructure outside the test write scope, report a TESTABILITY GAP
+  instead of adding brittle tests.
 - Prefer behaviour tests through public APIs, public state, public routing contracts, command
   outputs, or project-standard test helpers. Source-file inspection tests are a last-resort
   fallback for contracts that cannot be observed through the available test infrastructure.
@@ -137,6 +150,8 @@ YOUR TASK:
 3. Write or update tests that cover:
    - The new or changed behaviour introduced by this implementation
    - Edge cases and error paths visible from the public interface
+   - Each production entry point that reaches a changed operation when the entry points
+     have distinct error handling, state transitions, or side effects
    - Null / absent paths for every nullable value involved in the change
    - Structured input contract cases for parser/validator/expression/DSL/config/schema
      changes, including wrong expected result type rejection where typed contexts exist

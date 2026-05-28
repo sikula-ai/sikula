@@ -1,0 +1,6 @@
+node_modules/
+dist/
+coverage/
+.sikula/state/
+.sikula/worktrees/
+.DS_Store

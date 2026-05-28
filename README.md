@@ -285,7 +285,7 @@ sikula run .sikula/tasks/status-emoji-icons.md
 
 ## 3. Try an example
 
-The repo ships six runnable example projects — each a countries browser or API built around the same domain data:
+The repo ships seven runnable example projects — each a countries browser or API built around the same domain data:
 
 | Example | Stack | Data source | Config |
 |---|---|---|---|
@@ -293,6 +293,7 @@ The repo ships six runnable example projects — each a countries browser or API
 | `example/ios/countries/` | Swift, SwiftUI (iOS 17+), `@Observable` | [REST Countries API](https://restcountries.com) | `example/ios/countries/.sikula/config.yaml` |
 | `example/jvm/countries-gradle/` | Kotlin, Spring Boot, Gradle | local JSON dataset sourced from REST Countries | `example/jvm/countries-gradle/.sikula/config.yaml` |
 | `example/jvm/countries-maven/` | Kotlin, Spring Boot, Maven | local JSON dataset sourced from REST Countries | `example/jvm/countries-maven/.sikula/config.yaml` |
+| `example/node/countries-bun-fullstack/` | TypeScript, Bun full-stack | local TypeScript dataset sourced from REST Countries | `example/node/countries-bun-fullstack/.sikula/config.yaml` |
 | `example/node/countries-react/` | TypeScript, React, Vite | local TypeScript dataset sourced from REST Countries | `example/node/countries-react/.sikula/config.yaml` |
 | `example/rust/countries/` | Rust, Ratatui | local JSON file | `example/rust/countries/.sikula/config.yaml` |
 
@@ -323,6 +324,15 @@ The Node/React example ships a TypeScript web UI with Vitest and React Testing L
 | `.sikula/tasks/add-search-by-name.md` | Adds a country name search control |
 | `.sikula/tasks/add-country-detail-view.md` | Adds a country detail view with browser and in-app back navigation |
 | `.sikula/tasks/format-population.md` | Formats the population number with B/M/K suffixes |
+
+The Bun full-stack example ships a compact TypeScript app using `Bun.serve`,
+strict TypeScript type checking, Bun browser bundling, and `bun:test`:
+
+| Task file | What it does |
+|---|---|
+| `.sikula/tasks/add-search-by-name.md` | Adds a name search query to the API and browser UI |
+| `.sikula/tasks/add-country-detail-view.md` | Adds a detail view backed by `GET /api/countries/:code` |
+| `.sikula/tasks/format-population.md` | Formats list population values with B/M/K suffixes |
 
 The JVM examples ship the same Spring Boot REST API and the same task set in both build systems. Use the Gradle or Maven variant depending on the backend stack you want to test:
 
@@ -394,7 +404,7 @@ sikula --config /path/to/.sikula/config.yaml run my_task.md
 | `reviewer` | Read-only review for correctness, completeness, structured input contracts, dead code, and contract-bearing test weakening; issues are fed back to the implementer |
 | `security_reviewer` | Read-only security review; blocking issues are fed back to the implementer; warnings are logged only |
 | `test_writer` | Writes or updates unit tests after review/security phases complete, including positive/negative contract matrices for structured input |
-| `fixer` | Fixes build, test, and check failures; test failures and test-origin validation failures include production-vs-test triage |
+| `fixer` | Fixes build, test, and check failures; test failures and test-origin validation failures start test-only and require production-vs-test triage before any production fix |
 
 **A few common one-off overrides** (without editing the config YAML — see the full flag reference below):
 
@@ -430,7 +440,7 @@ run_build_per_step: false  # build/fix once after all steps (true = after each s
 
 Every `run_*` key (and `build.presync_clean`) can be overridden per-run without editing the YAML. Flag omitted = use config value.
 
-The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or the active build/fix loop reaches `sandbox.max_iterations`. In multi-step runs, `implement → review → security review → test write` runs for each planned step, then a final full-task gate runs before final build/fix validation. After a build/test/check failure, the fixer can iterate directly against deterministic validation; reviewer, security reviewer, and test writer rerun only after build/test/check are green again, and any changes they make are validated by another build/test/check pass. If build/check diagnostics reference only test files or recognized test targets, the fixer may repair malformed or stale tests, but production writes still require explicit `production_defect` + `production_code` triage. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags.
+The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or the active build/fix loop reaches `sandbox.max_iterations`. In multi-step runs, `implement → review → security review → test write` runs for each planned step, then a final full-task gate runs before final build/fix validation. After a build/test/check failure, the fixer can iterate directly against deterministic validation; reviewer, security reviewer, and test writer rerun only after build/test/check are green again, and any changes they make are validated by another build/test/check pass. Test failures, and build/check diagnostics that reference only test files or recognized test targets, start with a test-only fixer pass. If that pass reports `production_defect` + `production_code` without changing files, Sikula runs a second production-enabled fixer pass; production writes during the first pass fail the task. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags.
 
 Long-running phases publish an active-operation heartbeat while they are in progress.
 By default Sikula logs a "Still running" line every 60 seconds and updates task state
@@ -764,8 +774,8 @@ covers files reported by the provider's `run_agent()` result.
 
 | Key | Used by | Purpose |
 |---|---|---|
-| `allowed_write_paths` | ImplementerAgent, FixerAgent (build errors, test failures, check errors) | Production source directories agents may write to |
-| `allowed_test_write_paths` | TestWriterAgent, FixerAgent (test failures, check errors) | Test source directories; agents may write here when fixing test failures or check violations (e.g. detekt) |
+| `allowed_write_paths` | ImplementerAgent, FixerAgent (build errors, production-confirmed test fixes, check errors) | Production source directories agents may write to |
+| `allowed_test_write_paths` | TestWriterAgent, FixerAgent (test-only test-failure pass, production-confirmed test fixes, check errors) | Test source directories; agents may write here when fixing malformed/stale tests or check violations (e.g. detekt) |
 | `allowed_read_paths` | ImplementerAgent, FixerAgent, TestWriterAgent | Directories agents may read from (prompt constraint); `"."` means the entire project root |
 | `max_iterations` | Orchestrator build/fix loop | Max attempts per active build/fix loop before the task is aborted |
 | `max_review_iterations` | Orchestrator review loop | Max review+implement-fix cycles before task is aborted |
@@ -896,8 +906,9 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
 - The sandbox has separate production and test write allowlists:
   `sandbox.allowed_write_paths` and `sandbox.allowed_test_write_paths`.
 - Test-origin fixer triage protects production writes. Test failures and test-origin
-  validation failures require explicit production-vs-test classification; production
-  writes from those fixes require `production_defect` plus `production_code` triage.
+  validation failures start test-only; production writes are enabled only by a separate
+  pass after explicit `production_defect` plus `production_code` triage. That second
+  pass must actually change production code; test-only changes belong in the first pass.
 - Build/check diagnostics that reference only test files or recognized test targets may
   allow test repair. Unknown, production, or mixed diagnostics fall back to normal
   build/check scope.

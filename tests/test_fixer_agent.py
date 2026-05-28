@@ -53,6 +53,20 @@ class _FakeMixedSourceBuildTool(_FakeBuildTool):
         return path == "src/lib.rs" and before == "before" and after == "after"
 
 
+class _SequentialStubLLMClient(StubLLMClient):
+    def __init__(self, responses: list[tuple[list[str], str]]) -> None:
+        super().__init__()
+        self._responses = responses
+
+    def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
+        self.agent_calls.append(prompt)
+        if self.agent_error:
+            raise self.agent_error
+        if not self._responses:
+            raise AssertionError("No stubbed agent response left")
+        return self._responses.pop(0)
+
+
 # ---------------------------------------------------------------------------
 # Guard conditions
 # ---------------------------------------------------------------------------
@@ -287,15 +301,17 @@ class TestFixerAgentFixCycleRecord:
 
 
 class TestFixerAgentWritePaths:
-    def test_test_only_errors_use_production_and_test_write_paths(self, stub_llm: StubLLMClient, file_tool):
+    def test_test_only_errors_start_with_test_only_write_paths(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["tests/LoginTest.kt"]
         config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
         state = _make_state()
         state.test_errors = ["assertion failed"]
         _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
         prompt = stub_llm.agent_calls[0]
-        assert "src/, tests/" in prompt
-        assert "fix production code instead of weakening the test" in prompt
+        assert "You may only write to these directories: tests/" in prompt
+        assert "You may only write to these directories: src/" not in prompt
+        assert "test-only triage/fix pass" in prompt
+        assert "do not weaken the test" in prompt
         assert "malformed generated test or test harness assumption" in prompt
         assert "Treat build files" in prompt
         assert "TEST FAILURE TRIAGE:" in prompt
@@ -320,10 +336,12 @@ class TestFixerAgentWritePaths:
         state.errors = ["tests/countryFilters.test.ts(14,39): error TS2322: Type '\"   \"' is not assignable"]
         _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
         prompt = stub_llm.agent_calls[0]
-        assert "src/, tests/" in prompt
+        assert "You may only write to these directories: tests/" in prompt
+        assert "You may only write to these directories: src/" not in prompt
         assert "test-origin validation failure" in prompt
         assert "TEST FAILURE TRIAGE:" in prompt
         assert state.fix_cycle_records[0]["triage_scope"] == "test_origin_validation"
+        assert state.fix_cycle_records[0]["triage_pass"] == "test_only"
 
     def test_build_errors_from_mixed_production_and_test_files_use_production_scope(
         self, stub_llm: StubLLMClient, file_tool
@@ -379,7 +397,9 @@ class TestFixerAgentTestFailureProductionGate:
         assert "src/Login.kt" in state.files_changed
         assert any(e["action"] == "fix_failed" for e in state.history)
 
-    def test_test_failure_production_fix_with_valid_triage_succeeds(self, stub_llm: StubLLMClient, file_tool):
+    def test_test_failure_first_pass_cannot_write_production_even_with_valid_triage(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
         stub_llm.agent_result = ["src/Login.kt"]
         stub_llm.agent_output = (
             "TEST FAILURE TRIAGE:\n"
@@ -391,10 +411,79 @@ class TestFixerAgentTestFailureProductionGate:
         state = _make_state()
         state.test_errors = ["assertion failed"]
         result = _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        assert not result.success
+        assert state.failed is True
+        assert "test-only triage pass" in result.message
+        assert len(stub_llm.agent_calls) == 1
+
+    def test_test_failure_production_request_must_not_change_tests_in_first_pass(self, file_tool):
+        triage = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: production_defect\n"
+            "contract_affected: login validation\n"
+            "chosen_fix: production_code\n"
+        )
+        llm = _SequentialStubLLMClient([(["tests/LoginTest.kt"], triage)])
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+        assert not result.success
+        assert state.failed is True
+        assert "requested a production-code fix" in result.message
+        assert len(llm.agent_calls) == 1
+
+    def test_test_failure_production_fix_with_valid_triage_uses_second_pass(self, file_tool):
+        triage = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: production_defect\n"
+            "contract_affected: login validation\n"
+            "chosen_fix: production_code\n"
+        )
+        llm = _SequentialStubLLMClient(
+            [
+                ([], triage),
+                (["src/Login.kt"], "Fixed the confirmed production defect."),
+            ]
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
         assert result.success
         assert state.failed is False
         assert state.test_errors == []
         assert "src/Login.kt" in state.files_changed
+        assert len(llm.agent_calls) == 2
+        assert "You may only write to these directories: tests/" in llm.agent_calls[0]
+        assert "You may only write to these directories: src/, tests/" in llm.agent_calls[1]
+        assert "CONFIRMED TEST FAILURE TRIAGE" in llm.agent_calls[1]
+        assert len(state.fix_cycle_records) == 2
+        assert state.fix_cycle_records[0]["triage_pass"] == "test_only"
+        assert state.fix_cycle_records[1]["triage_pass"] == "production_confirmed"
+        assert state.fix_cycle_records[1]["confirmed_test_failure_triage"] == triage
+
+    def test_confirmed_production_pass_must_change_production_files(self, file_tool):
+        triage = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: production_defect\n"
+            "contract_affected: login validation\n"
+            "chosen_fix: production_code\n"
+        )
+        llm = _SequentialStubLLMClient(
+            [
+                ([], triage),
+                (["tests/LoginTest.kt"], "Changed only the test after production triage."),
+            ]
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+        assert not result.success
+        assert state.failed is True
+        assert "changed no production files" in result.message
+        assert "tests/LoginTest.kt" in state.files_changed
 
     def test_test_failure_test_only_fix_does_not_require_production_triage(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["tests/LoginTest.kt"]
@@ -448,25 +537,31 @@ class TestFixerAgentTestFailureProductionGate:
         assert "test-origin validation" in result.message.lower()
         assert "src/domain/countryFilters.ts" in state.files_changed
 
-    def test_test_origin_build_failure_production_fix_with_valid_triage_succeeds(
-        self, stub_llm: StubLLMClient, file_tool
-    ):
-        stub_llm.agent_result = ["src/domain/countryFilters.ts"]
-        stub_llm.agent_output = (
+    def test_test_origin_build_failure_production_fix_with_valid_triage_uses_second_pass(self, file_tool):
+        triage = (
             "TEST FAILURE TRIAGE:\n"
             "classification: production_defect\n"
             "contract_affected: filter API accepts blank input\n"
             "chosen_fix: production_code\n"
         )
+        llm = _SequentialStubLLMClient(
+            [
+                ([], triage),
+                (["src/domain/countryFilters.ts"], "Fixed the confirmed production defect."),
+            ]
+        )
         config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
         state = _make_state()
         state.errors = ["tests/countryFilters.test.ts(14,39): error TS2322: Type '\"   \"' is not assignable"]
-        result = _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
         assert result.success
         assert state.failed is False
         assert state.errors == []
         assert "src/domain/countryFilters.ts" in state.files_changed
         assert state.fix_cycle_records[0]["triage_scope"] == "test_origin_validation"
+        assert state.fix_cycle_records[0]["triage_pass"] == "test_only"
+        assert state.fix_cycle_records[1]["triage_scope"] == "test_origin_validation"
+        assert state.fix_cycle_records[1]["triage_pass"] == "production_confirmed"
 
     def test_test_origin_check_failure_production_fix_requires_explicit_triage(
         self, stub_llm: StubLLMClient, file_tool
@@ -492,7 +587,9 @@ class TestTestConstraint:
         state = _make_state()
         state.test_errors = ["assertion failed"]
         assert "MAY create and modify test files" in _test_constraint(state)
-        assert "fix production code instead of weakening the test" in _test_constraint(state)
+        assert "test-only triage/fix pass" in _test_constraint(state)
+        assert "leave files unchanged" in _test_constraint(state)
+        assert "do not weaken the test" in _test_constraint(state)
         assert "TEST FAILURE TRIAGE:" in _test_constraint(state)
 
     def test_build_errors_block_test_modification(self):
@@ -506,7 +603,16 @@ class TestTestConstraint:
         constraint = _test_constraint(state, test_origin_validation=True)
         assert "test-origin validation failure" in constraint
         assert "MAY create and modify test files" in constraint
+        assert "test-only triage/fix pass" in constraint
         assert "TEST FAILURE TRIAGE:" in constraint
+
+    def test_confirmed_production_test_fix_allows_production_modification(self):
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        constraint = _test_constraint(state, production_fix_confirmed=True)
+        assert "previous test-only triage" in constraint
+        assert "MAY modify production source files" in constraint
+        assert "classification: production_defect" in constraint
 
     def test_check_errors_allow_test_modification(self):
         state = _make_state()
@@ -533,17 +639,23 @@ class TestWritePathsForState:
         sandbox = {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}
         assert _write_paths_for_state(state, sandbox) == ["src/"]
 
-    def test_test_origin_build_errors_use_production_and_test_paths(self):
+    def test_test_origin_build_errors_start_with_test_paths(self):
         state = _make_state()
         state.errors = ["tests/LoginTest.kt:12: error: unresolved reference"]
         sandbox = {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}
-        assert _write_paths_for_state(state, sandbox, test_origin_validation=True) == ["src/", "tests/"]
+        assert _write_paths_for_state(state, sandbox, test_origin_validation=True) == ["tests/"]
 
-    def test_test_failures_use_production_and_test_paths(self):
+    def test_test_failures_start_with_test_paths(self):
         state = _make_state()
         state.test_errors = ["assertion failed"]
         sandbox = {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}
-        assert _write_paths_for_state(state, sandbox) == ["src/", "tests/"]
+        assert _write_paths_for_state(state, sandbox) == ["tests/"]
+
+    def test_confirmed_production_test_fix_uses_production_and_test_paths(self):
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        sandbox = {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}
+        assert _write_paths_for_state(state, sandbox, production_fix_confirmed=True) == ["src/", "tests/"]
 
     def test_check_errors_use_production_and_test_paths(self):
         state = _make_state()
@@ -781,9 +893,11 @@ class TestTestOriginValidationDetection:
         state.errors = ["ERROR: //pkg/countries:country_filters_test failed to build"]
         _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
         prompt = stub_llm.agent_calls[0]
-        assert "src/, tests/" in prompt
+        assert "You may only write to these directories: tests/" in prompt
+        assert "You may only write to these directories: src/" not in prompt
         assert "test-origin validation failure" in prompt
         assert state.fix_cycle_records[0]["triage_scope"] == "test_origin_validation"
+        assert state.fix_cycle_records[0]["triage_pass"] == "test_only"
 
     def test_rejects_mixed_test_and_production_validation_paths(self, tmp_project: Path):
         state = _make_state()

@@ -63,18 +63,22 @@ _BUILD_TEST_CONSTRAINT = """\
   (e.g. `test/`, `__tests__/`, `spec/`), regardless of what the errors say"""
 
 _TEST_ORIGIN_VALIDATION_CONSTRAINT = """\
-- These build/check errors appear to originate from test files or test targets
+- This appears to be a test-origin validation failure: build/check diagnostics reference
+  test files or test targets
+- This is a test-only triage/fix pass
 - You MAY create and modify test files
-- You MAY modify production source files only when the test-origin validation failure exposes
-  a production defect
+- Do NOT modify production source files, build configuration, runtime configuration,
+  dependency declarations, or pipeline settings in this pass
 - First decide whether the failure is caused by production behaviour or by an incorrect/stale test
 - Start your final response with:
   TEST FAILURE TRIAGE:
   classification: production_defect | stale_test | malformed_test | unclear
   contract_affected: <task/guideline/structured contract, or none>
   chosen_fix: production_code | test_code
+- If the failure exposes a production defect, choose `production_code`, explain the defect,
+  and leave files unchanged; Sikula will run a separate production-enabled fixer pass
 - If a test encodes the original task, implementation prompt, project guidelines, or a structured
-  input/output contract, fix production code instead of weakening the test
+  input/output contract, do not weaken the test
 - Modify tests only when the test is malformed, stale, or inconsistent with the accepted contract
 - If you choose test_code, explain which accepted contract the test conflicts with
 - If the failure is caused by a malformed generated test or test harness assumption, fix the
@@ -86,16 +90,20 @@ _TEST_ORIGIN_VALIDATION_CONSTRAINT = """\
 - Do not delete, relax, or rewrite assertions just to make the run green"""
 
 _TEST_TEST_CONSTRAINT = """\
+- This is a test-only triage/fix pass
 - You MAY create and modify test files
-- You MAY modify production source files when a failing test exposes a production defect
+- Do NOT modify production source files, build configuration, runtime configuration,
+  dependency declarations, or pipeline settings in this pass
 - First decide whether the failure is caused by production behaviour or by an incorrect/stale test
 - Start your final response with:
   TEST FAILURE TRIAGE:
   classification: production_defect | stale_test | malformed_test | unclear
   contract_affected: <task/guideline/structured contract, or none>
   chosen_fix: production_code | test_code
+- If the failing test exposes a production defect, choose `production_code`, explain the
+  defect, and leave files unchanged; Sikula will run a separate production-enabled fixer pass
 - If a test encodes the original task, implementation prompt, project guidelines, or a structured
-  input/output contract, fix production code instead of weakening the test
+  input/output contract, do not weaken the test
 - Modify tests only when the test is malformed, stale, or inconsistent with the accepted contract
 - If you choose test_code, explain which accepted contract the test conflicts with
 - If the failure is caused by a malformed generated test or test harness assumption
@@ -106,6 +114,21 @@ _TEST_TEST_CONSTRAINT = """\
 - Treat build files, dependency manifests, project/workspace files, generated-source config,
   and runtime configuration as production code for this triage. Changing them for a test
   failure requires `classification: production_defect` and `chosen_fix: production_code`.
+- Do not delete, relax, or rewrite assertions just to make the run green"""
+
+_CONFIRMED_PRODUCTION_TEST_FIX_CONSTRAINT = """\
+- A previous test-only triage in this fixer run classified this failure as a production defect
+  and selected a production-code fix
+- You MAY modify production source files to fix that confirmed defect
+- You MAY modify tests only if needed to preserve the accepted task/guideline/structured contract
+- Start your final response with:
+  TEST FAILURE TRIAGE:
+  classification: production_defect
+  contract_affected: <task/guideline/structured contract>
+  chosen_fix: production_code
+- Fix ONLY the confirmed production defect that caused the failing test or test-origin validation
+- Do not change build configuration, runtime configuration, dependency declarations, or pipeline
+  settings unless they are the confirmed production defect
 - Do not delete, relax, or rewrite assertions just to make the run green"""
 
 _CHECK_TEST_CONSTRAINT = """\
@@ -224,7 +247,14 @@ def _scope(state: TaskState) -> str:
     return "step" if state.plan else "task"
 
 
-def _test_constraint(state: TaskState, *, test_origin_validation: bool = False) -> str:
+def _test_constraint(
+    state: TaskState,
+    *,
+    test_origin_validation: bool = False,
+    production_fix_confirmed: bool = False,
+) -> str:
+    if production_fix_confirmed:
+        return _CONFIRMED_PRODUCTION_TEST_FIX_CONSTRAINT
     if test_origin_validation:
         return _TEST_ORIGIN_VALIDATION_CONSTRAINT
     if state.errors:
@@ -235,16 +265,37 @@ def _test_constraint(state: TaskState, *, test_origin_validation: bool = False) 
     return _CHECK_TEST_CONSTRAINT
 
 
-def _write_paths_for_state(state: TaskState, sandbox: dict, *, test_origin_validation: bool = False) -> list[str]:
-    if state.errors and not test_origin_validation:
-        return sandbox.get("allowed_write_paths", [])
-
+def _combined_write_paths(sandbox: dict) -> list[str]:
     paths: list[str] = []
     for key in ("allowed_write_paths", "allowed_test_write_paths"):
         for path in sandbox.get(key, []):
             if path not in paths:
                 paths.append(path)
     return paths
+
+
+def _test_write_paths(sandbox: dict) -> list[str]:
+    paths: list[str] = []
+    for path in sandbox.get("allowed_test_write_paths", []):
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _write_paths_for_state(
+    state: TaskState,
+    sandbox: dict,
+    *,
+    test_origin_validation: bool = False,
+    production_fix_confirmed: bool = False,
+) -> list[str]:
+    if production_fix_confirmed:
+        return _combined_write_paths(sandbox)
+    if test_origin_validation or (state.test_errors and not state.errors and not state.check_errors):
+        return _test_write_paths(sandbox)
+    if state.errors:
+        return sandbox.get("allowed_write_paths", [])
+    return _combined_write_paths(sandbox)
 
 
 def _normalize_project_path(path: str) -> str:
@@ -544,90 +595,177 @@ class FixerAgent(BaseAgent):
             triage_scope = "test_origin_validation"
         elif uses_test_failure_triage:
             triage_scope = "test_failure"
-        allowed_write_paths = _write_paths_for_state(state, sandbox, test_origin_validation=test_origin_validation)
-        allowed_str = ", ".join(allowed_write_paths) if allowed_write_paths else "(not configured)"
         allowed_read_paths = sandbox.get("allowed_read_paths", ["."])
         allowed_read_str = ", ".join(allowed_read_paths)
-
-        prompt = AGENT_SECURITY_PREFIX + _AGENT_PROMPT.format(
-            tech_stack=_tech_stack(self.project_config),
-            guidelines_files=_guidelines_files(self.project_config),
-            allowed_read_paths=allowed_read_str,
-            allowed_write_paths=allowed_str,
-            test_constraint=_test_constraint(state, test_origin_validation=test_origin_validation),
-            task_description=state.task_description,
-            implementation_prompt=state.implementation_prompt or "(not available)",
-            errors_section=_errors_section(state),
-        )
 
         errors_snapshot = {
             "build": list(state.errors),
             "test": list(state.test_errors),
             "check": list(state.check_errors),
         }
-        dirty_before = _git_dirty_text_snapshot(agent_cwd) if uses_test_failure_triage else {}
 
-        try:
-            changed, fixer_output = self.llm.run_agent(prompt, cwd=agent_cwd)
-        except RuntimeError as e:
-            msg = str(e)
-            state.record(self.name, "fix_failed", msg[:500])
+        def _prompt(
+            *,
+            allowed_write_paths: list[str],
+            test_constraint: str,
+            previous_triage: str | None = None,
+        ) -> str:
+            allowed_str = ", ".join(allowed_write_paths) if allowed_write_paths else "(not configured)"
+            errors_section = _errors_section(state)
+            if previous_triage:
+                errors_section += "\n\nCONFIRMED TEST FAILURE TRIAGE:\n" + previous_triage.strip()
+            return AGENT_SECURITY_PREFIX + _AGENT_PROMPT.format(
+                tech_stack=_tech_stack(self.project_config),
+                guidelines_files=_guidelines_files(self.project_config),
+                allowed_read_paths=allowed_read_str,
+                allowed_write_paths=allowed_str,
+                test_constraint=test_constraint,
+                task_description=state.task_description,
+                implementation_prompt=state.implementation_prompt or "(not available)",
+                errors_section=errors_section,
+            )
+
+        def _run_once(
+            *,
+            allowed_write_paths: list[str],
+            test_constraint: str,
+            triage_pass: str | None = None,
+            previous_triage: str | None = None,
+        ) -> tuple[AgentResult | None, list[str], str, dict[str, str | None], list[str]]:
+            prompt = _prompt(
+                allowed_write_paths=allowed_write_paths,
+                test_constraint=test_constraint,
+                previous_triage=previous_triage,
+            )
+            dirty_before = _git_dirty_text_snapshot(agent_cwd) if uses_test_failure_triage else {}
+            try:
+                changed, fixer_output = self.llm.run_agent(prompt, cwd=agent_cwd)
+            except RuntimeError as e:
+                msg = str(e)
+                state.record(self.name, "fix_failed", msg[:500])
+                record = {
+                    "build_iteration": state.build_iterations,
+                    "step": state.current_step,
+                    "scope": _scope(state),
+                    "errors_before": errors_snapshot,
+                    "fixer_prompt": prompt,
+                    "fixer_output": None,
+                    "files_written": [],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                if triage_scope:
+                    record["triage_scope"] = triage_scope
+                if triage_pass:
+                    record["triage_pass"] = triage_pass
+                if previous_triage:
+                    record["confirmed_test_failure_triage"] = previous_triage
+                state.fix_cycle_records.append(record)
+                return AgentResult(success=False, message=msg[:200]), [], "", dirty_before, allowed_write_paths
+
             record = {
                 "build_iteration": state.build_iterations,
                 "step": state.current_step,
                 "scope": _scope(state),
                 "errors_before": errors_snapshot,
                 "fixer_prompt": prompt,
-                "fixer_output": None,
-                "files_written": [],
+                "fixer_output": fixer_output,
+                "files_written": changed,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             if triage_scope:
                 record["triage_scope"] = triage_scope
+            if triage_pass:
+                record["triage_pass"] = triage_pass
+            if previous_triage:
+                record["confirmed_test_failure_triage"] = previous_triage
             state.fix_cycle_records.append(record)
-            return AgentResult(success=False, message=msg[:200])
+            return None, changed, fixer_output, dirty_before, allowed_write_paths
 
-        record = {
-            "build_iteration": state.build_iterations,
-            "step": state.current_step,
-            "scope": _scope(state),
-            "errors_before": errors_snapshot,
-            "fixer_prompt": prompt,
-            "fixer_output": fixer_output,
-            "files_written": changed,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        if triage_scope:
-            record["triage_scope"] = triage_scope
-        state.fix_cycle_records.append(record)
+        def _fail_after_changes(changed: list[str], msg: str) -> AgentResult:
+            for p in changed:
+                if p not in state.files_changed:
+                    state.files_changed.append(p)
+            state.record(self.name, "fix_failed", msg)
+            state.failed = True
+            return AgentResult(
+                success=False,
+                message=msg[:200],
+                data={"files_written": changed},
+            )
 
-        if uses_test_failure_triage:
+        def _production_writes(changed: list[str], dirty_before: dict[str, str | None]) -> list[str]:
             before_contents = _changed_text_contents_before(agent_cwd, changed, dirty_before)
             after_contents = _changed_text_contents_after(agent_cwd, changed)
-            production_writes = _test_failure_production_writes(
+            return _test_failure_production_writes(
                 changed,
                 sandbox,
                 self.tools.get("build"),
                 before_contents,
                 after_contents,
             )
-            if production_writes and not _has_valid_production_test_failure_triage(fixer_output):
-                for p in changed:
-                    if p not in state.files_changed:
-                        state.files_changed.append(p)
+
+        if uses_test_failure_triage:
+            allowed_write_paths = _write_paths_for_state(state, sandbox, test_origin_validation=test_origin_validation)
+            result, changed, fixer_output, dirty_before, final_allowed_write_paths = _run_once(
+                allowed_write_paths=allowed_write_paths,
+                test_constraint=_test_constraint(state, test_origin_validation=test_origin_validation),
+                triage_pass="test_only",
+            )
+            if result is not None:
+                return result
+
+            production_writes = _production_writes(changed, dirty_before)
+            if production_writes:
                 failure_kind = "test-origin validation" if test_origin_validation else "test-failure"
                 msg = (
-                    f"{failure_kind.capitalize()} fixer changed production files without explicit "
-                    "production_defect triage: "
+                    f"{failure_kind.capitalize()} fixer changed production files during the "
+                    "test-only triage pass: "
                     f"{production_writes}"
                 )
-                state.record(self.name, "fix_failed", msg)
-                state.failed = True
-                return AgentResult(
-                    success=False,
-                    message=msg[:200],
-                    data={"files_written": changed},
+                return _fail_after_changes(changed, msg)
+
+            if _has_valid_production_test_failure_triage(fixer_output):
+                failure_kind = "test-origin validation" if test_origin_validation else "test-failure"
+                if changed:
+                    msg = (
+                        f"{failure_kind.capitalize()} fixer requested a production-code fix but "
+                        f"changed files during the test-only triage pass: {changed}"
+                    )
+                    return _fail_after_changes(changed, msg)
+
+                allowed_write_paths = _write_paths_for_state(
+                    state,
+                    sandbox,
+                    test_origin_validation=test_origin_validation,
+                    production_fix_confirmed=True,
                 )
+                result, changed, fixer_output, dirty_before, final_allowed_write_paths = _run_once(
+                    allowed_write_paths=allowed_write_paths,
+                    test_constraint=_test_constraint(
+                        state,
+                        test_origin_validation=test_origin_validation,
+                        production_fix_confirmed=True,
+                    ),
+                    triage_pass="production_confirmed",
+                    previous_triage=fixer_output,
+                )
+                if result is not None:
+                    return result
+                production_writes = _production_writes(changed, dirty_before)
+                if changed and not production_writes:
+                    msg = (
+                        f"{failure_kind.capitalize()} production-confirmed fixer changed no production files "
+                        f"after production_defect triage: {changed}"
+                    )
+                    return _fail_after_changes(changed, msg)
+        else:
+            allowed_write_paths = _write_paths_for_state(state, sandbox, test_origin_validation=test_origin_validation)
+            result, changed, fixer_output, _, final_allowed_write_paths = _run_once(
+                allowed_write_paths=allowed_write_paths,
+                test_constraint=_test_constraint(state, test_origin_validation=test_origin_validation),
+            )
+            if result is not None:
+                return result
 
         if not changed:
             msg = "Agent made no file changes"
@@ -642,7 +780,7 @@ class FixerAgent(BaseAgent):
         state.test_errors.clear()
         state.check_errors.clear()
         state.record(self.name, "fix", f"files changed: {changed}")
-        _record_write_path_warnings(state, self.name, changed, allowed_write_paths, "active write paths")
+        _record_write_path_warnings(state, self.name, changed, final_allowed_write_paths, "active write paths")
         return AgentResult(
             success=True,
             message=f"Fix applied to {len(changed)} file(s): {changed}",
