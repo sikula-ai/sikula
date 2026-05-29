@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import subprocess
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+
+import pytest
 
 from agents.base_agent import AgentResult
 from tests.conftest import StubLLMClient
@@ -2588,6 +2591,27 @@ class TestOrchestratorTestsAndSyncFailure:
 
 
 class TestValidationArtifacts:
+    @staticmethod
+    def _non_executable_mode(path: Path) -> int:
+        path.chmod(0o644)
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if mode & stat.S_IXUSR:
+            mode &= ~stat.S_IXUSR
+            path.chmod(mode)
+            mode = stat.S_IMODE(path.stat().st_mode)
+        return mode
+
+    @staticmethod
+    def _executable_mode(path: Path, before_mode: int) -> int:
+        mode = before_mode | stat.S_IXUSR
+        if mode == before_mode:
+            pytest.skip("filesystem does not preserve executable bit changes")
+        path.chmod(mode)
+        changed_mode = stat.S_IMODE(path.stat().st_mode)
+        if changed_mode != mode:
+            pytest.skip("filesystem does not preserve executable bit changes")
+        return changed_mode
+
     def test_successful_build_cleans_untracked_generated_artifacts(self, tmp_project: Path):
         orch, _, build = _make_orchestrator(
             tmp_project,
@@ -2682,6 +2706,77 @@ class TestValidationArtifacts:
 
         assert result.done
         assert source.read_text() == "# task change\n"
+        assert result.validation_artifact_records[0]["artifacts"] == [
+            {
+                "path": "src/main.py",
+                "before_status": "tracked",
+                "after_status": "tracked",
+            }
+        ]
+
+    def test_successful_tests_restore_existing_dirty_file_mode_only_change(self, tmp_project: Path):
+        source = tmp_project / "src" / "main.py"
+        source.write_text("# task change\n")
+        before_mode = self._non_executable_mode(source)
+        after_mode = self._executable_mode(source, before_mode)
+        source.chmod(before_mode)
+        orch, _, build = _make_orchestrator(
+            tmp_project,
+            run_build=True,
+            run_tests=True,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+
+        def chmod_task_file() -> None:
+            source.chmod(after_mode)
+
+        build.test_side_effect = chmod_task_file
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=True)
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert source.read_text() == "# task change\n"
+        assert stat.S_IMODE(source.stat().st_mode) == before_mode
+        assert result.validation_artifact_records[0]["artifacts"] == [
+            {
+                "path": "src/main.py",
+                "before_status": "tracked",
+                "after_status": "tracked",
+            }
+        ]
+
+    def test_successful_tests_restore_existing_dirty_file_content_and_mode(self, tmp_project: Path):
+        source = tmp_project / "src" / "main.py"
+        source.write_text("# task change\n")
+        before_mode = self._non_executable_mode(source)
+        after_mode = self._executable_mode(source, before_mode)
+        source.chmod(before_mode)
+        orch, _, build = _make_orchestrator(
+            tmp_project,
+            run_build=True,
+            run_tests=True,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+
+        def mutate_task_file() -> None:
+            source.write_text("# task change\n# generated during test\n")
+            source.chmod(after_mode)
+
+        build.test_side_effect = mutate_task_file
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=True)
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert source.read_text() == "# task change\n"
+        assert stat.S_IMODE(source.stat().st_mode) == before_mode
         assert result.validation_artifact_records[0]["artifacts"] == [
             {
                 "path": "src/main.py",

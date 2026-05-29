@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import stat
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ class FileSnapshot:
     status: str
     exists: bool
     content: bytes | None
+    mode: int | None
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,13 @@ def _normalize_relative_path(path: str) -> str:
     return path.replace("\\", "/").strip("/")
 
 
+def _file_mode(path: Path) -> int | None:
+    try:
+        return stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return None
+
+
 def _is_ignored_root(path: str, ignored_roots: tuple[str, ...]) -> bool:
     normalized = _normalize_relative_path(path)
     return any(normalized == root or normalized.startswith(f"{root}/") for root in ignored_roots)
@@ -106,7 +115,12 @@ def snapshot_validation_dirty_files(
         except (IsADirectoryError, PermissionError):
             content = None
             exists = True
-        snapshot[path] = FileSnapshot(status=status, exists=exists, content=content)
+        snapshot[path] = FileSnapshot(
+            status=status,
+            exists=exists,
+            content=content,
+            mode=_file_mode(project_path) if exists else None,
+        )
     return snapshot
 
 
@@ -141,6 +155,11 @@ def _restore_head_file(cwd: Path, relative_path: str) -> str | None:
     if result.returncode == 0:
         return None
     return (result.stderr or result.stdout or "git checkout failed").strip()
+
+
+def _restore_file_mode(path: Path, mode: int | None) -> None:
+    if mode is not None:
+        path.chmod(mode)
 
 
 def restore_validation_artifacts(
@@ -198,6 +217,7 @@ def restore_validation_artifacts(
 
             project_path.parent.mkdir(parents=True, exist_ok=True)
             project_path.write_bytes(before_snapshot.content)
+            _restore_file_mode(project_path, before_snapshot.mode)
         except OSError as exc:
             errors.append(f"{artifact.path}: {exc}")
     return errors
