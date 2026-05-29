@@ -19,6 +19,7 @@ _DIAGNOSTIC_RE = re.compile(
     r"|test case '",
     re.IGNORECASE,
 )
+_CARGO_TEST_RERUN_RE = re.compile(r"^error: test failed, to rerun pass `.*`", re.IGNORECASE)
 
 
 def diagnostic_excerpt(text: str | None, limit: int = DEFAULT_DIAGNOSTIC_LIMIT, context_lines: int = 8) -> str:
@@ -39,6 +40,46 @@ def diagnostic_excerpt(text: str | None, limit: int = DEFAULT_DIAGNOSTIC_LIMIT, 
         return _compose_diagnostic_excerpt(text, diagnostic, limit)
 
     return _head_tail(text, limit)
+
+
+def cargo_test_failure_excerpt(text: str | None, limit: int = DEFAULT_DIAGNOSTIC_LIMIT) -> str:
+    """Return a Cargo-test-specific failure excerpt, falling back to generic extraction.
+
+    Cargo workspace test output can contain many harmless summaries such as
+    "0 failed" before or after the actual failure block. The generic extractor treats
+    those as diagnostic markers, so select Cargo's structured failure section first.
+    """
+    if not text or limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+
+    lines = text.splitlines(keepends=True)
+    first_failure = _first_cargo_failure_block(lines)
+    if first_failure is None:
+        return diagnostic_excerpt(text, limit=limit)
+
+    end = _cargo_failure_block_end(lines, first_failure)
+    excerpt = "".join(lines[first_failure:end])
+    return _head_tail(excerpt, limit) if len(excerpt) > limit else excerpt
+
+
+def _first_cargo_failure_block(lines: list[str]) -> int | None:
+    for index, line in enumerate(lines):
+        if _ANSI_RE.sub("", line).strip() == "failures:":
+            return index
+    return None
+
+
+def _cargo_failure_block_end(lines: list[str], start: int) -> int:
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        normalized = _ANSI_RE.sub("", lines[index]).strip()
+        if _CARGO_TEST_RERUN_RE.match(normalized):
+            return index + 1
+        if normalized.startswith("error: test failed"):
+            end = index + 1
+    return end
 
 
 def _diagnostic_blocks(text: str, context_lines: int) -> str:

@@ -27,7 +27,7 @@
 | `MavenTool` | `tools/maven_tool.py` | `BuildTool` implementation for Maven projects; auto-detects `./mvnw` |
 | `NodeTool` | `tools/node_tool.py` | `BuildTool` implementation for Node.js / TypeScript / JavaScript projects; detects npm/pnpm/yarn/bun |
 | `PythonTool` | `tools/python_tool.py` | `BuildTool` implementation for Python / pytest |
-| `CargoTool` | `tools/cargo_tool.py` | `BuildTool` implementation for Rust / Cargo |
+| `CargoTool` | `tools/cargo_tool.py` | `BuildTool` implementation for Rust / Cargo; failed `cargo test` output is reduced with Cargo-aware failure-block extraction before generic diagnostic truncation |
 | `XcodeTool` | `tools/xcode_tool.py` | `BuildTool` implementation for iOS / Xcode |
 | `InitAgent` | `agents/init_agent.py` | Generates `.sikula/guidelines.md` from codebase analysis; called by `cmd_init()` only — not part of the orchestrator loop |
 | `LLMClient` | `core/llm_client.py` | Abstract interface: `generate()` for single-shot text; `run_readonly_agent()` for read-only autonomous agents; `run_agent()` for autonomous file-editing agents |
@@ -1087,6 +1087,11 @@ All keys live under `build:` in `.sikula/config.yaml`.
 | `test_command` | `cargo test` | Shell command run by `run_tests()`. Use `cargo test --workspace` for workspace projects |
 | `timeout` | `600` | Timeout in seconds for all CargoTool operations (compile, test, check). Rust compilation is slower than interpreted languages — 600 s is a safe default |
 | `checks` | `[]` | List of named quality checks run when `run_checks: true`. Keys: `name` (display name), `command` (shell command), `timeout` (seconds, defaults to `build.timeout` = 600), optional `fix_command`. Example: `{name: clippy, command: "cargo clippy -- -D warnings", timeout: 120}` |
+
+Failed Cargo test commands preserve Cargo's structured `failures:` block and
+`error: test failed, to rerun pass ...` line before generic diagnostic truncation,
+so large workspace runs do not let repeated successful harness summaries crowd out
+the failing test name, panic/assertion message, or focused rerun command.
 
 #### `build` config keys — NodeTool (`project.build_tool: node`)
 

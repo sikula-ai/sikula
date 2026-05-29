@@ -72,6 +72,47 @@ class TestCargoToolRun:
         assert "test_rejects_wrong_result_type" in result.error
         assert "error: test failed" in result.error
 
+    def test_noisy_workspace_test_output_keeps_cargo_failure_block(self, tmp_path: Path):
+        tool = _make_tool(tmp_path, test_command="cargo test --workspace --all-features")
+        output = (
+            "Compiling workspace\n"
+            + "".join(
+                "running 0 tests\n\n"
+                "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\n"
+                f"     Running unrelated_test_binary_{i}\n"
+                for i in range(180)
+            )
+            + "running 47 tests\n"
+            + "test parses_config_with_default_values ... FAILED\n"
+            + "test rejects_config_with_missing_required_field ... FAILED\n"
+            + "failures:\n\n"
+            + "---- parses_config_with_default_values stdout ----\n\n"
+            + "thread 'parses_config_with_default_values' panicked at "
+            + "crates/config_parser/tests/config_validation.rs:849:10:\n"
+            + 'configuration parsing should succeed: MissingField("timeout_ms")\n\n'
+            + "---- rejects_config_with_missing_required_field stdout ----\n\n"
+            + "thread 'rejects_config_with_missing_required_field' panicked at "
+            + "crates/config_parser/tests/config_validation.rs:813:10:\n"
+            + 'configuration validation should report the expected field: MissingField("timeout_ms")\n\n'
+            + "failures:\n"
+            + "    parses_config_with_default_values\n"
+            + "    rejects_config_with_missing_required_field\n\n"
+            + "test result: FAILED. 45 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n\n"
+            + "error: test failed, to rerun pass `-p config_parser --test config_validation`\n"
+            + "".join(f"     Running post_failure_noise_{i}\n" for i in range(180))
+        )
+        with patch(
+            "tools.cargo_tool.subprocess.run",
+            return_value=_mock_run(returncode=101, stdout=output, stderr=""),
+        ):
+            result = tool.run_tests()
+
+        assert not result.success
+        assert "parses_config_with_default_values" in result.error
+        assert "rejects_config_with_missing_required_field" in result.error
+        assert 'MissingField("timeout_ms")' in result.error
+        assert "error: test failed, to rerun pass `-p config_parser --test config_validation`" in result.error
+
     def test_timeout_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
         with patch("tools.cargo_tool.subprocess.run", side_effect=__import__("subprocess").TimeoutExpired("cmd", 1)):
