@@ -57,8 +57,17 @@ def _dirty_paths(cwd: Path) -> tuple[set[str], set[str]] | None:
 
 def _safe_project_path(cwd: Path, relative_path: str) -> Path | None:
     root = cwd.resolve()
-    path = (root / relative_path).resolve(strict=False)
-    if path == root or root in path.parents:
+    if Path(relative_path).is_absolute():
+        return None
+    normalized = _normalize_relative_path(relative_path)
+    if not normalized:
+        return None
+    path_parts = Path(normalized).parts
+    if any(part == ".." for part in path_parts):
+        return None
+    path = root.joinpath(*path_parts)
+    parent = path.parent.resolve(strict=False)
+    if parent == root or root in parent.parents:
         return path
     return None
 
@@ -72,6 +81,19 @@ def _file_mode(path: Path) -> int | None:
         return stat.S_IMODE(path.stat().st_mode)
     except OSError:
         return None
+
+
+def _path_entry_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _remove_artifact_path(path: Path) -> str | None:
+    if not _path_entry_exists(path):
+        return None
+    if path.is_dir() and not path.is_symlink():
+        return "artifact path is a directory"
+    path.unlink()
+    return None
 
 
 def _is_ignored_root(path: str, ignored_roots: tuple[str, ...]) -> bool:
@@ -111,7 +133,7 @@ def snapshot_validation_dirty_files(
             exists = True
         except FileNotFoundError:
             content = None
-            exists = False
+            exists = project_path.is_symlink()
         except (IsADirectoryError, PermissionError):
             content = None
             exists = True
@@ -187,19 +209,15 @@ def restore_validation_artifacts(
                     if restore_error:
                         errors.append(f"{artifact.path}: {restore_error}")
                     continue
-                if project_path.exists():
-                    if project_path.is_dir():
-                        errors.append(f"{artifact.path}: artifact path is a directory")
-                    else:
-                        project_path.unlink()
+                remove_error = _remove_artifact_path(project_path)
+                if remove_error:
+                    errors.append(f"{artifact.path}: {remove_error}")
                 continue
 
             if not before_snapshot.exists:
-                if project_path.exists():
-                    if project_path.is_dir():
-                        errors.append(f"{artifact.path}: artifact path is a directory")
-                    else:
-                        project_path.unlink()
+                remove_error = _remove_artifact_path(project_path)
+                if remove_error:
+                    errors.append(f"{artifact.path}: {remove_error}")
                 continue
 
             if before_snapshot.content is None:
@@ -208,11 +226,9 @@ def restore_validation_artifacts(
                     if restore_error:
                         errors.append(f"{artifact.path}: {restore_error}")
                     continue
-                if project_path.exists():
-                    if project_path.is_dir():
-                        errors.append(f"{artifact.path}: artifact path is a directory")
-                    else:
-                        project_path.unlink()
+                remove_error = _remove_artifact_path(project_path)
+                if remove_error:
+                    errors.append(f"{artifact.path}: {remove_error}")
                 continue
 
             project_path.parent.mkdir(parents=True, exist_ok=True)

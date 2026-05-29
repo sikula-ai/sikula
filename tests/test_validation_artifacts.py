@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from core.validation_artifacts import (
     FileSnapshot,
     ValidationArtifact,
@@ -26,6 +28,13 @@ def _init_repo(path: Path) -> None:
 
 def _artifact(path: str, before: str = "tracked", after: str = "tracked") -> ValidationArtifact:
     return ValidationArtifact(path=path, before_status=before, after_status=after)
+
+
+def _make_broken_symlink(path: Path, target: str = "missing-target") -> None:
+    try:
+        path.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
 
 
 def test_snapshot_returns_empty_when_git_command_fails(tmp_path: Path, monkeypatch):
@@ -74,6 +83,21 @@ def test_snapshot_records_directory_like_dirty_path(tmp_path: Path, monkeypatch)
     assert entry.mode is not None
 
 
+def test_snapshot_records_broken_symlink_dirty_path(tmp_path: Path):
+    _init_repo(tmp_path)
+    link = tmp_path / "generated-link"
+    _make_broken_symlink(link)
+
+    snapshot = snapshot_validation_dirty_files(tmp_path)
+
+    assert snapshot["generated-link"] == FileSnapshot(
+        status="untracked",
+        exists=True,
+        content=None,
+        mode=None,
+    )
+
+
 def test_restore_rejects_paths_outside_project_root(tmp_path: Path):
     errors = restore_validation_artifacts(
         tmp_path,
@@ -96,6 +120,21 @@ def test_restore_deletes_new_untracked_file(tmp_path: Path):
 
     assert errors == []
     assert not artifact.exists()
+
+
+def test_restore_deletes_new_broken_symlink_artifact(tmp_path: Path):
+    artifact = tmp_path / "generated-link"
+    _make_broken_symlink(artifact)
+
+    errors = restore_validation_artifacts(
+        tmp_path,
+        before={},
+        artifacts=[_artifact("generated-link", before="clean", after="untracked")],
+    )
+
+    assert errors == []
+    assert not artifact.exists()
+    assert not artifact.is_symlink()
 
 
 def test_restore_reports_directory_for_new_untracked_artifact(tmp_path: Path):
@@ -152,6 +191,22 @@ def test_restore_deletes_file_recreated_after_task_deleted_it(tmp_path: Path):
     assert not source.exists()
 
 
+def test_restore_deletes_broken_symlink_recreated_after_task_deleted_it(tmp_path: Path):
+    source = tmp_path / "src" / "main.py"
+    source.parent.mkdir()
+    _make_broken_symlink(source)
+
+    errors = restore_validation_artifacts(
+        tmp_path,
+        before={"src/main.py": FileSnapshot(status="tracked", exists=False, content=None, mode=None)},
+        artifacts=[_artifact("src/main.py")],
+    )
+
+    assert errors == []
+    assert not source.exists()
+    assert not source.is_symlink()
+
+
 def test_restore_reports_directory_recreated_after_task_deleted_it(tmp_path: Path):
     source = tmp_path / "src" / "main.py"
     source.mkdir(parents=True)
@@ -177,6 +232,21 @@ def test_restore_deletes_existing_untracked_file_with_unreadable_snapshot(tmp_pa
 
     assert errors == []
     assert not artifact.exists()
+
+
+def test_restore_deletes_existing_untracked_broken_symlink_with_unreadable_snapshot(tmp_path: Path):
+    artifact = tmp_path / "generated-link"
+    _make_broken_symlink(artifact)
+
+    errors = restore_validation_artifacts(
+        tmp_path,
+        before={"generated-link": FileSnapshot(status="untracked", exists=True, content=None, mode=None)},
+        artifacts=[_artifact("generated-link", before="untracked", after="untracked")],
+    )
+
+    assert errors == []
+    assert not artifact.exists()
+    assert not artifact.is_symlink()
 
 
 def test_restore_reports_existing_untracked_directory_with_unreadable_snapshot(tmp_path: Path):
