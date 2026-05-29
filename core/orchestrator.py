@@ -1305,7 +1305,9 @@ class Orchestrator:
                 if artifacts_ok:
                     check_error = diagnostic_excerpt(result.error or result.output, limit=_FIXER_ERROR_LIMIT)
                 else:
-                    check_error = state.check_errors[-1] if state.check_errors else "validation artifacts cleanup failed"
+                    check_error = (
+                        state.check_errors[-1] if state.check_errors else "validation artifacts cleanup failed"
+                    )
                 log.error(f"Check {name} failed ({_fmt_elapsed(elapsed_s)}):\n{check_error}")
                 if artifacts_ok:
                     state.check_errors.append(f"[{name}]\n{check_error}")

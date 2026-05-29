@@ -87,9 +87,7 @@ def snapshot_validation_dirty_files(
         return {}
     paths, untracked_paths = dirty
     normalized_ignored_roots = tuple(
-        root
-        for root in (_normalize_relative_path(path) for path in (ignored_roots or ()))
-        if root and root != "."
+        root for root in (_normalize_relative_path(path) for path in (ignored_roots or ())) if root and root != "."
     )
     snapshot: dict[str, FileSnapshot] = {}
     for path in sorted(paths):
