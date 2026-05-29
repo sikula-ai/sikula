@@ -456,6 +456,8 @@ progress:
 
 The **sync** step calls `BuildTool.sync()` once before the first build and again whenever the fixer changes a build-config file. It resolves dependencies and generates any required sources. A sync failure is treated like a build failure — the error is passed to the fixer and the loop continues.
 
+Build, test, and check commands are expected to validate the repository, not leave new source files or mutate task output. Sikula snapshots non-ignored dirty files before each command, restores any unexpected command-produced repository artifacts afterward, and records that cleanup in task state. Ignored build outputs and caches are left alone. If cleanup itself fails, the validation step fails and the normal fixer loop gets the diagnostic.
+
 **Validation command coverage:** task descriptions often mention validation commands such as formatters, linters, tests, or report generators. Sikula treats those as acceptance criteria for the configured pipeline, not as shell commands for agents to run manually. The reviewer sees the effective build/test/check commands from the Sikula config file (auto-discovered `.sikula/config.yaml` by default, or the file passed with `--config`). That configured validation pipeline is what Sikula can execute. For `sikula run`, validation command coverage is the preflight/reviewer check that task-described commands are represented by that pipeline.
 
 To make a command count as task-described validation, write it explicitly: in backticks, in a shell code fence, with a `$` prompt, or as a command list under a heading/prefix such as `Verification:` or `Run:`; Markdown blank separator lines after the heading are allowed. Bare tool names such as `cargo` or `npm` are not treated as validation commands. If a `sikula run` task command is not covered there, it is reported as a validation coverage gap so you can add the same command to the effective build/test/check config or adjust the task before rerunning. In `sikula review` modes, commands found in PR/review text are informational branch-verification context and do not preflight-abort review/fix.
@@ -894,6 +896,8 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
 - Validation can include sync, compile/typecheck, tests, and configured quality checks.
   Check entries support `name`, `command`, `timeout`, and optional deterministic
   `fix_command`.
+- Build, test, and check commands are guarded against unexpected non-ignored repository
+  artifacts; Sikula restores those files and records the cleanup for audit.
 - Task-described validation commands are matched against the effective configured
   build/test/check pipeline. In `sikula run`, uncovered commands fail as validation
   coverage gaps; in `sikula review`, PR/review commands are informational context.

@@ -80,6 +80,7 @@ def _final_summary(state: "TaskState") -> dict:
         "validation_failures_count": sum(
             1 for entry in state.validation_cycle_records if entry.get("status") == "failed"
         ),
+        "validation_artifacts_count": len(state.validation_artifact_records),
         "fix_attempts": len(state.fix_cycle_records),
         "plan_completed": state.plan_completed,
         "final_full_task_review_done": state.final_full_task_review_done,
@@ -186,6 +187,7 @@ class TaskState:
     testability_gaps: list[dict] = field(default_factory=list)
     fix_cycle_records: list[dict] = field(default_factory=list)
     validation_cycle_records: list[dict] = field(default_factory=list)
+    validation_artifact_records: list[dict] = field(default_factory=list)
     task_file: Optional[str] = None
     worktree_path: Optional[str] = None
     worktree_branch: Optional[str] = None
@@ -326,6 +328,9 @@ class TaskState:
 
 
 class StateStore:
+    def internal_paths(self) -> list[Path]:
+        return []
+
     def load(self, task_id: str) -> Optional[TaskState]:
         raise NotImplementedError
 
@@ -364,6 +369,9 @@ class JsonStateStore(StateStore):
     def __init__(self, state_dir: Path) -> None:
         self._dir = Path(state_dir)
         self._lock = threading.RLock()
+
+    def internal_paths(self) -> list[Path]:
+        return [self._dir]
 
     def _path(self, task_id: str) -> Path:
         return self._dir / f"{task_id}.json"

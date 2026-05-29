@@ -45,6 +45,11 @@ CONSTRAINTS — follow strictly:
 - NEVER modify or delete any production source file
 - NEVER delete existing tests unless they directly conflict with the new behaviour
 - Do not write tests that pass trivially (empty assertions, always-true conditions)
+- Tests must not leave generated source/runtime files, snapshots, reports, caches, or other
+  repository changes behind during normal test execution. If a test needs temporary files,
+  write them to an OS temp directory or a project-ignored temp/cache path and clean them up.
+- Do not change production source, build configuration, dependency declarations, or pipeline
+  settings just to make a generated test harness compile or run.
 - Do not add comments or documentation unless required by the task or project guidelines.
   When modifying a function, class, or property that already has a doc comment, update it
   to stay accurate (e.g. add or remove @param entries) — do not delete it.
