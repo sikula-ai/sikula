@@ -6,6 +6,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from core.diagnostics import cargo_test_failure_excerpt
 from tools.base_tool import BuildTool, Sandbox, ToolResult, tool_error_excerpt
 
 log = logging.getLogger(__name__)
@@ -15,12 +16,23 @@ _BUILD_CONFIG_FILES = ("Cargo.toml", "Cargo.lock")
 _DEFAULT_COMPILE_COMMAND = "cargo check"
 _DEFAULT_TEST_COMMAND = "cargo test"
 _DEFAULT_TIMEOUT = 600
+_CARGO_ERROR_LIMIT = 8000
 _RUST_HUNK_RE = re.compile(
     r"@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
     r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@"
 )
 _RUST_CFG_TEST_RE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 _RUST_TEST_MODULE_RE = re.compile(r"\bmod\s+tests\b")
+
+
+def _is_cargo_test_command(command: str) -> bool:
+    return bool(re.match(r"^\s*cargo\s+(?:\S+\s+)*test(?:\s|$)", command))
+
+
+def _cargo_error_excerpt(command: str, output: str) -> str:
+    if _is_cargo_test_command(command):
+        return cargo_test_failure_excerpt(output, limit=_CARGO_ERROR_LIMIT)
+    return tool_error_excerpt(output)
 
 
 def _rust_raw_string_end(line: str, start: int) -> int | None:
@@ -255,7 +267,7 @@ class CargoTool(BuildTool):
             )
             output = r.stdout + r.stderr
             if r.returncode != 0:
-                return ToolResult(success=False, output=output, error=tool_error_excerpt(output))
+                return ToolResult(success=False, output=output, error=_cargo_error_excerpt(command, output))
             return ToolResult(success=True, output=output)
         except subprocess.TimeoutExpired:
             return ToolResult(success=False, output="", error=f"Command timed out: {command}")
