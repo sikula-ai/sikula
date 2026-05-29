@@ -18,6 +18,10 @@ The countries list shows population formatted with comma separators
   - in an existing country detail screen, if the app already has one
 - If the app does not have a country detail screen yet, do not create one for this task.
 - Preserving backend country detail data is enough in that case.
+- Preserve any already implemented region/name filtering, country detail navigation, back
+  behaviour, and country card layout.
+- Treat the current checked-out project state as the source of truth. Preserve existing UI/API
+  behaviour unless this task explicitly changes it.
 - Add or update tests for all threshold and trailing-zero cases.
 
 ## Out of scope
