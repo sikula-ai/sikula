@@ -1075,6 +1075,15 @@ class Orchestrator:
     def _validation_artifact_root(self, state: TaskState) -> Path:
         if state.worktree_base:
             return Path(state.worktree_base).resolve()
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=self._config.project_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return Path(result.stdout.strip()).resolve()
         return self._config.project_root.resolve()
 
     def _validation_artifact_ignored_roots(self, root: Path) -> tuple[str, ...]:

@@ -10,6 +10,7 @@ from typing import Callable
 
 import pytest
 
+import core.orchestrator as orchestrator_module
 from agents.base_agent import AgentResult
 from tests.conftest import StubLLMClient
 from core.orchestrator import Orchestrator, OrchestratorConfig, _build_tool, _fmt_elapsed
@@ -2995,6 +2996,49 @@ class TestValidationArtifacts:
             }
         ]
 
+    def test_no_isolate_subproject_validation_cleans_repo_root_artifacts(self, tmp_path: Path):
+        repo = tmp_path
+        project = repo / "apps" / "demo"
+        (project / "src").mkdir(parents=True)
+        (project / "src" / "main.py").write_text("# placeholder\n")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+        orch, _, build = _make_orchestrator(
+            project,
+            run_build=True,
+            run_tests=True,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+
+        def write_repo_root_artifact() -> None:
+            (repo / "coverage.json").write_text("{}\n")
+
+        build.test_side_effect = write_repo_root_artifact
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            build_synced=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert not (repo / "coverage.json").exists()
+        assert result.validation_artifact_records[0]["artifacts"] == [
+            {
+                "path": "coverage.json",
+                "before_status": "clean",
+                "after_status": "untracked",
+            }
+        ]
+
     def test_validation_artifact_cleanup_rescans_after_restoring_gitignore(self, tmp_project: Path):
         (tmp_project / ".gitignore").write_text("coverage/\n")
         subprocess.run(["git", "add", ".gitignore"], cwd=tmp_project, check=True, capture_output=True)
@@ -3039,6 +3083,40 @@ class TestValidationArtifacts:
                 }
             ],
         ]
+
+    def test_validation_artifact_cleanup_fails_after_repeated_rescan_artifacts(self, tmp_project: Path, monkeypatch):
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            run_build=True,
+            run_tests=True,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=True)
+        before = orch._validation_artifact_snapshot(state)
+        artifact = tmp_project / "reports" / "stuck.cache"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("keeps reappearing\n")
+        monkeypatch.setattr(orchestrator_module, "_VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES", 2)
+        monkeypatch.setattr(orchestrator_module, "restore_validation_artifacts", lambda *_args: [])
+
+        ok = orch._record_validation_artifacts(
+            state,
+            phase="check",
+            before=before,
+            check_name="typecheck",
+        )
+
+        assert not ok
+        assert state.check_status == "failed"
+        assert (
+            "check/typecheck command produced additional repository artifact(s) after 2 cleanup passes"
+            in (state.check_errors[-1])
+        )
+        assert [record["status"] for record in state.validation_artifact_records] == ["cleaned", "cleaned"]
+        assert [record["check_name"] for record in state.validation_artifact_records] == ["typecheck", "typecheck"]
 
 
 # ---------------------------------------------------------------------------
