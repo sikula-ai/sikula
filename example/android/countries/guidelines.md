@@ -256,6 +256,14 @@ fun NavGraphBuilder.countriesGraph(navController: NavController) {
 
 ## Testing
 
+### Example testing scope
+
+- Use the existing unit/integration test setup for example tasks.
+- Do not add new UI automation, screenshot, emulator, or simulator test infrastructure unless
+  the task explicitly asks for it.
+- Do not report a testability gap solely because full runtime UI automation is out of scope for
+  examples.
+
 ### Unit tests
 
 - Framework: JUnit 5 (Jupiter) — annotate with `@Test`, not JUnit 4.

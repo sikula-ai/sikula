@@ -83,9 +83,14 @@ export type Country = {
 - Test API routes by calling `handleRequest(new Request(...))`; do not bind real ports.
 - Test frontend behaviour through pure view-model helpers unless a task adds browser test
   infrastructure.
+- Do not add new end-to-end UI automation, screenshot, or browser infrastructure unless the task
+  explicitly asks for it.
+- Do not report a testability gap solely because full runtime browser automation is out of scope
+  for examples.
 - Do not write source-inspection tests that parse `.ts` files as text.
 - If a task cannot be tested through the existing `bun:test` setup, report a `TESTABILITY GAP`
-  instead of changing project infrastructure.
+  instead of changing project infrastructure, except for runtime browser automation that is
+  already out of scope above.
 
 ---
 
