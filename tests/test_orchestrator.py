@@ -2950,6 +2950,51 @@ class TestValidationArtifacts:
         assert (tmp_project / "coverage" / "index.html").exists()
         assert result.validation_artifact_records == []
 
+    def test_isolated_subproject_validation_cleans_repo_root_artifacts(self, tmp_path: Path):
+        repo = tmp_path
+        project = repo / "apps" / "demo"
+        (project / "src").mkdir(parents=True)
+        (project / "src" / "main.py").write_text("# placeholder\n")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+        orch, _, build = _make_orchestrator(
+            project,
+            run_build=True,
+            run_tests=True,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+
+        def write_repo_root_artifact() -> None:
+            (repo / "coverage.json").write_text("{}\n")
+
+        build.test_side_effect = write_repo_root_artifact
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            build_synced=True,
+            worktree_path=str(project),
+            worktree_base=str(repo),
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert not (repo / "coverage.json").exists()
+        assert result.validation_artifact_records[0]["artifacts"] == [
+            {
+                "path": "coverage.json",
+                "before_status": "clean",
+                "after_status": "untracked",
+            }
+        ]
+
     def test_validation_artifact_cleanup_rescans_after_restoring_gitignore(self, tmp_project: Path):
         (tmp_project / ".gitignore").write_text("coverage/\n")
         subprocess.run(["git", "add", ".gitignore"], cwd=tmp_project, check=True, capture_output=True)

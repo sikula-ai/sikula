@@ -1072,12 +1072,17 @@ class Orchestrator:
             log.info("%s changed build-config files — will re-sync before next build", source.capitalize())
             state.build_synced = False
 
-    def _validation_artifact_ignored_roots(self) -> tuple[str, ...]:
-        project_root = self._config.project_root.resolve()
+    def _validation_artifact_root(self, state: TaskState) -> Path:
+        if state.worktree_base:
+            return Path(state.worktree_base).resolve()
+        return self._config.project_root.resolve()
+
+    def _validation_artifact_ignored_roots(self, root: Path) -> tuple[str, ...]:
+        artifact_root = root.resolve()
         ignored_roots: list[str] = []
         for internal_path in self._store.internal_paths():
             try:
-                relative = Path(internal_path).resolve(strict=False).relative_to(project_root)
+                relative = Path(internal_path).resolve(strict=False).relative_to(artifact_root)
             except (OSError, ValueError):
                 continue
             relative_text = relative.as_posix().rstrip("/")
@@ -1085,10 +1090,11 @@ class Orchestrator:
                 ignored_roots.append(relative_text)
         return tuple(ignored_roots)
 
-    def _validation_artifact_snapshot(self) -> dict:
+    def _validation_artifact_snapshot(self, state: TaskState) -> dict:
+        root = self._validation_artifact_root(state)
         return snapshot_validation_dirty_files(
-            self._config.project_root,
-            ignored_roots=self._validation_artifact_ignored_roots(),
+            root,
+            ignored_roots=self._validation_artifact_ignored_roots(root),
         )
 
     def _record_validation_artifacts(
@@ -1109,7 +1115,7 @@ class Orchestrator:
 
         cleanup_passes = 0
         while True:
-            after = self._validation_artifact_snapshot()
+            after = self._validation_artifact_snapshot(state)
             artifacts = detect_validation_artifacts(before, after)
             if new_untracked_only:
                 artifacts = [
@@ -1142,7 +1148,7 @@ class Orchestrator:
                 return False
 
             cleanup_passes += 1
-            cleanup_errors = restore_validation_artifacts(self._config.project_root, before, artifacts)
+            cleanup_errors = restore_validation_artifacts(self._validation_artifact_root(state), before, artifacts)
             cleaned = not cleanup_errors
             artifact_records = [artifact.to_record() for artifact in artifacts]
             record: dict = {
@@ -1280,7 +1286,7 @@ class Orchestrator:
             name = check.get("name", "check")
             log.info(f"--- Phase: check/{name} ({progress}) ---")
             t0 = time.perf_counter()
-            artifact_before = self._validation_artifact_snapshot()
+            artifact_before = self._validation_artifact_snapshot(state)
             with self._active_operation(state, phase="check", message=f"Running check/{name}"):
                 result = build_tool.run_check(name, check)
             elapsed_s = time.perf_counter() - t0
@@ -1301,7 +1307,7 @@ class Orchestrator:
                 if "timeout" in check:
                     fix_cfg["timeout"] = check["timeout"]
                 t0 = time.perf_counter()
-                autofix_artifact_before = self._validation_artifact_snapshot()
+                autofix_artifact_before = self._validation_artifact_snapshot(state)
                 with self._active_operation(
                     state,
                     phase="check_autofix",
@@ -1332,7 +1338,7 @@ class Orchestrator:
                 )
                 if fix_success:
                     t0 = time.perf_counter()
-                    artifact_before = self._validation_artifact_snapshot()
+                    artifact_before = self._validation_artifact_snapshot(state)
                     with self._active_operation(state, phase="check", message=f"Running check/{name}"):
                         result = build_tool.run_check(name, check)
                     elapsed_s = time.perf_counter() - t0
@@ -1377,7 +1383,7 @@ class Orchestrator:
         build_tool: BuildTool = self._tools["build"]
         log.info("Running tests...")
         t0 = time.perf_counter()
-        artifact_before = self._validation_artifact_snapshot()
+        artifact_before = self._validation_artifact_snapshot(state)
         with self._active_operation(state, phase="test", message="Running tests"):
             result = build_tool.run_tests()
         elapsed_s = time.perf_counter() - t0
@@ -1432,7 +1438,7 @@ class Orchestrator:
         build_tool: BuildTool = self._tools["build"]
         log.info("Running compile check...")
         t0 = time.perf_counter()
-        artifact_before = self._validation_artifact_snapshot()
+        artifact_before = self._validation_artifact_snapshot(state)
         with self._active_operation(state, phase="build", message="Running compile check"):
             result = build_tool.compile_check()
         elapsed_s = time.perf_counter() - t0
