@@ -89,11 +89,8 @@ export type Country = {
   asks for project infrastructure changes.
 - Do not add new end-to-end UI automation, screenshot, or browser infrastructure unless the task
   explicitly asks for it.
-- Do not report a testability gap solely because full runtime browser automation is out of scope
-  for examples.
-- If a task cannot be tested through the existing Vitest/Testing Library setup, report a
-  `TESTABILITY GAP` instead of writing source-inspection tests, except for runtime browser
-  automation that is already out of scope above.
+- If an acceptance contract within the existing test surface cannot be meaningfully tested through
+  Vitest/Testing Library, report a `TESTABILITY GAP` instead of writing source-inspection tests.
 
 ---
 

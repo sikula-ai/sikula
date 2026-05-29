@@ -81,16 +81,13 @@ export type Country = {
 - Tests live in `tests/` and use `bun:test`.
 - Test pure domain functions directly.
 - Test API routes by calling `handleRequest(new Request(...))`; do not bind real ports.
-- Test frontend behaviour through pure view-model helpers unless a task adds browser test
-  infrastructure.
+- Test frontend behaviour through pure view-model helpers or the existing lightweight
+  `bun:test` harness.
 - Do not add new end-to-end UI automation, screenshot, or browser infrastructure unless the task
   explicitly asks for it.
-- Do not report a testability gap solely because full runtime browser automation is out of scope
-  for examples.
 - Do not write source-inspection tests that parse `.ts` files as text.
-- If a task cannot be tested through the existing `bun:test` setup, report a `TESTABILITY GAP`
-  instead of changing project infrastructure, except for runtime browser automation that is
-  already out of scope above.
+- If an acceptance contract within the existing test surface cannot be meaningfully tested through
+  `bun:test`, report a `TESTABILITY GAP` instead of changing project infrastructure.
 
 ---
 
