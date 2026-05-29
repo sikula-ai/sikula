@@ -15,6 +15,7 @@ class FileSnapshot:
     exists: bool
     content: bytes | None
     mode: int | None
+    symlink_target: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +97,50 @@ def _remove_artifact_path(path: Path) -> str | None:
     return None
 
 
+def _snapshot_path(status: str, path: Path) -> FileSnapshot:
+    if path.is_symlink():
+        return FileSnapshot(
+            status=status,
+            exists=True,
+            content=None,
+            mode=None,
+            symlink_target=str(path.readlink()),
+        )
+    try:
+        content = path.read_bytes()
+        exists = True
+    except FileNotFoundError:
+        content = None
+        exists = False
+    except (IsADirectoryError, PermissionError):
+        content = None
+        exists = True
+    return FileSnapshot(
+        status=status,
+        exists=exists,
+        content=content,
+        mode=_file_mode(path) if exists else None,
+    )
+
+
+def _restore_symlink(path: Path, target: str) -> str | None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    remove_error = _remove_artifact_path(path)
+    if remove_error:
+        return remove_error
+    path.symlink_to(target)
+    return None
+
+
+def _prepare_regular_file_restore(path: Path) -> str | None:
+    if path.is_symlink():
+        path.unlink()
+        return None
+    if path.exists() and path.is_dir():
+        return "artifact path is a directory"
+    return None
+
+
 def _is_ignored_root(path: str, ignored_roots: tuple[str, ...]) -> bool:
     normalized = _normalize_relative_path(path)
     return any(normalized == root or normalized.startswith(f"{root}/") for root in ignored_roots)
@@ -128,21 +173,7 @@ def snapshot_validation_dirty_files(
         if project_path is None:
             continue
         status = "untracked" if path in untracked_paths else "tracked"
-        try:
-            content = project_path.read_bytes()
-            exists = True
-        except FileNotFoundError:
-            content = None
-            exists = project_path.is_symlink()
-        except (IsADirectoryError, PermissionError):
-            content = None
-            exists = True
-        snapshot[path] = FileSnapshot(
-            status=status,
-            exists=exists,
-            content=content,
-            mode=_file_mode(project_path) if exists else None,
-        )
+        snapshot[path] = _snapshot_path(status, project_path)
     return snapshot
 
 
@@ -220,6 +251,12 @@ def restore_validation_artifacts(
                     errors.append(f"{artifact.path}: {remove_error}")
                 continue
 
+            if before_snapshot.symlink_target is not None:
+                restore_error = _restore_symlink(project_path, before_snapshot.symlink_target)
+                if restore_error:
+                    errors.append(f"{artifact.path}: {restore_error}")
+                continue
+
             if before_snapshot.content is None:
                 if artifact.before_status == "tracked":
                     restore_error = _restore_head_file(cwd, artifact.path)
@@ -232,6 +269,10 @@ def restore_validation_artifacts(
                 continue
 
             project_path.parent.mkdir(parents=True, exist_ok=True)
+            restore_error = _prepare_regular_file_restore(project_path)
+            if restore_error:
+                errors.append(f"{artifact.path}: {restore_error}")
+                continue
             project_path.write_bytes(before_snapshot.content)
             _restore_file_mode(project_path, before_snapshot.mode)
         except OSError as exc:
