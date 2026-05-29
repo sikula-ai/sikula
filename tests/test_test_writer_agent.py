@@ -221,12 +221,49 @@ class TestTestWriterAgentPrompt:
         config = {"sandbox": {"allowed_test_write_paths": ["tests/"]}, "test_writer": {"coverage_target": 85}}
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
-        assert "85%" in stub_llm.agent_calls[0]
+        prompt = stub_llm.agent_calls[0]
+        assert "85%" in prompt
+        assert "Within the configured test surface" in prompt
 
     def test_default_coverage_target_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
         assert "90%" in stub_llm.agent_calls[0]
+
+    def test_default_test_surface_policy_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "Test surface policy: existing_infrastructure" in prompt
+        assert "Use only existing project test infrastructure" in prompt
+        assert "Missing out-of-surface harnesses are not by themselves a TESTABILITY GAP" in prompt
+        assert state.test_write_records[0]["test_surface_policy"] == "existing_infrastructure"
+
+    def test_complete_test_surface_policy_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        config = {
+            **_config_with_test_paths(),
+            "test_writer": {"test_surface_policy": "complete"},
+        }
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "Test surface policy: complete" in prompt
+        assert "cover the complete changed behavior" in prompt
+        assert "report a TESTABILITY GAP" in prompt
+        assert state.test_write_records[0]["test_surface_policy"] == "complete"
+
+    def test_unknown_test_surface_policy_falls_back_to_existing_infrastructure(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
+        config = {
+            **_config_with_test_paths(),
+            "test_writer": {"test_surface_policy": "unknown"},
+        }
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "Test surface policy: existing_infrastructure" in prompt
+        assert state.test_write_records[0]["test_surface_policy"] == "existing_infrastructure"
 
     def test_diff_unavailable_fallback_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state()
@@ -266,6 +303,8 @@ class TestTestWriterAgentPrompt:
         assert "cover each entry point separately" in prompt
         assert "promises, futures" in prompt
         assert "observable failure/error path through the entry point" in prompt
+        assert "configured" in prompt
+        assert "test surface can do so" in prompt
         assert "report a TESTABILITY GAP" in prompt
 
     def test_structured_input_contract_matrix_in_prompt(self, stub_llm: StubLLMClient, file_tool):
