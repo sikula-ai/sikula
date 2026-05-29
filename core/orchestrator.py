@@ -73,6 +73,7 @@ _SCOPE_FINAL_FULL_TASK = "final_full_task"
 _FIXER_ERROR_LIMIT = 6000
 _LOG_ERROR_LIMIT = 2000
 _VALIDATION_ARTIFACT_ERROR_LIMIT = 2000
+_VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES = 5
 
 
 def _phase_scope_label(state: TaskState) -> str:
@@ -1106,67 +1107,91 @@ class Orchestrator:
         without letting artifacts leak into the final commit.
         """
 
-        after = self._validation_artifact_snapshot()
-        artifacts = detect_validation_artifacts(before, after)
-        if new_untracked_only:
-            artifacts = [
-                artifact
-                for artifact in artifacts
-                if artifact.before_status == "clean" and artifact.after_status == "untracked"
-            ]
-        if not artifacts:
-            return True
+        cleanup_passes = 0
+        while True:
+            after = self._validation_artifact_snapshot()
+            artifacts = detect_validation_artifacts(before, after)
+            if new_untracked_only:
+                artifacts = [
+                    artifact
+                    for artifact in artifacts
+                    if artifact.before_status == "clean" and artifact.after_status == "untracked"
+                ]
+            if not artifacts:
+                return True
 
-        cleanup_errors = restore_validation_artifacts(self._config.project_root, before, artifacts)
-        cleaned = not cleanup_errors
-        artifact_records = [artifact.to_record() for artifact in artifacts]
-        record: dict = {
-            "phase": phase,
-            "status": "cleaned" if cleaned else "cleanup_failed",
-            "build_iteration": state.build_iterations,
-            "step": state.current_step,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "artifacts": artifact_records,
-        }
-        if state.active_scope:
-            record["scope"] = state.active_scope
-        if check_name:
-            record["check_name"] = check_name
-        if cleanup_errors:
-            record["cleanup_errors"] = cleanup_errors
-        state.validation_artifact_records.append(record)
+            if cleanup_passes >= _VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES:
+                error = (
+                    f"{phase} command produced additional repository artifact(s) after "
+                    f"{_VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES} cleanup passes"
+                )
+                if check_name:
+                    error = (
+                        f"check/{check_name} command produced additional repository artifact(s) after "
+                        f"{_VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES} cleanup passes"
+                    )
+                log.error(error)
+                state.record("orchestrator", "validation_artifacts_cleanup_failed", error[:500])
+                state.record_validation(
+                    "validation_artifact",
+                    "failed",
+                    error=error,
+                    check_name=check_name,
+                )
+                self._append_validation_artifact_error(state, phase, error)
+                return False
 
-        paths = ", ".join(f"`{artifact.path}`" for artifact in artifacts[:10])
-        if len(artifacts) > 10:
-            paths += f", ... ({len(artifacts)} total)"
-        message = f"{phase} command produced unexpected repository artifact(s): {paths}"
-        if check_name:
-            message = f"check/{check_name} command produced unexpected repository artifact(s): {paths}"
-            if phase == "check_autofix":
-                message = f"check/{check_name} autofix command produced unexpected repository artifact(s): {paths}"
+            cleanup_passes += 1
+            cleanup_errors = restore_validation_artifacts(self._config.project_root, before, artifacts)
+            cleaned = not cleanup_errors
+            artifact_records = [artifact.to_record() for artifact in artifacts]
+            record: dict = {
+                "phase": phase,
+                "status": "cleaned" if cleaned else "cleanup_failed",
+                "build_iteration": state.build_iterations,
+                "step": state.current_step,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "artifacts": artifact_records,
+            }
+            if state.active_scope:
+                record["scope"] = state.active_scope
+            if check_name:
+                record["check_name"] = check_name
+            if cleanup_errors:
+                record["cleanup_errors"] = cleanup_errors
+            state.validation_artifact_records.append(record)
 
-        if cleaned:
-            log.warning("%s — cleaned automatically", message)
-            state.record("orchestrator", "validation_artifacts_cleaned", message)
+            paths = ", ".join(f"`{artifact.path}`" for artifact in artifacts[:10])
+            if len(artifacts) > 10:
+                paths += f", ... ({len(artifacts)} total)"
+            message = f"{phase} command produced unexpected repository artifact(s): {paths}"
+            if check_name:
+                message = f"check/{check_name} command produced unexpected repository artifact(s): {paths}"
+                if phase == "check_autofix":
+                    message = f"check/{check_name} autofix command produced unexpected repository artifact(s): {paths}"
+
+            if cleaned:
+                log.warning("%s — cleaned automatically", message)
+                state.record("orchestrator", "validation_artifacts_cleaned", message)
+                state.record_validation(
+                    "validation_artifact",
+                    "cleaned",
+                    error=message,
+                    check_name=check_name,
+                )
+                continue
+
+            error = message + "; cleanup failed: " + "; ".join(cleanup_errors)
+            log.error(error)
+            state.record("orchestrator", "validation_artifacts_cleanup_failed", error[:500])
             state.record_validation(
                 "validation_artifact",
-                "cleaned",
-                error=message,
+                "failed",
+                error=error,
                 check_name=check_name,
             )
-            return True
-
-        error = message + "; cleanup failed: " + "; ".join(cleanup_errors)
-        log.error(error)
-        state.record("orchestrator", "validation_artifacts_cleanup_failed", error[:500])
-        state.record_validation(
-            "validation_artifact",
-            "failed",
-            error=error,
-            check_name=check_name,
-        )
-        self._append_validation_artifact_error(state, phase, error)
-        return False
+            self._append_validation_artifact_error(state, phase, error)
+            return False
 
     def _append_validation_artifact_error(self, state: TaskState, phase: str, error: str) -> None:
         excerpt = diagnostic_excerpt(error, limit=_VALIDATION_ARTIFACT_ERROR_LIMIT)

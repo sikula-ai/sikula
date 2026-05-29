@@ -2950,6 +2950,51 @@ class TestValidationArtifacts:
         assert (tmp_project / "coverage" / "index.html").exists()
         assert result.validation_artifact_records == []
 
+    def test_validation_artifact_cleanup_rescans_after_restoring_gitignore(self, tmp_project: Path):
+        (tmp_project / ".gitignore").write_text("coverage/\n")
+        subprocess.run(["git", "add", ".gitignore"], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "ignore coverage"], cwd=tmp_project, check=True, capture_output=True)
+        orch, _, build = _make_orchestrator(
+            tmp_project,
+            run_build=True,
+            run_tests=True,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+
+        def write_hidden_artifact() -> None:
+            (tmp_project / ".gitignore").write_text("coverage/\ngenerated/\n")
+            artifact = tmp_project / "generated" / "test-runtime.cache"
+            artifact.parent.mkdir()
+            artifact.write_text("generated while hidden by mutated ignore rules\n")
+
+        build.test_side_effect = write_hidden_artifact
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=True)
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert (tmp_project / ".gitignore").read_text() == "coverage/\n"
+        assert not (tmp_project / "generated" / "test-runtime.cache").exists()
+        assert [record["artifacts"] for record in result.validation_artifact_records] == [
+            [
+                {
+                    "path": ".gitignore",
+                    "before_status": "clean",
+                    "after_status": "tracked",
+                }
+            ],
+            [
+                {
+                    "path": "generated/test-runtime.cache",
+                    "before_status": "clean",
+                    "after_status": "untracked",
+                }
+            ],
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Tests — _build_tool xcodebuild factory
