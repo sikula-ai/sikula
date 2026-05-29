@@ -1097,6 +1097,7 @@ class Orchestrator:
         phase: str,
         before: dict,
         check_name: str | None = None,
+        new_untracked_only: bool = False,
     ) -> bool:
         """Clean non-ignored repository changes produced by a validation command.
 
@@ -1107,6 +1108,12 @@ class Orchestrator:
 
         after = self._validation_artifact_snapshot()
         artifacts = detect_validation_artifacts(before, after)
+        if new_untracked_only:
+            artifacts = [
+                artifact
+                for artifact in artifacts
+                if artifact.before_status == "clean" and artifact.after_status == "untracked"
+            ]
         if not artifacts:
             return True
 
@@ -1135,6 +1142,8 @@ class Orchestrator:
         message = f"{phase} command produced unexpected repository artifact(s): {paths}"
         if check_name:
             message = f"check/{check_name} command produced unexpected repository artifact(s): {paths}"
+            if phase == "check_autofix":
+                message = f"check/{check_name} autofix command produced unexpected repository artifact(s): {paths}"
 
         if cleaned:
             log.warning("%s — cleaned automatically", message)
@@ -1164,7 +1173,7 @@ class Orchestrator:
         if phase == "test":
             state.test_errors.append(excerpt)
             state.test_status = "failed"
-        elif phase == "check":
+        elif phase in {"check", "check_autofix"}:
             state.check_errors.append(excerpt)
             state.check_status = "failed"
         else:
@@ -1267,6 +1276,7 @@ class Orchestrator:
                 if "timeout" in check:
                     fix_cfg["timeout"] = check["timeout"]
                 t0 = time.perf_counter()
+                autofix_artifact_before = self._validation_artifact_snapshot()
                 with self._active_operation(
                     state,
                     phase="check_autofix",
@@ -1274,15 +1284,28 @@ class Orchestrator:
                 ):
                     fix_result = build_tool.run_check(f"{name}_autofix", fix_cfg)
                 fix_elapsed_s = time.perf_counter() - t0
-                state.record("orchestrator", f"check_{name}_autofix", "success" if fix_result.success else "failed")
+                autofix_artifacts_ok = self._record_validation_artifacts(
+                    state,
+                    phase="check_autofix",
+                    before=autofix_artifact_before,
+                    check_name=name,
+                    new_untracked_only=True,
+                )
+                fix_success = fix_result.success and autofix_artifacts_ok
+                autofix_error = fix_result.error
+                if not autofix_error and not autofix_artifacts_ok:
+                    autofix_error = (
+                        state.check_errors[-1] if state.check_errors else "validation artifacts cleanup failed"
+                    )
+                state.record("orchestrator", f"check_{name}_autofix", "success" if fix_success else "failed")
                 state.record_validation(
                     "check_autofix",
-                    "success" if fix_result.success else "failed",
+                    "success" if fix_success else "failed",
                     elapsed_s=fix_elapsed_s,
-                    error=fix_result.error,
+                    error=autofix_error or None,
                     check_name=name,
                 )
-                if fix_result.success:
+                if fix_success:
                     t0 = time.perf_counter()
                     artifact_before = self._validation_artifact_snapshot()
                     with self._active_operation(state, phase="check", message=f"Running check/{name}"):
@@ -1296,7 +1319,7 @@ class Orchestrator:
                     )
                 else:
                     skip_final_failure_validation = True
-                    log.warning(f"Auto-fix for {name} failed: {diagnostic_excerpt(fix_result.error, limit=500)}")
+                    log.warning(f"Auto-fix for {name} failed: {diagnostic_excerpt(autofix_error, limit=500)}")
             if result.success and artifacts_ok:
                 log.info(f"Check {name} OK ({_fmt_elapsed(elapsed_s)})")
                 state.record("orchestrator", f"check_{name}", "success", elapsed_s=elapsed_s)
