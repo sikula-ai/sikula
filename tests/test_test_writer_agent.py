@@ -183,6 +183,19 @@ class TestTestWriterAgentSuccess:
         assert state.tests_up_to_date is True
         assert len(state.testability_gaps) == 1
 
+    def test_testability_gap_with_written_tests_can_fail_by_policy(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["tests/LoginTest.kt"]
+        stub_llm.agent_output = "TESTABILITY GAP:\ntarget: login UI\nreason: no UI harness\nrisk: high\n"
+        state = _make_state()
+        config = {**_config_with_test_paths(), "test_writer": {"testability_gap_policy": "fail"}}
+        result = _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        assert not result.success
+        assert state.failed is True
+        assert state.tests_up_to_date is True
+        assert "tests/LoginTest.kt" in state.test_files_written
+        assert result.data["files_written"] == ["tests/LoginTest.kt"]
+        assert len(state.testability_gaps) == 1
+
 
 # ---------------------------------------------------------------------------
 # Error handling

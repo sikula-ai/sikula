@@ -756,6 +756,14 @@ class TestCmdInitEdgeCases:
             cmd_init(self._args())
         mock_load_env.assert_called_once_with(tmp_path)
 
+    def test_init_writes_default_test_surface_policy(self, tmp_path: Path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        scan_result = self._scan_result()
+        with patch("tools.scanner.scan", return_value=scan_result):
+            cmd_init(self._args())
+        config_text = (tmp_path / ".sikula" / "config.yaml").read_text()
+        assert "test_surface_policy: existing_infrastructure" in config_text
+
     def test_init_adds_env_to_root_gitignore_inside_git_repo(self, tmp_path: Path, monkeypatch):
         subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
         monkeypatch.chdir(tmp_path)
