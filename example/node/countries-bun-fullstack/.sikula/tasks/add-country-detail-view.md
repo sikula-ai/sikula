@@ -14,7 +14,10 @@ The backend already exposes `GET /api/countries/:code`.
   control in the detail view header.
 - The in-app back control should behave like browser back for this view when possible.
 - If the selected country cannot be found, show an inline error message.
-- Keep existing region filtering behaviour unchanged.
+- Keep existing list filtering behaviour unchanged, including region filtering and any already
+  implemented name search.
+- Treat the current checked-out project state as the source of truth. Preserve existing UI/API
+  behaviour unless this task explicitly changes it.
 
 ## UI specs
 
@@ -22,6 +25,10 @@ The backend already exposes `GET /api/countries/:code`.
   into a single full-width column unless the viewport naturally reaches the mobile layout.
 - Each country item should remain a compact card-like grid item, but the entire item must
   become a real accessible navigation control.
+- Preserve the country card content structure: population and area stay as separate
+  label/value facts, not flattened into one inline sentence that wraps unpredictably.
+- If wrapping each country card in a button or link, keep the existing inner card hierarchy
+  and adapt styles for the interactive wrapper instead of replacing the card content layout.
 - Keep the existing visual density of the list: country cards should still use the available
   horizontal space on wider screens.
 - Use accessible buttons or links for country items; do not make non-interactive elements clickable.

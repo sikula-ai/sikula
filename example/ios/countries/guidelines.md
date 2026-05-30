@@ -197,6 +197,12 @@ For new screens, follow the same pattern: create ViewModel at the call site and 
 
 ## Testing
 
+### Example testing scope
+
+- Use the existing unit/integration test setup for example tasks.
+- Do not add new UI automation, screenshot, emulator, or simulator test infrastructure unless
+  the task explicitly asks for it.
+
 ### Unit Tests
 
 - Live in `CountriesTests/` and import the main module with `@testable import Countries`.

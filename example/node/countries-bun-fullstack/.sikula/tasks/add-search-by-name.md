@@ -14,6 +14,10 @@ There is no way to search the list by country name from either the API or the UI
 - Add a labelled search input to the browser UI.
 - When the name search is blank the API and UI behave as before.
 - Show an empty state, not an error, when the filters match no countries.
+- Preserve any already implemented country detail view, card navigation, back behaviour, and
+  detail formatting.
+- Treat the current checked-out project state as the source of truth. Preserve existing UI/API
+  behaviour unless this task explicitly changes it.
 
 ## Expected behaviour
 

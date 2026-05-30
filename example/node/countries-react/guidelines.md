@@ -87,8 +87,10 @@ export type Country = {
 - `tests/setup.ts` loads `@testing-library/jest-dom/vitest`.
 - Do not add new test dependencies or change build configuration unless the task explicitly
   asks for project infrastructure changes.
-- If a task cannot be tested through the existing Vitest/Testing Library setup, report a
-  `TESTABILITY GAP` instead of writing source-inspection tests.
+- Do not add new end-to-end UI automation, screenshot, or browser infrastructure unless the task
+  explicitly asks for it.
+- If an acceptance contract within the existing test surface cannot be meaningfully tested through
+  Vitest/Testing Library, report a `TESTABILITY GAP` instead of writing source-inspection tests.
 
 ---
 
@@ -99,4 +101,3 @@ export type Country = {
 - Keep display formatting in small named functions.
 - Keep CSS responsive and readable; avoid layout shifts when filter state changes.
 - User-visible strings should stay in components until a task introduces localization.
-

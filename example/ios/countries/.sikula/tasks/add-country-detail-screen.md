@@ -24,6 +24,11 @@ The app shows a list of countries. Tapping a country currently does nothing.
 ## UI specs
 
 - The screen title shows the country's common name.
+- The selected country identity is visible immediately after navigation. Use information already
+  available from the tapped list item for the initial screen title/name instead of waiting for
+  the detail request to complete.
+- Detail content may show a loading state while fresh detail data is fetched, but the title/header
+  must not be blank or visibly jump after the first render.
 - Each list item should feel like a standard navigation row that opens another screen.
 - On error, show an inline error message (see Strings section below).
 
