@@ -53,6 +53,11 @@ from core.llm_client import LLMClient
 from core.progress import ActiveOperationHeartbeat
 from core.retry_history import llm_retry_history
 from core.state import StateStore, TaskState
+from core.validation_artifacts import (
+    detect_validation_artifacts,
+    restore_validation_artifacts,
+    snapshot_validation_dirty_files,
+)
 from core.validation_coverage import INTERNAL_PIPELINE_CONFIG_KEY, validation_coverage_gaps
 from tools.base_tool import BuildTool, Sandbox
 from tools.file_tool import FileTool
@@ -67,6 +72,8 @@ log = logging.getLogger(__name__)
 _SCOPE_FINAL_FULL_TASK = "final_full_task"
 _FIXER_ERROR_LIMIT = 6000
 _LOG_ERROR_LIMIT = 2000
+_VALIDATION_ARTIFACT_ERROR_LIMIT = 2000
+_VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES = 5
 
 
 def _phase_scope_label(state: TaskState) -> str:
@@ -1065,6 +1072,154 @@ class Orchestrator:
             log.info("%s changed build-config files — will re-sync before next build", source.capitalize())
             state.build_synced = False
 
+    def _validation_artifact_root(self, state: TaskState) -> Path:
+        if state.worktree_base:
+            return Path(state.worktree_base).resolve()
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=self._config.project_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return Path(result.stdout.strip()).resolve()
+        return self._config.project_root.resolve()
+
+    def _validation_artifact_ignored_roots(self, root: Path) -> tuple[str, ...]:
+        artifact_root = root.resolve()
+        ignored_roots: list[str] = []
+        for internal_path in self._store.internal_paths():
+            try:
+                relative = Path(internal_path).resolve(strict=False).relative_to(artifact_root)
+            except (OSError, ValueError):
+                continue
+            relative_text = relative.as_posix().rstrip("/")
+            if relative_text and relative_text != ".":
+                ignored_roots.append(relative_text)
+        return tuple(ignored_roots)
+
+    def _validation_artifact_snapshot(self, state: TaskState) -> dict:
+        root = self._validation_artifact_root(state)
+        return snapshot_validation_dirty_files(
+            root,
+            ignored_roots=self._validation_artifact_ignored_roots(root),
+        )
+
+    def _record_validation_artifacts(
+        self,
+        state: TaskState,
+        *,
+        phase: str,
+        before: dict,
+        check_name: str | None = None,
+        new_untracked_only: bool = False,
+    ) -> bool:
+        """Clean non-ignored repository changes produced by a validation command.
+
+        Returns True when there were no artifacts or cleanup succeeded. A cleanup
+        failure is treated as a validation failure so the fixer can try to repair it
+        without letting artifacts leak into the final commit.
+        """
+
+        cleanup_passes = 0
+        while True:
+            after = self._validation_artifact_snapshot(state)
+            artifacts = detect_validation_artifacts(before, after)
+            if new_untracked_only:
+                artifacts = [
+                    artifact
+                    for artifact in artifacts
+                    if artifact.before_status == "clean" and artifact.after_status == "untracked"
+                ]
+            if not artifacts:
+                return True
+
+            if cleanup_passes >= _VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES:
+                error = (
+                    f"{phase} command produced additional repository artifact(s) after "
+                    f"{_VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES} cleanup passes"
+                )
+                if check_name:
+                    error = (
+                        f"check/{check_name} command produced additional repository artifact(s) after "
+                        f"{_VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES} cleanup passes"
+                    )
+                log.error(error)
+                state.record("orchestrator", "validation_artifacts_cleanup_failed", error[:500])
+                state.record_validation(
+                    "validation_artifact",
+                    "failed",
+                    error=error,
+                    check_name=check_name,
+                )
+                self._append_validation_artifact_error(state, phase, error)
+                return False
+
+            cleanup_passes += 1
+            cleanup_errors = restore_validation_artifacts(self._validation_artifact_root(state), before, artifacts)
+            cleaned = not cleanup_errors
+            artifact_records = [artifact.to_record() for artifact in artifacts]
+            record: dict = {
+                "phase": phase,
+                "status": "cleaned" if cleaned else "cleanup_failed",
+                "build_iteration": state.build_iterations,
+                "step": state.current_step,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "artifacts": artifact_records,
+            }
+            if state.active_scope:
+                record["scope"] = state.active_scope
+            if check_name:
+                record["check_name"] = check_name
+            if cleanup_errors:
+                record["cleanup_errors"] = cleanup_errors
+            state.validation_artifact_records.append(record)
+
+            paths = ", ".join(f"`{artifact.path}`" for artifact in artifacts[:10])
+            if len(artifacts) > 10:
+                paths += f", ... ({len(artifacts)} total)"
+            message = f"{phase} command produced unexpected repository artifact(s): {paths}"
+            if check_name:
+                message = f"check/{check_name} command produced unexpected repository artifact(s): {paths}"
+                if phase == "check_autofix":
+                    message = f"check/{check_name} autofix command produced unexpected repository artifact(s): {paths}"
+
+            if cleaned:
+                log.warning("%s — cleaned automatically", message)
+                state.record("orchestrator", "validation_artifacts_cleaned", message)
+                state.record_validation(
+                    "validation_artifact",
+                    "cleaned",
+                    error=message,
+                    check_name=check_name,
+                )
+                continue
+
+            error = message + "; cleanup failed: " + "; ".join(cleanup_errors)
+            log.error(error)
+            state.record("orchestrator", "validation_artifacts_cleanup_failed", error[:500])
+            state.record_validation(
+                "validation_artifact",
+                "failed",
+                error=error,
+                check_name=check_name,
+            )
+            self._append_validation_artifact_error(state, phase, error)
+            return False
+
+    def _append_validation_artifact_error(self, state: TaskState, phase: str, error: str) -> None:
+        excerpt = diagnostic_excerpt(error, limit=_VALIDATION_ARTIFACT_ERROR_LIMIT)
+        if phase == "test":
+            state.test_errors.append(excerpt)
+            state.test_status = "failed"
+        elif phase in {"check", "check_autofix"}:
+            state.check_errors.append(excerpt)
+            state.check_status = "failed"
+        else:
+            state.errors.append(excerpt)
+            state.build_status = "failed"
+
     def _run_agent(self, name: str, state: TaskState):
         from agents.base_agent import AgentResult
 
@@ -1140,12 +1295,19 @@ class Orchestrator:
             name = check.get("name", "check")
             log.info(f"--- Phase: check/{name} ({progress}) ---")
             t0 = time.perf_counter()
+            artifact_before = self._validation_artifact_snapshot(state)
             with self._active_operation(state, phase="check", message=f"Running check/{name}"):
                 result = build_tool.run_check(name, check)
             elapsed_s = time.perf_counter() - t0
+            artifacts_ok = self._record_validation_artifacts(
+                state,
+                phase="check",
+                before=artifact_before,
+                check_name=name,
+            )
             fix_command = check.get("fix_command")
             skip_final_failure_validation = False
-            if not result.success and fix_command:
+            if artifacts_ok and not result.success and fix_command:
                 state.record_validation(
                     "check", "failed", elapsed_s=elapsed_s, error=result.error or result.output, check_name=name
                 )
@@ -1154,6 +1316,7 @@ class Orchestrator:
                 if "timeout" in check:
                     fix_cfg["timeout"] = check["timeout"]
                 t0 = time.perf_counter()
+                autofix_artifact_before = self._validation_artifact_snapshot(state)
                 with self._active_operation(
                     state,
                     phase="check_autofix",
@@ -1161,32 +1324,58 @@ class Orchestrator:
                 ):
                     fix_result = build_tool.run_check(f"{name}_autofix", fix_cfg)
                 fix_elapsed_s = time.perf_counter() - t0
-                state.record("orchestrator", f"check_{name}_autofix", "success" if fix_result.success else "failed")
+                autofix_artifacts_ok = self._record_validation_artifacts(
+                    state,
+                    phase="check_autofix",
+                    before=autofix_artifact_before,
+                    check_name=name,
+                    new_untracked_only=True,
+                )
+                fix_success = fix_result.success and autofix_artifacts_ok
+                autofix_error = fix_result.error
+                if not autofix_error and not autofix_artifacts_ok:
+                    autofix_error = (
+                        state.check_errors[-1] if state.check_errors else "validation artifacts cleanup failed"
+                    )
+                state.record("orchestrator", f"check_{name}_autofix", "success" if fix_success else "failed")
                 state.record_validation(
                     "check_autofix",
-                    "success" if fix_result.success else "failed",
+                    "success" if fix_success else "failed",
                     elapsed_s=fix_elapsed_s,
-                    error=fix_result.error,
+                    error=autofix_error or None,
                     check_name=name,
                 )
-                if fix_result.success:
+                if fix_success:
                     t0 = time.perf_counter()
+                    artifact_before = self._validation_artifact_snapshot(state)
                     with self._active_operation(state, phase="check", message=f"Running check/{name}"):
                         result = build_tool.run_check(name, check)
                     elapsed_s = time.perf_counter() - t0
+                    artifacts_ok = self._record_validation_artifacts(
+                        state,
+                        phase="check",
+                        before=artifact_before,
+                        check_name=name,
+                    )
                 else:
                     skip_final_failure_validation = True
-                    log.warning(f"Auto-fix for {name} failed: {diagnostic_excerpt(fix_result.error, limit=500)}")
-            if result.success:
+                    log.warning(f"Auto-fix for {name} failed: {diagnostic_excerpt(autofix_error, limit=500)}")
+            if result.success and artifacts_ok:
                 log.info(f"Check {name} OK ({_fmt_elapsed(elapsed_s)})")
                 state.record("orchestrator", f"check_{name}", "success", elapsed_s=elapsed_s)
                 state.record_validation("check", "success", elapsed_s=elapsed_s, check_name=name)
             else:
-                check_error = diagnostic_excerpt(result.error or result.output, limit=_FIXER_ERROR_LIMIT)
+                if artifacts_ok:
+                    check_error = diagnostic_excerpt(result.error or result.output, limit=_FIXER_ERROR_LIMIT)
+                else:
+                    check_error = (
+                        state.check_errors[-1] if state.check_errors else "validation artifacts cleanup failed"
+                    )
                 log.error(f"Check {name} failed ({_fmt_elapsed(elapsed_s)}):\n{check_error}")
-                state.check_errors.append(f"[{name}]\n{check_error}")
+                if artifacts_ok:
+                    state.check_errors.append(f"[{name}]\n{check_error}")
                 state.record("orchestrator", f"check_{name}", "failed", elapsed_s=elapsed_s)
-                if not skip_final_failure_validation:
+                if artifacts_ok and not skip_final_failure_validation:
                     state.record_validation(
                         "check",
                         "failed",
@@ -1203,9 +1392,11 @@ class Orchestrator:
         build_tool: BuildTool = self._tools["build"]
         log.info("Running tests...")
         t0 = time.perf_counter()
+        artifact_before = self._validation_artifact_snapshot(state)
         with self._active_operation(state, phase="test", message="Running tests"):
             result = build_tool.run_tests()
         elapsed_s = time.perf_counter() - t0
+        artifacts_ok = self._record_validation_artifacts(state, phase="test", before=artifact_before)
         if not result.success:
             test_error = diagnostic_excerpt(result.error, limit=_FIXER_ERROR_LIMIT)
             log.error(
@@ -1215,6 +1406,13 @@ class Orchestrator:
             state.test_status = "failed"
             state.record("orchestrator", "test", "failed", elapsed_s=elapsed_s)
             state.record_validation("test", "failed", elapsed_s=elapsed_s, error=result.error)
+            return False
+        if not artifacts_ok:
+            log.error(
+                "Tests produced unexpected repository artifacts and cleanup failed (%s)",
+                _fmt_elapsed(elapsed_s),
+            )
+            state.record("orchestrator", "test", "failed", elapsed_s=elapsed_s)
             return False
         log.info(f"Tests OK ({_fmt_elapsed(elapsed_s)})")
         state.test_status = "success"
@@ -1249,19 +1447,30 @@ class Orchestrator:
         build_tool: BuildTool = self._tools["build"]
         log.info("Running compile check...")
         t0 = time.perf_counter()
+        artifact_before = self._validation_artifact_snapshot(state)
         with self._active_operation(state, phase="build", message="Running compile check"):
             result = build_tool.compile_check()
         elapsed_s = time.perf_counter() - t0
-        state.build_status = "success" if result.success else "failed"
+        artifacts_ok = self._record_validation_artifacts(state, phase="build", before=artifact_before)
+        state.build_status = "success" if result.success and artifacts_ok else "failed"
         state.record("orchestrator", "build", state.build_status, elapsed_s=elapsed_s)
         state.record_validation(
-            "build", state.build_status, elapsed_s=elapsed_s, error=None if result.success else result.error
+            "build",
+            state.build_status,
+            elapsed_s=elapsed_s,
+            error=None if result.success and artifacts_ok else result.error,
         )
         if not result.success:
             log.error(
                 f"Build failed ({_fmt_elapsed(elapsed_s)}):\n{diagnostic_excerpt(result.error, limit=_LOG_ERROR_LIMIT)}"
             )
             state.errors.append(diagnostic_excerpt(result.error, limit=_FIXER_ERROR_LIMIT))
+            return False
+        if not artifacts_ok:
+            log.error(
+                "Build produced unexpected repository artifacts and cleanup failed (%s)",
+                _fmt_elapsed(elapsed_s),
+            )
             return False
         log.info(f"Build OK ({_fmt_elapsed(elapsed_s)})")
         state.fixer_changed_code = False

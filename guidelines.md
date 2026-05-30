@@ -254,6 +254,7 @@ Agents mutate `state` in place. The key state fields written by agents:
 | `review_issues` | `ReviewerAgent` | Issue list from last review; cleared on approval |
 | `files_changed` | `ImplementerAgent`, `FixerAgent` | Append-only; never clear outside the orchestrator |
 | `errors`, `test_errors`, `check_errors` | Orchestrator | Cleared by the fixer after a fix pass |
+| `validation_artifact_records` | Orchestrator | Append-only audit of unexpected non-ignored repository changes produced and cleaned during build/test/check validation |
 | `history` | `state.record()` | Append-only audit log; never clear or modify past entries |
 | `done`, `failed` | Orchestrator only | Never set these in an agent |
 
@@ -373,6 +374,7 @@ instantiated only there and injected via constructor.
 | `errors`, `test_errors`, `check_errors` | Cleared by the fixer after a fix pass |
 | `history` | Append-only via `state.record()`; never cleared; permanent audit log |
 | `validation_cycle_records` | Append-only via the orchestrator; never used for pipeline control flow |
+| `validation_artifact_records` | Append-only via the orchestrator; records build/test/check artifact cleanup for audit |
 | `done`, `failed` | Set by the orchestrator only; never set in an agent |
 
 ---
@@ -471,7 +473,7 @@ python3 -m ruff format .
 - **Never** put platform-specific logic (Gradle tasks, Kotlin patterns, Android layer names) in agents, orchestrator, or LLM client code — it belongs only in `BuildTool` subclasses and `.sikula/config.yaml`.
 - **Never** set `state.done` or `state.failed` in an agent — these are orchestrator-only fields.
 - **Never** clear or modify past entries in `state.history` — it is a permanent audit log.
-- **Never** use `state.implement_cycle_records`, `state.fix_cycle_records`, `state.review_cycle_records`, `state.security_review_cycle_records`, or `state.test_write_records` to drive pipeline control flow — they are observability records only.
+- **Never** use `state.implement_cycle_records`, `state.fix_cycle_records`, `state.review_cycle_records`, `state.security_review_cycle_records`, `state.test_write_records`, or `state.validation_artifact_records` to drive pipeline control flow — they are observability records only.
 - **Always** add `from __future__ import annotations` immediately after the optional
   module docstring and before all other imports.
 - **Always** add type hints to every function signature.

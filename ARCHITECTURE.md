@@ -228,17 +228,26 @@ Orchestrator.run()
       │             → continue (will re-sync next iteration) │
       │                                                       │
       │  BuildTool.compile_check()      [platform-specific]  │
+      │      unexpected repo artifacts → clean + audit        │
+      │                                → cleanup failure      │
+      │                                  enters fix phase     │
       │      └ failure → state.errors.append(output)         │
       │               → fix phase (see below) → continue     │
       │                                                       │
       │  if run_tests: true                                   │
       │      BuildTool.run_tests()      [platform-specific]  │
+      │          unexpected repo artifacts → clean + audit    │
+      │                                    → cleanup failure  │
+      │                                      fix              │
       │          └ failure → state.test_errors.append(output)│
       │                   → fix phase (see below) → continue │
       │                                                       │
       │  if run_checks: true                                  │
       │      for each check in build.checks:                  │
       │          BuildTool.run_check(name, task_config)       │
+      │          unexpected repo artifacts → clean + audit    │
+      │                                    → cleanup failure  │
+      │                                      fix              │
       │          └ failure → state.check_errors.append(out)  │
       │                   → fix phase (see below) → continue │
       │                                                       │
@@ -987,6 +996,7 @@ Sikula processes at once is still unsupported.
 | `testability_gaps` | `list[dict]` | TestWriterAgent | Structured audit signal for behaviour the test writer could not safely cover with available project seams/infrastructure. Entries include `source`, `step`, `build_iteration`, optional `scope`, `message`, `timestamp`, and optional parsed `target`, `reason`, `recommended_action`, and `risk`. Default policy is warning-only; `test_writer.testability_gap_policy: fail` turns reported gaps into task failures. |
 | `fix_cycle_records` | `list[dict]` | FixerAgent | Structured observability — one entry per fixer invocation after a failed sync/build/test/check attempt: `build_iteration` (globally unique, never resets), `step`, `scope`, `errors_before` snapshot (build/test/check), `fixer_prompt`, `fixer_output` (`None` on exception), `files_written`, optional `triage_scope` (`test_failure` or `test_origin_validation`), optional `triage_pass` (`test_only` or `production_confirmed`), optional `confirmed_test_failure_triage`, `timestamp`; never read for pipeline decisions |
 | `validation_cycle_records` | `list[dict]` | Orchestrator | Structured observability — one entry per presync/sync/build/test/check outcome with `phase`, `status`, `build_iteration`, `step`, `timestamp`, optional `scope`, optional `elapsed_s`, optional `check_name`, and a diagnostic `error_excerpt` on failure; excerpts preserve failure-marker blocks from long tool output instead of storing only the final tail; never read for pipeline decisions |
+| `validation_artifact_records` | `list[dict]` | Orchestrator | Structured observability for unexpected non-ignored repository changes produced by build/test/check validation commands. Each record stores `phase`, `status` (`cleaned` or `cleanup_failed`), `build_iteration`, `step`, optional `scope`, optional `check_name`, and changed paths with before/after status. Cleanup success allows validation to continue; cleanup failure is treated as that validation phase failing. |
 | `active_operation` | `dict \| None` | Orchestrator | Current long-running operation heartbeat for status visibility while an agent or validation command is blocked. Contains `phase`, optional `agent`, optional `scope`, `started_at`, `last_heartbeat_at`, `heartbeat_count`, optional `heartbeat_interval_seconds`, and optional `message`. Cleared when the operation completes; never drives pipeline decisions. |
 | `test_files_written` | `list[str]` | TestWriterAgent | Cumulative list of all files written by the test writer agent across all runs; never cleared; passed to ReviewerAgent so it does not flag those files as implementer scope violations. In normal `sikula run`, these files are not reviewer-owned output; in `sikula review`, changed test files are reviewed as branch output. |
 | `fixer_changed_code` | `bool` | Orchestrator | Set True when FixerAgent writes files; used on resume to continue deterministic build/test/check validation before stale semantic gates rerun; cleared after the following compile check succeeds |

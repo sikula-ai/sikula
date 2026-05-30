@@ -84,6 +84,9 @@ _TEST_ORIGIN_VALIDATION_CONSTRAINT = """\
 - If the failure is caused by a malformed generated test or test harness assumption, fix the
   test or test helper. Do not change production source, build configuration, runtime
   configuration, dependency declarations, or pipeline settings merely to satisfy a malformed test.
+- If validation reports generated repository artifacts from tests, fix the test harness so it uses
+  OS temp storage or project-ignored temp/cache paths and cleans up after itself. Do not add
+  production shims or build configuration just to tolerate generated test artifacts.
 - Treat build files, dependency manifests, project/workspace files, generated-source config,
   and runtime configuration as production code for this triage. Changing them for a test-origin
   validation failure requires `classification: production_defect` and `chosen_fix: production_code`.
@@ -111,6 +114,9 @@ _TEST_TEST_CONSTRAINT = """\
   invalid test doubles, or unavailable test APIs), fix the test or test helper. Do not
   change production source, build configuration, runtime configuration, dependency
   declarations, or pipeline settings merely to satisfy a malformed test.
+- If validation reports generated repository artifacts from tests, fix the test harness so it uses
+  OS temp storage or project-ignored temp/cache paths and cleans up after itself. Do not add
+  production shims or build configuration just to tolerate generated test artifacts.
 - Treat build files, dependency manifests, project/workspace files, generated-source config,
   and runtime configuration as production code for this triage. Changing them for a test
   failure requires `classification: production_defect` and `chosen_fix: production_code`.
