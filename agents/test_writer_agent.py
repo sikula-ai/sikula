@@ -27,6 +27,25 @@ _MAX_DIFF_CHARS = 40_000
 _DEFAULT_COVERAGE_TARGET = 90
 _TESTABILITY_GAP_MARKER = "TESTABILITY GAP:"
 _TESTABILITY_GAP_POLICY_FAIL = "fail"
+_TEST_SURFACE_POLICY_COMPLETE = "complete"
+_TEST_SURFACE_POLICY_EXISTING_INFRASTRUCTURE = "existing_infrastructure"
+
+_TEST_SURFACE_POLICY_INSTRUCTIONS = {
+    _TEST_SURFACE_POLICY_COMPLETE: (
+        "complete: Aim to cover the complete changed behavior. If important behavior "
+        "cannot be meaningfully tested without adding missing project test infrastructure "
+        "or seams, report a TESTABILITY GAP using the structured block below."
+    ),
+    _TEST_SURFACE_POLICY_EXISTING_INFRASTRUCTURE: (
+        "existing_infrastructure: Use only existing project test infrastructure and "
+        "project-standard seams/helpers. Do not add new UI, browser, device, emulator, "
+        "simulator, external-service, or runtime harnesses unless the task explicitly asks "
+        "for that infrastructure. Missing out-of-surface harnesses are not by themselves "
+        "a TESTABILITY GAP. Add the best meaningful tests available through existing seams, "
+        "and report a TESTABILITY GAP only when an acceptance contract still cannot be "
+        "meaningfully checked within this configured test surface."
+    ),
+}
 
 _AGENT_PROMPT = """\
 You are writing unit tests for a {tech_stack} codebase.
@@ -55,6 +74,7 @@ CONSTRAINTS — follow strictly:
   to stay accurate (e.g. add or remove @param entries) — do not delete it.
 
 TESTING RULES:
+- Test surface policy: {test_surface_policy_instruction}
 - Mirror the conventions of the existing tests exactly: the same test framework constructs,
   assertion style, naming patterns, and test double setup. Read existing tests before writing
   any new ones. Do not introduce constructs or libraries not already present in the project.
@@ -70,9 +90,9 @@ TESTING RULES:
       test per nullable field
   When both signals are present, a parametric test is required, not optional.
   Do not use parametric tests where a plain test is clearer.
-- Achieve at least {coverage_target}% branch and line coverage on all new or changed code.
-  Think through every branch — including early returns, null checks, and error paths — before
-  deciding a test is complete.
+- Within the configured test surface, achieve at least {coverage_target}% branch and line
+  coverage on all new or changed code. Think through every branch — including early returns,
+  null checks, and error paths — before deciding a test is complete.
 - Nullability requires explicit test cases. Every nullable parameter, return value, or state
   field that takes part in the changed code must have at least one test that exercises the
   null / absent path. Missed null branches are one of the most common causes of coverage gaps.
@@ -108,9 +128,9 @@ TESTING RULES:
   shared helper through one entry point proves the other entry points are safe.
 - For async or deferred work started from an entry point (for example promises, futures,
   coroutines, tasks, threads, callbacks, or queued work), cover the observable success
-  path and the observable failure/error path through the entry point when the project's
-  existing test infrastructure can do so. If meaningful failure-path coverage would
-  require new infrastructure outside the test write scope, report a TESTABILITY GAP
+  path and the observable failure/error path through the entry point when the configured
+  test surface can do so. If meaningful failure-path coverage would require new
+  infrastructure outside the configured test surface, follow the test surface policy
   instead of adding brittle tests.
 - Prefer behaviour tests through public APIs, public state, public routing contracts, command
   outputs, or project-standard test helpers. Source-file inspection tests are a last-resort
@@ -119,9 +139,11 @@ TESTING RULES:
   file or repository root, do not depend on the test runner's current working directory, and
   do not require production source, build configuration, dependency declarations, runtime
   configuration, or pipeline settings to change just so the inspection test can pass.
-- If meaningful behaviour coverage would require adding new test infrastructure that is
-  outside the test write scope, do not create brittle source-inspection tests as a substitute.
-  Output the following block and make no file changes for that gap:
+- If meaningful behaviour coverage would require adding new test infrastructure outside
+  the configured test surface, follow the test surface policy. Under the complete policy,
+  output the following block and make no file changes for that gap. Under the
+  existing_infrastructure policy, do not report a gap merely because out-of-surface
+  infrastructure is absent; first add meaningful coverage through existing project seams.
   TESTABILITY GAP:
   target: <behaviour or contract that remains untested>
   reason: <missing seam, missing test harness, unavailable helper, etc.>
@@ -244,6 +266,22 @@ def _testability_gap_policy(project_config: dict) -> str:
     return _TESTABILITY_GAP_POLICY_FAIL if policy == _TESTABILITY_GAP_POLICY_FAIL else "warn"
 
 
+def _test_surface_policy(project_config: dict) -> str:
+    policy = (
+        str(
+            project_config.get("test_writer", {}).get(
+                "test_surface_policy",
+                _TEST_SURFACE_POLICY_EXISTING_INFRASTRUCTURE,
+            )
+        )
+        .strip()
+        .lower()
+    )
+    if policy == _TEST_SURFACE_POLICY_COMPLETE:
+        return _TEST_SURFACE_POLICY_COMPLETE
+    return _TEST_SURFACE_POLICY_EXISTING_INFRASTRUCTURE
+
+
 class TestWriterAgent(BaseAgent):
     name = "test_writer"
 
@@ -269,6 +307,7 @@ class TestWriterAgent(BaseAgent):
         allowed_read_paths = sandbox_cfg.get("allowed_read_paths", ["."])
         allowed_read_str = ", ".join(allowed_read_paths)
         coverage_target = self.project_config.get("test_writer", {}).get("coverage_target", _DEFAULT_COVERAGE_TARGET)
+        test_surface_policy = _test_surface_policy(self.project_config)
 
         diff = ""
         if git_tool:
@@ -286,6 +325,7 @@ class TestWriterAgent(BaseAgent):
             allowed_read_paths=allowed_read_str,
             allowed_test_write_paths=allowed_str,
             coverage_target=coverage_target,
+            test_surface_policy_instruction=_TEST_SURFACE_POLICY_INSTRUCTIONS[test_surface_policy],
             implementation_prompt=state.implementation_prompt,
             task_description=state.task_description,
             step_scope=_step_scope(state),
@@ -306,6 +346,7 @@ class TestWriterAgent(BaseAgent):
                     "step": state.current_step,
                     "build_iteration": state.build_iterations,
                     "scope": _scope(state),
+                    "test_surface_policy": test_surface_policy,
                     "test_writer_prompt": prompt,
                     "test_writer_output": None,
                     "files_written": [],
@@ -320,6 +361,7 @@ class TestWriterAgent(BaseAgent):
                 "step": state.current_step,
                 "build_iteration": state.build_iterations,
                 "scope": _scope(state),
+                "test_surface_policy": test_surface_policy,
                 "test_writer_prompt": prompt,
                 "test_writer_output": agent_output,
                 "files_written": list(changed),

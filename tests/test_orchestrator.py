@@ -3039,6 +3039,20 @@ class TestValidationArtifacts:
             }
         ]
 
+    def test_validation_artifact_root_falls_back_to_project_root_outside_git(self, tmp_path: Path):
+        orch, _, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=False,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+        state = TaskState(task_id="t1", task_description="test task")
+
+        assert orch._validation_artifact_root(state) == tmp_path.resolve()
+
     def test_validation_artifact_cleanup_rescans_after_restoring_gitignore(self, tmp_project: Path):
         (tmp_project / ".gitignore").write_text("coverage/\n")
         subprocess.run(["git", "add", ".gitignore"], cwd=tmp_project, check=True, capture_output=True)

@@ -194,8 +194,14 @@ planner:
 
 # Test writer configuration.
 test_writer:
-  # Minimum branch+line coverage target for new/changed code (percentage).
+  # Minimum branch+line coverage target within the configured test surface (percentage).
   coverage_target: 80
+  # Test surface policy:
+  # existing_infrastructure = stay within existing project test infra; missing heavy
+  # UI/browser/device/runtime harnesses are not gaps by themselves.
+  # complete = opt in to TESTABILITY GAP reports when important behaviour needs missing
+  # test infra outside the existing surface.
+  test_surface_policy: existing_infrastructure
   # What to do when safe tests require missing project seams/infrastructure:
   # warn = record a visible audit warning; fail = fail the task.
   testability_gap_policy: warn

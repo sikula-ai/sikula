@@ -782,6 +782,10 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
 - git diff HEAD (capped at 40 000 chars) — the exact changes made
 - current planner step description when `state.plan` is non-empty — injected as `CURRENT STEP`
 - `test_writer.coverage_target` from project config (default: 90) — injected into the prompt
+  as a target within the configured test surface
+- `test_writer.test_surface_policy` from project config (default:
+  `existing_infrastructure`) — controls whether missing test infrastructure is treated as
+  a gap or kept outside the configured test surface
 - project guidelines filenames from `guidelines.context_files` — test writer reads content via its tools
 
 **What it does:**
@@ -799,9 +803,9 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
      points include UI handlers, API/route handlers, CLI commands, lifecycle hooks,
      callbacks, queue/background jobs, timers, observers, and equivalent framework hooks.
    - Async/deferred work started from an entry point is tested through observable success
-     and failure paths when the project's existing test infrastructure can do so. If the
-     failure path requires new infrastructure outside the test write scope, the test writer
-     reports a `TESTABILITY GAP` instead of adding brittle source-inspection tests.
+     and failure paths when the configured test surface can do so. If the failure path
+     requires new infrastructure outside that surface, the test writer follows
+     `test_writer.test_surface_policy` instead of adding brittle source-inspection tests.
    - Parser, validator, expression engine, schema, DSL, config loader, and rule engine
      changes get a positive/negative contract matrix, including wrong expected result type
      rejection when typed contexts exist; rejected input classes must stay distinct, so a
@@ -816,7 +820,8 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
    null/absent inputs, a parametric test is required (not optional)
 5. When the change adds or modifies an enum value or sealed class case, adds that case to
    every existing parametric table that enumerates cases of the same type
-6. Targets at least `coverage_target`% branch and line coverage on new/changed code
+6. Targets at least `coverage_target`% branch and line coverage on new/changed code within
+   the configured test surface
 7. Follows project nullability conventions — null paths tested explicitly, no unsafe unwrapping
 8. Updates existing tests whose contract changed; never deletes unrelated tests
 9. For every function whose signature or behaviour changed, greps for all its callers in
@@ -829,17 +834,20 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
     current working directory and must not require production source, build configuration,
     dependency declarations, runtime configuration, or pipeline settings to change merely
     so the test can pass. If meaningful coverage requires new test infrastructure outside
-    the test write scope, the agent reports a structured `TESTABILITY GAP` instead of
-    adding brittle source-inspection tests. Sikula records the gap in
-    `state.testability_gaps`; by default it is a visible warning, or a blocking failure when
-    `test_writer.testability_gap_policy: fail` is configured.
+    the configured test surface, the agent follows `test_writer.test_surface_policy`:
+    `existing_infrastructure` uses the best meaningful existing-surface coverage and does
+    not report a gap merely because a heavy UI/browser/device/runtime harness is absent;
+    `complete` opts in to structured `TESTABILITY GAP` reports for missing test
+    infrastructure outside that surface. Sikula records reported gaps in
+    `state.testability_gaps`; by default they are visible warnings, or blocking failures
+    when `test_writer.testability_gap_policy: fail` is configured.
 
 **Output written to state:**
 - `state.tests_up_to_date = True` — set on success regardless of whether files changed
 - `state.files_changed` — test file paths appended (de-duplicated)
 - `state.test_files_written` — same paths also appended here (de-duplicated); used by ReviewerAgent to exempt these files from scope violation checks. In `sikula review` mode, the files are still reviewed for correctness and relevance.
-- `state.test_write_records` — one record appended per invocation with `step`, `build_iteration`, `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, and `timestamp`
-- `state.testability_gaps` — one record per `TESTABILITY GAP` reported by the test writer, with `source`, `step`, `build_iteration`, optional `scope`, the raw gap message, and any parsed `target`, `reason`, `recommended_action`, and `risk` fields. `tests_up_to_date` still becomes `True`; the gap means the test writer did all it safely could for the current diff, not that full behaviour coverage exists.
+- `state.test_write_records` — one record appended per invocation with `step`, `build_iteration`, `scope`, `test_surface_policy`, `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, and `timestamp`
+- `state.testability_gaps` — one record per `TESTABILITY GAP` reported by the test writer, with `source`, `step`, `build_iteration`, optional `scope`, the raw gap message, and any parsed `target`, `reason`, `recommended_action`, and `risk` fields. `tests_up_to_date` still becomes `True`; the gap means the test writer did all it safely could for the current diff under the configured test surface, not that full behaviour coverage exists.
 
 **Reset after fixer:** if `FixerAgent` changes any file, the orchestrator resets
 `state.tests_up_to_date = False`. After build/test/check validation is green again,
@@ -992,8 +1000,8 @@ Sikula processes at once is still unsupported.
 | `implement_cycle_records` | `list[dict]` | ImplementerAgent | Structured observability — one entry per implementer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = review/security fix after a post-fixer validation pass), `review_iteration` (`0` = initial or security fix; `>0` = review fix pass N), `security_review_iteration` (`0` = initial or review fix; `>0` = security fix pass N), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `step_description`, `implementer_prompt`, `implementer_output` (`None` on exception), `files_written`, `timestamp`; both iteration counters `== 0` and `build_iteration == 0` means initial implementation; never read for pipeline decisions. **Correlation note:** to find the reviewer record that triggered this implementer, look for a `review_cycle_records` entry with the same `step`, `build_iteration`, and `review_iteration: N-1` |
 | `review_cycle_records` | `list[dict]` | ReviewerAgent | Structured observability — one entry per reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = after a post-fixer validation pass), `review_iteration` (fix-pass index within this step's review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, reviewer history is limited to earlier final full-task reviews, not step-scoped reviews. **Correlation note:** a reviewer record with `review_iteration: N` that found issues triggered the implementer record with `review_iteration: N+1` — the orchestrator increments the counter before calling the implementer |
 | `security_review_cycle_records` | `list[dict]` | SecurityReviewerAgent | Structured observability — one entry per security reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = after a post-fixer validation pass), `security_review_iteration` (fix-pass index within this step's security review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the security reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, security history is limited to earlier final full-task security reviews. **Migration note:** state files from schema version 1 stored security reviewer entries inside `review_cycle_records` with `reviewer = "security_reviewer"`; `JsonStateStore.load()` moves them here and removes the redundant `reviewer` field. |
-| `test_write_records` | `list[dict]` | TestWriterAgent | Structured observability — one entry per test-writer invocation: `step`, `build_iteration` (`0` = before first build; `>0` = after a post-fixer validation pass), `scope`, `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
-| `testability_gaps` | `list[dict]` | TestWriterAgent | Structured audit signal for behaviour the test writer could not safely cover with available project seams/infrastructure. Entries include `source`, `step`, `build_iteration`, optional `scope`, `message`, `timestamp`, and optional parsed `target`, `reason`, `recommended_action`, and `risk`. Default policy is warning-only; `test_writer.testability_gap_policy: fail` turns reported gaps into task failures. |
+| `test_write_records` | `list[dict]` | TestWriterAgent | Structured observability — one entry per test-writer invocation: `step`, `build_iteration` (`0` = before first build; `>0` = after a post-fixer validation pass), `scope`, `test_surface_policy`, `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
+| `testability_gaps` | `list[dict]` | TestWriterAgent | Structured audit signal for behaviour the test writer could not safely cover within the configured test surface. Entries include `source`, `step`, `build_iteration`, optional `scope`, `message`, `timestamp`, and optional parsed `target`, `reason`, `recommended_action`, and `risk`. Default policy is warning-only; `test_writer.testability_gap_policy: fail` turns reported gaps into task failures. |
 | `fix_cycle_records` | `list[dict]` | FixerAgent | Structured observability — one entry per fixer invocation after a failed sync/build/test/check attempt: `build_iteration` (globally unique, never resets), `step`, `scope`, `errors_before` snapshot (build/test/check), `fixer_prompt`, `fixer_output` (`None` on exception), `files_written`, optional `triage_scope` (`test_failure` or `test_origin_validation`), optional `triage_pass` (`test_only` or `production_confirmed`), optional `confirmed_test_failure_triage`, `timestamp`; never read for pipeline decisions |
 | `validation_cycle_records` | `list[dict]` | Orchestrator | Structured observability — one entry per presync/sync/build/test/check outcome with `phase`, `status`, `build_iteration`, `step`, `timestamp`, optional `scope`, optional `elapsed_s`, optional `check_name`, and a diagnostic `error_excerpt` on failure; excerpts preserve failure-marker blocks from long tool output instead of storing only the final tail; never read for pipeline decisions |
 | `validation_artifact_records` | `list[dict]` | Orchestrator | Structured observability for unexpected non-ignored repository changes produced by build/test/check validation commands. Each record stores `phase`, `status` (`cleaned` or `cleanup_failed`), `build_iteration`, `step`, optional `scope`, optional `check_name`, and changed paths with before/after status. Cleanup success allows validation to continue; cleanup failure is treated as that validation phase failing. |
@@ -1281,7 +1289,8 @@ All keys live under `test_writer:` in `.sikula/config.yaml`.
 
 | Key | Default | Description |
 |---|---|---|
-| `coverage_target` | `90` | Minimum branch+line coverage % the agent must aim for on new/changed code |
+| `coverage_target` | `90` | Minimum branch+line coverage % the agent must aim for on new/changed code within the configured test surface |
+| `test_surface_policy` | `existing_infrastructure` | `existing_infrastructure` stays within existing project test infra and does not treat missing heavy UI/browser/device/runtime harnesses as gaps by themselves; `complete` opts in to `TESTABILITY GAP` reports when important behaviour needs missing test infra outside the existing surface |
 | `testability_gap_policy` | `warn` | `warn` records visible `TESTABILITY GAP` entries and allows the task to continue; `fail` records the same entries and fails the task |
 | `extra_rules` | — | Path (relative to project root) to a Markdown file appended to the test writer's prompt as `## Project-specific rules`. Use for project-specific testing conventions: required test doubles, naming patterns, mandatory parametric table rules. Note: unlike the analyst, reviewer, and security reviewer, the test writer does not have guidelines content pre-loaded — it reads `guidelines.context_files` via its file tools. `extra_rules` is the correct configuration point for test-specific conventions that the test writer should apply without needing to read the full guidelines. |
 
