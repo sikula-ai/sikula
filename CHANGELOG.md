@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-31
+
 ### Added
 - Long-running agents and validation commands now publish an active-operation heartbeat to task state and logs, configurable with `progress.heartbeat_interval_seconds` and visible through `sikula status --verbose` / `--json`.
 - Task state observability now includes validation-cycle records for presync, sync, build, test, and quality-check outcomes, plus runtime metadata and a compact terminal summary for completed or failed tasks.
@@ -29,7 +31,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Test-writer prompts prefer behaviour tests through public seams and make source-file inspection a last-resort fallback that must not depend on current working directory or require build/config changes to pass.
 
 ### Fixed
-- Multi-step `sikula run` now performs a final full-task reviewer/security/test-writer gate after all step-scoped validations complete, so the finished branch gets one whole-task pass against the original task before final validation.
+- Multi-step `sikula run` now performs a final full-task reviewer/security/test-writer gate after all planned steps complete, so the finished branch gets one whole-task pass against the original task before final validation.
 - Build/fix follow-up reviews in the final multi-step phase now stay in full-task scope after fixer changes, while per-step build/fix reviews remain scoped to the current step.
 - Build, test, sync, and check failure excerpts now preserve diagnostic blocks from the middle of long command output, so fixer prompts and validation records do not lose the concrete failing test, assertion, compiler error, or stack trace when tool output continues after the failure.
 - Cargo test failures now preserve Cargo's structured `failures:` block and focused rerun command before generic truncation, so noisy workspace output with many successful test-binary summaries does not hide the actual failing Rust test diagnostics from the fixer.

@@ -1167,7 +1167,7 @@ pip install -e ".[dev]"
 
 Editable installs run directly from the checkout. `sikula --version` shows the packaged
 version plus a development suffix when the checkout is inside git, for example
-`sikula 0.1.0-dev+feature.example.abc1234`.
+`sikula 0.2.0-dev+feature.example.abc1234`.
 
 > If you get an "externally-managed-environment" error (common on Linux and some Homebrew setups), create a venv first: `python3 -m venv .venv && source .venv/bin/activate`
 
