@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 
 DEFAULT_DIAGNOSTIC_LIMIT = 4000
+DEFAULT_DIAGNOSTIC_SUMMARY_LINES = 8
+DEFAULT_DIAGNOSTIC_SUMMARY_LINE_LIMIT = 260
 
 _TRUNCATED = "\n... [truncated] ...\n"
 _TRUNCATED_BEFORE_DIAGNOSTICS = "\n... [truncated before diagnostics] ...\n"
@@ -19,7 +21,26 @@ _DIAGNOSTIC_RE = re.compile(
     r"|test case '",
     re.IGNORECASE,
 )
+_PRIMARY_DIAGNOSTIC_RE = re.compile(
+    r"(^|\s)(e|error(?:\[[^\]]+\])?|fatal error|syntaxerror|typeerror|referenceerror|assertionerror|runtimeexception):\s"
+    r"|\b(traceback|panic|panicked|assertionerror|runtimeexception|exception)\b"
+    r"|\b(unresolved reference|cannot find|not found|not assignable|undefined|missing|expected|actual)\b"
+    r"|(^|\s)failed\s+[\w./\\:-]+"
+    r"|[A-Za-z_][\w.$]*(Test|Tests|Spec)\s*>\s*.+\s+FAILED\b"
+    r"|[\w./\\-]+\(\d+,\d+\):\s+error\b"
+    r"|(?:^|\s)(?:file://)?(?:[/\\][^\s:]+)+:\d+(?::\d+)?:",
+    re.IGNORECASE,
+)
+_NOISY_DIAGNOSTIC_RE = re.compile(
+    r"^\s*> Task .+ FAILED\s*$"
+    r"|^\s*BUILD FAILED\b"
+    r"|^\s*FAILURE: Build failed\b"
+    r"|^\s*\* What went wrong:"
+    r"|^\s*Execution failed for task ",
+    re.IGNORECASE,
+)
 _CARGO_TEST_RERUN_RE = re.compile(r"^error: test failed, to rerun pass `.*`", re.IGNORECASE)
+_ABSOLUTE_PATH_RE = re.compile(r"(?P<prefix>file://)?(?P<path>(?:[/\\][^\s:]+)+)(?P<location>:\d+(?::\d+)?)?")
 
 
 def diagnostic_excerpt(text: str | None, limit: int = DEFAULT_DIAGNOSTIC_LIMIT, context_lines: int = 8) -> str:
@@ -40,6 +61,57 @@ def diagnostic_excerpt(text: str | None, limit: int = DEFAULT_DIAGNOSTIC_LIMIT, 
         return _compose_diagnostic_excerpt(text, diagnostic, limit)
 
     return _head_tail(text, limit)
+
+
+def diagnostic_summary_lines(
+    text: str | None,
+    *,
+    max_lines: int = DEFAULT_DIAGNOSTIC_SUMMARY_LINES,
+    line_limit: int = DEFAULT_DIAGNOSTIC_SUMMARY_LINE_LIMIT,
+) -> list[str]:
+    """Return short high-signal diagnostic lines from command output.
+
+    This is intentionally platform-neutral. It prefers compiler/test/check lines that
+    carry concrete file locations, failed test names, exception classes, or assertion
+    text, and falls back to generic build-tool failure lines when nothing better is
+    available.
+    """
+    if not text or max_lines <= 0 or line_limit <= 0:
+        return []
+
+    raw_lines = text.splitlines()
+    scored: list[tuple[int, int]] = []
+    for index, line in enumerate(raw_lines):
+        score = _diagnostic_score(line)
+        if score:
+            scored.append((index, score))
+
+    if not scored:
+        return []
+
+    threshold = 100 if any(score >= 100 for _, score in scored) else 50
+    if not any(score >= threshold for _, score in scored):
+        threshold = 10
+
+    selected_indexes: list[int] = []
+    for index, score in scored:
+        if score < threshold:
+            continue
+        _append_unique_index(selected_indexes, index)
+        for related_index in _related_context_indexes(raw_lines, index):
+            _append_unique_index(selected_indexes, related_index)
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    for index in selected_indexes:
+        line = _compact_diagnostic_line(raw_lines[index], limit=line_limit)
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+        if len(lines) >= max_lines:
+            break
+    return lines
 
 
 def cargo_test_failure_excerpt(text: str | None, limit: int = DEFAULT_DIAGNOSTIC_LIMIT) -> str:
@@ -114,6 +186,86 @@ def _diagnostic_blocks(text: str, context_lines: int) -> str:
 def _is_diagnostic_line(line: str) -> bool:
     normalized = _ANSI_RE.sub("", line)
     return bool(_DIAGNOSTIC_RE.search(normalized))
+
+
+def _diagnostic_score(line: str) -> int:
+    normalized = _ANSI_RE.sub("", line).strip()
+    if not normalized:
+        return 0
+    if _NOISY_DIAGNOSTIC_RE.search(normalized):
+        return 10
+    if _PRIMARY_DIAGNOSTIC_RE.search(normalized):
+        return 100
+    if _DIAGNOSTIC_RE.search(normalized):
+        return 50
+    return 0
+
+
+def _append_unique_index(indexes: list[int], index: int) -> None:
+    if index not in indexes:
+        indexes.append(index)
+
+
+def _related_context_indexes(lines: list[str], index: int) -> list[int]:
+    indexes: list[int] = []
+    blank_lines_seen = 0
+    for related_index in range(index + 1, min(len(lines), index + 4)):
+        line = _ANSI_RE.sub("", lines[related_index]).rstrip()
+        stripped = line.strip()
+        if not stripped:
+            blank_lines_seen += 1
+            if blank_lines_seen > 1:
+                break
+            continue
+        if _diagnostic_score(stripped) >= 100 or _looks_like_failure_detail(line):
+            indexes.append(related_index)
+            continue
+        break
+    return indexes
+
+
+def _looks_like_failure_detail(line: str) -> bool:
+    stripped = line.strip()
+    return bool(
+        line.startswith((" ", "\t"))
+        or re.search(r"\bat\s+[\w.$/\\-]+:\d+", stripped)
+        or re.search(r"\b(expected|actual|left|right):\b", stripped, re.IGNORECASE)
+        or re.search(r"\b(java\.lang\.\w+|AssertionError|RuntimeException|Exception)\b", stripped)
+    )
+
+
+def _compact_diagnostic_line(line: str, *, limit: int) -> str:
+    compacted = " ".join(_ANSI_RE.sub("", line).split())
+    if not compacted:
+        return ""
+    compacted = _shorten_paths(compacted)
+    return _middle_truncate(compacted, limit)
+
+
+def _shorten_paths(line: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        path = match.group("path")
+        location = match.group("location") or ""
+        normalized = path.replace("\\", "/")
+        parts = [part for part in normalized.split("/") if part]
+        if len(parts) <= 3 and len(path) <= 80:
+            return match.group(0)
+        suffix = "/".join(parts[-3:]) if len(parts) >= 3 else normalized
+        return f".../{suffix}{location}"
+
+    return _ABSOLUTE_PATH_RE.sub(replace, line)
+
+
+def _middle_truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    marker = "..."
+    if limit <= len(marker):
+        return text[:limit]
+    available = limit - len(marker)
+    head_len = max(1, available // 3)
+    tail_len = available - head_len
+    return text[:head_len].rstrip() + marker + text[-tail_len:].lstrip()
 
 
 def _compose_diagnostic_excerpt(text: str, diagnostic: str, limit: int) -> str:

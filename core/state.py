@@ -18,7 +18,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Optional
 
-from core.diagnostics import diagnostic_excerpt
+from core.diagnostics import diagnostic_excerpt, diagnostic_summary_lines
 
 
 def _now() -> str:
@@ -280,6 +280,9 @@ class TaskState:
         error_excerpt = _short_text(error)
         if error_excerpt:
             entry["error_excerpt"] = error_excerpt
+        diagnostic_summary = diagnostic_summary_lines(error)
+        if diagnostic_summary:
+            entry["diagnostic_summary"] = diagnostic_summary
         self.validation_cycle_records.append(entry)
 
     def start_active_operation(

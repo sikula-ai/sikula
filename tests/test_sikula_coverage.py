@@ -666,7 +666,14 @@ class TestTaskAuditReport:
         state.validation_artifact_records.append({"status": "cleaned", "artifacts": [{"path": "tmp.log"}]})
         state.history.append({"action": "llm_retry"})
         state.validation_cycle_records.append({"phase": "test", "status": "failed"})
-        state.validation_cycle_records.append({"phase": "check", "status": "failed", "check_name": "ruff-format"})
+        state.validation_cycle_records.append(
+            {
+                "phase": "check",
+                "status": "failed",
+                "check_name": "ruff-format",
+                "diagnostic_summary": ["src/app.py:12:1: would reformat"],
+            }
+        )
         state.fix_cycle_records.append({"triage_pass": "production_confirmed"})
 
         warning_count = _print_task_audit_report(state)
@@ -683,9 +690,44 @@ class TestTaskAuditReport:
         assert "LLM retries: 1" in out
         assert "Recovered issues:" in out
         assert "validation recovered after failed check:ruff-format, test" in out
+        assert "check:ruff-format: src/app.py:12:1: would reformat" in out
         assert "fixer used production-confirmed test failure triage: 1" in out
         assert _task_audit_warnings(state)
         assert _task_recovered_issues(state)
+
+    def test_recovered_issues_include_diagnostic_summary_lines(self, capsys):
+        from core.state import TaskState
+
+        state = TaskState(task_id="t1", task_description="task")
+        state.done = True
+        state.validation_cycle_records.append(
+            {
+                "phase": "test",
+                "status": "failed",
+                "diagnostic_summary": [
+                    "CountryDetailScreenContractTest > detail content uses capital fallback() FAILED",
+                    "java.lang.AssertionError at CountryDetailScreenContractTest.kt:53",
+                ],
+            }
+        )
+        state.validation_cycle_records.append(
+            {
+                "phase": "check",
+                "status": "failed",
+                "check_name": "detekt",
+                "diagnostic_summary": [
+                    ".../CountryDetailScreen.kt:43:19: TopLevelPropertyNaming",
+                ],
+            }
+        )
+
+        _print_task_audit_report(state)
+
+        out = capsys.readouterr().out
+        assert "validation recovered after failed check:detekt, test" in out
+        assert "test: CountryDetailScreenContractTest > detail content uses capital fallback() FAILED" in out
+        assert "test: java.lang.AssertionError at CountryDetailScreenContractTest.kt:53" in out
+        assert "check:detekt: .../CountryDetailScreen.kt:43:19: TopLevelPropertyNaming" in out
 
     def test_failed_task_reports_production_triage_as_warning_not_recovered(self, capsys):
         from core.state import TaskState

@@ -67,6 +67,8 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
+from core.diagnostics import diagnostic_summary_lines
+
 _BASE = Path(__file__).parent
 # When adding a new platform: add it here, in _build_tool() in core/orchestrator.py,
 # in _generate_config() below, and in _SIGNATURES in tools/scanner.py.
@@ -852,6 +854,33 @@ def _validation_failure_summary(records: list[dict]) -> str | None:
     return ", ".join(parts)
 
 
+def _validation_failure_diagnostics(records: list[dict], limit: int = 6) -> list[str]:
+    diagnostics: list[str] = []
+    seen: set[str] = set()
+    for record in records:
+        if record.get("status") != "failed":
+            continue
+        label = str(record.get("phase") or "validation")
+        if record.get("check_name"):
+            label = f"{label}:{record['check_name']}"
+        summary = record.get("diagnostic_summary")
+        if isinstance(summary, list):
+            lines = [str(line) for line in summary if line]
+        elif isinstance(summary, str):
+            lines = [line for line in summary.splitlines() if line.strip()]
+        else:
+            lines = diagnostic_summary_lines(record.get("error_excerpt"))
+        for line in lines:
+            item = f"{label}: {_short_audit_line(line, limit=220)}"
+            if item in seen:
+                continue
+            seen.add(item)
+            diagnostics.append(item)
+            if len(diagnostics) >= limit:
+                return diagnostics
+    return diagnostics
+
+
 def _task_audit_warnings(state) -> list[str]:
     warnings: list[str] = []
     for warning in getattr(state, "analyst_warnings", []):
@@ -905,6 +934,7 @@ def _task_recovered_issues(state) -> list[str]:
     validation_failures = _validation_failure_summary(getattr(state, "validation_cycle_records", []))
     if state.done and validation_failures:
         recovered.append(f"validation recovered after failed {validation_failures}")
+        recovered.extend(_validation_failure_diagnostics(getattr(state, "validation_cycle_records", [])))
 
     production_triage_count = sum(
         1 for record in getattr(state, "fix_cycle_records", []) if record.get("triage_pass") == "production_confirmed"

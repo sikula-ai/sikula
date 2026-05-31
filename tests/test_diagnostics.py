@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from core.diagnostics import cargo_test_failure_excerpt, diagnostic_excerpt
+from core.diagnostics import cargo_test_failure_excerpt, diagnostic_excerpt, diagnostic_summary_lines
 
 
 class TestDiagnosticExcerpt:
@@ -88,6 +88,70 @@ class TestDiagnosticExcerpt:
         assert len(excerpt) <= 30
         assert "HEAD" not in excerpt
         assert "tail" not in excerpt
+
+
+class TestDiagnosticSummaryLines:
+    def test_extracts_gradle_compiler_error_from_noisy_output(self):
+        output = (
+            "> Task :app:preBuild UP-TO-DATE\n"
+            + ("noise\n" * 120)
+            + "> Task :feature:countries:compileDebugUnitTestKotlin FAILED\n"
+            + "96 actionable tasks: 16 executed, 80 up-to-date\n"
+            + "e: file:///Users/me/project/feature/countries/src/test/kotlin/com/example/"
+            "SourceContractTestSupport.kt:11:22 Unresolved reference 'readString'.\n"
+            + "\nFAILURE: Build failed with an exception.\n"
+            + "* What went wrong:\n"
+            + "Execution failed for task ':feature:countries:compileDebugUnitTestKotlin'.\n"
+            + "BUILD FAILED in 2s\n"
+        )
+
+        lines = diagnostic_summary_lines(output)
+
+        assert lines[0] == "e: .../com/example/SourceContractTestSupport.kt:11:22 Unresolved reference 'readString'."
+        assert not lines[0].startswith("> Task")
+
+    def test_extracts_failed_test_name_and_exception_context(self):
+        output = (
+            "> Task :feature:countries:testDebugUnitTest\n\n"
+            "CountriesNavigationContractTest > detail route builder uri encodes code name and flag emoji() FAILED\n"
+            "    java.lang.RuntimeException at CountriesNavigationContractTest.kt:27\n"
+            "\n38 tests completed, 1 failed\n"
+            "BUILD FAILED in 4s\n"
+        )
+
+        lines = diagnostic_summary_lines(output)
+
+        assert lines[:2] == [
+            "CountriesNavigationContractTest > detail route builder uri encodes code name and flag emoji() FAILED",
+            "java.lang.RuntimeException at CountriesNavigationContractTest.kt:27",
+        ]
+
+    def test_extracts_linter_file_locations_without_gradle_boilerplate_first(self):
+        output = (
+            "> Task :feature:countries:detekt FAILED\n"
+            "/Users/me/project/feature/countries/src/main/kotlin/com/example/CountryDetailScreen.kt:43:19: "
+            "Top level constant names should match the pattern: [A-Z][_A-Z0-9]* [TopLevelPropertyNaming]\n"
+            "/Users/me/project/feature/countries/src/test/kotlin/com/example/CountriesNavigationContractTest.kt:30:1: "
+            "Line detected, which is longer than the defined maximum line length in the code style. [MaxLineLength]\n"
+            "BUILD FAILED in 2s\n"
+        )
+
+        lines = diagnostic_summary_lines(output)
+
+        assert lines[0].startswith(".../com/example/CountryDetailScreen.kt:43:19")
+        assert "TopLevelPropertyNaming" in lines[0]
+        assert "MaxLineLength" in lines[1]
+
+    def test_extracts_typescript_and_rust_error_locations(self):
+        output = (
+            "tests/clientMain.test.ts(369,67): error TS2345: Argument of type 'null' is not assignable.\n"
+            "src/lib.rs:42:13: error[E0308]: mismatched types\n"
+        )
+
+        lines = diagnostic_summary_lines(output)
+
+        assert "tests/clientMain.test.ts(369,67): error TS2345" in lines[0]
+        assert "src/lib.rs:42:13: error[E0308]" in lines[1]
 
 
 class TestCargoTestFailureExcerpt:

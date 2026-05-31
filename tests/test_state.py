@@ -117,6 +117,24 @@ class TestJsonStateStore:
         assert record["step"] == 1
         assert record["elapsed_s"] == 1.3
         assert len(record["error_excerpt"]) == 1000
+        assert "diagnostic_summary" not in record
+
+    def test_validation_record_captures_diagnostic_summary(self):
+        state = TaskState(task_id="v1", task_description="validation task")
+        error = (
+            "> Task :app:test FAILED\n"
+            "CountryDetailScreenContractTest > detail content uses capital fallback() FAILED\n"
+            "    java.lang.AssertionError at CountryDetailScreenContractTest.kt:53\n"
+            "BUILD FAILED in 3s\n"
+        )
+
+        state.record_validation("test", "failed", error=error)
+
+        record = state.validation_cycle_records[0]
+        assert record["diagnostic_summary"] == [
+            "CountryDetailScreenContractTest > detail content uses capital fallback() FAILED",
+            "java.lang.AssertionError at CountryDetailScreenContractTest.kt:53",
+        ]
 
     def test_load_old_state_without_new_observability_fields(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
