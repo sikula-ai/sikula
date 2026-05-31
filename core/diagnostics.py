@@ -54,6 +54,9 @@ _ASSERTION_COMPARISON_VALUES_RE = re.compile(
     r"^([+-]?\s*(?:expected|received|actual|left|right)\b[^:]{0,60}:\s+).+",
     re.IGNORECASE,
 )
+_DOUBLE_QUOTED_LITERAL_RE = re.compile(r'"(?:\\.|[^"\n]){1,200}"')
+_SINGLE_QUOTED_LITERAL_RE = re.compile(r"'(?:\\.|[^'\n]){1,200}'")
+_BACKTICK_QUOTED_LITERAL_RE = re.compile(r"`(?:\\.|[^`\n]){1,200}`")
 _STACK_FRAME_DETAIL_RE = re.compile(
     r"^(?:"
     r"at\s+[\w.$/\\<>-]+(?:\([^)]*:\d+(?::\d+)?\)|:\d+(?::\d+)?)"
@@ -321,7 +324,30 @@ def _compact_diagnostic_line(line: str, *, limit: int) -> str:
     compacted = _ASSERTION_VALUES_RE.sub(r"\1assertion failed", compacted)
     compacted = _ASSERTION_COMPARISON_VALUES_RE.sub(r"\1<redacted>", compacted)
     compacted = _shorten_paths(compacted)
+    compacted = _redact_quoted_literals(compacted)
     return _middle_truncate(compacted, limit)
+
+
+def _redact_quoted_literals(line: str) -> str:
+    line = _DOUBLE_QUOTED_LITERAL_RE.sub(_replace_quoted_literal, line)
+    line = _SINGLE_QUOTED_LITERAL_RE.sub(_replace_quoted_literal, line)
+    return _BACKTICK_QUOTED_LITERAL_RE.sub(_replace_quoted_literal, line)
+
+
+def _replace_quoted_literal(match: re.Match[str]) -> str:
+    literal = match.group(0)
+    value = literal[1:-1]
+    if _looks_like_path_value(value):
+        return literal
+    return "<redacted>"
+
+
+def _looks_like_path_value(value: str) -> bool:
+    has_separator = "/" in value or "\\" in value
+    normalized = value.replace("\\", "/")
+    if normalized.startswith((".../", "./", "../", "/", "file://")):
+        return True
+    return has_separator and bool(re.search(r"(?:^|/)[A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+(?::\d+(?::\d+)?)?$", normalized))
 
 
 def _shorten_paths(line: str) -> str:

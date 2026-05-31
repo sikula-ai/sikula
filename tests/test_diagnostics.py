@@ -107,7 +107,7 @@ class TestDiagnosticSummaryLines:
 
         lines = diagnostic_summary_lines(output)
 
-        assert lines[0] == "e: .../com/example/SourceContractTestSupport.kt:11:22 Unresolved reference 'readString'."
+        assert lines[0] == "e: .../com/example/SourceContractTestSupport.kt:11:22 Unresolved reference <redacted>."
         assert not lines[0].startswith("> Task")
 
     def test_extracts_failed_test_name_and_exception_context(self):
@@ -146,7 +146,7 @@ class TestDiagnosticSummaryLines:
 
     def test_summary_skips_compiler_source_frames_after_error(self):
         output = (
-            "src/auth.ts:12:5 - error TS2322: Type 'string' is not assignable to type 'number'.\n"
+            "src/auth.ts:12:5 - error TS2322: Type '\"super-secret\"' is not assignable to type 'number'.\n"
             "12 | const token = 'super-secret'\n"
             "   |     ^^^^^\n"
             "error: Type check failed\n"
@@ -156,11 +156,18 @@ class TestDiagnosticSummaryLines:
         combined = "\n".join(lines)
 
         assert lines == [
-            "src/auth.ts:12:5 - error TS2322: Type 'string' is not assignable to type 'number'.",
+            "src/auth.ts:12:5 - error TS2322: Type <redacted> is not assignable to type <redacted>.",
             "error: Type check failed",
         ]
         assert "super-secret" not in combined
         assert "^^^^^" not in combined
+
+    def test_summary_redacts_panic_payload_literals(self):
+        output = "thread 'test_handles_token' panicked at src/lib.rs:42:5: token value 'super-secret'\n"
+
+        lines = diagnostic_summary_lines(output)
+
+        assert lines == ["thread <redacted> panicked at src/lib.rs:42:5: token value <redacted>"]
 
     def test_summary_omits_pytest_assertion_rewrite_values(self):
         output = (
@@ -257,7 +264,7 @@ class TestDiagnosticSummaryLines:
 
         lines = diagnostic_summary_lines(output)
 
-        assert lines == ["app.py:1:8: F401 `os` imported but unused"]
+        assert lines == ["app.py:1:8: F401 <redacted> imported but unused"]
 
     def test_extracts_relative_formatter_locations_without_error_token(self):
         output = "    src/app.py:12:1: would reformat\nAll done!\n"
