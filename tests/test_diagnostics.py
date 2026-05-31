@@ -180,6 +180,26 @@ class TestDiagnosticSummaryLines:
         assert "expected-token" not in combined
         assert "expected_token" not in combined
 
+    def test_summary_redacts_junit_assertion_payload_values(self):
+        output = (
+            "CountryRepositoryTest > token is not exposed() FAILED\n"
+            "java.lang.AssertionError: expected:<public-token> but was:<super-secret-token>\n"
+            "org.opentest4j.AssertionFailedError: expected: <expected-token> but was: <actual-token>\n"
+        )
+
+        lines = diagnostic_summary_lines(output)
+        combined = "\n".join(lines)
+
+        assert lines == [
+            "CountryRepositoryTest > token is not exposed() FAILED",
+            "java.lang.AssertionError: assertion failed",
+            "org.opentest4j.AssertionFailedError: assertion failed",
+        ]
+        assert "public-token" not in combined
+        assert "super-secret-token" not in combined
+        assert "expected-token" not in combined
+        assert "actual-token" not in combined
+
     def test_summary_redacts_jest_assertion_comparison_values(self):
         output = (
             "TokenCardTest > hides credentials() FAILED\n"
@@ -254,7 +274,7 @@ class TestDiagnosticSummaryLines:
 
         assert lines == [
             "FAILED tests/test_auth.py::test_login",
-            ".../project/tests/test_auth.py:42:5: AssertionError: login failed",
+            ".../project/tests/test_auth.py:42:5: AssertionError: assertion failed",
             "error: missing generated client",
         ]
 
@@ -267,7 +287,7 @@ class TestDiagnosticSummaryLines:
 
         lines = diagnostic_summary_lines(output)
 
-        assert lines == ["error: .../src/tests/test_user_flow.py:12:5 AssertionError: expected detail screen"]
+        assert lines == ["error: .../src/tests/test_user_flow.py:12:5 AssertionError: assertion failed"]
 
 
 class TestCargoTestFailureExcerpt:

@@ -41,7 +41,7 @@ _NOISY_DIAGNOSTIC_RE = re.compile(
 )
 _CARGO_TEST_RERUN_RE = re.compile(r"^error: test failed, to rerun pass `.*`", re.IGNORECASE)
 _ABSOLUTE_PATH_RE = re.compile(r"(?P<prefix>file://)?(?P<path>(?:[/\\][^\s:]+)+)(?P<location>:\d+(?::\d+)?)?")
-_ASSERTION_VALUES_RE = re.compile(r"(\bAssertionError:\s+)assert\b.*", re.IGNORECASE)
+_ASSERTION_VALUES_RE = re.compile(r"(\b[\w.]*Assertion(?:Failed)?Error:\s+).+", re.IGNORECASE)
 _ASSERTION_COMPARISON_VALUES_RE = re.compile(
     r"^([+-]?\s*(?:expected|received|actual|left|right)\b[^:]{0,60}:\s+).+",
     re.IGNORECASE,
