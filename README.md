@@ -10,7 +10,7 @@ Sikula is a stateful software engineering pipeline for real codebases, powered b
 
 `sikula review` reviews an existing branch — report-only, or with `--fix` to apply corrections through the same build and fix loop.
 
-**Platforms:** Android/Gradle, JVM backends (Spring Boot, Quarkus, Micronaut)/Gradle, JVM backends/Maven, Node.js/TypeScript/JavaScript, iOS/Xcode, Python, and Rust/Cargo are supported out of the box. The core orchestration and all agents are platform-neutral — supporting a new platform requires a `BuildTool` subclass and a project config YAML.
+**Platforms:** Android/Gradle, JVM backends (Spring Boot, Quarkus, Micronaut)/Gradle, JVM backends/Maven, Node.js/TypeScript/JavaScript (including npm, pnpm, Yarn, and Bun projects), iOS/Xcode, Python, and Rust/Cargo are supported out of the box. The core orchestration and all agents are platform-neutral — supporting a new platform requires a `BuildTool` subclass and a project config YAML.
 
 **LLM providers:** Codex, Claude, Gemini, and OpenCode are built in. Authenticate via CLI login or an API key in `.env` — no vendor lock-in.
 
@@ -99,13 +99,14 @@ sikula init --provider codex --model gpt-5.5 --guidelines  # adjust provider/mod
 
 ```bash
 # Pick the example closest to your stack:
-#   Android:     example/android/countries/.sikula/config.yaml
-#   iOS:         example/ios/countries/.sikula/config.yaml
-#   JVM/Gradle:  example/jvm/countries-gradle/.sikula/config.yaml
-#   JVM/Maven:   example/jvm/countries-maven/.sikula/config.yaml
-#   Node/React:  example/node/countries-react/.sikula/config.yaml
-#   Rust:        example/rust/countries/.sikula/config.yaml
-#   Python:      .sikula/config.yaml  (this repo)
+#   Android:         example/android/countries/.sikula/config.yaml
+#   iOS:             example/ios/countries/.sikula/config.yaml
+#   JVM/Gradle:      example/jvm/countries-gradle/.sikula/config.yaml
+#   JVM/Maven:       example/jvm/countries-maven/.sikula/config.yaml
+#   Node/React:      example/node/countries-react/.sikula/config.yaml
+#   Bun full-stack:  example/node/countries-bun-fullstack/.sikula/config.yaml
+#   Rust:            example/rust/countries/.sikula/config.yaml
+#   Python:          .sikula/config.yaml  (this repo)
 cp <example-config> my-project/.sikula/config.yaml
 # update: project name, allowed_write_paths, build tasks, guidelines.context_files
 ```
@@ -137,7 +138,7 @@ git diff main...sikula/<branch-name>
 - **Build-aware execution** — Sikula compiles, tests, runs configured checks, and feeds failures to a fixer until the task passes or fails explicitly
 - **Precise scope control** — the analyst reads your codebase before writing the implementation prompt; the reviewer verifies call sites, structured input contracts, completeness, and scope drift before code reaches you
 - **Fits existing git and CI workflows** — output is a normal git branch and commit, ready for human review and whatever CI you already run
-- **Stack-flexible core** — Android, iOS, JVM, Node.js/TypeScript/JavaScript, Python, and Rust are supported through platform-specific build tools; the orchestration stays the same
+- **Stack-flexible core** — Android, iOS, JVM, Node.js/TypeScript/JavaScript (including Bun), Python, and Rust are supported through platform-specific build tools; the orchestration stays the same
 - **Configurable and transparent** — each phase can be enabled or disabled, each agent can use a different model/provider, and every run is inspectable with `sikula show <task-id>`
 
 ## Why a pipeline instead of a single agent?
@@ -503,7 +504,7 @@ CLI values layer on top of `agents:` overrides in the project YAML.
 | Section | Key | Default | Description |
 |---|---|---|---|
 | `project` | `root_path` | `.` | Project root; `"."` (the default) resolves to the directory containing `.sikula/config.yaml`; use an absolute path only when the config lives outside the project tree |
-| `project` | `build_tool` | `"gradle-android"` | BuildTool selection: `"gradle-android"` (Android/Gradle), `"gradle-jvm"` (JVM backend/Gradle), `"maven"` (Maven), `"node"` (NodeTool for TypeScript/JavaScript), `"python"` (PythonTool), `"cargo"` (CargoTool), or `"xcodebuild"` (XcodeTool) |
+| `project` | `build_tool` | `"gradle-android"` | BuildTool selection: `"gradle-android"` (Android/Gradle), `"gradle-jvm"` (JVM backend/Gradle), `"maven"` (Maven), `"node"` (NodeTool for TypeScript/JavaScript, including npm/pnpm/yarn/Bun projects), `"python"` (PythonTool), `"cargo"` (CargoTool), or `"xcodebuild"` (XcodeTool) |
 | `project` | `platform` | — | Target platform (e.g. `Android`, `iOS`); injected into agent prompts |
 | `project` | `language` | — | Tech stack language (e.g. `Kotlin`, `Python`); injected into agent prompts |
 | `project` | `ui` | — | UI framework (e.g. `Jetpack Compose`); injected into agent prompts |
@@ -613,7 +614,7 @@ sikula review \
     --description-file login_pr.md
 ```
 
-Runs `ReviewerAgent`, then `SecurityReviewerAgent` (only if review passes; controlled by `--security-review` / project config, default on). Prints the full review output and exits `0` (approved) or `1` (issues found). The worktree is removed on completion. Task state is saved — inspect with `show <task-id>`.
+Runs `ReviewerAgent`, then `SecurityReviewerAgent` (only if review passes; controlled by `--security-review` / project config, default on). Prints the full review output plus the task audit summary and exits `0` (approved) or `1` (issues found). The worktree is removed on completion. Task state is saved — inspect with `show <task-id>`.
 
 **Fix mode** (`--fix`) — applies suggested fixes to the branch:
 
@@ -688,6 +689,13 @@ git merge sikula/<task-stem>-<task-id>
 Sikula state commands such as `status` and `show` can also be run from inside a
 preserved task worktree; Sikula resolves task state from the original project, not
 from the worktree copy.
+
+When a `sikula run` or `sikula review` task finishes, the terminal summary includes
+validation status, review status, audit warnings, and recovered issues. Audit warnings
+such as write-scope warnings, testability gaps, validation artifacts, or provider retries
+do not make an otherwise valid task fail; they point to items a human should inspect before
+merging.
+The full details remain available in `sikula show <task-id>`.
 Start fresh tasks from the original project, not from inside another task worktree.
 Use `sikula run --task-id <task-id>` to resume the current task instead.
 `cleanup --force` and `delete --force` must be run from outside the worktree they
@@ -769,7 +777,8 @@ under each provider in [§ Adding a new LLM provider](#adding-a-new-llm-provider
 in the agent prompt; they are not enforced at the OS level.
 After each write-capable agent call, Sikula compares the files reported by that call with
 the active write path list and records a non-blocking `write_path_warning` in task history
-when a file falls outside it. Inspect with `sikula show <task-id>`.
+when a file falls outside it. The completion report highlights these warnings, and the
+full record is available with `sikula show <task-id>`.
 This is an audit signal, not pipeline control flow: it does not fail the task and it only
 covers files reported by the provider's `run_agent()` result.
 
@@ -892,7 +901,7 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
 
 ### Validation
 
-- Built-in BuildTools cover Android/Gradle, JVM/Gradle, Maven, Node.js/TypeScript/JavaScript,
+- Built-in BuildTools cover Android/Gradle, JVM/Gradle, Maven, Node.js/TypeScript/JavaScript including Bun,
   Python, Rust/Cargo, and Xcode/Swift.
 - Validation can include sync, compile/typecheck, tests, and configured quality checks.
   Check entries support `name`, `command`, `timeout`, and optional deterministic

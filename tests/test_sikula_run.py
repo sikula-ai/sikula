@@ -877,6 +877,40 @@ class TestCmdRunStateStore:
         assert "Build attempts:  2 total (max 10/loop)" in out
         assert "Total time:" not in out
 
+    def test_terminal_done_prints_audit_warnings_without_failing(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        state = TaskState(task_id="abc123", task_description="resume me")
+        state.done = True
+        state.build_status = "success"
+        state.test_status = "success"
+        state.check_status = "success"
+        state.record(
+            "implementer",
+            "write_path_warning",
+            "files outside allowed_write_paths: ['README.md']; allowed: ['src/']",
+        )
+        store.save(state)
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            mock.run.return_value = state_store.load("abc123")
+            return mock
+
+        with (
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "Task abc123: ✓ DONE with warnings (1)" in out
+        assert "Audit warnings:" in out
+        assert "implementer: files outside allowed_write_paths" in out
+        exit_mock.assert_called_with(0)
+
     def test_task_id_terminal_failed_prints_reset_failed_hint(self, tmp_path: Path, capsys):
         from core.state import JsonStateStore, TaskState
 

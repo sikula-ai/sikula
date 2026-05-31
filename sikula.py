@@ -818,6 +818,135 @@ def _fmt_time(seconds: float) -> str:
     return f"{m}m {s:02d}s"
 
 
+def _short_audit_line(value: str | None, limit: int = 180) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _validation_status(value: str | None) -> str:
+    return value or "skipped"
+
+
+def _review_status(approved: bool, records: list[dict]) -> str:
+    if approved:
+        return "approved"
+    if records:
+        return "issues found"
+    return "skipped"
+
+
+def _validation_failure_summary(records: list[dict]) -> str | None:
+    counts: dict[str, int] = {}
+    for record in records:
+        if record.get("status") != "failed":
+            continue
+        label = str(record.get("phase") or "validation")
+        if record.get("check_name"):
+            label = f"{label}:{record['check_name']}"
+        counts[label] = counts.get(label, 0) + 1
+    if not counts:
+        return None
+    parts = [f"{label} x{count}" if count > 1 else label for label, count in sorted(counts.items())]
+    return ", ".join(parts)
+
+
+def _task_audit_warnings(state) -> list[str]:
+    warnings: list[str] = []
+    for warning in getattr(state, "analyst_warnings", []):
+        warnings.append(f"analyst: {_short_audit_line(warning)}")
+
+    for entry in getattr(state, "history", []):
+        if entry.get("action") == "write_path_warning":
+            agent = entry.get("agent") or "agent"
+            warnings.append(f"{agent}: {_short_audit_line(entry.get('result'))}")
+
+    review_warning_count = sum(1 for record in getattr(state, "review_cycle_records", []) if record.get("has_warnings"))
+    if review_warning_count:
+        warnings.append(f"reviewer warnings: {review_warning_count}")
+
+    security_warning_count = sum(
+        1 for record in getattr(state, "security_review_cycle_records", []) if record.get("has_warnings")
+    )
+    if security_warning_count:
+        warnings.append(f"security reviewer warnings: {security_warning_count}")
+
+    if getattr(state, "testability_gaps", []):
+        warnings.append(f"testability gaps: {len(state.testability_gaps)} (see: sikula show {state.task_id})")
+
+    artifacts = getattr(state, "validation_artifact_records", [])
+    if artifacts:
+        cleaned = sum(1 for record in artifacts if record.get("status") == "cleaned")
+        cleanup_failed = sum(1 for record in artifacts if record.get("status") == "cleanup_failed")
+        details = []
+        if cleaned:
+            details.append(f"{cleaned} cleaned")
+        if cleanup_failed:
+            details.append(f"{cleanup_failed} cleanup failed")
+        suffix = f" ({', '.join(details)})" if details else ""
+        warnings.append(f"validation artifacts: {len(artifacts)}{suffix}")
+
+    llm_retries = sum(1 for entry in getattr(state, "history", []) if entry.get("action") == "llm_retry")
+    if llm_retries:
+        warnings.append(f"LLM retries: {llm_retries}")
+
+    production_triage_count = sum(
+        1 for record in getattr(state, "fix_cycle_records", []) if record.get("triage_pass") == "production_confirmed"
+    )
+    if production_triage_count and not state.done:
+        warnings.append(f"production-confirmed test failure triage: {production_triage_count}")
+
+    return warnings
+
+
+def _task_recovered_issues(state) -> list[str]:
+    recovered: list[str] = []
+    validation_failures = _validation_failure_summary(getattr(state, "validation_cycle_records", []))
+    if state.done and validation_failures:
+        recovered.append(f"validation recovered after failed {validation_failures}")
+
+    production_triage_count = sum(
+        1 for record in getattr(state, "fix_cycle_records", []) if record.get("triage_pass") == "production_confirmed"
+    )
+    if state.done and production_triage_count:
+        recovered.append(f"fixer used production-confirmed test failure triage: {production_triage_count}")
+
+    return recovered
+
+
+def _print_limited_lines(lines: list[str], task_id: str, limit: int = 8) -> None:
+    for line in lines[:limit]:
+        print(f"  - {line}")
+    remaining = len(lines) - limit
+    if remaining > 0:
+        print(f"  - ... {remaining} more (see: sikula show {task_id})")
+
+
+def _print_task_audit_report(state) -> int:
+    warnings = _task_audit_warnings(state)
+    recovered = _task_recovered_issues(state)
+
+    print("Validation:")
+    print(f"  build: {_validation_status(state.build_status)}")
+    print(f"  test:  {_validation_status(state.test_status)}")
+    print(f"  check: {_validation_status(state.check_status)}")
+    print("Reviews:")
+    print(f"  reviewer:          {_review_status(state.review_approved, state.review_cycle_records)}")
+    print(f"  security reviewer: {_review_status(state.security_approved, state.security_review_cycle_records)}")
+    print(f"  test writer runs:  {len(state.test_write_records)}")
+
+    if warnings:
+        print("Audit warnings:")
+        _print_limited_lines(warnings, state.task_id)
+
+    if recovered:
+        print("Recovered issues:")
+        _print_limited_lines(recovered, state.task_id)
+
+    return len(warnings)
+
+
 def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
     from core.state import JsonStateStore
 
@@ -989,8 +1118,9 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
             longest_label = f"{h['agent']}/{h['action']}"
 
     max_iter = cfg.get("sandbox", {}).get("max_iterations", 10)
+    audit_warning_count = len(_task_audit_warnings(state))
     if state.done:
-        status = "✓ DONE"
+        status = f"✓ DONE with warnings ({audit_warning_count})" if audit_warning_count else "✓ DONE"
     elif state.failed:
         status = "✗ FAILED"
     else:
@@ -1016,10 +1146,9 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
         print("Files changed:")
         for f in state.files_changed:
             print(f"  {f}")
+    _print_task_audit_report(state)
     if state.errors:
         print(f"Errors:          {len(state.errors)} remaining (see: sikula show {state.task_id})")
-    if getattr(state, "testability_gaps", []):
-        print(f"Testability gaps: {len(state.testability_gaps)} (see: sikula show {state.task_id})")
 
     sys.exit(0 if state.done else 1)
 
@@ -1324,8 +1453,7 @@ def _print_review_summary(
     print(f"{'=' * 60}")
     approved = state.review_approved and (state.security_approved if run_security_review else True)
     print(f"Result:  {'APPROVED' if approved else 'ISSUES FOUND'}")
-    if getattr(state, "testability_gaps", []):
-        print(f"Testability gaps: {len(state.testability_gaps)}")
+    _print_task_audit_report(state)
     print(f"\nState ID: {state.task_id}  (sikula show {state.task_id})")
 
 
