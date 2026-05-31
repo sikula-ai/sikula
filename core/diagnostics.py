@@ -28,7 +28,10 @@ _PRIMARY_DIAGNOSTIC_RE = re.compile(
     r"|(^|\s)failed\s+[\w./\\:-]+"
     r"|[A-Za-z_][\w.$]*(Test|Tests|Spec)\s*>\s*.+\s+FAILED\b"
     r"|[\w./\\-]+\(\d+,\d+\):\s+error\b"
-    r"|(?:^|\s)(?:file://)?(?:[/\\][^\s:]+)+:\d+(?::\d+)?:",
+    r"|(?:^|\s)(?:file://)?(?:[/\\][^\s:]+)+:\d+(?::\d+)?:"
+    r"|(?:^|\s)(?:\.{1,2}[/\\])?"
+    r"(?:(?:[A-Za-z0-9_.-]+[/\\])+[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+)"
+    r":\d+(?::\d+)?:",
     re.IGNORECASE,
 )
 _NOISY_DIAGNOSTIC_RE = re.compile(
@@ -40,6 +43,11 @@ _NOISY_DIAGNOSTIC_RE = re.compile(
     re.IGNORECASE,
 )
 _CARGO_TEST_RERUN_RE = re.compile(r"^error: test failed, to rerun pass `.*`", re.IGNORECASE)
+_RELATIVE_PATH_LOCATION_RE = re.compile(
+    r"(?:^|\s)(?:\.{1,2}[/\\])?"
+    r"(?:(?:[A-Za-z0-9_.-]+[/\\])+[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+)"
+    r":\d+(?::\d+)?:"
+)
 _ABSOLUTE_PATH_RE = re.compile(r"(?P<prefix>file://)?(?P<path>(?:[/\\][^\s:]+)+)(?P<location>:\d+(?::\d+)?)?")
 _ASSERTION_VALUES_RE = re.compile(r"(\b[\w.]*Assertion(?:Failed)?Error:\s+).+", re.IGNORECASE)
 _ASSERTION_COMPARISON_VALUES_RE = re.compile(
@@ -287,6 +295,7 @@ def _looks_like_structured_diagnostic_line(line: str) -> bool:
         or _STACK_FRAME_DETAIL_RE.search(line)
         or _EXPLICIT_FAILURE_DETAIL_RE.search(line)
         or re.search(r"(?:^|\s)(?:file://)?(?:[/\\][^\s:]+)+:\d+(?::\d+)?:", line)
+        or _RELATIVE_PATH_LOCATION_RE.search(line)
         or re.search(r"(^|\s)(?:e|error(?:\[[^\]]+\])?|fatal error):\s", line, re.IGNORECASE)
     )
 

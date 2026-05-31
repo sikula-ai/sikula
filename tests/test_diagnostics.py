@@ -252,6 +252,20 @@ class TestDiagnosticSummaryLines:
         assert "TopLevelPropertyNaming" in lines[0]
         assert "MaxLineLength" in lines[1]
 
+    def test_extracts_relative_linter_locations_without_error_token(self):
+        output = "app.py:1:8: F401 `os` imported but unused\nFound 1 error.\n[*] 1 fixable with the `--fix` option.\n"
+
+        lines = diagnostic_summary_lines(output)
+
+        assert lines == ["app.py:1:8: F401 `os` imported but unused"]
+
+    def test_extracts_relative_formatter_locations_without_error_token(self):
+        output = "    src/app.py:12:1: would reformat\nAll done!\n"
+
+        lines = diagnostic_summary_lines(output)
+
+        assert lines == ["src/app.py:12:1: would reformat"]
+
     def test_extracts_typescript_and_rust_error_locations(self):
         output = (
             "tests/clientMain.test.ts(369,67): error TS2345: Argument of type 'null' is not assignable.\n"
