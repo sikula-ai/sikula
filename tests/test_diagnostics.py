@@ -180,6 +180,42 @@ class TestDiagnosticSummaryLines:
         assert "expected-token" not in combined
         assert "expected_token" not in combined
 
+    def test_summary_redacts_jest_assertion_comparison_values(self):
+        output = (
+            "TokenCardTest > hides credentials() FAILED\n"
+            'Expected: "public-token"\n'
+            'Received: "super-secret"\n'
+            "12 | expect(token).toEqual('public-token')\n"
+            "   |              ^\n"
+        )
+
+        lines = diagnostic_summary_lines(output)
+        combined = "\n".join(lines)
+
+        assert lines == [
+            "TokenCardTest > hides credentials() FAILED",
+            "Expected: <redacted>",
+            "Received: <redacted>",
+        ]
+        assert "public-token" not in combined
+        assert "super-secret" not in combined
+        assert "expect(token)" not in combined
+
+    def test_summary_redacts_assertion_count_values(self):
+        output = (
+            "LoginButton.test.tsx > calls submit() FAILED\n"
+            "Expected number of calls: >= 1\n"
+            "Received number of calls: 0\n"
+        )
+
+        lines = diagnostic_summary_lines(output)
+
+        assert lines == [
+            "LoginButton.test.tsx > calls submit() FAILED",
+            "Expected number of calls: <redacted>",
+            "Received number of calls: <redacted>",
+        ]
+
     def test_extracts_linter_file_locations_without_gradle_boilerplate_first(self):
         output = (
             "> Task :feature:countries:detekt FAILED\n"

@@ -42,6 +42,10 @@ _NOISY_DIAGNOSTIC_RE = re.compile(
 _CARGO_TEST_RERUN_RE = re.compile(r"^error: test failed, to rerun pass `.*`", re.IGNORECASE)
 _ABSOLUTE_PATH_RE = re.compile(r"(?P<prefix>file://)?(?P<path>(?:[/\\][^\s:]+)+)(?P<location>:\d+(?::\d+)?)?")
 _ASSERTION_VALUES_RE = re.compile(r"(\bAssertionError:\s+)assert\b.*", re.IGNORECASE)
+_ASSERTION_COMPARISON_VALUES_RE = re.compile(
+    r"^([+-]?\s*(?:expected|received|actual|left|right)\b[^:]{0,60}:\s+).+",
+    re.IGNORECASE,
+)
 _STACK_FRAME_DETAIL_RE = re.compile(
     r"^(?:"
     r"at\s+[\w.$/\\<>-]+(?:\([^)]*:\d+(?::\d+)?\)|:\d+(?::\d+)?)"
@@ -51,7 +55,7 @@ _STACK_FRAME_DETAIL_RE = re.compile(
 _EXPLICIT_FAILURE_DETAIL_RE = re.compile(
     r"^(?:"
     r"(?:caused by|suppressed):\s+"
-    r"|(?:expected|actual|left|right|reason|note|help):\s+"
+    r"|(?:expected|received|actual|left|right|reason|note|help):\s+"
     r"|(?:e|error|fail|failed):\s+"
     r"|(?:e|error|fail|failed)\s+(?:[\w.]+(?:error|exception)\b|expected\b|actual\b|left:|right:)"
     r"|[\w.]+(?:Error|Exception)(?:\b|:|\s+at\b)"
@@ -231,14 +235,18 @@ def _diagnostic_score(line: str) -> int:
     normalized = _ANSI_RE.sub("", line).rstrip()
     if not normalized.strip():
         return 0
-    normalized = normalized.strip()
-    if _NOISY_DIAGNOSTIC_RE.search(normalized):
+    stripped = normalized.strip()
+    if _NOISY_DIAGNOSTIC_RE.search(stripped):
         return 10
-    if _PRIMARY_DIAGNOSTIC_RE.search(normalized):
+    if _ASSERTION_COMPARISON_VALUES_RE.search(stripped):
+        return 50
+    if _looks_like_source_context_line(normalized) and not _looks_like_structured_diagnostic_line(stripped):
+        return 0
+    if _PRIMARY_DIAGNOSTIC_RE.search(stripped):
         return 100
     if _looks_like_source_context_line(normalized):
         return 0
-    if _DIAGNOSTIC_RE.search(normalized):
+    if _DIAGNOSTIC_RE.search(stripped):
         return 50
     return 0
 
@@ -273,6 +281,16 @@ def _looks_like_failure_detail(line: str) -> bool:
     return bool(_STACK_FRAME_DETAIL_RE.search(stripped) or _EXPLICIT_FAILURE_DETAIL_RE.search(stripped))
 
 
+def _looks_like_structured_diagnostic_line(line: str) -> bool:
+    return bool(
+        _ASSERTION_COMPARISON_VALUES_RE.search(line)
+        or _STACK_FRAME_DETAIL_RE.search(line)
+        or _EXPLICIT_FAILURE_DETAIL_RE.search(line)
+        or re.search(r"(?:^|\s)(?:file://)?(?:[/\\][^\s:]+)+:\d+(?::\d+)?:", line)
+        or re.search(r"(^|\s)(?:e|error(?:\[[^\]]+\])?|fatal error):\s", line, re.IGNORECASE)
+    )
+
+
 def _looks_like_source_context_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped or _looks_like_failure_detail(line):
@@ -292,6 +310,7 @@ def _compact_diagnostic_line(line: str, *, limit: int) -> str:
     if not compacted:
         return ""
     compacted = _ASSERTION_VALUES_RE.sub(r"\1assertion failed", compacted)
+    compacted = _ASSERTION_COMPARISON_VALUES_RE.sub(r"\1<redacted>", compacted)
     compacted = _shorten_paths(compacted)
     return _middle_truncate(compacted, limit)
 
