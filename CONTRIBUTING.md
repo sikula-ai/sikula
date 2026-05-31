@@ -35,7 +35,7 @@ pipx inject sikula pytest pytest-cov ruff
 
 Editable installs run directly from the checkout. `sikula --version` shows the packaged
 version plus a development suffix when the checkout is inside git, for example
-`sikula 0.1.0-dev+feature.example.abc1234`.
+`sikula 0.2.0-dev+feature.example.abc1234`.
 
 ## Running tests
 
