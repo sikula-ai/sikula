@@ -689,7 +689,10 @@ class TestTaskAuditReport:
         assert "validation artifacts: 1 (1 cleaned)" in out
         assert "LLM retries: 1" in out
         assert "Recovered issues:" in out
-        assert "validation recovered after failed check:ruff-format, test" in out
+        assert (
+            "validation recovered after failed check:ruff-format x1, test x1 "
+            "(showing up to 8 sampled diagnostics; see: sikula show t1)" in out
+        )
         assert "check:ruff-format: src/app.py:12:1: would reformat" in out
         assert "fixer used production-confirmed test failure triage: 1" in out
         assert _task_audit_warnings(state)
@@ -724,10 +727,85 @@ class TestTaskAuditReport:
         _print_task_audit_report(state)
 
         out = capsys.readouterr().out
-        assert "validation recovered after failed check:detekt, test" in out
+        assert (
+            "validation recovered after failed check:detekt x1, test x1 "
+            "(showing up to 8 sampled diagnostics; see: sikula show t1)" in out
+        )
         assert "test: CountryDetailScreenContractTest > detail content uses capital fallback() FAILED" in out
         assert "test: java.lang.AssertionError at CountryDetailScreenContractTest.kt:53" in out
         assert "check:detekt: .../CountryDetailScreen.kt:43:19: TopLevelPropertyNaming" in out
+
+    def test_recovered_diagnostics_sample_each_failed_validation_attempt(self, capsys):
+        from core.state import TaskState
+
+        state = TaskState(task_id="t1", task_description="task")
+        state.done = True
+        state.validation_cycle_records.extend(
+            [
+                {
+                    "phase": "test",
+                    "status": "failed",
+                    "diagnostic_summary": [
+                        ".../di/CountriesModuleSourceContractTest.kt:40:22 Unresolved reference 'readString'.",
+                        ".../navigation/AppNavHostSourceContractTest.kt:28:22 Unresolved reference 'readString'.",
+                        ".../navigation/CountriesGraphSourceContractTest.kt:72:22 Unresolved reference 'readString'.",
+                        ".../system/CountriesScreenSourceContractTest.kt:50:22 Unresolved reference 'readString'.",
+                        ".../system/CountryDetailScreenSourceContractTest.kt:78:22 Unresolved reference 'readString'.",
+                        ".../system/CountryDetailStringsSourceContractTest.kt:32:22 Unresolved reference 'readString'.",
+                    ],
+                },
+                {
+                    "phase": "test",
+                    "status": "failed",
+                    "diagnostic_summary": [
+                        "w: .../CountryDetailScreenSourceContractTest.kt:73:13 nullable receiver warning",
+                        "CountriesRoutesTest > detail encodes code name and flag emoji values() FAILED",
+                    ],
+                },
+                {
+                    "phase": "check",
+                    "status": "failed",
+                    "check_name": "detekt",
+                    "diagnostic_summary": [
+                        "> Analysis failed with 1 weighted issues.",
+                        ".../CountryDetailScreen.kt:54:13: The function CountryDetailScreenImpl is too long "
+                        "(71). The maximum length is 60. [LongMethod]",
+                    ],
+                },
+                {
+                    "phase": "test",
+                    "status": "failed",
+                    "diagnostic_summary": [
+                        "CountryDetailScreenSourceContractTest > formats and renders detail rows() FAILED",
+                    ],
+                },
+                {
+                    "phase": "test",
+                    "status": "failed",
+                    "diagnostic_summary": [
+                        "w: .../CountryDetailScreenSourceContractTest.kt:86:13 nullable receiver warning",
+                        "CountryDetailScreenSourceContractTest > uses top app bar back navigation contract() FAILED",
+                    ],
+                },
+            ]
+        )
+
+        _print_task_audit_report(state)
+
+        out = capsys.readouterr().out
+        assert (
+            "validation recovered after failed check:detekt x1, test x4 "
+            "(showing up to 8 sampled diagnostics; see: sikula show t1)" in out
+        )
+        assert "test #1: .../di/CountriesModuleSourceContractTest.kt:40:22" in out
+        assert "test #2: CountriesRoutesTest > detail encodes code name and flag emoji values() FAILED" in out
+        assert "check:detekt: .../CountryDetailScreen.kt:54:13" in out
+        assert "test #3: CountryDetailScreenSourceContractTest > formats and renders detail rows() FAILED" in out
+        assert (
+            "test #4: CountryDetailScreenSourceContractTest > uses top app bar back navigation contract() FAILED" in out
+        )
+        assert "test #1: .../navigation/AppNavHostSourceContractTest.kt:28:22" in out
+        assert "test #1: .../navigation/CountriesGraphSourceContractTest.kt:72:22" in out
 
     def test_failed_task_reports_production_triage_as_warning_not_recovered(self, capsys):
         from core.state import TaskState

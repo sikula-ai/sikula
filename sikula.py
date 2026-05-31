@@ -73,6 +73,7 @@ _BASE = Path(__file__).parent
 # When adding a new platform: add it here, in _build_tool() in core/orchestrator.py,
 # in _generate_config() below, and in _SIGNATURES in tools/scanner.py.
 _SUPPORTED_BUILD_TOOLS = {"cargo", "gradle-android", "gradle-jvm", "maven", "node", "xcodebuild", "python"}
+_RECOVERED_DIAGNOSTIC_LIMIT = 8
 
 
 def _git_output(args: list[str], cwd: Path) -> str | None:
@@ -844,41 +845,113 @@ def _validation_failure_summary(records: list[dict]) -> str | None:
     for record in records:
         if record.get("status") != "failed":
             continue
-        label = str(record.get("phase") or "validation")
-        if record.get("check_name"):
-            label = f"{label}:{record['check_name']}"
+        label = _validation_failure_label(record)
         counts[label] = counts.get(label, 0) + 1
     if not counts:
         return None
-    parts = [f"{label} x{count}" if count > 1 else label for label, count in sorted(counts.items())]
+    parts = [f"{label} x{count}" for label, count in sorted(counts.items())]
     return ", ".join(parts)
 
 
-def _validation_failure_diagnostics(records: list[dict], limit: int = 6) -> list[str]:
+def _validation_failure_diagnostics(records: list[dict], limit: int = _RECOVERED_DIAGNOSTIC_LIMIT) -> list[str]:
+    failed_records = [record for record in records if record.get("status") == "failed"]
+    label_counts: dict[str, int] = {}
+    for record in failed_records:
+        label = _validation_failure_label(record)
+        label_counts[label] = label_counts.get(label, 0) + 1
+
+    groups: list[tuple[str, list[str]]] = []
+    label_seen: dict[str, int] = {}
+    for record in failed_records:
+        label = _validation_failure_label(record)
+        label_seen[label] = label_seen.get(label, 0) + 1
+        group_label = f"{label} #{label_seen[label]}" if label_counts[label] > 1 else label
+        lines = _validation_record_diagnostic_lines(record)
+        if lines:
+            groups.append((group_label, lines))
+
     diagnostics: list[str] = []
     seen: set[str] = set()
-    for record in records:
-        if record.get("status") != "failed":
+    for label, lines in groups:
+        if not lines:
             continue
-        label = str(record.get("phase") or "validation")
-        if record.get("check_name"):
-            label = f"{label}:{record['check_name']}"
-        summary = record.get("diagnostic_summary")
-        if isinstance(summary, list):
-            lines = [str(line) for line in summary if line]
-        elif isinstance(summary, str):
-            lines = [line for line in summary.splitlines() if line.strip()]
-        else:
-            lines = diagnostic_summary_lines(record.get("error_excerpt"))
-        for line in lines:
-            item = f"{label}: {_short_audit_line(line, limit=220)}"
-            if item in seen:
-                continue
-            seen.add(item)
-            diagnostics.append(item)
-            if len(diagnostics) >= limit:
-                return diagnostics
+        _append_validation_diagnostic(diagnostics, seen, label, lines[0])
+        if len(diagnostics) >= limit:
+            return diagnostics
+
+    remaining: list[tuple[int, int, int, str, str]] = []
+    for group_index, (label, lines) in enumerate(groups):
+        for line_index, line in enumerate(lines[1:], start=1):
+            remaining.append((_audit_diagnostic_line_priority(line), line_index, group_index, label, line))
+
+    for _, _, _, label, line in sorted(remaining):
+        _append_validation_diagnostic(diagnostics, seen, label, line)
+        if len(diagnostics) >= limit:
+            return diagnostics
     return diagnostics
+
+
+def _append_validation_diagnostic(diagnostics: list[str], seen: set[str], label: str, line: str) -> None:
+    item = f"{label}: {_short_audit_line(line, limit=220)}"
+    if item in seen:
+        return
+    seen.add(item)
+    diagnostics.append(item)
+
+
+def _validation_failure_label(record: dict) -> str:
+    label = str(record.get("phase") or "validation")
+    if record.get("check_name"):
+        label = f"{label}:{record['check_name']}"
+    return label
+
+
+def _validation_record_diagnostic_lines(record: dict) -> list[str]:
+    summary = record.get("diagnostic_summary")
+    if isinstance(summary, list):
+        lines = [str(line) for line in summary if line]
+    elif isinstance(summary, str):
+        lines = [line for line in summary.splitlines() if line.strip()]
+    else:
+        lines = diagnostic_summary_lines(record.get("error_excerpt"))
+    return [
+        line
+        for _, line in sorted(
+            enumerate(lines),
+            key=lambda item: (_audit_diagnostic_line_priority(item[1]), item[0]),
+        )
+    ]
+
+
+def _audit_diagnostic_line_priority(line: str) -> int:
+    normalized = line.strip().lower()
+    if not normalized:
+        return 4
+    if normalized.startswith(("w:", "warning:")) or " warning" in normalized:
+        return 3
+    if re.search(r"(^|[./\\])[\w./\\-]+:\d+(?::\d+)?:", normalized):
+        return 0
+    if ">" in normalized and normalized.endswith("failed"):
+        return 0
+    if any(
+        marker in normalized
+        for marker in (
+            "error",
+            "exception",
+            "assertion",
+            "unresolved reference",
+            "cannot find",
+            "not assignable",
+            "undefined",
+            "missing",
+            "panic",
+            "panicked",
+        )
+    ):
+        return 0
+    if " failed" in normalized:
+        return 1
+    return 2
 
 
 def _task_audit_warnings(state) -> list[str]:
@@ -933,7 +1006,10 @@ def _task_recovered_issues(state) -> list[str]:
     recovered: list[str] = []
     validation_failures = _validation_failure_summary(getattr(state, "validation_cycle_records", []))
     if state.done and validation_failures:
-        recovered.append(f"validation recovered after failed {validation_failures}")
+        recovered.append(
+            f"validation recovered after failed {validation_failures} "
+            f"(showing up to {_RECOVERED_DIAGNOSTIC_LIMIT} sampled diagnostics; see: sikula show {state.task_id})"
+        )
         recovered.extend(_validation_failure_diagnostics(getattr(state, "validation_cycle_records", [])))
 
     production_triage_count = sum(
@@ -972,7 +1048,7 @@ def _print_task_audit_report(state) -> int:
 
     if recovered:
         print("Recovered issues:")
-        _print_limited_lines(recovered, state.task_id)
+        _print_limited_lines(recovered, state.task_id, limit=_RECOVERED_DIAGNOSTIC_LIMIT + 2)
 
     return len(warnings)
 
