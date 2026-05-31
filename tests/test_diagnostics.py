@@ -169,6 +169,23 @@ class TestDiagnosticSummaryLines:
 
         assert lines == ["thread <redacted> panicked at src/lib.rs:42:5: token value <redacted>"]
 
+    def test_summary_redacts_unquoted_secret_values(self):
+        output = (
+            "Exception: API_KEY=sk-test-secret\n"
+            "error: token=abc123\n"
+            "error: password: hunter2\n"
+            "error: Authorization: Bearer abc123456\n"
+        )
+
+        lines = diagnostic_summary_lines(output)
+
+        assert lines == [
+            "Exception: API_KEY=<redacted>",
+            "error: token=<redacted>",
+            "error: password: <redacted>",
+            "error: Authorization: <redacted>",
+        ]
+
     def test_summary_omits_pytest_assertion_rewrite_values(self):
         output = (
             "TokenTest > hides credentials() FAILED\n"

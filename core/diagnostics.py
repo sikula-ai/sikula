@@ -57,6 +57,17 @@ _ASSERTION_COMPARISON_VALUES_RE = re.compile(
 _DOUBLE_QUOTED_LITERAL_RE = re.compile(r'"(?:\\.|[^"\n]){1,200}"')
 _SINGLE_QUOTED_LITERAL_RE = re.compile(r"'(?:\\.|[^'\n]){1,200}'")
 _BACKTICK_QUOTED_LITERAL_RE = re.compile(r"`(?:\\.|[^`\n]){1,200}`")
+_SECRET_KEY_VALUE_RE = re.compile(
+    r"\b(?P<key>"
+    r"api[_-]?key|access[_-]?token|auth[_-]?token|authorization|bearer|client[_-]?secret|credentials?|"
+    r"id[_-]?token|password|passwd|private[_-]?key|pwd|refresh[_-]?token|secret|session[_-]?(?:id|token)|token"
+    r")(?P<sep>\s*[:=]\s*)(?P<value>(?:(?:Bearer|Basic)\s+)?[^\s,;)\]}]+)",
+    re.IGNORECASE,
+)
+_AUTH_SCHEME_TOKEN_RE = re.compile(r"\b(?P<scheme>Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{4,}", re.IGNORECASE)
+_COMMON_SECRET_TOKEN_RE = re.compile(
+    r"\b(?:sk-[A-Za-z0-9][A-Za-z0-9_-]{6,}|ghp_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]+|AKIA[0-9A-Z]{16})\b"
+)
 _STACK_FRAME_DETAIL_RE = re.compile(
     r"^(?:"
     r"at\s+[\w.$/\\<>-]+(?:\([^)]*:\d+(?::\d+)?\)|:\d+(?::\d+)?)"
@@ -325,6 +336,7 @@ def _compact_diagnostic_line(line: str, *, limit: int) -> str:
     compacted = _ASSERTION_COMPARISON_VALUES_RE.sub(r"\1<redacted>", compacted)
     compacted = _shorten_paths(compacted)
     compacted = _redact_quoted_literals(compacted)
+    compacted = _redact_secret_values(compacted)
     return _middle_truncate(compacted, limit)
 
 
@@ -348,6 +360,12 @@ def _looks_like_path_value(value: str) -> bool:
     if normalized.startswith((".../", "./", "../", "/", "file://")):
         return True
     return has_separator and bool(re.search(r"(?:^|/)[A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+(?::\d+(?::\d+)?)?$", normalized))
+
+
+def _redact_secret_values(line: str) -> str:
+    line = _SECRET_KEY_VALUE_RE.sub(r"\g<key>\g<sep><redacted>", line)
+    line = _AUTH_SCHEME_TOKEN_RE.sub(r"\g<scheme> <redacted>", line)
+    return _COMMON_SECRET_TOKEN_RE.sub("<redacted>", line)
 
 
 def _shorten_paths(line: str) -> str:
