@@ -105,13 +105,23 @@ def diagnostic_summary_lines(
     seen: set[str] = set()
     for index in selected_indexes:
         line = _compact_diagnostic_line(raw_lines[index], limit=line_limit)
-        if not line or line in seen:
+        key = diagnostic_identity_key(line)
+        if not line or key in seen:
             continue
-        seen.add(line)
+        seen.add(key)
         lines.append(line)
         if len(lines) >= max_lines:
             break
     return lines
+
+
+def diagnostic_identity_key(line: str) -> str:
+    """Return a stable key for deduplicating visually different forms of the same diagnostic."""
+
+    compacted = " ".join(_ANSI_RE.sub("", str(line)).split())
+    if ".../" in compacted:
+        return compacted.split(".../", 1)[1]
+    return compacted
 
 
 def cargo_test_failure_excerpt(text: str | None, limit: int = DEFAULT_DIAGNOSTIC_LIMIT) -> str:

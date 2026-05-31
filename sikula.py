@@ -67,7 +67,7 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
-from core.diagnostics import diagnostic_summary_lines
+from core.diagnostics import diagnostic_identity_key, diagnostic_summary_lines
 
 _BASE = Path(__file__).parent
 # When adding a new platform: add it here, in _build_tool() in core/orchestrator.py,
@@ -893,9 +893,10 @@ def _validation_failure_diagnostics(records: list[dict], limit: int = _RECOVERED
 
 def _append_validation_diagnostic(diagnostics: list[str], seen: set[str], label: str, line: str) -> None:
     item = f"{label}: {_short_audit_line(line, limit=220)}"
-    if item in seen:
+    key = diagnostic_identity_key(line)
+    if key in seen:
         return
-    seen.add(item)
+    seen.add(key)
     diagnostics.append(item)
 
 

@@ -749,6 +749,7 @@ class TestTaskAuditReport:
                         ".../di/CountriesModuleSourceContractTest.kt:40:22 Unresolved reference 'readString'.",
                         ".../navigation/AppNavHostSourceContractTest.kt:28:22 Unresolved reference 'readString'.",
                         ".../navigation/CountriesGraphSourceContractTest.kt:72:22 Unresolved reference 'readString'.",
+                        "task123.../di/CountriesModuleSourceContractTest.kt:40:22 Unresolved reference 'readString'.",
                         ".../system/CountriesScreenSourceContractTest.kt:50:22 Unresolved reference 'readString'.",
                         ".../system/CountryDetailScreenSourceContractTest.kt:78:22 Unresolved reference 'readString'.",
                         ".../system/CountryDetailStringsSourceContractTest.kt:32:22 Unresolved reference 'readString'.",
@@ -806,6 +807,7 @@ class TestTaskAuditReport:
         )
         assert "test #1: .../navigation/AppNavHostSourceContractTest.kt:28:22" in out
         assert "test #1: .../navigation/CountriesGraphSourceContractTest.kt:72:22" in out
+        assert "task123.../di/CountriesModuleSourceContractTest.kt:40:22" not in out
 
     def test_failed_task_reports_production_triage_as_warning_not_recovered(self, capsys):
         from core.state import TaskState

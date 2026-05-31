@@ -153,6 +153,17 @@ class TestDiagnosticSummaryLines:
         assert "tests/clientMain.test.ts(369,67): error TS2345" in lines[0]
         assert "src/lib.rs:42:13: error[E0308]" in lines[1]
 
+    def test_deduplicates_alternate_shortened_forms_of_same_location(self):
+        output = (
+            "error: file:///tmp/worktrees/task123/project/src/tests/test_user_flow.py:12:5 "
+            "AssertionError: expected detail screen\n"
+            "task123.../src/tests/test_user_flow.py:12:5 AssertionError: expected detail screen\n"
+        )
+
+        lines = diagnostic_summary_lines(output)
+
+        assert lines == ["error: .../src/tests/test_user_flow.py:12:5 AssertionError: expected detail screen"]
+
 
 class TestCargoTestFailureExcerpt:
     def test_empty_and_nonpositive_limits_return_empty(self):
