@@ -34,7 +34,8 @@ _TEST_SURFACE_POLICY_INSTRUCTIONS = {
     _TEST_SURFACE_POLICY_COMPLETE: (
         "complete: Aim to cover the complete changed behavior. If important behavior "
         "cannot be meaningfully tested without adding missing project test infrastructure "
-        "or seams, report a TESTABILITY GAP using the structured block below."
+        "or seams, report a TESTABILITY GAP using the structured block below instead of "
+        "substituting broad source-inspection tests."
     ),
     _TEST_SURFACE_POLICY_EXISTING_INFRASTRUCTURE: (
         "existing_infrastructure: Use only existing project test infrastructure and "
@@ -43,7 +44,9 @@ _TEST_SURFACE_POLICY_INSTRUCTIONS = {
         "for that infrastructure. Missing out-of-surface harnesses are not by themselves "
         "a TESTABILITY GAP. Add the best meaningful tests available through existing seams, "
         "and report a TESTABILITY GAP only when an acceptance contract still cannot be "
-        "meaningfully checked within this configured test surface."
+        "meaningfully checked within this configured test surface. Do not use broad "
+        "source-inspection tests to pretend an out-of-surface UI/browser/device/runtime "
+        "behavior was meaningfully tested."
     ),
 }
 
@@ -133,17 +136,29 @@ TESTING RULES:
   infrastructure outside the configured test surface, follow the test surface policy
   instead of adding brittle tests.
 - Prefer behaviour tests through public APIs, public state, public routing contracts, command
-  outputs, or project-standard test helpers. Source-file inspection tests are a last-resort
-  fallback for contracts that cannot be observed through the available test infrastructure.
-  If you use source inspection, keep it self-contained: resolve paths robustly from the test
-  file or repository root, do not depend on the test runner's current working directory, and
-  do not require production source, build configuration, dependency declarations, runtime
-  configuration, or pipeline settings to change just so the inspection test can pass.
+  outputs, or project-standard test helpers.
+- Treat source-file inspection tests as weak coverage, not as a substitute for behaviour
+  tests. Do NOT use source inspection for UI implementation details such as component
+  structure, layout branches, framework modifiers, view-tree shape, composable/widget
+  wiring, or literal calls inside screen/view files. Instead, test the nearest stable seam
+  already available in the project: view model, reducer, presenter, public state, route
+  builder, navigation contract, handler, command output, API contract, or repository/use-case.
+- Source inspection is acceptable only for narrow stable static contracts that are not
+  meaningfully executable through the available test surface, such as route constants,
+  string/resource keys, API annotations/signatures, schema/config keys, generated registry
+  entries, or other project-standard static contracts. Keep those tests focused on the
+  contract, not on incidental implementation shape.
 - If meaningful behaviour coverage would require adding new test infrastructure outside
   the configured test surface, follow the test surface policy. Under the complete policy,
   output the following block and make no file changes for that gap. Under the
   existing_infrastructure policy, do not report a gap merely because out-of-surface
   infrastructure is absent; first add meaningful coverage through existing project seams.
+  Do not replace missing coverage with broad source-inspection tests. If a narrow
+  source-inspection test is still justified, keep it self-contained: resolve paths robustly
+  from the test file or repository root, do not depend on the test runner's current working
+  directory, and do not require production source, build configuration, dependency
+  declarations, runtime configuration, or pipeline settings to change just so the inspection
+  test can pass.
   TESTABILITY GAP:
   target: <behaviour or contract that remains untested>
   reason: <missing seam, missing test harness, unavailable helper, etc.>

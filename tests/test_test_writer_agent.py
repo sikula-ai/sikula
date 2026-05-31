@@ -250,6 +250,7 @@ class TestTestWriterAgentPrompt:
         assert "Test surface policy: existing_infrastructure" in prompt
         assert "Use only existing project test infrastructure" in prompt
         assert "Missing out-of-surface harnesses are not by themselves a TESTABILITY GAP" in prompt
+        assert "Do not use broad source-inspection tests" in prompt
         assert state.test_write_records[0]["test_surface_policy"] == "existing_infrastructure"
 
     def test_complete_test_surface_policy_in_prompt(self, stub_llm: StubLLMClient, file_tool):
@@ -302,8 +303,11 @@ class TestTestWriterAgentPrompt:
         state = _make_state(implementation_prompt="Add navigation contract")
         _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
         prompt = stub_llm.agent_calls[0]
-        assert "Source-file inspection tests are a last-resort" in prompt
-        assert "do not depend on the test runner's current working directory" in prompt
+        assert "Treat source-file inspection tests as weak coverage" in prompt
+        assert "Do NOT use source inspection for UI implementation details" in prompt
+        assert "Source inspection is acceptable only for narrow stable static contracts" in prompt
+        assert "test runner's current working" in prompt
+        assert "directory" in prompt
         assert "TESTABILITY GAP:" in prompt
         assert "build configuration" in prompt
 
