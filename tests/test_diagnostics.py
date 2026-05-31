@@ -126,6 +126,60 @@ class TestDiagnosticSummaryLines:
             "java.lang.RuntimeException at CountriesNavigationContractTest.kt:27",
         ]
 
+    def test_summary_skips_indented_source_context_after_failure(self):
+        output = (
+            "UserTokenTest > does not leak token() FAILED\n"
+            "    response = {'token': 'super-secret'}\n"
+            "    assert response['token'] == expected_token\n"
+            "    java.lang.AssertionError at UserTokenTest.kt:17\n"
+        )
+
+        lines = diagnostic_summary_lines(output)
+        combined = "\n".join(lines)
+
+        assert lines == [
+            "UserTokenTest > does not leak token() FAILED",
+            "java.lang.AssertionError at UserTokenTest.kt:17",
+        ]
+        assert "super-secret" not in combined
+        assert "expected_token" not in combined
+
+    def test_summary_skips_compiler_source_frames_after_error(self):
+        output = (
+            "src/auth.ts:12:5 - error TS2322: Type 'string' is not assignable to type 'number'.\n"
+            "12 | const token = 'super-secret'\n"
+            "   |     ^^^^^\n"
+            "error: Type check failed\n"
+        )
+
+        lines = diagnostic_summary_lines(output)
+        combined = "\n".join(lines)
+
+        assert lines == [
+            "src/auth.ts:12:5 - error TS2322: Type 'string' is not assignable to type 'number'.",
+            "error: Type check failed",
+        ]
+        assert "super-secret" not in combined
+        assert "^^^^^" not in combined
+
+    def test_summary_omits_pytest_assertion_rewrite_values(self):
+        output = (
+            "TokenTest > hides credentials() FAILED\n"
+            "E       assert actual_token == expected_token\n"
+            "E       AssertionError: assert 'super-secret' == 'expected-token'\n"
+        )
+
+        lines = diagnostic_summary_lines(output)
+        combined = "\n".join(lines)
+
+        assert lines == [
+            "TokenTest > hides credentials() FAILED",
+            "E AssertionError: assertion failed",
+        ]
+        assert "super-secret" not in combined
+        assert "expected-token" not in combined
+        assert "expected_token" not in combined
+
     def test_extracts_linter_file_locations_without_gradle_boilerplate_first(self):
         output = (
             "> Task :feature:countries:detekt FAILED\n"
@@ -152,6 +206,21 @@ class TestDiagnosticSummaryLines:
 
         assert "tests/clientMain.test.ts(369,67): error TS2345" in lines[0]
         assert "src/lib.rs:42:13: error[E0308]" in lines[1]
+
+    def test_extracts_indented_real_diagnostics(self):
+        output = (
+            "FAILED tests/test_auth.py::test_login\n"
+            "    /tmp/project/tests/test_auth.py:42:5: AssertionError: login failed\n"
+            "    error: missing generated client\n"
+        )
+
+        lines = diagnostic_summary_lines(output)
+
+        assert lines == [
+            "FAILED tests/test_auth.py::test_login",
+            ".../project/tests/test_auth.py:42:5: AssertionError: login failed",
+            "error: missing generated client",
+        ]
 
     def test_deduplicates_alternate_shortened_forms_of_same_location(self):
         output = (

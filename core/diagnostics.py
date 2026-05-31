@@ -41,6 +41,35 @@ _NOISY_DIAGNOSTIC_RE = re.compile(
 )
 _CARGO_TEST_RERUN_RE = re.compile(r"^error: test failed, to rerun pass `.*`", re.IGNORECASE)
 _ABSOLUTE_PATH_RE = re.compile(r"(?P<prefix>file://)?(?P<path>(?:[/\\][^\s:]+)+)(?P<location>:\d+(?::\d+)?)?")
+_ASSERTION_VALUES_RE = re.compile(r"(\bAssertionError:\s+)assert\b.*", re.IGNORECASE)
+_STACK_FRAME_DETAIL_RE = re.compile(
+    r"^(?:"
+    r"at\s+[\w.$/\\<>-]+(?:\([^)]*:\d+(?::\d+)?\)|:\d+(?::\d+)?)"
+    r"|File \"[^\"]+\", line \d+, in .+"
+    r")$"
+)
+_EXPLICIT_FAILURE_DETAIL_RE = re.compile(
+    r"^(?:"
+    r"(?:caused by|suppressed):\s+"
+    r"|(?:expected|actual|left|right|reason|note|help):\s+"
+    r"|(?:e|error|fail|failed):\s+"
+    r"|(?:e|error|fail|failed)\s+(?:[\w.]+(?:error|exception)\b|expected\b|actual\b|left:|right:)"
+    r"|[\w.]+(?:Error|Exception)(?:\b|:|\s+at\b)"
+    r")",
+    re.IGNORECASE,
+)
+_SOURCE_CONTEXT_RE = re.compile(
+    r"^(?:"
+    r">\s*"
+    r"|(?:\d+\s*)?\|\s*"
+    r"|[\^~]{2,}"
+    r"|(?:assert|return|raise|throw|let|const|var|val|fun|func|def|class|if|else|elif|for|while|switch|case|"
+    r"import|from|public|private|protected|internal|static|final|override)\b"
+    r"|[@#]"
+    r"|//|/\*|\*"
+    r"|[{}()[\].,;]"
+    r")"
+)
 
 
 def diagnostic_excerpt(text: str | None, limit: int = DEFAULT_DIAGNOSTIC_LIMIT, context_lines: int = 8) -> str:
@@ -73,8 +102,8 @@ def diagnostic_summary_lines(
 
     This is intentionally platform-neutral. It prefers compiler/test/check lines that
     carry concrete file locations, failed test names, exception classes, or assertion
-    text, and falls back to generic build-tool failure lines when nothing better is
-    available.
+    failures without echoing source-code frames, and falls back to generic build-tool
+    failure lines when nothing better is available.
     """
     if not text or max_lines <= 0 or line_limit <= 0:
         return []
@@ -199,13 +228,16 @@ def _is_diagnostic_line(line: str) -> bool:
 
 
 def _diagnostic_score(line: str) -> int:
-    normalized = _ANSI_RE.sub("", line).strip()
-    if not normalized:
+    normalized = _ANSI_RE.sub("", line).rstrip()
+    if not normalized.strip():
         return 0
+    normalized = normalized.strip()
     if _NOISY_DIAGNOSTIC_RE.search(normalized):
         return 10
     if _PRIMARY_DIAGNOSTIC_RE.search(normalized):
         return 100
+    if _looks_like_source_context_line(normalized):
+        return 0
     if _DIAGNOSTIC_RE.search(normalized):
         return 50
     return 0
@@ -227,8 +259,10 @@ def _related_context_indexes(lines: list[str], index: int) -> list[int]:
             if blank_lines_seen > 1:
                 break
             continue
-        if _diagnostic_score(stripped) >= 100 or _looks_like_failure_detail(line):
+        if _diagnostic_score(line) >= 100 or _looks_like_failure_detail(line):
             indexes.append(related_index)
+            continue
+        if _looks_like_source_context_line(line):
             continue
         break
     return indexes
@@ -236,18 +270,28 @@ def _related_context_indexes(lines: list[str], index: int) -> list[int]:
 
 def _looks_like_failure_detail(line: str) -> bool:
     stripped = line.strip()
-    return bool(
-        line.startswith((" ", "\t"))
-        or re.search(r"\bat\s+[\w.$/\\-]+:\d+", stripped)
-        or re.search(r"\b(expected|actual|left|right):\b", stripped, re.IGNORECASE)
-        or re.search(r"\b(java\.lang\.\w+|AssertionError|RuntimeException|Exception)\b", stripped)
-    )
+    return bool(_STACK_FRAME_DETAIL_RE.search(stripped) or _EXPLICIT_FAILURE_DETAIL_RE.search(stripped))
+
+
+def _looks_like_source_context_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or _looks_like_failure_detail(line):
+        return False
+    if (
+        stripped.startswith(">")
+        or re.match(r"^[EW]\s+", stripped)
+        or re.match(r"^(?:\d+\s*)?\|", stripped)
+        or re.match(r"^[\^~]{2,}", stripped)
+    ):
+        return True
+    return line.startswith((" ", "\t")) or bool(_SOURCE_CONTEXT_RE.match(stripped))
 
 
 def _compact_diagnostic_line(line: str, *, limit: int) -> str:
     compacted = " ".join(_ANSI_RE.sub("", line).split())
     if not compacted:
         return ""
+    compacted = _ASSERTION_VALUES_RE.sub(r"\1assertion failed", compacted)
     compacted = _shorten_paths(compacted)
     return _middle_truncate(compacted, limit)
 
