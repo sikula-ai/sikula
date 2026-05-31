@@ -16,6 +16,9 @@ _fmt_time = _sikula._fmt_time
 _build_tool_class = _sikula._build_tool_class
 _reset_failed_state = _sikula._reset_failed_state
 _print_review_summary = _sikula._print_review_summary
+_print_task_audit_report = _sikula._print_task_audit_report
+_task_audit_warnings = _sikula._task_audit_warnings
+_task_recovered_issues = _sikula._task_recovered_issues
 _dev_version_suffix = _sikula._dev_version_suffix
 _sikula_version = _sikula._sikula_version
 cmd_run = _sikula.cmd_run
@@ -615,6 +618,92 @@ class TestCmdShow:
 
 
 # ---------------------------------------------------------------------------
+# task audit report
+# ---------------------------------------------------------------------------
+
+
+class TestTaskAuditReport:
+    def test_clean_success_prints_validation_and_review_statuses_without_warnings(self, capsys):
+        from core.state import TaskState
+
+        state = TaskState(task_id="t1", task_description="task")
+        state.done = True
+        state.build_status = "success"
+        state.test_status = "success"
+        state.check_status = "success"
+        state.review_approved = True
+        state.security_approved = True
+
+        warning_count = _print_task_audit_report(state)
+
+        out = capsys.readouterr().out
+        assert warning_count == 0
+        assert "Validation:" in out
+        assert "build: success" in out
+        assert "reviewer:          approved" in out
+        assert "Audit warnings:" not in out
+        assert "Recovered issues:" not in out
+
+    def test_reports_audit_warnings_and_recovered_issues(self, capsys):
+        from core.state import TaskState
+
+        state = TaskState(task_id="t1", task_description="task")
+        state.done = True
+        state.build_status = "success"
+        state.test_status = "success"
+        state.check_status = "success"
+        state.review_approved = True
+        state.security_approved = True
+        state.analyst_warnings.append("missing optional architecture context")
+        state.record(
+            "implementer",
+            "write_path_warning",
+            "files outside allowed_write_paths: ['README.md']; allowed: ['src/']",
+        )
+        state.review_cycle_records.append({"has_warnings": True})
+        state.security_review_cycle_records.append({"has_warnings": True})
+        state.testability_gaps.append({"message": "missing UI harness"})
+        state.validation_artifact_records.append({"status": "cleaned", "artifacts": [{"path": "tmp.log"}]})
+        state.history.append({"action": "llm_retry"})
+        state.validation_cycle_records.append({"phase": "test", "status": "failed"})
+        state.validation_cycle_records.append({"phase": "check", "status": "failed", "check_name": "ruff-format"})
+        state.fix_cycle_records.append({"triage_pass": "production_confirmed"})
+
+        warning_count = _print_task_audit_report(state)
+
+        out = capsys.readouterr().out
+        assert warning_count == 7
+        assert "Audit warnings:" in out
+        assert "analyst: missing optional architecture context" in out
+        assert "implementer: files outside allowed_write_paths" in out
+        assert "reviewer warnings: 1" in out
+        assert "security reviewer warnings: 1" in out
+        assert "testability gaps: 1" in out
+        assert "validation artifacts: 1 (1 cleaned)" in out
+        assert "LLM retries: 1" in out
+        assert "Recovered issues:" in out
+        assert "validation recovered after failed check:ruff-format, test" in out
+        assert "fixer used production-confirmed test failure triage: 1" in out
+        assert _task_audit_warnings(state)
+        assert _task_recovered_issues(state)
+
+    def test_failed_task_reports_production_triage_as_warning_not_recovered(self, capsys):
+        from core.state import TaskState
+
+        state = TaskState(task_id="t1", task_description="task")
+        state.failed = True
+        state.fix_cycle_records.append({"triage_pass": "production_confirmed"})
+
+        warning_count = _print_task_audit_report(state)
+
+        out = capsys.readouterr().out
+        assert warning_count == 1
+        assert "Audit warnings:" in out
+        assert "production-confirmed test failure triage: 1" in out
+        assert "Recovered issues:" not in out
+
+
+# ---------------------------------------------------------------------------
 # _print_review_summary
 # ---------------------------------------------------------------------------
 
@@ -660,7 +749,8 @@ class TestPrintReviewSummary:
         s.record_testability_gap("test_writer", "TESTABILITY GAP:\ntarget: native share")
         _print_review_summary(s, "feature/x", "main", 10.0)
         out = capsys.readouterr().out
-        assert "Testability gaps: 1" in out
+        assert "Audit warnings:" in out
+        assert "testability gaps: 1" in out
 
 
 # ---------------------------------------------------------------------------
