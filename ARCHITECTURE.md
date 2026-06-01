@@ -805,7 +805,7 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
    - Async/deferred work started from an entry point is tested through observable success
      and failure paths when the configured test surface can do so. If the failure path
      requires new infrastructure outside that surface, the test writer follows
-     `test_writer.test_surface_policy` instead of adding brittle source-inspection tests.
+     `test_writer.test_surface_policy` instead of substituting broad source-inspection tests.
    - Parser, validator, expression engine, schema, DSL, config loader, and rule engine
      changes get a positive/negative contract matrix, including wrong expected result type
      rejection when typed contexts exist; rejected input classes must stay distinct, so a
@@ -829,12 +829,19 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
    for callers not in `files_changed`, checks whether existing tests cover their path through
    the modified function and adds tests if not
 10. Prefers behaviour tests through public APIs, public state, public routing contracts,
-    command outputs, or project-standard test helpers. Source-file inspection is a
-    last-resort fallback only; such tests must resolve paths without relying on the runner's
-    current working directory and must not require production source, build configuration,
-    dependency declarations, runtime configuration, or pipeline settings to change merely
-    so the test can pass. If meaningful coverage requires new test infrastructure outside
-    the configured test surface, the agent follows `test_writer.test_surface_policy`:
+    command outputs, or project-standard test helpers. Source-file inspection is weak
+    coverage and must not be used for UI implementation details such as component
+    structure, layout branches, framework modifiers, view-tree shape, or literal calls
+    inside screen/view files. Narrow source inspection remains acceptable for stable
+    static contracts that are not meaningfully executable through the available surface,
+    such as route constants, string/resource keys, API annotations/signatures,
+    schema/config keys, or generated registry entries. Such tests must resolve paths
+    without relying on the runner's current working directory and must not require
+    production source, build configuration, dependency declarations, runtime
+    configuration, or pipeline settings to change merely so the test can pass. If
+    meaningful coverage requires new test infrastructure outside the configured test
+    surface, the agent follows `test_writer.test_surface_policy` instead of replacing
+    missing coverage with broad source-inspection tests:
     `existing_infrastructure` uses the best meaningful existing-surface coverage and does
     not report a gap merely because a heavy UI/browser/device/runtime harness is absent;
     `complete` opts in to structured `TESTABILITY GAP` reports for missing test
@@ -1290,7 +1297,7 @@ All keys live under `test_writer:` in `.sikula/config.yaml`.
 | Key | Default | Description |
 |---|---|---|
 | `coverage_target` | `90` | Minimum branch+line coverage % the agent must aim for on new/changed code within the configured test surface |
-| `test_surface_policy` | `existing_infrastructure` | `existing_infrastructure` stays within existing project test infra and does not treat missing heavy UI/browser/device/runtime harnesses as gaps by themselves; `complete` opts in to `TESTABILITY GAP` reports when important behaviour needs missing test infra outside the existing surface |
+| `test_surface_policy` | `existing_infrastructure` | `existing_infrastructure` stays within existing project test infra and does not treat missing heavy UI/browser/device/runtime harnesses as gaps by themselves; `complete` opts in to `TESTABILITY GAP` reports when important behaviour needs missing test infra outside the existing surface. The test writer prefers behavioural seams and should not replace missing UI/browser/device/runtime harnesses with broad source-inspection tests. |
 | `testability_gap_policy` | `warn` | `warn` records visible `TESTABILITY GAP` entries and allows the task to continue; `fail` records the same entries and fails the task |
 | `extra_rules` | — | Path (relative to project root) to a Markdown file appended to the test writer's prompt as `## Project-specific rules`. Use for project-specific testing conventions: required test doubles, naming patterns, mandatory parametric table rules. Note: unlike the analyst, reviewer, and security reviewer, the test writer does not have guidelines content pre-loaded — it reads `guidelines.context_files` via its file tools. `extra_rules` is the correct configuration point for test-specific conventions that the test writer should apply without needing to read the full guidelines. |
 

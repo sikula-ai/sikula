@@ -514,7 +514,7 @@ CLI values layer on top of `agents:` overrides in the project YAML.
 | `security` | `context` | — | Short description of what the application does, what data it handles, and who the users are. Injected into the security reviewer's prompt so it can focus on threats relevant to your project — e.g. `"Mobile app. Fetches user data from our backend — auth tokens in Keychain. Main concerns: token handling and API response validation."` See [Configuring the security reviewer](#configuring-the-security-reviewer). |
 | `security_reviewer` | `extra_rules` | — | Path to a Markdown file appended to the security reviewer's system prompt. Use for project-specific security requirements: compliance rules (GDPR, PCI), threat model specifics, data classification rules. Appended before the BLOCKING/WARNING categories — project rules take priority. |
 | `test_writer` | `coverage_target` | `90` | Minimum branch+line coverage % for new/changed code within the configured test surface |
-| `test_writer` | `test_surface_policy` | `existing_infrastructure` | Test surface the test writer should use: `existing_infrastructure` stays within existing project test infra and does not treat missing heavy UI/browser/device/runtime harnesses as gaps by themselves; `complete` opts in to `TESTABILITY GAP` reports when important behaviour needs missing test infra outside the existing surface |
+| `test_writer` | `test_surface_policy` | `existing_infrastructure` | Test surface the test writer should use: `existing_infrastructure` stays within existing project test infra and does not treat missing heavy UI/browser/device/runtime harnesses as gaps by themselves; `complete` opts in to `TESTABILITY GAP` reports when important behaviour needs missing test infra outside the existing surface. The test writer prefers behavioural seams and should not replace missing UI/browser/device/runtime harnesses with broad source-inspection tests. |
 | `test_writer` | `testability_gap_policy` | `warn` | What to do when the test writer reports behaviour that cannot be safely tested with available seams/infra: `warn` records a visible audit warning; `fail` fails the task |
 | `test_writer` | `extra_rules` | — | Path to a Markdown file appended to the test writer's prompt. Use for project-specific testing conventions: required test doubles, naming patterns, parametric table rules. |
 | `progress` | `heartbeat_interval_seconds` | `60` | Seconds between heartbeat updates; `0` disables the heartbeat |
@@ -921,7 +921,10 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
   against `test_writer.test_surface_policy`. The default surface is
   `existing_infrastructure`, which keeps generated tests within existing project test infra
   instead of warning solely because a heavy UI/browser/device/runtime harness is absent.
-  Use `complete` to opt in to gaps for missing test infrastructure outside that surface.
+  The test writer should cover behaviour through public APIs, state, routing contracts,
+  command outputs, or project-standard helpers; it should not replace missing
+  UI/browser/device/runtime harnesses with broad source-inspection tests. Use `complete`
+  to opt in to gaps for missing test infrastructure outside that surface.
   The default gap policy is `warn`; `test_writer.testability_gap_policy: fail` makes
   reported gaps blocking.
 
