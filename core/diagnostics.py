@@ -48,7 +48,9 @@ _RELATIVE_PATH_LOCATION_RE = re.compile(
     r"(?:(?:[A-Za-z0-9_.-]+[/\\])+[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+)"
     r":\d+(?::\d+)?:"
 )
-_ABSOLUTE_PATH_RE = re.compile(r"(?P<prefix>file://)?(?P<path>(?:[/\\][^\s:]+)+)(?P<location>:\d+(?::\d+)?)?")
+_ABSOLUTE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?P<prefix>file://)?(?P<path>(?:[/\\][^\s:]+)+)(?P<location>:\d+(?::\d+)?)?"
+)
 _ASSERTION_VALUES_RE = re.compile(r"(\b[\w.]*Assertion(?:Failed)?Error:\s+).+", re.IGNORECASE)
 _ASSERTION_COMPARISON_VALUES_RE = re.compile(
     r"^([+-]?\s*(?:expected|received|actual|left|right)\b[^:]{0,60}:\s+).+",
@@ -374,9 +376,9 @@ def _shorten_paths(line: str) -> str:
         location = match.group("location") or ""
         normalized = path.replace("\\", "/")
         parts = [part for part in normalized.split("/") if part]
-        if len(parts) <= 3 and len(path) <= 80:
+        if not parts:
             return match.group(0)
-        suffix = "/".join(parts[-3:]) if len(parts) >= 3 else normalized
+        suffix = "/".join(parts[-3:]) if len(parts) > 3 else parts[-1]
         return f".../{suffix}{location}"
 
     return _ABSOLUTE_PATH_RE.sub(replace, line)

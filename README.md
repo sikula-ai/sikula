@@ -696,12 +696,12 @@ such as write-scope warnings, testability gaps, validation artifacts, or provide
 do not make an otherwise valid task fail; they point to items a human should inspect before
 merging.
 Recovered validation failures include short diagnostic lines sampled across failed validation
-attempts, such as the failing test, compiler location, sanitized assertion failure, or linter
-rule, so a successful self-healed run still shows what the build/fix loop had to repair
+attempts, such as the failing test, shortened compiler location, sanitized assertion failure,
+or linter rule, so a successful self-healed run still shows what the build/fix loop had to repair
 without echoing source-code frames, assertion values, quoted literal payloads, or
-secret-looking key/value tokens. The terminal summary intentionally shows only sampled
-diagnostics; use `sikula show <task-id>` for the complete state records and stored command
-output excerpts.
+secret-looking key/value tokens. Absolute path prefixes are shortened before terminal output.
+The terminal summary intentionally shows only sampled diagnostics; use `sikula show <task-id>`
+for the complete state records and stored command output excerpts.
 Start fresh tasks from the original project, not from inside another task worktree.
 Use `sikula run --task-id <task-id>` to resume the current task instead.
 `cleanup --force` and `delete --force` must be run from outside the worktree they

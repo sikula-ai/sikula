@@ -276,6 +276,16 @@ class TestDiagnosticSummaryLines:
         assert "TopLevelPropertyNaming" in lines[0]
         assert "MaxLineLength" in lines[1]
 
+    def test_shortens_short_absolute_paths_before_summary_output(self):
+        output = "/Users/alice/app.py:1: error: import failed\n/home/bob/project.py:2: error: lint failed\n"
+
+        lines = diagnostic_summary_lines(output)
+
+        assert lines == [
+            ".../app.py:1: error: import failed",
+            ".../project.py:2: error: lint failed",
+        ]
+
     def test_extracts_relative_linter_locations_without_error_token(self):
         output = "app.py:1:8: F401 `os` imported but unused\nFound 1 error.\n[*] 1 fixable with the `--fix` option.\n"
 
