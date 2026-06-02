@@ -29,6 +29,7 @@ class StubLLMClient(LLMClient):
     def __init__(self) -> None:
         self.generate_result: str = ""
         self.readonly_result: str = ""
+        self.readonly_results: list[str] = []
         self.agent_result: list[str] = []
         self.agent_output: str = ""
         self.generate_error: Exception | None = None
@@ -48,6 +49,8 @@ class StubLLMClient(LLMClient):
         self.readonly_calls.append(prompt)
         if self.readonly_error:
             raise self.readonly_error
+        if self.readonly_results:
+            return self.readonly_results.pop(0)
         return self.readonly_result
 
     def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:

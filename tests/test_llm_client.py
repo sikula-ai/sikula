@@ -453,6 +453,20 @@ class TestCodexClientCommands:
         assert cmd[:5] == ["codex", "exec", "--skip-git-repo-check", "--json", "--sandbox"]
         assert cmd[5] == "read-only"
 
+    def test_generate_failure_reports_stdout_json_error(self):
+        client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
+        failure = MagicMock(
+            returncode=1,
+            stdout=json.dumps({"type": "turn.failed", "error": {"message": "model unavailable"}}),
+            stderr="",
+        )
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", return_value=failure),
+            pytest.raises(RuntimeError, match="codex turn failed: model unavailable"),
+        ):
+            client.generate("system", "user")
+
     def test_run_readonly_agent_uses_read_only_sandbox(self, tmp_path: Path):
         client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
         with patch("core.llm_client.subprocess.run", return_value=self._run_result()) as mock_run:
@@ -462,6 +476,34 @@ class TestCodexClientCommands:
         assert cmd[:5] == ["codex", "exec", "--skip-git-repo-check", "--json", "--sandbox"]
         assert cmd[5] == "read-only"
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
+
+    def test_run_readonly_agent_failure_reports_stdout_json_error(self, tmp_path: Path):
+        client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
+        failure = MagicMock(
+            returncode=1,
+            stdout=json.dumps({"type": "turn.failed", "error": {"message": "app-server timeout"}}),
+            stderr="",
+        )
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", return_value=failure),
+            pytest.raises(RuntimeError, match="codex turn failed: app-server timeout"),
+        ):
+            client.run_readonly_agent("prompt", tmp_path)
+
+    def test_run_readonly_agent_failure_reports_plain_stdout_error(self, tmp_path: Path):
+        client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
+        failure = MagicMock(
+            returncode=1,
+            stdout="Error: failed to initialize in-process app-server client",
+            stderr="",
+        )
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", return_value=failure),
+            pytest.raises(RuntimeError, match="failed to initialize in-process app-server client"),
+        ):
+            client.run_readonly_agent("prompt", tmp_path)
 
     def test_run_agent_uses_workspace_write_sandbox(self, tmp_path: Path):
         client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
@@ -500,6 +542,28 @@ class TestCodexClientCommands:
         assert event["max_attempts"] == 4
         assert event["delay_s"] == 30
         assert event["error"] == "codex agent error: temporary policy error"
+
+    def test_run_agent_notifies_retry_observer_with_stdout_json_error(self, tmp_path: Path):
+        observer = MagicMock()
+        client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex", retry_observer=observer))
+        failure = MagicMock(
+            returncode=1,
+            stdout=json.dumps({"type": "turn.failed", "error": {"message": "policy denied"}}),
+            stderr="",
+        )
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client.subprocess.run", side_effect=[failure, self._run_result()]),
+        ):
+            changed, output = client.run_agent("prompt", tmp_path)
+
+        assert changed == []
+        assert output == "ok"
+        observer.assert_called_once()
+        event = observer.call_args.args[0]
+        assert event["operation"] == "run_agent"
+        assert event["error"] == "codex agent error: codex turn failed: policy denied"
 
 
 class TestGeminiParseResponse:

@@ -16,6 +16,7 @@ Platform-specific settings (project_config / YAML):
 from __future__ import annotations
 
 import logging
+import re
 
 from agents.base_agent import (
     AGENT_SECURITY_PREFIX,
@@ -27,6 +28,74 @@ from agents.base_agent import (
 from core.state import TaskState
 
 log = logging.getLogger(__name__)
+
+_MAX_ANALYST_OUTPUT_ATTEMPTS = 2
+
+_META_COMPLETION_PHRASES = (
+    "implementation prompt above",
+    "prompt above is the final output",
+    "task is complete",
+    "no further tracking",
+    "no further action is needed",
+    "not part of an ongoing",
+    "this analyser run produced",
+    "this analyzer run produced",
+    "the prompt itself",
+)
+
+_GENERIC_SHORT_OUTPUTS = {
+    "approved",
+    "done",
+    "complete",
+    "completed",
+    "ok",
+    "the prompt",
+    "as requested",
+}
+
+_ACTIONABLE_SIGNALS = (
+    "add",
+    "change",
+    "create",
+    "delete",
+    "fix",
+    "implement",
+    "modify",
+    "remove",
+    "rename",
+    "replace",
+    "update",
+)
+
+_SPECIFIC_DETAIL_SIGNALS = (
+    "/",
+    "src/",
+    "acceptance",
+    "api",
+    "class",
+    "component",
+    "contract",
+    "criteria",
+    "docstring",
+    "endpoint",
+    "file",
+    "function",
+    "module",
+    "screen",
+    "test",
+    "view",
+)
+
+_FILE_REFERENCE_RE = re.compile(r"\b[\w./-]+\.[A-Za-z0-9]{1,8}\b")
+
+_STRUCTURE_SIGNALS = (
+    "context",
+    "required changes",
+    "architecture constraints",
+    "hard rules",
+    "cleanup",
+    "acceptance criteria",
+)
 
 _SYSTEM_ANALYZE = """\
 You are a senior {tech_stack} software architect with read access to the project codebase.
@@ -131,6 +200,63 @@ Produce the implementation prompt.\
 """
 
 
+def _normalize_text(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def _has_signal(text: str, signals: tuple[str, ...]) -> bool:
+    return any(signal in text for signal in signals)
+
+
+def _has_specific_detail(normalized: str, original: str) -> bool:
+    return _has_signal(normalized, _SPECIFIC_DETAIL_SIGNALS) or bool(_FILE_REFERENCE_RE.search(original))
+
+
+def _implementation_prompt_quality_issue(prompt: str | None) -> str | None:
+    if not prompt or not prompt.strip():
+        return "empty analyst output"
+
+    stripped = prompt.strip()
+    normalized = _normalize_text(stripped)
+
+    for phrase in _META_COMPLETION_PHRASES:
+        if phrase in normalized:
+            return f"meta completion response detected: {phrase!r}"
+
+    if normalized in _GENERIC_SHORT_OUTPUTS:
+        return "generic non-actionable analyst output"
+
+    has_structure = _has_signal(normalized, _STRUCTURE_SIGNALS)
+    has_action = _has_signal(normalized, _ACTIONABLE_SIGNALS)
+    has_specific_detail = _has_specific_detail(normalized, stripped)
+
+    if len(stripped) < 80 and not (has_action and has_specific_detail):
+        return "analyst output is too short and lacks actionable implementation detail"
+
+    if len(stripped) < 300 and not has_structure and not (has_action and has_specific_detail):
+        return "analyst output lacks structure or concrete implementation detail"
+
+    return None
+
+
+def _retry_prompt(original_prompt: str, issue: str) -> str:
+    return (
+        original_prompt
+        + "\n\n---\n"
+        + "Sikula rejected your previous response because it was not a usable implementation prompt.\n"
+        + f"Reason: {issue}.\n\n"
+        + "Retry once. Output only a complete implementation prompt with these sections:\n"
+        + "1. Context\n"
+        + "2. Required changes\n"
+        + "3. Architecture constraints\n"
+        + "4. Hard rules\n"
+        + "5. Cleanup\n"
+        + "6. Acceptance criteria\n\n"
+        + "Do not refer to a prompt above. Do not say the task is complete. "
+        + "Do not describe your process. Return the implementation prompt itself.\n"
+    )
+
+
 class AnalystAgent(BaseAgent):
     name = "analyst"
 
@@ -153,15 +279,41 @@ class AnalystAgent(BaseAgent):
 
         state.analyst_prompt = full_prompt
 
-        try:
-            prompt = self.llm.run_readonly_agent(full_prompt, cwd=file_tool._root)
-        except RuntimeError as e:
-            msg = str(e)
+        prompt = ""
+        prompt_to_send = full_prompt
+        for attempt in range(1, _MAX_ANALYST_OUTPUT_ATTEMPTS + 1):
+            try:
+                prompt = self.llm.run_readonly_agent(prompt_to_send, cwd=file_tool._root)
+            except RuntimeError as e:
+                msg = str(e)
+                state.record(self.name, "analyze_failed", msg[:500])
+                return AgentResult(success=False, message=msg[:200])
+
+            issue = _implementation_prompt_quality_issue(prompt)
+            if issue is None:
+                break
+
+            will_retry = attempt < _MAX_ANALYST_OUTPUT_ATTEMPTS
+            next_prompt = _retry_prompt(full_prompt, issue) if will_retry else None
+            state.record_analyst_retry(
+                attempt,
+                issue,
+                prompt,
+                will_retry=will_retry,
+                retry_prompt=next_prompt,
+            )
+            warning = f"⚠️ Rejected analyst output attempt {attempt}/{_MAX_ANALYST_OUTPUT_ATTEMPTS}: {issue}"
+            if will_retry:
+                warning += "; retrying analysis"
+            state.analyst_warnings.append(warning)
+            log.warning("Analyst output rejected: %s", issue)
+            if will_retry:
+                prompt_to_send = next_prompt or full_prompt
+                continue
+
+            msg = f"Analyst produced invalid implementation prompt after {attempt} attempt(s): {issue}"
             state.record(self.name, "analyze_failed", msg[:500])
             return AgentResult(success=False, message=msg[:200])
-
-        if not prompt:
-            return AgentResult(success=False, message="Analyst produced empty output")
 
         warnings = [line.strip() for line in prompt.splitlines() if line.strip().startswith("⚠️")]
         if warnings:

@@ -548,6 +548,29 @@ class TestOrchestratorLoop:
         assert result.failed
         assert len(stubs["implementer"].calls) == 0
 
+    def test_analyst_result_failure_aborts_before_planner(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path)
+
+        class FailingAnalyst:
+            def __init__(self) -> None:
+                self.calls: list[TaskState] = []
+
+            def run(self, state: TaskState) -> AgentResult:
+                self.calls.append(state)
+                state.record("analyst", "analyze_failed", "invalid implementation prompt")
+                return AgentResult(success=False, message="invalid implementation prompt")
+
+        failing_analyst = FailingAnalyst()
+        orch._agents["analyst"] = failing_analyst  # type: ignore[assignment]
+        _save_state(orch)
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed
+        assert len(failing_analyst.calls) == 1
+        assert len(stubs["planner"].calls) == 0
+        assert len(stubs["implementer"].calls) == 0
+
     def test_planner_skipped_when_disabled(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=False, run_build=False)
         _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
@@ -2561,6 +2584,30 @@ class TestOrchestratorPlannerAbort:
         _save_state(orch, implementation_prompt="p")
         result = orch.run(task_id="t1")
         assert result.failed
+        assert len(stubs["implementer"].calls) == 0
+
+    def test_planner_result_failure_aborts_task(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=True, run_build=False)
+
+        class FailingPlanner:
+            def __init__(self) -> None:
+                self.calls: list[TaskState] = []
+
+            def run(self, state: TaskState) -> AgentResult:
+                self.calls.append(state)
+                state.record("planner", "plan_failed", "temporary provider failure")
+                return AgentResult(success=False, message="temporary provider failure")
+
+        failing_planner = FailingPlanner()
+        orch._agents["planner"] = failing_planner  # type: ignore[assignment]
+        _save_state(orch, implementation_prompt="p")
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed
+        assert result.plan_decided is False
+        assert result.plan == []
+        assert len(failing_planner.calls) == 1
         assert len(stubs["implementer"].calls) == 0
 
 

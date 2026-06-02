@@ -328,16 +328,18 @@ class Orchestrator:
         # Phase 1: analyze (idempotent — skipped if prompt already exists)
         if not state.implementation_prompt:
             log.info("--- Phase: analyze ---")
-            self._run_agent("analyst", state)
-            if state.failed:
+            result = self._run_agent("analyst", state)
+            if state.failed or not result.success:
+                state.failed = True
                 self._store.save(state)
                 return
 
         # Phase 1.5: plan (skipped if planner already ran — plan_decided guards resume)
         if self._config.run_planner and not state.plan_decided:
             log.info("--- Phase: plan ---")
-            self._run_agent("planner", state)
-            if state.failed:
+            result = self._run_agent("planner", state)
+            if state.failed or not result.success:
+                state.failed = True
                 self._store.save(state)
                 return
 
