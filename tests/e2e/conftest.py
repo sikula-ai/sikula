@@ -12,6 +12,20 @@ import pytest
 from core.llm_client import LLMClient
 
 
+ANALYST_FAKE_PROMPT = (
+    "1. Context: calculator module\n"
+    "2. Required changes: update src/calculator.py for the requested behavior\n"
+    "3. Architecture constraints: keep the existing simple function style\n"
+    "4. Hard rules: minimal changes only\n"
+    "5. Cleanup: no dead production code expected\n"
+    "6. Acceptance criteria: requested calculator behavior is implemented and tests pass"
+)
+
+
+def _is_analyst_prompt(prompt: str) -> bool:
+    return "Produce the implementation prompt." in prompt and "Task description:" in prompt
+
+
 class FakeLLMClient(LLMClient):
     """Deterministic LLM client for E2E tests. No API keys or network required.
 
@@ -34,6 +48,8 @@ class FakeLLMClient(LLMClient):
         return self._generate_response
 
     def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+        if _is_analyst_prompt(prompt) and self._readonly_response == "APPROVED":
+            return ANALYST_FAKE_PROMPT
         return self._readonly_response
 
     def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
@@ -75,7 +91,10 @@ class SequencedFakeLLMClient(LLMClient):
         return self._generate_queue.popleft() if self._generate_queue else self._default_generate
 
     def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
-        return self._readonly_queue.popleft() if self._readonly_queue else self._default_readonly
+        response = self._readonly_queue.popleft() if self._readonly_queue else self._default_readonly
+        if _is_analyst_prompt(prompt) and response == "APPROVED":
+            return ANALYST_FAKE_PROMPT
+        return response
 
     def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
         if not self._agent_queue:

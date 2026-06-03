@@ -536,6 +536,13 @@ Output written to state:
 - `state.implementation_prompt` — structured prompt for the implementer covering:
   context (module/layer), exact files and changes required (based on actual codebase exploration),
   architecture constraints, hard rules, cleanup candidates with verified class names, and acceptance criteria.
+- `state.analyst_retry_records` — rejected analyst outputs when the response is empty, generic,
+  or looks like a meta completion message instead of an implementation prompt.
+
+Before `state.implementation_prompt` is stored, Sikula validates that the analyst response is
+usable as implementation input. Meta responses such as "the prompt above is the final output" or
+"the task is complete" are rejected. Sikula retries analysis once with a stricter instruction; if
+the retry is still invalid, the orchestrator fails the task before planner or implementer phases run.
 
 **Prompt rules enforced:**
 - *No test changes* — the analyst must not suggest changes to test files (test/, androidTest/,
@@ -1006,6 +1013,7 @@ Sikula processes at once is still unsupported.
 | `security_approved` | `bool` | SecurityReviewerAgent / Orchestrator | Set True when security review passes (no blocking issues); reset to False when Fixer changes files or step transitions; guards re-runs |
 | `security_review_iterations` | `int` | Orchestrator | Security fix attempt counter for the current cycle (counts completed security-review→implement pairs); independent of `review_iterations`; resets to 0 on step transitions and fixer passes; guarded by `config.max_security_review_iterations` |
 | `analyst_warnings` | `list[str]` | AnalystAgent | Warnings produced by the analyst (e.g. ambiguous task scope, missing context); logged for visibility, never block the pipeline |
+| `analyst_retry_records` | `list[dict]` | AnalystAgent | Append-only records for analyst outputs rejected before `implementation_prompt` is stored, including attempt number, reason, whether another retry follows, timestamp, the rejected output, and the retry prompt when another attempt follows. These records are audit-only and never drive pipeline control flow. |
 | `review_diff` | `str \| None` | `cmd_review()` in `sikula.py` / Orchestrator | PR-style diff passed to ReviewerAgent and SecurityReviewerAgent; initially set to `git diff base...branch` (three-dot) in `sikula review` mode; refreshed in `"review_fix"` mode before reviewer/security-reviewer calls so uncommitted fixes are included; `None` in standard `sikula run` flow (agents fall back to `GitTool.diff_head()`) |
 | `review_mode` | `str \| None` | `cmd_review()` in `sikula.py` | Review task kind: `"review_report"` for report-only review (not resumable) or `"review_fix"` for `sikula review --fix` (resumable via `sikula run --task-id`) |
 | `review_base_branch` | `str \| None` | `cmd_review()` in `sikula.py` | Base branch used to refresh `review_diff` in `"review_fix"` mode. Report-only review keeps the original frozen diff; review-fix refreshes against the merge base before reviewer/security-reviewer calls so fixes are reviewed against the current branch state. |

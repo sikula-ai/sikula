@@ -162,6 +162,25 @@ class TestSinglePassRun:
         store = JsonStateStore(git_project / ".sikula" / "state")
         assert store.load(store.list_tasks()[0]).failed is True
 
+    def test_invalid_analyst_output_fails_before_implementation(self, git_project: Path, seq_fake_llm):
+        fake = seq_fake_llm(readonly_responses=[_BAD_ANALYST_META_PROMPT, _BAD_ANALYST_META_PROMPT])
+
+        with patch("core.llm_client.create_llm_client", return_value=fake):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_file=str(_task(git_project, "Add subtract."))), _cfg(git_project))
+
+        assert exc_info.value.code == 1
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.failed is True
+        assert state.implementation_prompt is None
+        assert state.files_changed == []
+        assert len(state.analyst_retry_records) == 2
+        assert any(entry["action"] == "analyze_failed" for entry in state.history)
+
 
 class TestMultiStepRun:
     def test_two_step_plan_completes(self, git_project: Path, fake_llm):
@@ -371,6 +390,19 @@ _SECURITY_BLOCKING = (
 
 _CALC_V1 = "def add(a, b): return a + b\ndef subtract(a, b): return a - b\n"
 _CALC_V2 = 'def add(a, b):\n    """Add two numbers."""\n    return a + b\ndef subtract(a, b):\n    """Subtract b from a."""\n    return a - b\n'
+_ANALYST_PROMPT = (
+    "1. Context: calculator module\n"
+    "2. Required changes: update src/calculator.py for the requested calculator behavior\n"
+    "3. Architecture constraints: keep the existing simple function style\n"
+    "4. Hard rules: minimal changes only\n"
+    "5. Cleanup: no dead production code expected\n"
+    "6. Acceptance criteria: requested calculator behavior is implemented and validation passes"
+)
+_BAD_ANALYST_META_PROMPT = (
+    "The implementation prompt above is the final output. The task is complete — no further tracking is needed "
+    "(this analyser run produced a single artifact, the prompt itself, and is not part of an ongoing multi-step "
+    "implementation)."
+)
 
 
 class TestReviewRejectionCycle:
@@ -411,7 +443,7 @@ class TestReviewRejectionCycle:
         # max_review_iterations=2 → 2 fix attempts → 3 reviewer runs before abort
         fake = seq_fake_llm(
             readonly_responses=[
-                "Implement feature.",  # analyst
+                _ANALYST_PROMPT,  # analyst
                 _REVIEW_ISSUES,  # reviewer run 1
                 _REVIEW_ISSUES,  # reviewer run 2 (after fix 1)
                 _REVIEW_ISSUES,  # reviewer run 3 (after fix 2) → triggers abort
@@ -446,7 +478,7 @@ class TestSecurityReviewBlocking:
         # analyst, code reviewer, security(blocking), code reviewer(re-run), security(approved)
         fake = seq_fake_llm(
             readonly_responses=[
-                "Implement secure calculator feature.",  # analyst
+                _ANALYST_PROMPT,  # analyst
                 "APPROVED",  # code reviewer initial
                 _SECURITY_BLOCKING,  # security reviewer — blocking
                 "APPROVED",  # code reviewer after security fix
@@ -485,7 +517,7 @@ class TestSecurityReviewTimeout:
         # call order: analyst, review, security(block1), review, security(block2), review, security(block3 → abort)
         fake = seq_fake_llm(
             readonly_responses=[
-                "Implement feature.",  # analyst
+                _ANALYST_PROMPT,  # analyst
                 "APPROVED",  # code reviewer initial
                 _SECURITY_BLOCKING,  # security reviewer block 1 → fix 1
                 "APPROVED",  # code reviewer after fix 1
@@ -526,7 +558,7 @@ class TestAgentException:
                 return "SINGLE_PASS"
 
             def run_readonly_agent(self, prompt, cwd):
-                return "Implement something."
+                return _ANALYST_PROMPT
 
             def run_agent(self, prompt, cwd):
                 raise ValueError("Simulated unexpected crash in implementer")
@@ -550,7 +582,7 @@ class TestAllStepsSkipped:
     def test_all_steps_skipped_fails_task(self, git_project: Path, seq_fake_llm):
         """Multi-step where every step writes nothing → task fails (consistent with single-pass)."""
         fake = seq_fake_llm(
-            readonly_responses=["Implement two steps."],  # analyst only; review never runs for skipped steps
+            readonly_responses=[_ANALYST_PROMPT],  # analyst only; review never runs for skipped steps
             generate_responses=["1. Step one\n2. Step two"],  # planner → 2-step plan
             agent_responses=[],  # both implementer calls write nothing → step_skipped
         )
@@ -617,6 +649,41 @@ class TestWorktreeIsolation:
 
 
 class TestResumeRun:
+    def test_reset_failed_after_invalid_analyst_output_reruns_analysis(self, git_project: Path, seq_fake_llm):
+        from core.state import JsonStateStore
+
+        first_fake = seq_fake_llm(readonly_responses=[_BAD_ANALYST_META_PROMPT, _BAD_ANALYST_META_PROMPT])
+
+        with patch("core.llm_client.create_llm_client", return_value=first_fake):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_file=str(_task(git_project, "Add subtract."))), _cfg(git_project))
+
+        assert exc_info.value.code == 1
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        task_id = store.list_tasks()[0]
+        failed = store.load(task_id)
+        assert failed.failed is True
+        assert failed.implementation_prompt is None
+        assert len(failed.analyst_retry_records) == 2
+
+        second_fake = seq_fake_llm(
+            readonly_responses=[_ANALYST_PROMPT],
+            agent_responses=[{"src/calculator.py": _CALC_V1}],
+        )
+
+        with patch("core.llm_client.create_llm_client", return_value=second_fake):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_id=task_id, reset_failed=True), _cfg(git_project))
+
+        assert exc_info.value.code == 0
+        resumed = store.load(task_id)
+        assert resumed.done is True
+        assert resumed.failed is False
+        assert resumed.implementation_prompt == _ANALYST_PROMPT
+        assert resumed.files_changed == ["src/calculator.py"]
+        assert len(resumed.analyst_retry_records) == 2
+
     def test_reset_failed_then_resumes_to_completion(self, git_project: Path, fake_llm):
         """--reset-failed clears the failed flag and the task runs to completion (covers line 565)."""
         from core.state import JsonStateStore

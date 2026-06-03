@@ -788,20 +788,61 @@ def _codex_parse_text(output: str) -> str:
                 if text:
                     parts.append(text)
         elif etype == "turn.failed":
-            err = event.get("error") or event.get("data", "")
-            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            msg = _codex_error_message(event.get("error") or event.get("data") or event)
             raise RuntimeError(f"codex turn failed: {msg}")
         elif etype == "error":
-            raw = event.get("message") or event.get("data", "")
-            try:
-                inner = json.loads(raw) if isinstance(raw, str) else raw
-                msg = (inner.get("error") or {}).get("message") or str(raw)
-            except (json.JSONDecodeError, AttributeError):
-                msg = str(raw)
+            msg = _codex_error_message(event.get("error") or event.get("message") or event.get("data") or event)
             raise RuntimeError(f"codex error: {msg}")
     if not parts:
         raise RuntimeError("codex returned no text output")
     return "\n".join(parts)
+
+
+def _codex_error_message(raw: object) -> str:
+    """Extract a readable error message from Codex JSON event payloads."""
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return ""
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return text
+        nested = _codex_error_message(parsed)
+        return nested or text
+    if isinstance(raw, dict):
+        message = raw.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+        for key in ("error", "data"):
+            nested = _codex_error_message(raw.get(key))
+            if nested:
+                return nested
+        name = raw.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        return json.dumps(raw)
+    return str(raw).strip()
+
+
+def _codex_subprocess_error(result: subprocess.CompletedProcess[str]) -> str:
+    """Return the most useful error text from a codex subprocess result."""
+    stderr = result.stderr.strip()
+    if stderr:
+        return stderr
+    stdout = result.stdout.strip()
+    if stdout:
+        try:
+            _codex_parse_text(stdout)
+        except RuntimeError as exc:
+            message = str(exc)
+            if message == "codex returned no text output":
+                return stdout
+            return message
+        return stdout
+    return "non-zero exit"
 
 
 class CodexClient(LLMClient):
@@ -838,7 +879,7 @@ class CodexClient(LLMClient):
                 timeout=300,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"codex CLI error: {result.stderr.strip() or 'non-zero exit'}")
+                raise RuntimeError(f"codex CLI error: {_codex_subprocess_error(result)}")
             return _codex_parse_text(result.stdout)
 
         return _call_with_retry("generate", _call, self._config, "generate")
@@ -855,7 +896,7 @@ class CodexClient(LLMClient):
                 timeout=self._config.agent_timeout,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"codex agent error: {result.stderr.strip() or 'non-zero exit'}")
+                raise RuntimeError(f"codex agent error: {_codex_subprocess_error(result)}")
             return _codex_parse_text(result.stdout)
 
         return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
@@ -876,8 +917,7 @@ class CodexClient(LLMClient):
                     timeout=self._config.agent_timeout,
                 )
                 if result.returncode != 0:
-                    err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
-                    raise RuntimeError(f"codex agent error: {err}")
+                    raise RuntimeError(f"codex agent error: {_codex_subprocess_error(result)}")
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
                 try:

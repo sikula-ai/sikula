@@ -90,6 +90,7 @@ def _final_summary(state: "TaskState") -> dict:
         "security_reviewer_runs": len(state.security_review_cycle_records),
         "test_writer_runs": len(state.test_write_records),
         "testability_gaps_count": len(state.testability_gaps),
+        "analyst_retries_count": len(state.analyst_retry_records),
         "llm_retries": sum(1 for entry in state.history if entry.get("action") == "llm_retry"),
         "history_events_count": len(state.history),
         "created_at": state.created_at,
@@ -171,6 +172,7 @@ class TaskState:
     security_approved: bool = False
     security_review_iterations: int = 0
     analyst_warnings: list[str] = field(default_factory=list)
+    analyst_retry_records: list[dict] = field(default_factory=list)
     review_diff: Optional[str] = None
     review_mode: Optional[str] = None
     review_base_branch: Optional[str] = None
@@ -225,6 +227,30 @@ class TaskState:
         if error:
             entry["error"] = error
         self.history.append(entry)
+
+    def record_analyst_retry(
+        self,
+        attempt: int,
+        reason: str,
+        output: str | None,
+        *,
+        will_retry: bool,
+        retry_prompt: str | None = None,
+    ) -> None:
+        reason_excerpt = _short_text(reason, limit=500) or ""
+        entry: dict = {
+            "attempt": attempt,
+            "reason": reason_excerpt,
+            "will_retry": will_retry,
+            "timestamp": _now(),
+        }
+        if output is not None:
+            entry["output"] = output
+        if retry_prompt is not None:
+            entry["retry_prompt"] = retry_prompt
+        self.analyst_retry_records.append(entry)
+        action = "analyze_retry" if will_retry else "analyze_rejected"
+        self.record("analyst", action, reason_excerpt[:500])
 
     def record_testability_gap(
         self,

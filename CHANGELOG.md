@@ -13,6 +13,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 - Test-only fixer scope violations are now recoverable: Sikula restores all writes from the violating test-only pass, records the violation for audit, and retries once before failing closed.
+- Analyst outputs that are empty, generic, or meta-completion text are now rejected before
+  `implementation_prompt` is stored; Sikula retries analysis once and then fails before
+  planner/implementer phases if no usable implementation prompt is produced.
+- Codex provider failures now preserve readable errors emitted on stdout JSON streams for
+  generate, read-only agent, and write-agent calls instead of reporting only `non-zero exit`.
 
 ## [0.2.0] - 2026-05-31
 

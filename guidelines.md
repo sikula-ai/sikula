@@ -211,6 +211,11 @@ Every agent that invokes an LLM must append one record per invocation to the app
 | `TestWriterAgent` | `state.test_write_records` |
 | Orchestrator validation phases | `state.validation_cycle_records` |
 
+`AnalystAgent` is the exception for successful calls: its primary prompt and output are
+stored in dedicated fields (`state.analyst_prompt` and `state.implementation_prompt`)
+because that output drives the whole task. Rejected analyst outputs that trigger analysis
+retry are append-only records in `state.analyst_retry_records`.
+
 Each agent record must include at minimum: the agent's prompt, LLM output (`None` on
 exception), files written, timestamp, and the correlation keys needed to locate the record
 within the pipeline: `step`, `build_iteration` (`state.build_iterations`),
@@ -251,6 +256,7 @@ Agents mutate `state` in place. The key state fields written by agents:
 |-------|-----------|------|
 | `analyst_prompt` | `AnalystAgent` | Full assembled prompt stored before the LLM call; enables post-run audit even if guidelines files change |
 | `implementation_prompt` | `AnalystAgent` | Structured prompt fed to implementer; the analyst's key output |
+| `analyst_retry_records` | `AnalystAgent` | Append-only records for rejected analyst outputs; never read for pipeline decisions |
 | `review_issues` | `ReviewerAgent` | Issue list from last review; cleared on approval |
 | `files_changed` | `ImplementerAgent`, `FixerAgent` | Append-only; never clear outside the orchestrator |
 | `errors`, `test_errors`, `check_errors` | Orchestrator | Cleared by the fixer after a fix pass |
