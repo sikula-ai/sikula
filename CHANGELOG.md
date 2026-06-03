@@ -11,6 +11,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Failed validation records now include high-signal diagnostic summary lines, and task terminal summaries sample and deduplicate those lines across recovered build/test/check failures so successful self-healed runs still reveal the concrete compiler error, failed test, sanitized assertion failure, or linter rule that was repaired without echoing source-code frames or assertion values, with an explicit pointer to `sikula show` for full state details.
 - The test writer now more strongly prefers behavioural seams over broad source-inspection tests, especially for UI implementation details that cannot be meaningfully exercised by existing project test infrastructure.
 
+### Fixed
+- Test-only fixer scope violations are now recoverable: Sikula restores all writes from the violating test-only pass, records the violation for audit, and retries once before failing closed.
+
 ## [0.2.0] - 2026-05-31
 
 ### Added
@@ -43,7 +46,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Reviewer loops no longer need to block on deterministic formatter/linter/test commands that are already covered by the configured build/test/check pipeline; the orchestrator remains responsible for executing those commands and any configured `fix_command`.
 - Test-failure fixer triage now distinguishes production defects from malformed or stale tests when a failing test encodes the task, project guidelines, or a structured contract, saves that decision for audit, and gives the reviewer the recent triage so weakened contract tests can be treated as evidence of production defects.
 - Test-failure and test-origin validation fixes now start with a test-only triage/fix pass; production writes are enabled only in a second pass after no-change `production_defect` + `production_code` triage, and that second pass must actually change production code, preventing malformed generated tests from being fixed by immediate production-code edits.
-- Test-only fixer scope violations are now recoverable: Sikula restores all writes from the violating test-only pass, records the violation for audit, and retries once before failing closed.
 - Build/check failures whose diagnostics reference only test files or recognized test targets now use the same production-vs-test fixer triage as test failures, and those fixer records are marked for reviewer audit, so malformed generated tests can be repaired without opening production writes unless the fixer explicitly classifies the issue as a production defect. Target-only diagnostics are matched conservatively, so unknown, production, or mixed targets fall back to normal build/check scope.
 - Test-failure fixer audit treats non-test artifacts under broad test write roots, including build configuration and dependency manifests, as production writes so malformed generated tests cannot be fixed by changing project/build configuration without production-defect triage.
 - Test-failure fixer audit now supports opt-in platform proofs for mixed source/test files. Cargo treats edits limited to an already-existing Rust `#[cfg(test)] mod tests` block as test-only, while production hunks and newly-created inline test blocks still require production-defect triage.
