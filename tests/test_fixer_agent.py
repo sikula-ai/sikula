@@ -67,6 +67,32 @@ class _SequentialStubLLMClient(StubLLMClient):
         return self._responses.pop(0)
 
 
+_WritingResponse = tuple[dict[str, str | None], list[str], str]
+
+
+class _WritingSequentialStubLLMClient(StubLLMClient):
+    def __init__(self, responses: list[_WritingResponse | Exception]) -> None:
+        super().__init__()
+        self._responses = responses
+
+    def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
+        self.agent_calls.append(prompt)
+        if not self._responses:
+            raise AssertionError("No stubbed agent response left")
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        writes, changed, output = response
+        for relative_path, content in writes.items():
+            path = cwd / relative_path
+            if content is None:
+                path.unlink(missing_ok=True)
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        return changed, output
+
+
 # ---------------------------------------------------------------------------
 # Guard conditions
 # ---------------------------------------------------------------------------
@@ -394,7 +420,11 @@ class TestFixerAgentTestFailureProductionGate:
         assert not result.success
         assert state.failed is True
         assert state.test_errors == ["assertion failed"]
-        assert "src/Login.kt" in state.files_changed
+        assert "src/Login.kt" not in state.files_changed
+        assert len(stub_llm.agent_calls) == 2
+        assert "TEST-ONLY SCOPE RECOVERY" in stub_llm.agent_calls[1]
+        assert state.fix_cycle_records[0]["test_only_scope_violation"]["violation_files"] == ["src/Login.kt"]
+        assert state.fix_cycle_records[0]["test_only_scope_violation"]["retry"] is True
         assert any(e["action"] == "fix_failed" for e in state.history)
 
     def test_test_failure_first_pass_cannot_write_production_even_with_valid_triage(
@@ -413,8 +443,9 @@ class TestFixerAgentTestFailureProductionGate:
         result = _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
         assert not result.success
         assert state.failed is True
-        assert "test-only triage pass" in result.message
-        assert len(stub_llm.agent_calls) == 1
+        assert "test_only_retry pass" in result.message
+        assert len(stub_llm.agent_calls) == 2
+        assert "TEST-ONLY SCOPE RECOVERY" in stub_llm.agent_calls[1]
 
     def test_test_failure_production_request_must_not_change_tests_in_first_pass(self, file_tool):
         triage = (
@@ -423,7 +454,7 @@ class TestFixerAgentTestFailureProductionGate:
             "contract_affected: login validation\n"
             "chosen_fix: production_code\n"
         )
-        llm = _SequentialStubLLMClient([(["tests/LoginTest.kt"], triage)])
+        llm = _SequentialStubLLMClient([(["tests/LoginTest.kt"], triage), (["tests/LoginTest.kt"], triage)])
         config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
         state = _make_state()
         state.test_errors = ["assertion failed"]
@@ -431,7 +462,149 @@ class TestFixerAgentTestFailureProductionGate:
         assert not result.success
         assert state.failed is True
         assert "requested a production-code fix" in result.message
-        assert len(llm.agent_calls) == 1
+        assert len(llm.agent_calls) == 2
+        assert state.files_changed == []
+
+    def test_test_only_scope_violation_restores_attempt_and_retries_test_fix(self, file_tool, tmp_project: Path):
+        test_triage = (
+            "TEST FAILURE TRIAGE:\nclassification: malformed_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                (
+                    {
+                        "src/main.py": "# illegal production edit\n",
+                        "tests/LoginTest.py": "assert False\n",
+                    },
+                    ["src/main.py", "tests/LoginTest.py"],
+                    test_triage,
+                ),
+                (
+                    {"tests/LoginTest.py": "assert True\n"},
+                    ["tests/LoginTest.py"],
+                    test_triage,
+                ),
+            ]
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["android.net.Uri.encode is not mocked"]
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert result.success
+        assert (tmp_project / "src" / "main.py").read_text() == "# placeholder\n"
+        assert (tmp_project / "tests" / "LoginTest.py").read_text() == "assert True\n"
+        assert state.files_changed == ["tests/LoginTest.py"]
+        assert len(llm.agent_calls) == 2
+        assert "TEST-ONLY SCOPE RECOVERY" in llm.agent_calls[1]
+        violation = state.fix_cycle_records[0]["test_only_scope_violation"]
+        assert violation["kind"] == "production_writes"
+        assert violation["violation_files"] == ["src/main.py"]
+        assert violation["restored_files"] == ["src/main.py", "tests/LoginTest.py"]
+        assert violation["retry"] is True
+        assert state.fix_cycle_records[1]["triage_pass"] == "test_only_retry"
+
+    def test_test_only_scope_violation_restore_failure_fails_closed(self, file_tool, monkeypatch, tmp_project: Path):
+        test_triage = (
+            "TEST FAILURE TRIAGE:\nclassification: malformed_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                (
+                    {
+                        "src/main.py": "# illegal production edit\n",
+                        "tests/LoginTest.py": "assert False\n",
+                    },
+                    ["src/main.py", "tests/LoginTest.py"],
+                    test_triage,
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            "agents.fixer_agent.restore_validation_artifacts",
+            lambda _cwd, _before, _artifacts: ["src/main.py: permission denied"],
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert not result.success
+        assert state.failed is True
+        assert "failed to restore" in result.message
+        assert state.files_changed == ["src/main.py", "tests/LoginTest.py"]
+        violation = state.fix_cycle_records[0]["test_only_scope_violation"]
+        assert violation["restore_errors"] == ["src/main.py: permission denied"]
+        assert violation["retry"] is False
+        assert any(e["action"] == "test_only_scope_violation_restore_failed" for e in state.history)
+        assert (tmp_project / "src" / "main.py").read_text() == "# illegal production edit\n"
+
+    def test_test_only_scope_recovery_retry_llm_error_records_recovery_context(self, file_tool):
+        test_triage = (
+            "TEST FAILURE TRIAGE:\nclassification: malformed_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                (
+                    {"src/main.py": "# illegal production edit\n"},
+                    ["src/main.py"],
+                    test_triage,
+                ),
+                RuntimeError("retry timed out"),
+            ]
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert not result.success
+        assert "retry timed out" in result.message
+        assert len(state.fix_cycle_records) == 2
+        retry_record = state.fix_cycle_records[1]
+        assert retry_record["fixer_output"] is None
+        assert retry_record["triage_pass"] == "test_only_retry"
+        assert "TEST-ONLY SCOPE RECOVERY" in retry_record["scope_recovery"]
+        assert "TEST-ONLY SCOPE RECOVERY" in llm.agent_calls[1]
+
+    def test_recovered_production_request_uses_production_confirmed_pass(self, file_tool, tmp_project: Path):
+        production_triage = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: production_defect\n"
+            "contract_affected: login validation\n"
+            "chosen_fix: production_code\n"
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                (
+                    {"tests/LoginTest.py": "assert False\n"},
+                    ["tests/LoginTest.py"],
+                    production_triage,
+                ),
+                ({}, [], production_triage),
+                (
+                    {"src/main.py": "# production fix\n"},
+                    ["src/main.py"],
+                    "Fixed the confirmed production defect.",
+                ),
+            ]
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert result.success
+        assert (tmp_project / "src" / "main.py").read_text() == "# production fix\n"
+        assert not (tmp_project / "tests" / "LoginTest.py").exists()
+        assert state.files_changed == ["src/main.py"]
+        assert [record["triage_pass"] for record in state.fix_cycle_records] == [
+            "test_only",
+            "test_only_retry",
+            "production_confirmed",
+        ]
+        assert state.fix_cycle_records[0]["test_only_scope_violation"]["kind"] == "production_request_changed_files"
+        assert "CONFIRMED TEST FAILURE TRIAGE" in llm.agent_calls[2]
 
     def test_test_failure_production_fix_with_valid_triage_uses_second_pass(self, file_tool):
         triage = (
@@ -462,6 +635,33 @@ class TestFixerAgentTestFailureProductionGate:
         assert state.fix_cycle_records[0]["triage_pass"] == "test_only"
         assert state.fix_cycle_records[1]["triage_pass"] == "production_confirmed"
         assert state.fix_cycle_records[1]["confirmed_test_failure_triage"] == triage
+
+    def test_production_confirmed_pass_llm_error_records_confirmed_triage(self, file_tool):
+        triage = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: production_defect\n"
+            "contract_affected: login validation\n"
+            "chosen_fix: production_code\n"
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                ({}, [], triage),
+                RuntimeError("production retry timed out"),
+            ]
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert not result.success
+        assert "production retry timed out" in result.message
+        assert len(state.fix_cycle_records) == 2
+        confirmed_record = state.fix_cycle_records[1]
+        assert confirmed_record["fixer_output"] is None
+        assert confirmed_record["triage_pass"] == "production_confirmed"
+        assert confirmed_record["confirmed_test_failure_triage"] == triage
+        assert "CONFIRMED TEST FAILURE TRIAGE" in llm.agent_calls[1]
 
     def test_confirmed_production_pass_must_change_production_files(self, file_tool):
         triage = (
@@ -535,7 +735,8 @@ class TestFixerAgentTestFailureProductionGate:
         assert state.failed is True
         assert state.errors == ["tests/countryFilters.test.ts(14,39): error TS2322: Type '\"   \"' is not assignable"]
         assert "test-origin validation" in result.message.lower()
-        assert "src/domain/countryFilters.ts" in state.files_changed
+        assert "src/domain/countryFilters.ts" not in state.files_changed
+        assert len(stub_llm.agent_calls) == 2
 
     def test_test_origin_build_failure_production_fix_with_valid_triage_uses_second_pass(self, file_tool):
         triage = (

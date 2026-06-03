@@ -441,7 +441,7 @@ run_build_per_step: false  # build/fix once after all steps (true = after each s
 
 Every `run_*` key (and `build.presync_clean`) can be overridden per-run without editing the YAML. Flag omitted = use config value.
 
-The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or the active build/fix loop reaches `sandbox.max_iterations`. In multi-step runs, `implement → review → security review → test write` runs for each planned step, then a final full-task gate runs before final build/fix validation. After a build/test/check failure, the fixer can iterate directly against deterministic validation; reviewer, security reviewer, and test writer rerun only after build/test/check are green again, and any changes they make are validated by another build/test/check pass. Test failures, and build/check diagnostics that reference only test files or recognized test targets, start with a test-only fixer pass. If that pass reports `production_defect` + `production_code` without changing files, Sikula runs a second production-enabled fixer pass; production writes during the first pass fail the task. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags.
+The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or the active build/fix loop reaches `sandbox.max_iterations`. In multi-step runs, `implement → review → security review → test write` runs for each planned step, then a final full-task gate runs before final build/fix validation. After a build/test/check failure, the fixer can iterate directly against deterministic validation; reviewer, security reviewer, and test writer rerun only after build/test/check are green again, and any changes they make are validated by another build/test/check pass. Test failures, and build/check diagnostics that reference only test files or recognized test targets, start with a test-only fixer pass. If that pass reports `production_defect` + `production_code` without changing files, Sikula runs a second production-enabled fixer pass. If a test-only pass writes production files, Sikula restores that attempt's writes and retries the test-only pass once; restore failure or a second scope violation fails the task. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags.
 
 Long-running phases publish an active-operation heartbeat while they are in progress.
 By default Sikula logs a "Still running" line every 60 seconds and updates task state
@@ -937,6 +937,8 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
   validation failures start test-only; production writes are enabled only by a separate
   pass after explicit `production_defect` plus `production_code` triage. That second
   pass must actually change production code; test-only changes belong in the first pass.
+  If a test-only pass writes production files, Sikula restores that pass's writes and
+  retries once before failing closed.
 - Build/check diagnostics that reference only test files or recognized test targets may
   allow test repair. Unknown, production, or mixed diagnostics fall back to normal
   build/check scope.

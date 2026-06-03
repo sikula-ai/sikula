@@ -26,6 +26,11 @@ from agents.base_agent import (
     tech_stack as _tech_stack,
 )
 from core.state import TaskState
+from core.validation_artifacts import (
+    detect_validation_artifacts,
+    restore_validation_artifacts,
+    snapshot_validation_dirty_files,
+)
 
 _AGENT_PROMPT = """\
 You are fixing errors in a {tech_stack} codebase.
@@ -136,6 +141,14 @@ _CONFIRMED_PRODUCTION_TEST_FIX_CONSTRAINT = """\
 - Do not change build configuration, runtime configuration, dependency declarations, or pipeline
   settings unless they are the confirmed production defect
 - Do not delete, relax, or rewrite assertions just to make the run green"""
+
+_TEST_ONLY_SCOPE_RECOVERY_INSTRUCTION = """\
+TEST-ONLY SCOPE RECOVERY:
+- A previous test-only triage pass violated its write scope: {reason}
+- Sikula restored all file writes from that pass before this retry
+- Retry from the current working tree and keep this pass strictly test-only
+- If the failure requires production code, choose `production_code`, explain the production
+  defect, and leave files unchanged so Sikula can run the production-confirmed pass"""
 
 _CHECK_TEST_CONSTRAINT = """\
 - You MAY modify production or test files if the check errors explicitly reference them
@@ -615,11 +628,14 @@ class FixerAgent(BaseAgent):
             allowed_write_paths: list[str],
             test_constraint: str,
             previous_triage: str | None = None,
+            scope_recovery: str | None = None,
         ) -> str:
             allowed_str = ", ".join(allowed_write_paths) if allowed_write_paths else "(not configured)"
             errors_section = _errors_section(state)
             if previous_triage:
                 errors_section += "\n\nCONFIRMED TEST FAILURE TRIAGE:\n" + previous_triage.strip()
+            if scope_recovery:
+                errors_section += "\n\n" + scope_recovery.strip()
             return AGENT_SECURITY_PREFIX + _AGENT_PROMPT.format(
                 tech_stack=_tech_stack(self.project_config),
                 guidelines_files=_guidelines_files(self.project_config),
@@ -637,13 +653,16 @@ class FixerAgent(BaseAgent):
             test_constraint: str,
             triage_pass: str | None = None,
             previous_triage: str | None = None,
-        ) -> tuple[AgentResult | None, list[str], str, dict[str, str | None], list[str]]:
+            scope_recovery: str | None = None,
+        ) -> tuple[AgentResult | None, list[str], str, dict[str, str | None], dict[str, Any], list[str]]:
             prompt = _prompt(
                 allowed_write_paths=allowed_write_paths,
                 test_constraint=test_constraint,
                 previous_triage=previous_triage,
+                scope_recovery=scope_recovery,
             )
             dirty_before = _git_dirty_text_snapshot(agent_cwd) if uses_test_failure_triage else {}
+            artifact_before = snapshot_validation_dirty_files(agent_cwd) if uses_test_failure_triage else {}
             try:
                 changed, fixer_output = self.llm.run_agent(prompt, cwd=agent_cwd)
             except RuntimeError as e:
@@ -665,8 +684,17 @@ class FixerAgent(BaseAgent):
                     record["triage_pass"] = triage_pass
                 if previous_triage:
                     record["confirmed_test_failure_triage"] = previous_triage
+                if scope_recovery:
+                    record["scope_recovery"] = scope_recovery
                 state.fix_cycle_records.append(record)
-                return AgentResult(success=False, message=msg[:200]), [], "", dirty_before, allowed_write_paths
+                return (
+                    AgentResult(success=False, message=msg[:200]),
+                    [],
+                    "",
+                    dirty_before,
+                    artifact_before,
+                    allowed_write_paths,
+                )
 
             record = {
                 "build_iteration": state.build_iterations,
@@ -684,8 +712,10 @@ class FixerAgent(BaseAgent):
                 record["triage_pass"] = triage_pass
             if previous_triage:
                 record["confirmed_test_failure_triage"] = previous_triage
+            if scope_recovery:
+                record["scope_recovery"] = scope_recovery
             state.fix_cycle_records.append(record)
-            return None, changed, fixer_output, dirty_before, allowed_write_paths
+            return None, changed, fixer_output, dirty_before, artifact_before, allowed_write_paths
 
         def _fail_after_changes(changed: list[str], msg: str) -> AgentResult:
             for p in changed:
@@ -710,42 +740,117 @@ class FixerAgent(BaseAgent):
                 after_contents,
             )
 
+        def _restore_attempt_writes(changed: list[str], artifact_before: dict[str, Any]) -> tuple[list[str], list[str]]:
+            changed_set = set(changed)
+            artifact_after = snapshot_validation_dirty_files(agent_cwd)
+            artifacts = [
+                artifact
+                for artifact in detect_validation_artifacts(artifact_before, artifact_after)
+                if artifact.path in changed_set
+            ]
+            errors = restore_validation_artifacts(agent_cwd, artifact_before, artifacts)
+            return [artifact.path for artifact in artifacts], errors
+
+        def _record_test_only_scope_violation(
+            *,
+            kind: str,
+            reason: str,
+            changed: list[str],
+            violation_files: list[str],
+            restored_files: list[str],
+            restore_errors: list[str],
+            will_retry: bool,
+        ) -> None:
+            if state.fix_cycle_records:
+                state.fix_cycle_records[-1]["test_only_scope_violation"] = {
+                    "kind": kind,
+                    "reason": reason,
+                    "files_written": list(changed),
+                    "violation_files": list(violation_files),
+                    "restored_files": list(restored_files),
+                    "restore_errors": list(restore_errors),
+                    "retry": will_retry,
+                }
+            action = "test_only_scope_violation_reverted"
+            if restore_errors:
+                action = "test_only_scope_violation_restore_failed"
+            state.record(self.name, action, reason[:500])
+
         if uses_test_failure_triage:
             allowed_write_paths = _write_paths_for_state(state, sandbox, test_origin_validation=test_origin_validation)
-            result, changed, fixer_output, dirty_before, final_allowed_write_paths = _run_once(
-                allowed_write_paths=allowed_write_paths,
-                test_constraint=_test_constraint(state, test_origin_validation=test_origin_validation),
-                triage_pass="test_only",
-            )
-            if result is not None:
-                return result
-
-            production_writes = _production_writes(changed, dirty_before)
-            if production_writes:
-                failure_kind = "test-origin validation" if test_origin_validation else "test-failure"
-                msg = (
-                    f"{failure_kind.capitalize()} fixer changed production files during the "
-                    "test-only triage pass: "
-                    f"{production_writes}"
+            test_constraint = _test_constraint(state, test_origin_validation=test_origin_validation)
+            scope_recovery: str | None = None
+            changed: list[str] = []
+            fixer_output = ""
+            final_allowed_write_paths = allowed_write_paths
+            max_test_only_attempts = 2
+            for attempt_index in range(max_test_only_attempts):
+                triage_pass = "test_only" if attempt_index == 0 else "test_only_retry"
+                result, changed, fixer_output, dirty_before, artifact_before, final_allowed_write_paths = _run_once(
+                    allowed_write_paths=allowed_write_paths,
+                    test_constraint=test_constraint,
+                    triage_pass=triage_pass,
+                    scope_recovery=scope_recovery,
                 )
-                return _fail_after_changes(changed, msg)
+                if result is not None:
+                    return result
 
+                production_writes = _production_writes(changed, dirty_before)
+                production_request_with_writes = _has_valid_production_test_failure_triage(fixer_output) and bool(
+                    changed
+                )
+                if not production_writes and not production_request_with_writes:
+                    break
+
+                failure_kind = "test-origin validation" if test_origin_validation else "test-failure"
+                if production_writes:
+                    kind = "production_writes"
+                    violation_files = production_writes
+                    reason = (
+                        f"{failure_kind.capitalize()} fixer changed production files during the "
+                        f"{triage_pass} pass: {production_writes}"
+                    )
+                else:
+                    kind = "production_request_changed_files"
+                    violation_files = changed
+                    reason = (
+                        f"{failure_kind.capitalize()} fixer requested a production-code fix but "
+                        f"changed files during the {triage_pass} pass: {changed}"
+                    )
+
+                restored_files, restore_errors = _restore_attempt_writes(changed, artifact_before)
+                will_retry = not restore_errors and attempt_index + 1 < max_test_only_attempts
+                _record_test_only_scope_violation(
+                    kind=kind,
+                    reason=reason,
+                    changed=changed,
+                    violation_files=violation_files,
+                    restored_files=restored_files,
+                    restore_errors=restore_errors,
+                    will_retry=will_retry,
+                )
+                if restore_errors:
+                    msg = f"{reason}; failed to restore the violating fixer writes: {restore_errors}"
+                    return _fail_after_changes(changed, msg)
+                if not will_retry:
+                    msg = f"{reason}; restored violating writes and no retry attempts remain"
+                    state.record(self.name, "fix_failed", msg)
+                    state.failed = True
+                    return AgentResult(
+                        success=False,
+                        message=msg[:200],
+                        data={"files_written": changed, "restored_files": restored_files},
+                    )
+                scope_recovery = _TEST_ONLY_SCOPE_RECOVERY_INSTRUCTION.format(reason=reason)
             if _has_valid_production_test_failure_triage(fixer_output):
                 failure_kind = "test-origin validation" if test_origin_validation else "test-failure"
-                if changed:
-                    msg = (
-                        f"{failure_kind.capitalize()} fixer requested a production-code fix but "
-                        f"changed files during the test-only triage pass: {changed}"
-                    )
-                    return _fail_after_changes(changed, msg)
-
                 allowed_write_paths = _write_paths_for_state(
                     state,
                     sandbox,
                     test_origin_validation=test_origin_validation,
                     production_fix_confirmed=True,
                 )
-                result, changed, fixer_output, dirty_before, final_allowed_write_paths = _run_once(
+                result, changed, fixer_output, dirty_before, _, final_allowed_write_paths = _run_once(
                     allowed_write_paths=allowed_write_paths,
                     test_constraint=_test_constraint(
                         state,
@@ -766,7 +871,7 @@ class FixerAgent(BaseAgent):
                     return _fail_after_changes(changed, msg)
         else:
             allowed_write_paths = _write_paths_for_state(state, sandbox, test_origin_validation=test_origin_validation)
-            result, changed, fixer_output, _, final_allowed_write_paths = _run_once(
+            result, changed, fixer_output, _, _, final_allowed_write_paths = _run_once(
                 allowed_write_paths=allowed_write_paths,
                 test_constraint=_test_constraint(state, test_origin_validation=test_origin_validation),
             )
