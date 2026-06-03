@@ -86,7 +86,25 @@ _SPECIFIC_DETAIL_SIGNALS = (
     "view",
 )
 
+_META_CONCRETE_DETAIL_SIGNALS = (
+    "/",
+    "src/",
+    "api",
+    "class",
+    "component",
+    "contract",
+    "docstring",
+    "endpoint",
+    "file",
+    "function",
+    "module",
+    "screen",
+    "string",
+    "view",
+)
+
 _FILE_REFERENCE_RE = re.compile(r"\b[\w./-]+\.[A-Za-z0-9]{1,8}\b")
+_QUOTED_TEXT_RE = re.compile(r'"[^"]*"|\'[^\']*\'|`[^`]*`')
 
 _STRUCTURE_SIGNALS = (
     "context",
@@ -96,6 +114,26 @@ _STRUCTURE_SIGNALS = (
     "cleanup",
     "acceptance criteria",
 )
+
+
+def _meta_completion_phrase(normalized: str) -> str | None:
+    for phrase in _META_COMPLETION_PHRASES:
+        if phrase in normalized:
+            return phrase
+    return None
+
+
+def _without_quoted_text(text: str) -> str:
+    return _QUOTED_TEXT_RE.sub(" ", text)
+
+
+def _has_action_word(normalized: str) -> bool:
+    return any(re.search(rf"\b{re.escape(signal)}\b", normalized) for signal in _ACTIONABLE_SIGNALS)
+
+
+def _has_meta_concrete_detail(normalized: str, original: str) -> bool:
+    return _has_signal(normalized, _META_CONCRETE_DETAIL_SIGNALS) or bool(_FILE_REFERENCE_RE.search(original))
+
 
 _SYSTEM_ANALYZE = """\
 You are a senior {tech_stack} software architect with read access to the project codebase.
@@ -219,16 +257,17 @@ def _implementation_prompt_quality_issue(prompt: str | None) -> str | None:
     stripped = prompt.strip()
     normalized = _normalize_text(stripped)
 
-    for phrase in _META_COMPLETION_PHRASES:
-        if phrase in normalized:
-            return f"meta completion response detected: {phrase!r}"
-
     if normalized in _GENERIC_SHORT_OUTPUTS:
         return "generic non-actionable analyst output"
 
     has_structure = _has_signal(normalized, _STRUCTURE_SIGNALS)
     has_action = _has_signal(normalized, _ACTIONABLE_SIGNALS)
     has_specific_detail = _has_specific_detail(normalized, stripped)
+    unquoted_normalized = _normalize_text(_without_quoted_text(stripped))
+    meta_phrase = _meta_completion_phrase(unquoted_normalized)
+
+    if meta_phrase and not (_has_action_word(normalized) and _has_meta_concrete_detail(normalized, stripped)):
+        return f"meta completion response detected: {meta_phrase!r}"
 
     if len(stripped) < 80 and not (has_action and has_specific_detail):
         return "analyst output is too short and lacks actionable implementation detail"

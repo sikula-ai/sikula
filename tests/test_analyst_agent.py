@@ -162,6 +162,27 @@ class TestAnalystAgentRun:
         assert "retry_prompt" not in task_state.analyst_retry_records[-1]
         assert any(e["action"] == "analyze_failed" for e in task_state.history)
 
+    def test_structured_meta_output_without_actionable_detail_is_rejected(
+        self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
+    ):
+        prompt = (
+            "1. Context: the task is complete\n"
+            "2. Required changes: no further action is needed\n"
+            "3. Architecture constraints: none\n"
+            "4. Hard rules: none\n"
+            "5. Cleanup: none\n"
+            "6. Acceptance criteria: complete"
+        )
+        stub_llm.readonly_results = [prompt, prompt]
+        agent = _make_agent(stub_llm, file_tool)
+
+        result = agent.run(task_state)
+
+        assert not result.success
+        assert task_state.implementation_prompt is None
+        assert len(task_state.analyst_retry_records) == 2
+        assert "task is complete" in task_state.analyst_retry_records[0]["reason"]
+
     def test_concise_actionable_prompt_is_allowed(self, stub_llm: StubLLMClient, task_state: TaskState, file_tool):
         stub_llm.readonly_result = "Add subtract(a, b) to src/calculator.py."
         agent = _make_agent(stub_llm, file_tool)
@@ -170,6 +191,28 @@ class TestAnalystAgentRun:
 
         assert result.success
         assert task_state.implementation_prompt == "Add subtract(a, b) to src/calculator.py."
+
+    def test_actionable_prompt_can_include_required_meta_phrase_copy(
+        self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
+    ):
+        prompt = (
+            "1. Context: onboarding completion screen\n"
+            '2. Required changes: update src/onboarding/banner.py to display "Task is complete" '
+            "as the exact user-visible completion copy from the task\n"
+            "3. Architecture constraints: follow existing string resource conventions\n"
+            "4. Hard rules: keep the change scoped to the completion banner\n"
+            "5. Cleanup: no dead production code expected\n"
+            "6. Acceptance criteria: the completion banner renders the required copy"
+        )
+        stub_llm.readonly_result = prompt
+        agent = _make_agent(stub_llm, file_tool)
+
+        result = agent.run(task_state)
+
+        assert result.success
+        assert len(stub_llm.readonly_calls) == 1
+        assert task_state.implementation_prompt == prompt
+        assert task_state.analyst_retry_records == []
 
 
 class TestAnalystGatherGuidelines:
