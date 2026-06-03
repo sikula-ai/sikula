@@ -67,8 +67,11 @@ class _SequentialStubLLMClient(StubLLMClient):
         return self._responses.pop(0)
 
 
+_WritingResponse = tuple[dict[str, str | None], list[str], str]
+
+
 class _WritingSequentialStubLLMClient(StubLLMClient):
-    def __init__(self, responses: list[tuple[dict[str, str | None], list[str], str]]) -> None:
+    def __init__(self, responses: list[_WritingResponse | Exception]) -> None:
         super().__init__()
         self._responses = responses
 
@@ -76,7 +79,10 @@ class _WritingSequentialStubLLMClient(StubLLMClient):
         self.agent_calls.append(prompt)
         if not self._responses:
             raise AssertionError("No stubbed agent response left")
-        writes, changed, output = self._responses.pop(0)
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        writes, changed, output = response
         for relative_path, content in writes.items():
             path = cwd / relative_path
             if content is None:
@@ -498,6 +504,69 @@ class TestFixerAgentTestFailureProductionGate:
         assert violation["retry"] is True
         assert state.fix_cycle_records[1]["triage_pass"] == "test_only_retry"
 
+    def test_test_only_scope_violation_restore_failure_fails_closed(self, file_tool, monkeypatch, tmp_project: Path):
+        test_triage = (
+            "TEST FAILURE TRIAGE:\nclassification: malformed_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                (
+                    {
+                        "src/main.py": "# illegal production edit\n",
+                        "tests/LoginTest.py": "assert False\n",
+                    },
+                    ["src/main.py", "tests/LoginTest.py"],
+                    test_triage,
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            "agents.fixer_agent.restore_validation_artifacts",
+            lambda _cwd, _before, _artifacts: ["src/main.py: permission denied"],
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert not result.success
+        assert state.failed is True
+        assert "failed to restore" in result.message
+        assert state.files_changed == ["src/main.py", "tests/LoginTest.py"]
+        violation = state.fix_cycle_records[0]["test_only_scope_violation"]
+        assert violation["restore_errors"] == ["src/main.py: permission denied"]
+        assert violation["retry"] is False
+        assert any(e["action"] == "test_only_scope_violation_restore_failed" for e in state.history)
+        assert (tmp_project / "src" / "main.py").read_text() == "# illegal production edit\n"
+
+    def test_test_only_scope_recovery_retry_llm_error_records_recovery_context(self, file_tool):
+        test_triage = (
+            "TEST FAILURE TRIAGE:\nclassification: malformed_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                (
+                    {"src/main.py": "# illegal production edit\n"},
+                    ["src/main.py"],
+                    test_triage,
+                ),
+                RuntimeError("retry timed out"),
+            ]
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert not result.success
+        assert "retry timed out" in result.message
+        assert len(state.fix_cycle_records) == 2
+        retry_record = state.fix_cycle_records[1]
+        assert retry_record["fixer_output"] is None
+        assert retry_record["triage_pass"] == "test_only_retry"
+        assert "TEST-ONLY SCOPE RECOVERY" in retry_record["scope_recovery"]
+        assert "TEST-ONLY SCOPE RECOVERY" in llm.agent_calls[1]
+
     def test_recovered_production_request_uses_production_confirmed_pass(self, file_tool, tmp_project: Path):
         production_triage = (
             "TEST FAILURE TRIAGE:\n"
@@ -566,6 +635,33 @@ class TestFixerAgentTestFailureProductionGate:
         assert state.fix_cycle_records[0]["triage_pass"] == "test_only"
         assert state.fix_cycle_records[1]["triage_pass"] == "production_confirmed"
         assert state.fix_cycle_records[1]["confirmed_test_failure_triage"] == triage
+
+    def test_production_confirmed_pass_llm_error_records_confirmed_triage(self, file_tool):
+        triage = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: production_defect\n"
+            "contract_affected: login validation\n"
+            "chosen_fix: production_code\n"
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                ({}, [], triage),
+                RuntimeError("production retry timed out"),
+            ]
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert not result.success
+        assert "production retry timed out" in result.message
+        assert len(state.fix_cycle_records) == 2
+        confirmed_record = state.fix_cycle_records[1]
+        assert confirmed_record["fixer_output"] is None
+        assert confirmed_record["triage_pass"] == "production_confirmed"
+        assert confirmed_record["confirmed_test_failure_triage"] == triage
+        assert "CONFIRMED TEST FAILURE TRIAGE" in llm.agent_calls[1]
 
     def test_confirmed_production_pass_must_change_production_files(self, file_tool):
         triage = (

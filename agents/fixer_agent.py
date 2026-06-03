@@ -842,21 +842,8 @@ class FixerAgent(BaseAgent):
                         data={"files_written": changed, "restored_files": restored_files},
                     )
                 scope_recovery = _TEST_ONLY_SCOPE_RECOVERY_INSTRUCTION.format(reason=reason)
-            else:
-                msg = "Test-only fixer did not complete a clean triage pass"
-                state.record(self.name, "fix_failed", msg)
-                state.failed = True
-                return AgentResult(success=False, message=msg)
-
             if _has_valid_production_test_failure_triage(fixer_output):
                 failure_kind = "test-origin validation" if test_origin_validation else "test-failure"
-                if changed:
-                    msg = (
-                        f"{failure_kind.capitalize()} fixer requested a production-code fix but "
-                        f"changed files during the test-only triage pass: {changed}"
-                    )
-                    return _fail_after_changes(changed, msg)
-
                 allowed_write_paths = _write_paths_for_state(
                     state,
                     sandbox,
