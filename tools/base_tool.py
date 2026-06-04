@@ -9,7 +9,7 @@ Implement it for each platform (AndroidGradleTool for Android, NodeTool for Node
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,7 @@ class ToolResult:
     success: bool
     output: str
     error: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def tool_error_excerpt(output: str, limit: int = _TOOL_ERROR_LIMIT) -> str:

@@ -525,7 +525,7 @@ All paths in the config are relative to the project root. `project.root_path` it
 
 > **Guidelines are the single biggest lever for output quality.** The analyst reads them before writing a word of code — they define architecture, naming conventions, patterns to follow, and anti-patterns to avoid. A well-maintained `guidelines.md`, `AGENTS.md`, or architecture doc produces implementations that fit your codebase; missing or vague guidance produces generic code that the reviewer will flag. Start with your existing agent/project docs and expand based on what the reviewer catches.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full config reference including `build.*` keys (`compile_task`, `test_task`, `presync_task`, timeouts).
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full config reference including `build.*` keys (`sync_command`, `compile_task`, `test_task`, `presync_task`, timeouts).
 
 #### Using `extra_rules`
 
@@ -707,7 +707,7 @@ Use `sikula run --task-id <task-id>` to resume the current task instead.
 `cleanup --force` and `delete --force` must be run from outside the worktree they
 would remove.
 
-The `config_snapshot` field in the state JSON records every effective setting used for the run: `project` name, all `run_*` flags (including `run_checks`), `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.*` paths (`allowed_write_paths`, `allowed_test_write_paths`, `allowed_read_paths`), `build.*` settings (presync task, compile task, timeouts, `checks` list), and the resolved `provider`/`model`/`agent_timeout` for each agent. If `extra_rules` is configured for an agent, its path is also captured in the snapshot. It is written once at the start of the first run and never overwritten on resume, so it always reflects the original run's configuration.
+The `config_snapshot` field in the state JSON records every effective setting used for the run: `project` name, all `run_*` flags (including `run_checks`), `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.*` paths (`allowed_write_paths`, `allowed_test_write_paths`, `allowed_read_paths`), `build.*` settings (`sync_command`, presync task, compile task, timeouts, `checks` list), and the resolved `provider`/`model`/`agent_timeout` for each agent. If `extra_rules` is configured for an agent, its path is also captured in the snapshot. It is written once at the start of the first run and never overwritten on resume, so it always reflects the original run's configuration.
 
 Terminal task state also records `finished_at`, `result_commit` when Sikula creates a commit, and final `test_status` / `check_status` values (`success`, `failed`, or `skipped`) for audit and debugging.
 

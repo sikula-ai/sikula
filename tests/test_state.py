@@ -119,6 +119,26 @@ class TestJsonStateStore:
         assert len(record["error_excerpt"]) == 1000
         assert "diagnostic_summary" not in record
 
+    def test_validation_record_captures_metadata(self):
+        state = TaskState(task_id="v1", task_description="validation task")
+
+        state.record_validation(
+            "sync",
+            "success",
+            metadata={
+                "sync_retry": {
+                    "reason": "cargo_lockfile_needs_update",
+                    "initial_command": "cargo fetch --locked",
+                    "retry_command": "cargo fetch",
+                }
+            },
+        )
+
+        record = state.validation_cycle_records[0]
+        assert record["metadata"]["sync_retry"]["reason"] == "cargo_lockfile_needs_update"
+        assert record["metadata"]["sync_retry"]["initial_command"] == "cargo fetch --locked"
+        assert record["metadata"]["sync_retry"]["retry_command"] == "cargo fetch"
+
     def test_validation_record_captures_diagnostic_summary(self):
         state = TaskState(task_id="v1", task_description="validation task")
         error = (

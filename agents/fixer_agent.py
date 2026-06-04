@@ -25,6 +25,7 @@ from agents.base_agent import (
     record_write_path_warnings as _record_write_path_warnings,
     tech_stack as _tech_stack,
 )
+from agents.build_guidance import write_agent_constraints as _write_agent_constraints
 from core.state import TaskState
 from core.validation_artifacts import (
     detect_validation_artifacts,
@@ -49,7 +50,7 @@ CONSTRAINTS — follow strictly:
 - Fix ONLY what the errors describe — nothing more
 - Do not refactor unrelated code
 - Do not change behaviour beyond what the errors require
-- Do not add comments or documentation unless required by the task or project guidelines.
+{build_tool_constraints}- Do not add comments or documentation unless required by the task or project guidelines.
   When modifying a function, class, or property that already has a doc comment, update it
   to stay accurate (e.g. add or remove @param entries) — do not delete it.
 {test_constraint}
@@ -641,6 +642,7 @@ class FixerAgent(BaseAgent):
                 guidelines_files=_guidelines_files(self.project_config),
                 allowed_read_paths=allowed_read_str,
                 allowed_write_paths=allowed_str,
+                build_tool_constraints=_write_agent_constraints(self.project_config),
                 test_constraint=test_constraint,
                 task_description=state.task_description,
                 implementation_prompt=state.implementation_prompt or "(not available)",

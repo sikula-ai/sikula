@@ -16,6 +16,7 @@ from agents.base_agent import (
     record_write_path_warnings as _record_write_path_warnings,
     tech_stack as _tech_stack,
 )
+from agents.build_guidance import write_agent_constraints as _write_agent_constraints
 from core.state import TaskState
 
 _AGENT_PROMPT = """\
@@ -35,7 +36,7 @@ CONSTRAINTS — follow strictly:
 - Do not modify or delete files outside these directories under any circumstances
 - Make MINIMAL changes — only what the task requires
 - Do not refactor unrelated code
-- Do not introduce new usages of deprecated APIs when a non-deprecated alternative exists and switching to it is a drop-in change; if migration requires broader refactoring, using the deprecated API is acceptable within the minimal-changes constraint
+{build_tool_constraints}- Do not introduce new usages of deprecated APIs when a non-deprecated alternative exists and switching to it is a drop-in change; if migration requires broader refactoring, using the deprecated API is acceptable within the minimal-changes constraint
 - Do not add comments or documentation unless required by the task or project guidelines.
   When modifying a function, class, or property that already has a doc comment, update it
   to stay accurate (e.g. add or remove @param entries) — do not delete it.
@@ -143,6 +144,7 @@ class ImplementerAgent(BaseAgent):
             allowed_read_paths=allowed_read_str,
             allowed_write_paths=allowed_str,
             guidelines_files=_guidelines_files(self.project_config),
+            build_tool_constraints=_write_agent_constraints(self.project_config),
             implementation_prompt=state.implementation_prompt,
             step_section=step_section,
             review_fix_section=review_fix_section,

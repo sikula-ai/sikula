@@ -71,10 +71,16 @@ class StubBuildTool:
         self.compile_side_effect: Callable[[], None] | None = None
         self.test_side_effect: Callable[[], None] | None = None
         self.check_side_effects: dict[str, Callable[[], None]] = {}
+        self.sync_metadata: dict = {}
 
     def sync(self) -> ToolResult:
         self.sync_calls += 1
-        return ToolResult(success=self.sync_success, output="", error="" if self.sync_success else "sync failed")
+        return ToolResult(
+            success=self.sync_success,
+            output="",
+            error="" if self.sync_success else "sync failed",
+            metadata=dict(self.sync_metadata),
+        )
 
     def generate_sources(self) -> ToolResult:
         self.presync_calls += 1
@@ -2221,14 +2227,23 @@ class TestBuildToolFactory:
 
     def test_cargo_platform_creates_cargo_tool(self, tmp_path: Path):
         sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        (tmp_path / "Cargo.lock").write_text("# lock\n")
         tool = _build_tool(sandbox, tmp_path, {"project": {"build_tool": "cargo"}, "build": {}})
         assert isinstance(tool, CargoTool)
+        assert tool._sync_command == "cargo fetch --locked"
+
+    def test_cargo_platform_without_lockfile_uses_unlocked_fetch(self, tmp_path: Path):
+        sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
+        tool = _build_tool(sandbox, tmp_path, {"project": {"build_tool": "cargo"}, "build": {}})
+        assert isinstance(tool, CargoTool)
+        assert tool._sync_command == "cargo fetch"
 
     def test_cargo_tool_uses_configured_commands(self, tmp_path: Path):
         sandbox = Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."])
         config = {
             "project": {"build_tool": "cargo"},
             "build": {
+                "sync_command": "cargo generate-lockfile",
                 "compile_command": "cargo check --workspace",
                 "test_command": "cargo test --workspace",
                 "timeout": 300,
@@ -2236,6 +2251,7 @@ class TestBuildToolFactory:
         }
         tool = _build_tool(sandbox, tmp_path, config)
         assert isinstance(tool, CargoTool)
+        assert tool._sync_command == "cargo generate-lockfile"
         assert tool._compile_command == "cargo check --workspace"
         assert tool._test_command == "cargo test --workspace"
         assert tool._timeout == 300
@@ -2679,6 +2695,26 @@ class TestOrchestratorTestsAndSyncFailure:
         _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=False)
         result = orch.run(task_id="t1")
         assert result.errors
+
+    def test_sync_records_tool_metadata_for_audit(self, tmp_path: Path):
+        orch, _, build = _make_orchestrator(tmp_path, run_build=True, max_iterations=1)
+        build.sync_metadata = {
+            "sync_retry": {
+                "reason": "cargo_lockfile_needs_update",
+                "initial_command": "cargo fetch --locked",
+                "retry_command": "cargo fetch",
+                "retry_status": "success",
+            }
+        }
+        _save_state(orch, implementation_prompt="p", files_changed=["Cargo.toml"], build_synced=False)
+
+        result = orch.run(task_id="t1")
+
+        sync_records = [record for record in result.validation_cycle_records if record["phase"] == "sync"]
+        assert sync_records[-1]["status"] == "success"
+        assert sync_records[-1]["metadata"]["sync_retry"]["reason"] == "cargo_lockfile_needs_update"
+        assert sync_records[-1]["metadata"]["sync_retry"]["initial_command"] == "cargo fetch --locked"
+        assert sync_records[-1]["metadata"]["sync_retry"]["retry_command"] == "cargo fetch"
 
 
 class TestValidationArtifacts:

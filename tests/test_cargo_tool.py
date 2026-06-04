@@ -11,9 +11,20 @@ from tools.base_tool import Sandbox
 from tools.cargo_tool import CargoTool, _BUILD_CONFIG_FILES
 
 
-def _make_tool(root: Path, compile_command: str = "cargo check", test_command: str = "cargo test") -> CargoTool:
+def _make_tool(
+    root: Path,
+    sync_command: str | None = None,
+    compile_command: str = "cargo check",
+    test_command: str = "cargo test",
+) -> CargoTool:
     sandbox = Sandbox(project_root=root, allowed_write_paths=["."], allowed_read_paths=["."])
-    return CargoTool(sandbox=sandbox, project_root=root, compile_command=compile_command, test_command=test_command)
+    return CargoTool(
+        sandbox=sandbox,
+        project_root=root,
+        sync_command=sync_command,
+        compile_command=compile_command,
+        test_command=test_command,
+    )
 
 
 def _mock_run(returncode: int = 0, stdout: str = "", stderr: str = "") -> MagicMock:
@@ -165,13 +176,119 @@ class TestCargoToolRunTests:
 
 
 class TestCargoToolSync:
-    def test_runs_cargo_fetch(self, tmp_path: Path):
+    def test_runs_locked_sync_when_lockfile_exists(self, tmp_path: Path):
+        (tmp_path / "Cargo.lock").write_text("# lock\n")
+        tool = _make_tool(tmp_path)
+        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+            result = tool.sync()
+        assert result.success
+        args, _ = mock.call_args
+        assert args[0] == "cargo fetch --locked"
+
+    def test_runs_locked_sync_when_workspace_lockfile_exists(self, tmp_path: Path):
+        workspace = tmp_path
+        member = workspace / "crates" / "app"
+        member.mkdir(parents=True)
+        (workspace / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/app"]\n')
+        (workspace / "Cargo.lock").write_text("# workspace lock\n")
+        (member / "Cargo.toml").write_text('[package]\nname = "app"\n')
+        tool = _make_tool(member)
+        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+            result = tool.sync()
+        assert result.success
+        args, _ = mock.call_args
+        assert args[0] == "cargo fetch --locked"
+
+    def test_locked_default_retries_unlocked_when_lockfile_needs_update(self, tmp_path: Path):
+        (tmp_path / "Cargo.lock").write_text("# lock\n")
+        tool = _make_tool(tmp_path)
+        locked_failure = _mock_run(
+            returncode=101,
+            stderr="error: the lock file /tmp/Cargo.lock needs to be updated but --locked was passed",
+        )
+        with patch("tools.cargo_tool.subprocess.run", side_effect=[locked_failure, _mock_run()]) as mock:
+            result = tool.sync()
+        assert result.success
+        assert [call.args[0] for call in mock.call_args_list] == ["cargo fetch --locked", "cargo fetch"]
+        assert result.metadata["sync_retry"]["reason"] == "cargo_lockfile_needs_update"
+        assert result.metadata["sync_retry"]["initial_command"] == "cargo fetch --locked"
+        assert result.metadata["sync_retry"]["initial_status"] == "failed"
+        assert "needs to be updated" in result.metadata["sync_retry"]["initial_error_excerpt"]
+        assert result.metadata["sync_retry"]["retry_command"] == "cargo fetch"
+        assert result.metadata["sync_retry"]["retry_status"] == "success"
+
+    def test_locked_default_preserves_retry_metadata_when_unlocked_retry_fails(self, tmp_path: Path):
+        (tmp_path / "Cargo.lock").write_text("# lock\n")
+        tool = _make_tool(tmp_path)
+        locked_failure = _mock_run(
+            returncode=101,
+            stderr="error: the lock file /tmp/Cargo.lock needs to be updated but --locked was passed",
+        )
+        retry_failure = _mock_run(returncode=101, stderr="error: failed to download package")
+
+        with patch("tools.cargo_tool.subprocess.run", side_effect=[locked_failure, retry_failure]):
+            result = tool.sync()
+
+        assert not result.success
+        assert result.metadata["sync_retry"]["reason"] == "cargo_lockfile_needs_update"
+        assert result.metadata["sync_retry"]["retry_status"] == "failed"
+
+    def test_locked_default_does_not_retry_unrelated_failures(self, tmp_path: Path):
+        (tmp_path / "Cargo.lock").write_text("# lock\n")
+        tool = _make_tool(tmp_path)
+        with patch(
+            "tools.cargo_tool.subprocess.run",
+            return_value=_mock_run(returncode=101, stderr="error: failed to download package"),
+        ) as mock:
+            result = tool.sync()
+        assert not result.success
+        assert mock.call_count == 1
+        args, _ = mock.call_args
+        assert args[0] == "cargo fetch --locked"
+
+    def test_runs_unlocked_sync_when_lockfile_is_missing(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
         with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
             result = tool.sync()
         assert result.success
         args, _ = mock.call_args
         assert args[0] == "cargo fetch"
+
+    def test_runs_unlocked_sync_when_workspace_lockfile_is_missing(self, tmp_path: Path):
+        workspace = tmp_path
+        member = workspace / "crates" / "app"
+        member.mkdir(parents=True)
+        (workspace / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/app"]\n')
+        (member / "Cargo.toml").write_text('[package]\nname = "app"\n')
+        tool = _make_tool(member)
+        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+            result = tool.sync()
+        assert result.success
+        args, _ = mock.call_args
+        assert args[0] == "cargo fetch"
+
+    def test_uses_configured_sync_command(self, tmp_path: Path):
+        tool = _make_tool(tmp_path, sync_command="cargo generate-lockfile --offline")
+        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+            result = tool.sync()
+        assert result.success
+        args, _ = mock.call_args
+        assert args[0] == "cargo generate-lockfile --offline"
+
+    def test_configured_locked_sync_command_does_not_retry(self, tmp_path: Path):
+        tool = _make_tool(tmp_path, sync_command="cargo fetch --locked")
+        with patch(
+            "tools.cargo_tool.subprocess.run",
+            return_value=_mock_run(
+                returncode=101,
+                stderr="error: the lock file /tmp/Cargo.lock needs to be updated but --locked was passed",
+            ),
+        ) as mock:
+            result = tool.sync()
+        assert not result.success
+        assert mock.call_count == 1
+        args, _ = mock.call_args
+        assert args[0] == "cargo fetch --locked"
 
 
 class TestCargoToolRunCheck:

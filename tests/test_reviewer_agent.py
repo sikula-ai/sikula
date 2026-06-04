@@ -300,6 +300,34 @@ class TestReviewerAgentPrompt:
         assert "contract-bearing test was deleted, relaxed" in prompt
         assert "report the production-code issue" in prompt
 
+    def test_lockfile_guidance_avoids_prebuild_validation_record_block(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(files_changed=["Cargo.toml", "Cargo.lock"])
+        config = {"project": {"build_tool": "cargo"}}
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+
+        assert "Build-tool-specific policy" in prompt
+        assert "Cargo lockfiles" in prompt
+        assert "not hand-written by agents" in prompt
+        assert "signs of manual fabrication" in prompt
+        assert "Do not ask the implementer to run Cargo tooling" in prompt
+        assert "do not block solely" in prompt
+        assert "sync/build validation record does" in prompt
+        assert "not exist yet" in prompt
+
+    def test_lockfile_guidance_is_omitted_for_non_cargo_projects(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state(files_changed=["app/src/LoginActivity.kt"])
+        config = {"project": {"build_tool": "gradle-android"}}
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = stub_llm.readonly_calls[0]
+
+        assert "Cargo lockfiles" not in prompt
+        assert "Cargo.lock" not in prompt
+
     def test_validation_pipeline_context_covers_task_commands(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state(
