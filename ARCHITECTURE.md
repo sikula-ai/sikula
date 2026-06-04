@@ -1056,7 +1056,8 @@ Sikula processes at once is still unsupported.
 
 The orchestrator loop calls a small fixed interface on the registered `"build"` tool.
 `env_files()` is a static method called by `cmd_run()` and `cmd_review --fix` in `sikula.py` when creating a worktree.
-Everything else (assemble, …) are platform-specific extras on the subclass.
+Everything else (assemble, …) are platform-specific extras on the subclass. BuildTool methods
+return `ToolResult`.
 
 | Method | Contract | AndroidGradleTool impl |
 |---|---|---|
@@ -1121,9 +1122,10 @@ All keys live under `build:` in `.sikula/config.yaml`.
 
 | Key | Default | Description |
 |---|---|---|
+| `sync_command` | lockfile-aware (`cargo fetch --locked` when `Cargo.lock` exists at the Cargo workspace/project root; otherwise `cargo fetch`) | Shell command run by `sync()`. Omit this key to preserve existing lockfiles while keeping library-style projects without committed lockfiles usable. If Cargo reports that the lockfile needs to be updated during the locked default sync, CargoTool retries once with `cargo fetch` and includes retry details in the sync validation record metadata. Explicit `sync_command` values are run exactly as configured and do not get default fallback behavior. Generic sync-artifact review, workspace diff, and finalization policy are deferred to the workspace/platform refactor. |
 | `compile_command` | `cargo check` | Shell command run by `compile_check()`. Use `cargo check --workspace` for workspace projects |
 | `test_command` | `cargo test` | Shell command run by `run_tests()`. Use `cargo test --workspace` for workspace projects |
-| `timeout` | `600` | Timeout in seconds for all CargoTool operations (compile, test, check). Rust compilation is slower than interpreted languages — 600 s is a safe default |
+| `timeout` | `600` | Timeout in seconds for all CargoTool operations (sync, compile, test, check). Rust compilation is slower than interpreted languages — 600 s is a safe default |
 | `checks` | `[]` | List of named quality checks run when `run_checks: true`. Keys: `name` (display name), `command` (shell command), `timeout` (seconds, defaults to `build.timeout` = 600), optional `fix_command`. Example: `{name: clippy, command: "cargo clippy -- -D warnings", timeout: 120}` |
 
 Failed Cargo test commands preserve Cargo's structured `failures:` block and

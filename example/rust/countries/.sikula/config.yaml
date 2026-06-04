@@ -138,6 +138,14 @@ run_checks: true
 
 # Rust/Cargo build settings (CargoTool-specific).
 build:
+  # sync_command is intentionally omitted here. CargoTool uses a lockfile-aware
+  # default: `cargo fetch --locked` when Cargo.lock exists and `cargo fetch`
+  # otherwise. If Cargo reports that the existing lockfile needs updating during
+  # the locked default sync, Sikula retries once with plain `cargo fetch`.
+  # Uncomment only when your project intentionally wants a custom exact sync
+  # command; explicit sync_command values do not get CargoTool's fallback.
+  # sync_command: "cargo generate-lockfile"
+
   # cargo check — fast type-check and borrow-checker without codegen; catches most errors quickly.
   # Use cargo build if you need to verify link-time errors as well.
   compile_command: "cargo check"

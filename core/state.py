@@ -289,6 +289,7 @@ class TaskState:
         elapsed_s: float | None = None,
         error: str | None = None,
         check_name: str | None = None,
+        metadata: dict | None = None,
     ) -> None:
         entry: dict = {
             "phase": phase,
@@ -309,6 +310,8 @@ class TaskState:
         diagnostic_summary = diagnostic_summary_lines(error)
         if diagnostic_summary:
             entry["diagnostic_summary"] = diagnostic_summary
+        if metadata:
+            entry["metadata"] = metadata
         self.validation_cycle_records.append(entry)
 
     def start_active_operation(

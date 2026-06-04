@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 
 _BUILD_CONFIG_FILES = ("Cargo.toml", "Cargo.lock")
 
+_DEFAULT_SYNC_COMMAND = "cargo fetch --locked"
 _DEFAULT_COMPILE_COMMAND = "cargo check"
 _DEFAULT_TEST_COMMAND = "cargo test"
 _DEFAULT_TIMEOUT = 600
@@ -23,6 +24,11 @@ _RUST_HUNK_RE = re.compile(
 )
 _RUST_CFG_TEST_RE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 _RUST_TEST_MODULE_RE = re.compile(r"\bmod\s+tests\b")
+_CARGO_WORKSPACE_HEADER_RE = re.compile(r"^\s*\[workspace\]\s*(?:#.*)?$")
+_CARGO_LOCK_NEEDS_UPDATE_RE = re.compile(
+    r"(?:lock file .* needs to be updated|Cargo\.lock needs to be updated).*--locked",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _is_cargo_test_command(command: str) -> bool:
@@ -33,6 +39,32 @@ def _cargo_error_excerpt(command: str, output: str) -> str:
     if _is_cargo_test_command(command):
         return cargo_test_failure_excerpt(output, limit=_CARGO_ERROR_LIMIT)
     return tool_error_excerpt(output)
+
+
+def _manifest_declares_workspace(path: Path) -> bool:
+    try:
+        return any(_CARGO_WORKSPACE_HEADER_RE.match(line) for line in path.read_text().splitlines())
+    except OSError:
+        return False
+
+
+def _cargo_workspace_root(root: Path) -> Path:
+    current = root.resolve()
+    for candidate in (current, *current.parents):
+        manifest = candidate / "Cargo.toml"
+        if manifest.exists() and _manifest_declares_workspace(manifest):
+            return candidate
+    return current
+
+
+def _default_sync_command(root: Path) -> str:
+    if (_cargo_workspace_root(root) / "Cargo.lock").exists():
+        return _DEFAULT_SYNC_COMMAND
+    return "cargo fetch"
+
+
+def _cargo_lockfile_needs_update(output: str) -> bool:
+    return bool(_CARGO_LOCK_NEEDS_UPDATE_RE.search(output))
 
 
 def _rust_raw_string_end(line: str, start: int) -> int | None:
@@ -243,12 +275,15 @@ class CargoTool(BuildTool):
         self,
         sandbox: Sandbox,
         project_root: Path,
+        sync_command: str | None = None,
         compile_command: str = _DEFAULT_COMPILE_COMMAND,
         test_command: str = _DEFAULT_TEST_COMMAND,
         timeout: int = _DEFAULT_TIMEOUT,
     ) -> None:
         super().__init__(sandbox)
         self._root = project_root.resolve()
+        self._sync_command_is_default = sync_command is None
+        self._sync_command = sync_command or _default_sync_command(self._root)
         self._compile_command = compile_command
         self._test_command = test_command
         self._timeout = timeout
@@ -275,7 +310,25 @@ class CargoTool(BuildTool):
             return ToolResult(success=False, output="", error=str(e))
 
     def sync(self) -> ToolResult:
-        return self._run("cargo fetch")
+        result = self._run(self._sync_command)
+        if (
+            not result.success
+            and self._sync_command_is_default
+            and self._sync_command == _DEFAULT_SYNC_COMMAND
+            and _cargo_lockfile_needs_update(result.output or result.error)
+        ):
+            log.info("Cargo lockfile needs an update during locked sync; retrying with cargo fetch")
+            retry = self._run("cargo fetch")
+            retry.metadata["sync_retry"] = {
+                "reason": "cargo_lockfile_needs_update",
+                "initial_command": self._sync_command,
+                "initial_status": "failed",
+                "initial_error_excerpt": tool_error_excerpt(result.error or result.output, limit=1000),
+                "retry_command": "cargo fetch",
+                "retry_status": "success" if retry.success else "failed",
+            }
+            return retry
+        return result
 
     def compile_check(self) -> ToolResult:
         return self._run(self._compile_command)

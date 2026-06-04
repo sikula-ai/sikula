@@ -140,6 +140,7 @@ def _build_tool(sandbox: Sandbox, root: Path, project_config: dict) -> BuildTool
         return CargoTool(
             sandbox,
             root,
+            sync_command=build.get("sync_command"),
             compile_command=build.get("compile_command", "cargo check"),
             test_command=build.get("test_command", "cargo test"),
             timeout=build.get("timeout", 600),
@@ -1432,11 +1433,11 @@ class Orchestrator:
         if result.success:
             state.build_synced = True
             state.record("orchestrator", "sync", "ok", elapsed_s=elapsed_s)
-            state.record_validation("sync", "success", elapsed_s=elapsed_s)
+            state.record_validation("sync", "success", elapsed_s=elapsed_s, metadata=result.metadata)
             log.info(f"Build sync OK ({_fmt_elapsed(elapsed_s)})")
         else:
             state.record("orchestrator", "sync", "failed", elapsed_s=elapsed_s)
-            state.record_validation("sync", "failed", elapsed_s=elapsed_s, error=result.error)
+            state.record_validation("sync", "failed", elapsed_s=elapsed_s, error=result.error, metadata=result.metadata)
             log.error(
                 f"Build sync failed ({_fmt_elapsed(elapsed_s)}):\n"
                 f"{diagnostic_excerpt(result.error, limit=_LOG_ERROR_LIMIT)}"

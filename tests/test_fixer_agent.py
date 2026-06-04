@@ -282,6 +282,33 @@ class TestFixerAgentFixCycleRecord:
         assert state.task_description in prompt
         assert "compile error" in prompt
 
+    def test_prompt_tells_agent_not_to_manually_edit_lockfiles(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["Cargo.toml"]
+        state = _make_state()
+        state.errors = ["compile error"]
+        config = {"project": {"build_tool": "cargo"}}
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = state.fix_cycle_records[0]["fixer_prompt"]
+
+        assert "For Cargo/Rust projects" in prompt
+        assert "do not manually synthesize or edit Cargo.lock" in prompt
+        assert "Cargo.toml changes require lockfile updates" in prompt
+        assert "rely on configured" in prompt
+        assert "Cargo sync/build tooling" in prompt
+
+    def test_prompt_omits_cargo_lockfile_guidance_for_non_cargo_projects(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["src/Login.kt"]
+        state = _make_state()
+        state.errors = ["compile error"]
+        config = {"project": {"build_tool": "gradle-android"}}
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = state.fix_cycle_records[0]["fixer_prompt"]
+
+        assert "Cargo/Rust projects" not in prompt
+        assert "Cargo.lock" not in prompt
+
     def test_record_stores_files_written(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["src/Login.kt", "src/Auth.kt"]
         state = _make_state()

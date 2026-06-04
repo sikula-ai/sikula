@@ -36,6 +36,7 @@ from agents.base_agent import (
     load_extra_rules as _load_extra_rules,
     tech_stack as _tech_stack,
 )
+from agents.build_guidance import reviewer_policy as _build_tool_reviewer_policy
 from core.state import TaskState
 from core.validation_coverage import (
     configured_validation_commands,
@@ -163,6 +164,7 @@ Review steps:
       - You may still report a real correctness/completeness problem that is visible in
         code. Do not turn deterministic formatter/linter state into a review-loop blocker
         when it is covered by the configured pipeline.
+{build_tool_review_policy}
 
 {test_review_policy}
 
@@ -451,6 +453,7 @@ class ReviewerAgent(BaseAgent):
             _SYSTEM_REVIEW.format(
                 tech_stack=_tech_stack(self.project_config),
                 guidelines_context=_gather_guidelines(self.project_config, file_tool),
+                build_tool_review_policy=_build_tool_reviewer_policy(self.project_config),
                 test_review_policy=_test_review_policy(state),
             )
             + _load_extra_rules(self.project_config, self.name, file_tool)

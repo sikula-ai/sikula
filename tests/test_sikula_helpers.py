@@ -339,6 +339,12 @@ class TestGenerateConfig:
         assert "compile_timeout:" in cfg
         assert "test_timeout:" in cfg
 
+    def test_cargo_build_section_has_lockfile_aware_sync_command(self):
+        cfg = self._cfg(build_tool="cargo", language="Rust")
+        assert "sync_command:" not in cfg
+        assert 'compile_command: "cargo check"' in cfg
+        assert 'test_command: "cargo test"' in cfg
+
     def test_node_build_section_uses_detected_commands(self):
         cfg = self._cfg(
             build_tool="node",

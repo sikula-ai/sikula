@@ -331,6 +331,10 @@ All methods return `ToolResult`. Treat subprocess exit code 0 as success. Platfo
 exit codes (e.g. pytest exit 5 = "no tests collected") may also be treated as success — document
 why with an inline comment.
 
+Keep platform-specific dependency resolution behavior in the relevant `BuildTool`, not in the
+orchestrator. For example, Cargo's default sync may retry `cargo fetch` after a locked fetch
+reports that `Cargo.lock` needs updating, while explicit `build.sync_command` values remain exact.
+
 On failure, set `ToolResult.error` to the combined stdout+stderr output (not stderr alone) —
 many tools (pytest, cargo test, ruff) write diagnostics to stdout:
 
