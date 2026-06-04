@@ -2795,6 +2795,32 @@ class TestOrchestratorTestsAndSyncFailure:
         sync_records = [record for record in result.validation_cycle_records if record["phase"] == "sync"]
         assert sync_records[-1]["metadata"]["sync_outputs"]["adopted"][0]["path"] == "generated/api/schema.json"
 
+    def test_sync_adopts_outputs_from_configured_string_glob(self, tmp_project: Path):
+        config = {
+            "project": {"build_tool": "python"},
+            "build": {"sync_adopt_paths": "generated/**/*.json"},
+        }
+        orch, _, build = _make_orchestrator(
+            tmp_project,
+            project_config=config,
+            run_build=True,
+            run_tests=False,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+        output = tmp_project / "generated" / "api" / "schema.json"
+        build.sync_side_effect = lambda: (output.parent.mkdir(parents=True, exist_ok=True), output.write_text("{}\n"))
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=False)
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert "generated/api/schema.json" in result.files_changed
+        sync_records = [record for record in result.validation_cycle_records if record["phase"] == "sync"]
+        assert sync_records[-1]["metadata"]["sync_outputs"]["adopted"][0]["path"] == "generated/api/schema.json"
+
     def test_sync_adopts_project_relative_paths_when_git_root_differs(self, tmp_project: Path):
         project = tmp_project / "app"
         (project / "src").mkdir(parents=True)
@@ -2856,6 +2882,39 @@ class TestOrchestratorTestsAndSyncFailure:
         assert "cleanup_failed" not in metadata
         assert state.validation_artifact_records[0]["status"] == "blocked"
 
+    def test_sync_blocks_outside_project_outputs_after_adopting_inside_outputs(self, tmp_project: Path):
+        project = tmp_project / "app"
+        project.mkdir()
+        orch, _, build = _make_orchestrator(
+            project,
+            run_build=True,
+            run_tests=False,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+        build.sync_adoptable_files = {"Cargo.lock", "generated.lock"}
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=False)
+        before = orch._validation_artifact_snapshot(state)
+        (project / "generated.lock").write_text("resolved inside project root\n")
+        output = tmp_project / "Cargo.lock"
+        output.write_text("resolved outside project root\n")
+
+        ok, metadata, error = orch._record_sync_artifact_changes(
+            state,
+            before=before,
+            adopt_known_outputs=True,
+        )
+
+        assert not ok
+        assert "outside project root" in (error or "")
+        assert not output.exists()
+        assert "generated.lock" in state.files_changed
+        assert metadata["adopted"][0]["path"] == "generated.lock"
+        assert metadata["outside_project"][0]["path"] == "Cargo.lock"
+        assert metadata["cleaned"][0]["path"] == "Cargo.lock"
+
     def test_sync_cleans_unexpected_artifacts(self, tmp_project: Path):
         orch, _, build = _make_orchestrator(
             tmp_project,
@@ -2879,6 +2938,91 @@ class TestOrchestratorTestsAndSyncFailure:
         assert result.validation_artifact_records[0]["status"] == "cleaned"
         sync_records = [record for record in result.validation_cycle_records if record["phase"] == "sync"]
         assert sync_records[-1]["metadata"]["sync_outputs"]["cleaned"][0]["path"] == "tmp-sync.log"
+
+    def test_sync_adopts_known_outputs_before_unexpected_cleanup_failure(
+        self, tmp_project: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        orch, _, build = _make_orchestrator(
+            tmp_project,
+            run_build=True,
+            run_tests=False,
+            run_checks=False,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+        )
+        build.sync_adoptable_files = {"generated.lock"}
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            build_synced=False,
+            review_approved=True,
+            security_approved=True,
+            tests_up_to_date=True,
+        )
+        before = orch._validation_artifact_snapshot(state)
+        (tmp_project / "generated.lock").write_text("resolved during sync\n")
+        (tmp_project / "tmp-sync.log").write_text("cache\n")
+        monkeypatch.setattr(
+            orchestrator_module,
+            "restore_validation_artifacts",
+            lambda *_args: ["tmp-sync.log: permission denied"],
+        )
+
+        ok, metadata, error = orch._record_sync_artifact_changes(
+            state,
+            before=before,
+            adopt_known_outputs=True,
+        )
+
+        assert not ok
+        assert "permission denied" in (error or "")
+        assert "generated.lock" in state.files_changed
+        assert not state.review_approved
+        assert not state.security_approved
+        assert not state.tests_up_to_date
+        assert metadata["adopted"] == [
+            {"path": "generated.lock", "before_status": "clean", "after_status": "untracked"}
+        ]
+        assert metadata["cleanup_failed"] == [
+            {"path": "tmp-sync.log", "before_status": "clean", "after_status": "untracked"}
+        ]
+        assert "adoptable" not in metadata
+        assert state.validation_artifact_records[0]["status"] == "cleanup_failed"
+
+    def test_sync_adopts_known_outputs_before_cleanup_pass_limit(
+        self, tmp_project: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        orch, _, build = _make_orchestrator(
+            tmp_project,
+            run_build=True,
+            run_tests=False,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+        build.sync_adoptable_files = {"generated.lock"}
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=False)
+        before = orch._validation_artifact_snapshot(state)
+        (tmp_project / "generated.lock").write_text("resolved during sync\n")
+        (tmp_project / "tmp-sync.log").write_text("cache\n")
+        monkeypatch.setattr(orchestrator_module, "_VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES", 0)
+
+        ok, metadata, error = orch._record_sync_artifact_changes(
+            state,
+            before=before,
+            adopt_known_outputs=True,
+        )
+
+        assert not ok
+        assert "after 0 cleanup passes" in (error or "")
+        assert "generated.lock" in state.files_changed
+        assert metadata["adopted"][0]["path"] == "generated.lock"
+        assert metadata["cleanup_failed"][0]["path"] == "tmp-sync.log"
+        assert "adoptable" not in metadata
+        assert state.validation_artifact_records[0]["status"] == "cleanup_failed"
 
 
 class TestValidationArtifacts:

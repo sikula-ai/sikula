@@ -1194,7 +1194,8 @@ class Orchestrator:
                 )
                 metadata: dict = {"outside_project": artifact_records}
                 if adopted_records:
-                    metadata["adoptable"] = adopted_records
+                    self._adopt_sync_outputs(state, adopted_records)
+                    metadata["adopted"] = adopted_records
                 metadata["cleanup_failed" if cleanup_errors else "cleaned"] = artifact_records
                 return False, metadata, error
 
@@ -1221,7 +1222,8 @@ class Orchestrator:
                 )
                 metadata = {"cleanup_failed": artifact_records}
                 if adopted_records:
-                    metadata["adoptable"] = adopted_records
+                    self._adopt_sync_outputs(state, adopted_records)
+                    metadata["adopted"] = adopted_records
                 return False, metadata, error
 
             cleanup_passes += 1
@@ -1237,7 +1239,8 @@ class Orchestrator:
                 )
                 metadata = {"cleanup_failed": artifact_records}
                 if adopted_records:
-                    metadata["adoptable"] = adopted_records
+                    self._adopt_sync_outputs(state, adopted_records)
+                    metadata["adopted"] = adopted_records
                 return False, metadata, error
 
             cleaned_records.extend(artifact_records)
