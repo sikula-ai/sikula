@@ -664,6 +664,10 @@ class TestTaskAuditReport:
         state.security_review_cycle_records.append({"has_warnings": True})
         state.testability_gaps.append({"message": "missing UI harness"})
         state.validation_artifact_records.append({"status": "cleaned", "artifacts": [{"path": "tmp.log"}]})
+        state.validation_artifact_records.append({"status": "blocked", "artifacts": [{"path": "Cargo.lock"}]})
+        state.validation_artifact_records.append(
+            {"status": "cleanup_failed", "artifacts": [{"path": "reports/stuck.log"}]}
+        )
         state.history.append({"action": "llm_retry"})
         state.validation_cycle_records.append({"phase": "test", "status": "failed"})
         state.validation_cycle_records.append(
@@ -686,7 +690,7 @@ class TestTaskAuditReport:
         assert "reviewer warnings: 1" in out
         assert "security reviewer warnings: 1" in out
         assert "testability gaps: 1" in out
-        assert "validation artifacts: 1 (1 cleaned)" in out
+        assert "validation artifacts: 3 (1 cleaned, 1 blocked, 1 cleanup failed)" in out
         assert "LLM retries: 1" in out
         assert "Recovered issues:" in out
         assert (

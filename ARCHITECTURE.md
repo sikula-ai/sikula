@@ -222,6 +222,11 @@ Orchestrator.run()
       ┌──────────────────────────────────────────────────────┐
       │  if not state.build_synced:                          │
       │      BuildTool.sync()           [platform-specific]  │
+      │      known sync outputs → adopt + audit              │
+      │          → append state.files_changed                │
+      │          → stale review/security/test-writer gates   │
+      │      unexpected repo artifacts → clean + audit        │
+      │                                → cleanup failure/fix  │
       │      success → state.build_synced = True             │
       │      failure → state.errors.append(output)           │
       │             → fix phase (same as build failure)      │
@@ -949,6 +954,19 @@ content pre-loaded in the prompt.
 changed file. If any match, `state.build_synced = False` is set so sync runs before the
 next build. The patterns are defined by the `BuildTool` implementation, not the orchestrator.
 
+**Sync output adoption:** after `BuildTool.sync()` succeeds, the orchestrator compares the
+non-ignored repository snapshot taken before sync with the snapshot after sync. Platform
+`BuildTool` subclasses classify source-controlled outputs that sync may intentionally update
+through `is_sync_adoptable_file(path)`, for example lockfiles or dependency verification
+metadata. Project configs can add project-relative patterns with `build.sync_adopt_paths`.
+Adopted outputs are appended to `state.files_changed`, included in sync validation metadata,
+and make reviewer, security reviewer, and test-writer approvals stale so the final branch
+output is reviewed after deterministic validation. Paths outside `project.root_path` are not
+adopted into task state; known sync outputs there fail closed after cleanup. Other
+non-ignored sync artifacts are treated like validation artifacts: restore them to the
+pre-sync snapshot, record the cleanup, and fail validation only when cleanup cannot be
+completed.
+
 ---
 
 ### InitAgent (`agents/init_agent.py`)
@@ -1022,9 +1040,9 @@ Sikula processes at once is still unsupported.
 | `security_review_cycle_records` | `list[dict]` | SecurityReviewerAgent | Structured observability — one entry per security reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = after a post-fixer validation pass), `security_review_iteration` (fix-pass index within this step's security review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the security reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, security history is limited to earlier final full-task security reviews. **Migration note:** state files from schema version 1 stored security reviewer entries inside `review_cycle_records` with `reviewer = "security_reviewer"`; `JsonStateStore.load()` moves them here and removes the redundant `reviewer` field. |
 | `test_write_records` | `list[dict]` | TestWriterAgent | Structured observability — one entry per test-writer invocation: `step`, `build_iteration` (`0` = before first build; `>0` = after a post-fixer validation pass), `scope`, `test_surface_policy`, `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, `timestamp`; never read for pipeline decisions |
 | `testability_gaps` | `list[dict]` | TestWriterAgent | Structured audit signal for behaviour the test writer could not safely cover within the configured test surface. Entries include `source`, `step`, `build_iteration`, optional `scope`, `message`, `timestamp`, and optional parsed `target`, `reason`, `recommended_action`, and `risk`. Default policy is warning-only; `test_writer.testability_gap_policy: fail` turns reported gaps into task failures. |
-| `fix_cycle_records` | `list[dict]` | FixerAgent | Structured observability — one entry per fixer invocation after a failed sync/build/test/check attempt: `build_iteration` (globally unique, never resets), `step`, `scope`, `errors_before` snapshot (build/test/check), `fixer_prompt`, `fixer_output` (`None` on exception), `files_written`, optional `triage_scope` (`test_failure` or `test_origin_validation`), optional `triage_pass` (`test_only`, `test_only_retry`, or `production_confirmed`), optional `confirmed_test_failure_triage`, optional `scope_recovery`, optional `test_only_scope_violation` restore audit, `timestamp`; never read for pipeline decisions |
+| `fix_cycle_records` | `list[dict]` | FixerAgent | Structured observability — one entry per fixer invocation after a failed sync/build/test/check attempt: `build_iteration` (globally unique, never resets), `step`, `scope`, `errors_before` snapshot (sync/build/test/check), `fixer_prompt`, `fixer_output` (`None` on exception), `files_written`, optional `triage_scope` (`test_failure` or `test_origin_validation`), optional `triage_pass` (`test_only`, `test_only_retry`, or `production_confirmed`), optional `confirmed_test_failure_triage`, optional `scope_recovery`, optional `test_only_scope_violation` restore audit, `timestamp`; never read for pipeline decisions |
 | `validation_cycle_records` | `list[dict]` | Orchestrator | Structured observability — one entry per presync/sync/build/test/check outcome with `phase`, `status`, `build_iteration`, `step`, `timestamp`, optional `scope`, optional `elapsed_s`, optional `check_name`, and diagnostic `error_excerpt` plus high-signal `diagnostic_summary` lines on failure; excerpts preserve failure-marker blocks from long tool output instead of storing only the final tail, while summaries highlight shortened compiler locations, failed tests, sanitized assertion failures, and linter rules for terminal audit output sampled across failed validation attempts without echoing source-code frames, assertion values, quoted literal payloads, secret-looking key/value tokens, or absolute path prefixes; never read for pipeline decisions |
-| `validation_artifact_records` | `list[dict]` | Orchestrator | Structured observability for unexpected non-ignored repository changes produced by build/test/check validation commands. Each record stores `phase`, `status` (`cleaned` or `cleanup_failed`), `build_iteration`, `step`, optional `scope`, optional `check_name`, and changed paths with before/after status. Cleanup success allows validation to continue; cleanup failure is treated as that validation phase failing. |
+| `validation_artifact_records` | `list[dict]` | Orchestrator | Structured observability for unexpected non-ignored repository changes produced by sync/build/test/check validation commands, plus sync outputs that cannot be adopted safely. Each record stores `phase`, `status` (`cleaned`, `blocked`, or `cleanup_failed`), `build_iteration`, `step`, optional `scope`, optional `check_name`, and changed paths with before/after status. Cleanup success allows validation to continue for unexpected artifacts; cleanup failure, or a blocked sync output such as an adoptable file outside `project.root_path`, is treated as that validation phase failing. |
 | `active_operation` | `dict \| None` | Orchestrator | Current long-running operation heartbeat for status visibility while an agent or validation command is blocked. Contains `phase`, optional `agent`, optional `scope`, `started_at`, `last_heartbeat_at`, `heartbeat_count`, optional `heartbeat_interval_seconds`, and optional `message`. Cleared when the operation completes; never drives pipeline decisions. |
 | `test_files_written` | `list[str]` | TestWriterAgent | Cumulative list of all files written by the test writer agent across all runs; never cleared; passed to ReviewerAgent so it does not flag those files as implementer scope violations. In normal `sikula run`, these files are not reviewer-owned output; in `sikula review`, changed test files are reviewed as branch output. |
 | `fixer_changed_code` | `bool` | Orchestrator | Set True when FixerAgent writes files; used on resume to continue deterministic build/test/check validation before stale semantic gates rerun; cleared after the following compile check succeeds |
@@ -1067,6 +1085,7 @@ return `ToolResult`.
 | `run_tests()` | Run the project unit test suite | `./gradlew <build.test_task>` — task is configurable per project (see below) |
 | `run_check(name, task_config)` | Run a named quality check (lint, detekt, …). `task_config` is the opaque dict from `build.checks[i]` in the project YAML — the orchestrator passes it through unchanged; each BuildTool subclass interprets it. | `task_config["command"]` is the shell command to run (falls back to `name` if absent). `task_config["timeout"]` overrides the compile timeout. Uses `_run_shell()` — identical interface to PythonTool. |
 | `is_build_config_file(path)` | True if the file affects the build graph | `*.gradle`, `*.gradle.kts`, `*.properties`, `*.toml`, `gradle/`, `buildSrc/`, `build-logic/` |
+| `is_sync_adoptable_file(path)` | True if `sync()` may intentionally update this source-controlled project-relative path and the final branch diff should include it. Default returns `False`; platform subclasses only classify paths, while the orchestrator owns adoption, cleanup, audit records, and stale semantic gates. | Gradle dependency lock files and verification metadata; other platforms classify their own lockfiles such as `Cargo.lock`, Node package-manager lockfiles, or SwiftPM `Package.resolved`. |
 | `is_test_only_change(path, before, after)` | Optional conservative hook for mixed source/test files during test-failure fixer audit. Default returns `False`; platform subclasses may return `True` only when syntax-aware diff analysis proves the fixer changed test-only code. | Cargo treats edits limited to an already-existing Rust `#[cfg(test)] mod tests` block as test-only. |
 | `env_files()` *(static)* | Filenames of gitignored files that must be present for the build; copied from the original project root to each new worktree. Default returns `[]`. | `["local.properties"]` (SDK path) |
 
@@ -1105,6 +1124,20 @@ Progress settings live under `progress:` in `.sikula/config.yaml`.
 |---|---|---|
 | `heartbeat_interval_seconds` | `60` | Seconds between heartbeat updates; `0` disables the heartbeat |
 
+#### `build` config keys — all BuildTools
+
+All keys live under `build:` in `.sikula/config.yaml`.
+
+`sync_adopt_paths` is supported by all BuildTools. It is a string or list of project-relative
+path patterns for source-controlled files/directories that `sync()` may intentionally update
+and that should be included in the final branch diff. Use it for project-specific generated
+artifacts not covered by a platform default, for example `generated/api/` or
+`schema/generated/**/*.json`. Keep cache and build-output directories gitignored instead.
+
+| Key | Default | Description |
+|---|---|---|
+| `sync_adopt_paths` | `[]` | Additional project-relative paths or glob patterns to adopt after successful `sync()`. Directory patterns ending in `/` include all files below that directory. |
+
 #### `build` config keys — PythonTool (`project.build_tool: python`)
 
 All keys live under `build:` in `.sikula/config.yaml`.
@@ -1122,7 +1155,7 @@ All keys live under `build:` in `.sikula/config.yaml`.
 
 | Key | Default | Description |
 |---|---|---|
-| `sync_command` | lockfile-aware (`cargo fetch --locked` when `Cargo.lock` exists at the Cargo workspace/project root; otherwise `cargo fetch`) | Shell command run by `sync()`. Omit this key to preserve existing lockfiles while keeping library-style projects without committed lockfiles usable. If Cargo reports that the lockfile needs to be updated during the locked default sync, CargoTool retries once with `cargo fetch` and includes retry details in the sync validation record metadata. Explicit `sync_command` values are run exactly as configured and do not get default fallback behavior. Generic sync-artifact review, workspace diff, and finalization policy are deferred to the workspace/platform refactor. |
+| `sync_command` | lockfile-aware (`cargo fetch --locked` when `Cargo.lock` exists at the Cargo workspace/project root; otherwise `cargo fetch`) | Shell command run by `sync()`. Omit this key to preserve existing lockfiles while keeping library-style projects without committed lockfiles usable. If Cargo reports that the lockfile needs to be updated during the locked default sync, CargoTool retries once with `cargo fetch` and includes retry details in the sync validation record metadata. Explicit `sync_command` values are run exactly as configured and do not get default fallback behavior. |
 | `compile_command` | `cargo check` | Shell command run by `compile_check()`. Use `cargo check --workspace` for workspace projects |
 | `test_command` | `cargo test` | Shell command run by `run_tests()`. Use `cargo test --workspace` for workspace projects |
 | `timeout` | `600` | Timeout in seconds for all CargoTool operations (sync, compile, test, check). Rust compilation is slower than interpreted languages — 600 s is a safe default |

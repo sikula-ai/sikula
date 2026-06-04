@@ -284,6 +284,12 @@ class NodeTool(BuildTool):
             or self._is_build_config_dir_path(path_parts)
         )
 
+    def is_sync_adoptable_file(self, path: str) -> bool:
+        p = path.replace("\\", "/")
+        path_parts = tuple(part for part in PurePosixPath(p).parts if part not in {"", ".", "/"})
+        name = path_parts[-1] if path_parts else ""
+        return name in {lockfile for lockfile, _package_manager in _PACKAGE_MANAGER_LOCKFILES}
+
     def _is_build_config_dir_path(self, path_parts: tuple[str, ...]) -> bool:
         for index, part in enumerate(path_parts[:-1]):
             if part == ".yarn":

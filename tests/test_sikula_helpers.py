@@ -395,6 +395,22 @@ class TestGenerateConfig:
         assert "build_tool: TODO" in cfg
         assert 'compile_command: "TODO"' in cfg
 
+    def test_generated_build_sections_include_commented_sync_adopt_paths_hint(self):
+        build_tools = [
+            ("cargo", "Rust"),
+            ("python", "Python"),
+            ("node", "TypeScript"),
+            ("gradle-android", "Kotlin"),
+            ("gradle-jvm", "Kotlin"),
+            ("maven", "Java"),
+            ("xcodebuild", "Swift"),
+            (None, None),
+        ]
+        for build_tool, language in build_tools:
+            cfg = self._cfg(build_tool=build_tool, language=language)
+            assert "# sync_adopt_paths:" in cfg
+            assert "\nsync_adopt_paths:" not in cfg
+
     def test_security_section_present_in_generated_config(self):
         cfg = self._cfg()
         assert "security:" in cfg

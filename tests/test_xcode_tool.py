@@ -339,3 +339,14 @@ class TestXcodeToolIsBuildConfigFile:
         tool = _make_tool(tmp_path)
         assert tool.is_build_config_file("AppDelegate.swift") is False
         assert tool.is_build_config_file("build.gradle") is False
+
+
+class TestXcodeToolIsSyncAdoptableFile:
+    def test_recognizes_package_resolved(self, tmp_path: Path):
+        tool = _make_tool(tmp_path)
+        assert tool.is_sync_adoptable_file("Package.resolved") is True
+        assert tool.is_sync_adoptable_file("App.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved")
+
+    def test_rejects_project_file(self, tmp_path: Path):
+        tool = _make_tool(tmp_path)
+        assert tool.is_sync_adoptable_file("App.xcodeproj/project.pbxproj") is False

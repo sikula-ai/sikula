@@ -981,10 +981,13 @@ def _task_audit_warnings(state) -> list[str]:
     artifacts = getattr(state, "validation_artifact_records", [])
     if artifacts:
         cleaned = sum(1 for record in artifacts if record.get("status") == "cleaned")
+        blocked = sum(1 for record in artifacts if record.get("status") == "blocked")
         cleanup_failed = sum(1 for record in artifacts if record.get("status") == "cleanup_failed")
         details = []
         if cleaned:
             details.append(f"{cleaned} cleaned")
+        if blocked:
+            details.append(f"{blocked} blocked")
         if cleanup_failed:
             details.append(f"{cleanup_failed} cleanup failed")
         suffix = f" ({', '.join(details)})" if details else ""
@@ -1920,6 +1923,12 @@ build:
   compile_command: "cargo check"
   test_command: "cargo test"
   timeout: 600
+  # Optional: adopt project-specific source-controlled files generated or updated by sync().
+  # Platform defaults already cover Cargo.lock.
+  # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
+  # sync_adopt_paths:
+  #   - "src/generated/"
+  #   - "schema/generated/**/*.json"
   checks:
     - name: clippy
       command: "cargo clippy -- -D warnings"
@@ -1935,6 +1944,12 @@ build:
   compile_command: "python3 -m compileall -q ."
   test_command: "python3 -m pytest"
   timeout: 300
+  # Optional: adopt project-specific source-controlled files generated or updated by sync().
+  # PythonTool has no built-in lockfile default, so use this for intentional generated sync outputs.
+  # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
+  # sync_adopt_paths:
+  #   - "src/generated/"
+  #   - "schema/generated/**/*.json"
   checks:
     - name: ruff-check
       command: "python3 -m ruff check ."
@@ -1969,6 +1984,12 @@ build:
 build:
   package_manager: {package_manager}
   sync_command: "{sync_command}"
+  # Optional: adopt project-specific source-controlled files generated or updated by sync().
+  # Platform defaults already cover common package-manager lockfiles.
+  # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
+  # sync_adopt_paths:
+  #   - "src/generated/api/"
+  #   - "schema/generated/**/*.json"
   compile_command: "{compile_command}"
   test_command: "{test_command}"
   sync_timeout: 600
@@ -1991,6 +2012,12 @@ build:
   sync_timeout: 1800
   compile_timeout: 1800
   test_timeout: 1800
+  # Optional: adopt project-specific source-controlled files generated or updated by sync().
+  # Platform defaults already cover common Gradle lock/verification metadata.
+  # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
+  # sync_adopt_paths:
+  #   - "app/src/main/generated/api/"
+  #   - "schema/generated/**/*.json"
 """
     elif build_tool == "gradle-jvm":
         build_section = """\
@@ -2004,6 +2031,12 @@ build:
   compile_timeout: 600
   test_timeout: 600
   sync_timeout: 600
+  # Optional: adopt project-specific source-controlled files generated or updated by sync().
+  # Platform defaults already cover common Gradle lock/verification metadata.
+  # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
+  # sync_adopt_paths:
+  #   - "src/main/generated/api/"
+  #   - "schema/generated/**/*.json"
 """
     elif build_tool == "maven":
         build_section = """\
@@ -2013,6 +2046,12 @@ build:
   compile_timeout: 600
   test_timeout: 600
   sync_timeout: 300
+  # Optional: adopt project-specific source-controlled files generated or updated by sync().
+  # Maven has no built-in lockfile default, so use this for intentional generated sync outputs.
+  # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
+  # sync_adopt_paths:
+  #   - "src/main/generated/api/"
+  #   - "schema/generated/**/*.json"
 """
     elif build_tool == "xcodebuild":
         scheme_val = xcode_scheme if xcode_scheme else "TODO"
@@ -2025,6 +2064,12 @@ build:
   test_destination: "platform=iOS Simulator,OS=latest,name=iPhone 16"
   compile_timeout: 1800
   test_timeout: 1800
+  # Optional: adopt project-specific source-controlled files generated or updated by sync().
+  # Platform defaults already cover SwiftPM Package.resolved.
+  # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
+  # sync_adopt_paths:
+  #   - "Sources/Generated/"
+  #   - "schema/generated/**/*.json"
 """
     else:
         build_section = """\
@@ -2033,6 +2078,11 @@ build:
   compile_command: "TODO"
   test_command: "TODO"
   timeout: 600
+  # Optional: adopt project-specific source-controlled files generated or updated by sync().
+  # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
+  # sync_adopt_paths:
+  #   - "src/generated/"
+  #   - "schema/generated/**/*.json"
 """
 
     platform_line = f"  platform: {platform}\n" if platform else ""

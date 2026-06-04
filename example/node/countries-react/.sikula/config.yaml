@@ -145,6 +145,13 @@ build:
   # Command run by sync() before validation.
   sync_command: "npm ci"
 
+  # Optional: adopt project-specific source-controlled files generated or updated by sync().
+  # Platform defaults already cover common package-manager lockfiles.
+  # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
+  # sync_adopt_paths:
+  #   - "src/generated/api/"
+  #   - "schema/generated/**/*.json"
+
   # Command run by compile_check() in the build/fix loop.
   # For TypeScript projects this should usually be a no-emit type check.
   compile_command: "npm run typecheck"

@@ -333,6 +333,17 @@ class TestCargoToolIsBuildConfigFile:
         assert tool.is_build_config_file("not-Cargo.toml") is False
 
 
+class TestCargoToolIsSyncAdoptableFile:
+    def test_recognizes_cargo_lock(self):
+        tool = _make_tool(Path("."))
+        assert tool.is_sync_adoptable_file("Cargo.lock") is True
+        assert tool.is_sync_adoptable_file("crates/app/Cargo.lock") is True
+
+    def test_rejects_manifest(self):
+        tool = _make_tool(Path("."))
+        assert tool.is_sync_adoptable_file("Cargo.toml") is False
+
+
 class TestCargoToolIsTestOnlyChange:
     def test_allows_changes_inside_existing_cfg_test_module(self):
         tool = _make_tool(Path("."))

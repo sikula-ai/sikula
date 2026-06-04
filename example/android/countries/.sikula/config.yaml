@@ -171,6 +171,13 @@ build:
   compile_timeout: 1800
   test_timeout: 1800
 
+  # Optional: adopt project-specific source-controlled files generated or updated by sync().
+  # Platform defaults already cover common Gradle lock/verification metadata.
+  # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
+  # sync_adopt_paths:
+  #   - "app/src/main/generated/api/"
+  #   - "schema/generated/**/*.json"
+
   # Named quality checks run after tests when run_checks: true.
   # command: shell command to run. Use the full invocation — e.g. "./gradlew lintDebug".
   # fix_command: optional shell command run automatically on failure before the fixer agent.
