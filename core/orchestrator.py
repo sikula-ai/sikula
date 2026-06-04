@@ -36,6 +36,7 @@ import copy
 import fnmatch
 import logging
 import os
+import posixpath
 import subprocess
 import time
 from dataclasses import dataclass
@@ -75,6 +76,40 @@ _FIXER_ERROR_LIMIT = 6000
 _LOG_ERROR_LIMIT = 2000
 _VALIDATION_ARTIFACT_ERROR_LIMIT = 2000
 _VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES = 5
+_TEST_PATH_MARKERS = {
+    "__tests__",
+    "androidtest",
+    "spec",
+    "specs",
+    "test",
+    "testfixtures",
+    "tests",
+    "unittest",
+    "unittests",
+}
+_TEST_FILE_PREFIXES = ("test_", "test-")
+_TEST_FILE_SUFFIXES = (
+    ".spec.js",
+    ".spec.jsx",
+    ".spec.ts",
+    ".spec.tsx",
+    ".test.js",
+    ".test.jsx",
+    ".test.ts",
+    ".test.tsx",
+    "_spec.py",
+    "_test.py",
+    "_tests.py",
+    "Spec.java",
+    "Spec.kt",
+    "Spec.swift",
+    "Test.java",
+    "Test.kt",
+    "Test.swift",
+    "Tests.java",
+    "Tests.kt",
+    "Tests.swift",
+)
 
 
 def _phase_scope_label(state: TaskState) -> str:
@@ -97,6 +132,11 @@ def _build_loop_active_for_current_scope(state: TaskState) -> bool:
     return bool(state.build_loop_key) and state.build_loop_key == _build_loop_key(state)
 
 
+def _build_loop_can_validate(state: TaskState, max_iterations: int) -> bool:
+    attempts_used = _build_loop_attempts_used(state)
+    return attempts_used < max_iterations or (attempts_used == max_iterations and state.fixer_changed_code)
+
+
 def _normalize_artifact_path(path: str) -> str:
     return path.replace("\\", "/").strip().strip("/")
 
@@ -111,6 +151,48 @@ def _path_matches_pattern(path: str, pattern: str) -> bool:
     if directory_pattern:
         return normalized_path == normalized_pattern or normalized_path.startswith(f"{normalized_pattern}/")
     return normalized_path == normalized_pattern or fnmatch.fnmatch(normalized_path, normalized_pattern)
+
+
+def _normalize_project_path(path: str) -> str:
+    normalized = posixpath.normpath(str(path).replace("\\", "/").strip())
+    if normalized in ("", ".") or normalized == ".." or normalized.startswith("../") or posixpath.isabs(normalized):
+        return ""
+    return normalized.strip("/")
+
+
+def _path_is_under_root(path: str, root: str) -> bool:
+    normalized_path = _normalize_project_path(path)
+    normalized_root = _normalize_project_path(root)
+    if not normalized_path or not normalized_root:
+        return False
+    return normalized_path == normalized_root or normalized_path.startswith(f"{normalized_root}/")
+
+
+def _path_parts(path: str) -> list[str]:
+    normalized = _normalize_project_path(path)
+    return [part for part in normalized.split("/") if part]
+
+
+def _is_test_path_marker(part: str) -> bool:
+    lower_part = part.lower()
+    return lower_part in _TEST_PATH_MARKERS or lower_part.endswith(
+        ("test", "tests", "_test", "_tests", "-test", "-tests")
+    )
+
+
+def _path_looks_like_test_artifact(path: str) -> bool:
+    parts = _path_parts(path)
+    if any(_is_test_path_marker(part) for part in parts[:-1]):
+        return True
+    if not parts:
+        return False
+    filename = parts[-1]
+    lower_filename = filename.lower()
+    return (
+        lower_filename.startswith(_TEST_FILE_PREFIXES)
+        or lower_filename.endswith(tuple(suffix.lower() for suffix in _TEST_FILE_SUFFIXES if suffix.startswith((".", "_"))))
+        or filename.endswith(tuple(suffix for suffix in _TEST_FILE_SUFFIXES if suffix[0].isupper()))
+    )
 
 
 @dataclass
@@ -829,14 +911,28 @@ class Orchestrator:
             state.build_loop_start_iteration = state.build_iterations
             self._store.save(state)
 
-        while not state.failed and _build_loop_attempts_used(state) < self._config.max_iterations:
+        while not state.failed and _build_loop_can_validate(state, self._config.max_iterations):
+            validation_only = _build_loop_attempts_used(state) >= self._config.max_iterations
             state.build_iterations += 1
             loop_attempt = _build_loop_attempts_used(state)
-            progress = f"{loop_attempt}/{self._config.max_iterations}"
+            progress = (
+                "final validation"
+                if validation_only
+                else f"{loop_attempt}/{self._config.max_iterations}"
+            )
+            if validation_only:
+                state.record(
+                    "orchestrator",
+                    "final_validation_after_fix",
+                    "running final validation after last fixer change",
+                )
+                self._store.save(state)
 
             if not state.build_synced:
                 log.info(f"--- Phase: sync ({progress}) ---")
                 if not self._sync(state):
+                    if validation_only:
+                        break
                     if not self._run_fix_phase(state, progress):
                         return False
                     self._store.save(state)
@@ -844,6 +940,8 @@ class Orchestrator:
 
             log.info(f"--- Phase: build ({progress}) ---")
             if not self._build(state):
+                if validation_only:
+                    break
                 if not self._run_fix_phase(state, progress):
                     return False
                 self._store.save(state)
@@ -852,6 +950,8 @@ class Orchestrator:
             if self._config.run_tests:
                 log.info(f"--- Phase: test ({progress}) ---")
                 if not self._run_tests(state):
+                    if validation_only:
+                        break
                     if not self._run_fix_phase(state, progress):
                         return False
                     self._store.save(state)
@@ -862,6 +962,8 @@ class Orchestrator:
 
             if self._config.run_checks:
                 if not self._run_checks(state, progress):
+                    if validation_only:
+                        break
                     if not self._run_fix_phase(state, progress):
                         return False
                     self._store.save(state)
@@ -1027,15 +1129,20 @@ class Orchestrator:
         fixer_files = set((fixer_result.data or {}).get("files_written", []))
         self._mark_build_sync_stale_if_needed(fixer_files, "fixer", state)
         if fixer_files:
+            test_only_fix = self._fixer_change_is_test_only(fixer_files)
             self._session_code_changed = True
             state.fixer_changed_code = True
-            state.review_approved = False
-            state.security_approved = False
-            state.review_iterations = 0
-            state.security_review_iterations = 0
-            state.tests_up_to_date = False
-            if state.active_scope == _SCOPE_FINAL_FULL_TASK:
-                state.final_full_task_review_done = False
+            if test_only_fix:
+                paths = ", ".join(sorted(fixer_files))
+                state.record("orchestrator", "test_only_fix", f"semantic gates preserved for test-only fix: {paths}")
+            else:
+                state.review_approved = False
+                state.security_approved = False
+                state.review_iterations = 0
+                state.security_review_iterations = 0
+                state.tests_up_to_date = False
+                if state.active_scope == _SCOPE_FINAL_FULL_TASK:
+                    state.final_full_task_review_done = False
             self._store.save(state)
         return True
 
@@ -1091,6 +1198,37 @@ class Orchestrator:
         if any(build_tool.is_build_config_file(f) for f in files_written):
             log.info("%s changed build-config files — will re-sync before next build", source.capitalize())
             state.build_synced = False
+
+    def _configured_test_write_paths(self) -> list[str]:
+        raw = self._config.project_config.get("sandbox", {}).get("allowed_test_write_paths", [])
+        if isinstance(raw, str):
+            return [raw] if raw.strip() else []
+        if isinstance(raw, list):
+            return [str(item) for item in raw if str(item).strip()]
+        return []
+
+    def _is_configured_test_write_path(self, path: str) -> bool:
+        normalized_path = _normalize_project_path(path)
+        if not normalized_path:
+            return False
+        for raw_root in self._configured_test_write_paths():
+            root = raw_root.replace("\\", "/").strip()
+            if not root or _normalize_project_path(root) == "":
+                continue
+            if any(ch in root for ch in "*?["):
+                if _path_matches_pattern(normalized_path, root):
+                    return True
+                continue
+            if _path_is_under_root(normalized_path, root):
+                return True
+        return False
+
+    def _fixer_change_is_test_only(self, files_written) -> bool:
+        paths = [str(path) for path in files_written if str(path).strip()]
+        return bool(paths) and all(
+            self._is_configured_test_write_path(path) and _path_looks_like_test_artifact(path)
+            for path in paths
+        )
 
     def _configured_sync_adopt_paths(self) -> list[str]:
         raw = self._config.project_config.get("build", {}).get("sync_adopt_paths", [])

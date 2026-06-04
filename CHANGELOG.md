@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Build sync now has platform-neutral adoption and audit for source-controlled generated outputs such as lockfiles and dependency verification metadata: existing tracked sync outputs are added to `files_changed`, semantic review/test gates are invalidated, unexpected non-ignored artifacts are cleaned or fail closed, and project-specific new output patterns can be configured with `build.sync_adopt_paths`.
 
 ### Fixed
+- Test-only fixer changes on recognized test artifact paths now preserve already-approved reviewer, security reviewer, and test-writer gates while still forcing deterministic build/test/check validation, preventing unchanged production diffs from repeatedly triggering new test-writer passes.
+- Build/fix loops now give the last allowed fixer change one final validation-only pass before failing; if that validation still fails, Sikula aborts without starting another fixer attempt.
 - Test-only fixer scope violations are now recoverable: Sikula restores all writes from the violating test-only pass, records the violation for audit, and retries once before failing closed.
 - Analyst outputs that are empty, generic, or meta-completion text are now rejected before
   `implementation_prompt` is stored; Sikula retries analysis once and then fails before

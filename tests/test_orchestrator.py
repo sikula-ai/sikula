@@ -672,6 +672,90 @@ class TestOrchestratorBuildLoop:
         assert result.build_iterations == 2
         assert build.compile_calls == 1
 
+    def test_last_fixer_change_gets_final_validation_chance(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=False,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+            max_iterations=1,
+        )
+        build.compile_results = [False, True]
+
+        def fixer_effect(state: TaskState) -> None:
+            if "src/fix.py" not in state.files_changed:
+                state.files_changed.append("src/fix.py")
+
+        stubs["fixer"].side_effect = fixer_effect
+        self._build_ready(orch)
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert result.build_iterations == 2
+        assert build.compile_calls == 2
+        assert len(stubs["fixer"].calls) == 1
+        assert any(record["action"] == "final_validation_after_fix" for record in result.history)
+
+    def test_final_validation_after_last_fix_does_not_run_fixer_again(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=False,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+            max_iterations=1,
+        )
+        build.compile_results = [False, False]
+
+        def fixer_effect(state: TaskState) -> None:
+            if "src/fix.py" not in state.files_changed:
+                state.files_changed.append("src/fix.py")
+
+        stubs["fixer"].side_effect = fixer_effect
+        self._build_ready(orch)
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed
+        assert result.build_iterations == 2
+        assert build.compile_calls == 2
+        assert len(stubs["fixer"].calls) == 1
+
+    def test_resume_after_last_fix_gets_final_validation_chance(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=False,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+            max_iterations=1,
+        )
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py", "src/fix.py"],
+            build_synced=True,
+            build_iterations=1,
+            build_loop_key="task",
+            build_loop_start_iteration=0,
+            fixer_changed_code=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert result.build_iterations == 2
+        assert build.compile_calls == 1
+        assert len(stubs["fixer"].calls) == 0
+
     def test_sync_skipped_when_already_synced(self, tmp_path: Path):
         orch, _, build = _make_orchestrator(tmp_path, run_build=True)
         self._build_ready(orch)
@@ -1344,6 +1428,187 @@ class TestOrchestratorFixPhase:
         orch.run(task_id="t1")
 
         assert len(stubs["reviewer"].calls) == 0
+
+    def test_test_only_fix_preserves_semantic_gates(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            max_iterations=3,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_results = [False, True]
+
+        def run_tests() -> ToolResult:
+            build.test_calls += 1
+            success = test_results.pop(0)
+            return ToolResult(success=success, output="", error="" if success else "tests failed")
+
+        def fixer_effect(state: TaskState) -> None:
+            if "tests/test_main.py" not in state.files_changed:
+                state.files_changed.append("tests/test_main.py")
+
+        build.run_tests = run_tests  # type: ignore[method-assign]
+        stubs["fixer"].side_effect = fixer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            build_synced=True,
+            review_approved=True,
+            security_approved=True,
+            tests_up_to_date=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert result.review_approved
+        assert result.security_approved
+        assert result.tests_up_to_date
+        assert len(stubs["reviewer"].calls) == 0
+        assert len(stubs["security_reviewer"].calls) == 0
+        assert len(stubs["test_writer"].calls) == 0
+        assert any(record["action"] == "test_only_fix" for record in result.history)
+
+    def test_test_only_fix_with_broad_android_root_requires_test_artifact_path(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            max_iterations=3,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["feature/"]},
+            },
+        )
+        test_results = [False, True]
+
+        def run_tests() -> ToolResult:
+            build.test_calls += 1
+            success = test_results.pop(0)
+            return ToolResult(success=success, output="", error="" if success else "tests failed")
+
+        def fixer_effect(state: TaskState) -> None:
+            path = "feature/countries/src/test/kotlin/com/example/countries/CountriesModuleTest.kt"
+            if path not in state.files_changed:
+                state.files_changed.append(path)
+
+        build.run_tests = run_tests  # type: ignore[method-assign]
+        stubs["fixer"].side_effect = fixer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["feature/countries/src/main/kotlin/com/example/countries/CountriesRoutes.kt"],
+            build_synced=True,
+            review_approved=True,
+            security_approved=True,
+            tests_up_to_date=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert result.review_approved
+        assert result.security_approved
+        assert result.tests_up_to_date
+        assert len(stubs["reviewer"].calls) == 0
+        assert len(stubs["security_reviewer"].calls) == 0
+        assert len(stubs["test_writer"].calls) == 0
+        assert any(record["action"] == "test_only_fix" for record in result.history)
+
+    def test_production_fix_under_broad_test_root_stales_semantic_gates(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            max_iterations=3,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["feature/"]},
+            },
+        )
+        build.compile_results = [False, True]
+
+        def fixer_effect(state: TaskState) -> None:
+            path = "feature/countries/src/main/kotlin/com/example/countries/CountriesRoutes.kt"
+            if path not in state.files_changed:
+                state.files_changed.append(path)
+
+        def test_writer_effect(state: TaskState) -> None:
+            state.tests_up_to_date = True
+
+        stubs["fixer"].side_effect = fixer_effect
+        stubs["test_writer"].side_effect = test_writer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["feature/countries/src/main/kotlin/com/example/countries/CountriesScreen.kt"],
+            build_synced=True,
+            review_approved=True,
+            security_approved=True,
+            tests_up_to_date=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert len(stubs["reviewer"].calls) == 1
+        assert len(stubs["security_reviewer"].calls) == 1
+        assert len(stubs["test_writer"].calls) == 1
+        assert not any(record["action"] == "test_only_fix" for record in result.history)
+
+    def test_mixed_test_and_production_fix_stales_semantic_gates(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            max_iterations=3,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        build.compile_results = [False, True]
+
+        def fixer_effect(state: TaskState) -> None:
+            for path in ["src/fix.py", "tests/test_main.py"]:
+                if path not in state.files_changed:
+                    state.files_changed.append(path)
+
+        def test_writer_effect(state: TaskState) -> None:
+            state.tests_up_to_date = True
+
+        stubs["fixer"].side_effect = fixer_effect
+        stubs["test_writer"].side_effect = test_writer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            build_synced=True,
+            review_approved=True,
+            security_approved=True,
+            tests_up_to_date=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert len(stubs["reviewer"].calls) == 1
+        assert len(stubs["security_reviewer"].calls) == 1
+        assert len(stubs["test_writer"].calls) == 1
+        assert not any(record["action"] == "test_only_fix" for record in result.history)
 
 
 # ---------------------------------------------------------------------------

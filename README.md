@@ -441,7 +441,7 @@ run_build_per_step: false  # build/fix once after all steps (true = after each s
 
 Every `run_*` key (and `build.presync_clean`) can be overridden per-run without editing the YAML. Flag omitted = use config value.
 
-The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or the active build/fix loop reaches `sandbox.max_iterations`. In multi-step runs, `implement → review → security review → test write` runs for each planned step, then a final full-task gate runs before final build/fix validation. After a build/test/check failure, the fixer can iterate directly against deterministic validation; reviewer, security reviewer, and test writer rerun only after build/test/check are green again, and any changes they make are validated by another build/test/check pass. Test failures, and build/check diagnostics that reference only test files or recognized test targets, start with a test-only fixer pass. If that pass reports `production_defect` + `production_code` without changing files, Sikula runs a second production-enabled fixer pass. If a test-only pass writes production files, Sikula restores that attempt's writes and retries the test-only pass once; restore failure or a second scope violation fails the task. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags.
+The full loop: `presync → analyze → plan → implement → review → security review → test write → sync → build → test → checks → fix → ...` until done or the active build/fix loop reaches `sandbox.max_iterations`. If the last allowed fixer attempt writes files, Sikula gives that patch one final validation-only pass; if validation still fails, the task aborts without starting another fixer attempt. In multi-step runs, `implement → review → security review → test write` runs for each planned step, then a final full-task gate runs before final build/fix validation. After a build/test/check failure, the fixer can iterate directly against deterministic validation; reviewer, security reviewer, and test writer rerun only after build/test/check are green again, and any changes they make are validated by another build/test/check pass. If the fixer changes only files under `sandbox.allowed_test_write_paths` that are also recognized test artifacts, Sikula preserves already-approved review/security/test-writer gates and reruns deterministic validation without reopening the test writer for an unchanged production diff. Test failures, and build/check diagnostics that reference only test files or recognized test targets, start with a test-only fixer pass. If that pass reports `production_defect` + `production_code` without changing files, Sikula runs a second production-enabled fixer pass. If a test-only pass writes production files, Sikula restores that attempt's writes and retries the test-only pass once; restore failure or a second scope violation fails the task. Every phase except `analyze` and `implement` is optional — controlled by `run_*` flags.
 
 Long-running phases publish an active-operation heartbeat while they are in progress.
 By default Sikula logs a "Still running" line every 60 seconds and updates task state
@@ -796,7 +796,7 @@ covers files reported by the provider's `run_agent()` result.
 | `allowed_write_paths` | ImplementerAgent, FixerAgent (build errors, production-confirmed test fixes, check errors) | Production source directories agents may write to |
 | `allowed_test_write_paths` | TestWriterAgent, FixerAgent (test-only test-failure pass, production-confirmed test fixes, check errors) | Test source directories; agents may write here when fixing malformed/stale tests or check violations (e.g. detekt) |
 | `allowed_read_paths` | ImplementerAgent, FixerAgent, TestWriterAgent | Directories agents may read from (prompt constraint); `"."` means the entire project root |
-| `max_iterations` | Orchestrator build/fix loop | Max attempts per active build/fix loop before the task is aborted |
+| `max_iterations` | Orchestrator build/fix loop | Max fixer attempts per active build/fix loop before the task is aborted; a last fixer change gets one final validation-only pass |
 | `max_review_iterations` | Orchestrator review loop | Max review+implement-fix cycles before task is aborted |
 | `max_security_review_iterations` | Orchestrator security review loop | Max security-review+fix cycles (independent of `max_review_iterations`); default equals `max_review_iterations` if not set |
 
@@ -888,10 +888,13 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
 - `run_build_per_step: true` also runs build/fix after each planned step. The final
   full-task build/fix loop still runs afterward.
 - Build/test/check failures feed the fixer until validation passes or the active
-  build/fix loop reaches `sandbox.max_iterations`.
-- After fixer changes, stale reviewer, security reviewer, and test-writer gates rerun only
-  once deterministic validation is green again. Any files changed by those gates trigger
-  another validation pass.
+  build/fix loop reaches `sandbox.max_iterations`. A last allowed fixer change
+  gets one final validation-only pass, but no extra fixer attempt.
+- After production-impacting fixer changes, stale reviewer, security reviewer, and
+  test-writer gates rerun only once deterministic validation is green again. Any files
+  changed by those gates trigger another validation pass.
+- Test-only fixer changes, limited to recognized test artifact paths, keep already-approved
+  semantic gates valid while still forcing deterministic validation of the edited tests.
 
 ### Review Pipeline
 
