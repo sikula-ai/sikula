@@ -172,7 +172,7 @@ build:
   test_timeout: 1800
 
   # Optional: adopt project-specific source-controlled files generated or updated by sync().
-  # Platform defaults already cover common Gradle lock/verification metadata.
+  # Platform defaults already cover existing tracked Gradle lock/verification metadata.
   # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
   # sync_adopt_paths:
   #   - "app/src/main/generated/api/"

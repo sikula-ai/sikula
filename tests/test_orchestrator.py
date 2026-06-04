@@ -2734,6 +2734,9 @@ class TestOrchestratorTestsAndSyncFailure:
             run_test_writing=True,
         )
         output = tmp_project / "generated.lock"
+        output.write_text("before sync\n")
+        subprocess.run(["git", "add", "generated.lock"], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add generated lock"], cwd=tmp_project, check=True, capture_output=True)
         build.sync_adoptable_files = {"generated.lock"}
         build.sync_side_effect = lambda: output.write_text("resolved during sync\n")
         stubs["test_writer"].side_effect = lambda state: setattr(state, "tests_up_to_date", True)
@@ -2759,7 +2762,62 @@ class TestOrchestratorTestsAndSyncFailure:
         assert len(stubs["test_writer"].calls) == 1
         sync_records = [record for record in result.validation_cycle_records if record["phase"] == "sync"]
         assert sync_records[-1]["metadata"]["sync_outputs"]["adopted"] == [
-            {"path": "generated.lock", "before_status": "clean", "after_status": "untracked"}
+            {"path": "generated.lock", "before_status": "clean", "after_status": "tracked"}
+        ]
+
+    def test_sync_cleans_brand_new_builtin_lockfile_without_config(self, tmp_project: Path):
+        orch, _, build = _make_orchestrator(
+            tmp_project,
+            run_build=True,
+            run_tests=False,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+        output = tmp_project / "Cargo.lock"
+        build.sync_adoptable_files = {"Cargo.lock"}
+        build.sync_side_effect = lambda: output.write_text("brand-new lockfile from default sync\n")
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=False)
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert not output.exists()
+        assert "Cargo.lock" not in result.files_changed
+        sync_records = [record for record in result.validation_cycle_records if record["phase"] == "sync"]
+        assert sync_records[-1]["metadata"]["sync_outputs"]["cleaned"] == [
+            {"path": "Cargo.lock", "before_status": "clean", "after_status": "untracked"}
+        ]
+
+    def test_sync_adopts_brand_new_builtin_lockfile_when_configured(self, tmp_project: Path):
+        config = {
+            "project": {"build_tool": "python"},
+            "build": {"sync_adopt_paths": ["Cargo.lock"]},
+        }
+        orch, _, build = _make_orchestrator(
+            tmp_project,
+            project_config=config,
+            run_build=True,
+            run_tests=False,
+            run_checks=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+        output = tmp_project / "Cargo.lock"
+        build.sync_adoptable_files = {"Cargo.lock"}
+        build.sync_side_effect = lambda: output.write_text("brand-new lockfile explicitly opted in\n")
+        _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=False)
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert output.exists()
+        assert "Cargo.lock" in result.files_changed
+        sync_records = [record for record in result.validation_cycle_records if record["phase"] == "sync"]
+        assert sync_records[-1]["metadata"]["sync_outputs"]["adopted"] == [
+            {"path": "Cargo.lock", "before_status": "clean", "after_status": "untracked"}
         ]
 
     def test_sync_adopts_outputs_from_configured_patterns(self, tmp_project: Path):
@@ -2825,7 +2883,11 @@ class TestOrchestratorTestsAndSyncFailure:
         project = tmp_project / "app"
         (project / "src").mkdir(parents=True)
         (project / "src" / "main.py").write_text("# app\n")
-        subprocess.run(["git", "add", "app/src/main.py"], cwd=tmp_project, check=True, capture_output=True)
+        output = project / "Cargo.lock"
+        output.write_text("before sync\n")
+        subprocess.run(
+            ["git", "add", "app/src/main.py", "app/Cargo.lock"], cwd=tmp_project, check=True, capture_output=True
+        )
         subprocess.run(["git", "commit", "-m", "add app"], cwd=tmp_project, check=True, capture_output=True)
         orch, _, build = _make_orchestrator(
             project,
@@ -2836,7 +2898,6 @@ class TestOrchestratorTestsAndSyncFailure:
             run_security_review=False,
             run_test_writing=False,
         )
-        output = project / "Cargo.lock"
         build.sync_adoptable_files = {"Cargo.lock"}
         build.sync_side_effect = lambda: output.write_text("resolved during sync\n")
         _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=False)
@@ -2862,9 +2923,12 @@ class TestOrchestratorTestsAndSyncFailure:
             run_test_writing=False,
         )
         build.sync_adoptable_files = {"Cargo.lock"}
+        output = tmp_project / "Cargo.lock"
+        output.write_text("before sync\n")
+        subprocess.run(["git", "add", "Cargo.lock"], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add root lock"], cwd=tmp_project, check=True, capture_output=True)
         state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=False)
         before = orch._validation_artifact_snapshot(state)
-        output = tmp_project / "Cargo.lock"
         output.write_text("resolved outside project root\n")
 
         ok, metadata, error = orch._record_sync_artifact_changes(
@@ -2874,7 +2938,7 @@ class TestOrchestratorTestsAndSyncFailure:
         )
 
         assert not ok
-        assert not output.exists()
+        assert output.read_text() == "before sync\n"
         assert "outside project root" in (error or "")
         assert "Cargo.lock" not in state.files_changed
         assert metadata["outside_project"][0]["path"] == "Cargo.lock"
@@ -2895,10 +2959,17 @@ class TestOrchestratorTestsAndSyncFailure:
             run_test_writing=False,
         )
         build.sync_adoptable_files = {"Cargo.lock", "generated.lock"}
+        inside_output = project / "generated.lock"
+        inside_output.write_text("before sync\n")
+        output = tmp_project / "Cargo.lock"
+        output.write_text("before sync\n")
+        subprocess.run(
+            ["git", "add", "app/generated.lock", "Cargo.lock"], cwd=tmp_project, check=True, capture_output=True
+        )
+        subprocess.run(["git", "commit", "-m", "add sync outputs"], cwd=tmp_project, check=True, capture_output=True)
         state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=False)
         before = orch._validation_artifact_snapshot(state)
-        (project / "generated.lock").write_text("resolved inside project root\n")
-        output = tmp_project / "Cargo.lock"
+        inside_output.write_text("resolved inside project root\n")
         output.write_text("resolved outside project root\n")
 
         ok, metadata, error = orch._record_sync_artifact_changes(
@@ -2909,7 +2980,7 @@ class TestOrchestratorTestsAndSyncFailure:
 
         assert not ok
         assert "outside project root" in (error or "")
-        assert not output.exists()
+        assert output.read_text() == "before sync\n"
         assert "generated.lock" in state.files_changed
         assert metadata["adopted"][0]["path"] == "generated.lock"
         assert metadata["outside_project"][0]["path"] == "Cargo.lock"
@@ -2952,6 +3023,10 @@ class TestOrchestratorTestsAndSyncFailure:
             run_test_writing=True,
         )
         build.sync_adoptable_files = {"generated.lock"}
+        tracked_output = tmp_project / "generated.lock"
+        tracked_output.write_text("before sync\n")
+        subprocess.run(["git", "add", "generated.lock"], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add generated lock"], cwd=tmp_project, check=True, capture_output=True)
         state = _save_state(
             orch,
             implementation_prompt="p",
@@ -2962,7 +3037,7 @@ class TestOrchestratorTestsAndSyncFailure:
             tests_up_to_date=True,
         )
         before = orch._validation_artifact_snapshot(state)
-        (tmp_project / "generated.lock").write_text("resolved during sync\n")
+        tracked_output.write_text("resolved during sync\n")
         (tmp_project / "tmp-sync.log").write_text("cache\n")
         monkeypatch.setattr(
             orchestrator_module,
@@ -2982,9 +3057,7 @@ class TestOrchestratorTestsAndSyncFailure:
         assert not state.review_approved
         assert not state.security_approved
         assert not state.tests_up_to_date
-        assert metadata["adopted"] == [
-            {"path": "generated.lock", "before_status": "clean", "after_status": "untracked"}
-        ]
+        assert metadata["adopted"] == [{"path": "generated.lock", "before_status": "clean", "after_status": "tracked"}]
         assert metadata["cleanup_failed"] == [
             {"path": "tmp-sync.log", "before_status": "clean", "after_status": "untracked"}
         ]
@@ -3004,9 +3077,13 @@ class TestOrchestratorTestsAndSyncFailure:
             run_test_writing=False,
         )
         build.sync_adoptable_files = {"generated.lock"}
+        tracked_output = tmp_project / "generated.lock"
+        tracked_output.write_text("before sync\n")
+        subprocess.run(["git", "add", "generated.lock"], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add generated lock"], cwd=tmp_project, check=True, capture_output=True)
         state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=False)
         before = orch._validation_artifact_snapshot(state)
-        (tmp_project / "generated.lock").write_text("resolved during sync\n")
+        tracked_output.write_text("resolved during sync\n")
         (tmp_project / "tmp-sync.log").write_text("cache\n")
         monkeypatch.setattr(orchestrator_module, "_VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES", 0)
 

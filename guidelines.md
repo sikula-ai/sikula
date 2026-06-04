@@ -315,7 +315,9 @@ Subclass `BuildTool` for platform build systems. Implement all five required met
 Override `generate_sources()` only when `sync()` is too broad for the presync phase.
 Override `env_files()` only when the platform needs gitignored files copied to new worktrees.
 Override `is_sync_adoptable_file()` only to classify source-controlled, project-relative
-outputs that `sync()` may intentionally update and that should be reviewed in the final diff.
+outputs that `sync()` may intentionally update and that should be reviewed in the final diff
+when they already exist as tracked files. Brand-new generated outputs require explicit
+`build.sync_adopt_paths` opt-in.
 Override `is_test_only_change()` only for syntax-aware mixed source/test file detection; the
 default must remain conservative.
 

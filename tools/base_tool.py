@@ -144,9 +144,10 @@ class BuildTool(BaseTool):
         """Return True if sync may intentionally update this source-controlled path.
 
         Sync-adoptable files are generated or resolved by dependency/build tooling
-        but are still expected to be part of the final branch diff, such as lockfiles
-        or dependency verification metadata. The orchestrator owns adoption and
-        review invalidation; platform tools only classify paths.
+        but are still expected to be part of the final branch diff when they already
+        exist as tracked files, such as lockfiles or dependency verification metadata.
+        The orchestrator owns adoption and review invalidation; platform tools only
+        classify paths. Brand-new generated files require explicit project config.
         """
         return False
 

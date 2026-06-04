@@ -147,7 +147,7 @@ build:
   # sync_command: "cargo generate-lockfile"
 
   # Optional: adopt project-specific source-controlled files generated or updated by sync().
-  # Platform defaults already cover Cargo.lock.
+  # Platform defaults already cover existing tracked Cargo.lock.
   # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
   # sync_adopt_paths:
   #   - "src/generated/"

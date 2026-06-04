@@ -1100,10 +1100,16 @@ class Orchestrator:
             return [str(item) for item in raw if str(item).strip()]
         return []
 
-    def _is_sync_adoptable_file(self, build_tool: BuildTool, path: str) -> bool:
-        if build_tool.is_sync_adoptable_file(path):
-            return True
+    def _is_configured_sync_adopt_path(self, path: str) -> bool:
         return any(_path_matches_pattern(path, pattern) for pattern in self._configured_sync_adopt_paths())
+
+    def _is_builtin_sync_adoptable_artifact(self, build_tool: BuildTool, path: str, artifact) -> bool:
+        return artifact.after_status == "tracked" and build_tool.is_sync_adoptable_file(path)
+
+    def _is_sync_adoptable_artifact(self, build_tool: BuildTool, path: str, artifact) -> bool:
+        if self._is_configured_sync_adopt_path(path):
+            return True
+        return self._is_builtin_sync_adoptable_artifact(build_tool, path, artifact)
 
     def _project_relative_artifact_path(self, artifact_root: Path, path: str) -> str | None:
         normalized = _normalize_artifact_path(path)
@@ -1159,7 +1165,7 @@ class Orchestrator:
                     continue
 
                 project_path = self._project_relative_artifact_path(root, artifact.path)
-                if project_path and self._is_sync_adoptable_file(build_tool, project_path):
+                if project_path and self._is_sync_adoptable_artifact(build_tool, project_path, artifact):
                     record = artifact.to_record()
                     record["path"] = project_path
                     adopted_records.append(record)
@@ -1168,7 +1174,7 @@ class Orchestrator:
                 if (
                     project_path is None
                     and artifact.after_status != "clean"
-                    and build_tool.is_sync_adoptable_file(artifact.path)
+                    and self._is_builtin_sync_adoptable_artifact(build_tool, artifact.path, artifact)
                 ):
                     outside_project_artifacts.append(artifact)
                     continue

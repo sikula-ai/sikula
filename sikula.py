@@ -1924,7 +1924,7 @@ build:
   test_command: "cargo test"
   timeout: 600
   # Optional: adopt project-specific source-controlled files generated or updated by sync().
-  # Platform defaults already cover Cargo.lock.
+  # Platform defaults already cover existing tracked Cargo.lock.
   # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
   # sync_adopt_paths:
   #   - "src/generated/"
@@ -1985,7 +1985,7 @@ build:
   package_manager: {package_manager}
   sync_command: "{sync_command}"
   # Optional: adopt project-specific source-controlled files generated or updated by sync().
-  # Platform defaults already cover common package-manager lockfiles.
+  # Platform defaults already cover existing tracked package-manager lockfiles.
   # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
   # sync_adopt_paths:
   #   - "src/generated/api/"
@@ -2013,7 +2013,7 @@ build:
   compile_timeout: 1800
   test_timeout: 1800
   # Optional: adopt project-specific source-controlled files generated or updated by sync().
-  # Platform defaults already cover common Gradle lock/verification metadata.
+  # Platform defaults already cover existing tracked Gradle lock/verification metadata.
   # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
   # sync_adopt_paths:
   #   - "app/src/main/generated/api/"
@@ -2032,7 +2032,7 @@ build:
   test_timeout: 600
   sync_timeout: 600
   # Optional: adopt project-specific source-controlled files generated or updated by sync().
-  # Platform defaults already cover common Gradle lock/verification metadata.
+  # Platform defaults already cover existing tracked Gradle lock/verification metadata.
   # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
   # sync_adopt_paths:
   #   - "src/main/generated/api/"
@@ -2065,7 +2065,7 @@ build:
   compile_timeout: 1800
   test_timeout: 1800
   # Optional: adopt project-specific source-controlled files generated or updated by sync().
-  # Platform defaults already cover SwiftPM Package.resolved.
+  # Platform defaults already cover existing tracked SwiftPM Package.resolved.
   # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
   # sync_adopt_paths:
   #   - "Sources/Generated/"

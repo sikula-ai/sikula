@@ -959,13 +959,14 @@ non-ignored repository snapshot taken before sync with the snapshot after sync. 
 `BuildTool` subclasses classify source-controlled outputs that sync may intentionally update
 through `is_sync_adoptable_file(path)`, for example lockfiles or dependency verification
 metadata. Project configs can add project-relative patterns with `build.sync_adopt_paths`.
-Adopted outputs are appended to `state.files_changed`, included in sync validation metadata,
-and make reviewer, security reviewer, and test-writer approvals stale so the final branch
-output is reviewed after deterministic validation. Paths outside `project.root_path` are not
-adopted into task state; known sync outputs there fail closed after cleanup. Other
-non-ignored sync artifacts are treated like validation artifacts: restore them to the
-pre-sync snapshot, record the cleanup, and fail validation only when cleanup cannot be
-completed.
+Built-in platform classifications adopt only tracked files that already existed before sync;
+brand-new generated outputs require explicit `build.sync_adopt_paths` opt-in. Adopted outputs
+are appended to `state.files_changed`, included in sync validation metadata, and make reviewer,
+security reviewer, and test-writer approvals stale so the final branch output is reviewed
+after deterministic validation. Paths outside `project.root_path` are not adopted into task
+state; known tracked sync outputs there fail closed after cleanup. Other non-ignored sync
+artifacts are treated like validation artifacts: restore them to the pre-sync snapshot, record
+the cleanup, and fail validation only when cleanup cannot be completed.
 
 ---
 
@@ -1085,7 +1086,7 @@ return `ToolResult`.
 | `run_tests()` | Run the project unit test suite | `./gradlew <build.test_task>` — task is configurable per project (see below) |
 | `run_check(name, task_config)` | Run a named quality check (lint, detekt, …). `task_config` is the opaque dict from `build.checks[i]` in the project YAML — the orchestrator passes it through unchanged; each BuildTool subclass interprets it. | `task_config["command"]` is the shell command to run (falls back to `name` if absent). `task_config["timeout"]` overrides the compile timeout. Uses `_run_shell()` — identical interface to PythonTool. |
 | `is_build_config_file(path)` | True if the file affects the build graph | `*.gradle`, `*.gradle.kts`, `*.properties`, `*.toml`, `gradle/`, `buildSrc/`, `build-logic/` |
-| `is_sync_adoptable_file(path)` | True if `sync()` may intentionally update this source-controlled project-relative path and the final branch diff should include it. Default returns `False`; platform subclasses only classify paths, while the orchestrator owns adoption, cleanup, audit records, and stale semantic gates. | Gradle dependency lock files and verification metadata; other platforms classify their own lockfiles such as `Cargo.lock`, Node package-manager lockfiles, or SwiftPM `Package.resolved`. |
+| `is_sync_adoptable_file(path)` | True if `sync()` may intentionally update this source-controlled project-relative path and the final branch diff should include it when the file already exists as a tracked file. Default returns `False`; platform subclasses only classify paths, while the orchestrator owns adoption, cleanup, audit records, and stale semantic gates. Brand-new generated outputs require explicit `build.sync_adopt_paths` opt-in. | Gradle dependency lock files and verification metadata; other platforms classify their own lockfiles such as `Cargo.lock`, Node package-manager lockfiles, or SwiftPM `Package.resolved`. |
 | `is_test_only_change(path, before, after)` | Optional conservative hook for mixed source/test files during test-failure fixer audit. Default returns `False`; platform subclasses may return `True` only when syntax-aware diff analysis proves the fixer changed test-only code. | Cargo treats edits limited to an already-existing Rust `#[cfg(test)] mod tests` block as test-only. |
 | `env_files()` *(static)* | Filenames of gitignored files that must be present for the build; copied from the original project root to each new worktree. Default returns `[]`. | `["local.properties"]` (SDK path) |
 
@@ -1136,7 +1137,7 @@ artifacts not covered by a platform default, for example `generated/api/` or
 
 | Key | Default | Description |
 |---|---|---|
-| `sync_adopt_paths` | `[]` | Additional project-relative paths or glob patterns to adopt after successful `sync()`. Directory patterns ending in `/` include all files below that directory. |
+| `sync_adopt_paths` | `[]` | Additional project-relative paths or glob patterns to adopt after successful `sync()`, including brand-new generated files that are intentionally part of the final diff. Directory patterns ending in `/` include all files below that directory. |
 
 #### `build` config keys — PythonTool (`project.build_tool: python`)
 

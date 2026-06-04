@@ -154,7 +154,7 @@ build:
   test_timeout: 1800
 
   # Optional: adopt project-specific source-controlled files generated or updated by sync().
-  # Platform defaults already cover SwiftPM Package.resolved.
+  # Platform defaults already cover existing tracked SwiftPM Package.resolved.
   # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
   # sync_adopt_paths:
   #   - "Countries/Generated/"
