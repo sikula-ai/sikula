@@ -877,6 +877,12 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
     infrastructure outside that surface. Sikula records reported gaps in
     `state.testability_gaps`; by default they are visible warnings, or blocking failures
     when `test_writer.testability_gap_policy: fail` is configured.
+11. For framework/container wiring such as dependency injection modules, provider trees,
+    route registries, plugin registries, or service containers, does not hand-copy the
+    production registration logic into a local test-only container. It must exercise the
+    real production configuration through existing project-standard helpers, test a stable
+    public seam reached by that wiring, or follow `test_writer.test_surface_policy` when
+    meaningful coverage requires missing infrastructure.
 
 **Output written to state:**
 - `state.tests_up_to_date = True` — set on success regardless of whether files changed
@@ -912,6 +918,8 @@ not trigger another test-writing loop.
 - `state.errors[-3:]` — last three build error blobs (if non-empty, labelled "BUILD ERRORS")
 - `state.test_errors[-3:]` — last three test failure blobs (if non-empty, labelled "TEST FAILURES")
 - `state.check_errors[-3:]` — last three check failure blobs (if non-empty, labelled "CHECK ERRORS")
+- `state.test_files_written` — included for test-failure and test-origin validation prompts
+  so the fixer can distinguish generated tests from pre-existing project tests
 - `state.task_description` — original task (high-level context)
 - `state.implementation_prompt` — analyst's detailed implementation plan (gives fixer intent behind each file change)
 - write-path allowlist from project config — see constraint table above
@@ -941,6 +949,15 @@ attempt to the pre-attempt worktree snapshot, records `test_only_scope_violation
 retries the test-only pass once with explicit recovery context. A restore failure, a second
 test-only scope violation, or a production-confirmed second pass that changes only tests marks
 the task failed before the pipeline can accept the change.
+When the failure is in a file listed in `state.test_files_written`, the fixer prompt includes
+that generated-test context. The fixer may replace or delete such generated tests only when
+they are malformed/stale or depend on unavailable/brittle harness internals and do not encode
+the original task, project guidelines, or a structured contract. It must preserve real
+coverage through a stable-seam replacement when possible, and it must not delete or weaken
+pre-existing tests just to make validation pass. For framework/container wiring tests, it is
+also told not to mirror production registration logic in a local test-only container; it
+should exercise the real production configuration with existing helpers, use a stable public
+seam, or explain the testability gap.
 This audit does not rely only on `allowed_test_write_paths`: when a project uses broad test
 write roots, such as a platform module directory that contains both production and test
 sources, Sikula still treats non-test artifacts under that root as production writes. Build

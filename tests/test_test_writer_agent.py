@@ -299,6 +299,17 @@ class TestTestWriterAgentPrompt:
         assert "Do NOT write brittle tests" in prompt
         assert "opaque view trees" in prompt
 
+    def test_framework_wiring_guard_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state(implementation_prompt="Add dependency injection and route registration")
+        _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "For framework/container wiring" in prompt
+        assert "do not hand-copy production" in prompt
+        assert "Verify the real production" in prompt
+        assert "configuration through existing project-standard helpers" in prompt
+        assert "stable public seam" in prompt
+        assert "brittle framework-internals tests" in prompt
+
     def test_source_inspection_fallback_guard_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state(implementation_prompt="Add navigation contract")
         _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)

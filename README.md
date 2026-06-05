@@ -895,6 +895,11 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
   changed by those gates trigger another validation pass.
 - Test-only fixer changes, limited to recognized test artifact paths, keep already-approved
   semantic gates valid while still forcing deterministic validation of the edited tests.
+- For generated tests, Sikula distinguishes pre-existing tests from files written by the
+  test writer in the current task. Test-origin fixer prompts may replace or delete a
+  malformed generated test only when it does not encode the task/guidelines/structured
+  contract, and the test writer avoids brittle framework/container wiring tests that
+  hand-copy production registration logic into local test-only containers.
 
 ### Review Pipeline
 

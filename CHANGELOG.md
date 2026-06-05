@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 - Test-only fixer changes on recognized test artifact paths now preserve already-approved reviewer, security reviewer, and test-writer gates while still forcing deterministic build/test/check validation, preventing unchanged production diffs from repeatedly triggering new test-writer passes.
 - Build/fix loops now give the last allowed fixer change one final validation-only pass before failing; if that validation still fails, Sikula aborts without starting another fixer attempt.
+- Test writer and fixer prompts now avoid brittle framework/container wiring tests that hand-copy production registrations into local test-only harnesses; test-failure fixer prompts also identify Sikula-generated tests so malformed generated tests can be replaced or removed without weakening pre-existing tests or accepted contracts.
 - Test-only fixer scope violations are now recoverable: Sikula restores all writes from the violating test-only pass, records the violation for audit, and retries once before failing closed.
 - Analyst outputs that are empty, generic, or meta-completion text are now rejected before
   `implementation_prompt` is stored; Sikula retries analysis once and then fails before

@@ -282,6 +282,36 @@ class TestFixerAgentFixCycleRecord:
         assert state.task_description in prompt
         assert "compile error" in prompt
 
+    def test_test_failure_prompt_includes_generated_test_context(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["tests/LoginTest.kt"]
+        stub_llm.agent_output = (
+            "TEST FAILURE TRIAGE:\nclassification: malformed_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["tests/LoginTest.kt failed"]
+        state.test_files_written = ["tests/LoginTest.kt", "tests/AuthTest.kt"]
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+        prompt = state.fix_cycle_records[0]["fixer_prompt"]
+
+        assert "TEST FILES GENERATED OR UPDATED BY SIKULA EARLIER IN THIS TASK:" in prompt
+        assert "tests/LoginTest.kt" in prompt
+        assert "tests/AuthTest.kt" in prompt
+        assert "generated test output from the current task" in prompt
+        assert "malformed or brittle generated harness" in prompt
+
+    def test_build_error_prompt_omits_generated_test_context(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["src/Login.kt"]
+        state = _make_state()
+        state.errors = ["compile error"]
+        state.test_files_written = ["tests/LoginTest.kt"]
+
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        prompt = state.fix_cycle_records[0]["fixer_prompt"]
+
+        assert "TEST FILES GENERATED OR UPDATED BY SIKULA EARLIER IN THIS TASK:" not in prompt
+
     def test_prompt_tells_agent_not_to_manually_edit_lockfiles(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["Cargo.toml"]
         state = _make_state()
@@ -366,6 +396,8 @@ class TestFixerAgentWritePaths:
         assert "test-only triage/fix pass" in prompt
         assert "do not weaken the test" in prompt
         assert "malformed generated test or test harness assumption" in prompt
+        assert "you may replace or delete that generated test" in prompt
+        assert "do not hand-copy production" in prompt
         assert "Treat build files" in prompt
         assert "TEST FAILURE TRIAGE:" in prompt
         assert "classification: production_defect | stale_test | malformed_test | unclear" in prompt
