@@ -260,7 +260,7 @@ Agents mutate `state` in place. The key state fields written by agents:
 | `review_issues` | `ReviewerAgent` | Issue list from last review; cleared on approval |
 | `files_changed` | `ImplementerAgent`, `FixerAgent` | Append-only; never clear outside the orchestrator |
 | `errors`, `test_errors`, `check_errors` | Orchestrator | Cleared by the fixer after a fix pass |
-| `validation_artifact_records` | Orchestrator | Append-only audit of unexpected non-ignored repository changes produced and cleaned during build/test/check validation |
+| `validation_artifact_records` | Orchestrator | Append-only audit of unexpected non-ignored repository changes produced during sync/build/test/check validation, plus sync outputs blocked from safe adoption |
 | `history` | `state.record()` | Append-only audit log; never clear or modify past entries |
 | `done`, `failed` | Orchestrator only | Never set these in an agent |
 
@@ -314,6 +314,10 @@ Subclass `BuildTool` for platform build systems. Implement all five required met
 `sync()`, `compile_check()`, `run_tests()`, `run_check()`, `is_build_config_file()`.
 Override `generate_sources()` only when `sync()` is too broad for the presync phase.
 Override `env_files()` only when the platform needs gitignored files copied to new worktrees.
+Override `is_sync_adoptable_file()` only to classify source-controlled, project-relative
+outputs that `sync()` may intentionally update and that should be reviewed in the final diff
+when they already exist as tracked files. Brand-new generated outputs require explicit
+`build.sync_adopt_paths` opt-in.
 Override `is_test_only_change()` only for syntax-aware mixed source/test file detection; the
 default must remain conservative.
 
@@ -334,6 +338,11 @@ why with an inline comment.
 Keep platform-specific dependency resolution behavior in the relevant `BuildTool`, not in the
 orchestrator. For example, Cargo's default sync may retry `cargo fetch` after a locked fetch
 reports that `Cargo.lock` needs updating, while explicit `build.sync_command` values remain exact.
+Keep sync-output policy platform-neutral: the orchestrator owns repository snapshots,
+cleanup, adoption into `state.files_changed`, audit records, and stale review/security/test
+gates. Platform tools only classify paths such as lockfiles or dependency verification
+metadata through `is_sync_adoptable_file()`; do not put Cargo, Gradle, Node, or Xcode
+path rules in agents or orchestration logic.
 
 On failure, set `ToolResult.error` to the combined stdout+stderr output (not stderr alone) —
 many tools (pytest, cargo test, ruff) write diagnostics to stdout:
@@ -384,7 +393,7 @@ instantiated only there and injected via constructor.
 | `errors`, `test_errors`, `check_errors` | Cleared by the fixer after a fix pass |
 | `history` | Append-only via `state.record()`; never cleared; permanent audit log |
 | `validation_cycle_records` | Append-only via the orchestrator; never used for pipeline control flow |
-| `validation_artifact_records` | Append-only via the orchestrator; records build/test/check artifact cleanup for audit |
+| `validation_artifact_records` | Append-only via the orchestrator; records sync/build/test/check artifact cleanup and blocked sync-output adoption for audit |
 | `done`, `failed` | Set by the orchestrator only; never set in an agent |
 
 ---

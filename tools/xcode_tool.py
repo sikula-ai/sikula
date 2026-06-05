@@ -250,3 +250,6 @@ class XcodeTool(BuildTool):
     def is_build_config_file(self, path: str) -> bool:
         p = Path(path)
         return p.name in _BUILD_CONFIG_FILES or p.suffix in _BUILD_CONFIG_SUFFIXES
+
+    def is_sync_adoptable_file(self, path: str) -> bool:
+        return Path(path).name == "Package.resolved"

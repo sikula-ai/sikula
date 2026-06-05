@@ -11,6 +11,7 @@ from tools.base_tool import BuildTool, Sandbox
 from tools.node_tool import (
     NodeTool,
     _BUILD_CONFIG_FILES,
+    _PACKAGE_MANAGER_LOCKFILES,
     default_node_checks,
     default_node_compile_command,
     default_node_sync_command,
@@ -303,3 +304,15 @@ class TestNodeToolIsBuildConfigFile:
         assert tool.is_build_config_file("src/dispatches/applyPatch.ts") is False
         assert tool.is_build_config_file("src/patches/applyPatch.ts") is False
         assert tool.is_build_config_file("src/yarn.locked.ts") is False
+
+
+class TestNodeToolIsSyncAdoptableFile:
+    @pytest.mark.parametrize("lockfile,package_manager", _PACKAGE_MANAGER_LOCKFILES)
+    def test_recognizes_package_manager_lockfiles(self, lockfile: str, package_manager: str, tmp_path: Path):
+        tool = _make_tool(tmp_path, package_manager=package_manager)
+        assert tool.is_sync_adoptable_file(lockfile) is True
+        assert tool.is_sync_adoptable_file(f"packages/app/{lockfile}") is True
+
+    def test_rejects_package_manifest(self, tmp_path: Path):
+        tool = _make_tool(tmp_path)
+        assert tool.is_sync_adoptable_file("package.json") is False

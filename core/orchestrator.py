@@ -33,6 +33,7 @@ steps complete. If state.plan is empty, a single pass through phases 2-5 is used
 from __future__ import annotations
 
 import copy
+import fnmatch
 import logging
 import os
 import subprocess
@@ -94,6 +95,22 @@ def _build_loop_attempts_used(state: TaskState) -> int:
 
 def _build_loop_active_for_current_scope(state: TaskState) -> bool:
     return bool(state.build_loop_key) and state.build_loop_key == _build_loop_key(state)
+
+
+def _normalize_artifact_path(path: str) -> str:
+    return path.replace("\\", "/").strip().strip("/")
+
+
+def _path_matches_pattern(path: str, pattern: str) -> bool:
+    normalized_path = _normalize_artifact_path(path)
+    raw_pattern = pattern.replace("\\", "/").strip()
+    directory_pattern = raw_pattern.endswith("/")
+    normalized_pattern = raw_pattern.strip("/")
+    if not normalized_path or not normalized_pattern:
+        return False
+    if directory_pattern:
+        return normalized_path == normalized_pattern or normalized_path.startswith(f"{normalized_pattern}/")
+    return normalized_path == normalized_pattern or fnmatch.fnmatch(normalized_path, normalized_pattern)
 
 
 @dataclass
@@ -1075,6 +1092,221 @@ class Orchestrator:
             log.info("%s changed build-config files — will re-sync before next build", source.capitalize())
             state.build_synced = False
 
+    def _configured_sync_adopt_paths(self) -> list[str]:
+        raw = self._config.project_config.get("build", {}).get("sync_adopt_paths", [])
+        if isinstance(raw, str):
+            return [raw] if raw.strip() else []
+        if isinstance(raw, list):
+            return [str(item) for item in raw if str(item).strip()]
+        return []
+
+    def _is_configured_sync_adopt_path(self, path: str) -> bool:
+        return any(_path_matches_pattern(path, pattern) for pattern in self._configured_sync_adopt_paths())
+
+    def _is_builtin_sync_adoptable_artifact(self, build_tool: BuildTool, path: str, artifact) -> bool:
+        return artifact.after_status == "tracked" and build_tool.is_sync_adoptable_file(path)
+
+    def _is_sync_adoptable_artifact(self, build_tool: BuildTool, path: str, artifact) -> bool:
+        if self._is_configured_sync_adopt_path(path):
+            return True
+        return self._is_builtin_sync_adoptable_artifact(build_tool, path, artifact)
+
+    def _project_relative_artifact_path(self, artifact_root: Path, path: str) -> str | None:
+        normalized = _normalize_artifact_path(path)
+        if not normalized:
+            return None
+        artifact_path = artifact_root.joinpath(*Path(normalized).parts).resolve(strict=False)
+        try:
+            relative = artifact_path.relative_to(self._config.project_root.resolve())
+        except (OSError, ValueError):
+            return None
+        relative_text = relative.as_posix()
+        return relative_text if relative_text and relative_text != "." else None
+
+    def _adopt_sync_outputs(self, state: TaskState, artifact_records: list[dict]) -> None:
+        if not artifact_records:
+            return
+        paths = sorted({record["path"] for record in artifact_records})
+        for path in paths:
+            if path not in state.files_changed:
+                state.files_changed.append(path)
+        self._session_code_changed = True
+        state.review_approved = False
+        state.security_approved = False
+        state.review_iterations = 0
+        state.security_review_iterations = 0
+        state.tests_up_to_date = False
+        if state.active_scope == _SCOPE_FINAL_FULL_TASK:
+            state.final_full_task_review_done = False
+        log.info("Build sync adopted reviewable output file(s): %s", ", ".join(paths))
+        state.record("orchestrator", "sync_outputs_adopted", f"{len(paths)} file(s) adopted from build sync")
+
+    def _record_sync_artifact_changes(
+        self,
+        state: TaskState,
+        *,
+        before: dict,
+        adopt_known_outputs: bool,
+    ) -> tuple[bool, dict, str | None]:
+        build_tool: BuildTool = self._tools["build"]
+        cleanup_passes = 0
+        cleaned_records: list[dict] = []
+        root = self._validation_artifact_root(state)
+
+        while True:
+            after = self._validation_artifact_snapshot(state)
+            artifacts = detect_validation_artifacts(before, after)
+            adopted_records = []
+            outside_project_artifacts = []
+            unexpected_artifacts = []
+            for artifact in artifacts:
+                if not adopt_known_outputs or artifact.after_status == "clean":
+                    unexpected_artifacts.append(artifact)
+                    continue
+
+                project_path = self._project_relative_artifact_path(root, artifact.path)
+                if project_path and self._is_sync_adoptable_artifact(build_tool, project_path, artifact):
+                    record = artifact.to_record()
+                    record["path"] = project_path
+                    adopted_records.append(record)
+                    continue
+
+                if (
+                    project_path is None
+                    and artifact.after_status != "clean"
+                    and self._is_builtin_sync_adoptable_artifact(build_tool, artifact.path, artifact)
+                ):
+                    outside_project_artifacts.append(artifact)
+                    continue
+
+                unexpected_artifacts.append(artifact)
+
+            if outside_project_artifacts:
+                artifact_records = [artifact.to_record() for artifact in outside_project_artifacts]
+                cleanup_errors = restore_validation_artifacts(root, before, outside_project_artifacts)
+                error = self._sync_artifact_message(artifact_records).replace(
+                    "unexpected repository artifact(s)",
+                    "adoptable repository output(s) outside project root",
+                    1,
+                )
+                if cleanup_errors:
+                    error += "; cleanup failed: " + "; ".join(cleanup_errors)
+                self._record_sync_artifact_cleanup(
+                    state,
+                    artifact_records=artifact_records,
+                    status="failed" if cleanup_errors else "blocked",
+                    error=error,
+                    cleanup_errors=cleanup_errors or None,
+                )
+                metadata: dict = {"outside_project": artifact_records}
+                if adopted_records:
+                    self._adopt_sync_outputs(state, adopted_records)
+                    metadata["adopted"] = adopted_records
+                metadata["cleanup_failed" if cleanup_errors else "cleaned"] = artifact_records
+                return False, metadata, error
+
+            if not unexpected_artifacts:
+                self._adopt_sync_outputs(state, adopted_records)
+                metadata: dict = {}
+                if adopted_records:
+                    metadata["adopted"] = adopted_records
+                if cleaned_records:
+                    metadata["cleaned"] = cleaned_records
+                return True, metadata, None
+
+            artifact_records = [artifact.to_record() for artifact in unexpected_artifacts]
+            if cleanup_passes >= _VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES:
+                error = (
+                    "sync command produced additional unexpected repository artifact(s) after "
+                    f"{_VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES} cleanup passes"
+                )
+                self._record_sync_artifact_cleanup(
+                    state,
+                    artifact_records=artifact_records,
+                    status="failed",
+                    error=error,
+                )
+                metadata = {"cleanup_failed": artifact_records}
+                if adopted_records:
+                    self._adopt_sync_outputs(state, adopted_records)
+                    metadata["adopted"] = adopted_records
+                return False, metadata, error
+
+            cleanup_passes += 1
+            cleanup_errors = restore_validation_artifacts(root, before, unexpected_artifacts)
+            if cleanup_errors:
+                error = self._sync_artifact_message(artifact_records) + "; cleanup failed: " + "; ".join(cleanup_errors)
+                self._record_sync_artifact_cleanup(
+                    state,
+                    artifact_records=artifact_records,
+                    status="failed",
+                    error=error,
+                    cleanup_errors=cleanup_errors,
+                )
+                metadata = {"cleanup_failed": artifact_records}
+                if adopted_records:
+                    self._adopt_sync_outputs(state, adopted_records)
+                    metadata["adopted"] = adopted_records
+                return False, metadata, error
+
+            cleaned_records.extend(artifact_records)
+            self._record_sync_artifact_cleanup(
+                state,
+                artifact_records=artifact_records,
+                status="cleaned",
+                error=self._sync_artifact_message(artifact_records),
+            )
+
+    def _sync_artifact_message(self, artifact_records: list[dict]) -> str:
+        paths = ", ".join(f"`{record['path']}`" for record in artifact_records[:10])
+        if len(artifact_records) > 10:
+            paths += f", ... ({len(artifact_records)} total)"
+        return f"sync command produced unexpected repository artifact(s): {paths}"
+
+    def _record_sync_artifact_cleanup(
+        self,
+        state: TaskState,
+        *,
+        artifact_records: list[dict],
+        status: str,
+        error: str,
+        cleanup_errors: list[str] | None = None,
+    ) -> None:
+        if status == "cleaned":
+            record_status = "cleaned"
+        elif status == "blocked":
+            record_status = "blocked"
+        else:
+            record_status = "cleanup_failed"
+        record: dict = {
+            "phase": "sync",
+            "status": record_status,
+            "build_iteration": state.build_iterations,
+            "step": state.current_step,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "artifacts": artifact_records,
+        }
+        if state.active_scope:
+            record["scope"] = state.active_scope
+        if cleanup_errors:
+            record["cleanup_errors"] = cleanup_errors
+        state.validation_artifact_records.append(record)
+        if status == "cleaned":
+            log.warning("%s — cleaned automatically", error)
+            state.record("orchestrator", "validation_artifacts_cleaned", error)
+            state.record_validation("validation_artifact", "cleaned", error=error)
+            return
+        if status == "blocked":
+            log.error(error)
+            state.record("orchestrator", "sync_outputs_blocked", error[:500])
+            state.record_validation("validation_artifact", "failed", error=error)
+            self._append_validation_artifact_error(state, "sync", error)
+            return
+        log.error(error)
+        state.record("orchestrator", "validation_artifacts_cleanup_failed", error[:500])
+        state.record_validation("validation_artifact", "failed", error=error)
+        self._append_validation_artifact_error(state, "sync", error)
+
     def _validation_artifact_root(self, state: TaskState) -> Path:
         if state.worktree_base:
             return Path(state.worktree_base).resolve()
@@ -1426,25 +1658,37 @@ class Orchestrator:
     def _sync(self, state: TaskState) -> bool:
         build_tool: BuildTool = self._tools["build"]
         log.info(f"Running build sync ({build_tool.__class__.__name__}.sync()) — this may take a few minutes...")
+        artifact_before = self._validation_artifact_snapshot(state)
         t0 = time.perf_counter()
         with self._active_operation(state, phase="sync", message="Running build sync"):
             result = build_tool.sync()
         elapsed_s = time.perf_counter() - t0
-        if result.success:
+        artifacts_ok, sync_output_metadata, artifact_error = self._record_sync_artifact_changes(
+            state,
+            before=artifact_before,
+            adopt_known_outputs=result.success,
+        )
+        metadata = dict(result.metadata)
+        if sync_output_metadata:
+            metadata["sync_outputs"] = sync_output_metadata
+        sync_success = result.success and artifacts_ok
+        if sync_success:
             state.build_synced = True
             state.record("orchestrator", "sync", "ok", elapsed_s=elapsed_s)
-            state.record_validation("sync", "success", elapsed_s=elapsed_s, metadata=result.metadata)
+            state.record_validation("sync", "success", elapsed_s=elapsed_s, metadata=metadata)
             log.info(f"Build sync OK ({_fmt_elapsed(elapsed_s)})")
         else:
+            error = result.error
+            if artifact_error:
+                error = f"{error}\n{artifact_error}" if error else artifact_error
             state.record("orchestrator", "sync", "failed", elapsed_s=elapsed_s)
-            state.record_validation("sync", "failed", elapsed_s=elapsed_s, error=result.error, metadata=result.metadata)
+            state.record_validation("sync", "failed", elapsed_s=elapsed_s, error=error, metadata=metadata)
             log.error(
-                f"Build sync failed ({_fmt_elapsed(elapsed_s)}):\n"
-                f"{diagnostic_excerpt(result.error, limit=_LOG_ERROR_LIMIT)}"
+                f"Build sync failed ({_fmt_elapsed(elapsed_s)}):\n{diagnostic_excerpt(error, limit=_LOG_ERROR_LIMIT)}"
             )
-            state.errors.append(diagnostic_excerpt(result.error, limit=_FIXER_ERROR_LIMIT))
+            state.errors.append(diagnostic_excerpt(error, limit=_FIXER_ERROR_LIMIT))
         self._store.save(state)
-        return result.success
+        return sync_success
 
     def _build(self, state: TaskState) -> bool:
         build_tool: BuildTool = self._tools["build"]

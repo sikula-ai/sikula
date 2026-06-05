@@ -170,6 +170,27 @@ class TestGradleBaseToolIsBuildConfigFile:
         assert tool.is_build_config_file("gradle\\wrapper\\gradle-wrapper.properties") is True
 
 
+class TestGradleBaseToolIsSyncAdoptableFile:
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "gradle.lockfile",
+            "app/gradle.lockfile",
+            "gradle/dependency-locks/compileClasspath.lockfile",
+            "gradle/verification-metadata.xml",
+            "gradle/verification-keyring.keys",
+        ],
+    )
+    def test_recognizes_gradle_sync_outputs(self, path: str, tmp_path: Path):
+        tool = _make_tool(tmp_path)
+        assert tool.is_sync_adoptable_file(path) is True
+
+    def test_rejects_regular_build_config(self, tmp_path: Path):
+        tool = _make_tool(tmp_path)
+        assert tool.is_sync_adoptable_file("build.gradle.kts") is False
+        assert tool.is_sync_adoptable_file("src/generated.lockfile") is False
+
+
 class TestAndroidGradleToolEnvFiles:
     def test_returns_local_properties(self, tmp_path: Path):
         tool = _make_tool(tmp_path)

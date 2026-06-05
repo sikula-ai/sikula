@@ -344,6 +344,9 @@ class CargoTool(BuildTool):
     def is_build_config_file(self, path: str) -> bool:
         return Path(path).name in _BUILD_CONFIG_FILES
 
+    def is_sync_adoptable_file(self, path: str) -> bool:
+        return Path(path).name == "Cargo.lock"
+
     def is_test_only_change(self, path: str, before: str | None, after: str | None) -> bool:
         if Path(path).suffix != ".rs" or before is None or after is None or before == after:
             return False

@@ -140,6 +140,17 @@ class BuildTool(BaseTool):
         """
         raise NotImplementedError
 
+    def is_sync_adoptable_file(self, path: str) -> bool:
+        """Return True if sync may intentionally update this source-controlled path.
+
+        Sync-adoptable files are generated or resolved by dependency/build tooling
+        but are still expected to be part of the final branch diff when they already
+        exist as tracked files, such as lockfiles or dependency verification metadata.
+        The orchestrator owns adoption and review invalidation; platform tools only
+        classify paths. Brand-new generated files require explicit project config.
+        """
+        return False
+
     def is_test_only_change(self, path: str, before: str | None, after: str | None) -> bool:
         """Return True when a production-looking path contains only test-only edits.
 

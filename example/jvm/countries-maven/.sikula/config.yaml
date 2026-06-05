@@ -148,6 +148,13 @@ build:
   sync_command: "./mvnw dependency:resolve --batch-mode"
   presync_command: "./mvnw generate-sources --batch-mode"
 
+  # Optional: adopt project-specific source-controlled files generated or updated by sync().
+  # Maven has no built-in lockfile default, so use this for intentional generated sync outputs.
+  # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
+  # sync_adopt_paths:
+  #   - "src/main/generated/api/"
+  #   - "schema/generated/**/*.json"
+
   # Run `mvn clean` before presync_command. Slower, but avoids stale generated files.
   presync_clean: true
 

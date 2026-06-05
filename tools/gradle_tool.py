@@ -10,6 +10,12 @@ log = logging.getLogger(__name__)
 
 _BUILD_CONFIG_SUFFIXES = (".gradle", ".gradle.kts", ".properties", ".toml")
 _BUILD_CONFIG_DIRS = ("gradle/", "buildsrc/", "build-logic/")
+_SYNC_ADOPTABLE_FILES = ("gradle.lockfile",)
+_SYNC_ADOPTABLE_PATHS = (
+    "gradle/dependency-locks/",
+    "gradle/verification-metadata.xml",
+    "gradle/verification-keyring.keys",
+)
 
 _DEFAULT_SYNC_TIMEOUT = 1800
 _DEFAULT_COMPILE_TIMEOUT = 1800
@@ -85,3 +91,10 @@ class GradleBaseTool(BuildTool):
     def is_build_config_file(self, path: str) -> bool:
         p = path.replace("\\", "/").lower()
         return any(p.endswith(s) for s in _BUILD_CONFIG_SUFFIXES) or any(d in p for d in _BUILD_CONFIG_DIRS)
+
+    def is_sync_adoptable_file(self, path: str) -> bool:
+        p = path.replace("\\", "/").lower()
+        name = Path(p).name
+        return name in _SYNC_ADOPTABLE_FILES or any(
+            p == adoptable_path or p.startswith(adoptable_path) for adoptable_path in _SYNC_ADOPTABLE_PATHS
+        )

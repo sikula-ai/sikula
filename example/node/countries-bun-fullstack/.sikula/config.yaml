@@ -113,6 +113,13 @@ build:
   # Install dependencies exactly from bun.lock.
   sync_command: "bun install --frozen-lockfile"
 
+  # Optional: adopt project-specific source-controlled files generated or updated by sync().
+  # Platform defaults already cover existing tracked package-manager lockfiles.
+  # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
+  # sync_adopt_paths:
+  #   - "src/generated/api/"
+  #   - "schema/generated/**/*.json"
+
   # TypeScript type checking is the compile gate; bundling runs as a named check below.
   compile_command: "bun run typecheck"
 

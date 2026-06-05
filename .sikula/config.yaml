@@ -135,6 +135,13 @@ build:
   # Timeout in seconds for all PythonTool operations.
   timeout: 300
 
+  # Optional: adopt project-specific source-controlled files generated or updated by sync().
+  # PythonTool has no built-in lockfile default, so use this for intentional generated sync outputs.
+  # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
+  # sync_adopt_paths:
+  #   - "src/generated/"
+  #   - "schema/generated/**/*.json"
+
   # Named quality checks run after tests when run_checks: true.
   # command: shell command to run.
   # fix_command: optional shell command run automatically on failure before the fixer agent.
