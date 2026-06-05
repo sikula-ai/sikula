@@ -190,7 +190,9 @@ def _path_looks_like_test_artifact(path: str) -> bool:
     lower_filename = filename.lower()
     return (
         lower_filename.startswith(_TEST_FILE_PREFIXES)
-        or lower_filename.endswith(tuple(suffix.lower() for suffix in _TEST_FILE_SUFFIXES if suffix.startswith((".", "_"))))
+        or lower_filename.endswith(
+            tuple(suffix.lower() for suffix in _TEST_FILE_SUFFIXES if suffix.startswith((".", "_")))
+        )
         or filename.endswith(tuple(suffix for suffix in _TEST_FILE_SUFFIXES if suffix[0].isupper()))
     )
 
@@ -915,11 +917,7 @@ class Orchestrator:
             validation_only = _build_loop_attempts_used(state) >= self._config.max_iterations
             state.build_iterations += 1
             loop_attempt = _build_loop_attempts_used(state)
-            progress = (
-                "final validation"
-                if validation_only
-                else f"{loop_attempt}/{self._config.max_iterations}"
-            )
+            progress = "final validation" if validation_only else f"{loop_attempt}/{self._config.max_iterations}"
             if validation_only:
                 state.record(
                     "orchestrator",
@@ -1134,7 +1132,15 @@ class Orchestrator:
             state.fixer_changed_code = True
             if test_only_fix:
                 paths = ", ".join(sorted(fixer_files))
-                state.record("orchestrator", "test_only_fix", f"semantic gates preserved for test-only fix: {paths}")
+                state.security_approved = False
+                state.security_review_iterations = 0
+                if state.active_scope == _SCOPE_FINAL_FULL_TASK:
+                    state.final_full_task_review_done = False
+                state.record(
+                    "orchestrator",
+                    "test_only_fix",
+                    f"review/test-writer gates preserved; security review invalidated for test-only fix: {paths}",
+                )
             else:
                 state.review_approved = False
                 state.security_approved = False
@@ -1226,8 +1232,7 @@ class Orchestrator:
     def _fixer_change_is_test_only(self, files_written) -> bool:
         paths = [str(path) for path in files_written if str(path).strip()]
         return bool(paths) and all(
-            self._is_configured_test_write_path(path) and _path_looks_like_test_artifact(path)
-            for path in paths
+            self._is_configured_test_write_path(path) and _path_looks_like_test_artifact(path) for path in paths
         )
 
     def _configured_sync_adopt_paths(self) -> list[str]:

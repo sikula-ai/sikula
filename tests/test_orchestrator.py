@@ -1429,7 +1429,7 @@ class TestOrchestratorFixPhase:
 
         assert len(stubs["reviewer"].calls) == 0
 
-    def test_test_only_fix_preserves_semantic_gates(self, tmp_path: Path):
+    def test_test_only_fix_preserves_review_and_test_writer_gates(self, tmp_path: Path):
         orch, stubs, build = _make_orchestrator(
             tmp_path,
             run_build=True,
@@ -1472,9 +1472,48 @@ class TestOrchestratorFixPhase:
         assert result.security_approved
         assert result.tests_up_to_date
         assert len(stubs["reviewer"].calls) == 0
-        assert len(stubs["security_reviewer"].calls) == 0
+        assert len(stubs["security_reviewer"].calls) == 1
         assert len(stubs["test_writer"].calls) == 0
         assert any(record["action"] == "test_only_fix" for record in result.history)
+
+    def test_final_scope_test_only_fix_resets_final_gate_and_security(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            max_iterations=3,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+
+        def fixer_effect(state: TaskState) -> None:
+            state.files_changed.append("tests/test_main.py")
+
+        stubs["fixer"].side_effect = fixer_effect
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            active_scope="final_full_task",
+            final_full_task_review_done=True,
+            review_approved=True,
+            security_approved=True,
+            security_review_iterations=2,
+            tests_up_to_date=True,
+        )
+
+        assert orch._run_fix_phase(state, "1/3")
+
+        assert state.review_approved
+        assert state.tests_up_to_date
+        assert not state.security_approved
+        assert state.security_review_iterations == 0
+        assert not state.final_full_task_review_done
+        assert any(record["action"] == "test_only_fix" for record in state.history)
 
     def test_test_only_fix_with_broad_android_root_requires_test_artifact_path(self, tmp_path: Path):
         orch, stubs, build = _make_orchestrator(
@@ -1520,7 +1559,7 @@ class TestOrchestratorFixPhase:
         assert result.security_approved
         assert result.tests_up_to_date
         assert len(stubs["reviewer"].calls) == 0
-        assert len(stubs["security_reviewer"].calls) == 0
+        assert len(stubs["security_reviewer"].calls) == 1
         assert len(stubs["test_writer"].calls) == 0
         assert any(record["action"] == "test_only_fix" for record in result.history)
 

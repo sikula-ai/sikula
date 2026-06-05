@@ -278,7 +278,8 @@ Orchestrator.run()
       │        if every changed file is under                 │
       │        sandbox.allowed_test_write_paths and           │
       │        has a recognized test artifact path/name:      │
-      │          preserve review/security/test-writer gates   │
+      │          preserve review/test-writer gates,           │
+      │          invalidate security review                   │
       │        else:                                          │
       │          state.review_approved = False                │
       │          state.security_approved = False              │
@@ -781,12 +782,12 @@ means after reviewer approval; if `run_review: false`, it still runs unless
 
 **Iteration limit:** uses `config.max_security_review_iterations` (independent of `config.max_review_iterations`); timeout sets `state.failed = True`.
 
-**Reset after fixer:** if `FixerAgent` changes production-impacting files,
-`state.security_approved` is reset to `False`. Test-only fixer changes whose reported
-files are all under `sandbox.allowed_test_write_paths` and have recognized test artifact
-paths/names preserve security approval, but still force deterministic validation. After
-production-impacting fixes validate green again, the security review re-runs after the
-review loop.
+**Reset after fixer:** if `FixerAgent` changes production-impacting files or executable test
+artifacts, `state.security_approved` is reset to `False`. Test-only fixer changes whose
+reported files are all under `sandbox.allowed_test_write_paths` and have recognized test
+artifact paths/names preserve reviewer and test-writer approval, but still force deterministic
+validation and a fresh security review before acceptance. After production-impacting fixes
+validate green again, the security review re-runs after the review loop.
 
 ---
 
@@ -1084,7 +1085,7 @@ Sikula processes at once is still unsupported.
 | `active_operation` | `dict \| None` | Orchestrator | Current long-running operation heartbeat for status visibility while an agent or validation command is blocked. Contains `phase`, optional `agent`, optional `scope`, `started_at`, `last_heartbeat_at`, `heartbeat_count`, optional `heartbeat_interval_seconds`, and optional `message`. Cleared when the operation completes; never drives pipeline decisions. |
 | `test_files_written` | `list[str]` | TestWriterAgent | Cumulative list of all files written by the test writer agent across all runs; never cleared; passed to ReviewerAgent so it does not flag those files as implementer scope violations. In normal `sikula run`, these files are not reviewer-owned output; in `sikula review`, changed test files are reviewed as branch output. |
 | `fixer_changed_code` | `bool` | Orchestrator | Set True when FixerAgent writes files; used on resume to continue deterministic build/test/check validation before stale semantic gates rerun; cleared after the following compile check succeeds |
-| `tests_up_to_date` | `bool` | TestWriterAgent / Orchestrator | Set True after test write; reset to False when Fixer changes production-impacting files; preserved for test-only fixer changes on recognized test artifact paths so validation can rerun without redundant test-writer passes |
+| `tests_up_to_date` | `bool` | TestWriterAgent / Orchestrator | Set True after test write; reset to False when Fixer changes production-impacting files; preserved for test-only fixer changes on recognized test artifact paths so validation can rerun without redundant test-writer passes while security review still reruns for the executable test changes |
 | `worktree_path` | `str \| None` | `cmd_run()` / `cmd_review()` in `sikula.py` | Absolute path of the effective project root within the worktree — equals `worktree_base` when `root_path` is itself a git root, or `worktree_base/<rel>` for subdirectory projects; used as `cwd` by all agents; `None` for `--no-isolate` runs |
 | `worktree_base` | `str \| None` | `cmd_run()` / `cmd_review()` in `sikula.py` | Absolute path of the git worktree root (where `git add/commit/worktree remove` run); equals `worktree_path` when project is its own git root; `None` for `--no-isolate` runs |
 | `worktree_branch` | `str \| None` | `cmd_run()` / `cmd_review()` in `sikula.py` | Branch name for the worktree; `sikula/<stem>-<task_id>` for `cmd_run()`; the existing PR branch name for `cmd_review()`; `None` for `--no-isolate` runs |
