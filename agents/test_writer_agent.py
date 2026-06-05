@@ -122,6 +122,13 @@ TESTING RULES:
   helpers. Do NOT write brittle tests that inspect UI framework internals, opaque view trees,
   reflection-only private storage, or component type-name strings unless the existing test
   suite already uses that exact pattern for the same UI framework.
+- For framework/container wiring such as dependency injection modules, provider trees,
+  route registries, plugin registries, or service containers, do not hand-copy production
+  registration logic into a local test-only container. Verify the real production
+  configuration through existing project-standard helpers, or test a stable public seam
+  reached by that wiring. If meaningful wiring coverage would require new infrastructure
+  outside the configured test surface, follow the test surface policy instead of creating
+  brittle framework-internals tests.
 - Map changed behaviour through its production entry points before choosing tests:
   user interaction handlers, API or route handlers, CLI commands, lifecycle hooks,
   callbacks, queue/background job handlers, timers, observers, or equivalent platform

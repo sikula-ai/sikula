@@ -90,6 +90,18 @@ _TEST_ORIGIN_VALIDATION_CONSTRAINT = """\
 - If the failure is caused by a malformed generated test or test harness assumption, fix the
   test or test helper. Do not change production source, build configuration, runtime
   configuration, dependency declarations, or pipeline settings merely to satisfy a malformed test.
+- If the failing file is listed as a test generated or updated by Sikula earlier in this
+  task, you may replace or delete that generated test only when it is malformed/stale,
+  depends on unavailable or brittle framework/test harness internals, and does not encode
+  the original task, project guidelines, or a structured contract. Preserve real coverage
+  by replacing it with a stable-seam test when possible; if no meaningful existing seam
+  exists, explain the testability gap instead. Never delete or weaken pre-existing tests
+  merely to make validation pass.
+- For framework/container wiring such as dependency injection modules, provider trees,
+  route registries, plugin registries, or service containers, do not hand-copy production
+  registration logic into a local test-only container. Prefer exercising the real
+  production configuration through existing helpers; otherwise replace the brittle
+  generated test with stable-seam coverage or explain the gap.
 - If validation reports generated repository artifacts from tests, fix the test harness so it uses
   OS temp storage or project-ignored temp/cache paths and cleans up after itself. Do not add
   production shims or build configuration just to tolerate generated test artifacts.
@@ -120,6 +132,18 @@ _TEST_TEST_CONSTRAINT = """\
   invalid test doubles, or unavailable test APIs), fix the test or test helper. Do not
   change production source, build configuration, runtime configuration, dependency
   declarations, or pipeline settings merely to satisfy a malformed test.
+- If the failing file is listed as a test generated or updated by Sikula earlier in this
+  task, you may replace or delete that generated test only when it is malformed/stale,
+  depends on unavailable or brittle framework/test harness internals, and does not encode
+  the original task, project guidelines, or a structured contract. Preserve real coverage
+  by replacing it with a stable-seam test when possible; if no meaningful existing seam
+  exists, explain the testability gap instead. Never delete or weaken pre-existing tests
+  merely to make validation pass.
+- For framework/container wiring such as dependency injection modules, provider trees,
+  route registries, plugin registries, or service containers, do not hand-copy production
+  registration logic into a local test-only container. Prefer exercising the real
+  production configuration through existing helpers; otherwise replace the brittle
+  generated test with stable-seam coverage or explain the gap.
 - If validation reports generated repository artifacts from tests, fix the test harness so it uses
   OS temp storage or project-ignored temp/cache paths and cleans up after itself. Do not add
   production shims or build configuration just to tolerate generated test artifacts.
@@ -595,6 +619,22 @@ def _errors_section(state: TaskState) -> str:
     return "\n\n".join(sections)
 
 
+def _generated_test_context(state: TaskState) -> str:
+    if not state.test_files_written:
+        return ""
+    files = "\n".join(f"  - {path}" for path in state.test_files_written[:50])
+    if len(state.test_files_written) > 50:
+        files += f"\n  ... ({len(state.test_files_written) - 50} more)"
+    return (
+        "TEST FILES GENERATED OR UPDATED BY SIKULA EARLIER IN THIS TASK:\n"
+        f"{files}\n\n"
+        "These files are generated test output from the current task, not pre-existing "
+        "project tests. If the current failure is in one of these files, preserve any "
+        "real task/guideline/structured-contract coverage, but do not keep repairing a "
+        "malformed or brittle generated harness merely because it exists."
+    )
+
+
 class FixerAgent(BaseAgent):
     name = "fixer"
 
@@ -633,6 +673,9 @@ class FixerAgent(BaseAgent):
         ) -> str:
             allowed_str = ", ".join(allowed_write_paths) if allowed_write_paths else "(not configured)"
             errors_section = _errors_section(state)
+            generated_test_context = _generated_test_context(state) if uses_test_failure_triage else ""
+            if generated_test_context:
+                errors_section += "\n\n" + generated_test_context
             if previous_triage:
                 errors_section += "\n\nCONFIRMED TEST FAILURE TRIAGE:\n" + previous_triage.strip()
             if scope_recovery:

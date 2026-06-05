@@ -274,9 +274,16 @@ Orchestrator.run()
       │                (triggers re-sync next iteration)      │
       │                                                       │
       │      if fixer changed files:                          │
-      │        state.review_approved = False                  │
-      │        state.security_approved = False                │
-      │        state.tests_up_to_date = False                 │
+      │        state.fixer_changed_code = True                │
+      │        if every changed file is under                 │
+      │        sandbox.allowed_test_write_paths and           │
+      │        has a recognized test artifact path/name:      │
+      │          preserve review/test-writer gates,           │
+      │          invalidate security review                   │
+      │        else:                                          │
+      │          state.review_approved = False                │
+      │          state.security_approved = False              │
+      │          state.tests_up_to_date = False               │
       │        continue build/test/check validation first     │
       │                                                       │
       │      after build/test/check are green again:          │
@@ -288,6 +295,9 @@ Orchestrator.run()
       │                                                       │
       │  repeat until state.done or current build/fix loop   │
       │              reaches config.max_iterations            │
+      │  if the last allowed fixer pass changed files:        │
+      │      run one final validation-only pass; failure      │
+      │      aborts without another fixer attempt             │
       └──────────────────────────────────────────────────────┘
 ```
 
@@ -718,12 +728,15 @@ invalid fixtures, or material missing tests may be reported as review issues.
 - Approved: `state.review_approved = True`, `state.review_issues` cleared; output includes a structured verification summary — `Completeness:`, `Correctness:`, and `Callers verified:` lines, each omitted when not applicable — followed by `APPROVED` on its own line; record appended to `state.review_cycle_records` with `approved = True`
 - Issues found: `state.review_issues` populated with structured issue list; `state.review_approved` stays `False`; record appended with `approved = False`
 
-**Re-review after fixer:** if `FixerAgent` changes any file, the orchestrator resets
-`state.review_approved = False` and first reruns deterministic build/test/check
-validation. The review loop reruns after validation is green; if review fixes change
-files, build/test/check validation runs again before the task or step can be accepted.
-In `review --fix`, test-writer changes receive one final validation-only reviewer
-pass; rejection fails the task rather than feeding another fix cycle.
+**Re-review after fixer:** if `FixerAgent` changes production-impacting files, the
+orchestrator resets `state.review_approved = False` and first reruns deterministic
+build/test/check validation. Test-only fixer changes whose reported files are all under
+`sandbox.allowed_test_write_paths` and have recognized test artifact paths/names preserve
+reviewer approval, but still force deterministic validation. The review loop reruns after
+production-impacting fixes once validation is green; if review fixes change files,
+build/test/check validation runs again before the task or step can be accepted. In
+`review --fix`, test-writer changes receive one final validation-only reviewer pass;
+rejection fails the task rather than feeding another fix cycle.
 
 ---
 
@@ -769,17 +782,22 @@ means after reviewer approval; if `run_review: false`, it still runs unless
 
 **Iteration limit:** uses `config.max_security_review_iterations` (independent of `config.max_review_iterations`); timeout sets `state.failed = True`.
 
-**Reset after fixer:** if `FixerAgent` changes any file, `state.security_approved` is reset
-to `False`. After build/test/check validation is green again, the security review re-runs
-after the review loop.
+**Reset after fixer:** if `FixerAgent` changes production-impacting files or executable test
+artifacts, `state.security_approved` is reset to `False`. Test-only fixer changes whose
+reported files are all under `sandbox.allowed_test_write_paths` and have recognized test
+artifact paths/names preserve reviewer and test-writer approval, but still force deterministic
+validation and a fresh security review before acceptance. After production-impacting fixes
+validate green again, the security review re-runs after the review loop.
 
 ---
 
 ### TestWriterAgent (`agents/test_writer_agent.py`)
 
-Runs after the review loop is approved (Phase 4), and again after fixer changes once
-deterministic build/test/check validation is green. Skipped when `run_test_writing: false`
-or `state.tests_up_to_date` is already set.
+Runs after the review loop is approved (Phase 4), and again after production-impacting
+fixer changes once deterministic build/test/check validation is green. Test-only fixer
+changes preserve `state.tests_up_to_date`, so edited tests are validated physically
+without reopening the test writer for an unchanged production diff. Skipped when
+`run_test_writing: false` or `state.tests_up_to_date` is already set.
 
 **Write scope:** the prompt restricts the agent to directories listed under
 `sandbox.allowed_test_write_paths` and explicitly forbids production source edits.
@@ -860,6 +878,12 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
     infrastructure outside that surface. Sikula records reported gaps in
     `state.testability_gaps`; by default they are visible warnings, or blocking failures
     when `test_writer.testability_gap_policy: fail` is configured.
+11. For framework/container wiring such as dependency injection modules, provider trees,
+    route registries, plugin registries, or service containers, does not hand-copy the
+    production registration logic into a local test-only container. It must exercise the
+    real production configuration through existing project-standard helpers, test a stable
+    public seam reached by that wiring, or follow `test_writer.test_surface_policy` when
+    meaningful coverage requires missing infrastructure.
 
 **Output written to state:**
 - `state.tests_up_to_date = True` — set on success regardless of whether files changed
@@ -868,12 +892,15 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
 - `state.test_write_records` — one record appended per invocation with `step`, `build_iteration`, `scope`, `test_surface_policy`, `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, and `timestamp`
 - `state.testability_gaps` — one record per `TESTABILITY GAP` reported by the test writer, with `source`, `step`, `build_iteration`, optional `scope`, the raw gap message, and any parsed `target`, `reason`, `recommended_action`, and `risk` fields. `tests_up_to_date` still becomes `True`; the gap means the test writer did all it safely could for the current diff under the configured test surface, not that full behaviour coverage exists.
 
-**Reset after fixer:** if `FixerAgent` changes any file, the orchestrator resets
-`state.tests_up_to_date = False`. After build/test/check validation is green again,
-the test write phase reruns after review/security gates (only when `run_test_writing: true`).
-If the test writer changes files, build/test/check validation runs again. In `review --fix`,
-test-writer changes are reviewed once as a final validation gate and do not trigger another
-test-writing loop.
+**Reset after fixer:** if `FixerAgent` changes production-impacting files, the
+orchestrator resets `state.tests_up_to_date = False`. Test-only fixer changes whose
+reported files are all under `sandbox.allowed_test_write_paths` and have recognized test
+artifact paths/names preserve `tests_up_to_date`, but the build/test/check loop still
+validates the edited tests. After production-impacting fixes validate green again, the
+test write phase reruns after review/security gates (only when `run_test_writing: true`).
+If the test writer changes files, build/test/check validation runs again. In
+`review --fix`, test-writer changes are reviewed once as a final validation gate and do
+not trigger another test-writing loop.
 
 ---
 
@@ -892,6 +919,8 @@ test-writing loop.
 - `state.errors[-3:]` — last three build error blobs (if non-empty, labelled "BUILD ERRORS")
 - `state.test_errors[-3:]` — last three test failure blobs (if non-empty, labelled "TEST FAILURES")
 - `state.check_errors[-3:]` — last three check failure blobs (if non-empty, labelled "CHECK ERRORS")
+- `state.test_files_written` — included for test-failure and test-origin validation prompts
+  so the fixer can distinguish generated tests from pre-existing project tests
 - `state.task_description` — original task (high-level context)
 - `state.implementation_prompt` — analyst's detailed implementation plan (gives fixer intent behind each file change)
 - write-path allowlist from project config — see constraint table above
@@ -921,6 +950,15 @@ attempt to the pre-attempt worktree snapshot, records `test_only_scope_violation
 retries the test-only pass once with explicit recovery context. A restore failure, a second
 test-only scope violation, or a production-confirmed second pass that changes only tests marks
 the task failed before the pipeline can accept the change.
+When the failure is in a file listed in `state.test_files_written`, the fixer prompt includes
+that generated-test context. The fixer may replace or delete such generated tests only when
+they are malformed/stale or depend on unavailable/brittle harness internals and do not encode
+the original task, project guidelines, or a structured contract. It must preserve real
+coverage through a stable-seam replacement when possible, and it must not delete or weaken
+pre-existing tests just to make validation pass. For framework/container wiring tests, it is
+also told not to mirror production registration logic in a local test-only container; it
+should exercise the real production configuration with existing helpers, use a stable public
+seam, or explain the testability gap.
 This audit does not rely only on `allowed_test_write_paths`: when a project uses broad test
 write roots, such as a platform module directory that contains both production and test
 sources, Sikula still treats non-test artifacts under that root as production writes. Build
@@ -1019,7 +1057,7 @@ Sikula processes at once is still unsupported.
 | `build_synced` | `bool` | Orchestrator | Guards unnecessary re-syncs; reset when build-config files change |
 | `build_iterations` | `int` | Orchestrator | Total build/fix attempts across the task; used as an audit/correlation counter in validation and agent records |
 | `build_loop_key` | `str \| None` | Orchestrator | Active build/fix loop identity (`"task"`, `"step:N"`, or `"final_full_task"`); persisted so resume keeps the same loop budget |
-| `build_loop_start_iteration` | `int` | Orchestrator | Global `build_iterations` value at the start of the active build/fix loop; `config.max_iterations` is enforced relative to this value |
+| `build_loop_start_iteration` | `int` | Orchestrator | Global `build_iterations` value at the start of the active build/fix loop; `config.max_iterations` is enforced relative to this value, with one final validation-only pass allowed when the last fixer attempt wrote files |
 | `build_status` | `str \| None` | Orchestrator | `"success"` or `"failed"` |
 | `test_status` | `str \| None` | Orchestrator | Final test phase outcome: `"success"`, `"failed"`, or `"skipped"`; `None` until the test phase is reached |
 | `check_status` | `str \| None` | Orchestrator | Final configured-check phase outcome: `"success"`, `"failed"`, or `"skipped"`; `None` until the check phase is reached |
@@ -1028,8 +1066,8 @@ Sikula processes at once is still unsupported.
 | `check_errors` | `list[str]` | Orchestrator | Check failure blobs for current fix cycle (from `run_checks` phase); Fixer reads last 3, clears after fix |
 | `review_issues` | `list[str]` | ReviewerAgent | Issue list from last review; cleared on approval; passed to Implementer on fix pass |
 | `review_iterations` | `int` | Orchestrator | Fix attempt counter for the current review cycle (counts completed review→implement pairs); resets to 0 after each fixer pass; guarded by `config.max_review_iterations` |
-| `review_approved` | `bool` | ReviewerAgent / Orchestrator | Set True on approval; reset to False when Fixer changes files |
-| `security_approved` | `bool` | SecurityReviewerAgent / Orchestrator | Set True when security review passes (no blocking issues); reset to False when Fixer changes files or step transitions; guards re-runs |
+| `review_approved` | `bool` | ReviewerAgent / Orchestrator | Set True on approval; reset to False when Fixer changes production-impacting files |
+| `security_approved` | `bool` | SecurityReviewerAgent / Orchestrator | Set True when security review passes (no blocking issues); reset to False when Fixer changes production-impacting files or step transitions; guards re-runs |
 | `security_review_iterations` | `int` | Orchestrator | Security fix attempt counter for the current cycle (counts completed security-review→implement pairs); independent of `review_iterations`; resets to 0 on step transitions and fixer passes; guarded by `config.max_security_review_iterations` |
 | `analyst_warnings` | `list[str]` | AnalystAgent | Warnings produced by the analyst (e.g. ambiguous task scope, missing context); logged for visibility, never block the pipeline |
 | `analyst_retry_records` | `list[dict]` | AnalystAgent | Append-only records for analyst outputs rejected before `implementation_prompt` is stored, including attempt number, reason, whether another retry follows, timestamp, the rejected output, and the retry prompt when another attempt follows. These records are audit-only and never drive pipeline control flow. |
@@ -1047,7 +1085,7 @@ Sikula processes at once is still unsupported.
 | `active_operation` | `dict \| None` | Orchestrator | Current long-running operation heartbeat for status visibility while an agent or validation command is blocked. Contains `phase`, optional `agent`, optional `scope`, `started_at`, `last_heartbeat_at`, `heartbeat_count`, optional `heartbeat_interval_seconds`, and optional `message`. Cleared when the operation completes; never drives pipeline decisions. |
 | `test_files_written` | `list[str]` | TestWriterAgent | Cumulative list of all files written by the test writer agent across all runs; never cleared; passed to ReviewerAgent so it does not flag those files as implementer scope violations. In normal `sikula run`, these files are not reviewer-owned output; in `sikula review`, changed test files are reviewed as branch output. |
 | `fixer_changed_code` | `bool` | Orchestrator | Set True when FixerAgent writes files; used on resume to continue deterministic build/test/check validation before stale semantic gates rerun; cleared after the following compile check succeeds |
-| `tests_up_to_date` | `bool` | TestWriterAgent / Orchestrator | Set True after test write; reset to False when Fixer changes files; after validation is green, guards redundant test-writer re-runs |
+| `tests_up_to_date` | `bool` | TestWriterAgent / Orchestrator | Set True after test write; reset to False when Fixer changes production-impacting files; preserved for test-only fixer changes on recognized test artifact paths so validation can rerun without redundant test-writer passes while security review still reruns for the executable test changes |
 | `worktree_path` | `str \| None` | `cmd_run()` / `cmd_review()` in `sikula.py` | Absolute path of the effective project root within the worktree — equals `worktree_base` when `root_path` is itself a git root, or `worktree_base/<rel>` for subdirectory projects; used as `cwd` by all agents; `None` for `--no-isolate` runs |
 | `worktree_base` | `str \| None` | `cmd_run()` / `cmd_review()` in `sikula.py` | Absolute path of the git worktree root (where `git add/commit/worktree remove` run); equals `worktree_path` when project is its own git root; `None` for `--no-isolate` runs |
 | `worktree_branch` | `str \| None` | `cmd_run()` / `cmd_review()` in `sikula.py` | Branch name for the worktree; `sikula/<stem>-<task_id>` for `cmd_run()`; the existing PR branch name for `cmd_review()`; `None` for `--no-isolate` runs |
