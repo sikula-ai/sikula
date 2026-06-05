@@ -91,6 +91,7 @@ def _final_summary(state: "TaskState") -> dict:
         "test_writer_runs": len(state.test_write_records),
         "testability_gaps_count": len(state.testability_gaps),
         "analyst_retries_count": len(state.analyst_retry_records),
+        "planner_retries_count": len(state.planner_retry_records),
         "llm_retries": sum(1 for entry in state.history if entry.get("action") == "llm_retry"),
         "history_events_count": len(state.history),
         "created_at": state.created_at,
@@ -182,6 +183,7 @@ class TaskState:
         False  # set when fixer writes files; cleared after build validates; guards resume skip condition
     )
     # Structured observability records — one entry per agent invocation; never read for pipeline decisions
+    planner_retry_records: list[dict] = field(default_factory=list)
     implement_cycle_records: list[dict] = field(default_factory=list)
     review_cycle_records: list[dict] = field(default_factory=list)
     security_review_cycle_records: list[dict] = field(default_factory=list)
@@ -251,6 +253,34 @@ class TaskState:
         self.analyst_retry_records.append(entry)
         action = "analyze_retry" if will_retry else "analyze_rejected"
         self.record("analyst", action, reason_excerpt[:500])
+
+    def record_planner_retry(
+        self,
+        attempt: int,
+        reason: str,
+        output: str | None,
+        *,
+        max_steps: int,
+        parsed_step_count: int,
+        will_retry: bool,
+        retry_prompt: str | None = None,
+    ) -> None:
+        reason_excerpt = _short_text(reason, limit=500) or ""
+        entry: dict = {
+            "attempt": attempt,
+            "reason": reason_excerpt,
+            "max_steps": max_steps,
+            "parsed_step_count": parsed_step_count,
+            "will_retry": will_retry,
+            "timestamp": _now(),
+        }
+        if output is not None:
+            entry["output"] = output
+        if retry_prompt is not None:
+            entry["retry_prompt"] = retry_prompt
+        self.planner_retry_records.append(entry)
+        action = "plan_retry" if will_retry else "plan_rejected"
+        self.record("planner", action, reason_excerpt[:500])
 
     def record_testability_gap(
         self,
