@@ -175,8 +175,10 @@ def _path_parts(path: str) -> list[str]:
 
 def _is_test_path_marker(part: str) -> bool:
     lower_part = part.lower()
-    return lower_part in _TEST_PATH_MARKERS or lower_part.endswith(
-        ("test", "tests", "_test", "_tests", "-test", "-tests")
+    return (
+        lower_part in _TEST_PATH_MARKERS
+        or lower_part.endswith(("_test", "_tests", "-test", "-tests"))
+        or part.endswith(("Test", "Tests"))
     )
 
 

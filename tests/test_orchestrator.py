@@ -153,6 +153,18 @@ class RetryReportingAgent:
 # ---------------------------------------------------------------------------
 
 
+class TestPathClassification:
+    def test_test_path_marker_requires_explicit_marker_or_separator(self):
+        assert orchestrator_module._path_looks_like_test_artifact(
+            "feature/countries/src/integrationTest/kotlin/CountriesModule.kt"
+        )
+        assert orchestrator_module._path_looks_like_test_artifact(
+            "feature/countries/src/integration-test/kotlin/CountriesModule.kt"
+        )
+        assert not orchestrator_module._path_looks_like_test_artifact("feature/latest/src/main/App.ts")
+        assert not orchestrator_module._path_looks_like_test_artifact("feature/contest/src/main/App.ts")
+
+
 def _make_orchestrator(
     tmp_path: Path,
     **config_kwargs,
@@ -1592,6 +1604,49 @@ class TestOrchestratorFixPhase:
             orch,
             implementation_prompt="p",
             files_changed=["feature/countries/src/main/kotlin/com/example/countries/CountriesScreen.kt"],
+            build_synced=True,
+            review_approved=True,
+            security_approved=True,
+            tests_up_to_date=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert len(stubs["reviewer"].calls) == 1
+        assert len(stubs["security_reviewer"].calls) == 1
+        assert len(stubs["test_writer"].calls) == 1
+        assert not any(record["action"] == "test_only_fix" for record in result.history)
+
+    def test_production_fix_under_directory_ending_test_does_not_count_as_test_only(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            max_iterations=3,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["feature/"]},
+            },
+        )
+        build.compile_results = [False, True]
+
+        def fixer_effect(state: TaskState) -> None:
+            path = "feature/latest/src/main/App.ts"
+            if path not in state.files_changed:
+                state.files_changed.append(path)
+
+        def test_writer_effect(state: TaskState) -> None:
+            state.tests_up_to_date = True
+
+        stubs["fixer"].side_effect = fixer_effect
+        stubs["test_writer"].side_effect = test_writer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["feature/latest/src/main/Existing.ts"],
             build_synced=True,
             review_approved=True,
             security_approved=True,
