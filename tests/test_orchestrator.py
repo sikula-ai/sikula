@@ -33,6 +33,8 @@ class StubAgent:
     calls: list = field(default_factory=list)
     side_effect: Callable[[TaskState], None] | None = None
     result_data: dict | None = None  # when set, overrides auto-detected files_written
+    result_success: bool = True
+    result_message: str | None = None
     raise_exception: Exception | None = None
 
     def run(self, state: TaskState) -> AgentResult:
@@ -49,7 +51,7 @@ class StubAgent:
             if self.result_data is not None
             else {"files_written": [f for f in state.files_changed if f not in files_before]}
         )
-        return AgentResult(success=True, message=f"{self.name} ok", data=data)
+        return AgentResult(success=self.result_success, message=self.result_message or f"{self.name} ok", data=data)
 
 
 class StubBuildTool:
@@ -1526,6 +1528,27 @@ class TestOrchestratorFixPhase:
         assert state.security_review_iterations == 0
         assert not state.final_full_task_review_done
         assert any(record["action"] == "test_only_fix" for record in state.history)
+
+    def test_fix_phase_fails_task_when_fixer_result_is_unsuccessful(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_build=True)
+        stubs["fixer"].result_success = False
+        stubs["fixer"].result_message = "Agent made no file changes"
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            errors=["compile failed"],
+        )
+
+        assert not orch._run_fix_phase(state, "1/3")
+
+        assert state.failed
+        assert any(
+            record["agent"] == "orchestrator"
+            and record["action"] == "abort"
+            and "Agent made no file changes" in record["result"]
+            for record in state.history
+        )
 
     def test_test_only_fix_with_broad_android_root_requires_test_artifact_path(self, tmp_path: Path):
         orch, stubs, build = _make_orchestrator(

@@ -1489,18 +1489,23 @@ Retry is implemented by Sikula's built-in CLI-backed providers (`CodexClient`,
 `ClaudeClient`, `GeminiClient`, `OpenCodeClient`), not by the abstract `LLMClient`
 interface itself. Custom providers must implement their own retry policy if they need one.
 
+Provider subprocess output is classified into typed `LLMProviderError` subclasses. Fatal
+provider/account failures such as quota exhaustion (`LLMQuotaExceeded`), authentication
+failure (`LLMAuthError`), and invalid provider/model configuration
+(`LLMConfigurationError`) are not retried. Retryable failures use `LLMTransientError`;
+subprocess timeouts are wrapped as `LLMTimeoutError`.
+
 The built-in providers retry `generate()` and `run_readonly_agent()` through
-`_call_with_retry()` on `RuntimeError` (non-zero CLI exit, provider error, or missing text
-output) and `subprocess.TimeoutExpired`. Up to **4 attempts** total are made, with delays
-of 30 s, 60 s, and 120 s between them (`_RETRY_DELAYS`).
+`_call_with_retry()` only for retryable failures. Up to **4 attempts** total are made, with
+delays of 30 s, 60 s, and 120 s between them (`_RETRY_DELAYS`).
 
 When an agent is run through Sikula's orchestration or report-only review path, each retry
 attempt before the next sleep is appended to `state.history` as `action = "llm_retry"`.
 The entry stores provider, model, operation, attempt number, max attempts, delay, error type,
 and a truncated provider error message.
 
-The built-in providers also retry `run_agent()` on `RuntimeError` and
-`subprocess.TimeoutExpired`, but with an additional safety guard:
+The built-in providers also retry `run_agent()` only for retryable failures, with an
+additional safety guard:
 
 **`run_agent` safety guard:** after each failure the implementation takes a fresh git snapshot.
 If files were changed before the failure, the retry is skipped — running the agent again on a

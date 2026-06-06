@@ -11,7 +11,11 @@ import pytest
 
 from core.llm_client import (
     LLMClient,
+    LLMAuthError,
     LLMConfig,
+    LLMConfigurationError,
+    LLMQuotaExceeded,
+    LLMTransientError,
     _call_with_retry,
     _claude_write_settings,
     _codex_parse_text,
@@ -57,7 +61,7 @@ class TestCallWithRetry:
         assert fn.call_count == 1
 
     def test_retries_on_runtime_error(self):
-        fn = MagicMock(side_effect=[RuntimeError("fail"), RuntimeError("fail"), "ok"])
+        fn = MagicMock(side_effect=[LLMTransientError("fail"), LLMTransientError("fail"), "ok"])
         with patch("core.llm_client.time.sleep"):
             result = _call_with_retry("test", fn)
         assert result == "ok"
@@ -66,7 +70,7 @@ class TestCallWithRetry:
     def test_notifies_retry_observer(self):
         observer = MagicMock()
         cfg = LLMConfig(provider="codex", model="gpt-5.3-codex", retry_observer=observer)
-        fn = MagicMock(side_effect=[RuntimeError("fail"), "ok"])
+        fn = MagicMock(side_effect=[LLMTransientError("fail"), "ok"])
 
         with patch("core.llm_client.time.sleep"):
             result = _call_with_retry("test", fn, cfg, "generate")
@@ -81,12 +85,12 @@ class TestCallWithRetry:
         assert event["max_attempts"] == 4
         assert event["delay_s"] == 30
         assert event["error"] == "fail"
-        assert event["error_type"] == "RuntimeError"
+        assert event["error_type"] == "LLMTransientError"
 
     def test_retry_observer_error_keeps_head_and_tail_when_truncated(self):
         observer = MagicMock()
         cfg = LLMConfig(provider="codex", model="gpt-5.3-codex", retry_observer=observer)
-        fn = MagicMock(side_effect=[RuntimeError("head-" + "x" * 1200 + "-tail-error"), "ok"])
+        fn = MagicMock(side_effect=[LLMTransientError("head-" + "x" * 1200 + "-tail-error"), "ok"])
 
         with patch("core.llm_client.time.sleep"):
             _call_with_retry("test", fn, cfg, "generate")
@@ -117,11 +121,27 @@ class TestCallWithRetry:
         assert fn.call_count == 2
 
     def test_raises_after_all_retries_exhausted(self):
-        fn = MagicMock(side_effect=RuntimeError("always fails"))
+        fn = MagicMock(side_effect=LLMTransientError("always fails"))
         with patch("core.llm_client.time.sleep"):
-            with pytest.raises(RuntimeError, match="always fails"):
+            with pytest.raises(LLMTransientError, match="always fails"):
                 _call_with_retry("test", fn)
         assert fn.call_count == 4  # 1 initial + 3 retries
+
+    def test_does_not_retry_fatal_provider_error(self):
+        fn = MagicMock(side_effect=LLMQuotaExceeded("quota exhausted"))
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            pytest.raises(LLMQuotaExceeded, match="quota exhausted"),
+        ):
+            _call_with_retry("test", fn)
+        assert fn.call_count == 1
+        sleep.assert_not_called()
+
+    def test_does_not_retry_plain_runtime_error(self):
+        fn = MagicMock(side_effect=RuntimeError("not classified"))
+        with pytest.raises(RuntimeError, match="not classified"):
+            _call_with_retry("test", fn)
+        assert fn.call_count == 1
 
     def test_does_not_retry_other_exceptions(self):
         fn = MagicMock(side_effect=ValueError("not retried"))
@@ -250,6 +270,87 @@ class TestOpenCodeClientCommands:
             pytest.raises(RuntimeError, match="bad prompt"),
         ):
             client.run_readonly_agent("prompt", tmp_path)
+
+    def test_readonly_usage_limit_reached_is_fatal_and_not_retried(self, tmp_path: Path):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=1,
+            stdout=self._line(
+                {
+                    "type": "error",
+                    "error": {
+                        "name": "ProviderError",
+                        "data": {
+                            "type": "usage_limit_reached",
+                            "message": "The usage limit has been reached",
+                            "headers": {
+                                "x-codex-credits-balance": "0",
+                                "x-codex-credits-has-credits": "False",
+                            },
+                        },
+                    },
+                }
+            ),
+            stderr="",
+        )
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMQuotaExceeded, match="usage limit"),
+        ):
+            client.run_readonly_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_generate_auth_failure_is_fatal_and_not_retried(self):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=1,
+            stdout=self._line(
+                {"type": "error", "error": {"name": "AuthError", "data": {"message": "not authenticated"}}}
+            ),
+            stderr="",
+        )
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMAuthError, match="not authenticated"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_generate_invalid_model_is_fatal_and_not_retried(self):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/nope"))
+        result = MagicMock(returncode=1, stdout="", stderr="invalid model: openai/nope")
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMConfigurationError, match="invalid model"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_run_agent_transient_error_is_still_retried(self, tmp_path: Path):
+        observer = MagicMock()
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex", retry_observer=observer))
+        failure = MagicMock(returncode=1, stdout="", stderr="temporary upstream error")
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client.subprocess.run", side_effect=[failure, self._run_result()]) as mock_run,
+        ):
+            changed, output = client.run_agent("prompt", tmp_path)
+
+        assert changed == []
+        assert output == "ok"
+        assert mock_run.call_count == 2
+        observer.assert_called_once()
+        assert observer.call_args.args[0]["error_type"] == "LLMTransientError"
 
     def test_readonly_failure_falls_back_to_non_zero_exit(self, tmp_path: Path):
         client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
@@ -563,7 +664,7 @@ class TestCodexClientCommands:
         observer.assert_called_once()
         event = observer.call_args.args[0]
         assert event["operation"] == "run_agent"
-        assert event["error"] == "codex agent error: codex turn failed: policy denied"
+        assert event["error"] == "codex turn failed: policy denied"
 
 
 class TestGeminiParseResponse:

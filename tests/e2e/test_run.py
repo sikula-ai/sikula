@@ -181,6 +181,38 @@ class TestSinglePassRun:
         assert len(state.analyst_retry_records) == 2
         assert any(entry["action"] == "analyze_failed" for entry in state.history)
 
+    def test_build_fixer_no_changes_fails_immediately(self, git_project: Path, fake_llm):
+        fake = fake_llm(agent_responses=[{"src/calculator.py": "def add(a, b):\n    return a +\n"}])
+        cfg = _cfg(git_project)
+        cfg["run_build"] = True
+        cfg["run_review"] = False
+        cfg["run_security_review"] = False
+        cfg["run_tests"] = False
+        cfg["run_checks"] = False
+        cfg["sandbox"]["max_iterations"] = 3
+
+        with patch("core.llm_client.create_llm_client", return_value=fake):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_file=str(_task(git_project, "Break the build."))), cfg)
+
+        assert exc_info.value.code == 1
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.failed is True
+        assert state.done is False
+        assert state.build_iterations == 1
+        assert len(state.fix_cycle_records) == 1
+        assert state.fix_cycle_records[0]["files_written"] == []
+        assert any(
+            entry["action"] == "abort"
+            and "fixer failed" in entry["result"]
+            and "Agent made no file changes" in entry["result"]
+            for entry in state.history
+        )
+
 
 class TestMultiStepRun:
     def test_two_step_plan_completes(self, git_project: Path, fake_llm):

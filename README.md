@@ -979,8 +979,10 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
 - Supported local CLI providers are Codex, Claude, Gemini, and OpenCode.
 - Project-specific `extra_rules` files are supported for reviewer, security reviewer,
   test writer, and planner agents.
-- LLM failures are retried up to four times with backoff. Retry attempts are recorded in
-  task history, and retries stop when partial file changes are detected.
+- Retryable LLM provider failures are retried up to four times with backoff. Retry attempts
+  are recorded in task history, and write-agent retries stop when partial file changes are
+  detected. Fatal provider failures such as quota exhaustion, authentication failure, or
+  invalid provider/model configuration fail the task without retry.
 
 ---
 

@@ -1124,6 +1124,13 @@ class Orchestrator:
         fixer_result = self._run_agent("fixer", state)
         if state.failed:
             return False
+        if not fixer_result.success:
+            msg = f"fixer failed: {fixer_result.message}"
+            log.error(msg)
+            state.record("orchestrator", "abort", msg)
+            state.failed = True
+            self._store.save(state)
+            return False
         # Use files reported by this fixer call — not a set-diff on state.files_changed, which
         # would miss re-edits of files already in the list (skipped by fixer dedup on line 127).
         fixer_files = set((fixer_result.data or {}).get("files_written", []))

@@ -40,6 +40,34 @@ _RETRY_ERROR_HEAD_CHARS = 350
 RetryObserver = Callable[[dict[str, object]], None]
 
 
+class LLMProviderError(RuntimeError):
+    """Base class for LLM provider failures."""
+
+
+class LLMTransientError(LLMProviderError):
+    """Retryable provider failure."""
+
+
+class LLMTimeoutError(LLMTransientError):
+    """Retryable provider timeout."""
+
+
+class LLMFatalError(LLMProviderError):
+    """Non-retryable provider failure."""
+
+
+class LLMQuotaExceeded(LLMFatalError):
+    """Provider account quota, credits, or usage limit is exhausted."""
+
+
+class LLMAuthError(LLMFatalError):
+    """Provider authentication failed."""
+
+
+class LLMConfigurationError(LLMFatalError):
+    """Provider/model configuration is invalid."""
+
+
 @dataclass
 class LLMConfig:
     provider: str = "codex"
@@ -116,14 +144,94 @@ def _notify_retry(
         log.exception("LLM retry observer failed")
 
 
+def _provider_error(provider: str, operation: str, message: str) -> LLMProviderError:
+    """Classify provider output into retryable vs fatal LLM errors."""
+    text = message.strip() or "provider failed"
+    lower = text.lower()
+    prefix = f"{provider} {operation} error: "
+    formatted = text if lower.startswith(f"{provider} ") else f"{prefix}{text}"
+
+    quota_markers = (
+        "usage_limit_reached",
+        "usage limit has been reached",
+        "credits balance: 0",
+        "credits-balance: 0",
+        "x-codex-credits-balance: 0",
+        "credits has credits: false",
+        "credits-has-credits: false",
+        "x-codex-credits-has-credits: false",
+        "quota exceeded",
+        "quota_exceeded",
+        "resource exhausted",
+        "insufficient_quota",
+        "credit balance is too low",
+        "out of credits",
+        "exceeded your current quota",
+    )
+    auth_markers = (
+        "401",
+        "unauthorized",
+        "unauthenticated",
+        "authentication failed",
+        "not authenticated",
+        "no auth",
+        "login required",
+        "not logged in",
+        "api key",
+        "api-key",
+        "apikey",
+        "invalid key",
+        "missing key",
+        "invalid token",
+        "missing token",
+    )
+    config_markers = (
+        "billing disabled",
+        "billing account",
+        "invalid model",
+        "model not supported",
+        "unsupported model",
+        "unknown model",
+        "unknown provider",
+        "provider not found",
+        "invalid provider",
+        "invalid configuration",
+        "configuration error",
+        "not enabled for this account",
+    )
+
+    if any(marker in lower for marker in quota_markers):
+        return LLMQuotaExceeded(formatted)
+    if any(marker in lower for marker in auth_markers):
+        return LLMAuthError(formatted)
+    if any(marker in lower for marker in config_markers):
+        return LLMConfigurationError(formatted)
+    return LLMTransientError(formatted)
+
+
 def _call_with_retry(label: str, fn, config: LLMConfig | None = None, operation: str | None = None):
-    """Call fn() and retry on RuntimeError or TimeoutExpired with exponential backoff."""
+    """Call fn() and retry only retryable LLM failures with exponential backoff."""
     total = len(_RETRY_DELAYS) + 1
     last_exc: Exception | None = None
     for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
         try:
             return fn()
-        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        except subprocess.TimeoutExpired as exc:
+            last_exc = LLMTimeoutError(f"{label} timed out after {exc.timeout}s")
+            if delay is None:
+                break
+            log.warning(
+                "%s failed (attempt %d/%d): %s — retrying in %ds",
+                label,
+                attempt + 1,
+                total,
+                last_exc,
+                delay,
+            )
+            if config is not None:
+                _notify_retry(config, operation or label, attempt + 1, total, delay, last_exc)
+            time.sleep(delay)
+        except LLMTransientError as exc:
             last_exc = exc
             if delay is None:
                 break
@@ -239,7 +347,7 @@ class ClaudeClient(LLMClient):
                 timeout=300,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"claude CLI error: {result.stderr.strip() or 'non-zero exit'}")
+                raise _provider_error("claude", "CLI", result.stderr.strip() or "non-zero exit")
             return result.stdout.strip()
 
         return _call_with_retry("generate", _call, self._config, "generate")
@@ -271,7 +379,7 @@ class ClaudeClient(LLMClient):
             )
             if result.returncode != 0:
                 err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
-                raise RuntimeError(f"claude agent error: {err}")
+                raise _provider_error("claude", "agent", err)
             return result.stdout.strip()
 
         return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
@@ -311,11 +419,27 @@ class ClaudeClient(LLMClient):
                 )
                 if result.returncode != 0:
                     err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
-                    raise RuntimeError(f"claude agent error: {err}")
+                    raise _provider_error("claude", "agent", err)
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
                 return changed, result.stdout.strip()
-            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            except subprocess.TimeoutExpired as exc:
+                last_exc = LLMTimeoutError(f"claude agent timed out after {exc.timeout}s")
+                if delay is None:
+                    break
+                if _git_snapshot(cwd) != before:
+                    log.warning("Agent failed after partial file changes — not retrying")
+                    break
+                log.warning(
+                    "Agent call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1,
+                    total,
+                    last_exc,
+                    delay,
+                )
+                _notify_retry(self._config, "run_agent", attempt + 1, total, delay, last_exc)
+                time.sleep(delay)
+            except LLMTransientError as exc:
                 last_exc = exc
                 if delay is None:
                     break
@@ -412,7 +536,7 @@ def _opencode_parse_text(output: str) -> str:
     """Extract assistant text from opencode --format json NDJSON output.
 
     Each line is a JSON event; text events carry the model's response chunks.
-    Raises RuntimeError if the output contains a session error event.
+    Raises LLMProviderError if the output contains a session error event.
     """
     parts = []
     for line in output.splitlines():
@@ -431,9 +555,12 @@ def _opencode_parse_text(output: str) -> str:
             err = event.get("error", {})
             if isinstance(err, dict):
                 msg = (err.get("data", {}) or {}).get("message") or err.get("name") or str(err)
+                raw = json.dumps(err)
+                if raw not in msg:
+                    msg = f"{msg} {raw}"
             else:
                 msg = str(err)
-            raise RuntimeError(f"opencode error: {msg}")
+            raise _provider_error("opencode", "event", msg)
     return "\n".join(parts)
 
 
@@ -484,10 +611,10 @@ class OpenCodeClient(LLMClient):
                 timeout=300,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"opencode CLI error: {_opencode_error(result)}")
+                raise _provider_error("opencode", "CLI", _opencode_error(result))
             text = _opencode_parse_text(result.stdout)
             if not text:
-                raise RuntimeError("opencode returned no text output")
+                raise LLMTransientError("opencode CLI error: returned no text output")
             return text
 
         return _call_with_retry("generate", _call, self._config, "generate")
@@ -518,10 +645,10 @@ class OpenCodeClient(LLMClient):
                     timeout=self._config.agent_timeout,
                 )
             if result.returncode != 0:
-                raise RuntimeError(f"opencode agent error: {_opencode_error(result)}")
+                raise _provider_error("opencode", "agent", _opencode_error(result))
             text = _opencode_parse_text(result.stdout)
             if not text:
-                raise RuntimeError("opencode returned no text output")
+                raise LLMTransientError("opencode agent error: returned no text output")
             return text
 
         return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
@@ -556,15 +683,31 @@ class OpenCodeClient(LLMClient):
                         timeout=self._config.agent_timeout,
                     )
                 if result.returncode != 0:
-                    raise RuntimeError(f"opencode agent error: {_opencode_error(result)}")
+                    raise _provider_error("opencode", "agent", _opencode_error(result))
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
                 try:
                     text = _opencode_parse_text(result.stdout)
-                except RuntimeError:
+                except LLMProviderError:
                     text = ""
                 return changed, text
-            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            except subprocess.TimeoutExpired as exc:
+                last_exc = LLMTimeoutError(f"opencode agent timed out after {exc.timeout}s")
+                if delay is None:
+                    break
+                if _git_snapshot(cwd) != before:
+                    log.warning("Agent failed after partial file changes — not retrying")
+                    break
+                log.warning(
+                    "Agent call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1,
+                    total,
+                    last_exc,
+                    delay,
+                )
+                _notify_retry(self._config, "run_agent", attempt + 1, total, delay, last_exc)
+                time.sleep(delay)
+            except LLMTransientError as exc:
                 last_exc = exc
                 if delay is None:
                     break
@@ -639,7 +782,7 @@ def _gemini_write_settings(cwd: Path, settings: dict) -> None:
 def _gemini_parse_response(output: str) -> str:
     """Parse JSON output from gemini --output-format json.
 
-    Raises RuntimeError if the response contains an error field.
+    Raises LLMProviderError if the response contains an error field.
     Falls back to returning raw output if JSON parsing fails.
     """
     try:
@@ -649,10 +792,10 @@ def _gemini_parse_response(output: str) -> str:
     if data.get("error"):
         err = data["error"]
         msg = err.get("message") or str(err) if isinstance(err, dict) else str(err)
-        raise RuntimeError(f"gemini error: {msg}")
+        raise _provider_error("gemini", "response", msg)
     text = data.get("response", "").strip()
     if not text:
-        raise RuntimeError("gemini returned no text output")
+        raise LLMTransientError("gemini response error: returned no text output")
     return text
 
 
@@ -691,7 +834,7 @@ class GeminiClient(LLMClient):
                 timeout=300,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"gemini CLI error: {result.stderr.strip() or 'non-zero exit'}")
+                raise _provider_error("gemini", "CLI", result.stderr.strip() or "non-zero exit")
             return _gemini_parse_response(result.stdout)
 
         return _call_with_retry("generate", _call, self._config, "generate")
@@ -710,7 +853,7 @@ class GeminiClient(LLMClient):
             )
             if result.returncode != 0:
                 err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
-                raise RuntimeError(f"gemini agent error: {err}")
+                raise _provider_error("gemini", "agent", err)
             return _gemini_parse_response(result.stdout)
 
         return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
@@ -733,15 +876,31 @@ class GeminiClient(LLMClient):
                 )
                 if result.returncode != 0:
                     err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
-                    raise RuntimeError(f"gemini agent error: {err}")
+                    raise _provider_error("gemini", "agent", err)
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
                 try:
                     text = _gemini_parse_response(result.stdout)
-                except RuntimeError:
+                except LLMProviderError:
                     text = ""
                 return changed, text
-            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            except subprocess.TimeoutExpired as exc:
+                last_exc = LLMTimeoutError(f"gemini agent timed out after {exc.timeout}s")
+                if delay is None:
+                    break
+                if _git_snapshot(cwd) != before:
+                    log.warning("Agent failed after partial file changes — not retrying")
+                    break
+                log.warning(
+                    "Agent call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1,
+                    total,
+                    last_exc,
+                    delay,
+                )
+                _notify_retry(self._config, "run_agent", attempt + 1, total, delay, last_exc)
+                time.sleep(delay)
+            except LLMTransientError as exc:
                 last_exc = exc
                 if delay is None:
                     break
@@ -769,7 +928,7 @@ def _codex_parse_text(output: str) -> str:
     """Extract assistant text from codex exec --json JSONL output.
 
     Collects text from item.completed events (type=agent_message).
-    Raises RuntimeError on error/turn.failed events or when no text was produced.
+    Raises LLMProviderError on error/turn.failed events or when no text was produced.
     """
     parts: list[str] = []
     for line in output.splitlines():
@@ -789,12 +948,12 @@ def _codex_parse_text(output: str) -> str:
                     parts.append(text)
         elif etype == "turn.failed":
             msg = _codex_error_message(event.get("error") or event.get("data") or event)
-            raise RuntimeError(f"codex turn failed: {msg}")
+            raise _provider_error("codex", "turn", f"codex turn failed: {msg}")
         elif etype == "error":
             msg = _codex_error_message(event.get("error") or event.get("message") or event.get("data") or event)
-            raise RuntimeError(f"codex error: {msg}")
+            raise _provider_error("codex", "event", f"codex error: {msg}")
     if not parts:
-        raise RuntimeError("codex returned no text output")
+        raise LLMTransientError("codex output error: returned no text output")
     return "\n".join(parts)
 
 
@@ -838,7 +997,7 @@ def _codex_subprocess_error(result: subprocess.CompletedProcess[str]) -> str:
             _codex_parse_text(stdout)
         except RuntimeError as exc:
             message = str(exc)
-            if message == "codex returned no text output":
+            if "returned no text output" in message:
                 return stdout
             return message
         return stdout
@@ -879,7 +1038,7 @@ class CodexClient(LLMClient):
                 timeout=300,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"codex CLI error: {_codex_subprocess_error(result)}")
+                raise _provider_error("codex", "CLI", _codex_subprocess_error(result))
             return _codex_parse_text(result.stdout)
 
         return _call_with_retry("generate", _call, self._config, "generate")
@@ -896,7 +1055,7 @@ class CodexClient(LLMClient):
                 timeout=self._config.agent_timeout,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"codex agent error: {_codex_subprocess_error(result)}")
+                raise _provider_error("codex", "agent", _codex_subprocess_error(result))
             return _codex_parse_text(result.stdout)
 
         return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
@@ -917,15 +1076,31 @@ class CodexClient(LLMClient):
                     timeout=self._config.agent_timeout,
                 )
                 if result.returncode != 0:
-                    raise RuntimeError(f"codex agent error: {_codex_subprocess_error(result)}")
+                    raise _provider_error("codex", "agent", _codex_subprocess_error(result))
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
                 try:
                     text = _codex_parse_text(result.stdout)
-                except RuntimeError:
+                except LLMProviderError:
                     text = ""
                 return changed, text
-            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            except subprocess.TimeoutExpired as exc:
+                last_exc = LLMTimeoutError(f"codex agent timed out after {exc.timeout}s")
+                if delay is None:
+                    break
+                if _git_snapshot(cwd) != before:
+                    log.warning("Agent failed after partial file changes — not retrying")
+                    break
+                log.warning(
+                    "Agent call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1,
+                    total,
+                    last_exc,
+                    delay,
+                )
+                _notify_retry(self._config, "run_agent", attempt + 1, total, delay, last_exc)
+                time.sleep(delay)
+            except LLMTransientError as exc:
                 last_exc = exc
                 if delay is None:
                     break
