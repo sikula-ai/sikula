@@ -21,8 +21,10 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import subprocess
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -394,7 +396,7 @@ class ClaudeClient(LLMClient):
         last_exc: Exception | None = None
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
             try:
-                result = subprocess.run(
+                result = _run_agent_subprocess_streaming(
                     [
                         "claude",
                         "-p",
@@ -412,10 +414,10 @@ class ClaudeClient(LLMClient):
                         "--allowedTools",
                         "Read,Edit,Write,Bash(grep *),Bash(find *),Bash(ls *),Bash(git rm *),LS,Glob",
                     ],
-                    capture_output=True,
-                    text=True,
                     cwd=cwd,
+                    env=None,
                     timeout=self._config.agent_timeout,
+                    provider="claude",
                 )
                 if result.returncode != 0:
                     err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
@@ -579,6 +581,132 @@ def _opencode_error(result: subprocess.CompletedProcess[str]) -> str:
     return "non-zero exit"
 
 
+def _terminate_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def _run_agent_subprocess_streaming(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None,
+    timeout: int,
+    provider: str,
+    stdin_text: str | None = None,
+    stdout_error_parser: Callable[[str], str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run an agent subprocess while watching output for fatal provider errors."""
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    if stdin_text is not None:
+        process.stdin.write(stdin_text)
+    process.stdin.close()
+
+    lines: queue.Queue[tuple[str, str]] = queue.Queue()
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+
+    def _reader(name: str, stream) -> None:
+        try:
+            for line in stream:
+                lines.put((name, line))
+        finally:
+            stream.close()
+
+    threads = [
+        threading.Thread(target=_reader, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=_reader, args=("stderr", process.stderr), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    deadline = time.monotonic() + timeout
+    while process.poll() is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate_process(process)
+            raise subprocess.TimeoutExpired(cmd, timeout, output="".join(stdout_parts), stderr="".join(stderr_parts))
+        try:
+            name, line = lines.get(timeout=min(0.2, remaining))
+        except queue.Empty:
+            continue
+
+        if name == "stdout":
+            stdout_parts.append(line)
+            if stdout_error_parser is not None:
+                try:
+                    stdout_error_parser(line)
+                except LLMProviderError as exc:
+                    if isinstance(exc, LLMTransientError) and "returned no text output" in str(exc):
+                        continue
+                    _terminate_process(process)
+                    raise exc
+            else:
+                provider_error = _provider_error(provider, "agent", line)
+                if isinstance(provider_error, LLMFatalError):
+                    _terminate_process(process)
+                    raise provider_error
+        else:
+            stderr_parts.append(line)
+            provider_error = _provider_error(provider, "agent", line)
+            if isinstance(provider_error, LLMFatalError):
+                _terminate_process(process)
+                raise provider_error
+
+    for thread in threads:
+        thread.join(timeout=1)
+    while True:
+        try:
+            name, line = lines.get_nowait()
+        except queue.Empty:
+            break
+        if name == "stdout":
+            stdout_parts.append(line)
+        else:
+            stderr_parts.append(line)
+
+    return subprocess.CompletedProcess(cmd, process.returncode or 0, "".join(stdout_parts), "".join(stderr_parts))
+
+
+def _run_opencode_streaming(
+    cmd: list[str],
+    *,
+    prompt: str,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    """Run opencode while watching output for provider errors before process exit."""
+    return _run_agent_subprocess_streaming(
+        cmd,
+        cwd=cwd,
+        env=env,
+        timeout=timeout,
+        provider="opencode",
+        stdin_text=prompt,
+        stdout_error_parser=_opencode_parse_text,
+    )
+
+
 class OpenCodeClient(LLMClient):
     """Calls opencode via the `opencode run` CLI.
 
@@ -662,7 +790,7 @@ class OpenCodeClient(LLMClient):
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
             try:
                 with _opencode_agent_env() as env:
-                    result = subprocess.run(
+                    result = _run_opencode_streaming(
                         [
                             "opencode",
                             "run",
@@ -675,9 +803,7 @@ class OpenCodeClient(LLMClient):
                             "--format",
                             "json",
                         ],
-                        capture_output=True,
-                        input=prompt,
-                        text=True,
+                        prompt=prompt,
                         cwd=cwd,
                         env=env,
                         timeout=self._config.agent_timeout,
@@ -867,12 +993,12 @@ class GeminiClient(LLMClient):
         last_exc: Exception | None = None
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
             try:
-                result = subprocess.run(
+                result = _run_agent_subprocess_streaming(
                     self._cmd(prompt, ["--approval-mode", "yolo"]),
-                    capture_output=True,
-                    text=True,
                     cwd=cwd,
+                    env=None,
                     timeout=self._config.agent_timeout,
+                    provider="gemini",
                 )
                 if result.returncode != 0:
                     err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
@@ -1068,12 +1194,13 @@ class CodexClient(LLMClient):
         last_exc: Exception | None = None
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
             try:
-                result = subprocess.run(
+                result = _run_agent_subprocess_streaming(
                     self._exec_cmd("workspace-write", prompt),
-                    capture_output=True,
-                    text=True,
                     cwd=cwd,
+                    env=None,
                     timeout=self._config.agent_timeout,
+                    provider="codex",
+                    stdout_error_parser=_codex_parse_text,
                 )
                 if result.returncode != 0:
                     raise _provider_error("codex", "agent", _codex_subprocess_error(result))

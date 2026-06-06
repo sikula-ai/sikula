@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
+import subprocess
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -608,6 +611,158 @@ class TestAgentException:
         assert state.failed is True
         actions = [h["action"] for h in state.history]
         assert "error" in actions
+
+    @pytest.mark.parametrize(
+        ("provider", "stdout", "stderr", "expected_message"),
+        [
+            (
+                "opencode",
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "name": "ProviderError",
+                            "data": {
+                                "type": "usage_limit_reached",
+                                "message": "The usage limit has been reached",
+                                "headers": {
+                                    "x-codex-credits-balance": "0",
+                                    "x-codex-credits-has-credits": "False",
+                                },
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                "",
+                "usage limit",
+            ),
+            (
+                "codex",
+                json.dumps({"type": "error", "message": "quota exceeded"}) + "\n",
+                "",
+                "quota exceeded",
+            ),
+            ("claude", "", "not authenticated\n", "not authenticated"),
+            ("gemini", "", "invalid model: gemini/nope\n", "invalid model"),
+        ],
+    )
+    def test_streaming_fatal_provider_error_fails_implementer_without_retry(
+        self,
+        git_project: Path,
+        provider: str,
+        stdout: str,
+        stderr: str,
+        expected_message: str,
+    ):
+        """Full run with real provider clients fails on streamed fatal provider errors."""
+        from core.llm_client import LLMClient as _LLMClient
+        from core.llm_client import ClaudeClient, CodexClient, GeminiClient, OpenCodeClient
+
+        class _PlanningLLM(_LLMClient):
+            def generate(self, system, user):
+                return "SINGLE_PASS"
+
+            def run_readonly_agent(self, prompt, cwd):
+                return _ANALYST_PROMPT
+
+            def run_agent(self, prompt, cwd):
+                raise AssertionError("Only the OpenCode implementer should run as a write agent")
+
+        class _HangingFatalProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stdin = StringIO()
+                self.stdout = StringIO(stdout)
+                self.stderr = StringIO(stderr)
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        processes = []
+        real_popen = subprocess.Popen
+
+        def _popen(*args, **kwargs):
+            cmd = args[0] if args else kwargs.get("args")
+            provider_commands = {
+                "opencode": "opencode",
+                "codex": "codex",
+                "claude": "claude",
+                "gemini": "gemini",
+            }
+            if not (isinstance(cmd, list) and cmd and cmd[0] == provider_commands[provider]):
+                return real_popen(*args, **kwargs)
+            process = _HangingFatalProcess(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        def _llm_factory(config):
+            if config.provider == "opencode":
+                return OpenCodeClient(config)
+            if config.provider == "codex":
+                return CodexClient(config)
+            if config.provider == "claude":
+                return ClaudeClient(config)
+            if config.provider == "gemini":
+                return GeminiClient(config)
+            return _PlanningLLM()
+
+        cfg = _cfg(git_project)
+        cfg["llm"] = {"provider": "fake", "model": "fake"}
+        cfg["agents"] = {
+            "implementer": {
+                "llm": {
+                    "provider": provider,
+                    "model": "test-model",
+                    "agent_timeout": 30,
+                }
+            }
+        }
+        cfg["run_review"] = False
+        cfg["run_security_review"] = False
+        cfg["run_build"] = False
+        cfg["run_tests"] = False
+        cfg["run_checks"] = False
+
+        with (
+            patch("core.llm_client.create_llm_client", side_effect=_llm_factory),
+            patch("core.llm_client.subprocess.Popen", side_effect=_popen),
+            patch("core.llm_client.time.sleep") as sleep,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_run(_args(task_file=str(_task(git_project, f"Trigger {provider} fatal provider error."))), cfg)
+
+        assert exc_info.value.code == 1
+        assert processes[0].terminated is True
+        sleep.assert_not_called()
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.failed is True
+        assert state.done is False
+        assert any(
+            entry["agent"] == "implementer"
+            and entry["action"] == "implement_failed"
+            and expected_message in entry["result"]
+            for entry in state.history
+        )
+        assert any(
+            entry["agent"] == "orchestrator" and entry["action"] == "abort" and expected_message in entry["result"]
+            for entry in state.history
+        )
 
 
 class TestAllStepsSkipped:

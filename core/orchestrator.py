@@ -607,8 +607,15 @@ class Orchestrator:
         has_preexisting_changes = bool(state.files_changed)
         if not state.files_changed:
             log.info("--- Phase: implement ---")
-            self._run_agent("implementer", state)
+            result = self._run_agent("implementer", state)
             if state.failed:
+                self._store.save(state)
+                return
+            if not result.success:
+                msg = f"implementer failed: {result.message}"
+                log.error(msg)
+                state.record("orchestrator", "abort", msg)
+                state.failed = True
                 self._store.save(state)
                 return
             if not state.files_changed:
@@ -798,8 +805,15 @@ class Orchestrator:
         # Implement this step (idempotent via step_implemented flag)
         if not state.step_implemented:
             log.info(f"--- Phase: implement (Step {step_num}/{total_steps}) ---")
-            self._run_agent("implementer", state)
+            result = self._run_agent("implementer", state)
             if state.failed:
+                return False
+            if not result.success:
+                msg = f"implementer failed: {result.message}"
+                log.error(msg)
+                state.record("orchestrator", "abort", msg)
+                state.failed = True
+                self._store.save(state)
                 return False
             if not state.files_changed:
                 dirty = self._worktree_dirty_files(state)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -22,8 +23,10 @@ from core.llm_client import (
     _git_exclude_file,
     _gemini_parse_response,
     _gemini_write_settings,
+    _run_agent_subprocess_streaming,
     _opencode_agent_env,
     _opencode_parse_text,
+    _run_opencode_streaming,
     create_llm_client,
 )
 from core.llm_client import ClaudeClient, CodexClient, GeminiClient, OpenCodeClient
@@ -242,7 +245,7 @@ class TestOpenCodeClientCommands:
         client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
         with (
             patch("core.llm_client._git_snapshot", return_value={}),
-            patch("core.llm_client.subprocess.run", return_value=self._run_result()) as mock_run,
+            patch("core.llm_client._run_opencode_streaming", return_value=self._run_result()) as mock_run,
         ):
             changed, output = client.run_agent("prompt", tmp_path)
 
@@ -251,7 +254,7 @@ class TestOpenCodeClientCommands:
         assert "prompt" not in cmd
         assert "--agent" in cmd
         assert cmd[cmd.index("--dir") + 1] == str(tmp_path)
-        assert mock_run.call_args.kwargs["input"] == "prompt"
+        assert mock_run.call_args.kwargs["prompt"] == "prompt"
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
         assert "OPENCODE_CONFIG_DIR" in mock_run.call_args.kwargs["env"]
         assert changed == []
@@ -342,7 +345,7 @@ class TestOpenCodeClientCommands:
         with (
             patch("core.llm_client.time.sleep"),
             patch("core.llm_client._git_snapshot", return_value={}),
-            patch("core.llm_client.subprocess.run", side_effect=[failure, self._run_result()]) as mock_run,
+            patch("core.llm_client._run_opencode_streaming", side_effect=[failure, self._run_result()]) as mock_run,
         ):
             changed, output = client.run_agent("prompt", tmp_path)
 
@@ -351,6 +354,139 @@ class TestOpenCodeClientCommands:
         assert mock_run.call_count == 2
         observer.assert_called_once()
         assert observer.call_args.args[0]["error_type"] == "LLMTransientError"
+
+    def test_streaming_agent_stops_on_usage_limit_before_process_exit(self, tmp_path: Path):
+        class HangingQuotaProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stdin = StringIO()
+                self.stdout = StringIO(
+                    self._line(
+                        {
+                            "type": "error",
+                            "error": {
+                                "name": "ProviderError",
+                                "data": {
+                                    "type": "usage_limit_reached",
+                                    "message": "The usage limit has been reached",
+                                    "headers": {
+                                        "x-codex-credits-balance": "0",
+                                        "x-codex-credits-has-credits": "False",
+                                    },
+                                },
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                self.stderr = StringIO()
+                self.returncode = None
+                self.terminated = False
+
+            @staticmethod
+            def _line(event: dict) -> str:
+                return json.dumps(event)
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        processes = []
+
+        def fake_popen(*args, **kwargs):
+            process = HangingQuotaProcess(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with (
+            patch("core.llm_client.subprocess.Popen", side_effect=fake_popen),
+            pytest.raises(LLMQuotaExceeded, match="usage limit"),
+        ):
+            _run_opencode_streaming(
+                ["opencode", "run", "--format", "json"],
+                prompt="prompt",
+                cwd=tmp_path,
+                env={},
+                timeout=30,
+            )
+
+        assert processes[0].terminated is True
+
+    @pytest.mark.parametrize(
+        ("provider", "stdout", "stderr", "stdout_error_parser", "expected_error", "match"),
+        [
+            (
+                "codex",
+                json.dumps({"type": "error", "message": "quota exceeded"}) + "\n",
+                "",
+                _codex_parse_text,
+                LLMQuotaExceeded,
+                "quota exceeded",
+            ),
+            ("claude", "", "not authenticated\n", None, LLMAuthError, "not authenticated"),
+            ("gemini", "invalid model: gemini/nope\n", "", None, LLMConfigurationError, "invalid model"),
+        ],
+    )
+    def test_streaming_agent_stops_on_fatal_markers_for_other_providers(
+        self,
+        tmp_path: Path,
+        provider: str,
+        stdout: str,
+        stderr: str,
+        stdout_error_parser,
+        expected_error,
+        match: str,
+    ):
+        class HangingFatalProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stdin = StringIO()
+                self.stdout = StringIO(stdout)
+                self.stderr = StringIO(stderr)
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        processes = []
+
+        def fake_popen(*args, **kwargs):
+            process = HangingFatalProcess(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with (
+            patch("core.llm_client.subprocess.Popen", side_effect=fake_popen),
+            pytest.raises(expected_error, match=match),
+        ):
+            _run_agent_subprocess_streaming(
+                [provider, "agent"],
+                cwd=tmp_path,
+                env=None,
+                timeout=30,
+                provider=provider,
+                stdout_error_parser=stdout_error_parser,
+            )
+
+        assert processes[0].terminated is True
 
     def test_readonly_failure_falls_back_to_non_zero_exit(self, tmp_path: Path):
         client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
@@ -444,15 +580,11 @@ class TestClaudeWriteSettings:
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
         client = ClaudeClient(cfg)
 
-        def fake_run(cmd, **kwargs):
-            m = MagicMock()
-            m.returncode = 0
-            m.stdout = "done"
-            m.stderr = ""
-            return m
-
         with (
-            patch("core.llm_client.subprocess.run", side_effect=fake_run),
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                return_value=subprocess.CompletedProcess([], 0, "done", ""),
+            ),
             patch("core.llm_client._git_snapshot", return_value={}),
             patch("core.llm_client._claude_write_settings") as mock_setup,
         ):
@@ -610,7 +742,7 @@ class TestCodexClientCommands:
         client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
         with (
             patch("core.llm_client._git_snapshot", return_value={}),
-            patch("core.llm_client.subprocess.run", return_value=self._run_result()) as mock_run,
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=self._run_result()) as mock_run,
         ):
             changed, output = client.run_agent("prompt", tmp_path)
 
@@ -628,7 +760,7 @@ class TestCodexClientCommands:
         with (
             patch("core.llm_client.time.sleep"),
             patch("core.llm_client._git_snapshot", return_value={}),
-            patch("core.llm_client.subprocess.run", side_effect=[failure, self._run_result()]),
+            patch("core.llm_client._run_agent_subprocess_streaming", side_effect=[failure, self._run_result()]),
         ):
             changed, output = client.run_agent("prompt", tmp_path)
 
@@ -655,7 +787,7 @@ class TestCodexClientCommands:
         with (
             patch("core.llm_client.time.sleep"),
             patch("core.llm_client._git_snapshot", return_value={}),
-            patch("core.llm_client.subprocess.run", side_effect=[failure, self._run_result()]),
+            patch("core.llm_client._run_agent_subprocess_streaming", side_effect=[failure, self._run_result()]),
         ):
             changed, output = client.run_agent("prompt", tmp_path)
 
@@ -726,7 +858,7 @@ class TestGeminiClientCommands:
         with (
             patch("core.llm_client._gemini_write_settings"),
             patch("core.llm_client._git_snapshot", return_value={}),
-            patch("core.llm_client.subprocess.run", return_value=self._run_result()) as mock_run,
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=self._run_result()) as mock_run,
         ):
             changed, output = client.run_agent("prompt", tmp_path)
 
