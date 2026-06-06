@@ -73,6 +73,7 @@ class TestJsonStateStore:
         data = json.loads((tmp_path / "order1.json").read_text())
         keys = list(data)
         record_keys = [
+            "planner_retry_records",
             "implement_cycle_records",
             "review_cycle_records",
             "security_review_cycle_records",
@@ -543,7 +544,27 @@ class TestJsonStateStore:
         assert loaded.final_summary["reviewer_runs"] == 0
         assert loaded.final_summary["security_reviewer_runs"] == 0
         assert loaded.final_summary["testability_gaps_count"] == 0
+        assert loaded.final_summary["planner_retries_count"] == 0
         assert loaded.final_summary["llm_retries"] == 1
+
+    def test_final_summary_counts_planner_retries(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="summary-planner", task_description="summary")
+        state.failed = True
+        state.finished_at = state.created_at
+        state.record_planner_retry(
+            1,
+            "too many steps",
+            "1. A\n2. B\n3. C",
+            max_steps=2,
+            parsed_step_count=3,
+            will_retry=False,
+        )
+
+        store.save(state)
+        loaded = store.load("summary-planner")
+
+        assert loaded.final_summary["planner_retries_count"] == 1
 
     def test_final_summary_counts_testability_gaps(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)

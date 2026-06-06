@@ -18,6 +18,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   provider/model configuration are now classified separately from transient failures and fail
   without retry; fixer phases also fail immediately when the fixer returns an unsuccessful
   result instead of continuing the build/fix loop until the iteration limit.
+- Planner outputs that exceed `planner.max_steps` are now rejected, retried once with a stricter
+  format prompt, and then failed before implementation if still over limit; planner config is
+  also captured in task config snapshots for auditability.
 - Test-only fixer changes on recognized test artifact paths now preserve already-approved reviewer and test-writer gates while still forcing deterministic build/test/check validation and a fresh security review, preventing unchanged production diffs from repeatedly triggering new test-writer passes without accepting unreviewed executable test changes.
 - Build/fix loops now give the last allowed fixer change one final validation-only pass before failing; if that validation still fails, Sikula aborts without starting another fixer attempt.
 - Test writer and fixer prompts now avoid brittle framework/container wiring tests that hand-copy production registrations into local test-only harnesses; test-failure fixer prompts also identify Sikula-generated tests so malformed generated tests can be replaced or removed without weakening pre-existing tests or accepted contracts.

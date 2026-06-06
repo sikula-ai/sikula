@@ -509,7 +509,7 @@ either signals single-pass or produces an ordered list of steps.
 
 Output is one of:
 - `SINGLE_PASS` — task is focused enough for one pass; `state.plan` stays empty
-- A numbered list of 2–N steps — each compilable in isolation
+- A numbered list of 2 to `planner.max_steps` steps — each compilable in isolation
 
 When producing steps, the planner keeps compile dependencies with the step that first
 uses them. For example, a step that references a new localization key, route/API
@@ -519,13 +519,14 @@ dependency in the same step. If that makes the split unclear, planner should cho
 
 **Output written to state:**
 - `state.planner_prompt` — full assembled prompt sent to the planner LLM (system + user sections); stored before the LLM call
+- `state.planner_retry_records` — rejected over-limit planner outputs, including parsed step count, configured max, rejected output, and retry prompt when another attempt follows
 - `state.plan_decided = True` — set after every successful decision; guards re-run on resume
 - `state.plan` — list of step description strings (only set when splitting; stays empty for SINGLE_PASS)
 - `state.current_step = 0` — reset to start (only when splitting)
 
-**Fallback:** if the output is neither `SINGLE_PASS` nor parseable into 2+ numbered steps,
+**Fallback and retry:** if the output is neither `SINGLE_PASS` nor parseable into 2+ numbered steps,
 `state.plan` stays empty, `state.plan_decided` is still set, and the orchestrator uses single-pass behavior.
-The planner only retries on resume if it previously failed with an exception (`plan_decided` not set).
+If the output parses into more than `planner.max_steps` steps, Sikula rejects the output and retries once with a stricter format prompt. If the retry is still over the limit, `plan_decided` remains false and the orchestrator fails before implementation starts. Because the task is then in terminal `failed` state, retrying that planner phase requires the normal `--reset-failed` path.
 
 ---
 
@@ -1048,7 +1049,7 @@ Sikula processes at once is still unsupported.
 | `task_description` | `str` | caller | Original plain-text task |
 | `schema_version` | `int` | `StateStore.create()` | State file schema version; used by `JsonStateStore.load()` to run migrations before constructing `TaskState`; current value is `SCHEMA_VERSION = 2` |
 | `task_file` | `str \| None` | `cmd_run()` in `sikula.py` | Basename of the task file (e.g. `add-login.md`); set on first run via `--task-file`; used by `status` for display; `None` for tasks created before this field was added or when resuming via `--task-id` only |
-| `config_snapshot` | `dict` | Orchestrator | Effective run configuration captured on first run (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. Visible in `show <task_id>`. |
+| `config_snapshot` | `dict` | Orchestrator | Effective run configuration captured on first run (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `planner.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. Visible in `show <task_id>`. |
 | `analyst_prompt` | `str \| None` | AnalystAgent | Full assembled prompt sent to the analyst LLM (system + user sections, including inlined guidelines content); stored before the LLM call so it captures the exact input even on exception; enables post-run analysis of analyst behaviour |
 | `planner_prompt` | `str \| None` | PlannerAgent | Full assembled prompt sent to the planner LLM (system + user sections); stored before the LLM call; `None` when `run_planner: false` or planner not yet reached |
 | `implementation_prompt` | `str \| None` | AnalystAgent | Structured prompt fed to ImplementerAgent; the analyst's key output |
@@ -1071,6 +1072,7 @@ Sikula processes at once is still unsupported.
 | `security_review_iterations` | `int` | Orchestrator | Security fix attempt counter for the current cycle (counts completed security-review→implement pairs); independent of `review_iterations`; resets to 0 on step transitions and fixer passes; guarded by `config.max_security_review_iterations` |
 | `analyst_warnings` | `list[str]` | AnalystAgent | Warnings produced by the analyst (e.g. ambiguous task scope, missing context); logged for visibility, never block the pipeline |
 | `analyst_retry_records` | `list[dict]` | AnalystAgent | Append-only records for analyst outputs rejected before `implementation_prompt` is stored, including attempt number, reason, whether another retry follows, timestamp, the rejected output, and the retry prompt when another attempt follows. These records are audit-only and never drive pipeline control flow. |
+| `planner_retry_records` | `list[dict]` | PlannerAgent | Append-only records for planner outputs rejected because the parsed step count exceeded `planner.max_steps`, including attempt number, reason, max step count, parsed step count, whether another retry follows, timestamp, the rejected output, and the retry prompt when another attempt follows. These records are audit-only and never drive pipeline control flow. |
 | `review_diff` | `str \| None` | `cmd_review()` in `sikula.py` / Orchestrator | PR-style diff passed to ReviewerAgent and SecurityReviewerAgent; initially set to `git diff base...branch` (three-dot) in `sikula review` mode; refreshed in `"review_fix"` mode before reviewer/security-reviewer calls so uncommitted fixes are included; `None` in standard `sikula run` flow (agents fall back to `GitTool.diff_head()`) |
 | `review_mode` | `str \| None` | `cmd_review()` in `sikula.py` | Review task kind: `"review_report"` for report-only review (not resumable) or `"review_fix"` for `sikula review --fix` (resumable via `sikula run --task-id`) |
 | `review_base_branch` | `str \| None` | `cmd_review()` in `sikula.py` | Base branch used to refresh `review_diff` in `"review_fix"` mode. Report-only review keeps the original frozen diff; review-fix refreshes against the merge base before reviewer/security-reviewer calls so fixes are reviewed against the current branch state. |
@@ -1358,7 +1360,7 @@ All keys live under `planner:` in `.sikula/config.yaml`.
 
 | Key | Default | Description |
 |---|---|---|
-| `max_steps` | `8` | Maximum number of steps the planner may produce; injected into the prompt as an upper bound |
+| `max_steps` | `8` | Maximum number of steps the planner may produce; injected into the prompt as an upper bound and enforced before implementation starts |
 | `extra_rules` | — | Path (relative to project root) to a Markdown file appended to the planner's system prompt as `## Project-specific rules` with an explicit override statement. Scope: task-splitting decisions only — which concerns to split, which to keep atomic. Has no effect on what individual agents do. |
 
 #### `reviewer` config keys
