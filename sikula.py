@@ -702,6 +702,7 @@ def build_orchestrator(cfg: dict, overrides: dict | None = None, state_store=Non
             "allowed_read_paths": sandbox.get("allowed_read_paths", ["."]),
         },
         "build": cfg.get("build", {}),
+        "planner": cfg.get("planner", {}),
         "test_writer": cfg.get("test_writer", {}),
         "agents": {name: _agent_snapshot(name) for name in sorted(_VALID_AGENTS)},
     }

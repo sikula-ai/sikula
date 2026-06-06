@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from core.state import JsonStateStore
+
 _sikula = importlib.import_module("sikula")
 _resolve_task_path = _sikula._resolve_task_path
 _finalize_worktree = _sikula._finalize_worktree
@@ -124,8 +126,6 @@ class TestFinalizeWorktree:
 
 class TestCmdRunFinalizeWorktreeState:
     def test_successful_isolated_run_clears_removed_worktree_paths(self, tmp_path: Path):
-        from core.state import JsonStateStore
-
         task_file = tmp_path / ".sikula" / "tasks" / "task.md"
         task_file.parent.mkdir(parents=True)
         task_file.write_text("do something")
@@ -557,6 +557,16 @@ class TestCmdCleanup:
 
 class TestCmdRunStateStore:
     """Verify that build_orchestrator receives the store created before root_path is mutated."""
+
+    def test_build_orchestrator_config_snapshot_includes_planner_config(self, tmp_path: Path):
+        cfg = _run_cfg(tmp_path)
+        cfg["planner"] = {"max_steps": 6}
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+
+        with patch("core.llm_client.create_llm_client", return_value=MagicMock()):
+            orch = _sikula.build_orchestrator(cfg, state_store=store)
+
+        assert orch._config_snapshot["planner"] == {"max_steps": 6}
 
     def test_task_file_with_isolate_passes_store_to_build_orchestrator(self, tmp_path: Path):
         task_file = tmp_path / "task.md"
