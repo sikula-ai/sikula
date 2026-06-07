@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -23,6 +24,7 @@ from core.llm_client import (
     _git_exclude_file,
     _gemini_parse_response,
     _gemini_write_settings,
+    _LogFatalScanner,
     _run_agent_subprocess_streaming,
     _opencode_agent_env,
     _opencode_parse_text,
@@ -376,7 +378,6 @@ class TestOpenCodeClientCommands:
                             },
                         }
                     )
-                    + "\n"
                 )
                 self.stderr = StringIO()
                 self.returncode = None
@@ -408,7 +409,7 @@ class TestOpenCodeClientCommands:
 
         with (
             patch("core.llm_client.subprocess.Popen", side_effect=fake_popen),
-            pytest.raises(LLMQuotaExceeded, match="usage limit"),
+            pytest.raises(LLMQuotaExceeded, match="usage_limit"),
         ):
             _run_opencode_streaming(
                 ["opencode", "run", "--format", "json"],
@@ -420,19 +421,114 @@ class TestOpenCodeClientCommands:
 
         assert processes[0].terminated is True
 
+    def test_opencode_streaming_agent_stops_on_usage_limit_in_log_file(self, tmp_path: Path):
+        class HangingLogQuotaProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stdin = StringIO()
+                self.stdout = StringIO()
+                self.stderr = StringIO()
+                self.returncode = None
+                self.terminated = False
+
+                log_dir = Path(kwargs["env"]["XDG_DATA_HOME"]) / "opencode" / "log"
+                log_dir.mkdir(parents=True)
+                cmd = args[0]
+                (log_dir / "2026-06-07T000000.log").write_text(
+                    f"INFO args={json.dumps(cmd[1:])} opencode\n"
+                    'ERROR service=llm responseHeaders={"x-codex-credits-balance":"0",'
+                    '"x-codex-credits-has-credits":"False"} '
+                    'responseBody={"error":{"type":"usage_limit_reached",'
+                    '"message":"The usage limit has been reached"}}'
+                )
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        processes = []
+
+        def fake_popen(*args, **kwargs):
+            process = HangingLogQuotaProcess(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with (
+            patch("core.llm_client.subprocess.Popen", side_effect=fake_popen),
+            pytest.raises(LLMQuotaExceeded, match="usage_limit"),
+        ):
+            _run_opencode_streaming(
+                ["opencode", "run", "--format", "json"],
+                prompt="prompt",
+                cwd=tmp_path,
+                env={"XDG_DATA_HOME": str(tmp_path / "xdg")},
+                timeout=30,
+            )
+
+        assert processes[0].terminated is True
+
+    def test_opencode_log_scanner_ignores_other_run_args(self, tmp_path: Path):
+        log_dir = tmp_path / "opencode" / "log"
+        log_dir.mkdir(parents=True)
+        expected_cmd = [
+            "opencode",
+            "run",
+            "--dir",
+            "/work/current",
+            "--model",
+            "openai/gpt-5.5",
+            "--agent",
+            "sikula-implementer",
+            "--format",
+            "json",
+        ]
+        other_cmd = [
+            "run",
+            "--dir",
+            "/work/other",
+            "--model",
+            "anthropic/claude",
+            "--agent",
+            "other-agent",
+            "--format",
+            "json",
+        ]
+        (log_dir / "other.log").write_text(
+            f"INFO args={json.dumps(other_cmd)} opencode\n"
+            'ERROR responseBody={"error":{"type":"usage_limit_reached"}}'
+        )
+
+        scanner = _LogFatalScanner(log_dir, time.time() - 1, expected_cmd)
+        assert scanner.read_new_text() == ""
+
+        matching_cmd = expected_cmd[1:]
+        (log_dir / "current.log").write_text(
+            f"INFO args={json.dumps(matching_cmd)} opencode\n"
+            'ERROR responseBody={"error":{"type":"usage_limit_reached"}}'
+        )
+        assert "usage_limit_reached" in scanner.read_new_text()
+
     @pytest.mark.parametrize(
         ("provider", "stdout", "stderr", "stdout_error_parser", "expected_error", "match"),
         [
             (
                 "codex",
-                json.dumps({"type": "error", "message": "quota exceeded"}) + "\n",
+                json.dumps({"type": "error", "message": "quota exceeded"}),
                 "",
                 _codex_parse_text,
                 LLMQuotaExceeded,
                 "quota exceeded",
             ),
-            ("claude", "", "not authenticated\n", None, LLMAuthError, "not authenticated"),
-            ("gemini", "invalid model: gemini/nope\n", "", None, LLMConfigurationError, "invalid model"),
+            ("claude", "", "not authenticated", None, LLMAuthError, "not authenticated"),
+            ("gemini", "invalid model: gemini/nope", "", None, LLMConfigurationError, "invalid model"),
         ],
     )
     def test_streaming_agent_stops_on_fatal_markers_for_other_providers(
@@ -797,6 +893,20 @@ class TestCodexClientCommands:
         event = observer.call_args.args[0]
         assert event["operation"] == "run_agent"
         assert event["error"] == "codex turn failed: policy denied"
+
+    def test_run_agent_success_exit_stdout_json_error_is_not_ignored(self, tmp_path: Path):
+        client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"type": "error", "message": "quota exceeded"}),
+            stderr="",
+        )
+        with (
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=result),
+            pytest.raises(LLMQuotaExceeded, match="quota exceeded"),
+        ):
+            client.run_agent("prompt", tmp_path)
 
 
 class TestGeminiParseResponse:

@@ -38,6 +38,8 @@ log = logging.getLogger(__name__)
 _RETRY_DELAYS: tuple[int, ...] = (30, 60, 120)
 _MAX_RETRY_ERROR_CHARS = 1000
 _RETRY_ERROR_HEAD_CHARS = 350
+_STREAM_FATAL_SCAN_CHARS = 8000
+_LOG_MATCH_SCAN_CHARS = 200000
 
 RetryObserver = Callable[[dict[str, object]], None]
 
@@ -249,6 +251,15 @@ def _call_with_retry(label: str, fn, config: LLMConfig | None = None, operation:
                 _notify_retry(config, operation or label, attempt + 1, total, delay, exc)
             time.sleep(delay)
     raise last_exc  # type: ignore[misc]
+
+
+def _agent_text_or_empty(parse_fn: Callable[[str], str], output: str) -> str:
+    try:
+        return parse_fn(output)
+    except LLMTransientError as exc:
+        if "returned no text output" in str(exc):
+            return ""
+        raise
 
 
 class LLMClient:
@@ -592,6 +603,107 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
         process.wait()
 
 
+def _fatal_stream_error(provider: str, text: str) -> LLMFatalError | None:
+    if not text.strip():
+        return None
+    tail = text[-_STREAM_FATAL_SCAN_CHARS:]
+    lower = tail.lower()
+    for marker in (
+        "usage_limit_reached",
+        "usage limit has been reached",
+        "quota exceeded",
+        "resource exhausted",
+        "insufficient_quota",
+        "out of credits",
+        "not authenticated",
+        "unauthorized",
+        "invalid token",
+        "invalid model",
+        "unsupported model",
+        "unknown provider",
+        "invalid configuration",
+        "x-codex-credits-has-credits",
+        "credits-has-credits",
+    ):
+        pos = lower.find(marker)
+        if pos < 0:
+            continue
+        tail = tail[pos : pos + 1200]
+        break
+    provider_error = _provider_error(provider, "agent", tail)
+    return provider_error if isinstance(provider_error, LLMFatalError) else None
+
+
+def _opencode_log_matches_command(text: str, cmd: list[str]) -> bool:
+    if "args=[" not in text:
+        return False
+    expected_tokens = cmd[1:] if cmd and cmd[0] == "opencode" else cmd
+    return all(json.dumps(token) in text for token in expected_tokens)
+
+
+class _LogFatalScanner:
+    def __init__(self, log_dir: Path, start_time: float, expected_cmd: list[str] | None = None) -> None:
+        self._log_dir = log_dir
+        self._start_time = start_time
+        self._offsets: dict[Path, int] = {}
+        self._expected_cmd = expected_cmd
+        self._matched_paths: set[Path] = set()
+
+    def _read_match_window(self, path: Path, size: int) -> str:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as f:
+                head = f.read(_LOG_MATCH_SCAN_CHARS)
+                if size > _LOG_MATCH_SCAN_CHARS:
+                    f.seek(max(0, size - _STREAM_FATAL_SCAN_CHARS))
+                    tail = f.read()
+                else:
+                    tail = ""
+        except OSError:
+            return ""
+        return head + "\n" + tail
+
+    def _matches_expected_command(self, path: Path, size: int) -> bool:
+        if self._expected_cmd is None or path in self._matched_paths:
+            return True
+        if _opencode_log_matches_command(self._read_match_window(path, size), self._expected_cmd):
+            self._matched_paths.add(path)
+            return True
+        return False
+
+    def read_new_text(self) -> str:
+        if not self._log_dir.exists():
+            return ""
+        chunks: list[str] = []
+        for path in self._log_dir.glob("*.log"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if path not in self._offsets:
+                if stat.st_mtime < self._start_time - 2:
+                    continue
+                self._offsets[path] = max(0, stat.st_size - _STREAM_FATAL_SCAN_CHARS)
+            if not self._matches_expected_command(path, stat.st_size):
+                continue
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as f:
+                    f.seek(self._offsets[path])
+                    text = f.read()
+                    self._offsets[path] = f.tell()
+            except OSError:
+                continue
+            if text:
+                chunks.append(text)
+        return "\n".join(chunks)
+
+
+def _opencode_log_dir(env: dict[str, str]) -> Path:
+    data_home = env.get("XDG_DATA_HOME")
+    if data_home:
+        return Path(data_home) / "opencode" / "log"
+    return Path.home() / ".local" / "share" / "opencode" / "log"
+
+
 def _run_agent_subprocess_streaming(
     cmd: list[str],
     *,
@@ -601,6 +713,7 @@ def _run_agent_subprocess_streaming(
     provider: str,
     stdin_text: str | None = None,
     stdout_error_parser: Callable[[str], str] | None = None,
+    fatal_output_supplier: Callable[[], str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run an agent subprocess while watching output for fatal provider errors."""
     process = subprocess.Popen(
@@ -621,14 +734,18 @@ def _run_agent_subprocess_streaming(
         process.stdin.write(stdin_text)
     process.stdin.close()
 
-    lines: queue.Queue[tuple[str, str]] = queue.Queue()
+    chunks: queue.Queue[tuple[str, str]] = queue.Queue()
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
+    stdout_line_buffer = ""
 
     def _reader(name: str, stream) -> None:
         try:
-            for line in stream:
-                lines.put((name, line))
+            while True:
+                chunk = stream.read(1)
+                if not chunk:
+                    break
+                chunks.put((name, chunk))
         finally:
             stream.close()
 
@@ -641,48 +758,56 @@ def _run_agent_subprocess_streaming(
 
     deadline = time.monotonic() + timeout
     while process.poll() is None:
+        if fatal_output_supplier is not None:
+            fatal_error = _fatal_stream_error(provider, fatal_output_supplier())
+            if fatal_error is not None:
+                _terminate_process(process)
+                raise fatal_error
+
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             _terminate_process(process)
             raise subprocess.TimeoutExpired(cmd, timeout, output="".join(stdout_parts), stderr="".join(stderr_parts))
         try:
-            name, line = lines.get(timeout=min(0.2, remaining))
+            name, chunk = chunks.get(timeout=min(0.2, remaining))
         except queue.Empty:
             continue
 
         if name == "stdout":
-            stdout_parts.append(line)
-            if stdout_error_parser is not None:
-                try:
-                    stdout_error_parser(line)
-                except LLMProviderError as exc:
-                    if isinstance(exc, LLMTransientError) and "returned no text output" in str(exc):
-                        continue
-                    _terminate_process(process)
-                    raise exc
-            else:
-                provider_error = _provider_error(provider, "agent", line)
-                if isinstance(provider_error, LLMFatalError):
-                    _terminate_process(process)
-                    raise provider_error
-        else:
-            stderr_parts.append(line)
-            provider_error = _provider_error(provider, "agent", line)
-            if isinstance(provider_error, LLMFatalError):
+            stdout_parts.append(chunk)
+            fatal_error = _fatal_stream_error(provider, "".join(stdout_parts))
+            if fatal_error is not None:
                 _terminate_process(process)
-                raise provider_error
+                raise fatal_error
+            if stdout_error_parser is not None:
+                stdout_line_buffer += chunk
+                while "\n" in stdout_line_buffer:
+                    line, stdout_line_buffer = stdout_line_buffer.split("\n", 1)
+                    try:
+                        stdout_error_parser(line)
+                    except LLMProviderError as exc:
+                        if isinstance(exc, LLMTransientError) and "returned no text output" in str(exc):
+                            continue
+                        _terminate_process(process)
+                        raise exc
+        else:
+            stderr_parts.append(chunk)
+            fatal_error = _fatal_stream_error(provider, "".join(stderr_parts))
+            if fatal_error is not None:
+                _terminate_process(process)
+                raise fatal_error
 
     for thread in threads:
         thread.join(timeout=1)
     while True:
         try:
-            name, line = lines.get_nowait()
+            name, chunk = chunks.get_nowait()
         except queue.Empty:
             break
         if name == "stdout":
-            stdout_parts.append(line)
+            stdout_parts.append(chunk)
         else:
-            stderr_parts.append(line)
+            stderr_parts.append(chunk)
 
     return subprocess.CompletedProcess(cmd, process.returncode or 0, "".join(stdout_parts), "".join(stderr_parts))
 
@@ -696,6 +821,7 @@ def _run_opencode_streaming(
     timeout: int,
 ) -> subprocess.CompletedProcess[str]:
     """Run opencode while watching output for provider errors before process exit."""
+    log_scanner = _LogFatalScanner(_opencode_log_dir(env), time.time(), cmd)
     return _run_agent_subprocess_streaming(
         cmd,
         cwd=cwd,
@@ -704,6 +830,7 @@ def _run_opencode_streaming(
         provider="opencode",
         stdin_text=prompt,
         stdout_error_parser=_opencode_parse_text,
+        fatal_output_supplier=log_scanner.read_new_text,
     )
 
 
@@ -812,10 +939,7 @@ class OpenCodeClient(LLMClient):
                     raise _provider_error("opencode", "agent", _opencode_error(result))
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
-                try:
-                    text = _opencode_parse_text(result.stdout)
-                except LLMProviderError:
-                    text = ""
+                text = _agent_text_or_empty(_opencode_parse_text, result.stdout)
                 return changed, text
             except subprocess.TimeoutExpired as exc:
                 last_exc = LLMTimeoutError(f"opencode agent timed out after {exc.timeout}s")
@@ -1005,10 +1129,7 @@ class GeminiClient(LLMClient):
                     raise _provider_error("gemini", "agent", err)
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
-                try:
-                    text = _gemini_parse_response(result.stdout)
-                except LLMProviderError:
-                    text = ""
+                text = _agent_text_or_empty(_gemini_parse_response, result.stdout)
                 return changed, text
             except subprocess.TimeoutExpired as exc:
                 last_exc = LLMTimeoutError(f"gemini agent timed out after {exc.timeout}s")
@@ -1206,10 +1327,7 @@ class CodexClient(LLMClient):
                     raise _provider_error("codex", "agent", _codex_subprocess_error(result))
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
-                try:
-                    text = _codex_parse_text(result.stdout)
-                except LLMProviderError:
-                    text = ""
+                text = _agent_text_or_empty(_codex_parse_text, result.stdout)
                 return changed, text
             except subprocess.TimeoutExpired as exc:
                 last_exc = LLMTimeoutError(f"codex agent timed out after {exc.timeout}s")
