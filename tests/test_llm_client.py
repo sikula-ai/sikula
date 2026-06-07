@@ -528,8 +528,8 @@ class TestOpenCodeClientCommands:
                 LLMQuotaExceeded,
                 "quota exceeded",
             ),
-            ("claude", "", "not authenticated", None, LLMAuthError, "not authenticated"),
-            ("gemini", "invalid model: gemini/nope", "", None, LLMConfigurationError, "invalid model"),
+            ("claude", "", "Error: not authenticated", None, LLMAuthError, "not authenticated"),
+            ("gemini", "", "Error: invalid model: gemini/nope", None, LLMConfigurationError, "invalid model"),
         ],
     )
     def test_streaming_agent_stops_on_fatal_markers_for_other_providers(
@@ -585,9 +585,25 @@ class TestOpenCodeClientCommands:
 
         assert processes[0].terminated is True
 
-    @pytest.mark.parametrize("stream_name", ["stdout", "stderr"])
-    def test_streaming_agent_ignores_benign_auth_terms_without_fatal_marker(self, tmp_path: Path, stream_name: str):
-        benign_output = "Document how API key rotation handles 401 responses without stopping the task."
+    @pytest.mark.parametrize(
+        ("stream_name", "benign_output"),
+        [
+            ("stdout", "Document how API key rotation handles 401 responses without stopping the task."),
+            ("stderr", "Document how API key rotation handles 401 responses without stopping the task."),
+            ("stdout", "Document an unauthorized response from an upstream API."),
+            ("stderr", "Document an unauthorized response from an upstream API."),
+            ("stdout", "Document invalid model and unsupported model provider cases."),
+            ("stderr", "Document invalid model and unsupported model provider cases."),
+            ("stdout", "Error handling docs for unauthorized and invalid model responses."),
+            ("stderr", "Error handling docs for unauthorized and invalid model responses."),
+        ],
+    )
+    def test_streaming_agent_ignores_benign_provider_error_terms_without_diagnostics(
+        self,
+        tmp_path: Path,
+        stream_name: str,
+        benign_output: str,
+    ):
 
         class SuccessfulAuthDocsProcess:
             def __init__(self, *args, **kwargs) -> None:
@@ -639,8 +655,8 @@ class TestOpenCodeClientCommands:
         else:
             assert benign_output in result.stderr
 
-    def test_streaming_agent_ignores_benign_log_auth_terms_without_fatal_marker(self, tmp_path: Path):
-        benign_log = "INFO args=[] output mentions API key rotation and 401 examples"
+    def test_streaming_agent_ignores_benign_log_terms_without_error_marker(self, tmp_path: Path):
+        benign_log = "INFO args=[] output mentions unauthorized, invalid model, API key, and 401 examples"
 
         class SuccessfulProcess:
             def __init__(self, *args, **kwargs) -> None:

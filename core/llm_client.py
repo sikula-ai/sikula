@@ -603,32 +603,108 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
         process.wait()
 
 
+_FATAL_STREAM_MARKERS = (
+    "usage_limit_reached",
+    "usage limit has been reached",
+    "quota exceeded",
+    "resource exhausted",
+    "insufficient_quota",
+    "out of credits",
+    "not authenticated",
+    "unauthorized",
+    "invalid token",
+    "invalid model",
+    "unsupported model",
+    "unknown provider",
+    "invalid configuration",
+    "x-codex-credits-has-credits",
+    "credits-has-credits",
+)
+
+_FATAL_STREAM_DIAGNOSTIC_PREFIXES = (
+    "error:",
+    "fatal:",
+    "failed:",
+    "provider error:",
+    "auth error:",
+    "authentication error:",
+    "quota error:",
+    "config error:",
+    "configuration error:",
+)
+
+
 def _fatal_stream_error(provider: str, text: str) -> LLMFatalError | None:
     if not text.strip():
         return None
     tail = text[-_STREAM_FATAL_SCAN_CHARS:]
-    lower = tail.lower()
-    for marker in (
-        "usage_limit_reached",
-        "usage limit has been reached",
-        "quota exceeded",
-        "resource exhausted",
-        "insufficient_quota",
-        "out of credits",
-        "not authenticated",
-        "unauthorized",
-        "invalid token",
-        "invalid model",
-        "unsupported model",
-        "unknown provider",
-        "invalid configuration",
-        "x-codex-credits-has-credits",
-        "credits-has-credits",
-    ):
+    for line in tail.splitlines():
+        structured_error = _structured_fatal_stream_error(provider, line)
+        if structured_error is not None:
+            return structured_error
+        if not _looks_like_provider_diagnostic(line):
+            continue
+        diagnostic_error = _diagnostic_fatal_stream_error(provider, line)
+        if diagnostic_error is not None:
+            return diagnostic_error
+    if "\n" not in tail and _looks_like_provider_diagnostic(tail):
+        return _diagnostic_fatal_stream_error(provider, tail)
+    return None
+
+
+def _structured_fatal_stream_error(provider: str, line: str) -> LLMFatalError | None:
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+
+    if "responseBody" in event or "responseHeaders" in event:
+        msg = json.dumps(event)
+        provider_error = _provider_error(provider, "agent", msg)
+        return provider_error if isinstance(provider_error, LLMFatalError) else None
+
+    etype = event.get("type")
+    if etype in ("error", "turn.failed"):
+        msg = _codex_error_message(event.get("error") or event.get("message") or event.get("data") or event)
+        raw = json.dumps(event)
+        if raw not in msg:
+            msg = f"{msg} {raw}"
+        provider_error = _provider_error(provider, "agent", msg)
+        return provider_error if isinstance(provider_error, LLMFatalError) else None
+
+    payload = event.get("payload")
+    if isinstance(payload, dict) and payload.get("type") in ("error", "turn.failed"):
+        msg = _codex_error_message(payload.get("error") or payload.get("message") or payload)
+        raw = json.dumps(payload)
+        if raw not in msg:
+            msg = f"{msg} {raw}"
+        provider_error = _provider_error(provider, "agent", msg)
+        return provider_error if isinstance(provider_error, LLMFatalError) else None
+
+    return None
+
+
+def _looks_like_provider_diagnostic(line: str) -> bool:
+    stripped = line.lstrip()
+    if not stripped:
+        return False
+    lower = stripped.lower()
+    if lower.startswith(_FATAL_STREAM_DIAGNOSTIC_PREFIXES):
+        return True
+    if stripped.startswith(("ERROR ", "ERROR\t", "ERROR[", "FATAL ", "FATAL\t", "FATAL[")):
+        return True
+    return " responsebody=" in lower or " responseheaders=" in lower
+
+
+def _diagnostic_fatal_stream_error(provider: str, text: str) -> LLMFatalError | None:
+    lower = text.lower()
+    for marker in _FATAL_STREAM_MARKERS:
         pos = lower.find(marker)
         if pos < 0:
             continue
-        snippet = tail[pos : pos + 1200]
+        snippet = text[pos : pos + 1200]
         provider_error = _provider_error(provider, "agent", snippet)
         return provider_error if isinstance(provider_error, LLMFatalError) else None
     return None
