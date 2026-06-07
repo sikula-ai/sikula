@@ -913,9 +913,10 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
   a collection of harmless small mocks. These harnesses also do not justify skipped,
   disabled, ignored, or environment-gated tests for changed behaviour; if configured
   validation cannot execute the behaviour, Sikula should record a `TESTABILITY GAP`.
-  Sikula also audits files written or modified by its test writer/fixer and treats newly
-  added execution gates as test-origin validation issues, so the fixer can replace them
-  with real existing-seam coverage or remove the placeholder and report a gap.
+  Sikula also audits test files and inline-test source files written or modified by its
+  test writer/fixer and treats newly added execution gates as test-origin validation
+  issues, so the fixer can replace them with real existing-seam coverage or remove the
+  placeholder and report a gap.
   It also records synthetic harness audit findings when the current Sikula-modified test
   file crosses the broad-harness threshold relative to the task baseline, including
   harnesses assembled across multiple test-writer/fixer passes. Those findings are fed
@@ -982,10 +983,10 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
   production defect. This is platform-neutral and does not fail the task by itself; it
   changes the model contract and records the decision in `fix_cycle_records`.
 - Newly added skipped, disabled, ignored, assumption-gated, or environment-gated tests in
-  Sikula-modified test files are recorded in `test_execution_gate_records` and fed back
-  through the build/fix loop as test-origin validation issues. This preserves autonomy for
-  legitimate stale-test fixes while preventing green placeholder tests from replacing real
-  coverage.
+  Sikula-modified test files or inline-test source files under configured test write paths
+  are recorded in `test_execution_gate_records` and fed back through the build/fix loop as
+  test-origin validation issues. This preserves autonomy for legitimate stale-test fixes
+  while preventing green placeholder tests from replacing real coverage.
 - Synthetic runtime harnesses that newly appear relative to the task baseline in
   Sikula-modified tests are recorded in `synthetic_test_harness_records` as audit warnings.
   Existing project helper harnesses already present at baseline are not treated as new
@@ -1235,9 +1236,13 @@ Each new platform also needs:
 - `.sikula/config.yaml` in the project directory with `sandbox.allowed_write_paths`, `guidelines.context_files`, and `guidelines.max_file_chars`
 - Platform-specific guidelines docs (listed under `guidelines.context_files`)
 - Platform onboarding guardrail coverage in `tests/test_platform_onboarding.py`
-- Test execution gate audit coverage for the platform's skip/disable/ignore/assumption
-  idioms when they are not already covered (`core/test_execution_gate_audit.py`,
-  `tests/test_test_execution_gate_audit.py`)
+- A conservative decision on `BuildTool.is_sync_adoptable_file()` for source-controlled
+  outputs that `sync()` may update, and `BuildTool.is_test_only_change()` for mixed
+  source/test files; leave the defaults unless the platform can classify these safely
+- Test execution gate audit coverage for the platform's inline-test source suffixes
+  (`_TEST_GATE_AUDIT_SOURCE_SUFFIXES` in `core/orchestrator.py`) and any
+  skip/disable/ignore/assumption idioms that are not already covered
+  (`core/test_execution_gate_audit.py`, `tests/test_test_execution_gate_audit.py`)
 - Synthetic test harness audit coverage for any platform-specific fake runtime idioms
   that are not already covered (`core/synthetic_test_harness_audit.py`,
   `tests/test_synthetic_test_harness_audit.py`)

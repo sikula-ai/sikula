@@ -121,6 +121,25 @@ _TEST_FILE_SUFFIXES = (
     "Tests.kt",
     "Tests.swift",
 )
+_TEST_GATE_AUDIT_SOURCE_SUFFIXES = (
+    ".cs",
+    ".dart",
+    ".go",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".kts",
+    ".mjs",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".scala",
+    ".swift",
+    ".ts",
+    ".tsx",
+)
 
 
 def _phase_scope_label(state: TaskState) -> str:
@@ -212,6 +231,15 @@ def _path_looks_like_test_artifact(path: str) -> bool:
         )
         or filename.endswith(tuple(suffix for suffix in _TEST_FILE_SUFFIXES if suffix[0].isupper()))
     )
+
+
+def _path_looks_like_test_gate_audit_candidate(path: str) -> bool:
+    if _path_looks_like_test_artifact(path):
+        return True
+    parts = _path_parts(path)
+    if not parts:
+        return False
+    return parts[-1].lower().endswith(_TEST_GATE_AUDIT_SOURCE_SUFFIXES)
 
 
 @dataclass
@@ -1406,7 +1434,7 @@ class Orchestrator:
                 candidate = candidate.resolve(strict=False)
                 if candidate.is_file():
                     relative = self._relative_project_path(candidate)
-                    if relative and _path_looks_like_test_artifact(relative):
+                    if relative and _path_looks_like_test_gate_audit_candidate(relative):
                         yield candidate
                     continue
                 if not candidate.is_dir():
@@ -1417,7 +1445,7 @@ class Orchestrator:
                     relative = self._relative_project_path(path)
                     if not relative or self._path_is_internal(relative):
                         continue
-                    if _path_looks_like_test_artifact(relative):
+                    if _path_looks_like_test_gate_audit_candidate(relative):
                         yield path
 
     def _relative_project_path(self, path: Path) -> str | None:
@@ -1471,7 +1499,8 @@ class Orchestrator:
             {
                 _normalize_project_path(str(path))
                 for path in files_written
-                if self._is_configured_test_write_path(str(path)) and _path_looks_like_test_artifact(str(path))
+                if self._is_configured_test_write_path(str(path))
+                and _path_looks_like_test_gate_audit_candidate(str(path))
             }
         )
         findings: list[dict] = []
@@ -1582,7 +1611,7 @@ class Orchestrator:
                 continue
             if (
                 self._is_configured_test_write_path(path)
-                and _path_looks_like_test_artifact(path)
+                and _path_looks_like_test_gate_audit_candidate(path)
                 and before_snapshot.get(path) == self._read_project_text(path)
             ):
                 continue

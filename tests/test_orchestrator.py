@@ -166,6 +166,12 @@ class TestPathClassification:
         assert not orchestrator_module._path_looks_like_test_artifact("feature/latest/src/main/App.ts")
         assert not orchestrator_module._path_looks_like_test_artifact("feature/contest/src/main/App.ts")
 
+    def test_execution_gate_audit_candidates_include_source_files_for_inline_tests(self):
+        assert orchestrator_module._path_looks_like_test_gate_audit_candidate("src/lib.rs")
+        assert orchestrator_module._path_looks_like_test_gate_audit_candidate("src/main/kotlin/InlineTests.kt")
+        assert orchestrator_module._path_looks_like_test_gate_audit_candidate("tests/clientMain.test.ts")
+        assert not orchestrator_module._path_looks_like_test_gate_audit_candidate("assets/logo.png")
+
 
 def _make_orchestrator(
     tmp_path: Path,
@@ -1682,6 +1688,73 @@ class TestOrchestratorFixPhase:
         assert changed
         assert len(state.test_execution_gate_records) == 1
         assert state.test_execution_gate_records[0]["source"] == "test_writer"
+        assert state.test_errors[0].startswith("TEST EXECUTION GATE AUDIT:")
+
+    def test_test_writer_execution_gate_audit_includes_inline_source_tests(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "sandbox": {"allowed_test_write_paths": ["src/"]},
+            },
+        )
+        source_file = tmp_path / "src" / "lib.rs"
+        source_file.parent.mkdir()
+        source_file.write_text(
+            """\
+pub fn answer() -> i32 {
+    42
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn existing_contract() {
+        assert_eq!(super::answer(), 42);
+    }
+}
+""",
+            encoding="utf-8",
+        )
+
+        def test_writer_effect(state: TaskState) -> None:
+            source_file.write_text(
+                """\
+pub fn answer() -> i32 {
+    42
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn existing_contract() {
+        assert_eq!(super::answer(), 42);
+    }
+
+    #[ignore]
+    #[test]
+    fn generated_contract() {
+        assert_eq!(super::answer(), 42);
+    }
+}
+""",
+                encoding="utf-8",
+            )
+            state.tests_up_to_date = True
+            state.files_changed.append("src/lib.rs")
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.rs"])
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed
+        assert len(state.test_execution_gate_records) == 1
+        finding = state.test_execution_gate_records[0]["findings"][0]
+        assert finding["path"] == "src/lib.rs"
+        assert finding["reason"] == "Rust ignored test"
         assert state.test_errors[0].startswith("TEST EXECUTION GATE AUDIT:")
 
     def test_test_writer_execution_gate_audit_fails_when_build_loop_disabled(self, tmp_path: Path):

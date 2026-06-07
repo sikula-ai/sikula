@@ -88,11 +88,18 @@ def test_scanner_detection_surface_matches_supported_build_tools():
     assert scanner_tools == sikula_module._SUPPORTED_BUILD_TOOLS
 
 
-def test_platform_onboarding_docs_include_audit_registries():
-    readme = Path("README.md").read_text(encoding="utf-8")
-    architecture = Path("ARCHITECTURE.md").read_text(encoding="utf-8")
+def test_platform_onboarding_docs_include_audit_and_buildtool_registries():
+    documents = {
+        "README.md": Path("README.md").read_text(encoding="utf-8"),
+        "ARCHITECTURE.md": Path("ARCHITECTURE.md").read_text(encoding="utf-8"),
+        "guidelines.md": Path("guidelines.md").read_text(encoding="utf-8"),
+        "tools/base_tool.py": Path("tools/base_tool.py").read_text(encoding="utf-8"),
+    }
     required_entries = [
         "tests/test_platform_onboarding.py",
+        "is_sync_adoptable_file",
+        "is_test_only_change",
+        "_TEST_GATE_AUDIT_SOURCE_SUFFIXES",
         "core/test_execution_gate_audit.py",
         "tests/test_test_execution_gate_audit.py",
         "core/synthetic_test_harness_audit.py",
@@ -100,5 +107,5 @@ def test_platform_onboarding_docs_include_audit_registries():
     ]
 
     for entry in required_entries:
-        assert entry in readme
-        assert entry in architecture
+        for name, content in documents.items():
+            assert entry in content, f"{entry} missing from {name}"

@@ -78,10 +78,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Terminal audit summaries now sample unique testability gap details, including `reason`
   and `covered_by` when available, while preserving total-vs-unique counts so repeated gap
   records remain auditable without duplicating the visible summary.
-- Sikula now deterministically audits test files written or modified by the test writer or
-  fixer for newly added skip/disable/ignore/assumption/environment execution gates, records
-  findings in task state, and feeds active findings back through the build/fix loop instead
-  of accepting green placeholder tests as coverage.
+- Sikula now deterministically audits test files and inline-test source files written or
+  modified by the test writer or fixer for newly added
+  skip/disable/ignore/assumption/environment execution gates, records findings in task
+  state, and feeds active findings back through the build/fix loop instead of accepting
+  green placeholder tests as coverage.
 - Test-only fixer changes on recognized test artifact paths now preserve already-approved reviewer and test-writer gates while still forcing deterministic build/test/check validation and a fresh security review, preventing unchanged production diffs from repeatedly triggering new test-writer passes without accepting unreviewed executable test changes.
 - Build/fix loops now give the last allowed fixer change one final validation-only pass before failing; if that validation still fails, Sikula aborts without starting another fixer attempt.
 - Test writer and fixer prompts now avoid brittle framework/container wiring tests that hand-copy production registrations into local test-only harnesses; test-failure fixer prompts also identify Sikula-generated tests so malformed generated tests can be replaced or removed without weakening pre-existing tests or accepted contracts.
