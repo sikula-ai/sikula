@@ -79,6 +79,8 @@ class TestJsonStateStore:
             "security_review_cycle_records",
             "test_write_records",
             "testability_gaps",
+            "test_execution_gate_records",
+            "synthetic_test_harness_records",
             "fix_cycle_records",
         ]
         first = keys.index(record_keys[0])
@@ -167,6 +169,7 @@ class TestJsonStateStore:
         data.pop("runtime_metadata", None)
         data.pop("final_summary", None)
         data.pop("testability_gaps", None)
+        data.pop("test_execution_gate_records", None)
         data.pop("build_loop_key", None)
         data.pop("build_loop_start_iteration", None)
         path.write_text(json.dumps(data))
@@ -178,6 +181,7 @@ class TestJsonStateStore:
         assert loaded.runtime_metadata == {}
         assert loaded.final_summary == {}
         assert loaded.testability_gaps == []
+        assert loaded.test_execution_gate_records == []
         assert loaded.build_loop_key is None
         assert loaded.build_loop_start_iteration == 0
 
@@ -194,6 +198,7 @@ class TestJsonStateStore:
             "TESTABILITY GAP:\ntarget: share sheet",
             target="share sheet",
             reason="no UI harness",
+            covered_by="view model state tests",
             recommended_action="add UI tests",
             risk="medium",
         )
@@ -206,9 +211,42 @@ class TestJsonStateStore:
         assert gap["scope"] == "final_full_task"
         assert gap["target"] == "share sheet"
         assert gap["reason"] == "no UI harness"
+        assert gap["covered_by"] == "view model state tests"
         assert gap["recommended_action"] == "add UI tests"
         assert gap["risk"] == "medium"
         assert state.history[-1]["action"] == "testability_gap"
+
+    def test_record_test_execution_gate_audit_captures_scope_and_metadata(self):
+        state = TaskState(
+            task_id="gate1",
+            task_description="gate task",
+            current_step=1,
+            build_iterations=2,
+            active_scope="final_full_task",
+        )
+
+        state.record_test_execution_gate_audit(
+            "fixer",
+            [
+                {
+                    "path": "tests/clientMain.test.ts",
+                    "line": 31,
+                    "category": "environment",
+                    "reason": "environment-gated test registration",
+                    "excerpt": 'if (typeof document === "undefined") {',
+                }
+            ],
+        )
+
+        assert len(state.test_execution_gate_records) == 1
+        record = state.test_execution_gate_records[0]
+        assert record["source"] == "fixer"
+        assert record["step"] == 1
+        assert record["build_iteration"] == 2
+        assert record["scope"] == "final_full_task"
+        assert record["status"] == "detected"
+        assert record["findings"][0]["path"] == "tests/clientMain.test.ts"
+        assert state.history[-1]["action"] == "test_execution_gate_audit"
 
     def test_load_migrates_mixed_review_cycle_records(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
@@ -544,6 +582,7 @@ class TestJsonStateStore:
         assert loaded.final_summary["reviewer_runs"] == 0
         assert loaded.final_summary["security_reviewer_runs"] == 0
         assert loaded.final_summary["testability_gaps_count"] == 0
+        assert loaded.final_summary["test_execution_gate_audits_count"] == 0
         assert loaded.final_summary["planner_retries_count"] == 0
         assert loaded.final_summary["llm_retries"] == 1
 
@@ -576,6 +615,40 @@ class TestJsonStateStore:
 
         assert loaded is not None
         assert loaded.final_summary["testability_gaps_count"] == 1
+
+    def test_final_summary_counts_test_execution_gate_audits(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="summary_gates", task_description="summary gates task", done=True)
+        state.record_test_execution_gate_audit(
+            "test_writer",
+            [{"path": "tests/test_main.py", "line": 5, "category": "skip", "excerpt": "test.skip("}],
+        )
+
+        store.save(state)
+        loaded = store.load("summary_gates")
+
+        assert loaded is not None
+        assert loaded.final_summary["test_execution_gate_audits_count"] == 1
+
+    def test_final_summary_counts_synthetic_test_harness_audits(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="summary_harness", task_description="summary harness task", done=True)
+        state.record_synthetic_test_harness_audit(
+            "test_writer",
+            [
+                {
+                    "path": "tests/clientMain.test.ts",
+                    "subsystems": ["event_dispatch", "navigation_history", "network_server"],
+                    "evidence": [],
+                }
+            ],
+        )
+
+        store.save(state)
+        loaded = store.load("summary_harness")
+
+        assert loaded is not None
+        assert loaded.final_summary["synthetic_test_harness_audits_count"] == 1
 
     def test_final_summary_counts_review_records_separately(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)

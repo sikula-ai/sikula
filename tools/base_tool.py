@@ -71,9 +71,10 @@ class BaseTool:
 class BuildTool(BaseTool):
     """Abstract interface for platform build systems.
 
-    Implement one subclass per platform and register it as the "build" tool
-    in Orchestrator.__init__(). The orchestrator loop calls only these core
-    methods — everything else is platform-specific extras on the subclass.
+    Implement one subclass per platform and register it through _build_tool();
+    Orchestrator.__init__() exposes the selected instance as the "build" tool.
+    The orchestrator loop calls only these core methods — everything else is
+    platform-specific extras on the subclass.
 
     To add a new platform:
       1. Create tools/<platform>_tool.py — subclass BuildTool (or GradleBaseTool for
@@ -83,6 +84,10 @@ class BuildTool(BaseTool):
          (_build_tool_class(), _generate_config(), _SUPPORTED_BUILD_TOOLS).
       3. Add detection logic to tools/scanner.py (_SIGNATURES and path detection).
       4. Add a .sikula/config.yaml in the project directory.
+      5. Update tests/test_platform_onboarding.py so factory/scanner/init wiring is covered.
+      6. If the platform uses test-framework skip/disable/ignore/assumption idioms
+         not already covered, extend core/test_execution_gate_audit.py and
+         tests/test_test_execution_gate_audit.py.
     """
 
     def generate_sources(self) -> ToolResult:

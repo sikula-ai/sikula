@@ -90,6 +90,8 @@ def _final_summary(state: "TaskState") -> dict:
         "security_reviewer_runs": len(state.security_review_cycle_records),
         "test_writer_runs": len(state.test_write_records),
         "testability_gaps_count": len(state.testability_gaps),
+        "test_execution_gate_audits_count": len(state.test_execution_gate_records),
+        "synthetic_test_harness_audits_count": len(state.synthetic_test_harness_records),
         "analyst_retries_count": len(state.analyst_retry_records),
         "planner_retries_count": len(state.planner_retry_records),
         "llm_retries": sum(1 for entry in state.history if entry.get("action") == "llm_retry"),
@@ -189,6 +191,8 @@ class TaskState:
     security_review_cycle_records: list[dict] = field(default_factory=list)
     test_write_records: list[dict] = field(default_factory=list)
     testability_gaps: list[dict] = field(default_factory=list)
+    test_execution_gate_records: list[dict] = field(default_factory=list)
+    synthetic_test_harness_records: list[dict] = field(default_factory=list)
     fix_cycle_records: list[dict] = field(default_factory=list)
     validation_cycle_records: list[dict] = field(default_factory=list)
     validation_artifact_records: list[dict] = field(default_factory=list)
@@ -288,6 +292,7 @@ class TaskState:
         message: str,
         target: str | None = None,
         reason: str | None = None,
+        covered_by: str | None = None,
         recommended_action: str | None = None,
         risk: str | None = None,
     ) -> None:
@@ -305,12 +310,46 @@ class TaskState:
             entry["target"] = target
         if reason:
             entry["reason"] = reason
+        if covered_by:
+            entry["covered_by"] = covered_by
         if recommended_action:
             entry["recommended_action"] = recommended_action
         if risk:
             entry["risk"] = risk
         self.testability_gaps.append(entry)
         self.record(source, "testability_gap", message_excerpt[:500])
+
+    def record_test_execution_gate_audit(self, source: str, findings: list[dict], status: str = "detected") -> None:
+        if not findings:
+            return
+        entry: dict = {
+            "source": source,
+            "step": self.current_step,
+            "build_iteration": self.build_iterations,
+            "status": status,
+            "findings": findings,
+            "timestamp": _now(),
+        }
+        if self.active_scope:
+            entry["scope"] = self.active_scope
+        self.test_execution_gate_records.append(entry)
+        self.record(source, "test_execution_gate_audit", f"{len(findings)} newly added execution gate(s)")
+
+    def record_synthetic_test_harness_audit(self, source: str, findings: list[dict], status: str = "detected") -> None:
+        if not findings:
+            return
+        entry: dict = {
+            "source": source,
+            "step": self.current_step,
+            "build_iteration": self.build_iterations,
+            "status": status,
+            "findings": findings,
+            "timestamp": _now(),
+        }
+        if self.active_scope:
+            entry["scope"] = self.active_scope
+        self.synthetic_test_harness_records.append(entry)
+        self.record(source, "synthetic_test_harness_audit", f"{len(findings)} synthetic test harness finding(s)")
 
     def record_validation(
         self,

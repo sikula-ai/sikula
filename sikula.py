@@ -71,7 +71,9 @@ from core.diagnostics import diagnostic_identity_key, diagnostic_summary_lines
 
 _BASE = Path(__file__).parent
 # When adding a new platform: add it here, in _build_tool() in core/orchestrator.py,
-# in _generate_config() below, and in _SIGNATURES in tools/scanner.py.
+# in _build_tool_class() and _generate_config() below, in _SIGNATURES in tools/scanner.py,
+# in tests/test_platform_onboarding.py, and in the test execution gate audit registry if
+# the platform brings new test skip idioms.
 _SUPPORTED_BUILD_TOOLS = {"cargo", "gradle-android", "gradle-jvm", "maven", "node", "xcodebuild", "python"}
 _RECOVERED_DIAGNOSTIC_LIMIT = 8
 
@@ -296,8 +298,10 @@ def _build_tool_class(cfg: dict):
     """Return the BuildTool subclass for the configured project.
 
     Used only for env_files() — called before the orchestrator is created.
-    When adding a new platform, extend both this function and _build_tool()
-    in core/orchestrator.py.
+    When adding a new platform, extend this function, _SUPPORTED_BUILD_TOOLS,
+    _generate_config(), _build_tool() in core/orchestrator.py, scanner detection, and
+    tests/test_platform_onboarding.py. Also extend the test execution gate audit
+    registry if the platform brings new test skip idioms.
     """
     platform = cfg.get("project", {}).get("build_tool", "gradle-android")
     if platform == "python":
@@ -976,8 +980,27 @@ def _task_audit_warnings(state) -> list[str]:
     if security_warning_count:
         warnings.append(f"security reviewer warnings: {security_warning_count}")
 
-    if getattr(state, "testability_gaps", []):
-        warnings.append(f"testability gaps: {len(state.testability_gaps)} (see: sikula show {state.task_id})")
+    testability_gaps = getattr(state, "testability_gaps", [])
+    if testability_gaps:
+        unique_count = len(_unique_testability_gaps(testability_gaps))
+        detail = f"{len(testability_gaps)}"
+        if unique_count != len(testability_gaps):
+            detail += f" ({unique_count} unique)"
+        warnings.append(f"testability gaps: {detail} (see: sikula show {state.task_id})")
+
+    gate_records = getattr(state, "test_execution_gate_records", [])
+    active_gate_records = [record for record in gate_records if record.get("status") != "resolved"]
+    if active_gate_records:
+        warnings.append(
+            f"test execution gate audits: {len(active_gate_records)} active (see: sikula show {state.task_id})"
+        )
+
+    synthetic_harness_records = getattr(state, "synthetic_test_harness_records", [])
+    active_synthetic_records = [record for record in synthetic_harness_records if record.get("status") != "resolved"]
+    if active_synthetic_records:
+        warnings.append(
+            f"synthetic test harness audits: {len(active_synthetic_records)} active (see: sikula show {state.task_id})"
+        )
 
     artifacts = getattr(state, "validation_artifact_records", [])
     if artifacts:
@@ -1007,6 +1030,54 @@ def _task_audit_warnings(state) -> list[str]:
     return warnings
 
 
+def _testability_gap_key(gap: dict) -> tuple[str, str, str, str]:
+    return (
+        str(gap.get("target") or "").strip().lower(),
+        str(gap.get("reason") or gap.get("message") or "").strip().lower(),
+        str(gap.get("covered_by") or "").strip().lower(),
+        str(gap.get("risk") or "").strip().lower(),
+    )
+
+
+def _unique_testability_gaps(gaps: list[dict]) -> list[dict]:
+    unique: list[dict] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for gap in gaps:
+        if not isinstance(gap, dict):
+            continue
+        key = _testability_gap_key(gap)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(gap)
+    return unique
+
+
+def _testability_gap_label(gap: dict) -> str:
+    target = _short_audit_line(gap.get("target") or gap.get("message") or "unspecified target", limit=120)
+    risk = _short_audit_line(gap.get("risk"), limit=40)
+    label = f"gap: {target}"
+    if risk:
+        label += f" [{risk}]"
+    details = []
+    if gap.get("reason"):
+        details.append(f"reason: {_short_audit_line(gap.get('reason'), limit=120)}")
+    if gap.get("covered_by"):
+        details.append(f"covered_by: {_short_audit_line(gap.get('covered_by'), limit=120)}")
+    if details:
+        label += " — " + "; ".join(details)
+    return label
+
+
+def _testability_gap_sample_lines(state, limit: int = 3) -> list[str]:
+    gaps = _unique_testability_gaps(getattr(state, "testability_gaps", []))
+    lines = [_testability_gap_label(gap) for gap in gaps[:limit]]
+    remaining = len(gaps) - limit
+    if remaining > 0:
+        lines.append(f"... {remaining} more unique gap(s) (see: sikula show {state.task_id})")
+    return lines
+
+
 def _task_recovered_issues(state) -> list[str]:
     recovered: list[str] = []
     validation_failures = _validation_failure_summary(getattr(state, "validation_cycle_records", []))
@@ -1022,6 +1093,16 @@ def _task_recovered_issues(state) -> list[str]:
     )
     if state.done and production_triage_count:
         recovered.append(f"fixer used production-confirmed test failure triage: {production_triage_count}")
+
+    gate_records = getattr(state, "test_execution_gate_records", [])
+    resolved_gate_records = [record for record in gate_records if record.get("status") == "resolved"]
+    if state.done and resolved_gate_records:
+        recovered.append(f"test execution gate audits recovered: {len(resolved_gate_records)}")
+
+    synthetic_harness_records = getattr(state, "synthetic_test_harness_records", [])
+    resolved_synthetic_records = [record for record in synthetic_harness_records if record.get("status") == "resolved"]
+    if state.done and resolved_synthetic_records:
+        recovered.append(f"synthetic test harness audits recovered: {len(resolved_synthetic_records)}")
 
     return recovered
 
@@ -1050,6 +1131,10 @@ def _print_task_audit_report(state) -> int:
     if warnings:
         print("Audit warnings:")
         _print_limited_lines(warnings, state.task_id)
+        gap_lines = _testability_gap_sample_lines(state)
+        if gap_lines:
+            print("Testability gaps:")
+            _print_limited_lines(gap_lines, state.task_id, limit=len(gap_lines))
 
     if recovered:
         print("Recovered issues:")

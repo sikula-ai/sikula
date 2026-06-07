@@ -514,7 +514,7 @@ CLI values layer on top of `agents:` overrides in the project YAML.
 | `security` | `context` | — | Short description of what the application does, what data it handles, and who the users are. Injected into the security reviewer's prompt so it can focus on threats relevant to your project — e.g. `"Mobile app. Fetches user data from our backend — auth tokens in Keychain. Main concerns: token handling and API response validation."` See [Configuring the security reviewer](#configuring-the-security-reviewer). |
 | `security_reviewer` | `extra_rules` | — | Path to a Markdown file appended to the security reviewer's system prompt. Use for project-specific security requirements: compliance rules (GDPR, PCI), threat model specifics, data classification rules. Appended before the BLOCKING/WARNING categories — project rules take priority. |
 | `test_writer` | `coverage_target` | `90` | Minimum branch+line coverage % for new/changed code within the configured test surface |
-| `test_writer` | `test_surface_policy` | `existing_infrastructure` | Test surface the test writer should use: `existing_infrastructure` stays within existing project test infra and does not treat missing heavy UI/browser/device/runtime harnesses as gaps by themselves; `complete` opts in to `TESTABILITY GAP` reports when important behaviour needs missing test infra outside the existing surface. The test writer prefers behavioural seams and should not replace missing UI/browser/device/runtime harnesses with broad source-inspection tests. |
+| `test_writer` | `test_surface_policy` | `existing_infrastructure` | Test surface the test writer should use: `existing_infrastructure` stays within existing project test infra and does not treat missing heavy UI/browser/device/runtime harnesses as gaps by themselves; `complete` opts in to `TESTABILITY GAP` reports when important behaviour needs missing test infra outside the existing surface. The test writer prefers behavioural seams and should not replace missing UI/browser/device/runtime harnesses with broad source-inspection tests, synthetic runtime/framework harnesses, or skipped/disabled tests that the configured validation will not execute. |
 | `test_writer` | `testability_gap_policy` | `warn` | What to do when the test writer reports behaviour that cannot be safely tested with available seams/infra: `warn` records a visible audit warning; `fail` fails the task |
 | `test_writer` | `extra_rules` | — | Path to a Markdown file appended to the test writer's prompt. Use for project-specific testing conventions: required test doubles, naming patterns, parametric table rules. |
 | `progress` | `heartbeat_interval_seconds` | `60` | Seconds between heartbeat updates; `0` disables the heartbeat |
@@ -692,10 +692,14 @@ preserved task worktree; Sikula resolves task state from the original project, n
 from the worktree copy.
 
 When a `sikula run` or `sikula review` task finishes, the terminal summary includes
-validation status, review status, audit warnings, and recovered issues. Audit warnings
-such as write-scope warnings, testability gaps, validation artifacts, or provider retries
-do not make an otherwise valid task fail; they point to items a human should inspect before
-merging.
+validation status, review status, audit warnings, and recovered issues. Warning-mode audit
+entries such as write-scope warnings, testability gaps, synthetic test harness findings,
+validation artifacts, or provider retries do not make an otherwise valid task fail; they
+point to items a human should inspect before merging. Configured blocking policies, such as
+`test_writer.testability_gap_policy: fail`, are still enforced separately.
+For testability gaps, the summary prints a total count and samples unique gap details such
+as `reason` and `covered_by` when available. Repeated gap records are still preserved in
+task state for audit, but duplicate details are collapsed in the terminal output.
 Recovered validation failures include short diagnostic lines sampled across failed validation
 attempts, such as the failing test, shortened compiler location, sanitized assertion failure,
 or linter rule, so a successful self-healed run still shows what the build/fix loop had to repair
@@ -899,7 +903,34 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
   test writer in the current task. Test-origin fixer prompts may replace or delete a
   malformed generated test only when it does not encode the task/guidelines/structured
   contract, and the test writer avoids brittle framework/container wiring tests that
-  hand-copy production registration logic into local test-only containers.
+  hand-copy production registration logic into local test-only containers. The same
+  guardrail applies to synthetic runtime/framework harnesses: coverage targets do not
+  justify generated tests that recreate render trees, event systems, navigation/history
+  stacks, containers, device/runtime APIs, servers, command runners, or similar missing
+  infrastructure inside test code. A generated test/helper that combines several fake
+  runtime subsystems, such as event dispatch plus navigation/history/router plus
+  network/fetch/server doubles, is treated as a synthetic runtime harness rather than
+  a collection of harmless small mocks. These harnesses also do not justify skipped,
+  disabled, ignored, or environment-gated tests for changed behaviour; if configured
+  validation cannot execute the behaviour, Sikula should record a `TESTABILITY GAP`.
+  Sikula also audits files written or modified by its test writer/fixer and treats newly
+  added execution gates as test-origin validation issues, so the fixer can replace them
+  with real existing-seam coverage or remove the placeholder and report a gap.
+  It also records synthetic harness audit findings when the current Sikula-modified test
+  file crosses the broad-harness threshold relative to the task baseline, including
+  harnesses assembled across multiple test-writer/fixer passes. Those findings are fed
+  back to later test-writer/fixer prompts, surfaced in task summaries, and handled with
+  soft recovery: Sikula restores the affected generated test files to the pre-agent
+  snapshot and retries once. If the retry recreates the broad harness, Sikula restores it
+  again, records a `TESTABILITY GAP`, and lets normal validation continue instead of
+  failing solely on the audit.
+  After repeated generated-test fixer passes, Sikula also requires a structured
+  `GENERATED TEST RE-TRIAGE` decision before accepting another generated-test edit. If the
+  fixer changes generated tests without that block, Sikula restores that pass and retries
+  once with recovery context instead of burning another validation iteration. If the retry
+  still omits the block, Sikula records the audit and lets normal validation decide the
+  task outcome rather than failing solely on prompt-compliance.
+  Pre-existing skipped tests outside the current agent edits are not blocked by this audit.
 
 ### Review Pipeline
 
@@ -926,16 +957,44 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
 - Task-described validation commands are matched against the effective configured
   build/test/check pipeline. In `sikula run`, uncovered commands fail as validation
   coverage gaps; in `sikula review`, PR/review commands are informational context.
-- Testability gaps reported by the test writer are visible in task state and interpreted
-  against `test_writer.test_surface_policy`. The default surface is
+- Testability gaps reported by the test writer or test-only fixer are visible in task
+  state; test-writer decisions are interpreted against `test_writer.test_surface_policy`.
+  The default surface is
   `existing_infrastructure`, which keeps generated tests within existing project test infra
   instead of warning solely because a heavy UI/browser/device/runtime harness is absent.
   The test writer should cover behaviour through public APIs, state, routing contracts,
   command outputs, or project-standard helpers; it should not replace missing
-  UI/browser/device/runtime harnesses with broad source-inspection tests. Use `complete`
-  to opt in to gaps for missing test infrastructure outside that surface.
-  The default gap policy is `warn`; `test_writer.testability_gap_policy: fail` makes
-  reported gaps blocking.
+  UI/browser/device/runtime harnesses with broad source-inspection tests or synthetic
+  runtime/framework harnesses. When a test has to combine multiple fake runtime subsystems
+  to exercise an entry point, Sikula treats that as missing infrastructure and expects
+  narrower seam coverage or a gap instead. The test writer also should not add skipped or
+  disabled tests as coverage for behaviour the configured validation will not execute. Use
+  `complete` to opt in to gaps for missing test infrastructure outside that surface.
+  For test-writer gaps, the default gap policy is `warn`;
+  `test_writer.testability_gap_policy: fail` makes those gaps blocking.
+  Gap records should include `covered_by` when existing-surface tests or seams cover the
+  runnable portion of the change, making the out-of-surface exclusion auditable instead of
+  an unqualified coverage excuse.
+- When the same Sikula-generated test keeps failing and the fixer has already made
+  repeated test-only changes to generated test files, the next fixer prompt requires a
+  `GENERATED TEST RE-TRIAGE` block. The strategy must be one of narrower seam coverage,
+  removing a malformed generated test, reporting a `TESTABILITY GAP`, or escalating a real
+  production defect. This is platform-neutral and does not fail the task by itself; it
+  changes the model contract and records the decision in `fix_cycle_records`.
+- Newly added skipped, disabled, ignored, assumption-gated, or environment-gated tests in
+  Sikula-modified test files are recorded in `test_execution_gate_records` and fed back
+  through the build/fix loop as test-origin validation issues. This preserves autonomy for
+  legitimate stale-test fixes while preventing green placeholder tests from replacing real
+  coverage.
+- Synthetic runtime harnesses that newly appear relative to the task baseline in
+  Sikula-modified tests are recorded in `synthetic_test_harness_records` as audit warnings.
+  Existing project helper harnesses already present at baseline are not treated as new
+  findings, and normal usage of project-standard test infrastructure is not a finding by
+  itself. Sikula feeds active findings back into later test-writer/fixer prompts and uses
+  soft recovery: the affected generated test files are restored to the pre-agent snapshot
+  and the agent gets one retry to produce narrower existing-seam coverage or a
+  `TESTABILITY GAP`. If the retry recreates the broad harness, Sikula restores it again and
+  records the gap; these findings do not add `test_errors` or fail the task on their own.
 
 ### Safety And Scope
 
@@ -1175,6 +1234,13 @@ defined on `BuildTool`; `AndroidGradleTool`, `JvmGradleTool`, `MavenTool`, `Node
 Each new platform also needs:
 - `.sikula/config.yaml` in the project directory with `sandbox.allowed_write_paths`, `guidelines.context_files`, and `guidelines.max_file_chars`
 - Platform-specific guidelines docs (listed under `guidelines.context_files`)
+- Platform onboarding guardrail coverage in `tests/test_platform_onboarding.py`
+- Test execution gate audit coverage for the platform's skip/disable/ignore/assumption
+  idioms when they are not already covered (`core/test_execution_gate_audit.py`,
+  `tests/test_test_execution_gate_audit.py`)
+- Synthetic test harness audit coverage for any platform-specific fake runtime idioms
+  that are not already covered (`core/synthetic_test_harness_audit.py`,
+  `tests/test_synthetic_test_harness_audit.py`)
 
 The agents and the orchestration loop need no changes.
 See [ARCHITECTURE.md § Add a platform](ARCHITECTURE.md#add-a-platform-ios-backend-) for the step-by-step.

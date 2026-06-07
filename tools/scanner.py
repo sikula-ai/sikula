@@ -22,7 +22,10 @@ from tools.node_tool import (
 # (trigger_files, build_tool, language, platform)
 # Priority order: first match wins when resolving ambiguity.
 # When adding a new platform: add an entry here, add path detection helpers below,
-# and extend _generate_config() in sikula.py and _build_tool() in core/orchestrator.py.
+# extend _SUPPORTED_BUILD_TOOLS, _build_tool_class(), and _generate_config() in
+# sikula.py, extend _build_tool() in core/orchestrator.py, update
+# tests/test_platform_onboarding.py, and update the test execution gate audit registry
+# if the platform brings new skip/disable/ignore/assumption idioms.
 # Note: Gradle entries use "gradle-android" as a placeholder; scan() refines them to
 # "gradle-android" or "gradle-jvm" based on AndroidManifest.xml presence.
 _SIGNATURES: list[tuple[list[str], str, str, str | None]] = [

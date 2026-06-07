@@ -12,6 +12,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The test writer now more strongly prefers behavioural seams over broad source-inspection tests, especially for UI implementation details that cannot be meaningfully exercised by existing project test infrastructure.
 - Cargo projects now support `build.sync_command`; the default Cargo sync uses `cargo fetch --locked` when `Cargo.lock` exists at the Cargo workspace/project root and `cargo fetch` otherwise, with a one-time plain `cargo fetch` fallback and sync validation metadata when Cargo reports that the lockfile needs updating.
 - Build sync now has platform-neutral adoption and audit for source-controlled generated outputs such as lockfiles and dependency verification metadata: existing tracked sync outputs are added to `files_changed`, semantic review/test gates are invalidated, unexpected non-ignored artifacts are cleaned or fail closed, and project-specific new output patterns can be configured with `build.sync_adopt_paths`.
+- Sikula now records platform-neutral synthetic test harness audit findings when generated
+  or fixed tests cross the broad-harness threshold relative to the task baseline, including
+  harnesses assembled across multiple agent passes. Findings are deduplicated, fed back into
+  later test-writer/fixer prompts, surfaced in task summaries, and trigger soft recovery:
+  Sikula restores the affected generated test files, retries the agent once, and records a
+  `TESTABILITY GAP` if the retry recreates the broad harness instead of directly failing the
+  task.
 
 ### Fixed
 - OpenCode write-agent runs now monitor structured provider error events and OpenCode's
@@ -41,6 +48,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Planner outputs that exceed `planner.max_steps` are now rejected, retried once with a stricter
   format prompt, and then failed before implementation if still over limit; planner config is
   also captured in task config snapshots for auditability.
+- Test writer and test-only fixer prompts now treat synthetic runtime/framework harnesses
+  as outside the configured test surface, so coverage targets do not encourage agents to
+  build and repeatedly patch fake render trees, event systems, navigation/history stacks,
+  containers, device runtimes, servers, or command runners when stable project seams or a
+  `TESTABILITY GAP` are the safer output; prompts now also call out tests that combine
+  several fake runtime subsystems as synthetic harnesses rather than harmless small mocks.
+- Test writer and test-only fixer prompts now reject skipped, disabled, ignored, or
+  environment-gated tests as a substitute for coverage of changed behaviour, and fixer
+  `TESTABILITY GAP` blocks are recorded in task state for audit when missing runtime
+  infrastructure prevents meaningful execution in the configured validation surface.
+  Gap records can also include `covered_by` so excluded out-of-surface behaviour is paired
+  with the existing-surface tests or seams that still cover the runnable portion.
+- Repeated generated-test failures now add a structured fixer re-triage prompt that asks
+  the agent to choose between narrower seam coverage, removing malformed generated tests,
+  reporting a testability gap, or escalating a real production defect; the selected
+  strategy is recorded in `fix_cycle_records` for audit instead of adding a new hard fail
+  condition. If a repeated-generated-test fixer changes generated tests but omits that
+  required re-triage block, Sikula now restores the pass and retries once before spending
+  another build/test iteration; if the retry still omits the block, Sikula records the
+  audit and continues to validation instead of failing solely on prompt-compliance.
+- Fixer follow-up agent passes now log why they are launching, making restored
+  generated-test re-triage violations, test-only scope violations, and
+  production-confirmed passes visible in live task logs.
+- Synthetic runtime harness detection is now conservative enough for recovery: it focuses on
+  newly declared local fake runtime/framework constructs across multiple subsystems rather
+  than normal usage of project-standard test infrastructure such as browser/device test
+  runners, server helpers, or small unit-test doubles.
+- Terminal audit summaries now sample unique testability gap details, including `reason`
+  and `covered_by` when available, while preserving total-vs-unique counts so repeated gap
+  records remain auditable without duplicating the visible summary.
+- Sikula now deterministically audits test files written or modified by the test writer or
+  fixer for newly added skip/disable/ignore/assumption/environment execution gates, records
+  findings in task state, and feeds active findings back through the build/fix loop instead
+  of accepting green placeholder tests as coverage.
 - Test-only fixer changes on recognized test artifact paths now preserve already-approved reviewer and test-writer gates while still forcing deterministic build/test/check validation and a fresh security review, preventing unchanged production diffs from repeatedly triggering new test-writer passes without accepting unreviewed executable test changes.
 - Build/fix loops now give the last allowed fixer change one final validation-only pass before failing; if that validation still fails, Sikula aborts without starting another fixer attempt.
 - Test writer and fixer prompts now avoid brittle framework/container wiring tests that hand-copy production registrations into local test-only harnesses; test-failure fixer prompts also identify Sikula-generated tests so malformed generated tests can be replaced or removed without weakening pre-existing tests or accepted contracts.
