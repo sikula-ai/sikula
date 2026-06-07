@@ -792,6 +792,7 @@ def _run_agent_subprocess_streaming(
     assert process.stderr is not None
 
     chunks: queue.Queue[tuple[str, str]] = queue.Queue()
+    writer_errors: queue.Queue[OSError] = queue.Queue()
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
     stdout_line_buffer = ""
@@ -818,25 +819,36 @@ def _run_agent_subprocess_streaming(
         finally:
             stream.close()
 
+    def _writer() -> None:
+        try:
+            if stdin_text is not None:
+                process.stdin.write(stdin_text)
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
+        except OSError as exc:
+            if exc.errno != errno.EPIPE:
+                writer_errors.put(exc)
+
     threads = [
         threading.Thread(target=_reader, args=("stdout", process.stdout), daemon=True),
         threading.Thread(target=_reader, args=("stderr", process.stderr), daemon=True),
     ]
     for thread in threads:
         thread.start()
-
-    try:
-        if stdin_text is not None:
-            process.stdin.write(stdin_text)
-        process.stdin.close()
-    except BrokenPipeError:
-        pass
-    except OSError as exc:
-        if exc.errno != errno.EPIPE:
-            raise
+    writer_thread = threading.Thread(target=_writer, daemon=True)
+    writer_thread.start()
 
     deadline = time.monotonic() + timeout
     while process.poll() is None:
+        try:
+            writer_error = writer_errors.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            _terminate_process(process)
+            raise writer_error
+
         if fatal_event_supplier is not None:
             fatal_error = fatal_event_supplier()
             if fatal_error is not None:
@@ -871,6 +883,13 @@ def _run_agent_subprocess_streaming(
 
     for thread in threads:
         thread.join(timeout=1)
+    writer_thread.join(timeout=1)
+    try:
+        writer_error = writer_errors.get_nowait()
+    except queue.Empty:
+        pass
+    else:
+        raise writer_error
     while True:
         try:
             name, chunk = chunks.get_nowait()

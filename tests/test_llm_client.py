@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
+import threading
 import time
 from io import StringIO
 from pathlib import Path
@@ -357,6 +359,116 @@ class TestStreamingProcessHelpers:
                 env=None,
                 timeout=0,
                 provider="provider",
+            )
+
+        assert processes[0].terminated is True
+
+    def test_streaming_agent_timeout_applies_while_stdin_write_blocks(self, tmp_path: Path):
+        class BlockingStdin:
+            def __init__(self, release: threading.Event) -> None:
+                self._release = release
+                self.closed = False
+
+            def write(self, _text: str) -> int:
+                self._release.wait(timeout=5)
+                return 0
+
+            def close(self) -> None:
+                self.closed = True
+
+        class StalledPromptProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self._release_stdin = threading.Event()
+                self.stdin = BlockingStdin(self._release_stdin)
+                self.stdout = StringIO()
+                self.stderr = StringIO()
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+                self._release_stdin.set()
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+                self._release_stdin.set()
+
+        processes = []
+
+        def fake_popen(*args, **kwargs):
+            process = StalledPromptProcess(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with (
+            patch("core.llm_client.subprocess.Popen", side_effect=fake_popen),
+            pytest.raises(subprocess.TimeoutExpired),
+        ):
+            _run_agent_subprocess_streaming(
+                ["provider", "agent"],
+                cwd=tmp_path,
+                env=None,
+                timeout=0,
+                provider="provider",
+                stdin_text="large prompt",
+            )
+
+        assert processes[0].terminated is True
+
+    def test_streaming_agent_propagates_non_pipe_stdin_write_errors(self, tmp_path: Path):
+        class FailingStdin:
+            def write(self, _text: str) -> int:
+                raise OSError(errno.EINVAL, "bad file descriptor")
+
+            def close(self) -> None:
+                pass
+
+        class RunningProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stdin = FailingStdin()
+                self.stdout = StringIO()
+                self.stderr = StringIO()
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        processes = []
+
+        def fake_popen(*args, **kwargs):
+            process = RunningProcess(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with (
+            patch("core.llm_client.subprocess.Popen", side_effect=fake_popen),
+            pytest.raises(OSError, match="bad file descriptor"),
+        ):
+            _run_agent_subprocess_streaming(
+                ["provider", "agent"],
+                cwd=tmp_path,
+                env=None,
+                timeout=30,
+                provider="provider",
+                stdin_text="prompt",
             )
 
         assert processes[0].terminated is True

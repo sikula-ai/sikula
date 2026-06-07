@@ -28,9 +28,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Codex, Claude, and Gemini prompts are now passed through stdin instead of as command-line
   arguments, preventing large reviewer/analyst prompts from failing before the provider starts
   with OS argument-length errors.
-- Write-agent CLI providers now tolerate early stdin pipe closure when the provider exits
-  immediately with a quota/auth/config error, allowing Sikula to drain and classify the
-  provider output instead of surfacing an unexpected broken-pipe agent exception.
+- Write-agent CLI providers now write prompts through a timeout-aware stdin writer and
+  tolerate early stdin pipe closure when the provider exits immediately with a
+  quota/auth/config error, allowing Sikula to keep enforcing `agent_timeout` while draining
+  and classifying provider output instead of surfacing an unexpected broken-pipe agent
+  exception or hanging during prompt delivery.
 - Planner outputs that exceed `planner.max_steps` are now rejected, retried once with a stricter
   format prompt, and then failed before implementation if still over limit; planner config is
   also captured in task config snapshots for auditability.
