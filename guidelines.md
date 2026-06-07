@@ -194,6 +194,11 @@ input channel for `generate()`, `run_readonly_agent()`, and `run_agent()` prompt
 Reviewer, analyst, and implementation prompts can exceed operating-system argument
 length limits on large tasks; command arguments should carry provider options only.
 
+For streaming write-agent subprocesses, start output readers before writing the prompt
+and tolerate early stdin pipe closure. A provider can exit immediately on quota,
+authentication, or configuration failures; Sikula must still drain and classify
+stdout/stderr instead of surfacing a raw broken-pipe exception.
+
 ### State recording
 
 Call `state.record(self.name, action, result)` after every meaningful action.

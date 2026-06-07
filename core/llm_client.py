@@ -17,6 +17,7 @@ To add another provider subclass LLMClient and register it in create_llm_client(
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -790,10 +791,6 @@ def _run_agent_subprocess_streaming(
     assert process.stdout is not None
     assert process.stderr is not None
 
-    if stdin_text is not None:
-        process.stdin.write(stdin_text)
-    process.stdin.close()
-
     chunks: queue.Queue[tuple[str, str]] = queue.Queue()
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
@@ -827,6 +824,16 @@ def _run_agent_subprocess_streaming(
     ]
     for thread in threads:
         thread.start()
+
+    try:
+        if stdin_text is not None:
+            process.stdin.write(stdin_text)
+        process.stdin.close()
+    except BrokenPipeError:
+        pass
+    except OSError as exc:
+        if exc.errno != errno.EPIPE:
+            raise
 
     deadline = time.monotonic() + timeout
     while process.poll() is None:

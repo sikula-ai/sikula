@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from io import StringIO
@@ -18,6 +19,8 @@ from core.llm_client import (
     LLMConfigurationError,
     LLMQuotaExceeded,
     LLMTransientError,
+    LLMTimeoutError,
+    _agent_text_or_empty,
     _call_with_retry,
     _claude_write_settings,
     _codex_parse_text,
@@ -27,10 +30,13 @@ from core.llm_client import (
     _gemini_parse_response,
     _gemini_write_settings,
     _LogFatalScanner,
+    _opencode_log_matches_command,
+    _opencode_stream_error,
     _run_agent_subprocess_streaming,
     _opencode_agent_env,
     _opencode_parse_text,
     _run_opencode_streaming,
+    _terminate_process,
     create_llm_client,
 )
 from core.llm_client import ClaudeClient, CodexClient, GeminiClient, OpenCodeClient
@@ -127,6 +133,29 @@ class TestCallWithRetry:
         assert result == "ok"
         assert fn.call_count == 2
 
+    def test_notifies_retry_observer_on_timeout_expired(self):
+        observer = MagicMock()
+        cfg = LLMConfig(provider="codex", model="gpt-5.3-codex", retry_observer=observer)
+        fn = MagicMock(side_effect=[subprocess.TimeoutExpired("cmd", 30), "ok"])
+
+        with patch("core.llm_client.time.sleep"):
+            result = _call_with_retry("test", fn, cfg, "run_agent")
+
+        assert result == "ok"
+        observer.assert_called_once()
+        event = observer.call_args.args[0]
+        assert event["operation"] == "run_agent"
+        assert event["error_type"] == "LLMTimeoutError"
+
+    def test_raises_timeout_after_all_retries_exhausted(self):
+        fn = MagicMock(side_effect=subprocess.TimeoutExpired("cmd", 30))
+
+        with patch("core.llm_client.time.sleep"):
+            with pytest.raises(LLMTimeoutError, match="timed out after 30s"):
+                _call_with_retry("test", fn)
+
+        assert fn.call_count == 4
+
     def test_raises_after_all_retries_exhausted(self):
         fn = MagicMock(side_effect=LLMTransientError("always fails"))
         with patch("core.llm_client.time.sleep"):
@@ -155,6 +184,21 @@ class TestCallWithRetry:
         with pytest.raises(ValueError):
             _call_with_retry("test", fn)
         assert fn.call_count == 1
+
+
+class TestAgentTextOrEmpty:
+    def test_returns_empty_for_no_text_transient_error(self):
+        def parse(_output: str) -> str:
+            raise LLMTransientError("codex output error: returned no text output")
+
+        assert _agent_text_or_empty(parse, "") == ""
+
+    def test_reraises_other_transient_errors(self):
+        def parse(_output: str) -> str:
+            raise LLMTransientError("temporary provider failure")
+
+        with pytest.raises(LLMTransientError, match="temporary provider failure"):
+            _agent_text_or_empty(parse, "")
 
 
 class TestOpencodeParsText:
@@ -190,9 +234,189 @@ class TestOpencodeParsText:
         ndjson = "not json\n" + self._line({"type": "text", "part": {"text": "ok"}})
         assert _opencode_parse_text(ndjson) == "ok"
 
+    def test_skips_non_object_json_lines(self):
+        ndjson = json.dumps(["not", "an", "event"]) + "\n" + self._line({"type": "text", "part": {"text": "ok"}})
+        assert _opencode_parse_text(ndjson) == "ok"
+
     def test_empty_text_parts_excluded(self):
         ndjson = self._line({"type": "text", "part": {"text": "   "}})
         assert _opencode_parse_text(ndjson) == ""
+
+    def test_raises_on_string_error_event(self):
+        ndjson = self._line({"type": "error", "error": "not authenticated"})
+        with pytest.raises(LLMAuthError, match="not authenticated"):
+            _opencode_parse_text(ndjson)
+
+    @pytest.mark.parametrize("line", ["", "not json", json.dumps(["not", "object"])])
+    def test_stream_error_ignores_non_error_lines(self, line: str):
+        assert _opencode_stream_error(line) is None
+
+    def test_stream_error_returns_provider_error(self):
+        error = _opencode_stream_error(self._line({"type": "error", "error": {"data": {"message": "invalid model"}}}))
+        assert isinstance(error, LLMConfigurationError)
+
+
+class TestStreamingProcessHelpers:
+    def test_terminate_process_returns_when_process_already_exited(self):
+        process = MagicMock()
+        process.poll.return_value = 0
+
+        _terminate_process(process)
+
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+
+    def test_terminate_process_kills_when_graceful_wait_times_out(self):
+        process = MagicMock()
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("agent", 5), 0]
+
+        _terminate_process(process)
+
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        assert process.wait.call_count == 2
+
+    def test_opencode_log_matches_expected_command_tokens(self):
+        cmd = ["opencode", "run", "--dir", "/work/current", "--model", "openai/gpt-5.5"]
+        text = f"INFO args={json.dumps(cmd[1:])} opencode"
+
+        assert _opencode_log_matches_command(text, cmd)
+        assert not _opencode_log_matches_command("INFO no args here", cmd)
+        assert not _opencode_log_matches_command('INFO args=["run","--dir","/work/other"]', cmd)
+
+    def test_log_scanner_returns_none_when_log_dir_missing(self, tmp_path: Path):
+        scanner = _LogFatalScanner(tmp_path / "missing" / "log", time.time(), None)
+
+        assert scanner.read_fatal_error() is None
+
+    def test_log_scanner_ignores_old_files(self, tmp_path: Path):
+        log_dir = tmp_path / "opencode" / "log"
+        log_dir.mkdir(parents=True)
+        path = log_dir / "old.log"
+        path.write_text('ERROR responseBody={"error":{"type":"usage_limit_reached"}}')
+        old = time.time() - 30
+        path.touch()
+        os.utime(path, (old, old))
+
+        scanner = _LogFatalScanner(log_dir, time.time(), None)
+
+        assert scanner.read_fatal_error() is None
+
+    def test_log_scanner_reads_large_file_tail_after_matching_header(self, tmp_path: Path):
+        log_dir = tmp_path / "opencode" / "log"
+        log_dir.mkdir(parents=True)
+        cmd = ["opencode", "run", "--dir", "/work/current", "--model", "openai/gpt-5.5"]
+        path = log_dir / "current.log"
+        path.write_text(
+            f"INFO args={json.dumps(cmd[1:])} opencode\n"
+            + ("x" * 140000)
+            + '\nERROR responseBody={"error":{"type":"usage_limit_reached"}}'
+        )
+
+        scanner = _LogFatalScanner(log_dir, time.time() - 1, cmd)
+
+        assert isinstance(scanner.read_fatal_error(), LLMQuotaExceeded)
+
+    def test_streaming_agent_timeout_terminates_process(self, tmp_path: Path):
+        class HangingProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stdin = StringIO()
+                self.stdout = StringIO()
+                self.stderr = StringIO()
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        processes = []
+
+        def fake_popen(*args, **kwargs):
+            process = HangingProcess(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with (
+            patch("core.llm_client.subprocess.Popen", side_effect=fake_popen),
+            pytest.raises(subprocess.TimeoutExpired),
+        ):
+            _run_agent_subprocess_streaming(
+                ["provider", "agent"],
+                cwd=tmp_path,
+                env=None,
+                timeout=0,
+                provider="provider",
+            )
+
+        assert processes[0].terminated is True
+
+    def test_log_scanner_ignores_malformed_structured_marker(self, tmp_path: Path):
+        log_dir = tmp_path / "opencode" / "log"
+        log_dir.mkdir(parents=True)
+        (log_dir / "current.log").write_text("ERROR responseBody={not-json}")
+
+        scanner = _LogFatalScanner(log_dir, time.time() - 1, None)
+
+        assert scanner.read_fatal_error() is None
+
+    def test_streaming_agent_stops_on_stderr_structured_error(self, tmp_path: Path):
+        class StderrErrorProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stdin = StringIO()
+                self.stdout = StringIO()
+                self.stderr = StringIO(json.dumps({"type": "error", "error": "not authenticated"}))
+                self.returncode = None
+                self.terminated = False
+                self._polls = 0
+
+            def poll(self):
+                self._polls += 1
+                if self._polls > 50 and self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        processes = []
+
+        def fake_popen(*args, **kwargs):
+            process = StderrErrorProcess(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with (
+            patch("core.llm_client.subprocess.Popen", side_effect=fake_popen),
+            pytest.raises(LLMAuthError, match="not authenticated"),
+        ):
+            _run_agent_subprocess_streaming(
+                ["provider", "agent"],
+                cwd=tmp_path,
+                env=None,
+                timeout=30,
+                provider="provider",
+                stderr_error_parser=_opencode_stream_error,
+            )
+
+        assert processes[0].terminated is True
 
 
 class TestOpenCodeClientCommands:
@@ -342,6 +566,28 @@ class TestOpenCodeClientCommands:
         assert mock_run.call_count == 1
         sleep.assert_not_called()
 
+    def test_generate_empty_output_is_retried(self):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        empty = MagicMock(returncode=0, stdout="", stderr="")
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", side_effect=[empty, self._run_result("ok")]) as mock_run,
+        ):
+            assert client.generate("system", "user") == "ok"
+
+        assert mock_run.call_count == 2
+
+    def test_readonly_empty_output_is_retried(self, tmp_path: Path):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        empty = MagicMock(returncode=0, stdout="", stderr="")
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", side_effect=[empty, self._run_result("ok")]) as mock_run,
+        ):
+            assert client.run_readonly_agent("prompt", tmp_path) == "ok"
+
+        assert mock_run.call_count == 2
+
     def test_run_agent_transient_error_is_still_retried(self, tmp_path: Path):
         observer = MagicMock()
         client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex", retry_observer=observer))
@@ -358,6 +604,24 @@ class TestOpenCodeClientCommands:
         assert mock_run.call_count == 2
         observer.assert_called_once()
         assert observer.call_args.args[0]["error_type"] == "LLMTransientError"
+
+    def test_run_agent_timeout_is_retried(self, tmp_path: Path):
+        observer = MagicMock()
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex", retry_observer=observer))
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch(
+                "core.llm_client._run_opencode_streaming",
+                side_effect=[subprocess.TimeoutExpired("opencode", 30), self._run_result()],
+            ) as mock_run,
+        ):
+            changed, output = client.run_agent("prompt", tmp_path)
+
+        assert changed == []
+        assert output == "ok"
+        assert mock_run.call_count == 2
+        assert observer.call_args.args[0]["error_type"] == "LLMTimeoutError"
 
     def test_streaming_agent_stops_on_usage_limit_before_process_exit(self, tmp_path: Path):
         class HangingQuotaProcess:
@@ -799,6 +1063,37 @@ class TestClaudeWriteSettings:
         assert mock_run.call_args.kwargs["input"] == "review this"
         mock_setup.assert_called_once_with(tmp_path)
 
+    def test_generate_failure_is_classified(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(returncode=1, stdout="", stderr="not authenticated")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMAuthError, match="not authenticated"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_run_readonly_agent_failure_is_classified(self, tmp_path):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(returncode=1, stdout="invalid model", stderr="")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            patch("core.llm_client._claude_write_settings"),
+            pytest.raises(LLMConfigurationError, match="invalid model"),
+        ):
+            client.run_readonly_agent("review this", tmp_path)
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
     def test_run_agent_calls_write_settings(self, tmp_path):
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
         client = ClaudeClient(cfg)
@@ -818,6 +1113,43 @@ class TestClaudeWriteSettings:
         assert "implement this" not in cmd
         assert mock_run.call_args.kwargs["stdin_text"] == "implement this"
         mock_setup.assert_called_once_with(tmp_path)
+
+    def test_run_agent_nonzero_exit_is_classified(self, tmp_path):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = subprocess.CompletedProcess([], 1, "", "unsupported model")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=result) as mock_run,
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client._claude_write_settings"),
+            pytest.raises(LLMConfigurationError, match="unsupported model"),
+        ):
+            client.run_agent("implement this", tmp_path)
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_run_agent_timeout_is_retried(self, tmp_path):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6", retry_observer=MagicMock())
+        client = ClaudeClient(cfg)
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                side_effect=[subprocess.TimeoutExpired("claude", 30), subprocess.CompletedProcess([], 0, "done", "")],
+            ) as mock_run,
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client._claude_write_settings"),
+        ):
+            changed, output = client.run_agent("implement this", tmp_path)
+
+        assert changed == []
+        assert output == "done"
+        assert mock_run.call_count == 2
+        assert cfg.retry_observer.call_args.args[0]["error_type"] == "LLMTimeoutError"
 
 
 class TestCodexParseText:
@@ -893,6 +1225,18 @@ class TestCodexParseText:
     def test_skips_invalid_json_lines(self):
         lines = "not json\n" + self._item_line("ok")
         assert _codex_parse_text(lines) == "ok"
+
+    def test_skips_non_object_json_lines(self):
+        lines = json.dumps(["not", "object"]) + "\n" + self._item_line("ok")
+        assert _codex_parse_text(lines) == "ok"
+
+    def test_extracts_task_complete_last_agent_message(self):
+        line = json.dumps({"type": "task_complete", "payload": {"last_agent_message": "Done from task."}})
+        assert _codex_parse_text(line) == "Done from task."
+
+    @pytest.mark.parametrize("line", ["", "not json", json.dumps(["not", "object"])])
+    def test_stream_error_ignores_non_error_lines(self, line: str):
+        assert _codex_stream_error(line) is None
 
     def test_extracts_current_response_item_final_answer(self):
         line = json.dumps(
@@ -1015,6 +1359,19 @@ class TestCodexClientCommands:
         ):
             client.generate("system", "user")
 
+    def test_generate_usage_limit_is_fatal_and_not_retried(self):
+        client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
+        failure = MagicMock(returncode=1, stdout=json.dumps({"type": "error", "message": "quota exceeded"}), stderr="")
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=failure) as mock_run,
+            pytest.raises(LLMQuotaExceeded, match="quota exceeded"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
     def test_run_readonly_agent_uses_read_only_sandbox(self, tmp_path: Path):
         client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
         with patch("core.llm_client.subprocess.run", return_value=self._run_result()) as mock_run:
@@ -1133,6 +1490,57 @@ class TestCodexClientCommands:
         ):
             client.run_agent("prompt", tmp_path)
 
+    def test_run_agent_classifies_provider_error_after_broken_stdin_pipe(self, tmp_path: Path):
+        class BrokenPipeStdin(StringIO):
+            def write(self, s):
+                raise BrokenPipeError()
+
+        class ExitedBeforePromptProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stdin = BrokenPipeStdin()
+                self.stdout = StringIO()
+                self.stderr = StringIO("not authenticated")
+                self.returncode = 1
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
+
+        with (
+            patch("core.llm_client.subprocess.Popen", side_effect=ExitedBeforePromptProcess),
+            patch("core.llm_client._git_snapshot", return_value={}),
+            pytest.raises(LLMAuthError, match="not authenticated"),
+        ):
+            client.run_agent("prompt", tmp_path)
+
+    def test_run_agent_timeout_is_retried(self, tmp_path: Path):
+        observer = MagicMock()
+        client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex", retry_observer=observer))
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                side_effect=[subprocess.TimeoutExpired("codex", 30), self._run_result()],
+            ) as mock_run,
+        ):
+            changed, output = client.run_agent("prompt", tmp_path)
+
+        assert changed == []
+        assert output == "ok"
+        assert mock_run.call_count == 2
+        assert observer.call_args.args[0]["error_type"] == "LLMTimeoutError"
+
 
 class TestGeminiParseResponse:
     def test_returns_response_field(self):
@@ -1142,6 +1550,11 @@ class TestGeminiParseResponse:
     def test_raises_on_error_field(self):
         output = json.dumps({"error": {"message": "quota exceeded"}})
         with pytest.raises(RuntimeError, match="quota exceeded"):
+            _gemini_parse_response(output)
+
+    def test_raises_on_string_error_field(self):
+        output = json.dumps({"error": "not authenticated"})
+        with pytest.raises(LLMAuthError, match="not authenticated"):
             _gemini_parse_response(output)
 
     def test_raises_on_empty_response(self):
@@ -1177,6 +1590,20 @@ class TestGeminiClientCommands:
         assert mock_run.call_args.kwargs["input"] == "system\n\nuser"
         assert "--approval-mode" not in cmd
 
+    def test_generate_failure_is_classified(self):
+        client = GeminiClient(LLMConfig(provider="gemini", model="gemini-nope"))
+        result = MagicMock(returncode=1, stdout="", stderr="invalid model")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMConfigurationError, match="invalid model"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
     def test_run_readonly_agent_skips_workspace_trust_check(self, tmp_path: Path):
         client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro"))
         with (
@@ -1191,6 +1618,21 @@ class TestGeminiClientCommands:
         assert mock_run.call_args.kwargs["input"] == "prompt"
         assert cmd[cmd.index("--approval-mode") + 1] == "yolo"
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
+
+    def test_run_readonly_agent_failure_is_classified(self, tmp_path: Path):
+        client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro"))
+        result = MagicMock(returncode=1, stdout="not authenticated", stderr="")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._gemini_write_settings"),
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMAuthError, match="not authenticated"),
+        ):
+            client.run_readonly_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
 
     def test_run_agent_skips_workspace_trust_check(self, tmp_path: Path):
         client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro"))
@@ -1209,3 +1651,39 @@ class TestGeminiClientCommands:
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
         assert changed == []
         assert output == "ok"
+
+    def test_run_agent_nonzero_exit_is_classified(self, tmp_path: Path):
+        client = GeminiClient(LLMConfig(provider="gemini", model="gemini-nope"))
+        result = subprocess.CompletedProcess([], 1, "", "unsupported model")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._gemini_write_settings"),
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=result) as mock_run,
+            pytest.raises(LLMConfigurationError, match="unsupported model"),
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_run_agent_timeout_is_retried(self, tmp_path: Path):
+        observer = MagicMock()
+        client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro", retry_observer=observer))
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client._gemini_write_settings"),
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                side_effect=[subprocess.TimeoutExpired("gemini", 30), self._run_result()],
+            ) as mock_run,
+        ):
+            changed, output = client.run_agent("prompt", tmp_path)
+
+        assert changed == []
+        assert output == "ok"
+        assert mock_run.call_count == 2
+        assert observer.call_args.args[0]["error_type"] == "LLMTimeoutError"

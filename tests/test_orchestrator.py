@@ -1870,6 +1870,32 @@ class TestOrchestratorInterruptResume:
         assert result.done
         assert len(stubs["implementer"].calls) == 2
 
+    def test_step_loop_implementer_failure_aborts_before_review(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=True, run_build=False)
+        stubs["implementer"].result_success = False
+        stubs["implementer"].result_message = "usage limit reached"
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: add feature A", "Step 2: add feature B"],
+            plan_decided=True,
+        )
+
+        result = orch.run(task_id="t1")
+        saved = orch._store.load("t1")
+
+        assert result.failed is True
+        assert saved is not None
+        assert saved.failed is True
+        assert len(stubs["implementer"].calls) == 1
+        assert len(stubs["reviewer"].calls) == 0
+        assert any(
+            entry["agent"] == "orchestrator"
+            and entry["action"] == "abort"
+            and entry["result"] == "implementer failed: usage limit reached"
+            for entry in saved.history
+        )
+
     def test_step_loop_max_review_iterations_persists_failed_state(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
             tmp_path,
