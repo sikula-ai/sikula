@@ -21,6 +21,7 @@ from core.llm_client import (
     _call_with_retry,
     _claude_write_settings,
     _codex_parse_text,
+    _codex_subprocess_error,
     _git_exclude_file,
     _gemini_parse_response,
     _gemini_write_settings,
@@ -584,6 +585,110 @@ class TestOpenCodeClientCommands:
 
         assert processes[0].terminated is True
 
+    @pytest.mark.parametrize("stream_name", ["stdout", "stderr"])
+    def test_streaming_agent_ignores_benign_auth_terms_without_fatal_marker(self, tmp_path: Path, stream_name: str):
+        benign_output = "Document how API key rotation handles 401 responses without stopping the task."
+
+        class SuccessfulAuthDocsProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stdin = StringIO()
+                self.stdout = StringIO(benign_output if stream_name == "stdout" else "")
+                self.stderr = StringIO(benign_output if stream_name == "stderr" else "")
+                self.returncode = None
+                self.terminated = False
+                self._polls = 0
+
+            def poll(self):
+                self._polls += 1
+                if self._polls > len(benign_output) + 2:
+                    self.returncode = 0
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        processes = []
+
+        def fake_popen(*args, **kwargs):
+            process = SuccessfulAuthDocsProcess(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with patch("core.llm_client.subprocess.Popen", side_effect=fake_popen):
+            result = _run_agent_subprocess_streaming(
+                ["codex", "agent"],
+                cwd=tmp_path,
+                env=None,
+                timeout=30,
+                provider="codex",
+            )
+
+        assert processes[0].terminated is False
+        assert result.returncode == 0
+        if stream_name == "stdout":
+            assert benign_output in result.stdout
+        else:
+            assert benign_output in result.stderr
+
+    def test_streaming_agent_ignores_benign_log_auth_terms_without_fatal_marker(self, tmp_path: Path):
+        benign_log = "INFO args=[] output mentions API key rotation and 401 examples"
+
+        class SuccessfulProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stdin = StringIO()
+                self.stdout = StringIO()
+                self.stderr = StringIO()
+                self.returncode = None
+                self.terminated = False
+                self._polls = 0
+
+            def poll(self):
+                self._polls += 1
+                if self._polls > 3:
+                    self.returncode = 0
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        processes = []
+
+        def fake_popen(*args, **kwargs):
+            process = SuccessfulProcess(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with patch("core.llm_client.subprocess.Popen", side_effect=fake_popen):
+            result = _run_agent_subprocess_streaming(
+                ["opencode", "agent"],
+                cwd=tmp_path,
+                env=None,
+                timeout=30,
+                provider="opencode",
+                fatal_output_supplier=lambda: benign_log,
+            )
+
+        assert processes[0].terminated is False
+        assert result.returncode == 0
+
     def test_readonly_failure_falls_back_to_non_zero_exit(self, tmp_path: Path):
         client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
         result = MagicMock(returncode=1, stdout="", stderr="")
@@ -762,6 +867,91 @@ class TestCodexParseText:
     def test_skips_invalid_json_lines(self):
         lines = "not json\n" + self._item_line("ok")
         assert _codex_parse_text(lines) == "ok"
+
+    def test_extracts_current_response_item_final_answer(self):
+        line = json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "Done."}],
+                },
+            }
+        )
+        assert _codex_parse_text(line) == "Done."
+
+    def test_extracts_current_event_msg_final_answer(self):
+        line = json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "final_answer",
+                    "message": "Final text.",
+                },
+            }
+        )
+        assert _codex_parse_text(line) == "Final text."
+
+    def test_ignores_current_commentary_and_tool_output_without_final_answer(self):
+        lines = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "agent_message",
+                            "phase": "commentary",
+                            "message": "Reading source files.",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "output": "201: StrategyMode::Atomic => ScannerEvaluationRecord {",
+                        },
+                    }
+                ),
+            ]
+        )
+        with pytest.raises(RuntimeError, match="no text output"):
+            _codex_parse_text(lines)
+
+    def test_subprocess_error_does_not_report_raw_current_jsonl_without_error(self):
+        stdout = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "output": "201: StrategyMode::Atomic => ScannerEvaluationRecord {",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {"type": "token_count", "info": {"total_tokens": 306669}},
+                    }
+                ),
+            ]
+        )
+        result = MagicMock(returncode=1, stdout=stdout, stderr="")
+
+        error = _codex_subprocess_error(result)
+
+        assert error == "codex exited before producing a final answer or structured error"
+        assert "ScannerEvaluationRecord" not in error
+
+    def test_subprocess_error_keeps_plain_stdout_error(self):
+        result = MagicMock(returncode=1, stdout="Error: failed to initialize app-server", stderr="")
+        assert _codex_subprocess_error(result) == "Error: failed to initialize app-server"
 
 
 class TestCodexClientCommands:

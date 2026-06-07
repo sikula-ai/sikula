@@ -628,10 +628,10 @@ def _fatal_stream_error(provider: str, text: str) -> LLMFatalError | None:
         pos = lower.find(marker)
         if pos < 0:
             continue
-        tail = tail[pos : pos + 1200]
-        break
-    provider_error = _provider_error(provider, "agent", tail)
-    return provider_error if isinstance(provider_error, LLMFatalError) else None
+        snippet = tail[pos : pos + 1200]
+        provider_error = _provider_error(provider, "agent", snippet)
+        return provider_error if isinstance(provider_error, LLMFatalError) else None
+    return None
 
 
 def _opencode_log_matches_command(text: str, cmd: list[str]) -> bool:
@@ -1174,7 +1174,8 @@ class GeminiClient(LLMClient):
 def _codex_parse_text(output: str) -> str:
     """Extract assistant text from codex exec --json JSONL output.
 
-    Collects text from item.completed events (type=agent_message).
+    Collects final assistant text from both legacy item.completed events and
+    current Codex session JSONL response/event messages.
     Raises LLMProviderError on error/turn.failed events or when no text was produced.
     """
     parts: list[str] = []
@@ -1193,6 +1194,26 @@ def _codex_parse_text(output: str) -> str:
                 text = item.get("text", "").strip()
                 if text:
                     parts.append(text)
+        elif etype == "response_item":
+            payload = event.get("payload", {})
+            if payload.get("type") == "message" and payload.get("phase") in (None, "final_answer"):
+                text = _codex_message_content_text(payload).strip()
+                if text:
+                    parts.append(text)
+        elif etype == "event_msg":
+            payload = event.get("payload", {})
+            if payload.get("type") == "agent_message" and payload.get("phase") in (None, "final_answer"):
+                text = str(payload.get("message", "")).strip()
+                if text:
+                    parts.append(text)
+            elif payload.get("type") in ("error", "turn.failed"):
+                msg = _codex_error_message(payload.get("error") or payload.get("message") or payload)
+                raise _provider_error("codex", "event", f"codex error: {msg}")
+        elif etype == "task_complete":
+            msg = event.get("payload", {}).get("last_agent_message", "")
+            text = str(msg).strip()
+            if text and not parts:
+                parts.append(text)
         elif etype == "turn.failed":
             msg = _codex_error_message(event.get("error") or event.get("data") or event)
             raise _provider_error("codex", "turn", f"codex turn failed: {msg}")
@@ -1202,6 +1223,22 @@ def _codex_parse_text(output: str) -> str:
     if not parts:
         raise LLMTransientError("codex output error: returned no text output")
     return "\n".join(parts)
+
+
+def _codex_message_content_text(payload: dict) -> str:
+    content = payload.get("content")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text") or item.get("output_text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        return "\n".join(parts)
+    if isinstance(content, str):
+        return content
+    return ""
 
 
 def _codex_error_message(raw: object) -> str:
@@ -1240,15 +1277,32 @@ def _codex_subprocess_error(result: subprocess.CompletedProcess[str]) -> str:
         return stderr
     stdout = result.stdout.strip()
     if stdout:
+        saw_json_event = _codex_output_has_json_events(stdout)
         try:
             _codex_parse_text(stdout)
         except RuntimeError as exc:
             message = str(exc)
             if "returned no text output" in message:
+                if saw_json_event:
+                    return "codex exited before producing a final answer or structured error"
                 return stdout
             return message
         return stdout
     return "non-zero exit"
+
+
+def _codex_output_has_json_events(output: str) -> bool:
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type"):
+            return True
+    return False
 
 
 class CodexClient(LLMClient):
