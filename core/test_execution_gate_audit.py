@@ -11,7 +11,7 @@ _SKIP_GATE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     (
         "skip",
         "skipped JavaScript/TypeScript test",
-        re.compile(r"\b(?:describe|context|suite|test|it)\.skip\s*\("),
+        re.compile(r"\b(?:describe|context|suite|test|it)\.skip(?:\.\w+)*\s*\("),
     ),
     (
         "skip",
@@ -31,7 +31,7 @@ _SKIP_GATE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     (
         "skip",
         "JUnit disabled test",
-        re.compile(r"(?:^|\s)@Disabled\b"),
+        re.compile(r"(?:^|\s)@(?:Disabled|(?:org\.junit\.)?Ignore)\b"),
     ),
     (
         "assumption",

@@ -47,6 +47,49 @@ fn generated_contract_test() {}
     assert findings[1]["reason"] == "Rust ignored test"
 
 
+def test_detects_parameterized_javascript_skip_gates():
+    findings = detect_new_test_execution_gates(
+        path="tests/generated.test.ts",
+        before=None,
+        after="""\
+test.skip.each([
+  ["case"],
+])("changed behavior %s", () => {});
+describe.skip.each([
+  ["case"],
+])("changed suite %s", () => {});
+""",
+    )
+
+    assert [finding["line"] for finding in findings] == [1, 4]
+    assert [finding["reason"] for finding in findings] == [
+        "skipped JavaScript/TypeScript test",
+        "skipped JavaScript/TypeScript test",
+    ]
+
+
+def test_detects_junit4_ignore_gates():
+    findings = detect_new_test_execution_gates(
+        path="src/test/kotlin/GeneratedTest.kt",
+        before=None,
+        after="""\
+@Ignore
+@Test
+fun generatedContractTest() {}
+
+@org.junit.Ignore("requires browser")
+@Test
+fun generatedBrowserTest() {}
+""",
+    )
+
+    assert [finding["line"] for finding in findings] == [1, 5]
+    assert [finding["reason"] for finding in findings] == [
+        "JUnit disabled test",
+        "JUnit disabled test",
+    ]
+
+
 def test_detects_same_line_environment_gated_test_registration():
     findings = detect_new_test_execution_gates(
         path="tests/clientMain.test.ts",
