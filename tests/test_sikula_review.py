@@ -75,6 +75,7 @@ def _run_review(
         _sub(),  # git worktree add --detach
         _sub(stdout="@@ -1 +1 @@\n+x"),  # git diff
         _sub(stdout="src/main.py\n"),  # git diff --name-only
+        _sub(stdout="@@ -1 +1 @@\n+x"),  # git diff --relative HEAD (reviewer fallback)
         _sub(),  # git worktree remove
     ]
 

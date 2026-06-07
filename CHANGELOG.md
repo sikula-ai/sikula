@@ -21,8 +21,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   keys, 401s, or invalid models.
 - Fatal LLM provider failures such as quota exhaustion, authentication failures, and invalid
   provider/model configuration are now classified separately from transient failures and fail
-  without retry; fixer phases also fail immediately when the fixer returns an unsuccessful
-  result instead of continuing the build/fix loop until the iteration limit.
+  without retry; reviewer, security reviewer, test writer, and fixer phases now fail
+  immediately when the agent returns an unsuccessful technical/provider result instead of
+  continuing from stale state or looping until an iteration limit.
 - Review-fix and security-fix implementer passes now abort immediately when the implementer
   returns an unsuccessful result, preserving the underlying provider/agent failure instead of
   treating an unchanged diff as a completed fix attempt.

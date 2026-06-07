@@ -96,7 +96,10 @@ intentional user-facing terminal output.
 
 ### Error handling
 
-Return `AgentResult(success=False, ...)` or `ToolResult(success=False, ...)` on failure.
+Return `AgentResult(success=False, ...)` or `ToolResult(success=False, ...)` on
+technical/tool/provider failure. Reviewer-style agents may also use
+`AgentResult(success=False, data={"issues": ...})` for a valid domain decision such as
+"issues found"; orchestration must distinguish that from a failed agent invocation.
 Catch `RuntimeError` from LLM clients. Do not catch broad `Exception` unless re-raising
 or wrapping:
 
@@ -476,8 +479,10 @@ Use a stub `LLMClient` (do not call real LLMs in tests). Verify:
 ### Coverage
 
 Target: ≥ 90% branch and line coverage on new and changed code (configured via
-`test_writer.coverage_target` in project YAML). Every `AgentResult(success=False, ...)` path
-must have a dedicated test.
+`test_writer.coverage_target` in project YAML). Every technical/tool/provider failure path
+that returns `AgentResult(success=False, ...)` must have a dedicated test. Valid review
+outcomes that return `success=False` with structured issues must also be covered as normal
+review-loop behavior, not treated as agent invocation failures.
 
 ---
 

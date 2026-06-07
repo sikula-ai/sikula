@@ -567,9 +567,9 @@ class Orchestrator:
             log.info("--- Phase: final review (test changes) ---")
             if not self._refresh_review_fix_diff(state):
                 return
-            self._run_agent("reviewer", state)
+            reviewer_result = self._run_agent("reviewer", state)
             self._reviewer_ran_this_session = True
-            if state.failed:
+            if state.failed or self._abort_on_failed_agent_result(state, "reviewer", reviewer_result):
                 return
             if not state.review_approved:
                 msg = "reviewer rejected test writer changes"
@@ -587,8 +587,8 @@ class Orchestrator:
             log.info("--- Phase: final security review (test changes) ---")
             if not self._refresh_review_fix_diff(state):
                 return
-            self._run_agent("security_reviewer", state)
-            if state.failed:
+            security_result = self._run_agent("security_reviewer", state)
+            if state.failed or self._abort_on_failed_agent_result(state, "security_reviewer", security_result):
                 return
             if not state.security_approved:
                 msg = "security reviewer rejected test writer changes"
@@ -1026,9 +1026,9 @@ class Orchestrator:
             log.info(f"--- Phase: {_phase_scope_label(state)}review ({label}) ---")
             if not self._refresh_review_fix_diff(state):
                 return
-            self._run_agent("reviewer", state)
+            reviewer_result = self._run_agent("reviewer", state)
             self._reviewer_ran_this_session = True
-            if state.failed:
+            if state.failed or self._abort_on_failed_agent_result(state, "reviewer", reviewer_result):
                 return
             if state.review_approved:
                 return
@@ -1093,8 +1093,8 @@ class Orchestrator:
             log.info(f"--- Phase: {_phase_scope_label(state)}security review ({sec_label}) ---")
             if not self._refresh_review_fix_diff(state):
                 return
-            self._run_agent("security_reviewer", state)
-            if state.failed:
+            security_result = self._run_agent("security_reviewer", state)
+            if state.failed or self._abort_on_failed_agent_result(state, "security_reviewer", security_result):
                 return
             if state.security_approved:
                 return
@@ -1669,6 +1669,18 @@ class Orchestrator:
         self._store.save(state)
         return result
 
+    def _abort_on_failed_agent_result(self, state: TaskState, name: str, result) -> bool:
+        if result.success:
+            return False
+        if name in {"reviewer", "security_reviewer"} and (result.data or {}).get("issues"):
+            return False
+        msg = f"{name} failed: {result.message}"
+        log.error(msg)
+        state.record("orchestrator", "abort", msg)
+        state.failed = True
+        self._store.save(state)
+        return True
+
     def _active_operation(
         self,
         state: TaskState,
@@ -1692,6 +1704,8 @@ class Orchestrator:
             return False
         log.info(f"--- Phase: {_phase_scope_label(state)}test write ---")
         result = self._run_agent("test_writer", state)
+        if state.failed or self._abort_on_failed_agent_result(state, "test_writer", result):
+            return False
         files_written = (result.data or {}).get("files_written", [])
         self._mark_build_sync_stale_if_needed(files_written, "test writer", state)
         return bool(files_written)

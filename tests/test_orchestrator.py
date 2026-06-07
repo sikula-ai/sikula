@@ -962,6 +962,25 @@ class TestOrchestratorReviewLoop:
             for entry in result.history
         )
 
+    def test_reviewer_agent_failure_aborts_task(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_review=True, run_build=False)
+        stubs["reviewer"].side_effect = None
+        stubs["reviewer"].result_success = False
+        stubs["reviewer"].result_message = "usage limit reached"
+        self._review_ready(orch)
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed
+        assert len(stubs["reviewer"].calls) == 1
+        assert len(stubs["implementer"].calls) == 0
+        assert any(
+            entry["agent"] == "orchestrator"
+            and entry["action"] == "abort"
+            and entry["result"] == "reviewer failed: usage limit reached"
+            for entry in result.history
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests — security review loop
@@ -1054,6 +1073,30 @@ class TestOrchestratorSecurityLoop:
             entry["agent"] == "orchestrator"
             and entry["action"] == "abort"
             and entry["result"] == "implementer failed: not authenticated"
+            for entry in result.history
+        )
+
+    def test_security_reviewer_agent_failure_aborts_task(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_security_review=True,
+            run_review=False,
+            run_build=False,
+        )
+        stubs["security_reviewer"].side_effect = None
+        stubs["security_reviewer"].result_success = False
+        stubs["security_reviewer"].result_message = "not authenticated"
+        self._security_ready(orch)
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed
+        assert len(stubs["security_reviewer"].calls) == 1
+        assert len(stubs["implementer"].calls) == 0
+        assert any(
+            entry["agent"] == "orchestrator"
+            and entry["action"] == "abort"
+            and entry["result"] == "security_reviewer failed: not authenticated"
             for entry in result.history
         )
 
@@ -1653,6 +1696,36 @@ class TestOrchestratorFixPhase:
         assert len(stubs["security_reviewer"].calls) == 1
         assert len(stubs["test_writer"].calls) == 0
         assert any(record["action"] == "test_only_fix" for record in result.history)
+
+    def test_test_writer_agent_failure_aborts_task(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=True,
+        )
+        stubs["test_writer"].result_success = False
+        stubs["test_writer"].result_message = "quota exhausted"
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            review_approved=True,
+            security_approved=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed
+        assert not result.done
+        assert len(stubs["test_writer"].calls) == 1
+        assert any(
+            entry["agent"] == "orchestrator"
+            and entry["action"] == "abort"
+            and entry["result"] == "test_writer failed: quota exhausted"
+            for entry in result.history
+        )
 
     def test_production_fix_under_broad_test_root_stales_semantic_gates(self, tmp_path: Path):
         orch, stubs, build = _make_orchestrator(
