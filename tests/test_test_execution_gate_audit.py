@@ -59,6 +59,149 @@ def test_detects_same_line_environment_gated_test_registration():
     assert findings[0]["line"] == 1
 
 
+def test_detects_env_var_gated_test_registration_across_common_runtimes():
+    cases = [
+        (
+            "tests/clientMain.test.ts",
+            """\
+if (process.env.RUN_BROWSER_TESTS) {
+  test("browser behavior", () => {});
+}
+""",
+            1,
+        ),
+        (
+            "tests/clientMain.test.ts",
+            """\
+if (process.env.RUN_BROWSER_TESTS)
+  test("browser behavior", () => {});
+""",
+            1,
+        ),
+        (
+            "tests/clientMain.test.ts",
+            """\
+if (import.meta.env.RUN_BROWSER_TESTS) {
+  it("browser behavior", () => {});
+}
+""",
+            1,
+        ),
+        (
+            "tests/client_main_test.py",
+            """\
+import os
+
+if os.environ.get("RUN_BROWSER_TESTS"):
+    def test_browser_behavior():
+        pass
+""",
+            3,
+        ),
+        (
+            "tests/ClientMainTest.kt",
+            """\
+if (System.getenv("RUN_BROWSER_TESTS") != null) {
+    @Test
+    fun testBrowserBehavior() {}
+}
+""",
+            1,
+        ),
+        (
+            "Tests/ClientMainTests.swift",
+            """\
+if ProcessInfo.processInfo.environment["RUN_BROWSER_TESTS"] != nil {
+    func testBrowserBehavior() {}
+}
+""",
+            1,
+        ),
+        (
+            "tests/client_main_test.go",
+            """\
+if (os.Getenv("RUN_BROWSER_TESTS") != "") {
+    func TestBrowserBehavior(t *testing.T) {}
+}
+""",
+            1,
+        ),
+        (
+            "tests/ClientMainTest.php",
+            """\
+if (getenv("RUN_BROWSER_TESTS")) {
+    public function testBrowserBehavior(): void {}
+}
+""",
+            1,
+        ),
+        (
+            "tests/client_main_spec.rb",
+            """\
+if ENV["RUN_BROWSER_TESTS"]
+  it "tests browser behavior" do
+  end
+end
+""",
+            1,
+        ),
+    ]
+
+    for path, after, expected_line in cases:
+        findings = detect_new_test_execution_gates(path=path, before=None, after=after)
+
+        assert findings == [
+            {
+                "path": path,
+                "line": expected_line,
+                "category": "environment",
+                "reason": "environment-gated test registration",
+                "excerpt": after.splitlines()[expected_line - 1].strip(),
+            }
+        ]
+
+
+def test_ignores_env_var_check_that_does_not_gate_test_registration():
+    cases = [
+        (
+            "tests/clientMain.test.ts",
+            """\
+if (process.env.CI) {
+  configureExternalService();
+}
+
+test("runs in normal validation", () => {});
+""",
+        ),
+        (
+            "tests/client_main_test.py",
+            """\
+import os
+
+if os.environ.get("CI"):
+    configure_external_service()
+
+def test_runs_in_normal_validation():
+    pass
+""",
+        ),
+        (
+            "tests/client_main_spec.rb",
+            """\
+if ENV["CI"]
+  configure_external_service
+end
+
+it "runs in normal validation" do
+end
+""",
+        ),
+    ]
+
+    for path, after in cases:
+        assert detect_new_test_execution_gates(path=path, before=None, after=after) == []
+
+
 def test_ignores_preexisting_skip_gate_when_other_lines_change():
     before = """\
 test.skip('external service contract', () => {});

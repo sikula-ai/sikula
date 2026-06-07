@@ -65,10 +65,24 @@ _ENVIRONMENT_GATE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bif\s*\(.*(?:globalThis\.)?(?:document|window|navigator)\s*[!=]==?\s*undefined\b"),
     re.compile(r"\bif\s*\(.*(?:globalThis\.)?(?:document|window|navigator)\s*[!=]==?\s*null\b"),
     re.compile(r"\bif\s*\(.*[\"'](?:document|window|navigator)[\"']\s+in\s+globalThis\b"),
+    re.compile(r"\bif\s*\(.*\b(?:process|import\.meta)\.env(?:\.[A-Za-z_]\w*|\s*\[[^\]]+\])"),
+    re.compile(r"\bif\s+.*\bos\.environ(?:\b|\s*\[|\.get\s*\()"),
+    re.compile(r"\bif\s+.*\bos\.getenv\s*\("),
+    re.compile(r"\bif\s*\(.*\bSystem\.getenv\s*\("),
+    re.compile(r"\bif\s+.*\bENV\s*\["),
+    re.compile(r"\bif\s*\(.*\b(?:getenv\s*\(|\$_(?:ENV|SERVER)\s*\[)"),
+    re.compile(r"\bif\s+.*\bProcessInfo\.processInfo\.environment\b"),
+    re.compile(r"\bif\s*\(.*\bos\.Getenv\s*\("),
 )
 
 _TEST_REGISTRATION_PATTERN = re.compile(
-    r"\b(?:describe|context|suite|test|it)\s*\(|(?:^|\s)(?:func|fun)\s+test\w*\s*\(|(?:^|\s)@Test\b|#\s*\[\s*test\b"
+    r"\b(?:describe|context|suite|test|it)\s*\(|"
+    r"(?:^|\s)(?:describe|context|it)\s+[\"'][^\"']+[\"']\s+do\b|"
+    r"(?:^|\s)def\s+test_\w*\s*\(|"
+    r"(?:^|\s)(?:func|fun)\s+[Tt]est\w*\s*\(|"
+    r"(?:^|\s)(?:public\s+)?function\s+test\w*\s*\(|"
+    r"(?:^|\s)@Test\b|"
+    r"#\s*\[\s*test\b"
 )
 
 
@@ -164,8 +178,71 @@ def _is_environment_gate_for_test_registration(lines: list[str], index: int) -> 
     if not any(pattern.search(stripped) for pattern in _ENVIRONMENT_GATE_PATTERNS):
         return False
 
-    window = lines[index : min(len(lines), index + 12)]
-    return any(_TEST_REGISTRATION_PATTERN.search(_strip_line_comment(line).strip()) for line in window)
+    if _TEST_REGISTRATION_PATTERN.search(stripped):
+        return True
+
+    return any(_TEST_REGISTRATION_PATTERN.search(line) for line in _gated_body_lines(lines, index))
+
+
+def _gated_body_lines(lines: list[str], index: int) -> list[str]:
+    gate_line = _strip_line_comment(lines[index])
+    stripped = gate_line.strip()
+    if "{" in stripped:
+        return _brace_body_lines(lines, index)
+
+    indented = _indented_body_lines(lines, index)
+    if indented:
+        return indented
+
+    return _end_delimited_body_lines(lines, index)
+
+
+def _brace_body_lines(lines: list[str], index: int) -> list[str]:
+    depth = _brace_delta(_strip_line_comment(lines[index]))
+    if depth <= 0:
+        return []
+
+    body: list[str] = []
+    for line in lines[index + 1 : min(len(lines), index + 50)]:
+        stripped = _strip_line_comment(line).strip()
+        if stripped:
+            body.append(stripped)
+        depth += _brace_delta(line)
+        if depth <= 0:
+            break
+    return body
+
+
+def _indented_body_lines(lines: list[str], index: int) -> list[str]:
+    gate_indent = _indent_width(lines[index])
+    body: list[str] = []
+    for line in lines[index + 1 : min(len(lines), index + 50)]:
+        stripped = _strip_line_comment(line).strip()
+        if not stripped:
+            continue
+        if _indent_width(line) <= gate_indent:
+            break
+        body.append(stripped)
+    return body
+
+
+def _end_delimited_body_lines(lines: list[str], index: int) -> list[str]:
+    body: list[str] = []
+    for line in lines[index + 1 : min(len(lines), index + 50)]:
+        stripped = _strip_line_comment(line).strip()
+        if stripped == "end":
+            return body
+        if stripped:
+            body.append(stripped)
+    return []
+
+
+def _brace_delta(line: str) -> int:
+    return line.count("{") - line.count("}")
+
+
+def _indent_width(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
 
 
 def _strip_line_comment(line: str) -> str:
