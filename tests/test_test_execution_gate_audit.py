@@ -58,14 +58,57 @@ test.skip.each([
 describe.skip.each([
   ["case"],
 ])("changed suite %s", () => {});
+test.concurrent.skip("changed concurrent test", () => {});
 """,
     )
 
-    assert [finding["line"] for finding in findings] == [1, 4]
+    assert [finding["line"] for finding in findings] == [1, 4, 7]
     assert [finding["reason"] for finding in findings] == [
         "skipped JavaScript/TypeScript test",
         "skipped JavaScript/TypeScript test",
+        "skipped JavaScript/TypeScript test",
     ]
+
+
+def test_detects_playwright_and_todo_skip_gates():
+    findings = detect_new_test_execution_gates(
+        path="tests/generated.spec.ts",
+        before=None,
+        after="""\
+test.fixme("changed behavior", async ({ page }) => {});
+test.describe.fixme("changed group", () => {});
+test.todo("changed behavior");
+it.todo("changed behavior");
+test.describe.configure({ mode: "skip" });
+test.describe.configure({
+  mode: 'skip',
+});
+""",
+    )
+
+    assert [finding["line"] for finding in findings] == [1, 2, 3, 4, 5, 7]
+    assert [finding["reason"] for finding in findings] == [
+        "Playwright fixme-skipped test",
+        "Playwright fixme-skipped test",
+        "JavaScript/TypeScript todo test",
+        "JavaScript/TypeScript todo test",
+        "Playwright skip-mode configuration",
+        "Playwright skip-mode configuration",
+    ]
+
+
+def test_ignores_unrelated_javascript_skip_mode_values():
+    findings = detect_new_test_execution_gates(
+        path="tests/generated.spec.ts",
+        before=None,
+        after="""\
+test.describe.configure({ mode: "parallel" });
+const options = { mode: "skip" };
+test("runs in normal validation", () => {});
+""",
+    )
+
+    assert findings == []
 
 
 def test_detects_junit4_ignore_gates():

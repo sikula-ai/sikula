@@ -11,7 +11,17 @@ _SKIP_GATE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     (
         "skip",
         "skipped JavaScript/TypeScript test",
-        re.compile(r"\b(?:describe|context|suite|test|it)\.skip(?:\.\w+)*\s*\("),
+        re.compile(r"\b(?:describe|context|suite|test|it)(?:\.\w+)*\.skip(?:\.\w+)*\s*\("),
+    ),
+    (
+        "skip",
+        "Playwright fixme-skipped test",
+        re.compile(r"\b(?:describe|context|suite|test|it)(?:\.\w+)*\.fixme(?:\.\w+)*\s*\("),
+    ),
+    (
+        "skip",
+        "JavaScript/TypeScript todo test",
+        re.compile(r"\b(?:describe|context|suite|test|it)(?:\.\w+)*\.todo(?:\.\w+)*\s*\("),
     ),
     (
         "skip",
@@ -59,6 +69,8 @@ _SKIP_GATE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         re.compile(r"\bmarkTestSkipped\s*\("),
     ),
 )
+_PLAYWRIGHT_CONFIGURE_OPEN_RE = re.compile(r"\btest\.describe\.configure\s*\(\s*\{")
+_PLAYWRIGHT_SKIP_MODE_RE = re.compile(r"\bmode\s*:\s*[\"']skip[\"']")
 
 _ENVIRONMENT_GATE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bif\s*\(.*\btypeof\s+(?:globalThis\.)?(?:document|window|navigator)\b"),
@@ -112,6 +124,10 @@ def detect_new_test_execution_gates(
         if classification:
             category, reason = classification
             findings.append(_finding(path, index, category, reason, line))
+            continue
+
+        if _is_playwright_skip_mode_configuration(after_lines, index):
+            findings.append(_finding(path, index, "skip", "Playwright skip-mode configuration", line))
             continue
 
         if _is_environment_gate_for_test_registration(after_lines, index):
@@ -169,6 +185,22 @@ def _classify_direct_gate(line: str) -> tuple[str, str] | None:
         if pattern.search(stripped):
             return category, reason
     return None
+
+
+def _is_playwright_skip_mode_configuration(lines: list[str], index: int) -> bool:
+    stripped = _strip_line_comment(lines[index]).strip()
+    if not _PLAYWRIGHT_SKIP_MODE_RE.search(stripped):
+        return False
+    if _PLAYWRIGHT_CONFIGURE_OPEN_RE.search(stripped):
+        return True
+
+    for line in reversed(lines[max(0, index - 20) : index]):
+        previous = _strip_line_comment(line).strip()
+        if "}" in previous:
+            break
+        if _PLAYWRIGHT_CONFIGURE_OPEN_RE.search(previous):
+            return True
+    return False
 
 
 def _is_environment_gate_for_test_registration(lines: list[str], index: int) -> bool:
