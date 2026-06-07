@@ -183,7 +183,7 @@ pipx install sikula
 Sikula ships with built-in clients for:
 - **`CodexClient`** (`provider: "codex"`) — calls the `codex exec` CLI
 - **`ClaudeClient`** (`provider: "claude"`) — calls the `claude -p` CLI
-- **`GeminiClient`** (`provider: "gemini"`) — calls the `gemini -p` CLI
+- **`GeminiClient`** (`provider: "gemini"`) — calls the `gemini` CLI
 - **`OpenCodeClient`** (`provider: "opencode"`) — calls the `opencode run` CLI; model must be in `provider/model` format (e.g. `openai/gpt-5.3-codex`)
 
 To use a different model or provider, see [Adding a new LLM provider](#adding-a-new-llm-provider) and [Per-agent LLM config](#10-per-agent-llm-config).
@@ -1031,6 +1031,10 @@ class CustomClient(LLMClient):
 ```
 
 The `system` argument passed to `generate` and the `prompt` argument passed to `run_readonly_agent` and `run_agent` already contain `AGENT_SECURITY_PREFIX` (defined in `agents/base_agent.py`) — the network and filesystem constraint is injected by each agent before calling the provider. You do not need to add it in your implementation.
+
+If a provider is backed by a CLI, pass large prompts through stdin or another non-argv input
+channel. Reviewer, analyst, and implementation prompts can exceed operating-system command-line
+argument limits on large tasks.
 
 **Step 2 — register in the factory** (`core/llm_client.py`):
 

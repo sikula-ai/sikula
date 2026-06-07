@@ -186,6 +186,14 @@ read-only invariant and the sandbox boundary.
 | `AnalystAgent`, `ReviewerAgent`, `SecurityReviewerAgent` | `run_readonly_agent()` |
 | `ImplementerAgent`, `FixerAgent`, `TestWriterAgent` | `run_agent()` |
 
+### CLI-backed LLM clients
+
+When implementing or modifying a provider in `core/llm_client.py` that wraps a CLI,
+do not pass full prompts as command-line arguments. Use stdin or another non-argv
+input channel for `generate()`, `run_readonly_agent()`, and `run_agent()` prompts.
+Reviewer, analyst, and implementation prompts can exceed operating-system argument
+length limits on large tasks; command arguments should carry provider options only.
+
 ### State recording
 
 Call `state.record(self.name, action, result)` after every meaningful action.

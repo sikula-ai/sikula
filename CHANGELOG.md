@@ -25,6 +25,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Review-fix and security-fix implementer passes now abort immediately when the implementer
   returns an unsuccessful result, preserving the underlying provider/agent failure instead of
   treating an unchanged diff as a completed fix attempt.
+- Codex, Claude, and Gemini prompts are now passed through stdin instead of as command-line
+  arguments, preventing large reviewer/analyst prompts from failing before the provider starts
+  with OS argument-length errors.
 - Planner outputs that exceed `planner.max_steps` are now rejected, retried once with a stricter
   format prompt, and then failed before implementation if still over limit; planner config is
   also captured in task config snapshots for auditability.

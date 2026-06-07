@@ -358,8 +358,9 @@ class ClaudeClient(LLMClient):
 
         def _call():
             result = subprocess.run(
-                ["claude", "-p", prompt, "--model", self._config.model],
+                ["claude", "-p", "--model", self._config.model],
                 capture_output=True,
+                input=prompt,
                 text=True,
                 timeout=300,
             )
@@ -379,7 +380,6 @@ class ClaudeClient(LLMClient):
                 [
                     "claude",
                     "-p",
-                    prompt,
                     "--model",
                     self._config.model,
                     "--permission-mode",
@@ -390,6 +390,7 @@ class ClaudeClient(LLMClient):
                     "Read,Bash(grep *),Bash(find *),Bash(ls *),LS,Glob",
                 ],
                 capture_output=True,
+                input=prompt,
                 text=True,
                 cwd=cwd,
                 timeout=self._config.agent_timeout,
@@ -415,7 +416,6 @@ class ClaudeClient(LLMClient):
                     [
                         "claude",
                         "-p",
-                        prompt,
                         "--model",
                         self._config.model,
                         # acceptEdits: auto-approves file edits; --settings passes Sikula's
@@ -433,6 +433,7 @@ class ClaudeClient(LLMClient):
                     env=None,
                     timeout=self._config.agent_timeout,
                     provider="claude",
+                    stdin_text=prompt,
                 )
                 if result.returncode != 0:
                     err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
@@ -1123,11 +1124,9 @@ class GeminiClient(LLMClient):
     def __init__(self, config: LLMConfig) -> None:
         self._config = config
 
-    def _cmd(self, prompt: str, extra: list[str] | None = None) -> list[str]:
+    def _cmd(self, extra: list[str] | None = None) -> list[str]:
         return [
             "gemini",
-            "-p",
-            prompt,
             "--skip-trust",
             "--model",
             self._config.model,
@@ -1142,8 +1141,9 @@ class GeminiClient(LLMClient):
 
         def _call():
             result = subprocess.run(
-                self._cmd(prompt),
+                self._cmd(),
                 capture_output=True,
+                input=prompt,
                 text=True,
                 timeout=300,
             )
@@ -1159,8 +1159,9 @@ class GeminiClient(LLMClient):
 
         def _call():
             result = subprocess.run(
-                self._cmd(prompt, ["--approval-mode", "yolo"]),
+                self._cmd(["--approval-mode", "yolo"]),
                 capture_output=True,
+                input=prompt,
                 text=True,
                 cwd=cwd,
                 timeout=self._config.agent_timeout,
@@ -1182,11 +1183,12 @@ class GeminiClient(LLMClient):
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
             try:
                 result = _run_agent_subprocess_streaming(
-                    self._cmd(prompt, ["--approval-mode", "yolo"]),
+                    self._cmd(["--approval-mode", "yolo"]),
                     cwd=cwd,
                     env=None,
                     timeout=self._config.agent_timeout,
                     provider="gemini",
+                    stdin_text=prompt,
                 )
                 if result.returncode != 0:
                     err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
@@ -1402,7 +1404,7 @@ class CodexClient(LLMClient):
     def __init__(self, config: LLMConfig) -> None:
         self._config = config
 
-    def _exec_cmd(self, sandbox: str, prompt: str) -> list[str]:
+    def _exec_cmd(self, sandbox: str) -> list[str]:
         return [
             "codex",
             "exec",
@@ -1412,7 +1414,7 @@ class CodexClient(LLMClient):
             sandbox,
             "-m",
             self._config.model,
-            prompt,
+            "-",
         ]
 
     def generate(self, system: str, user: str) -> str:
@@ -1421,8 +1423,9 @@ class CodexClient(LLMClient):
 
         def _call():
             result = subprocess.run(
-                self._exec_cmd("read-only", prompt),
+                self._exec_cmd("read-only"),
                 capture_output=True,
+                input=prompt,
                 text=True,
                 timeout=300,
             )
@@ -1437,8 +1440,9 @@ class CodexClient(LLMClient):
 
         def _call():
             result = subprocess.run(
-                self._exec_cmd("read-only", prompt),
+                self._exec_cmd("read-only"),
                 capture_output=True,
+                input=prompt,
                 text=True,
                 cwd=cwd,
                 timeout=self._config.agent_timeout,
@@ -1458,11 +1462,12 @@ class CodexClient(LLMClient):
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
             try:
                 result = _run_agent_subprocess_streaming(
-                    self._exec_cmd("workspace-write", prompt),
+                    self._exec_cmd("workspace-write"),
                     cwd=cwd,
                     env=None,
                     timeout=self._config.agent_timeout,
                     provider="codex",
+                    stdin_text=prompt,
                     stdout_error_parser=_codex_stream_error,
                 )
                 if result.returncode != 0:

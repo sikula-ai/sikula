@@ -788,11 +788,15 @@ class TestClaudeWriteSettings:
             return m
 
         with (
-            patch("core.llm_client.subprocess.run", side_effect=fake_run),
+            patch("core.llm_client.subprocess.run", side_effect=fake_run) as mock_run,
             patch("core.llm_client._claude_write_settings") as mock_setup,
         ):
             client.run_readonly_agent("review this", tmp_path)
 
+        cmd = mock_run.call_args.args[0]
+        assert cmd[:2] == ["claude", "-p"]
+        assert "review this" not in cmd
+        assert mock_run.call_args.kwargs["input"] == "review this"
         mock_setup.assert_called_once_with(tmp_path)
 
     def test_run_agent_calls_write_settings(self, tmp_path):
@@ -803,12 +807,16 @@ class TestClaudeWriteSettings:
             patch(
                 "core.llm_client._run_agent_subprocess_streaming",
                 return_value=subprocess.CompletedProcess([], 0, "done", ""),
-            ),
+            ) as mock_run,
             patch("core.llm_client._git_snapshot", return_value={}),
             patch("core.llm_client._claude_write_settings") as mock_setup,
         ):
             client.run_agent("implement this", tmp_path)
 
+        cmd = mock_run.call_args.args[0]
+        assert cmd[:2] == ["claude", "-p"]
+        assert "implement this" not in cmd
+        assert mock_run.call_args.kwargs["stdin_text"] == "implement this"
         mock_setup.assert_called_once_with(tmp_path)
 
 
@@ -989,6 +997,9 @@ class TestCodexClientCommands:
         cmd = mock_run.call_args.args[0]
         assert cmd[:5] == ["codex", "exec", "--skip-git-repo-check", "--json", "--sandbox"]
         assert cmd[5] == "read-only"
+        assert cmd[-1] == "-"
+        assert "system\n\nuser" not in cmd
+        assert mock_run.call_args.kwargs["input"] == "system\n\nuser"
 
     def test_generate_failure_reports_stdout_json_error(self):
         client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
@@ -1012,6 +1023,9 @@ class TestCodexClientCommands:
         cmd = mock_run.call_args.args[0]
         assert cmd[:5] == ["codex", "exec", "--skip-git-repo-check", "--json", "--sandbox"]
         assert cmd[5] == "read-only"
+        assert cmd[-1] == "-"
+        assert "prompt" not in cmd
+        assert mock_run.call_args.kwargs["input"] == "prompt"
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
 
     def test_run_readonly_agent_failure_reports_stdout_json_error(self, tmp_path: Path):
@@ -1053,7 +1067,10 @@ class TestCodexClientCommands:
         cmd = mock_run.call_args.args[0]
         assert cmd[:5] == ["codex", "exec", "--skip-git-repo-check", "--json", "--sandbox"]
         assert cmd[5] == "workspace-write"
+        assert cmd[-1] == "-"
+        assert "prompt" not in cmd
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
+        assert mock_run.call_args.kwargs["stdin_text"] == "prompt"
         assert changed == []
         assert output == "ok"
 
@@ -1155,7 +1172,9 @@ class TestGeminiClientCommands:
             assert client.generate("system", "user") == "ok"
 
         cmd = mock_run.call_args.args[0]
-        assert cmd[:4] == ["gemini", "-p", "system\n\nuser", "--skip-trust"]
+        assert cmd[:3] == ["gemini", "--skip-trust", "--model"]
+        assert "system\n\nuser" not in cmd
+        assert mock_run.call_args.kwargs["input"] == "system\n\nuser"
         assert "--approval-mode" not in cmd
 
     def test_run_readonly_agent_skips_workspace_trust_check(self, tmp_path: Path):
@@ -1167,7 +1186,9 @@ class TestGeminiClientCommands:
             assert client.run_readonly_agent("prompt", tmp_path) == "ok"
 
         cmd = mock_run.call_args.args[0]
-        assert cmd[:4] == ["gemini", "-p", "prompt", "--skip-trust"]
+        assert cmd[:3] == ["gemini", "--skip-trust", "--model"]
+        assert "prompt" not in cmd
+        assert mock_run.call_args.kwargs["input"] == "prompt"
         assert cmd[cmd.index("--approval-mode") + 1] == "yolo"
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
 
@@ -1181,7 +1202,9 @@ class TestGeminiClientCommands:
             changed, output = client.run_agent("prompt", tmp_path)
 
         cmd = mock_run.call_args.args[0]
-        assert cmd[:4] == ["gemini", "-p", "prompt", "--skip-trust"]
+        assert cmd[:3] == ["gemini", "--skip-trust", "--model"]
+        assert "prompt" not in cmd
+        assert mock_run.call_args.kwargs["stdin_text"] == "prompt"
         assert cmd[cmd.index("--approval-mode") + 1] == "yolo"
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
         assert changed == []
