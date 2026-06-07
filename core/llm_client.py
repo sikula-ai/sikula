@@ -39,8 +39,6 @@ log = logging.getLogger(__name__)
 _RETRY_DELAYS: tuple[int, ...] = (30, 60, 120)
 _MAX_RETRY_ERROR_CHARS = 1000
 _RETRY_ERROR_HEAD_CHARS = 350
-_STREAM_FATAL_SCAN_CHARS = 8000
-_LOG_MATCH_SCAN_CHARS = 200000
 
 RetryObserver = Callable[[dict[str, object]], None]
 
@@ -74,7 +72,6 @@ class LLMConfigurationError(LLMFatalError):
 
 
 StreamErrorParser = Callable[[str], LLMProviderError | None]
-FatalEventSupplier = Callable[[], LLMFatalError | None]
 
 
 @dataclass
@@ -630,13 +627,6 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
         process.wait()
 
 
-def _opencode_log_matches_command(text: str, cmd: list[str]) -> bool:
-    if "args=[" not in text:
-        return False
-    expected_tokens = cmd[1:] if cmd and cmd[0] == "opencode" else cmd
-    return all(json.dumps(token) in text for token in expected_tokens)
-
-
 def _json_object_after_marker(text: str, marker: str) -> object | None:
     marker_pos = text.find(marker)
     if marker_pos < 0:
@@ -672,96 +662,30 @@ def _json_object_after_marker(text: str, marker: str) -> object | None:
     return None
 
 
-def _opencode_log_fatal_error(text: str) -> LLMFatalError | None:
-    for line in text.splitlines():
-        structured_parts: dict[str, object] = {}
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            event = None
-        if isinstance(event, dict):
-            if "responseBody" in event:
-                structured_parts["responseBody"] = event["responseBody"]
-            if "responseHeaders" in event:
-                structured_parts["responseHeaders"] = event["responseHeaders"]
+def _opencode_log_error(line: str) -> LLMProviderError | None:
+    structured_parts: dict[str, object] = {}
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        event = None
+    if isinstance(event, dict):
+        if "responseBody" in event:
+            structured_parts["responseBody"] = event["responseBody"]
+        if "responseHeaders" in event:
+            structured_parts["responseHeaders"] = event["responseHeaders"]
 
-        response_body = _json_object_after_marker(line, "responseBody=")
-        if response_body is not None:
-            structured_parts["responseBody"] = response_body
-        response_headers = _json_object_after_marker(line, "responseHeaders=")
-        if response_headers is not None:
-            structured_parts["responseHeaders"] = response_headers
+    response_body = _json_object_after_marker(line, "responseBody=")
+    if response_body is not None:
+        structured_parts["responseBody"] = response_body
+    response_headers = _json_object_after_marker(line, "responseHeaders=")
+    if response_headers is not None:
+        structured_parts["responseHeaders"] = response_headers
 
-        if not structured_parts:
-            continue
+    if structured_parts:
         provider_error = _provider_error("opencode", "agent", json.dumps(structured_parts))
         if isinstance(provider_error, LLMFatalError):
             return provider_error
     return None
-
-
-class _LogFatalScanner:
-    def __init__(self, log_dir: Path, start_time: float, expected_cmd: list[str] | None = None) -> None:
-        self._log_dir = log_dir
-        self._start_time = start_time
-        self._offsets: dict[Path, int] = {}
-        self._expected_cmd = expected_cmd
-        self._matched_paths: set[Path] = set()
-
-    def _read_match_window(self, path: Path, size: int) -> str:
-        try:
-            with path.open("r", encoding="utf-8", errors="replace") as f:
-                head = f.read(_LOG_MATCH_SCAN_CHARS)
-                if size > _LOG_MATCH_SCAN_CHARS:
-                    f.seek(max(0, size - _STREAM_FATAL_SCAN_CHARS))
-                    tail = f.read()
-                else:
-                    tail = ""
-        except OSError:
-            return ""
-        return head + "\n" + tail
-
-    def _matches_expected_command(self, path: Path, size: int) -> bool:
-        if self._expected_cmd is None or path in self._matched_paths:
-            return True
-        if _opencode_log_matches_command(self._read_match_window(path, size), self._expected_cmd):
-            self._matched_paths.add(path)
-            return True
-        return False
-
-    def read_fatal_error(self) -> LLMFatalError | None:
-        if not self._log_dir.exists():
-            return None
-        for path in self._log_dir.glob("*.log"):
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            if path not in self._offsets:
-                if stat.st_mtime < self._start_time - 2:
-                    continue
-                self._offsets[path] = max(0, stat.st_size - _STREAM_FATAL_SCAN_CHARS)
-            if not self._matches_expected_command(path, stat.st_size):
-                continue
-            try:
-                with path.open("r", encoding="utf-8", errors="replace") as f:
-                    f.seek(self._offsets[path])
-                    text = f.read()
-                    self._offsets[path] = f.tell()
-            except OSError:
-                continue
-            if text:
-                fatal_error = _opencode_log_fatal_error(text)
-                if fatal_error is not None:
-                    return fatal_error
-        return None
-
-
-def _opencode_log_dir(env: dict[str, str]) -> Path:
-    data_home = env.get("XDG_DATA_HOME")
-    if data_home:
-        return Path(data_home) / "opencode" / "log"
-    return Path.home() / ".local" / "share" / "opencode" / "log"
 
 
 def _run_agent_subprocess_streaming(
@@ -774,7 +698,6 @@ def _run_agent_subprocess_streaming(
     stdin_text: str | None = None,
     stdout_error_parser: StreamErrorParser | None = None,
     stderr_error_parser: StreamErrorParser | None = None,
-    fatal_event_supplier: FatalEventSupplier | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run an agent subprocess while watching provider-owned events for fatal errors."""
     process = subprocess.Popen(
@@ -849,12 +772,6 @@ def _run_agent_subprocess_streaming(
             _terminate_process(process)
             raise writer_error
 
-        if fatal_event_supplier is not None:
-            fatal_error = fatal_event_supplier()
-            if fatal_error is not None:
-                _terminate_process(process)
-                raise fatal_error
-
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             _terminate_process(process)
@@ -912,7 +829,6 @@ def _run_opencode_streaming(
     timeout: int,
 ) -> subprocess.CompletedProcess[str]:
     """Run opencode while watching output for provider errors before process exit."""
-    log_scanner = _LogFatalScanner(_opencode_log_dir(env), time.time(), cmd)
     return _run_agent_subprocess_streaming(
         cmd,
         cwd=cwd,
@@ -921,7 +837,7 @@ def _run_opencode_streaming(
         provider="opencode",
         stdin_text=prompt,
         stdout_error_parser=_opencode_stream_error,
-        fatal_event_supplier=log_scanner.read_fatal_error,
+        stderr_error_parser=_opencode_log_error,
     )
 
 
@@ -1020,6 +936,9 @@ class OpenCodeClient(LLMClient):
                             _OPENCODE_IMPLEMENTER_AGENT,
                             "--format",
                             "json",
+                            "--print-logs",
+                            "--log-level",
+                            "ERROR",
                         ],
                         prompt=prompt,
                         cwd=cwd,

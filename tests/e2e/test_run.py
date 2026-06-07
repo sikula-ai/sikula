@@ -614,11 +614,10 @@ class TestAgentException:
         assert "error" in actions
 
     @pytest.mark.parametrize(
-        ("provider", "stdout", "stderr", "log_text", "expected_message"),
+        ("provider", "stdout", "stderr", "expected_message"),
         [
             (
                 "opencode",
-                "",
                 "",
                 json.dumps(
                     {
@@ -640,7 +639,6 @@ class TestAgentException:
                 "codex",
                 json.dumps({"type": "error", "message": "quota exceeded"}),
                 "",
-                "",
                 "quota exceeded",
             ),
         ],
@@ -651,7 +649,6 @@ class TestAgentException:
         provider: str,
         stdout: str,
         stderr: str,
-        log_text: str,
         expected_message: str,
     ):
         """Full run with real provider clients fails on streamed fatal provider errors."""
@@ -675,13 +672,6 @@ class TestAgentException:
                 self.stderr = StringIO(stderr)
                 self.returncode = None
                 self.terminated = False
-                if log_text:
-                    log_dir = Path(os.environ["XDG_DATA_HOME"]) / "opencode" / "log"
-                    log_dir.mkdir(parents=True)
-                    cmd = args[0]
-                    (log_dir / "2026-06-07T000000.log").write_text(
-                        f"INFO args={json.dumps(cmd[1:])} opencode\n{log_text}"
-                    )
 
             def poll(self):
                 return self.returncode

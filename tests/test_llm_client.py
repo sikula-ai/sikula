@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import errno
 import json
-import os
 import subprocess
 import threading
-import time
 from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -31,8 +29,6 @@ from core.llm_client import (
     _git_exclude_file,
     _gemini_parse_response,
     _gemini_write_settings,
-    _LogFatalScanner,
-    _opencode_log_matches_command,
     _opencode_stream_error,
     _run_agent_subprocess_streaming,
     _opencode_agent_env,
@@ -279,47 +275,6 @@ class TestStreamingProcessHelpers:
         process.kill.assert_called_once()
         assert process.wait.call_count == 2
 
-    def test_opencode_log_matches_expected_command_tokens(self):
-        cmd = ["opencode", "run", "--dir", "/work/current", "--model", "openai/gpt-5.5"]
-        text = f"INFO args={json.dumps(cmd[1:])} opencode"
-
-        assert _opencode_log_matches_command(text, cmd)
-        assert not _opencode_log_matches_command("INFO no args here", cmd)
-        assert not _opencode_log_matches_command('INFO args=["run","--dir","/work/other"]', cmd)
-
-    def test_log_scanner_returns_none_when_log_dir_missing(self, tmp_path: Path):
-        scanner = _LogFatalScanner(tmp_path / "missing" / "log", time.time(), None)
-
-        assert scanner.read_fatal_error() is None
-
-    def test_log_scanner_ignores_old_files(self, tmp_path: Path):
-        log_dir = tmp_path / "opencode" / "log"
-        log_dir.mkdir(parents=True)
-        path = log_dir / "old.log"
-        path.write_text('ERROR responseBody={"error":{"type":"usage_limit_reached"}}')
-        old = time.time() - 30
-        path.touch()
-        os.utime(path, (old, old))
-
-        scanner = _LogFatalScanner(log_dir, time.time(), None)
-
-        assert scanner.read_fatal_error() is None
-
-    def test_log_scanner_reads_large_file_tail_after_matching_header(self, tmp_path: Path):
-        log_dir = tmp_path / "opencode" / "log"
-        log_dir.mkdir(parents=True)
-        cmd = ["opencode", "run", "--dir", "/work/current", "--model", "openai/gpt-5.5"]
-        path = log_dir / "current.log"
-        path.write_text(
-            f"INFO args={json.dumps(cmd[1:])} opencode\n"
-            + ("x" * 140000)
-            + '\nERROR responseBody={"error":{"type":"usage_limit_reached"}}'
-        )
-
-        scanner = _LogFatalScanner(log_dir, time.time() - 1, cmd)
-
-        assert isinstance(scanner.read_fatal_error(), LLMQuotaExceeded)
-
     def test_streaming_agent_timeout_terminates_process(self, tmp_path: Path):
         class HangingProcess:
             def __init__(self, *args, **kwargs) -> None:
@@ -473,15 +428,6 @@ class TestStreamingProcessHelpers:
 
         assert processes[0].terminated is True
 
-    def test_log_scanner_ignores_malformed_structured_marker(self, tmp_path: Path):
-        log_dir = tmp_path / "opencode" / "log"
-        log_dir.mkdir(parents=True)
-        (log_dir / "current.log").write_text("ERROR responseBody={not-json}")
-
-        scanner = _LogFatalScanner(log_dir, time.time() - 1, None)
-
-        assert scanner.read_fatal_error() is None
-
     def test_streaming_agent_stops_on_stderr_structured_error(self, tmp_path: Path):
         class StderrErrorProcess:
             def __init__(self, *args, **kwargs) -> None:
@@ -597,6 +543,8 @@ class TestOpenCodeClientCommands:
         assert mock_run.call_args.kwargs["prompt"] == "prompt"
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
         assert "OPENCODE_CONFIG_DIR" in mock_run.call_args.kwargs["env"]
+        assert "--print-logs" in cmd
+        assert cmd[cmd.index("--log-level") + 1] == "ERROR"
         assert changed == []
         assert output == "ok"
 
@@ -799,25 +747,19 @@ class TestOpenCodeClientCommands:
 
         assert processes[0].terminated is True
 
-    def test_opencode_streaming_agent_stops_on_usage_limit_in_log_file(self, tmp_path: Path):
-        class HangingLogQuotaProcess:
+    def test_opencode_streaming_agent_stops_on_usage_limit_in_printed_log_stream(self, tmp_path: Path):
+        class HangingPrintedLogQuotaProcess:
             def __init__(self, *args, **kwargs) -> None:
                 self.stdin = StringIO()
                 self.stdout = StringIO()
-                self.stderr = StringIO()
-                self.returncode = None
-                self.terminated = False
-
-                log_dir = Path(kwargs["env"]["XDG_DATA_HOME"]) / "opencode" / "log"
-                log_dir.mkdir(parents=True)
-                cmd = args[0]
-                (log_dir / "2026-06-07T000000.log").write_text(
-                    f"INFO args={json.dumps(cmd[1:])} opencode\n"
+                self.stderr = StringIO(
                     'ERROR service=llm responseHeaders={"x-codex-credits-balance":"0",'
                     '"x-codex-credits-has-credits":"False"} '
                     'responseBody={"error":{"type":"usage_limit_reached",'
                     '"message":"The usage limit has been reached"}}'
                 )
+                self.returncode = None
+                self.terminated = False
 
             def poll(self):
                 return self.returncode
@@ -835,7 +777,7 @@ class TestOpenCodeClientCommands:
         processes = []
 
         def fake_popen(*args, **kwargs):
-            process = HangingLogQuotaProcess(*args, **kwargs)
+            process = HangingPrintedLogQuotaProcess(*args, **kwargs)
             processes.append(process)
             return process
 
@@ -847,52 +789,11 @@ class TestOpenCodeClientCommands:
                 ["opencode", "run", "--format", "json"],
                 prompt="prompt",
                 cwd=tmp_path,
-                env={"XDG_DATA_HOME": str(tmp_path / "xdg")},
+                env={},
                 timeout=30,
             )
 
         assert processes[0].terminated is True
-
-    def test_opencode_log_scanner_ignores_other_run_args(self, tmp_path: Path):
-        log_dir = tmp_path / "opencode" / "log"
-        log_dir.mkdir(parents=True)
-        expected_cmd = [
-            "opencode",
-            "run",
-            "--dir",
-            "/work/current",
-            "--model",
-            "openai/gpt-5.5",
-            "--agent",
-            "sikula-implementer",
-            "--format",
-            "json",
-        ]
-        other_cmd = [
-            "run",
-            "--dir",
-            "/work/other",
-            "--model",
-            "anthropic/claude",
-            "--agent",
-            "other-agent",
-            "--format",
-            "json",
-        ]
-        (log_dir / "other.log").write_text(
-            f"INFO args={json.dumps(other_cmd)} opencode\n"
-            'ERROR responseBody={"error":{"type":"usage_limit_reached"}}'
-        )
-
-        scanner = _LogFatalScanner(log_dir, time.time() - 1, expected_cmd)
-        assert scanner.read_fatal_error() is None
-
-        matching_cmd = expected_cmd[1:]
-        (log_dir / "current.log").write_text(
-            f"INFO args={json.dumps(matching_cmd)} opencode\n"
-            'ERROR responseBody={"error":{"type":"usage_limit_reached"}}'
-        )
-        assert isinstance(scanner.read_fatal_error(), LLMQuotaExceeded)
 
     def test_streaming_agent_stops_on_structured_codex_error_event(
         self,
@@ -1002,6 +903,56 @@ class TestOpenCodeClientCommands:
         assert processes[0].terminated is False
         assert result.returncode == 0
 
+    def test_opencode_printed_error_log_without_provider_payload_keeps_running(self, tmp_path: Path):
+        raw_log = "ERROR service=default message=background warning without provider response payload"
+
+        class SuccessfulPrintedLogProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stdin = StringIO()
+                self.stdout = StringIO(json.dumps({"type": "text", "part": {"text": "done"}}))
+                self.stderr = StringIO(raw_log)
+                self.returncode = None
+                self.terminated = False
+                self._polls = 0
+
+            def poll(self):
+                self._polls += 1
+                if self._polls > len(raw_log) + 5:
+                    self.returncode = 0
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        processes = []
+
+        def fake_popen(*args, **kwargs):
+            process = SuccessfulPrintedLogProcess(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with patch("core.llm_client.subprocess.Popen", side_effect=fake_popen):
+            result = _run_opencode_streaming(
+                ["opencode", "run", "--format", "json", "--print-logs", "--log-level", "ERROR"],
+                prompt="prompt",
+                cwd=tmp_path,
+                env={},
+                timeout=30,
+            )
+
+        assert processes[0].terminated is False
+        assert result.returncode == 0
+        assert raw_log in result.stderr
+
     @pytest.mark.parametrize(
         ("stream_name", "benign_output"),
         [
@@ -1071,17 +1022,6 @@ class TestOpenCodeClientCommands:
             assert benign_output in result.stdout
         else:
             assert benign_output in result.stderr
-
-    def test_opencode_log_scanner_ignores_unstructured_log_terms(self, tmp_path: Path):
-        log_dir = tmp_path / "opencode" / "log"
-        log_dir.mkdir(parents=True)
-        (log_dir / "current.log").write_text(
-            "INFO args=[] output mentions unauthorized, invalid model, API key, and 401 examples"
-        )
-
-        scanner = _LogFatalScanner(log_dir, time.time() - 1, None)
-
-        assert scanner.read_fatal_error() is None
 
     def test_readonly_failure_falls_back_to_non_zero_exit(self, tmp_path: Path):
         client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))

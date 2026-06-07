@@ -14,10 +14,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Build sync now has platform-neutral adoption and audit for source-controlled generated outputs such as lockfiles and dependency verification metadata: existing tracked sync outputs are added to `files_changed`, semantic review/test gates are invalidated, unexpected non-ignored artifacts are cleaned or fail closed, and project-specific new output patterns can be configured with `build.sync_adopt_paths`.
 
 ### Fixed
-- OpenCode write-agent runs now monitor structured provider error events and command-matched
-  OpenCode log `responseBody` / `responseHeaders` fields for fatal quota/auth/config failures,
-  so exhausted credits fail immediately instead of waiting for the long agent timeout while
-  avoiding false positives from normal agent prose that mentions API keys, 401s, or invalid models.
+- OpenCode write-agent runs now monitor structured provider error events and OpenCode's
+  `--print-logs` stderr stream for `responseBody` / `responseHeaders` fields carrying fatal
+  quota/auth/config failures, so exhausted credits fail immediately instead of waiting for the
+  long agent timeout while avoiding false positives from normal agent prose that mentions API
+  keys, 401s, or invalid models.
 - Fatal LLM provider failures such as quota exhaustion, authentication failures, and invalid
   provider/model configuration are now classified separately from transient failures and fail
   without retry; fixer phases also fail immediately when the fixer returns an unsuccessful
