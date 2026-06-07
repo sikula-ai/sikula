@@ -1045,9 +1045,16 @@ class Orchestrator:
             scope = _phase_scope_label(state)
             log.info(f"--- Phase: implement ({scope}review fix {state.review_iterations}/{max_fixes}) ---")
             implementer_result = self._run_agent("implementer", state)
-            self._session_code_changed = True
             if state.failed:
                 return
+            if not implementer_result.success:
+                msg = f"implementer failed: {implementer_result.message}"
+                log.error(msg)
+                state.record("orchestrator", "abort", msg)
+                state.failed = True
+                self._store.save(state)
+                return
+            self._session_code_changed = True
             self._mark_build_sync_stale_if_needed(
                 (implementer_result.data or {}).get("files_written", []),
                 "review fix",
@@ -1106,9 +1113,16 @@ class Orchestrator:
             scope = _phase_scope_label(state)
             log.info(f"--- Phase: implement ({scope}security fix {state.security_review_iterations}/{max_iter}) ---")
             implementer_result = self._run_agent("implementer", state)
-            self._session_code_changed = True
             if state.failed:
                 return
+            if not implementer_result.success:
+                msg = f"implementer failed: {implementer_result.message}"
+                log.error(msg)
+                state.record("orchestrator", "abort", msg)
+                state.failed = True
+                self._store.save(state)
+                return
+            self._session_code_changed = True
             self._mark_build_sync_stale_if_needed(
                 (implementer_result.data or {}).get("files_written", []),
                 "security fix",

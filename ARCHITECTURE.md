@@ -176,6 +176,7 @@ Orchestrator.run()
    │     │      ImplementerAgent  (review fix pass)                │
    │     │        reads  → state.review_issues appended to prompt  │
    │     │        applies fixes, updates state.files_changed       │
+   │     │        failure → state.failed = True, task aborted      │
    │     │        resets → state.tests_up_to_date = False          │
    │     │                                                         │
    │     │  repeat until approved or review_iterations ≥          │
@@ -200,6 +201,7 @@ Orchestrator.run()
    │     │      ImplementerAgent  (security fix pass)              │
    │     │        reads  → state.review_issues appended to prompt  │
    │     │        applies fixes, updates state.files_changed       │
+   │     │        failure → state.failed = True, task aborted      │
    │     │      review loop re-runs (Phase 3)                      │
    │     │      security review re-runs                            │
    │     │                                                         │

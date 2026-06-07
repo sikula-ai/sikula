@@ -938,6 +938,30 @@ class TestOrchestratorReviewLoop:
         assert len(stubs["reviewer"].calls) == 2
         assert len(stubs["implementer"].calls) == 1
 
+    def test_review_fix_implementer_failure_aborts_task(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_review=True, run_build=False, max_review_iterations=3)
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = False
+            state.review_issues = ["missing null check"]
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].result_success = False
+        stubs["implementer"].result_message = "quota exhausted"
+        self._review_ready(orch)
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed
+        assert len(stubs["reviewer"].calls) == 1
+        assert len(stubs["implementer"].calls) == 1
+        assert any(
+            entry["agent"] == "orchestrator"
+            and entry["action"] == "abort"
+            and entry["result"] == "implementer failed: quota exhausted"
+            for entry in result.history
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests — security review loop
@@ -1000,6 +1024,38 @@ class TestOrchestratorSecurityLoop:
         assert not result.failed
         assert len(stubs["implementer"].calls) == 1
         assert len(stubs["reviewer"].calls) >= 1
+
+    def test_security_fix_implementer_failure_aborts_task(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_security_review=True,
+            run_review=True,
+            run_build=False,
+            max_security_review_iterations=2,
+            max_review_iterations=3,
+        )
+
+        def security_effect(state: TaskState) -> None:
+            state.security_approved = False
+            state.review_issues = ["hardcoded key"]
+
+        stubs["security_reviewer"].side_effect = security_effect
+        stubs["implementer"].result_success = False
+        stubs["implementer"].result_message = "not authenticated"
+        self._security_ready(orch)
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed
+        assert len(stubs["security_reviewer"].calls) == 1
+        assert len(stubs["implementer"].calls) == 1
+        assert len(stubs["reviewer"].calls) == 0
+        assert any(
+            entry["agent"] == "orchestrator"
+            and entry["action"] == "abort"
+            and entry["result"] == "implementer failed: not authenticated"
+            for entry in result.history
+        )
 
     def test_security_warnings_only_do_not_trigger_implementer_fix(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(

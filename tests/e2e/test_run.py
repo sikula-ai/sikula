@@ -643,8 +643,6 @@ class TestAgentException:
                 "",
                 "quota exceeded",
             ),
-            ("claude", "", "Error: not authenticated", "", "not authenticated"),
-            ("gemini", "", "Error: invalid model: gemini/nope", "", "invalid model"),
         ],
     )
     def test_streaming_fatal_provider_error_fails_implementer_without_retry(

@@ -72,6 +72,10 @@ class LLMConfigurationError(LLMFatalError):
     """Provider/model configuration is invalid."""
 
 
+StreamErrorParser = Callable[[str], LLMProviderError | None]
+FatalEventSupplier = Callable[[], LLMFatalError | None]
+
+
 @dataclass
 class LLMConfig:
     provider: str = "codex"
@@ -560,21 +564,42 @@ def _opencode_parse_text(output: str) -> str:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(event, dict):
+            continue
+        provider_error = _opencode_error_from_event(event)
+        if provider_error is not None:
+            raise provider_error
         if event.get("type") == "text":
             text = event.get("part", {}).get("text", "").strip()
             if text:
                 parts.append(text)
-        elif event.get("type") == "error":
-            err = event.get("error", {})
-            if isinstance(err, dict):
-                msg = (err.get("data", {}) or {}).get("message") or err.get("name") or str(err)
-                raw = json.dumps(err)
-                if raw not in msg:
-                    msg = f"{msg} {raw}"
-            else:
-                msg = str(err)
-            raise _provider_error("opencode", "event", msg)
     return "\n".join(parts)
+
+
+def _opencode_error_from_event(event: dict) -> LLMProviderError | None:
+    if event.get("type") != "error":
+        return None
+    err = event.get("error", {})
+    if isinstance(err, dict):
+        msg = (err.get("data", {}) or {}).get("message") or err.get("name") or str(err)
+        raw = json.dumps(err)
+        if raw not in msg:
+            msg = f"{msg} {raw}"
+    else:
+        msg = str(err)
+    return _provider_error("opencode", "event", msg)
+
+
+def _opencode_stream_error(line: str) -> LLMProviderError | None:
+    if not line.strip():
+        return None
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    return _opencode_error_from_event(event)
 
 
 def _opencode_error(result: subprocess.CompletedProcess[str]) -> str:
@@ -603,118 +628,74 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
         process.wait()
 
 
-_FATAL_STREAM_MARKERS = (
-    "usage_limit_reached",
-    "usage limit has been reached",
-    "quota exceeded",
-    "resource exhausted",
-    "insufficient_quota",
-    "out of credits",
-    "not authenticated",
-    "unauthorized",
-    "invalid token",
-    "invalid model",
-    "unsupported model",
-    "unknown provider",
-    "invalid configuration",
-    "x-codex-credits-has-credits",
-    "credits-has-credits",
-)
-
-_FATAL_STREAM_DIAGNOSTIC_PREFIXES = (
-    "error:",
-    "fatal:",
-    "failed:",
-    "provider error:",
-    "auth error:",
-    "authentication error:",
-    "quota error:",
-    "config error:",
-    "configuration error:",
-)
-
-
-def _fatal_stream_error(provider: str, text: str) -> LLMFatalError | None:
-    if not text.strip():
-        return None
-    tail = text[-_STREAM_FATAL_SCAN_CHARS:]
-    for line in tail.splitlines():
-        structured_error = _structured_fatal_stream_error(provider, line)
-        if structured_error is not None:
-            return structured_error
-        if not _looks_like_provider_diagnostic(line):
-            continue
-        diagnostic_error = _diagnostic_fatal_stream_error(provider, line)
-        if diagnostic_error is not None:
-            return diagnostic_error
-    if "\n" not in tail and _looks_like_provider_diagnostic(tail):
-        return _diagnostic_fatal_stream_error(provider, tail)
-    return None
-
-
-def _structured_fatal_stream_error(provider: str, line: str) -> LLMFatalError | None:
-    try:
-        event = json.loads(line)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(event, dict):
-        return None
-
-    if "responseBody" in event or "responseHeaders" in event:
-        msg = json.dumps(event)
-        provider_error = _provider_error(provider, "agent", msg)
-        return provider_error if isinstance(provider_error, LLMFatalError) else None
-
-    etype = event.get("type")
-    if etype in ("error", "turn.failed"):
-        msg = _codex_error_message(event.get("error") or event.get("message") or event.get("data") or event)
-        raw = json.dumps(event)
-        if raw not in msg:
-            msg = f"{msg} {raw}"
-        provider_error = _provider_error(provider, "agent", msg)
-        return provider_error if isinstance(provider_error, LLMFatalError) else None
-
-    payload = event.get("payload")
-    if isinstance(payload, dict) and payload.get("type") in ("error", "turn.failed"):
-        msg = _codex_error_message(payload.get("error") or payload.get("message") or payload)
-        raw = json.dumps(payload)
-        if raw not in msg:
-            msg = f"{msg} {raw}"
-        provider_error = _provider_error(provider, "agent", msg)
-        return provider_error if isinstance(provider_error, LLMFatalError) else None
-
-    return None
-
-
-def _looks_like_provider_diagnostic(line: str) -> bool:
-    stripped = line.lstrip()
-    if not stripped:
-        return False
-    lower = stripped.lower()
-    if lower.startswith(_FATAL_STREAM_DIAGNOSTIC_PREFIXES):
-        return True
-    if stripped.startswith(("ERROR ", "ERROR\t", "ERROR[", "FATAL ", "FATAL\t", "FATAL[")):
-        return True
-    return " responsebody=" in lower or " responseheaders=" in lower
-
-
-def _diagnostic_fatal_stream_error(provider: str, text: str) -> LLMFatalError | None:
-    lower = text.lower()
-    for marker in _FATAL_STREAM_MARKERS:
-        pos = lower.find(marker)
-        if pos < 0:
-            continue
-        snippet = text[pos : pos + 1200]
-        provider_error = _provider_error(provider, "agent", snippet)
-        return provider_error if isinstance(provider_error, LLMFatalError) else None
-    return None
-
-
 def _opencode_log_matches_command(text: str, cmd: list[str]) -> bool:
     if "args=[" not in text:
         return False
     expected_tokens = cmd[1:] if cmd and cmd[0] == "opencode" else cmd
     return all(json.dumps(token) in text for token in expected_tokens)
+
+
+def _json_object_after_marker(text: str, marker: str) -> object | None:
+    marker_pos = text.find(marker)
+    if marker_pos < 0:
+        return None
+    start = text.find("{", marker_pos + len(marker))
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for pos in range(start, len(text)):
+        char = text[pos]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start : pos + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def _opencode_log_fatal_error(text: str) -> LLMFatalError | None:
+    for line in text.splitlines():
+        structured_parts: dict[str, object] = {}
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            event = None
+        if isinstance(event, dict):
+            if "responseBody" in event:
+                structured_parts["responseBody"] = event["responseBody"]
+            if "responseHeaders" in event:
+                structured_parts["responseHeaders"] = event["responseHeaders"]
+
+        response_body = _json_object_after_marker(line, "responseBody=")
+        if response_body is not None:
+            structured_parts["responseBody"] = response_body
+        response_headers = _json_object_after_marker(line, "responseHeaders=")
+        if response_headers is not None:
+            structured_parts["responseHeaders"] = response_headers
+
+        if not structured_parts:
+            continue
+        provider_error = _provider_error("opencode", "agent", json.dumps(structured_parts))
+        if isinstance(provider_error, LLMFatalError):
+            return provider_error
+    return None
 
 
 class _LogFatalScanner:
@@ -746,10 +727,9 @@ class _LogFatalScanner:
             return True
         return False
 
-    def read_new_text(self) -> str:
+    def read_fatal_error(self) -> LLMFatalError | None:
         if not self._log_dir.exists():
-            return ""
-        chunks: list[str] = []
+            return None
         for path in self._log_dir.glob("*.log"):
             try:
                 stat = path.stat()
@@ -769,8 +749,10 @@ class _LogFatalScanner:
             except OSError:
                 continue
             if text:
-                chunks.append(text)
-        return "\n".join(chunks)
+                fatal_error = _opencode_log_fatal_error(text)
+                if fatal_error is not None:
+                    return fatal_error
+        return None
 
 
 def _opencode_log_dir(env: dict[str, str]) -> Path:
@@ -788,10 +770,11 @@ def _run_agent_subprocess_streaming(
     timeout: int,
     provider: str,
     stdin_text: str | None = None,
-    stdout_error_parser: Callable[[str], str] | None = None,
-    fatal_output_supplier: Callable[[], str] | None = None,
+    stdout_error_parser: StreamErrorParser | None = None,
+    stderr_error_parser: StreamErrorParser | None = None,
+    fatal_event_supplier: FatalEventSupplier | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run an agent subprocess while watching output for fatal provider errors."""
+    """Run an agent subprocess while watching provider-owned events for fatal errors."""
     process = subprocess.Popen(
         cmd,
         cwd=cwd,
@@ -814,6 +797,18 @@ def _run_agent_subprocess_streaming(
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
     stdout_line_buffer = ""
+    stderr_line_buffer = ""
+
+    def _parse_stream_buffer(buffer: str, parser: StreamErrorParser | None) -> tuple[str, LLMProviderError | None]:
+        if parser is None:
+            return buffer, None
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            provider_error = parser(line)
+            if provider_error is not None:
+                return buffer, provider_error
+        provider_error = parser(buffer)
+        return buffer, provider_error
 
     def _reader(name: str, stream) -> None:
         try:
@@ -834,8 +829,8 @@ def _run_agent_subprocess_streaming(
 
     deadline = time.monotonic() + timeout
     while process.poll() is None:
-        if fatal_output_supplier is not None:
-            fatal_error = _fatal_stream_error(provider, fatal_output_supplier())
+        if fatal_event_supplier is not None:
+            fatal_error = fatal_event_supplier()
             if fatal_error is not None:
                 _terminate_process(process)
                 raise fatal_error
@@ -851,27 +846,20 @@ def _run_agent_subprocess_streaming(
 
         if name == "stdout":
             stdout_parts.append(chunk)
-            fatal_error = _fatal_stream_error(provider, "".join(stdout_parts))
-            if fatal_error is not None:
-                _terminate_process(process)
-                raise fatal_error
             if stdout_error_parser is not None:
                 stdout_line_buffer += chunk
-                while "\n" in stdout_line_buffer:
-                    line, stdout_line_buffer = stdout_line_buffer.split("\n", 1)
-                    try:
-                        stdout_error_parser(line)
-                    except LLMProviderError as exc:
-                        if isinstance(exc, LLMTransientError) and "returned no text output" in str(exc):
-                            continue
-                        _terminate_process(process)
-                        raise exc
+                stdout_line_buffer, provider_error = _parse_stream_buffer(stdout_line_buffer, stdout_error_parser)
+                if provider_error is not None:
+                    _terminate_process(process)
+                    raise provider_error
         else:
             stderr_parts.append(chunk)
-            fatal_error = _fatal_stream_error(provider, "".join(stderr_parts))
-            if fatal_error is not None:
-                _terminate_process(process)
-                raise fatal_error
+            if stderr_error_parser is not None:
+                stderr_line_buffer += chunk
+                stderr_line_buffer, provider_error = _parse_stream_buffer(stderr_line_buffer, stderr_error_parser)
+                if provider_error is not None:
+                    _terminate_process(process)
+                    raise provider_error
 
     for thread in threads:
         thread.join(timeout=1)
@@ -905,8 +893,8 @@ def _run_opencode_streaming(
         timeout=timeout,
         provider="opencode",
         stdin_text=prompt,
-        stdout_error_parser=_opencode_parse_text,
-        fatal_output_supplier=log_scanner.read_new_text,
+        stdout_error_parser=_opencode_stream_error,
+        fatal_event_supplier=log_scanner.read_fatal_error,
     )
 
 
@@ -1263,6 +1251,11 @@ def _codex_parse_text(output: str) -> str:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(event, dict):
+            continue
+        provider_error = _codex_event_error(event)
+        if provider_error is not None:
+            raise provider_error
         etype = event.get("type")
         if etype == "item.completed":
             item = event.get("item", {})
@@ -1282,23 +1275,42 @@ def _codex_parse_text(output: str) -> str:
                 text = str(payload.get("message", "")).strip()
                 if text:
                     parts.append(text)
-            elif payload.get("type") in ("error", "turn.failed"):
-                msg = _codex_error_message(payload.get("error") or payload.get("message") or payload)
-                raise _provider_error("codex", "event", f"codex error: {msg}")
         elif etype == "task_complete":
             msg = event.get("payload", {}).get("last_agent_message", "")
             text = str(msg).strip()
             if text and not parts:
                 parts.append(text)
-        elif etype == "turn.failed":
-            msg = _codex_error_message(event.get("error") or event.get("data") or event)
-            raise _provider_error("codex", "turn", f"codex turn failed: {msg}")
-        elif etype == "error":
-            msg = _codex_error_message(event.get("error") or event.get("message") or event.get("data") or event)
-            raise _provider_error("codex", "event", f"codex error: {msg}")
     if not parts:
         raise LLMTransientError("codex output error: returned no text output")
     return "\n".join(parts)
+
+
+def _codex_stream_error(line: str) -> LLMProviderError | None:
+    if not line.strip():
+        return None
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    return _codex_event_error(event)
+
+
+def _codex_event_error(event: dict) -> LLMProviderError | None:
+    etype = event.get("type")
+    if etype == "turn.failed":
+        msg = _codex_error_message(event.get("error") or event.get("data") or event)
+        return _provider_error("codex", "turn", f"codex turn failed: {msg}")
+    if etype == "error":
+        msg = _codex_error_message(event.get("error") or event.get("message") or event.get("data") or event)
+        return _provider_error("codex", "event", f"codex error: {msg}")
+    if etype == "event_msg":
+        payload = event.get("payload", {})
+        if isinstance(payload, dict) and payload.get("type") in ("error", "turn.failed"):
+            msg = _codex_error_message(payload.get("error") or payload.get("message") or payload)
+            return _provider_error("codex", "event", f"codex error: {msg}")
+    return None
 
 
 def _codex_message_content_text(payload: dict) -> str:
@@ -1451,7 +1463,7 @@ class CodexClient(LLMClient):
                     env=None,
                     timeout=self._config.agent_timeout,
                     provider="codex",
-                    stdout_error_parser=_codex_parse_text,
+                    stdout_error_parser=_codex_stream_error,
                 )
                 if result.returncode != 0:
                     raise _provider_error("codex", "agent", _codex_subprocess_error(result))

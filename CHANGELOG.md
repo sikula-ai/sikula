@@ -14,13 +14,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Build sync now has platform-neutral adoption and audit for source-controlled generated outputs such as lockfiles and dependency verification metadata: existing tracked sync outputs are added to `files_changed`, semantic review/test gates are invalidated, unexpected non-ignored artifacts are cleaned or fail closed, and project-specific new output patterns can be configured with `build.sync_adopt_paths`.
 
 ### Fixed
-- OpenCode write-agent runs now monitor streaming output and OpenCode log files for provider
-  error events and fatal quota/auth/config markers, so exhausted credits fail immediately
-  instead of waiting for the long agent timeout while only progress heartbeats are emitted.
+- OpenCode write-agent runs now monitor structured provider error events and command-matched
+  OpenCode log `responseBody` / `responseHeaders` fields for fatal quota/auth/config failures,
+  so exhausted credits fail immediately instead of waiting for the long agent timeout while
+  avoiding false positives from normal agent prose that mentions API keys, 401s, or invalid models.
 - Fatal LLM provider failures such as quota exhaustion, authentication failures, and invalid
   provider/model configuration are now classified separately from transient failures and fail
   without retry; fixer phases also fail immediately when the fixer returns an unsuccessful
   result instead of continuing the build/fix loop until the iteration limit.
+- Review-fix and security-fix implementer passes now abort immediately when the implementer
+  returns an unsuccessful result, preserving the underlying provider/agent failure instead of
+  treating an unchanged diff as a completed fix attempt.
 - Planner outputs that exceed `planner.max_steps` are now rejected, retried once with a stricter
   format prompt, and then failed before implementation if still over limit; planner config is
   also captured in task config snapshots for auditability.
