@@ -2307,6 +2307,58 @@ mod tests {
         assert test_file.read_text(encoding="utf-8") == "test('view model seam', () => expect(true).toBe(true));\n"
         assert state.synthetic_test_harness_records[0]["status"] == "resolved"
 
+    def test_fixer_synthetic_harness_recovery_aborts_failed_retry(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        attempts = {"count": 0}
+
+        def fixer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                test_file.write_text(
+                    "\n".join(
+                        [
+                            "class FakeElement { appendChild() {}; querySelector() {} }",
+                            "class FakeHistory { pushState() {} }",
+                            "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                state.files_changed.append("tests/client_main.test.ts")
+            else:
+                stubs["fixer"].result_success = False
+                stubs["fixer"].result_message = "provider failure"
+
+        stubs["fixer"].side_effect = fixer_effect
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=[],
+            test_errors=["tests failed"],
+            test_status="failed",
+        )
+
+        assert not orch._run_fix_phase(state, "1/1")
+
+        assert attempts["count"] == 2
+        assert state.failed is True
+        assert any(
+            entry["agent"] == "orchestrator"
+            and entry["action"] == "abort"
+            and entry["result"] == "fixer failed: provider failure"
+            for entry in state.history
+        )
+
     def test_fixer_synthetic_harness_recovery_preserves_other_changed_files(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
             tmp_path,

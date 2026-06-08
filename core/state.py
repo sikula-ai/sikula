@@ -522,6 +522,9 @@ class JsonStateStore(StateStore):
             raise ValueError(f"Invalid snapshot name: {name!r}")
         return self._snapshot_dir(task_id) / f"{name}.json"
 
+    def _delete_text_snapshots_unlocked(self, task_id: str) -> None:
+        shutil.rmtree(self._snapshot_dir(task_id), ignore_errors=True)
+
     def _read_json(self, path: Path) -> dict:
         return json.loads(path.read_text())
 
@@ -590,7 +593,7 @@ class JsonStateStore(StateStore):
     def delete(self, task_id: str) -> None:
         with self._lock:
             self._path(task_id).unlink(missing_ok=True)
-            self.delete_text_snapshots(task_id)
+            self._delete_text_snapshots_unlocked(task_id)
 
     def save_text_snapshot(self, task_id: str, name: str, snapshot: dict[str, str | None]) -> None:
         with self._lock:
@@ -614,7 +617,7 @@ class JsonStateStore(StateStore):
 
     def delete_text_snapshots(self, task_id: str) -> None:
         with self._lock:
-            shutil.rmtree(self._snapshot_dir(task_id), ignore_errors=True)
+            self._delete_text_snapshots_unlocked(task_id)
 
     def update_active_operation(self, task_id: str, active_operation: dict | None) -> None:
         with self._lock:

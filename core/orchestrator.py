@@ -1282,7 +1282,7 @@ class Orchestrator:
                 log.info("Retrying fixer agent after synthetic test harness recovery")
                 retry_test_gate_before = self._test_execution_gate_snapshot()
                 fixer_result = self._run_agent("fixer", state)
-                if state.failed:
+                if state.failed or self._abort_on_failed_agent_result(state, "fixer", fixer_result):
                     return False
                 retry_files = set((fixer_result.data or {}).get("files_written", []))
                 gate_findings.extend(

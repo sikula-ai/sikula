@@ -11,6 +11,20 @@ import core.state as state_module
 from core.state import JsonStateStore, TaskState
 
 
+class _NonReentrantLock:
+    def __init__(self) -> None:
+        self.locked = False
+
+    def __enter__(self):
+        if self.locked:
+            raise AssertionError("lock re-entered")
+        self.locked = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.locked = False
+
+
 class TestTaskStateRecord:
     def test_appends_to_history(self):
         state = TaskState(task_id="t1", task_description="task")
@@ -92,6 +106,18 @@ class TestJsonStateStore:
         state = TaskState(task_id="abc123", task_description="test task")
         store.save(state)
         store.save_text_snapshot("abc123", "test_writer_audit_before", {"tests/LoginTest.py": "assert True\n"})
+
+        store.delete("abc123")
+
+        assert store.load("abc123") is None
+        assert store.load_text_snapshot("abc123", "test_writer_audit_before") is None
+
+    def test_delete_removes_text_snapshots_without_reentering_lock(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="abc123", task_description="test task")
+        store.save(state)
+        store.save_text_snapshot("abc123", "test_writer_audit_before", {"tests/LoginTest.py": "assert True\n"})
+        store._lock = _NonReentrantLock()  # type: ignore[assignment]
 
         store.delete("abc123")
 
