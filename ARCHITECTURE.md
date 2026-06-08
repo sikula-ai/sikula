@@ -176,6 +176,7 @@ Orchestrator.run()
    │     │      ImplementerAgent  (review fix pass)                │
    │     │        reads  → state.review_issues appended to prompt  │
    │     │        applies fixes, updates state.files_changed       │
+   │     │        failure → state.failed = True, task aborted      │
    │     │        resets → state.tests_up_to_date = False          │
    │     │                                                         │
    │     │  repeat until approved or review_iterations ≥          │
@@ -200,6 +201,7 @@ Orchestrator.run()
    │     │      ImplementerAgent  (security fix pass)              │
    │     │        reads  → state.review_issues appended to prompt  │
    │     │        applies fixes, updates state.files_changed       │
+   │     │        failure → state.failed = True, task aborted      │
    │     │      review loop re-runs (Phase 3)                      │
    │     │      security review re-runs                            │
    │     │                                                         │
@@ -1483,6 +1485,11 @@ See `README.md § Adding a new LLM provider` for a step-by-step example. Three m
 
 The `system` argument passed to `generate` and the `prompt` argument passed to `run_readonly_agent` and `run_agent` already contain `AGENT_SECURITY_PREFIX` (defined in `agents/base_agent.py`) — the network and filesystem constraint is injected by each agent before calling the provider. Provider implementations do not need to add it.
 
+CLI-backed providers should pass large prompts through stdin or another non-argv input channel
+when the provider CLI supports that mode. Reviewer, analyst, and implementation prompts can
+exceed operating-system command-line argument limits on large tasks. If a provider CLI requires
+the prompt as an option value for non-interactive mode, preserve that provider contract.
+
 ---
 
 ## Retry behaviour (`core/llm_client.py`)
@@ -1491,18 +1498,23 @@ Retry is implemented by Sikula's built-in CLI-backed providers (`CodexClient`,
 `ClaudeClient`, `GeminiClient`, `OpenCodeClient`), not by the abstract `LLMClient`
 interface itself. Custom providers must implement their own retry policy if they need one.
 
+Provider subprocess output is classified into typed `LLMProviderError` subclasses. Fatal
+provider/account failures such as quota exhaustion (`LLMQuotaExceeded`), authentication
+failure (`LLMAuthError`), and invalid provider/model configuration
+(`LLMConfigurationError`) are not retried. Retryable failures use `LLMTransientError`;
+subprocess timeouts are wrapped as `LLMTimeoutError`.
+
 The built-in providers retry `generate()` and `run_readonly_agent()` through
-`_call_with_retry()` on `RuntimeError` (non-zero CLI exit, provider error, or missing text
-output) and `subprocess.TimeoutExpired`. Up to **4 attempts** total are made, with delays
-of 30 s, 60 s, and 120 s between them (`_RETRY_DELAYS`).
+`_call_with_retry()` only for retryable failures. Up to **4 attempts** total are made, with
+delays of 30 s, 60 s, and 120 s between them (`_RETRY_DELAYS`).
 
 When an agent is run through Sikula's orchestration or report-only review path, each retry
 attempt before the next sleep is appended to `state.history` as `action = "llm_retry"`.
 The entry stores provider, model, operation, attempt number, max attempts, delay, error type,
 and a truncated provider error message.
 
-The built-in providers also retry `run_agent()` on `RuntimeError` and
-`subprocess.TimeoutExpired`, but with an additional safety guard:
+The built-in providers also retry `run_agent()` only for retryable failures, with an
+additional safety guard:
 
 **`run_agent` safety guard:** after each failure the implementation takes a fresh git snapshot.
 If files were changed before the failure, the retry is skipped — running the agent again on a

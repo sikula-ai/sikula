@@ -14,6 +14,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Build sync now has platform-neutral adoption and audit for source-controlled generated outputs such as lockfiles and dependency verification metadata: existing tracked sync outputs are added to `files_changed`, semantic review/test gates are invalidated, unexpected non-ignored artifacts are cleaned or fail closed, and project-specific new output patterns can be configured with `build.sync_adopt_paths`.
 
 ### Fixed
+- OpenCode write-agent runs now monitor structured provider error events and OpenCode's
+  `--print-logs` stderr stream for `responseBody` / `responseHeaders` fields carrying fatal
+  quota/auth/config failures, so exhausted credits fail immediately instead of waiting for the
+  long agent timeout while avoiding false positives from normal agent prose that mentions API
+  keys, 401s, or invalid models.
+- OpenCode, Codex, and Gemini non-zero exits now prefer provider-owned structured stdout
+  error events before stderr fallback text, so fatal quota/auth/config errors are not hidden
+  by unrelated CLI warning/log output.
+- Fatal LLM provider failures such as quota exhaustion, authentication failures, and invalid
+  provider/model configuration are now classified separately from transient failures and fail
+  without retry; reviewer, security reviewer, test writer, and fixer phases now fail
+  immediately when the agent returns an unsuccessful technical/provider result instead of
+  continuing from stale state or looping until an iteration limit.
+- Review-fix and security-fix implementer passes now abort immediately when the implementer
+  returns an unsuccessful result, preserving the underlying provider/agent failure instead of
+  treating an unchanged diff as a completed fix attempt.
+- Codex and Claude prompts are now passed through stdin instead of as command-line
+  arguments, preventing large reviewer/analyst prompts from failing before the provider starts
+  with OS argument-length errors.
+- Write-agent CLI providers now write prompts through a timeout-aware stdin writer and
+  tolerate early stdin pipe closure when the provider exits immediately with a
+  quota/auth/config error, allowing Sikula to keep enforcing `agent_timeout` while draining
+  and classifying provider output instead of surfacing an unexpected broken-pipe agent
+  exception or hanging during prompt delivery.
 - Planner outputs that exceed `planner.max_steps` are now rejected, retried once with a stricter
   format prompt, and then failed before implementation if still over limit; planner config is
   also captured in task config snapshots for auditability.
@@ -24,8 +48,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Analyst outputs that are empty, generic, or meta-completion text are now rejected before
   `implementation_prompt` is stored; Sikula retries analysis once and then fails before
   planner/implementer phases if no usable implementation prompt is produced.
-- Codex provider failures now preserve readable errors emitted on stdout JSON streams for
-  generate, read-only agent, and write-agent calls instead of reporting only `non-zero exit`.
+- Codex and Gemini provider failures now preserve readable errors emitted on stdout JSON
+  streams for generate, read-only agent, and write-agent calls instead of reporting only
+  fallback stderr or `non-zero exit`.
 
 ## [0.2.0] - 2026-05-31
 

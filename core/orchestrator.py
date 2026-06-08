@@ -567,9 +567,9 @@ class Orchestrator:
             log.info("--- Phase: final review (test changes) ---")
             if not self._refresh_review_fix_diff(state):
                 return
-            self._run_agent("reviewer", state)
+            reviewer_result = self._run_agent("reviewer", state)
             self._reviewer_ran_this_session = True
-            if state.failed:
+            if state.failed or self._abort_on_failed_agent_result(state, "reviewer", reviewer_result):
                 return
             if not state.review_approved:
                 msg = "reviewer rejected test writer changes"
@@ -587,8 +587,8 @@ class Orchestrator:
             log.info("--- Phase: final security review (test changes) ---")
             if not self._refresh_review_fix_diff(state):
                 return
-            self._run_agent("security_reviewer", state)
-            if state.failed:
+            security_result = self._run_agent("security_reviewer", state)
+            if state.failed or self._abort_on_failed_agent_result(state, "security_reviewer", security_result):
                 return
             if not state.security_approved:
                 msg = "security reviewer rejected test writer changes"
@@ -607,8 +607,15 @@ class Orchestrator:
         has_preexisting_changes = bool(state.files_changed)
         if not state.files_changed:
             log.info("--- Phase: implement ---")
-            self._run_agent("implementer", state)
+            result = self._run_agent("implementer", state)
             if state.failed:
+                self._store.save(state)
+                return
+            if not result.success:
+                msg = f"implementer failed: {result.message}"
+                log.error(msg)
+                state.record("orchestrator", "abort", msg)
+                state.failed = True
                 self._store.save(state)
                 return
             if not state.files_changed:
@@ -798,8 +805,15 @@ class Orchestrator:
         # Implement this step (idempotent via step_implemented flag)
         if not state.step_implemented:
             log.info(f"--- Phase: implement (Step {step_num}/{total_steps}) ---")
-            self._run_agent("implementer", state)
+            result = self._run_agent("implementer", state)
             if state.failed:
+                return False
+            if not result.success:
+                msg = f"implementer failed: {result.message}"
+                log.error(msg)
+                state.record("orchestrator", "abort", msg)
+                state.failed = True
+                self._store.save(state)
                 return False
             if not state.files_changed:
                 dirty = self._worktree_dirty_files(state)
@@ -1012,9 +1026,9 @@ class Orchestrator:
             log.info(f"--- Phase: {_phase_scope_label(state)}review ({label}) ---")
             if not self._refresh_review_fix_diff(state):
                 return
-            self._run_agent("reviewer", state)
+            reviewer_result = self._run_agent("reviewer", state)
             self._reviewer_ran_this_session = True
-            if state.failed:
+            if state.failed or self._abort_on_failed_agent_result(state, "reviewer", reviewer_result):
                 return
             if state.review_approved:
                 return
@@ -1031,9 +1045,16 @@ class Orchestrator:
             scope = _phase_scope_label(state)
             log.info(f"--- Phase: implement ({scope}review fix {state.review_iterations}/{max_fixes}) ---")
             implementer_result = self._run_agent("implementer", state)
-            self._session_code_changed = True
             if state.failed:
                 return
+            if not implementer_result.success:
+                msg = f"implementer failed: {implementer_result.message}"
+                log.error(msg)
+                state.record("orchestrator", "abort", msg)
+                state.failed = True
+                self._store.save(state)
+                return
+            self._session_code_changed = True
             self._mark_build_sync_stale_if_needed(
                 (implementer_result.data or {}).get("files_written", []),
                 "review fix",
@@ -1072,8 +1093,8 @@ class Orchestrator:
             log.info(f"--- Phase: {_phase_scope_label(state)}security review ({sec_label}) ---")
             if not self._refresh_review_fix_diff(state):
                 return
-            self._run_agent("security_reviewer", state)
-            if state.failed:
+            security_result = self._run_agent("security_reviewer", state)
+            if state.failed or self._abort_on_failed_agent_result(state, "security_reviewer", security_result):
                 return
             if state.security_approved:
                 return
@@ -1092,9 +1113,16 @@ class Orchestrator:
             scope = _phase_scope_label(state)
             log.info(f"--- Phase: implement ({scope}security fix {state.security_review_iterations}/{max_iter}) ---")
             implementer_result = self._run_agent("implementer", state)
-            self._session_code_changed = True
             if state.failed:
                 return
+            if not implementer_result.success:
+                msg = f"implementer failed: {implementer_result.message}"
+                log.error(msg)
+                state.record("orchestrator", "abort", msg)
+                state.failed = True
+                self._store.save(state)
+                return
+            self._session_code_changed = True
             self._mark_build_sync_stale_if_needed(
                 (implementer_result.data or {}).get("files_written", []),
                 "security fix",
@@ -1123,6 +1151,13 @@ class Orchestrator:
         log.info(f"--- Phase: fix ({progress}) ---")
         fixer_result = self._run_agent("fixer", state)
         if state.failed:
+            return False
+        if not fixer_result.success:
+            msg = f"fixer failed: {fixer_result.message}"
+            log.error(msg)
+            state.record("orchestrator", "abort", msg)
+            state.failed = True
+            self._store.save(state)
             return False
         # Use files reported by this fixer call — not a set-diff on state.files_changed, which
         # would miss re-edits of files already in the list (skipped by fixer dedup on line 127).
@@ -1634,6 +1669,18 @@ class Orchestrator:
         self._store.save(state)
         return result
 
+    def _abort_on_failed_agent_result(self, state: TaskState, name: str, result) -> bool:
+        if result.success:
+            return False
+        if name in {"reviewer", "security_reviewer"} and (result.data or {}).get("issues"):
+            return False
+        msg = f"{name} failed: {result.message}"
+        log.error(msg)
+        state.record("orchestrator", "abort", msg)
+        state.failed = True
+        self._store.save(state)
+        return True
+
     def _active_operation(
         self,
         state: TaskState,
@@ -1657,6 +1704,8 @@ class Orchestrator:
             return False
         log.info(f"--- Phase: {_phase_scope_label(state)}test write ---")
         result = self._run_agent("test_writer", state)
+        if state.failed or self._abort_on_failed_agent_result(state, "test_writer", result):
+            return False
         files_written = (result.data or {}).get("files_written", [])
         self._mark_build_sync_stale_if_needed(files_written, "test writer", state)
         return bool(files_written)

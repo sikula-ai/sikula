@@ -17,12 +17,16 @@ To add another provider subclass LLMClient and register it in create_llm_client(
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
 import os
+import queue
+import signal
 import subprocess
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -38,6 +42,37 @@ _MAX_RETRY_ERROR_CHARS = 1000
 _RETRY_ERROR_HEAD_CHARS = 350
 
 RetryObserver = Callable[[dict[str, object]], None]
+
+
+class LLMProviderError(RuntimeError):
+    """Base class for LLM provider failures."""
+
+
+class LLMTransientError(LLMProviderError):
+    """Retryable provider failure."""
+
+
+class LLMTimeoutError(LLMTransientError):
+    """Retryable provider timeout."""
+
+
+class LLMFatalError(LLMProviderError):
+    """Non-retryable provider failure."""
+
+
+class LLMQuotaExceeded(LLMFatalError):
+    """Provider account quota, credits, or usage limit is exhausted."""
+
+
+class LLMAuthError(LLMFatalError):
+    """Provider authentication failed."""
+
+
+class LLMConfigurationError(LLMFatalError):
+    """Provider/model configuration is invalid."""
+
+
+StreamErrorParser = Callable[[str], LLMProviderError | None]
 
 
 @dataclass
@@ -116,14 +151,94 @@ def _notify_retry(
         log.exception("LLM retry observer failed")
 
 
+def _provider_error(provider: str, operation: str, message: str) -> LLMProviderError:
+    """Classify provider output into retryable vs fatal LLM errors."""
+    text = message.strip() or "provider failed"
+    lower = text.lower()
+    prefix = f"{provider} {operation} error: "
+    formatted = text if lower.startswith(f"{provider} ") else f"{prefix}{text}"
+
+    quota_markers = (
+        "usage_limit_reached",
+        "usage limit has been reached",
+        "credits balance: 0",
+        "credits-balance: 0",
+        "x-codex-credits-balance: 0",
+        "credits has credits: false",
+        "credits-has-credits: false",
+        "x-codex-credits-has-credits: false",
+        "quota exceeded",
+        "quota_exceeded",
+        "resource exhausted",
+        "insufficient_quota",
+        "credit balance is too low",
+        "out of credits",
+        "exceeded your current quota",
+    )
+    auth_markers = (
+        "401",
+        "unauthorized",
+        "unauthenticated",
+        "authentication failed",
+        "not authenticated",
+        "no auth",
+        "login required",
+        "not logged in",
+        "api key",
+        "api-key",
+        "apikey",
+        "invalid key",
+        "missing key",
+        "invalid token",
+        "missing token",
+    )
+    config_markers = (
+        "billing disabled",
+        "billing account",
+        "invalid model",
+        "model not supported",
+        "unsupported model",
+        "unknown model",
+        "unknown provider",
+        "provider not found",
+        "invalid provider",
+        "invalid configuration",
+        "configuration error",
+        "not enabled for this account",
+    )
+
+    if any(marker in lower for marker in quota_markers):
+        return LLMQuotaExceeded(formatted)
+    if any(marker in lower for marker in auth_markers):
+        return LLMAuthError(formatted)
+    if any(marker in lower for marker in config_markers):
+        return LLMConfigurationError(formatted)
+    return LLMTransientError(formatted)
+
+
 def _call_with_retry(label: str, fn, config: LLMConfig | None = None, operation: str | None = None):
-    """Call fn() and retry on RuntimeError or TimeoutExpired with exponential backoff."""
+    """Call fn() and retry only retryable LLM failures with exponential backoff."""
     total = len(_RETRY_DELAYS) + 1
     last_exc: Exception | None = None
     for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
         try:
             return fn()
-        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        except subprocess.TimeoutExpired as exc:
+            last_exc = LLMTimeoutError(f"{label} timed out after {exc.timeout}s")
+            if delay is None:
+                break
+            log.warning(
+                "%s failed (attempt %d/%d): %s — retrying in %ds",
+                label,
+                attempt + 1,
+                total,
+                last_exc,
+                delay,
+            )
+            if config is not None:
+                _notify_retry(config, operation or label, attempt + 1, total, delay, last_exc)
+            time.sleep(delay)
+        except LLMTransientError as exc:
             last_exc = exc
             if delay is None:
                 break
@@ -139,6 +254,15 @@ def _call_with_retry(label: str, fn, config: LLMConfig | None = None, operation:
                 _notify_retry(config, operation or label, attempt + 1, total, delay, exc)
             time.sleep(delay)
     raise last_exc  # type: ignore[misc]
+
+
+def _agent_text_or_empty(parse_fn: Callable[[str], str], output: str) -> str:
+    try:
+        return parse_fn(output)
+    except LLMTransientError as exc:
+        if "returned no text output" in str(exc):
+            return ""
+        raise
 
 
 class LLMClient:
@@ -233,13 +357,14 @@ class ClaudeClient(LLMClient):
 
         def _call():
             result = subprocess.run(
-                ["claude", "-p", prompt, "--model", self._config.model],
+                ["claude", "-p", "--model", self._config.model],
                 capture_output=True,
+                input=prompt,
                 text=True,
                 timeout=300,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"claude CLI error: {result.stderr.strip() or 'non-zero exit'}")
+                raise _provider_error("claude", "CLI", result.stderr.strip() or "non-zero exit")
             return result.stdout.strip()
 
         return _call_with_retry("generate", _call, self._config, "generate")
@@ -254,7 +379,6 @@ class ClaudeClient(LLMClient):
                 [
                     "claude",
                     "-p",
-                    prompt,
                     "--model",
                     self._config.model,
                     "--permission-mode",
@@ -265,13 +389,14 @@ class ClaudeClient(LLMClient):
                     "Read,Bash(grep *),Bash(find *),Bash(ls *),LS,Glob",
                 ],
                 capture_output=True,
+                input=prompt,
                 text=True,
                 cwd=cwd,
                 timeout=self._config.agent_timeout,
             )
             if result.returncode != 0:
                 err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
-                raise RuntimeError(f"claude agent error: {err}")
+                raise _provider_error("claude", "agent", err)
             return result.stdout.strip()
 
         return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
@@ -286,11 +411,10 @@ class ClaudeClient(LLMClient):
         last_exc: Exception | None = None
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
             try:
-                result = subprocess.run(
+                result = _run_agent_subprocess_streaming(
                     [
                         "claude",
                         "-p",
-                        prompt,
                         "--model",
                         self._config.model,
                         # acceptEdits: auto-approves file edits; --settings passes Sikula's
@@ -304,18 +428,35 @@ class ClaudeClient(LLMClient):
                         "--allowedTools",
                         "Read,Edit,Write,Bash(grep *),Bash(find *),Bash(ls *),Bash(git rm *),LS,Glob",
                     ],
-                    capture_output=True,
-                    text=True,
                     cwd=cwd,
+                    env=None,
                     timeout=self._config.agent_timeout,
+                    provider="claude",
+                    stdin_text=prompt,
                 )
                 if result.returncode != 0:
                     err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
-                    raise RuntimeError(f"claude agent error: {err}")
+                    raise _provider_error("claude", "agent", err)
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
                 return changed, result.stdout.strip()
-            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            except subprocess.TimeoutExpired as exc:
+                last_exc = LLMTimeoutError(f"claude agent timed out after {exc.timeout}s")
+                if delay is None:
+                    break
+                if _git_snapshot(cwd) != before:
+                    log.warning("Agent failed after partial file changes — not retrying")
+                    break
+                log.warning(
+                    "Agent call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1,
+                    total,
+                    last_exc,
+                    delay,
+                )
+                _notify_retry(self._config, "run_agent", attempt + 1, total, delay, last_exc)
+                time.sleep(delay)
+            except LLMTransientError as exc:
                 last_exc = exc
                 if delay is None:
                     break
@@ -412,7 +553,7 @@ def _opencode_parse_text(output: str) -> str:
     """Extract assistant text from opencode --format json NDJSON output.
 
     Each line is a JSON event; text events carry the model's response chunks.
-    Raises RuntimeError if the output contains a session error event.
+    Raises LLMProviderError if the output contains a session error event.
     """
     parts = []
     for line in output.splitlines():
@@ -423,33 +564,337 @@ def _opencode_parse_text(output: str) -> str:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(event, dict):
+            continue
+        provider_error = _opencode_error_from_event(event)
+        if provider_error is not None:
+            raise provider_error
         if event.get("type") == "text":
             text = event.get("part", {}).get("text", "").strip()
             if text:
                 parts.append(text)
-        elif event.get("type") == "error":
-            err = event.get("error", {})
-            if isinstance(err, dict):
-                msg = (err.get("data", {}) or {}).get("message") or err.get("name") or str(err)
-            else:
-                msg = str(err)
-            raise RuntimeError(f"opencode error: {msg}")
     return "\n".join(parts)
 
 
+def _opencode_error_from_event(event: dict) -> LLMProviderError | None:
+    if event.get("type") != "error":
+        return None
+    err = event.get("error", {})
+    if isinstance(err, dict):
+        msg = (err.get("data", {}) or {}).get("message") or err.get("name") or str(err)
+        raw = json.dumps(err)
+        if raw not in msg:
+            msg = f"{msg} {raw}"
+    else:
+        msg = str(err)
+    return _provider_error("opencode", "event", msg)
+
+
+def _opencode_stream_error(line: str) -> LLMProviderError | None:
+    if not line.strip():
+        return None
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    return _opencode_error_from_event(event)
+
+
 def _opencode_error(result: subprocess.CompletedProcess[str]) -> str:
-    """Return the most useful error text from an opencode subprocess result."""
+    """Return fallback error text from an opencode subprocess result."""
     stderr = result.stderr.strip()
     if stderr:
         return stderr
     stdout = result.stdout.strip()
     if stdout:
-        try:
-            _opencode_parse_text(stdout)
-        except RuntimeError as exc:
-            return str(exc)
         return stdout
     return "non-zero exit"
+
+
+def _opencode_result_error(result: subprocess.CompletedProcess[str], operation: str) -> LLMProviderError:
+    """Return the best typed error from an opencode subprocess result."""
+    stdout = result.stdout.strip()
+    if stdout:
+        try:
+            _opencode_parse_text(stdout)
+        except LLMProviderError as exc:
+            return exc
+    return _provider_error("opencode", operation, _opencode_error(result))
+
+
+def _signal_process_group(process: subprocess.Popen[str], sig: int) -> bool:
+    pid = getattr(process, "pid", None)
+    if os.name != "posix" or not isinstance(pid, int):
+        return False
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        return True
+    return True
+
+
+def _terminate_process(process: subprocess.Popen[str], *, process_group: bool = False) -> None:
+    if process_group:
+        if _signal_process_group(process, signal.SIGTERM):
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                time.sleep(0.2)
+            _signal_process_group(process, signal.SIGKILL)
+            return
+
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def _json_object_after_marker(text: str, marker: str) -> object | None:
+    marker_pos = text.find(marker)
+    if marker_pos < 0:
+        return None
+    start = text.find("{", marker_pos + len(marker))
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for pos in range(start, len(text)):
+        char = text[pos]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start : pos + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def _opencode_log_error(line: str) -> LLMProviderError | None:
+    structured_parts: dict[str, object] = {}
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        event = None
+    if isinstance(event, dict):
+        if "responseBody" in event:
+            structured_parts["responseBody"] = event["responseBody"]
+        if "responseHeaders" in event:
+            structured_parts["responseHeaders"] = event["responseHeaders"]
+
+    response_body = _json_object_after_marker(line, "responseBody=")
+    if response_body is not None:
+        structured_parts["responseBody"] = response_body
+    response_headers = _json_object_after_marker(line, "responseHeaders=")
+    if response_headers is not None:
+        structured_parts["responseHeaders"] = response_headers
+
+    if structured_parts:
+        provider_error = _provider_error("opencode", "agent", json.dumps(structured_parts))
+        if isinstance(provider_error, LLMFatalError):
+            return provider_error
+
+    headers = structured_parts.get("responseHeaders")
+    if _opencode_headers_indicate_quota_exhausted(headers):
+        return _provider_error(
+            "opencode",
+            "agent",
+            "x-codex-credits-balance: 0; x-codex-credits-has-credits: false",
+        )
+    return None
+
+
+def _opencode_headers_indicate_quota_exhausted(headers: object) -> bool:
+    if not isinstance(headers, dict):
+        return False
+    normalized = {str(key).lower(): value for key, value in headers.items()}
+    balance = normalized.get("x-codex-credits-balance")
+    has_credits = normalized.get("x-codex-credits-has-credits")
+    return str(balance).strip() == "0" or str(has_credits).strip().lower() == "false"
+
+
+def _run_agent_subprocess_streaming(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None,
+    timeout: int,
+    provider: str,
+    stdin_text: str | None = None,
+    stdout_error_parser: StreamErrorParser | None = None,
+    stderr_error_parser: StreamErrorParser | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run an agent subprocess while watching provider-owned events for fatal errors."""
+    popen_kwargs = {
+        "cwd": cwd,
+        "env": env,
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "bufsize": 1,
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    process = subprocess.Popen(cmd, **popen_kwargs)
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    chunks: queue.Queue[tuple[str, str]] = queue.Queue()
+    writer_errors: queue.Queue[OSError] = queue.Queue()
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    stdout_line_buffer = ""
+    stderr_line_buffer = ""
+
+    def _parse_stream_buffer(buffer: str, parser: StreamErrorParser | None) -> tuple[str, LLMProviderError | None]:
+        if parser is None:
+            return buffer, None
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            provider_error = parser(line)
+            if provider_error is not None:
+                return buffer, provider_error
+        provider_error = parser(buffer)
+        return buffer, provider_error
+
+    def _record_chunk(name: str, chunk: str) -> LLMProviderError | None:
+        nonlocal stdout_line_buffer, stderr_line_buffer
+        if name == "stdout":
+            stdout_parts.append(chunk)
+            stdout_line_buffer, provider_error = _parse_stream_buffer(stdout_line_buffer + chunk, stdout_error_parser)
+            return provider_error
+        stderr_parts.append(chunk)
+        stderr_line_buffer, provider_error = _parse_stream_buffer(stderr_line_buffer + chunk, stderr_error_parser)
+        return provider_error
+
+    def _record_or_raise(name: str, chunk: str) -> None:
+        provider_error = _record_chunk(name, chunk)
+        if provider_error is not None:
+            _terminate_process(process, process_group=True)
+            raise provider_error
+
+    def _drain_ready_chunks() -> None:
+        while True:
+            try:
+                name, chunk = chunks.get_nowait()
+            except queue.Empty:
+                break
+            _record_or_raise(name, chunk)
+            process.poll()
+
+    def _raise_timeout() -> None:
+        _terminate_process(process, process_group=True)
+        _drain_ready_chunks()
+        raise subprocess.TimeoutExpired(cmd, timeout, output="".join(stdout_parts), stderr="".join(stderr_parts))
+
+    def _check_writer_error() -> None:
+        try:
+            writer_error = writer_errors.get_nowait()
+        except queue.Empty:
+            return
+        _terminate_process(process, process_group=True)
+        raise writer_error
+
+    def _reader(name: str, stream) -> None:
+        try:
+            while True:
+                chunk = stream.read(1)
+                if not chunk:
+                    break
+                chunks.put((name, chunk))
+        finally:
+            stream.close()
+
+    def _writer() -> None:
+        try:
+            if stdin_text is not None:
+                process.stdin.write(stdin_text)
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
+        except OSError as exc:
+            if exc.errno != errno.EPIPE:
+                writer_errors.put(exc)
+
+    threads = [
+        threading.Thread(target=_reader, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=_reader, args=("stderr", process.stderr), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    writer_thread = threading.Thread(target=_writer, daemon=True)
+    writer_thread.start()
+
+    deadline = time.monotonic() + timeout
+    while True:
+        _drain_ready_chunks()
+        _check_writer_error()
+        if process.poll() is not None and not any(thread.is_alive() for thread in threads) and chunks.empty():
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _raise_timeout()
+        try:
+            name, chunk = chunks.get(timeout=min(0.2, remaining))
+        except queue.Empty:
+            continue
+        _record_or_raise(name, chunk)
+
+    while writer_thread.is_alive():
+        _check_writer_error()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _raise_timeout()
+        writer_thread.join(timeout=min(0.2, remaining))
+    _check_writer_error()
+
+    return subprocess.CompletedProcess(cmd, process.returncode or 0, "".join(stdout_parts), "".join(stderr_parts))
+
+
+def _run_opencode_streaming(
+    cmd: list[str],
+    *,
+    prompt: str,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    """Run opencode while watching output for provider errors before process exit."""
+    return _run_agent_subprocess_streaming(
+        cmd,
+        cwd=cwd,
+        env=env,
+        timeout=timeout,
+        provider="opencode",
+        stdin_text=prompt,
+        stdout_error_parser=_opencode_stream_error,
+        stderr_error_parser=_opencode_log_error,
+    )
 
 
 class OpenCodeClient(LLMClient):
@@ -484,10 +929,10 @@ class OpenCodeClient(LLMClient):
                 timeout=300,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"opencode CLI error: {_opencode_error(result)}")
+                raise _opencode_result_error(result, "CLI")
             text = _opencode_parse_text(result.stdout)
             if not text:
-                raise RuntimeError("opencode returned no text output")
+                raise LLMTransientError("opencode CLI error: returned no text output")
             return text
 
         return _call_with_retry("generate", _call, self._config, "generate")
@@ -518,10 +963,10 @@ class OpenCodeClient(LLMClient):
                     timeout=self._config.agent_timeout,
                 )
             if result.returncode != 0:
-                raise RuntimeError(f"opencode agent error: {_opencode_error(result)}")
+                raise _opencode_result_error(result, "agent")
             text = _opencode_parse_text(result.stdout)
             if not text:
-                raise RuntimeError("opencode returned no text output")
+                raise LLMTransientError("opencode agent error: returned no text output")
             return text
 
         return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
@@ -535,7 +980,7 @@ class OpenCodeClient(LLMClient):
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
             try:
                 with _opencode_agent_env() as env:
-                    result = subprocess.run(
+                    result = _run_opencode_streaming(
                         [
                             "opencode",
                             "run",
@@ -547,24 +992,38 @@ class OpenCodeClient(LLMClient):
                             _OPENCODE_IMPLEMENTER_AGENT,
                             "--format",
                             "json",
+                            "--print-logs",
+                            "--log-level",
+                            "ERROR",
                         ],
-                        capture_output=True,
-                        input=prompt,
-                        text=True,
+                        prompt=prompt,
                         cwd=cwd,
                         env=env,
                         timeout=self._config.agent_timeout,
                     )
                 if result.returncode != 0:
-                    raise RuntimeError(f"opencode agent error: {_opencode_error(result)}")
+                    raise _opencode_result_error(result, "agent")
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
-                try:
-                    text = _opencode_parse_text(result.stdout)
-                except RuntimeError:
-                    text = ""
+                text = _agent_text_or_empty(_opencode_parse_text, result.stdout)
                 return changed, text
-            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            except subprocess.TimeoutExpired as exc:
+                last_exc = LLMTimeoutError(f"opencode agent timed out after {exc.timeout}s")
+                if delay is None:
+                    break
+                if _git_snapshot(cwd) != before:
+                    log.warning("Agent failed after partial file changes — not retrying")
+                    break
+                log.warning(
+                    "Agent call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1,
+                    total,
+                    last_exc,
+                    delay,
+                )
+                _notify_retry(self._config, "run_agent", attempt + 1, total, delay, last_exc)
+                time.sleep(delay)
+            except LLMTransientError as exc:
                 last_exc = exc
                 if delay is None:
                     break
@@ -639,7 +1098,7 @@ def _gemini_write_settings(cwd: Path, settings: dict) -> None:
 def _gemini_parse_response(output: str) -> str:
     """Parse JSON output from gemini --output-format json.
 
-    Raises RuntimeError if the response contains an error field.
+    Raises LLMProviderError if the response contains an error field.
     Falls back to returning raw output if JSON parsing fails.
     """
     try:
@@ -649,11 +1108,21 @@ def _gemini_parse_response(output: str) -> str:
     if data.get("error"):
         err = data["error"]
         msg = err.get("message") or str(err) if isinstance(err, dict) else str(err)
-        raise RuntimeError(f"gemini error: {msg}")
+        raise _provider_error("gemini", "response", msg)
     text = data.get("response", "").strip()
     if not text:
-        raise RuntimeError("gemini returned no text output")
+        raise LLMTransientError("gemini response error: returned no text output")
     return text
+
+
+def _gemini_result_error(result: subprocess.CompletedProcess[str], operation: str) -> LLMProviderError:
+    stdout = result.stdout.strip()
+    if stdout:
+        try:
+            _gemini_parse_response(stdout)
+        except LLMProviderError as exc:
+            return exc
+    return _provider_error("gemini", operation, result.stderr.strip() or stdout or "non-zero exit")
 
 
 class GeminiClient(LLMClient):
@@ -669,11 +1138,11 @@ class GeminiClient(LLMClient):
     def _cmd(self, prompt: str, extra: list[str] | None = None) -> list[str]:
         return [
             "gemini",
-            "-p",
-            prompt,
             "--skip-trust",
             "--model",
             self._config.model,
+            "-p",
+            prompt,
             *(extra or []),
             "--output-format",
             "json",
@@ -691,7 +1160,7 @@ class GeminiClient(LLMClient):
                 timeout=300,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"gemini CLI error: {result.stderr.strip() or 'non-zero exit'}")
+                raise _gemini_result_error(result, "CLI")
             return _gemini_parse_response(result.stdout)
 
         return _call_with_retry("generate", _call, self._config, "generate")
@@ -709,8 +1178,7 @@ class GeminiClient(LLMClient):
                 timeout=self._config.agent_timeout,
             )
             if result.returncode != 0:
-                err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
-                raise RuntimeError(f"gemini agent error: {err}")
+                raise _gemini_result_error(result, "agent")
             return _gemini_parse_response(result.stdout)
 
         return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
@@ -724,24 +1192,36 @@ class GeminiClient(LLMClient):
         last_exc: Exception | None = None
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
             try:
-                result = subprocess.run(
+                result = _run_agent_subprocess_streaming(
                     self._cmd(prompt, ["--approval-mode", "yolo"]),
-                    capture_output=True,
-                    text=True,
                     cwd=cwd,
+                    env=None,
                     timeout=self._config.agent_timeout,
+                    provider="gemini",
                 )
                 if result.returncode != 0:
-                    err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
-                    raise RuntimeError(f"gemini agent error: {err}")
+                    raise _gemini_result_error(result, "agent")
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
-                try:
-                    text = _gemini_parse_response(result.stdout)
-                except RuntimeError:
-                    text = ""
+                text = _agent_text_or_empty(_gemini_parse_response, result.stdout)
                 return changed, text
-            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            except subprocess.TimeoutExpired as exc:
+                last_exc = LLMTimeoutError(f"gemini agent timed out after {exc.timeout}s")
+                if delay is None:
+                    break
+                if _git_snapshot(cwd) != before:
+                    log.warning("Agent failed after partial file changes — not retrying")
+                    break
+                log.warning(
+                    "Agent call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1,
+                    total,
+                    last_exc,
+                    delay,
+                )
+                _notify_retry(self._config, "run_agent", attempt + 1, total, delay, last_exc)
+                time.sleep(delay)
+            except LLMTransientError as exc:
                 last_exc = exc
                 if delay is None:
                     break
@@ -768,8 +1248,9 @@ class GeminiClient(LLMClient):
 def _codex_parse_text(output: str) -> str:
     """Extract assistant text from codex exec --json JSONL output.
 
-    Collects text from item.completed events (type=agent_message).
-    Raises RuntimeError on error/turn.failed events or when no text was produced.
+    Collects final assistant text from both legacy item.completed events and
+    current Codex session JSONL response/event messages.
+    Raises LLMProviderError on error/turn.failed events or when no text was produced.
     """
     parts: list[str] = []
     for line in output.splitlines():
@@ -780,6 +1261,11 @@ def _codex_parse_text(output: str) -> str:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(event, dict):
+            continue
+        provider_error = _codex_event_error(event)
+        if provider_error is not None:
+            raise provider_error
         etype = event.get("type")
         if etype == "item.completed":
             item = event.get("item", {})
@@ -787,15 +1273,70 @@ def _codex_parse_text(output: str) -> str:
                 text = item.get("text", "").strip()
                 if text:
                     parts.append(text)
-        elif etype == "turn.failed":
-            msg = _codex_error_message(event.get("error") or event.get("data") or event)
-            raise RuntimeError(f"codex turn failed: {msg}")
-        elif etype == "error":
-            msg = _codex_error_message(event.get("error") or event.get("message") or event.get("data") or event)
-            raise RuntimeError(f"codex error: {msg}")
+        elif etype == "response_item":
+            payload = event.get("payload", {})
+            if payload.get("type") == "message" and payload.get("phase") in (None, "final_answer"):
+                text = _codex_message_content_text(payload).strip()
+                if text:
+                    parts.append(text)
+        elif etype == "event_msg":
+            payload = event.get("payload", {})
+            if payload.get("type") == "agent_message" and payload.get("phase") in (None, "final_answer"):
+                text = str(payload.get("message", "")).strip()
+                if text:
+                    parts.append(text)
+        elif etype == "task_complete":
+            msg = event.get("payload", {}).get("last_agent_message", "")
+            text = str(msg).strip()
+            if text and not parts:
+                parts.append(text)
     if not parts:
-        raise RuntimeError("codex returned no text output")
+        raise LLMTransientError("codex output error: returned no text output")
     return "\n".join(parts)
+
+
+def _codex_stream_error(line: str) -> LLMProviderError | None:
+    if not line.strip():
+        return None
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    return _codex_event_error(event)
+
+
+def _codex_event_error(event: dict) -> LLMProviderError | None:
+    etype = event.get("type")
+    if etype == "turn.failed":
+        msg = _codex_error_message(event.get("error") or event.get("data") or event)
+        return _provider_error("codex", "turn", f"codex turn failed: {msg}")
+    if etype == "error":
+        msg = _codex_error_message(event.get("error") or event.get("message") or event.get("data") or event)
+        return _provider_error("codex", "event", f"codex error: {msg}")
+    if etype == "event_msg":
+        payload = event.get("payload", {})
+        if isinstance(payload, dict) and payload.get("type") in ("error", "turn.failed"):
+            msg = _codex_error_message(payload.get("error") or payload.get("message") or payload)
+            return _provider_error("codex", "event", f"codex error: {msg}")
+    return None
+
+
+def _codex_message_content_text(payload: dict) -> str:
+    content = payload.get("content")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text") or item.get("output_text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        return "\n".join(parts)
+    if isinstance(content, str):
+        return content
+    return ""
 
 
 def _codex_error_message(raw: object) -> str:
@@ -829,20 +1370,39 @@ def _codex_error_message(raw: object) -> str:
 
 def _codex_subprocess_error(result: subprocess.CompletedProcess[str]) -> str:
     """Return the most useful error text from a codex subprocess result."""
-    stderr = result.stderr.strip()
-    if stderr:
-        return stderr
     stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
     if stdout:
+        saw_json_event = _codex_output_has_json_events(stdout)
         try:
             _codex_parse_text(stdout)
         except RuntimeError as exc:
             message = str(exc)
-            if message == "codex returned no text output":
+            if "returned no text output" in message:
+                if stderr:
+                    return stderr
+                if saw_json_event:
+                    return "codex exited before producing a final answer or structured error"
                 return stdout
             return message
         return stdout
+    if stderr:
+        return stderr
     return "non-zero exit"
+
+
+def _codex_output_has_json_events(output: str) -> bool:
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type"):
+            return True
+    return False
 
 
 class CodexClient(LLMClient):
@@ -854,7 +1414,7 @@ class CodexClient(LLMClient):
     def __init__(self, config: LLMConfig) -> None:
         self._config = config
 
-    def _exec_cmd(self, sandbox: str, prompt: str) -> list[str]:
+    def _exec_cmd(self, sandbox: str) -> list[str]:
         return [
             "codex",
             "exec",
@@ -864,7 +1424,7 @@ class CodexClient(LLMClient):
             sandbox,
             "-m",
             self._config.model,
-            prompt,
+            "-",
         ]
 
     def generate(self, system: str, user: str) -> str:
@@ -873,13 +1433,14 @@ class CodexClient(LLMClient):
 
         def _call():
             result = subprocess.run(
-                self._exec_cmd("read-only", prompt),
+                self._exec_cmd("read-only"),
                 capture_output=True,
+                input=prompt,
                 text=True,
                 timeout=300,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"codex CLI error: {_codex_subprocess_error(result)}")
+                raise _provider_error("codex", "CLI", _codex_subprocess_error(result))
             return _codex_parse_text(result.stdout)
 
         return _call_with_retry("generate", _call, self._config, "generate")
@@ -889,14 +1450,15 @@ class CodexClient(LLMClient):
 
         def _call():
             result = subprocess.run(
-                self._exec_cmd("read-only", prompt),
+                self._exec_cmd("read-only"),
                 capture_output=True,
+                input=prompt,
                 text=True,
                 cwd=cwd,
                 timeout=self._config.agent_timeout,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"codex agent error: {_codex_subprocess_error(result)}")
+                raise _provider_error("codex", "agent", _codex_subprocess_error(result))
             return _codex_parse_text(result.stdout)
 
         return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
@@ -909,23 +1471,38 @@ class CodexClient(LLMClient):
         last_exc: Exception | None = None
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
             try:
-                result = subprocess.run(
-                    self._exec_cmd("workspace-write", prompt),
-                    capture_output=True,
-                    text=True,
+                result = _run_agent_subprocess_streaming(
+                    self._exec_cmd("workspace-write"),
                     cwd=cwd,
+                    env=None,
                     timeout=self._config.agent_timeout,
+                    provider="codex",
+                    stdin_text=prompt,
+                    stdout_error_parser=_codex_stream_error,
                 )
                 if result.returncode != 0:
-                    raise RuntimeError(f"codex agent error: {_codex_subprocess_error(result)}")
+                    raise _provider_error("codex", "agent", _codex_subprocess_error(result))
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
-                try:
-                    text = _codex_parse_text(result.stdout)
-                except RuntimeError:
-                    text = ""
+                text = _agent_text_or_empty(_codex_parse_text, result.stdout)
                 return changed, text
-            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            except subprocess.TimeoutExpired as exc:
+                last_exc = LLMTimeoutError(f"codex agent timed out after {exc.timeout}s")
+                if delay is None:
+                    break
+                if _git_snapshot(cwd) != before:
+                    log.warning("Agent failed after partial file changes — not retrying")
+                    break
+                log.warning(
+                    "Agent call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1,
+                    total,
+                    last_exc,
+                    delay,
+                )
+                _notify_retry(self._config, "run_agent", attempt + 1, total, delay, last_exc)
+                time.sleep(delay)
+            except LLMTransientError as exc:
                 last_exc = exc
                 if delay is None:
                     break

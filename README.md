@@ -183,7 +183,7 @@ pipx install sikula
 Sikula ships with built-in clients for:
 - **`CodexClient`** (`provider: "codex"`) — calls the `codex exec` CLI
 - **`ClaudeClient`** (`provider: "claude"`) — calls the `claude -p` CLI
-- **`GeminiClient`** (`provider: "gemini"`) — calls the `gemini -p` CLI
+- **`GeminiClient`** (`provider: "gemini"`) — calls the `gemini` CLI
 - **`OpenCodeClient`** (`provider: "opencode"`) — calls the `opencode run` CLI; model must be in `provider/model` format (e.g. `openai/gpt-5.3-codex`)
 
 To use a different model or provider, see [Adding a new LLM provider](#adding-a-new-llm-provider) and [Per-agent LLM config](#10-per-agent-llm-config).
@@ -979,8 +979,10 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
 - Supported local CLI providers are Codex, Claude, Gemini, and OpenCode.
 - Project-specific `extra_rules` files are supported for reviewer, security reviewer,
   test writer, and planner agents.
-- LLM failures are retried up to four times with backoff. Retry attempts are recorded in
-  task history, and retries stop when partial file changes are detected.
+- Retryable LLM provider failures are retried up to four times with backoff. Retry attempts
+  are recorded in task history, and write-agent retries stop when partial file changes are
+  detected. Fatal provider failures such as quota exhaustion, authentication failure, or
+  invalid provider/model configuration fail the task without retry.
 
 ---
 
@@ -1029,6 +1031,12 @@ class CustomClient(LLMClient):
 ```
 
 The `system` argument passed to `generate` and the `prompt` argument passed to `run_readonly_agent` and `run_agent` already contain `AGENT_SECURITY_PREFIX` (defined in `agents/base_agent.py`) — the network and filesystem constraint is injected by each agent before calling the provider. You do not need to add it in your implementation.
+
+If a provider is backed by a CLI and supports a headless prompt channel outside argv, pass large
+prompts through stdin or another non-argv input channel. Reviewer, analyst, and implementation
+prompts can exceed operating-system command-line argument limits on large tasks. If a provider CLI
+requires the prompt as an option value for non-interactive mode, keep that required contract rather
+than inventing unsupported stdin behavior.
 
 **Step 2 — register in the factory** (`core/llm_client.py`):
 

@@ -96,7 +96,10 @@ intentional user-facing terminal output.
 
 ### Error handling
 
-Return `AgentResult(success=False, ...)` or `ToolResult(success=False, ...)` on failure.
+Return `AgentResult(success=False, ...)` or `ToolResult(success=False, ...)` on
+technical/tool/provider failure. Reviewer-style agents may also use
+`AgentResult(success=False, data={"issues": ...})` for a valid domain decision such as
+"issues found"; orchestration must distinguish that from a failed agent invocation.
 Catch `RuntimeError` from LLM clients. Do not catch broad `Exception` unless re-raising
 or wrapping:
 
@@ -185,6 +188,22 @@ read-only invariant and the sandbox boundary.
 |-------|--------|
 | `AnalystAgent`, `ReviewerAgent`, `SecurityReviewerAgent` | `run_readonly_agent()` |
 | `ImplementerAgent`, `FixerAgent`, `TestWriterAgent` | `run_agent()` |
+
+### CLI-backed LLM clients
+
+When implementing or modifying a provider in `core/llm_client.py` that wraps a CLI,
+prefer stdin or another provider-supported non-argv input channel for `generate()`,
+`run_readonly_agent()`, and `run_agent()` prompts. Reviewer, analyst, and implementation
+prompts can exceed operating-system argument length limits on large tasks; command
+arguments should carry provider options only when the provider CLI supports it. If a
+provider requires the prompt as an option value to enter headless/non-interactive mode,
+preserve that provider contract.
+
+For streaming write-agent subprocesses, start output readers before writing the prompt,
+write stdin through a timeout-aware path, and tolerate early stdin pipe closure. A provider
+can exit immediately or stop reading stdin on quota, authentication, or configuration
+failures; Sikula must still enforce `agent_timeout` and drain/classify stdout/stderr
+instead of hanging or surfacing a raw broken-pipe exception.
 
 ### State recording
 
@@ -462,8 +481,10 @@ Use a stub `LLMClient` (do not call real LLMs in tests). Verify:
 ### Coverage
 
 Target: ≥ 90% branch and line coverage on new and changed code (configured via
-`test_writer.coverage_target` in project YAML). Every `AgentResult(success=False, ...)` path
-must have a dedicated test.
+`test_writer.coverage_target` in project YAML). Every technical/tool/provider failure path
+that returns `AgentResult(success=False, ...)` must have a dedicated test. Valid review
+outcomes that return `success=False` with structured issues must also be covered as normal
+review-loop behavior, not treated as agent invocation failures.
 
 ---
 
