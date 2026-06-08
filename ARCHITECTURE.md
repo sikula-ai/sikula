@@ -1534,6 +1534,7 @@ All keys live under `test_writer:` in `.sikula/config.yaml`.
    - `project.build_tool: your_build_tool` — must match the branch key added in step 3
    - `project.platform: iOS` (or `Android`, `backend`, …) — injected into agent prompts as tech stack context
    - `sandbox.allowed_write_paths` — writable source directories
+   - `sandbox.allowed_test_write_paths` — writable test directories (`"."` = entire project root for projects with inline tests anywhere under the repo)
    - `sandbox.allowed_read_paths` — readable directories (`"."` = entire project root)
    - `guidelines.context_files` — platform-specific guidelines docs
    - `guidelines.max_file_chars` — max chars read per guidelines file

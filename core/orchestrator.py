@@ -1409,13 +1409,18 @@ class Orchestrator:
             return False
         for raw_root in self._configured_test_write_paths():
             root = raw_root.replace("\\", "/").strip()
-            if not root or _normalize_project_path(root) == "":
+            normalized_root = _normalize_project_path(root)
+            if not root:
+                continue
+            if posixpath.normpath(root) == ".":
+                return True
+            if not normalized_root:
                 continue
             if any(ch in root for ch in "*?["):
                 if _path_matches_pattern(normalized_path, root):
                     return True
                 continue
-            if _path_is_under_root(normalized_path, root):
+            if _path_is_under_root(normalized_path, normalized_root):
                 return True
         return False
 

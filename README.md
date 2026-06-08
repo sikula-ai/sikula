@@ -799,7 +799,7 @@ covers files reported by the provider's `run_agent()` result.
 | Key | Used by | Purpose |
 |---|---|---|
 | `allowed_write_paths` | ImplementerAgent, FixerAgent (build errors, production-confirmed test fixes, check errors) | Production source directories agents may write to |
-| `allowed_test_write_paths` | TestWriterAgent, FixerAgent (test-only test-failure pass, production-confirmed test fixes, check errors) | Test source directories; agents may write here when fixing malformed/stale tests or check violations (e.g. detekt) |
+| `allowed_test_write_paths` | TestWriterAgent, FixerAgent (test-only test-failure pass, production-confirmed test fixes, check errors) | Test source directories; agents may write here when fixing malformed/stale tests or check violations (e.g. detekt). `"."` means the entire project root, including inline-test source files. |
 | `allowed_read_paths` | ImplementerAgent, FixerAgent, TestWriterAgent | Directories agents may read from (prompt constraint); `"."` means the entire project root |
 | `max_iterations` | Orchestrator build/fix loop | Max fixer attempts per active build/fix loop before the task is aborted; a last fixer change gets one final validation-only pass |
 | `max_review_iterations` | Orchestrator review loop | Max review+implement-fix cycles before task is aborted |

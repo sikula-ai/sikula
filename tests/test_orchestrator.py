@@ -1824,6 +1824,42 @@ mod tests {
         assert state.test_errors[0].startswith("TEST EXECUTION GATE AUDIT:")
         assert state.history[-1]["action"] == "abort"
 
+    def test_execution_gate_audit_treats_dot_test_write_root_as_project_root(self, tmp_path: Path):
+        orch, _, _ = _make_orchestrator(
+            tmp_path,
+            project_config={
+                "project": {"build_tool": "rust"},
+                "sandbox": {"allowed_test_write_paths": ["."]},
+            },
+        )
+        source_file = tmp_path / "src" / "lib.rs"
+        source_file.parent.mkdir()
+        source_file.write_text(
+            """\
+#[cfg(test)]
+mod tests {
+    #[ignore]
+    #[test]
+    fn generated_contract_test() {}
+}
+""",
+            encoding="utf-8",
+        )
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/lib.rs"])
+
+        findings = orch._audit_test_execution_gates_after_agent(
+            state,
+            source="test_writer",
+            files_written=["src/lib.rs"],
+            before_snapshot={"src/lib.rs": None},
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["path"] == "src/lib.rs"
+        assert findings[0]["reason"] == "Rust ignored test"
+        assert len(state.test_execution_gate_records) == 1
+        assert state.test_errors[0].startswith("TEST EXECUTION GATE AUDIT:")
+
     def test_resume_recovers_pending_synthetic_harness_and_retries_test_writer(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
             tmp_path,
