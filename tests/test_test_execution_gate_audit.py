@@ -216,6 +216,39 @@ if (process.env.RUN_BROWSER_TESTS) {
         )
 
 
+def test_detects_expression_style_env_gated_javascript_registrations():
+    cases = [
+        """\
+process.env.RUN_BROWSER_TESTS && test("browser behavior", () => {});
+""",
+        """\
+Boolean(process.env.RUN_BROWSER_TESTS) && test.each(cases)("browser behavior %s", () => {});
+""",
+        """\
+import.meta.env.RUN_BROWSER_TESTS ? it("browser behavior", () => {}) : undefined;
+""",
+        """\
+!process.env.RUN_BROWSER_TESTS || describe("browser behavior", () => {});
+""",
+        """\
+ENV["RUN_BROWSER_TESTS"] && it "browser behavior" do
+end
+""",
+    ]
+
+    for after in cases:
+        findings = detect_new_test_execution_gates(path="tests/clientMain.test.ts", before=None, after=after)
+
+        assert len(findings) == 1
+        _assert_public_finding_metadata(
+            findings[0],
+            path="tests/clientMain.test.ts",
+            line=1,
+            category="environment",
+            reason="environment-gated test registration",
+        )
+
+
 def test_ignores_env_var_gated_javascript_test_configuration_without_registration():
     findings = detect_new_test_execution_gates(
         path="tests/clientMain.test.ts",
@@ -339,6 +372,14 @@ def test_ignores_env_var_check_that_does_not_gate_test_registration():
 if (process.env.CI) {
   configureExternalService();
 }
+
+test("runs in normal validation", () => {});
+""",
+        ),
+        (
+            "tests/clientMain.test.ts",
+            """\
+const enabled = process.env.RUN_BROWSER_TESTS && configureExternalService();
 
 test("runs in normal validation", () => {});
 """,

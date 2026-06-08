@@ -79,6 +79,8 @@ _ENVIRONMENT_GATE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bif\s*\(.*(?:globalThis\.)?(?:document|window|navigator)\s*[!=]==?\s*null\b"),
     re.compile(r"\bif\s*\(.*[\"'](?:document|window|navigator)[\"']\s+in\s+globalThis\b"),
     re.compile(r"\bif\s*\(.*\b(?:process|import\.meta)\.env(?:\.[A-Za-z_]\w*|\s*\[[^\]]+\])"),
+    re.compile(r"\b(?:process|import\.meta)\.env(?:\.[A-Za-z_]\w*|\s*\[[^\]]+\]).*?(?:&&|\|\||\?)"),
+    re.compile(r"\bENV\s*\[[^\]]+\].*?(?:&&|\|\||\?)"),
     re.compile(r"\bif\s+.*\bos\.environ(?:\b|\s*\[|\.get\s*\()"),
     re.compile(r"\bif\s+.*\bos\.getenv\s*\("),
     re.compile(r"\bif\s*\(.*\bSystem\.getenv\s*\("),
