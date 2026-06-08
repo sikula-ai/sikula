@@ -752,7 +752,8 @@ sikula cleanup <task-id> --force  # remove the preserved worktree, keep state JS
 ```
 
 `cleanup` preserves the state JSON and records a cleanup entry in `history`, so `sikula show`
-still works for audit/debugging. Resume is no longer possible after the worktree is removed.
+still works for audit/debugging. Resume is no longer possible after the worktree is removed,
+and transient internal recovery snapshots are deleted.
 
 To remove both the worktree and the state JSON:
 
@@ -985,8 +986,10 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
 - Newly added skipped, disabled, ignored, assumption-gated, or environment-gated tests in
   Sikula-modified test files or inline-test source files under configured test write paths
   are recorded in `test_execution_gate_records` and fed back through the build/fix loop as
-  test-origin validation issues. This preserves autonomy for legitimate stale-test fixes
-  while preventing green placeholder tests from replacing real coverage.
+  test-origin validation issues. If the build/fix loop is disabled with `--no-build`, active
+  execution-gate findings fail the task instead of allowing a green placeholder test to
+  complete as coverage. This preserves autonomy for legitimate stale-test fixes while
+  preventing green placeholder tests from replacing real coverage.
 - Synthetic runtime harnesses that newly appear relative to the task baseline in
   Sikula-modified tests are recorded in `synthetic_test_harness_records` as audit warnings.
   Existing project helper harnesses already present at baseline are not treated as new

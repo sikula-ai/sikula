@@ -250,6 +250,12 @@ _TESTABILITY_GAP_MARKER = "TESTABILITY GAP:"
 _TESTABILITY_GAP_FIELDS = {"target", "reason", "covered_by", "recommended_action", "risk"}
 _GENERATED_TEST_RETRIAGE_MARKER = "GENERATED TEST RE-TRIAGE:"
 _GENERATED_TEST_RETRIAGE_FIELDS = {"strategy", "target", "reason", "covered_by"}
+_GENERATED_TEST_RETRIAGE_STRATEGIES = {
+    "replace_with_narrower_seam_test",
+    "remove_malformed_generated_test",
+    "report_testability_gap",
+    "production_defect",
+}
 _TEST_PATH_MARKERS = {
     "__tests__",
     "acceptancetest",
@@ -751,6 +757,10 @@ def _parse_generated_test_retriage(output: str | None) -> dict | None:
         normalized_key = key.strip().lower().replace(" ", "_")
         if normalized_key in _GENERATED_TEST_RETRIAGE_FIELDS:
             retriage[normalized_key] = value.strip()
+    if any(not str(retriage.get(field, "")).strip() for field in _GENERATED_TEST_RETRIAGE_FIELDS):
+        return None
+    if retriage["strategy"] not in _GENERATED_TEST_RETRIAGE_STRATEGIES:
+        return None
     return retriage
 
 
@@ -774,26 +784,21 @@ def _repeated_generated_test_fix_context(state: TaskState) -> str:
     if not state.test_files_written:
         return ""
     generated = set(state.test_files_written)
-    matching_records = [
-        record
-        for record in state.fix_cycle_records
-        if str(record.get("triage_pass", "")).startswith("test_only")
-        and generated.intersection(record.get("files_written") or [])
+    repeated_files = [
+        (path, _generated_test_fix_count(state, path))
+        for path in state.test_files_written
+        if path in generated and _generated_test_fix_count(state, path) >= 2
     ]
-    if len(matching_records) < 2:
+    if not repeated_files:
         return ""
 
-    files: list[str] = []
-    for record in matching_records:
-        for path in record.get("files_written") or []:
-            if path in generated and path not in files:
-                files.append(path)
-    file_list = "\n".join(f"  - {path}" for path in files[:20])
-    if len(files) > 20:
-        file_list += f"\n  ... ({len(files) - 20} more)"
+    file_list = "\n".join(f"  - {path} ({count} generated-test fix attempts)" for path, count in repeated_files[:20])
+    if len(repeated_files) > 20:
+        file_list += f"\n  ... ({len(repeated_files) - 20} more)"
+    total_attempts = sum(count for _, count in repeated_files)
     return (
         "REPEATED GENERATED TEST FIX CONTEXT:\n"
-        f"Sikula has already made {len(matching_records)} test-only fixer pass(es) against "
+        f"Sikula has already made {total_attempts} test-only fixer pass(es) against "
         "test files generated or updated in this task.\n"
         f"{file_list}\n\n"
         "Treat another failure in this area as a signal that the generated test harness may "
@@ -825,6 +830,20 @@ def _repeated_generated_test_retriage_required(state: TaskState) -> bool:
 def _generated_test_writes(state: TaskState, changed: list[str]) -> list[str]:
     generated = set(state.test_files_written)
     return [path for path in changed if path in generated]
+
+
+def _generated_test_fix_count(state: TaskState, path: str) -> int:
+    try:
+        return max(0, int(state.generated_test_fix_counts.get(path, 0)))
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def _record_generated_test_fix_attempt(state: TaskState, paths: list[str]) -> None:
+    if not isinstance(state.generated_test_fix_counts, dict):
+        state.generated_test_fix_counts = {}
+    for path in sorted({str(candidate) for candidate in paths if str(candidate).strip()}):
+        state.generated_test_fix_counts[path] = _generated_test_fix_count(state, path) + 1
 
 
 class FixerAgent(BaseAgent):
@@ -1089,6 +1108,8 @@ class FixerAgent(BaseAgent):
                 )
                 if not production_writes and not production_request_with_writes:
                     generated_test_files = _generated_test_writes(state, changed)
+                    if generated_test_files:
+                        _record_generated_test_fix_attempt(state, generated_test_files)
                     missing_generated_test_retriage = (
                         generated_test_retriage_required
                         and bool(generated_test_files)

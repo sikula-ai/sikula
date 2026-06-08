@@ -217,6 +217,39 @@ def test_cumulative_active_finding_resolves_when_only_baseline_helpers_remain(tm
     assert active_findings_for_current_files(tmp_path, [record]) == []
 
 
+def test_active_findings_use_subsystems_without_source_excerpts(tmp_path):
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    test_file = tests / "clientMain.test.ts"
+    test_file.write_text(
+        "\n".join(
+            [
+                "class FakeEventTarget { addEventListener() {}; dispatchEvent() {} }",
+                "class FakeHistory { pushState() {} }",
+                "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    record = {
+        "status": "detected",
+        "findings": [
+            {
+                "path": "tests/clientMain.test.ts",
+                "subsystems": ["event_dispatch", "navigation_history", "network_server"],
+                "baseline_subsystems": [],
+                "evidence": [
+                    {"category": "event_dispatch", "lines": [{"line": 1}]},
+                    {"category": "navigation_history", "lines": [{"line": 2}]},
+                    {"category": "network_server", "lines": [{"line": 3}]},
+                ],
+            }
+        ],
+    }
+
+    assert active_findings_for_current_files(tmp_path, [record])
+
+
 def test_prompt_context_is_non_blocking_and_actionable():
     records = [
         {
@@ -244,3 +277,5 @@ def test_prompt_context_is_non_blocking_and_actionable():
     assert "harness does not remain in branch output" in context
     assert "tests/clientMain.test.ts" in context
     assert "event_dispatch, navigation_history, network_server" in context
+    assert "event_dispatch line 10" in context
+    assert "class FakeEventTarget" not in context

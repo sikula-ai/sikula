@@ -1,4 +1,15 @@
-from core.test_execution_gate_audit import detect_new_test_execution_gates
+from core.test_execution_gate_audit import active_findings_for_current_files, detect_new_test_execution_gates
+
+
+def _assert_public_finding_metadata(finding, *, path, line, category, reason, baseline_count=0, occurrence=1):
+    assert finding["path"] == path
+    assert finding["line"] == line
+    assert finding["category"] == category
+    assert finding["reason"] == reason
+    assert finding["baseline_count"] == baseline_count
+    assert finding["occurrence"] == occurrence
+    assert finding["signature"].startswith(f"{category}:")
+    assert "excerpt" not in finding
 
 
 def test_detects_new_environment_gated_test_registration():
@@ -18,15 +29,14 @@ if (typeof document === "undefined") {
 """,
     )
 
-    assert findings == [
-        {
-            "path": "tests/clientMain.test.ts",
-            "line": 3,
-            "category": "environment",
-            "reason": "environment-gated test registration",
-            "excerpt": 'if (typeof document === "undefined") {',
-        }
-    ]
+    assert len(findings) == 1
+    _assert_public_finding_metadata(
+        findings[0],
+        path="tests/clientMain.test.ts",
+        line=3,
+        category="environment",
+        reason="environment-gated test registration",
+    )
 
 
 def test_detects_new_skip_and_ignore_gates():
@@ -123,14 +133,38 @@ fun generatedContractTest() {}
 @org.junit.Ignore("requires browser")
 @Test
 fun generatedBrowserTest() {}
+
+@org.junit.jupiter.api.Disabled("requires emulator")
+@Test
+fun generatedEmulatorTest() {}
 """,
     )
 
-    assert [finding["line"] for finding in findings] == [1, 5]
+    assert [finding["line"] for finding in findings] == [1, 5, 9]
     assert [finding["reason"] for finding in findings] == [
         "JUnit disabled test",
         "JUnit disabled test",
+        "JUnit disabled test",
     ]
+
+
+def test_detects_swift_try_xctskip_gates():
+    findings = detect_new_test_execution_gates(
+        path="Tests/GeneratedTests.swift",
+        before=None,
+        after="""\
+func testGeneratedBehavior() throws {
+    try XCTSkipIf(ProcessInfo.processInfo.environment["RUN_UI"] == nil)
+}
+
+func testGeneratedFallback() throws {
+    try XCTSkipUnless(false)
+}
+""",
+    )
+
+    assert [finding["line"] for finding in findings] == [2, 6]
+    assert [finding["reason"] for finding in findings] == ["XCTest skipped test", "XCTest skipped test"]
 
 
 def test_detects_same_line_environment_gated_test_registration():
@@ -143,6 +177,57 @@ def test_detects_same_line_environment_gated_test_registration():
     assert len(findings) == 1
     assert findings[0]["category"] == "environment"
     assert findings[0]["line"] == 1
+
+
+def test_detects_env_var_gated_chained_javascript_registrations():
+    cases = [
+        """\
+if (process.env.RUN_BROWSER_TESTS) {
+  test.each(cases)("browser behavior %s", () => {});
+}
+""",
+        """\
+if (process.env.RUN_BROWSER_TESTS) {
+  test.concurrent("browser behavior", () => {});
+}
+""",
+        """\
+if (process.env.RUN_BROWSER_TESTS) {
+  test.concurrent.each(cases)("browser behavior %s", () => {});
+}
+""",
+        """\
+if (process.env.RUN_BROWSER_TESTS) {
+  test.describe.parallel("browser behavior", () => {});
+}
+""",
+    ]
+
+    for after in cases:
+        findings = detect_new_test_execution_gates(path="tests/clientMain.test.ts", before=None, after=after)
+
+        assert len(findings) == 1
+        _assert_public_finding_metadata(
+            findings[0],
+            path="tests/clientMain.test.ts",
+            line=1,
+            category="environment",
+            reason="environment-gated test registration",
+        )
+
+
+def test_ignores_env_var_gated_javascript_test_configuration_without_registration():
+    findings = detect_new_test_execution_gates(
+        path="tests/clientMain.test.ts",
+        before=None,
+        after="""\
+if (process.env.CI) {
+  test.describe.configure({ timeout: 60000 });
+}
+""",
+    )
+
+    assert findings == []
 
 
 def test_detects_env_var_gated_test_registration_across_common_runtimes():
@@ -236,15 +321,14 @@ end
     for path, after, expected_line in cases:
         findings = detect_new_test_execution_gates(path=path, before=None, after=after)
 
-        assert findings == [
-            {
-                "path": path,
-                "line": expected_line,
-                "category": "environment",
-                "reason": "environment-gated test registration",
-                "excerpt": after.splitlines()[expected_line - 1].strip(),
-            }
-        ]
+        assert len(findings) == 1
+        _assert_public_finding_metadata(
+            findings[0],
+            path=path,
+            line=expected_line,
+            category="environment",
+            reason="environment-gated test registration",
+        )
 
 
 def test_ignores_env_var_check_that_does_not_gate_test_registration():
@@ -305,6 +389,83 @@ test('old assertion', () => {
     findings = detect_new_test_execution_gates(path="tests/existing.test.ts", before=before, after=after)
 
     assert findings == []
+
+
+def test_detects_only_new_occurrence_when_identical_skip_already_exists():
+    before = """\
+test.skip("external service contract", () => {});
+test("normal behavior", () => {});
+"""
+    after = """\
+test.skip("external service contract", () => {});
+test("normal behavior", () => {});
+test.skip("external service contract", () => {});
+"""
+
+    findings = detect_new_test_execution_gates(path="tests/existing.test.ts", before=before, after=after)
+
+    assert len(findings) == 1
+    _assert_public_finding_metadata(
+        findings[0],
+        path="tests/existing.test.ts",
+        line=3,
+        category="skip",
+        reason="skipped JavaScript/TypeScript test",
+        baseline_count=1,
+        occurrence=2,
+    )
+
+
+def test_active_findings_resolve_against_added_occurrence_not_matching_baseline_text(tmp_path):
+    test_file = tmp_path / "tests" / "existing.test.ts"
+    test_file.parent.mkdir()
+    before = """\
+test.skip("external service contract", () => {});
+test("normal behavior", () => {});
+"""
+    after = """\
+test.skip("external service contract", () => {});
+test("normal behavior", () => {});
+test.skip("external service contract", () => {});
+"""
+    findings = detect_new_test_execution_gates(path="tests/existing.test.ts", before=before, after=after)
+    record = {"status": "detected", "findings": findings}
+
+    test_file.write_text(after, encoding="utf-8")
+    active = active_findings_for_current_files(tmp_path, [record])
+
+    assert len(active) == 1
+    assert "excerpt" not in active[0]
+
+    test_file.write_text(before, encoding="utf-8")
+
+    assert active_findings_for_current_files(tmp_path, [record]) == []
+
+
+def test_legacy_excerpt_findings_do_not_match_same_text_elsewhere(tmp_path):
+    test_file = tmp_path / "tests" / "existing.test.ts"
+    test_file.parent.mkdir()
+    test_file.write_text(
+        """\
+test.skip("external service contract", () => {});
+test("normal behavior", () => {});
+""",
+        encoding="utf-8",
+    )
+    record = {
+        "status": "detected",
+        "findings": [
+            {
+                "path": "tests/existing.test.ts",
+                "line": 3,
+                "category": "skip",
+                "reason": "skipped JavaScript/TypeScript test",
+                "excerpt": 'test.skip("external service contract", () => {});',
+            }
+        ],
+    }
+
+    assert active_findings_for_current_files(tmp_path, [record]) == []
 
 
 def test_ignores_environment_check_that_does_not_gate_test_registration():

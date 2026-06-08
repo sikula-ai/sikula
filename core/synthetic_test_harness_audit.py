@@ -155,7 +155,7 @@ def active_findings_for_current_files(root, records: Iterable[dict]) -> list[dic
         for finding in record.get("findings", []):
             path = str(finding.get("path", ""))
             excerpts = _finding_excerpts(finding)
-            if not path or not excerpts:
+            if not path:
                 continue
             try:
                 text = root.joinpath(*path.split("/")).read_text(encoding="utf-8", errors="replace")
@@ -265,10 +265,8 @@ def _prompt_evidence(finding: dict) -> str:
         category = str(subsystem.get("category", "")).strip()
         for line in subsystem.get("lines", [])[:1]:
             line_no = line.get("line", "?")
-            excerpt = str(line.get("excerpt", "")).strip()
-            if excerpt:
-                samples.append(f"{category} line {line_no}: {excerpt}")
-                break
+            samples.append(f"{category} line {line_no}")
+            break
         if len(samples) >= 3:
             break
     return "; ".join(samples)

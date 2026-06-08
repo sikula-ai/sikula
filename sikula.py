@@ -1625,6 +1625,7 @@ def cmd_cleanup(args: argparse.Namespace, cfg: dict) -> None:
             store.delete(state.task_id)
             print(f"Deleted state: {state.task_id}")
     elif not dry_run:
+        store.delete_text_snapshots(state.task_id)
         state.record(
             "sikula",
             "cleanup",

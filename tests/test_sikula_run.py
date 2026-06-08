@@ -447,6 +447,7 @@ class TestCmdCleanup:
         worktree = tmp_path / "wt"
         worktree.mkdir()
         store, _ = _saved_state(tmp_path, worktree=worktree)
+        store.save_text_snapshot("abc123", "test_writer_audit_before", {"tests/test_main.py": "assert True\n"})
 
         with (
             patch("sikula._worktree_dirty", return_value=False),
@@ -460,6 +461,7 @@ class TestCmdCleanup:
         assert "No changes made" in out
         remove_worktree.assert_not_called()
         assert store.load("abc123").worktree_base == str(worktree)
+        assert store.load_text_snapshot("abc123", "test_writer_audit_before") == {"tests/test_main.py": "assert True\n"}
 
     def test_cleanup_refuses_dirty_worktree_without_discard(self, tmp_path: Path, capsys):
         worktree = tmp_path / "wt"
@@ -495,6 +497,7 @@ class TestCmdCleanup:
         worktree = tmp_path / "wt"
         worktree.mkdir()
         store, _ = _saved_state(tmp_path, worktree=worktree)
+        store.save_text_snapshot("abc123", "test_writer_audit_before", {"tests/test_main.py": "assert True\n"})
 
         with (
             patch("sikula._worktree_dirty", return_value=False),
@@ -509,6 +512,7 @@ class TestCmdCleanup:
         assert state.worktree_base is None
         assert state.worktree_path is None
         assert any(h["action"] == "cleanup" for h in state.history)
+        assert store.load_text_snapshot("abc123", "test_writer_audit_before") is None
 
     @pytest.mark.parametrize("delete_state", [False, True])
     def test_cleanup_force_refuses_to_remove_current_worktree(
@@ -544,6 +548,7 @@ class TestCmdCleanup:
         worktree = tmp_path / "wt"
         worktree.mkdir()
         store, _ = _saved_state(tmp_path, worktree=worktree)
+        store.save_text_snapshot("abc123", "test_writer_audit_before", {"tests/test_main.py": "assert True\n"})
 
         with (
             patch("sikula._worktree_dirty", return_value=False),
@@ -553,6 +558,7 @@ class TestCmdCleanup:
             cmd_cleanup(_cleanup_args(force=True, delete_state=True), _run_cfg(tmp_path))
 
         assert store.load("abc123") is None
+        assert store.load_text_snapshot("abc123", "test_writer_audit_before") is None
 
 
 class TestCmdRunStateStore:

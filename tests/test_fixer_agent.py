@@ -456,16 +456,7 @@ class TestFixerAgentWritePaths:
         state = _make_state()
         state.test_errors = ["tests/LoginTest.kt failed in generated fake navigation harness"]
         state.test_files_written = ["tests/LoginTest.kt"]
-        state.fix_cycle_records = [
-            {
-                "triage_pass": "test_only",
-                "files_written": ["tests/LoginTest.kt"],
-            },
-            {
-                "triage_pass": "test_only",
-                "files_written": ["tests/LoginTest.kt"],
-            },
-        ]
+        state.generated_test_fix_counts = {"tests/LoginTest.kt": 2}
 
         _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
 
@@ -483,6 +474,25 @@ class TestFixerAgentWritePaths:
         assert "report_testability_gap" in prompt
         assert "coverage targets as applying only to runnable behaviour" in prompt
         assert "TESTABILITY GAP" in prompt
+
+    def test_repeated_generated_test_context_ignores_fix_cycle_records(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["tests/LoginTest.kt"]
+        stub_llm.agent_output = (
+            "TEST FAILURE TRIAGE:\nclassification: malformed_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["tests/LoginTest.kt failed in generated fake navigation harness"]
+        state.test_files_written = ["tests/LoginTest.kt"]
+        state.fix_cycle_records = [
+            {"triage_pass": "test_only", "files_written": ["tests/LoginTest.kt"]},
+            {"triage_pass": "test_only", "files_written": ["tests/LoginTest.kt"]},
+        ]
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert "REPEATED GENERATED TEST FIX CONTEXT:" not in stub_llm.agent_calls[0]
+        assert state.generated_test_fix_counts == {"tests/LoginTest.kt": 1}
 
     def test_generated_test_retriage_parser_stops_before_next_structured_block(self):
         retriage = _parse_generated_test_retriage(
@@ -511,6 +521,28 @@ class TestFixerAgentWritePaths:
             "reason": "configured tests cannot run browser interactions",
             "covered_by": "route contract tests",
         }
+
+    def test_generated_test_retriage_parser_requires_required_fields(self):
+        assert _parse_generated_test_retriage("GENERATED TEST RE-TRIAGE:\n") is None
+        assert (
+            _parse_generated_test_retriage(
+                "GENERATED TEST RE-TRIAGE:\n"
+                "strategy: report_testability_gap\n"
+                "target: generated browser harness\n"
+                "reason: configured tests cannot run browser interactions\n"
+            )
+            is None
+        )
+        assert (
+            _parse_generated_test_retriage(
+                "GENERATED TEST RE-TRIAGE:\n"
+                "strategy: keep_patching\n"
+                "target: generated browser harness\n"
+                "reason: configured tests cannot run browser interactions\n"
+                "covered_by: route contract tests\n"
+            )
+            is None
+        )
 
     def test_test_only_fixer_output_records_testability_gap(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["tests/LoginTest.kt"]
@@ -562,16 +594,7 @@ class TestFixerAgentWritePaths:
         state = _make_state()
         state.test_errors = ["tests/LoginTest.kt failed in generated fake navigation harness"]
         state.test_files_written = ["tests/LoginTest.kt"]
-        state.fix_cycle_records = [
-            {
-                "triage_pass": "test_only",
-                "files_written": ["tests/LoginTest.kt"],
-            },
-            {
-                "triage_pass": "test_only",
-                "files_written": ["tests/LoginTest.kt"],
-            },
-        ]
+        state.generated_test_fix_counts = {"tests/LoginTest.kt": 2}
 
         result = _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
 
@@ -581,6 +604,7 @@ class TestFixerAgentWritePaths:
         assert retriage["target"] == "LoginTest generated navigation harness"
         assert retriage["reason"] == "repeated failures show the test surface is wrong"
         assert retriage["covered_by"] == "route state tests"
+        assert state.generated_test_fix_counts["tests/LoginTest.kt"] == 3
 
     def test_missing_generated_test_retriage_restores_attempt_and_retries(self, file_tool, tmp_project: Path, caplog):
         (tmp_project / "tests").mkdir()
@@ -603,7 +627,7 @@ class TestFixerAgentWritePaths:
                 (
                     {"tests/LoginTest.py": "assert False\n"},
                     ["tests/LoginTest.py"],
-                    test_triage,
+                    test_triage + "\nGENERATED TEST RE-TRIAGE:\n",
                 ),
                 (
                     {"tests/LoginTest.py": "assert True\n"},
@@ -616,10 +640,7 @@ class TestFixerAgentWritePaths:
         state = _make_state()
         state.test_errors = ["tests/LoginTest.py failed in generated fake runtime harness"]
         state.test_files_written = ["tests/LoginTest.py"]
-        state.fix_cycle_records = [
-            {"triage_pass": "test_only", "files_written": ["tests/LoginTest.py"]},
-            {"triage_pass": "test_only", "files_written": ["tests/LoginTest.py"]},
-        ]
+        state.generated_test_fix_counts = {"tests/LoginTest.py": 2}
 
         with caplog.at_level(logging.INFO, logger="agents.fixer_agent"):
             result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
@@ -628,13 +649,14 @@ class TestFixerAgentWritePaths:
         assert (tmp_project / "tests" / "LoginTest.py").read_text() == "assert True\n"
         assert len(llm.agent_calls) == 2
         assert "GENERATED TEST RE-TRIAGE RECOVERY" in llm.agent_calls[1]
-        violation = state.fix_cycle_records[2]["generated_test_retriage_violation"]
+        violation = state.fix_cycle_records[0]["generated_test_retriage_violation"]
         assert violation["generated_test_files"] == ["tests/LoginTest.py"]
         assert violation["restored_files"] == ["tests/LoginTest.py"]
         assert violation["retry"] is True
-        retry_record = state.fix_cycle_records[3]
+        retry_record = state.fix_cycle_records[1]
         assert retry_record["triage_pass"] == "test_only_retry"
         assert retry_record["generated_test_retriage"]["strategy"] == "replace_with_narrower_seam_test"
+        assert state.generated_test_fix_counts["tests/LoginTest.py"] == 4
         assert state.files_changed == ["tests/LoginTest.py"]
         assert any(e["action"] == "generated_test_retriage_violation_reverted" for e in state.history)
         assert (
@@ -674,10 +696,7 @@ class TestFixerAgentWritePaths:
         state = _make_state()
         state.test_errors = ["tests/LoginTest.py failed in generated fake runtime harness"]
         state.test_files_written = ["tests/LoginTest.py"]
-        state.fix_cycle_records = [
-            {"triage_pass": "test_only", "files_written": ["tests/LoginTest.py"]},
-            {"triage_pass": "test_only", "files_written": ["tests/LoginTest.py"]},
-        ]
+        state.generated_test_fix_counts = {"tests/LoginTest.py": 2}
 
         with caplog.at_level(logging.INFO, logger="agents.fixer_agent"):
             result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
@@ -686,8 +705,9 @@ class TestFixerAgentWritePaths:
         assert state.failed is False
         assert (tmp_project / "tests" / "LoginTest.py").read_text() == "assert 1 == 1\n"
         assert len(llm.agent_calls) == 2
-        assert state.fix_cycle_records[2]["generated_test_retriage_violation"]["retry"] is True
-        assert state.fix_cycle_records[3]["generated_test_retriage_violation"]["retry"] is False
+        assert state.fix_cycle_records[0]["generated_test_retriage_violation"]["retry"] is True
+        assert state.fix_cycle_records[1]["generated_test_retriage_violation"]["retry"] is False
+        assert state.generated_test_fix_counts["tests/LoginTest.py"] == 4
         assert state.files_changed == ["tests/LoginTest.py"]
         assert any(e["action"] == "generated_test_retriage_violation_continue" for e in state.history)
         assert "Generated test re-triage still missing after retry for tests/LoginTest.py" in caplog.text

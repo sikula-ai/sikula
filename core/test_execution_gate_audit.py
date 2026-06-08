@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import difflib
+import hashlib
 import re
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Iterable, Mapping
 
 
 _SKIP_GATE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
@@ -41,7 +42,7 @@ _SKIP_GATE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     (
         "skip",
         "JUnit disabled test",
-        re.compile(r"(?:^|\s)@(?:Disabled|(?:org\.junit\.)?Ignore)\b"),
+        re.compile(r"(?:^|\s)@(?:(?:org\.junit\.jupiter\.api\.)?Disabled|(?:org\.junit\.)?Ignore)\b"),
     ),
     (
         "assumption",
@@ -61,7 +62,7 @@ _SKIP_GATE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     (
         "skip",
         "XCTest skipped test",
-        re.compile(r"\b(?:throw\s+)?XCTSkip(?:If|Unless)?\s*\("),
+        re.compile(r"\b(?:(?:try[!?]?|throw)\s+)?XCTSkip(?:If|Unless)?\s*\("),
     ),
     (
         "skip",
@@ -88,7 +89,8 @@ _ENVIRONMENT_GATE_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 _TEST_REGISTRATION_PATTERN = re.compile(
-    r"\b(?:describe|context|suite|test|it)\s*\(|"
+    r"\b(?:describe|context|suite|test|it)"
+    r"(?:\.(?:describe|each|concurrent|serial|parallel|skip|fixme|todo|only))*\s*\(|"
     r"(?:^|\s)(?:describe|context|it)\s+[\"'][^\"']+[\"']\s+do\b|"
     r"(?:^|\s)def\s+test_\w*\s*\(|"
     r"(?:^|\s)(?:func|fun)\s+[Tt]est\w*\s*\(|"
@@ -103,6 +105,7 @@ def detect_new_test_execution_gates(
     path: str,
     before: str | None,
     after: str | None,
+    before_counts: Mapping[str, int] | None = None,
 ) -> list[dict]:
     """Return newly added skip/disable/assumption/environment gates in a test file.
 
@@ -110,27 +113,77 @@ def detect_new_test_execution_gates(
     skips remain untouched; Sikula only cares when its own agent introduces a new gate.
     """
 
-    if not after:
+    baseline_counts = _coerce_gate_signature_counts(before_counts)
+    if before_counts is None:
+        baseline_counts = _gate_signature_counts(before)
+    seen_after: Counter[str] = Counter()
+    findings: list[dict] = []
+
+    for finding in _all_test_execution_gates(path=path, text=after):
+        signature = str(finding.get("signature", ""))
+        seen_after[signature] += 1
+        occurrence = seen_after[signature]
+        baseline_count = baseline_counts[signature]
+        if occurrence <= baseline_count:
+            continue
+        finding["baseline_count"] = baseline_count
+        finding["occurrence"] = occurrence
+        findings.append(finding)
+    return findings
+
+
+def test_execution_gate_signature_counts(text: str | None) -> dict[str, int]:
+    """Return sanitized execution-gate baseline counts for durable task state."""
+
+    return dict(_gate_signature_counts(text))
+
+
+def active_findings_for_current_files(root, records: Iterable[dict]) -> list[dict]:
+    """Return findings that still appear in the current working tree.
+
+    This keeps pending audit errors resume-safe and avoids retrying against a stale
+    finding that a later test writer/fixer pass already removed.
+    """
+
+    active: list[dict] = []
+    cache: dict[str, list[dict]] = {}
+    for record in records:
+        if record.get("status") == "resolved":
+            continue
+        for finding in record.get("findings", []):
+            path = str(finding.get("path", ""))
+            if not path:
+                continue
+            try:
+                text = root.joinpath(*path.split("/")).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if path not in cache:
+                cache[path] = _all_test_execution_gates(path=path, text=text)
+            active_finding = _active_finding_from_current_gates(finding, cache[path], text)
+            if active_finding:
+                active.append(active_finding)
+    return active
+
+
+def _all_test_execution_gates(*, path: str, text: str | None) -> list[dict]:
+    if not text:
         return []
 
-    before_lines = before.splitlines() if before else []
-    after_lines = after.splitlines()
-    new_line_indexes = _changed_after_line_indexes(before_lines, after_lines)
-
+    lines = text.splitlines()
     findings: list[dict] = []
-    for index in new_line_indexes:
-        line = after_lines[index]
+    for index, line in enumerate(lines):
         classification = _classify_direct_gate(line)
         if classification:
             category, reason = classification
             findings.append(_finding(path, index, category, reason, line))
             continue
 
-        if _is_playwright_skip_mode_configuration(after_lines, index):
+        if _is_playwright_skip_mode_configuration(lines, index):
             findings.append(_finding(path, index, "skip", "Playwright skip-mode configuration", line))
             continue
 
-        if _is_environment_gate_for_test_registration(after_lines, index):
+        if _is_environment_gate_for_test_registration(lines, index):
             findings.append(
                 _finding(
                     path,
@@ -143,38 +196,62 @@ def detect_new_test_execution_gates(
     return findings
 
 
-def active_findings_for_current_files(root, records: Iterable[dict]) -> list[dict]:
-    """Return findings that still appear in the current working tree.
+def _gate_signature_counts(text: str | None) -> Counter[str]:
+    return Counter(str(finding.get("signature", "")) for finding in _all_test_execution_gates(path="", text=text))
 
-    This keeps pending audit errors resume-safe and avoids retrying against a stale
-    finding that a later test writer/fixer pass already removed.
-    """
 
-    active: list[dict] = []
-    for record in records:
-        if record.get("status") == "resolved":
+def _coerce_gate_signature_counts(counts: Mapping[str, int] | None) -> Counter[str]:
+    coerced: Counter[str] = Counter()
+    for signature, count in (counts or {}).items():
+        if not signature:
             continue
-        for finding in record.get("findings", []):
-            path = str(finding.get("path", ""))
-            excerpt = str(finding.get("excerpt", "")).strip()
-            if not path or not excerpt:
-                continue
-            try:
-                text = root.joinpath(*path.split("/")).read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            if excerpt in text:
-                active.append(finding)
-    return active
+        try:
+            parsed = int(count)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            coerced[str(signature)] = parsed
+    return coerced
 
 
-def _changed_after_line_indexes(before_lines: list[str], after_lines: list[str]) -> list[int]:
-    matcher = difflib.SequenceMatcher(a=before_lines, b=after_lines, autojunk=False)
-    indexes: list[int] = []
-    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
-        if tag in {"insert", "replace"}:
-            indexes.extend(range(j1, j2))
-    return indexes
+def _active_finding_from_current_gates(finding: dict, current_gates: list[dict], text: str) -> dict | None:
+    signature = str(finding.get("signature", ""))
+    occurrence = _positive_int(finding.get("occurrence"))
+    baseline_count = _nonnegative_int(finding.get("baseline_count"))
+    if signature and occurrence is not None:
+        matching = [gate for gate in current_gates if gate.get("signature") == signature]
+        if len(matching) >= occurrence and len(matching) > baseline_count:
+            active = dict(finding)
+            active["line"] = matching[occurrence - 1].get("line", active.get("line"))
+            active.pop("excerpt", None)
+            return active
+        return None
+
+    # Backward compatibility for state files written before signatures were recorded.
+    excerpt = str(finding.get("excerpt", "")).strip()
+    line = _positive_int(finding.get("line"))
+    lines = text.splitlines()
+    if excerpt and line is not None and line <= len(lines) and excerpt in lines[line - 1]:
+        active = dict(finding)
+        active.pop("excerpt", None)
+        return active
+    return None
+
+
+def _positive_int(value) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _nonnegative_int(value) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(parsed, 0)
 
 
 def _classify_direct_gate(line: str) -> tuple[str, str] | None:
@@ -290,5 +367,11 @@ def _finding(path: str, index: int, category: str, reason: str, line: str) -> di
         "line": index + 1,
         "category": category,
         "reason": reason,
-        "excerpt": line.strip(),
+        "signature": _gate_signature(category, reason, line),
     }
+
+
+def _gate_signature(category: str, reason: str, line: str) -> str:
+    normalized = re.sub(r"\s+", " ", _strip_line_comment(line).strip())
+    digest = hashlib.sha256(f"{category}\0{reason}\0{normalized}".encode("utf-8")).hexdigest()
+    return f"{category}:{digest[:16]}"
