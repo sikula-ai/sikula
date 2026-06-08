@@ -14,6 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Build sync now has platform-neutral adoption and audit for source-controlled generated outputs such as lockfiles and dependency verification metadata: existing tracked sync outputs are added to `files_changed`, semantic review/test gates are invalidated, unexpected non-ignored artifacts are cleaned or fail closed, and project-specific new output patterns can be configured with `build.sync_adopt_paths`.
 
 ### Fixed
+- OpenCode runs that exit successfully but produce no assistant text now include cleaned
+  stderr and structured tool-call diagnostics in the reported no-output/no-change error,
+  so rejected tool calls and provider diagnostics are visible without dumping raw JSON events.
 - OpenCode write-agent runs now monitor structured provider error events and OpenCode's
   `--print-logs` stderr stream for `responseBody` / `responseHeaders` fields carrying fatal
   quota/auth/config failures, so exhausted credits fail immediately instead of waiting for the

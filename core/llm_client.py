@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import queue
+import re
 import signal
 import subprocess
 import tempfile
@@ -83,6 +84,7 @@ class LLMConfig:
     temperature: float = 0.0
     agent_timeout: int = 1800  # seconds; applies to run_agent and run_readonly_agent
     retry_observer: RetryObserver | None = None
+    session_title: str | None = None
 
 
 def _git_snapshot(cwd: Path) -> dict[str, str]:
@@ -276,6 +278,16 @@ class LLMClient:
             return previous
         previous = getattr(self, "_retry_observer", None)
         self._retry_observer = observer
+        return previous
+
+    def set_session_title(self, title: str | None) -> str | None:
+        config = getattr(self, "_config", None)
+        if config is not None and hasattr(config, "session_title"):
+            previous = config.session_title
+            config.session_title = title
+            return previous
+        previous = getattr(self, "_session_title", None)
+        self._session_title = title
         return previous
 
     def generate(self, system: str, user: str) -> str:
@@ -484,6 +496,9 @@ class ClaudeClient(LLMClient):
 
 _OPENCODE_READONLY_AGENT = "sikula-readonly"
 _OPENCODE_IMPLEMENTER_AGENT = "sikula-implementer"
+_OPENCODE_GENERATE_TITLE = "sikula-generate"
+_OPENCODE_READONLY_TITLE = "sikula-readonly"
+_OPENCODE_IMPLEMENTER_TITLE = "sikula-implementer"
 
 _OPENCODE_READONLY_CONFIG = """\
 ---
@@ -581,10 +596,14 @@ def _opencode_error_from_event(event: dict) -> LLMProviderError | None:
         return None
     err = event.get("error", {})
     if isinstance(err, dict):
-        msg = (err.get("data", {}) or {}).get("message") or err.get("name") or str(err)
-        raw = json.dumps(err)
-        if raw not in msg:
-            msg = f"{msg} {raw}"
+        data = err.get("data", {}) or {}
+        headers = data.get("headers") if isinstance(data, dict) else None
+        if _opencode_headers_indicate_quota_exhausted(headers):
+            return LLMQuotaExceeded("opencode event error: quota exceeded")
+        msg = data.get("message") if isinstance(data, dict) else None
+        msg = msg or err.get("message")
+        msg = msg or event.get("message")
+        msg = msg or err.get("name") or "provider error"
     else:
         msg = str(err)
     return _provider_error("opencode", "event", msg)
@@ -602,15 +621,98 @@ def _opencode_stream_error(line: str) -> LLMProviderError | None:
     return _opencode_error_from_event(event)
 
 
-def _opencode_error(result: subprocess.CompletedProcess[str]) -> str:
-    """Return fallback error text from an opencode subprocess result."""
-    stderr = result.stderr.strip()
-    if stderr:
-        return stderr
-    stdout = result.stdout.strip()
-    if stdout:
-        return stdout
-    return "non-zero exit"
+def _opencode_stdout_diagnostic(stdout: str) -> str:
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        part = event.get("part")
+        if not isinstance(part, dict) or part.get("type") != "tool":
+            continue
+        state = part.get("state")
+        if not isinstance(state, dict) or state.get("status") != "error":
+            continue
+        error = str(state.get("error") or "tool call failed").strip()
+        tool = part.get("tool") or "tool"
+        input_data = state.get("input")
+        path = input_data.get("path") if isinstance(input_data, dict) else None
+        if path:
+            return f"{tool} failed: {error} (path: {path})"
+        return f"{tool} failed: {error}"
+    return ""
+
+
+def _provider_error_label(provider_error: LLMProviderError) -> str:
+    if isinstance(provider_error, LLMQuotaExceeded):
+        return "quota exceeded"
+    if isinstance(provider_error, LLMAuthError):
+        return "authentication failed"
+    if isinstance(provider_error, LLMConfigurationError):
+        return "configuration error"
+    return "provider error"
+
+
+@dataclass(frozen=True)
+class _OpenCodeDiagnostic:
+    public_message: str
+    error_type: type[LLMProviderError] | None = None
+
+    def to_provider_error(self, operation: str) -> LLMProviderError:
+        message = f"opencode {operation} error: {self.public_message}"
+        if self.error_type is not None:
+            return self.error_type(message)
+        return LLMTransientError(message)
+
+
+def _opencode_stderr_diagnostic(
+    stderr: str,
+    operation: str,
+    *,
+    classify_plain_fatal: bool = False,
+) -> _OpenCodeDiagnostic | None:
+    first_structured_diagnostic: _OpenCodeDiagnostic | None = None
+    for line in stderr.splitlines():
+        structured_parts = _opencode_log_structured_parts(line, include_error_payload=True)
+        if not structured_parts:
+            continue
+        headers = structured_parts.get("responseHeaders")
+        if _opencode_headers_indicate_quota_exhausted(headers):
+            return _OpenCodeDiagnostic("opencode provider diagnostic: quota exceeded", LLMQuotaExceeded)
+        provider_error = _opencode_diagnostic_provider_error("stderr", json.dumps(structured_parts))
+        error_type = type(provider_error) if isinstance(provider_error, LLMFatalError) else None
+        diagnostic = _OpenCodeDiagnostic(
+            f"opencode provider diagnostic: {_provider_error_label(provider_error)}",
+            error_type,
+        )
+        if diagnostic.error_type is not None:
+            return diagnostic
+        if first_structured_diagnostic is None:
+            first_structured_diagnostic = diagnostic
+    if first_structured_diagnostic is not None:
+        return first_structured_diagnostic
+    if stderr.strip():
+        if classify_plain_fatal:
+            provider_error = _provider_error("opencode", operation, stderr)
+            if isinstance(provider_error, LLMFatalError):
+                return _OpenCodeDiagnostic(
+                    f"opencode provider diagnostic: {_provider_error_label(provider_error)}",
+                    type(provider_error),
+                )
+        return _OpenCodeDiagnostic("stderr without a safe diagnostic")
+    return None
+
+
+def _opencode_error(result: subprocess.CompletedProcess[str], operation: str) -> LLMProviderError:
+    """Return a safe typed error from an opencode subprocess result."""
+    stderr_diagnostic = _opencode_stderr_diagnostic(result.stderr or "", operation, classify_plain_fatal=True)
+    if stderr_diagnostic is not None:
+        return stderr_diagnostic.to_provider_error(operation)
+    if result.stdout.strip():
+        return LLMTransientError(f"opencode {operation} error: non-zero exit with stdout but no safe diagnostic")
+    return LLMTransientError(f"opencode {operation} error: non-zero exit")
 
 
 def _opencode_result_error(result: subprocess.CompletedProcess[str], operation: str) -> LLMProviderError:
@@ -621,7 +723,45 @@ def _opencode_result_error(result: subprocess.CompletedProcess[str], operation: 
             _opencode_parse_text(stdout)
         except LLMProviderError as exc:
             return exc
-    return _provider_error("opencode", operation, _opencode_error(result))
+    return _opencode_error(result, operation)
+
+
+def _subprocess_output_excerpt(result: subprocess.CompletedProcess[str]) -> str:
+    parts = []
+    stderr = _opencode_stderr_diagnostic(result.stderr or "", "diagnostic")
+    if stderr is not None:
+        parts.append(f"stderr: {stderr.public_message}")
+
+    stdout_diagnostic = _opencode_stdout_diagnostic(result.stdout or "")
+    if stdout_diagnostic:
+        parts.append(f"stdout: {stdout_diagnostic}")
+    return "\n".join(parts)
+
+
+def _opencode_no_text_message(result: subprocess.CompletedProcess[str], context: str) -> str:
+    message = f"opencode {context} error: returned no text output"
+    excerpt = _subprocess_output_excerpt(result)
+    if excerpt:
+        message = f"{message}\n{excerpt}"
+    return message
+
+
+def _opencode_diagnostic_provider_error(operation: str, message: str) -> LLMProviderError:
+    lower = message.lower()
+    if "invalid_request_error" in lower or "unsupported_value" in lower or "unsupported value" in lower:
+        return LLMConfigurationError(message)
+    return _provider_error("opencode", operation, message)
+
+
+def _opencode_no_text_error(result: subprocess.CompletedProcess[str], context: str) -> LLMProviderError:
+    message = _opencode_no_text_message(result, context)
+    stderr_diagnostic = _opencode_stderr_diagnostic(result.stderr or "", context)
+    if stderr_diagnostic is not None and stderr_diagnostic.error_type is not None:
+        return stderr_diagnostic.error_type(message)
+    provider_error = _opencode_diagnostic_provider_error(context, message)
+    if isinstance(provider_error, LLMFatalError):
+        return type(provider_error)(message)
+    return LLMTransientError(message)
 
 
 def _signal_process_group(process: subprocess.Popen[str], sig: int) -> bool:
@@ -693,7 +833,7 @@ def _json_object_after_marker(text: str, marker: str) -> object | None:
     return None
 
 
-def _opencode_log_error(line: str) -> LLMProviderError | None:
+def _opencode_log_structured_parts(line: str, *, include_error_payload: bool = False) -> dict[str, object]:
     structured_parts: dict[str, object] = {}
     try:
         event = json.loads(line)
@@ -712,18 +852,18 @@ def _opencode_log_error(line: str) -> LLMProviderError | None:
     if response_headers is not None:
         structured_parts["responseHeaders"] = response_headers
 
-    if structured_parts:
-        provider_error = _provider_error("opencode", "agent", json.dumps(structured_parts))
-        if isinstance(provider_error, LLMFatalError):
-            return provider_error
+    if include_error_payload:
+        error_payload = _json_object_after_marker(line, "error=")
+        if error_payload is not None:
+            structured_parts["error"] = error_payload
 
-    headers = structured_parts.get("responseHeaders")
-    if _opencode_headers_indicate_quota_exhausted(headers):
-        return _provider_error(
-            "opencode",
-            "agent",
-            "x-codex-credits-balance: 0; x-codex-credits-has-credits: false",
-        )
+    return structured_parts
+
+
+def _opencode_log_error(line: str) -> LLMProviderError | None:
+    diagnostic = _opencode_stderr_diagnostic(line, "agent")
+    if diagnostic is not None and diagnostic.error_type is not None:
+        return diagnostic.to_provider_error("agent")
     return None
 
 
@@ -734,6 +874,32 @@ def _opencode_headers_indicate_quota_exhausted(headers: object) -> bool:
     balance = normalized.get("x-codex-credits-balance")
     has_credits = normalized.get("x-codex-credits-has-credits")
     return str(balance).strip() == "0" or str(has_credits).strip().lower() == "false"
+
+
+def _opencode_log_diagnostic_error(line: str) -> LLMProviderError | None:
+    diagnostic = _opencode_stderr_diagnostic(line, "log")
+    if diagnostic is None or diagnostic.error_type is None:
+        return None
+    return diagnostic.to_provider_error("log")
+
+
+def _warn_opencode_success_diagnostics(stderr: str) -> None:
+    for line in stderr.splitlines():
+        provider_error = _opencode_log_diagnostic_error(line)
+        if provider_error is not None:
+            log.warning("opencode reported provider diagnostic: %s", _provider_error_label(provider_error))
+
+
+def _opencode_error_log_args() -> list[str]:
+    return ["--print-logs", "--log-level", "ERROR"]
+
+
+def _opencode_title(value: str | None, fallback: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return fallback
+    title = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
+    return title[:80].strip("-") or fallback
 
 
 def _run_agent_subprocess_streaming(
@@ -920,8 +1086,11 @@ class OpenCodeClient(LLMClient):
                     "run",
                     "--model",
                     self._config.model,
+                    "--title",
+                    _opencode_title(self._config.session_title, _OPENCODE_GENERATE_TITLE),
                     "--format",
                     "json",
+                    *_opencode_error_log_args(),
                 ],
                 capture_output=True,
                 input=prompt,
@@ -930,9 +1099,10 @@ class OpenCodeClient(LLMClient):
             )
             if result.returncode != 0:
                 raise _opencode_result_error(result, "CLI")
+            _warn_opencode_success_diagnostics(result.stderr)
             text = _opencode_parse_text(result.stdout)
             if not text:
-                raise LLMTransientError("opencode CLI error: returned no text output")
+                raise _opencode_no_text_error(result, "CLI")
             return text
 
         return _call_with_retry("generate", _call, self._config, "generate")
@@ -952,8 +1122,11 @@ class OpenCodeClient(LLMClient):
                         self._config.model,
                         "--agent",
                         _OPENCODE_READONLY_AGENT,
+                        "--title",
+                        _opencode_title(self._config.session_title, _OPENCODE_READONLY_TITLE),
                         "--format",
                         "json",
+                        *_opencode_error_log_args(),
                     ],
                     capture_output=True,
                     input=prompt,
@@ -964,9 +1137,10 @@ class OpenCodeClient(LLMClient):
                 )
             if result.returncode != 0:
                 raise _opencode_result_error(result, "agent")
+            _warn_opencode_success_diagnostics(result.stderr)
             text = _opencode_parse_text(result.stdout)
             if not text:
-                raise LLMTransientError("opencode agent error: returned no text output")
+                raise _opencode_no_text_error(result, "agent")
             return text
 
         return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
@@ -990,11 +1164,11 @@ class OpenCodeClient(LLMClient):
                             self._config.model,
                             "--agent",
                             _OPENCODE_IMPLEMENTER_AGENT,
+                            "--title",
+                            _opencode_title(self._config.session_title, _OPENCODE_IMPLEMENTER_TITLE),
                             "--format",
                             "json",
-                            "--print-logs",
-                            "--log-level",
-                            "ERROR",
+                            *_opencode_error_log_args(),
                         ],
                         prompt=prompt,
                         cwd=cwd,
@@ -1003,9 +1177,15 @@ class OpenCodeClient(LLMClient):
                     )
                 if result.returncode != 0:
                     raise _opencode_result_error(result, "agent")
+                _warn_opencode_success_diagnostics(result.stderr)
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
                 text = _agent_text_or_empty(_opencode_parse_text, result.stdout)
+                if not text:
+                    message = _opencode_no_text_message(result, "agent")
+                    if not changed:
+                        raise _opencode_no_text_error(result, "agent")
+                    text = message
                 return changed, text
             except subprocess.TimeoutExpired as exc:
                 last_exc = LLMTimeoutError(f"opencode agent timed out after {exc.timeout}s")

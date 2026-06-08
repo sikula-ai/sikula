@@ -241,6 +241,29 @@ class TestOrchestratorLoop:
         assert loaded is not None
         assert loaded.active_operation is None
 
+    def test_run_agent_sets_scoped_llm_session_title(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, heartbeat_interval_seconds=0)
+        llm = StubLLMClient()
+        stubs["analyst"].llm = llm
+        state = TaskState(
+            task_id="5b891efb881f4388a8f0fd0578f98573",
+            task_description="Confidential Customer Bug SECRET-123",
+        )
+        orch._store.save(state)
+
+        def assert_session_title(_state: TaskState) -> None:
+            title = getattr(llm, "_session_title")
+            assert title == "sikula-analyst-5b891efb"
+            assert "Confidential" not in title
+            assert "SECRET-123" not in title
+
+        stubs["analyst"].side_effect = assert_session_title
+
+        result = orch._run_agent("analyst", state)
+
+        assert result.success
+        assert getattr(llm, "_session_title") is None
+
     def test_run_agent_skips_active_operation_when_heartbeat_disabled(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path, heartbeat_interval_seconds=0)
 
