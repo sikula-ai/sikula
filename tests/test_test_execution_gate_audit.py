@@ -216,6 +216,64 @@ if (process.env.RUN_BROWSER_TESTS) {
         )
 
 
+def test_detects_multiline_environment_gated_test_registration_headers():
+    cases = [
+        (
+            "tests/clientMain.test.ts",
+            """\
+if (
+  process.env.RUN_BROWSER_TESTS
+) {
+  test("browser behavior", () => {});
+}
+""",
+        ),
+        (
+            "tests/client_main_test.py",
+            """\
+if (
+    os.environ.get("RUN_BROWSER_TESTS")
+):
+    def test_browser_behavior():
+        pass
+""",
+        ),
+        (
+            "tests/ClientMainTest.kt",
+            """\
+if (
+    System.getenv("RUN_BROWSER_TESTS") != null
+) {
+    @Test
+    fun testBrowserBehavior() {}
+}
+""",
+        ),
+        (
+            "tests/client_main_test.go",
+            """\
+if (
+    os.Getenv("RUN_BROWSER_TESTS") != ""
+) {
+    func TestBrowserBehavior(t *testing.T) {}
+}
+""",
+        ),
+    ]
+
+    for path, after in cases:
+        findings = detect_new_test_execution_gates(path=path, before=None, after=after)
+
+        assert len(findings) == 1
+        _assert_public_finding_metadata(
+            findings[0],
+            path=path,
+            line=1,
+            category="environment",
+            reason="environment-gated test registration",
+        )
+
+
 def test_detects_expression_style_env_gated_javascript_registrations():
     cases = [
         """\
@@ -261,6 +319,30 @@ if (process.env.CI) {
     )
 
     assert findings == []
+
+
+def test_ignores_multiline_environment_gate_without_test_registration():
+    cases = [
+        """\
+if (
+  process.env.CI
+) {
+  configureExternalService();
+}
+
+test("runs in normal validation", () => {});
+""",
+        """\
+if (shouldConfigureExternalService) {
+  const enabled = process.env.RUN_BROWSER_TESTS && configureExternalService();
+}
+
+test("runs in normal validation", () => {});
+""",
+    ]
+
+    for after in cases:
+        assert detect_new_test_execution_gates(path="tests/clientMain.test.ts", before=None, after=after) == []
 
 
 def test_detects_env_var_gated_test_registration_across_common_runtimes():
