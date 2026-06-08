@@ -1371,6 +1371,7 @@ def _codex_error_message(raw: object) -> str:
 def _codex_subprocess_error(result: subprocess.CompletedProcess[str]) -> str:
     """Return the most useful error text from a codex subprocess result."""
     stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
     if stdout:
         saw_json_event = _codex_output_has_json_events(stdout)
         try:
@@ -1378,12 +1379,13 @@ def _codex_subprocess_error(result: subprocess.CompletedProcess[str]) -> str:
         except RuntimeError as exc:
             message = str(exc)
             if "returned no text output" in message:
+                if stderr:
+                    return stderr
                 if saw_json_event:
                     return "codex exited before producing a final answer or structured error"
                 return stdout
             return message
         return stdout
-    stderr = result.stderr.strip()
     if stderr:
         return stderr
     return "non-zero exit"

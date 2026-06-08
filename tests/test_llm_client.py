@@ -1690,6 +1690,19 @@ class TestCodexParseText:
         assert error == "codex exited before producing a final answer or structured error"
         assert "ScannerEvaluationRecord" not in error
 
+    def test_subprocess_error_prefers_stderr_over_non_error_json_progress(self):
+        stdout = "\n".join(
+            [
+                json.dumps(
+                    {"type": "response_item", "payload": {"type": "function_call_output", "output": "progress"}}
+                ),
+                json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {"total_tokens": 123}}}),
+            ]
+        )
+        result = MagicMock(returncode=1, stdout=stdout, stderr="401 unauthorized")
+
+        assert _codex_subprocess_error(result) == "401 unauthorized"
+
     def test_subprocess_error_keeps_plain_stdout_error(self):
         result = MagicMock(returncode=1, stdout="Error: failed to initialize app-server", stderr="")
         assert _codex_subprocess_error(result) == "Error: failed to initialize app-server"
@@ -1754,6 +1767,20 @@ class TestCodexClientCommands:
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client.subprocess.run", return_value=failure) as mock_run,
             pytest.raises(LLMQuotaExceeded, match="quota exceeded"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_generate_prefers_stderr_over_non_error_json_progress(self):
+        client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
+        stdout = json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {"total_tokens": 123}}})
+        failure = MagicMock(returncode=1, stdout=stdout, stderr="401 unauthorized")
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=failure) as mock_run,
+            pytest.raises(LLMAuthError, match="401 unauthorized"),
         ):
             client.generate("system", "user")
 
