@@ -167,11 +167,11 @@ class TestPathClassification:
         assert not orchestrator_module._path_looks_like_test_artifact("feature/latest/src/main/App.ts")
         assert not orchestrator_module._path_looks_like_test_artifact("feature/contest/src/main/App.ts")
 
-    def test_execution_gate_audit_candidates_include_source_files_for_inline_tests(self):
-        assert orchestrator_module._path_looks_like_test_gate_audit_candidate("src/lib.rs")
-        assert orchestrator_module._path_looks_like_test_gate_audit_candidate("src/main/kotlin/InlineTests.kt")
-        assert orchestrator_module._path_looks_like_test_gate_audit_candidate("tests/clientMain.test.ts")
-        assert not orchestrator_module._path_looks_like_test_gate_audit_candidate("assets/logo.png")
+    def test_test_audit_candidates_include_source_files_for_inline_tests(self):
+        assert orchestrator_module._path_looks_like_test_audit_candidate("src/lib.rs")
+        assert orchestrator_module._path_looks_like_test_audit_candidate("src/main/kotlin/InlineTests.kt")
+        assert orchestrator_module._path_looks_like_test_audit_candidate("tests/clientMain.test.ts")
+        assert not orchestrator_module._path_looks_like_test_audit_candidate("assets/logo.png")
 
 
 def _make_orchestrator(
@@ -1760,6 +1760,75 @@ mod tests {
         assert finding["path"] == "src/lib.rs"
         assert finding["reason"] == "Rust ignored test"
         assert state.test_errors[0].startswith("TEST EXECUTION GATE AUDIT:")
+
+    def test_test_writer_synthetic_harness_audit_includes_inline_source_tests(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "sandbox": {"allowed_test_write_paths": ["src/"]},
+            },
+        )
+        source_file = tmp_path / "src" / "lib.rs"
+        source_file.parent.mkdir()
+        baseline = "pub fn answer() -> i32 {\n    42\n}\n"
+        source_file.write_text(baseline, encoding="utf-8")
+        attempts = {"count": 0}
+
+        def test_writer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                source_file.write_text(
+                    baseline
+                    + """\
+
+#[cfg(test)]
+mod tests {
+    struct FakeElement;
+    struct FakeEventTarget;
+    struct FakeHistory;
+    struct FakeServer;
+}
+""",
+                    encoding="utf-8",
+                )
+            else:
+                saved = orch._store.load("t1")
+                assert saved is not None
+                assert any(record["action"] == "synthetic_test_harness_recovered" for record in saved.history)
+                assert source_file.read_text(encoding="utf-8") == baseline
+                source_file.write_text(
+                    baseline
+                    + """\
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn generated_contract() {
+        assert_eq!(super::answer(), 42);
+    }
+}
+""",
+                    encoding="utf-8",
+                )
+            state.tests_up_to_date = True
+            state.files_changed.append("src/lib.rs")
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        stubs["test_writer"].result_data = {"files_written": ["src/lib.rs"]}
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.rs"])
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed
+        assert attempts["count"] == 2
+        assert len(state.synthetic_test_harness_records) == 1
+        record = state.synthetic_test_harness_records[0]
+        assert record["findings"][0]["path"] == "src/lib.rs"
+        assert record["status"] == "resolved"
+        assert "FakeElement" not in source_file.read_text(encoding="utf-8")
 
     def test_test_writer_execution_gate_audit_fails_when_build_loop_disabled(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(

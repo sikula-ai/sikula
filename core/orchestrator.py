@@ -235,7 +235,7 @@ def _path_looks_like_test_artifact(path: str) -> bool:
     )
 
 
-def _path_looks_like_test_gate_audit_candidate(path: str) -> bool:
+def _path_looks_like_test_audit_candidate(path: str) -> bool:
     if _path_looks_like_test_artifact(path):
         return True
     parts = _path_parts(path)
@@ -1534,7 +1534,7 @@ class Orchestrator:
                 candidate = candidate.resolve(strict=False)
                 if candidate.is_file():
                     relative = self._relative_project_path(candidate)
-                    if relative and _path_looks_like_test_gate_audit_candidate(relative):
+                    if relative and _path_looks_like_test_audit_candidate(relative):
                         yield candidate
                     continue
                 if not candidate.is_dir():
@@ -1545,7 +1545,7 @@ class Orchestrator:
                     relative = self._relative_project_path(path)
                     if not relative or self._path_is_internal(relative):
                         continue
-                    if _path_looks_like_test_gate_audit_candidate(relative):
+                    if _path_looks_like_test_audit_candidate(relative):
                         yield path
 
     def _relative_project_path(self, path: Path) -> str | None:
@@ -1600,8 +1600,7 @@ class Orchestrator:
             {
                 _normalize_project_path(str(path))
                 for path in files_written
-                if self._is_configured_test_write_path(str(path))
-                and _path_looks_like_test_gate_audit_candidate(str(path))
+                if self._is_configured_test_write_path(str(path)) and _path_looks_like_test_audit_candidate(str(path))
             }
         )
         findings: list[dict] = []
@@ -1635,7 +1634,7 @@ class Orchestrator:
             {
                 _normalize_project_path(str(path))
                 for path in files_written
-                if self._is_configured_test_write_path(str(path)) and _path_looks_like_test_artifact(str(path))
+                if self._is_configured_test_write_path(str(path)) and _path_looks_like_test_audit_candidate(str(path))
             }
         )
         active_before = self._refresh_synthetic_test_harness_audits(state)
@@ -1665,7 +1664,7 @@ class Orchestrator:
                 for normalized in [_normalize_project_path(str(finding.get("path", "")))]
                 if normalized
                 and self._is_configured_test_write_path(normalized)
-                and _path_looks_like_test_artifact(normalized)
+                and _path_looks_like_test_audit_candidate(normalized)
             }
         )
 
@@ -1713,7 +1712,7 @@ class Orchestrator:
                 continue
             if (
                 self._is_configured_test_write_path(path)
-                and _path_looks_like_test_gate_audit_candidate(path)
+                and _path_looks_like_test_audit_candidate(path)
                 and before_snapshot.get(path) == self._read_project_text(path)
             ):
                 continue

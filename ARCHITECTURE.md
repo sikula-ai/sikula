@@ -913,9 +913,10 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
     ignored, assumption-gated, or environment-gated execution paths. Existing project
     skips are not blocked. New gates are recorded in `state.test_execution_gate_records`
     and fed into the build/fix loop as test-origin validation issues.
-    Sikula also audits the current Sikula-modified test file against the task baseline
-    for generated synthetic runtime harnesses that combine multiple locally declared fake
-    runtime subsystems such as render trees, event dispatch, navigation/history,
+    Sikula also audits the current Sikula-modified test file or inline-test source file
+    against the task baseline for generated synthetic runtime harnesses that combine
+    multiple locally declared fake runtime subsystems such as render trees,
+    event dispatch, navigation/history,
     networking, scheduler/lifecycle, dependency-container, filesystem/command-runner, or
     platform/device runtime fakes. This catches harnesses assembled across multiple agent
     passes while leaving baseline project helpers and normal project-standard test

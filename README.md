@@ -919,9 +919,10 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
   issues, so the fixer can replace them with real existing-seam coverage or remove the
   placeholder and report a gap.
   It also records synthetic harness audit findings when the current Sikula-modified test
-  file crosses the broad-harness threshold relative to the task baseline, including
-  harnesses assembled across multiple test-writer/fixer passes. Those findings are fed
-  back to later test-writer/fixer prompts, surfaced in task summaries, and handled with
+  file or inline-test source file crosses the broad-harness threshold relative to the
+  task baseline, including harnesses assembled across multiple test-writer/fixer passes.
+  Those findings are fed back to later test-writer/fixer prompts, surfaced in task
+  summaries, and handled with
   soft recovery: Sikula restores the affected generated test files to the pre-agent
   snapshot and retries once. If the retry recreates the broad harness, Sikula restores it
   again, records a `TESTABILITY GAP`, and lets normal validation continue instead of
