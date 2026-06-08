@@ -107,10 +107,10 @@ _TEST_ORIGIN_VALIDATION_CONSTRAINT = """\
   subsystem at a time; simplify to narrower pure-seam/public-contract coverage or report the
   TESTABILITY GAP for behaviour that cannot be executed meaningfully.
 - Do not fix a generated test failure by adding a new skipped, disabled, ignored,
-  assumption-gated, or environment-gated test for the changed behaviour. A test that is
-  expected to be skipped in Sikula's configured validation pipeline is not coverage. If
-  missing runtime infrastructure prevents execution, preserve stable-seam coverage where
-  possible and output a structured TESTABILITY GAP block.
+  expected-failure, assumption-gated, or environment-gated test for the changed behaviour. A
+  test that is expected to be skipped, or expected to fail, in Sikula's configured validation
+  pipeline is not coverage. If missing runtime infrastructure prevents execution, preserve
+  stable-seam coverage where possible and output a structured TESTABILITY GAP block.
 - When outputting a TESTABILITY GAP, use:
   TESTABILITY GAP:
   target: <behaviour or contract that remains untested>
@@ -173,10 +173,10 @@ _TEST_TEST_CONSTRAINT = """\
   subsystem at a time; simplify to narrower pure-seam/public-contract coverage or report the
   TESTABILITY GAP for behaviour that cannot be executed meaningfully.
 - Do not fix a generated test failure by adding a new skipped, disabled, ignored,
-  assumption-gated, or environment-gated test for the changed behaviour. A test that is
-  expected to be skipped in Sikula's configured validation pipeline is not coverage. If
-  missing runtime infrastructure prevents execution, preserve stable-seam coverage where
-  possible and output a structured TESTABILITY GAP block.
+  expected-failure, assumption-gated, or environment-gated test for the changed behaviour. A
+  test that is expected to be skipped, or expected to fail, in Sikula's configured validation
+  pipeline is not coverage. If missing runtime infrastructure prevents execution, preserve
+  stable-seam coverage where possible and output a structured TESTABILITY GAP block.
 - When outputting a TESTABILITY GAP, use:
   TESTABILITY GAP:
   target: <behaviour or contract that remains untested>

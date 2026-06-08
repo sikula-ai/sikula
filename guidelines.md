@@ -306,8 +306,9 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
   similar missing infrastructure. A test/helper that combines several fake runtime
   subsystems is a synthetic runtime harness, not a collection of harmless small mocks; use
   project-standard seams, narrow stable contracts, or `TESTABILITY GAP` output instead.
-  Skipped, disabled, ignored, assumption-gated, or environment-gated tests that Sikula's
-  configured validation will not execute do not count as coverage for changed behaviour.
+  Skipped, disabled, ignored, expected-failure, assumption-gated, or environment-gated
+  tests that Sikula's configured validation will not execute do not count as coverage for
+  changed behaviour.
   The deterministic execution-gate audit must stay scoped to newly added gates in
   Sikula-modified test files and inline-test source files under configured test write paths
   so pre-existing project skips and legitimate stale-test fixes do not become false
@@ -384,7 +385,8 @@ path detection). Update `tests/test_platform_onboarding.py` so the factory, scan
 generated init-config surfaces stay in sync. If the platform supports inline tests in
 source files with suffixes not already covered, update `_TEST_GATE_AUDIT_SOURCE_SUFFIXES`
 in `core/orchestrator.py`. If the platform introduces test framework
-skip/disable/ignore/assumption idioms that are not already covered, also update
+skip/disable/ignore/expected-failure/assumption idioms that are not already covered, also
+update
 `core/test_execution_gate_audit.py` and `tests/test_test_execution_gate_audit.py`. If the
 platform introduces common fake runtime idioms not already covered, update
 `core/synthetic_test_harness_audit.py` and `tests/test_synthetic_test_harness_audit.py`.

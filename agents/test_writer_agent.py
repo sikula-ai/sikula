@@ -71,9 +71,10 @@ CONSTRAINTS — follow strictly:
 - NEVER modify or delete any production source file
 - NEVER delete existing tests unless they directly conflict with the new behaviour
 - Do not write tests that pass trivially (empty assertions, always-true conditions)
-- Do not add skipped, disabled, ignored, assumption-gated, or environment-gated tests as
-  a substitute for real coverage of changed behaviour. A test that is expected to be skipped
-  in Sikula's configured validation pipeline does not count as coverage.
+- Do not add skipped, disabled, ignored, expected-failure, assumption-gated, or
+  environment-gated tests as a substitute for real coverage of changed behaviour. A test that
+  is expected to be skipped, or expected to fail, in Sikula's configured validation pipeline
+  does not count as coverage.
 - Tests must not leave generated source/runtime files, snapshots, reports, caches, or other
   repository changes behind during normal test execution. If a test needs temporary files,
   write them to an OS temp directory or a project-ignored temp/cache path and clean them up.

@@ -57,6 +57,43 @@ fn generated_contract_test() {}
     assert findings[1]["reason"] == "Rust ignored test"
 
 
+def test_detects_python_expected_failure_gates():
+    findings = detect_new_test_execution_gates(
+        path="tests/test_generated.py",
+        before=None,
+        after="""\
+@pytest.mark.xfail(reason="missing browser runtime")
+def test_browser_contract():
+    pass
+
+def test_runtime_contract():
+    pytest.xfail("missing browser runtime")
+
+@pytest.mark.parametrize("case", [pytest.param("browser", marks=pytest.mark.xfail(reason="missing runtime"))])
+def test_param_contract(case):
+    pass
+
+@unittest.expectedFailure
+def test_unittest_contract():
+    pass
+""",
+    )
+
+    assert [finding["line"] for finding in findings] == [1, 6, 8, 12]
+    assert [finding["category"] for finding in findings] == [
+        "expected_failure",
+        "expected_failure",
+        "expected_failure",
+        "expected_failure",
+    ]
+    assert [finding["reason"] for finding in findings] == [
+        "pytest expected-failure test",
+        "pytest expected-failure test",
+        "pytest expected-failure test",
+        "unittest expected-failure test",
+    ]
+
+
 def test_detects_parameterized_javascript_skip_gates():
     findings = detect_new_test_execution_gates(
         path="tests/generated.test.ts",

@@ -35,9 +35,19 @@ _SKIP_GATE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         re.compile(r"(?:^|\s)(?:@pytest\.mark\.skip(?:if)?\b|pytest\.skip\s*\()"),
     ),
     (
+        "expected_failure",
+        "pytest expected-failure test",
+        re.compile(r"(?:^|[^\w.])(?:pytest\.mark\.xfail\b|pytest\.xfail\s*\()"),
+    ),
+    (
         "skip",
         "unittest skipped test",
         re.compile(r"(?:^|\s)(?:@unittest\.skip(?:If|Unless)?\b|self\.skipTest\s*\()"),
+    ),
+    (
+        "expected_failure",
+        "unittest expected-failure test",
+        re.compile(r"(?:^|\s)@unittest\.expectedFailure\b"),
     ),
     (
         "skip",
@@ -111,7 +121,7 @@ def detect_new_test_execution_gates(
     after: str | None,
     before_counts: Mapping[str, int] | None = None,
 ) -> list[dict]:
-    """Return newly added skip/disable/assumption/environment gates in a test file.
+    """Return newly added skip/disable/xfail/assumption/environment gates in a test file.
 
     The detector intentionally looks only at inserted/replaced lines. Existing project
     skips remain untouched; Sikula only cares when its own agent introduces a new gate.

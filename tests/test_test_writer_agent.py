@@ -365,6 +365,7 @@ class TestTestWriterAgentPrompt:
         prompt = stub_llm.agent_calls[0]
         assert "Do not add skipped, disabled, ignored" in prompt
         assert "expected to be skipped" in prompt
+        assert "expected to fail" in prompt
         assert "does not count as coverage" in prompt
         assert "Do not replace missing coverage with skipped or disabled tests" in prompt
 
