@@ -1032,9 +1032,11 @@ class CustomClient(LLMClient):
 
 The `system` argument passed to `generate` and the `prompt` argument passed to `run_readonly_agent` and `run_agent` already contain `AGENT_SECURITY_PREFIX` (defined in `agents/base_agent.py`) — the network and filesystem constraint is injected by each agent before calling the provider. You do not need to add it in your implementation.
 
-If a provider is backed by a CLI, pass large prompts through stdin or another non-argv input
-channel. Reviewer, analyst, and implementation prompts can exceed operating-system command-line
-argument limits on large tasks.
+If a provider is backed by a CLI and supports a headless prompt channel outside argv, pass large
+prompts through stdin or another non-argv input channel. Reviewer, analyst, and implementation
+prompts can exceed operating-system command-line argument limits on large tasks. If a provider CLI
+requires the prompt as an option value for non-interactive mode, keep that required contract rather
+than inventing unsupported stdin behavior.
 
 **Step 2 — register in the factory** (`core/llm_client.py`):
 

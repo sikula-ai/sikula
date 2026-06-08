@@ -192,10 +192,12 @@ read-only invariant and the sandbox boundary.
 ### CLI-backed LLM clients
 
 When implementing or modifying a provider in `core/llm_client.py` that wraps a CLI,
-do not pass full prompts as command-line arguments. Use stdin or another non-argv
-input channel for `generate()`, `run_readonly_agent()`, and `run_agent()` prompts.
-Reviewer, analyst, and implementation prompts can exceed operating-system argument
-length limits on large tasks; command arguments should carry provider options only.
+prefer stdin or another provider-supported non-argv input channel for `generate()`,
+`run_readonly_agent()`, and `run_agent()` prompts. Reviewer, analyst, and implementation
+prompts can exceed operating-system argument length limits on large tasks; command
+arguments should carry provider options only when the provider CLI supports it. If a
+provider requires the prompt as an option value to enter headless/non-interactive mode,
+preserve that provider contract.
 
 For streaming write-agent subprocesses, start output readers before writing the prompt,
 write stdin through a timeout-aware path, and tolerate early stdin pipe closure. A provider

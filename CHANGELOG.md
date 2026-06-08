@@ -19,6 +19,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   quota/auth/config failures, so exhausted credits fail immediately instead of waiting for the
   long agent timeout while avoiding false positives from normal agent prose that mentions API
   keys, 401s, or invalid models.
+- OpenCode, Codex, and Gemini non-zero exits now prefer provider-owned structured stdout
+  error events before stderr fallback text, so fatal quota/auth/config errors are not hidden
+  by unrelated CLI warning/log output.
 - Fatal LLM provider failures such as quota exhaustion, authentication failures, and invalid
   provider/model configuration are now classified separately from transient failures and fail
   without retry; reviewer, security reviewer, test writer, and fixer phases now fail
@@ -27,7 +30,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Review-fix and security-fix implementer passes now abort immediately when the implementer
   returns an unsuccessful result, preserving the underlying provider/agent failure instead of
   treating an unchanged diff as a completed fix attempt.
-- Codex, Claude, and Gemini prompts are now passed through stdin instead of as command-line
+- Codex and Claude prompts are now passed through stdin instead of as command-line
   arguments, preventing large reviewer/analyst prompts from failing before the provider starts
   with OS argument-length errors.
 - Write-agent CLI providers now write prompts through a timeout-aware stdin writer and
@@ -45,8 +48,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Analyst outputs that are empty, generic, or meta-completion text are now rejected before
   `implementation_prompt` is stored; Sikula retries analysis once and then fails before
   planner/implementer phases if no usable implementation prompt is produced.
-- Codex provider failures now preserve readable errors emitted on stdout JSON streams for
-  generate, read-only agent, and write-agent calls instead of reporting only `non-zero exit`.
+- Codex and Gemini provider failures now preserve readable errors emitted on stdout JSON
+  streams for generate, read-only agent, and write-agent calls instead of reporting only
+  fallback stderr or `non-zero exit`.
 
 ## [0.2.0] - 2026-05-31
 

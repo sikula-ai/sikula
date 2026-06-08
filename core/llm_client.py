@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import queue
+import signal
 import subprocess
 import tempfile
 import threading
@@ -602,21 +603,51 @@ def _opencode_stream_error(line: str) -> LLMProviderError | None:
 
 
 def _opencode_error(result: subprocess.CompletedProcess[str]) -> str:
-    """Return the most useful error text from an opencode subprocess result."""
+    """Return fallback error text from an opencode subprocess result."""
     stderr = result.stderr.strip()
     if stderr:
         return stderr
     stdout = result.stdout.strip()
     if stdout:
-        try:
-            _opencode_parse_text(stdout)
-        except RuntimeError as exc:
-            return str(exc)
         return stdout
     return "non-zero exit"
 
 
-def _terminate_process(process: subprocess.Popen[str]) -> None:
+def _opencode_result_error(result: subprocess.CompletedProcess[str], operation: str) -> LLMProviderError:
+    """Return the best typed error from an opencode subprocess result."""
+    stdout = result.stdout.strip()
+    if stdout:
+        try:
+            _opencode_parse_text(stdout)
+        except LLMProviderError as exc:
+            return exc
+    return _provider_error("opencode", operation, _opencode_error(result))
+
+
+def _signal_process_group(process: subprocess.Popen[str], sig: int) -> bool:
+    pid = getattr(process, "pid", None)
+    if os.name != "posix" or not isinstance(pid, int):
+        return False
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        return True
+    return True
+
+
+def _terminate_process(process: subprocess.Popen[str], *, process_group: bool = False) -> None:
+    if process_group:
+        if _signal_process_group(process, signal.SIGTERM):
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                time.sleep(0.2)
+            _signal_process_group(process, signal.SIGKILL)
+            return
+
     if process.poll() is not None:
         return
     process.terminate()
@@ -685,7 +716,24 @@ def _opencode_log_error(line: str) -> LLMProviderError | None:
         provider_error = _provider_error("opencode", "agent", json.dumps(structured_parts))
         if isinstance(provider_error, LLMFatalError):
             return provider_error
+
+    headers = structured_parts.get("responseHeaders")
+    if _opencode_headers_indicate_quota_exhausted(headers):
+        return _provider_error(
+            "opencode",
+            "agent",
+            "x-codex-credits-balance: 0; x-codex-credits-has-credits: false",
+        )
     return None
+
+
+def _opencode_headers_indicate_quota_exhausted(headers: object) -> bool:
+    if not isinstance(headers, dict):
+        return False
+    normalized = {str(key).lower(): value for key, value in headers.items()}
+    balance = normalized.get("x-codex-credits-balance")
+    has_credits = normalized.get("x-codex-credits-has-credits")
+    return str(balance).strip() == "0" or str(has_credits).strip().lower() == "false"
 
 
 def _run_agent_subprocess_streaming(
@@ -700,16 +748,18 @@ def _run_agent_subprocess_streaming(
     stderr_error_parser: StreamErrorParser | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run an agent subprocess while watching provider-owned events for fatal errors."""
-    process = subprocess.Popen(
-        cmd,
-        cwd=cwd,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
+    popen_kwargs = {
+        "cwd": cwd,
+        "env": env,
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "bufsize": 1,
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    process = subprocess.Popen(cmd, **popen_kwargs)
     assert process.stdin is not None
     assert process.stdout is not None
     assert process.stderr is not None
@@ -731,6 +781,44 @@ def _run_agent_subprocess_streaming(
                 return buffer, provider_error
         provider_error = parser(buffer)
         return buffer, provider_error
+
+    def _record_chunk(name: str, chunk: str) -> LLMProviderError | None:
+        nonlocal stdout_line_buffer, stderr_line_buffer
+        if name == "stdout":
+            stdout_parts.append(chunk)
+            stdout_line_buffer, provider_error = _parse_stream_buffer(stdout_line_buffer + chunk, stdout_error_parser)
+            return provider_error
+        stderr_parts.append(chunk)
+        stderr_line_buffer, provider_error = _parse_stream_buffer(stderr_line_buffer + chunk, stderr_error_parser)
+        return provider_error
+
+    def _record_or_raise(name: str, chunk: str) -> None:
+        provider_error = _record_chunk(name, chunk)
+        if provider_error is not None:
+            _terminate_process(process, process_group=True)
+            raise provider_error
+
+    def _drain_ready_chunks() -> None:
+        while True:
+            try:
+                name, chunk = chunks.get_nowait()
+            except queue.Empty:
+                break
+            _record_or_raise(name, chunk)
+            process.poll()
+
+    def _raise_timeout() -> None:
+        _terminate_process(process, process_group=True)
+        _drain_ready_chunks()
+        raise subprocess.TimeoutExpired(cmd, timeout, output="".join(stdout_parts), stderr="".join(stderr_parts))
+
+    def _check_writer_error() -> None:
+        try:
+            writer_error = writer_errors.get_nowait()
+        except queue.Empty:
+            return
+        _terminate_process(process, process_group=True)
+        raise writer_error
 
     def _reader(name: str, stream) -> None:
         try:
@@ -763,59 +851,27 @@ def _run_agent_subprocess_streaming(
     writer_thread.start()
 
     deadline = time.monotonic() + timeout
-    while process.poll() is None:
-        try:
-            writer_error = writer_errors.get_nowait()
-        except queue.Empty:
-            pass
-        else:
-            _terminate_process(process)
-            raise writer_error
-
+    while True:
+        _drain_ready_chunks()
+        _check_writer_error()
+        if process.poll() is not None and not any(thread.is_alive() for thread in threads) and chunks.empty():
+            break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            _terminate_process(process)
-            raise subprocess.TimeoutExpired(cmd, timeout, output="".join(stdout_parts), stderr="".join(stderr_parts))
+            _raise_timeout()
         try:
             name, chunk = chunks.get(timeout=min(0.2, remaining))
         except queue.Empty:
             continue
+        _record_or_raise(name, chunk)
 
-        if name == "stdout":
-            stdout_parts.append(chunk)
-            if stdout_error_parser is not None:
-                stdout_line_buffer += chunk
-                stdout_line_buffer, provider_error = _parse_stream_buffer(stdout_line_buffer, stdout_error_parser)
-                if provider_error is not None:
-                    _terminate_process(process)
-                    raise provider_error
-        else:
-            stderr_parts.append(chunk)
-            if stderr_error_parser is not None:
-                stderr_line_buffer += chunk
-                stderr_line_buffer, provider_error = _parse_stream_buffer(stderr_line_buffer, stderr_error_parser)
-                if provider_error is not None:
-                    _terminate_process(process)
-                    raise provider_error
-
-    for thread in threads:
-        thread.join(timeout=1)
-    writer_thread.join(timeout=1)
-    try:
-        writer_error = writer_errors.get_nowait()
-    except queue.Empty:
-        pass
-    else:
-        raise writer_error
-    while True:
-        try:
-            name, chunk = chunks.get_nowait()
-        except queue.Empty:
-            break
-        if name == "stdout":
-            stdout_parts.append(chunk)
-        else:
-            stderr_parts.append(chunk)
+    while writer_thread.is_alive():
+        _check_writer_error()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _raise_timeout()
+        writer_thread.join(timeout=min(0.2, remaining))
+    _check_writer_error()
 
     return subprocess.CompletedProcess(cmd, process.returncode or 0, "".join(stdout_parts), "".join(stderr_parts))
 
@@ -873,7 +929,7 @@ class OpenCodeClient(LLMClient):
                 timeout=300,
             )
             if result.returncode != 0:
-                raise _provider_error("opencode", "CLI", _opencode_error(result))
+                raise _opencode_result_error(result, "CLI")
             text = _opencode_parse_text(result.stdout)
             if not text:
                 raise LLMTransientError("opencode CLI error: returned no text output")
@@ -907,7 +963,7 @@ class OpenCodeClient(LLMClient):
                     timeout=self._config.agent_timeout,
                 )
             if result.returncode != 0:
-                raise _provider_error("opencode", "agent", _opencode_error(result))
+                raise _opencode_result_error(result, "agent")
             text = _opencode_parse_text(result.stdout)
             if not text:
                 raise LLMTransientError("opencode agent error: returned no text output")
@@ -946,7 +1002,7 @@ class OpenCodeClient(LLMClient):
                         timeout=self._config.agent_timeout,
                     )
                 if result.returncode != 0:
-                    raise _provider_error("opencode", "agent", _opencode_error(result))
+                    raise _opencode_result_error(result, "agent")
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
                 text = _agent_text_or_empty(_opencode_parse_text, result.stdout)
@@ -1059,6 +1115,16 @@ def _gemini_parse_response(output: str) -> str:
     return text
 
 
+def _gemini_result_error(result: subprocess.CompletedProcess[str], operation: str) -> LLMProviderError:
+    stdout = result.stdout.strip()
+    if stdout:
+        try:
+            _gemini_parse_response(stdout)
+        except LLMProviderError as exc:
+            return exc
+    return _provider_error("gemini", operation, result.stderr.strip() or stdout or "non-zero exit")
+
+
 class GeminiClient(LLMClient):
     """Calls Gemini via the `gemini -p` CLI.
 
@@ -1069,12 +1135,14 @@ class GeminiClient(LLMClient):
     def __init__(self, config: LLMConfig) -> None:
         self._config = config
 
-    def _cmd(self, extra: list[str] | None = None) -> list[str]:
+    def _cmd(self, prompt: str, extra: list[str] | None = None) -> list[str]:
         return [
             "gemini",
             "--skip-trust",
             "--model",
             self._config.model,
+            "-p",
+            prompt,
             *(extra or []),
             "--output-format",
             "json",
@@ -1086,14 +1154,13 @@ class GeminiClient(LLMClient):
 
         def _call():
             result = subprocess.run(
-                self._cmd(),
+                self._cmd(prompt),
                 capture_output=True,
-                input=prompt,
                 text=True,
                 timeout=300,
             )
             if result.returncode != 0:
-                raise _provider_error("gemini", "CLI", result.stderr.strip() or "non-zero exit")
+                raise _gemini_result_error(result, "CLI")
             return _gemini_parse_response(result.stdout)
 
         return _call_with_retry("generate", _call, self._config, "generate")
@@ -1104,16 +1171,14 @@ class GeminiClient(LLMClient):
 
         def _call():
             result = subprocess.run(
-                self._cmd(["--approval-mode", "yolo"]),
+                self._cmd(prompt, ["--approval-mode", "yolo"]),
                 capture_output=True,
-                input=prompt,
                 text=True,
                 cwd=cwd,
                 timeout=self._config.agent_timeout,
             )
             if result.returncode != 0:
-                err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
-                raise _provider_error("gemini", "agent", err)
+                raise _gemini_result_error(result, "agent")
             return _gemini_parse_response(result.stdout)
 
         return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
@@ -1128,16 +1193,14 @@ class GeminiClient(LLMClient):
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
             try:
                 result = _run_agent_subprocess_streaming(
-                    self._cmd(["--approval-mode", "yolo"]),
+                    self._cmd(prompt, ["--approval-mode", "yolo"]),
                     cwd=cwd,
                     env=None,
                     timeout=self._config.agent_timeout,
                     provider="gemini",
-                    stdin_text=prompt,
                 )
                 if result.returncode != 0:
-                    err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
-                    raise _provider_error("gemini", "agent", err)
+                    raise _gemini_result_error(result, "agent")
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
                 text = _agent_text_or_empty(_gemini_parse_response, result.stdout)
@@ -1307,9 +1370,6 @@ def _codex_error_message(raw: object) -> str:
 
 def _codex_subprocess_error(result: subprocess.CompletedProcess[str]) -> str:
     """Return the most useful error text from a codex subprocess result."""
-    stderr = result.stderr.strip()
-    if stderr:
-        return stderr
     stdout = result.stdout.strip()
     if stdout:
         saw_json_event = _codex_output_has_json_events(stdout)
@@ -1323,6 +1383,9 @@ def _codex_subprocess_error(result: subprocess.CompletedProcess[str]) -> str:
                 return stdout
             return message
         return stdout
+    stderr = result.stderr.strip()
+    if stderr:
+        return stderr
     return "non-zero exit"
 
 
