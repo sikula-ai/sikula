@@ -1798,6 +1798,49 @@ class TestOrchestratorFixPhase:
         assert state.test_execution_gate_records == []
         assert state.test_errors == []
 
+    def test_resume_missing_snapshot_uses_reported_file_gate_counts(self, tmp_path: Path):
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        test_file.write_text('test.skip("preexisting project gate", () => {});\n', encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True
+        )
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add preexisting skip"], cwd=tmp_path, check=True, capture_output=True)
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            test_writer_audit_pending=True,
+            test_writer_audit_agent_completed=True,
+            test_writer_audit_files_written=["tests/client_main.test.ts"],
+        )
+        orch._persist_test_writer_audit_restore_baselines(state, ["tests/client_main.test.ts"])
+        orch._store.delete_text_snapshot(state.task_id, orchestrator_module._TEST_WRITER_AUDIT_SNAPSHOT)
+        test_file.write_text(
+            test_file.read_text(encoding="utf-8") + "test('new behavior', () => {});\n",
+            encoding="utf-8",
+        )
+        orch._store.save(state)
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed
+        assert stubs["test_writer"].calls == []
+        assert state.test_execution_gate_records == []
+        assert state.test_errors == []
+
     def test_test_writer_execution_gate_audit_includes_inline_source_tests(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
             tmp_path,

@@ -1521,7 +1521,9 @@ class Orchestrator:
                 and _path_looks_like_test_audit_candidate(path)
                 and path not in snapshot
             ):
-                snapshot[path] = self._read_git_head_project_text(path)
+                baseline = self._read_git_head_project_text(path)
+                snapshot[path] = baseline
+                state.test_writer_audit_gate_counts[path] = test_execution_gate_signature_counts(baseline)
                 changed = True
         if changed:
             self._store.save_text_snapshot(state.task_id, _TEST_WRITER_AUDIT_SNAPSHOT, snapshot)
