@@ -1570,14 +1570,6 @@ class Orchestrator:
             and self._path_has_pending_changes(relative)
         )
 
-    def _state_known_test_audit_paths(self, state: TaskState) -> set[str]:
-        return {
-            path
-            for raw_path in [*state.files_changed, *state.test_files_written, *state.test_writer_audit_files_written]
-            for path in [_normalize_project_path(str(raw_path))]
-            if path and self._is_configured_test_write_path(path) and _path_looks_like_test_audit_candidate(path)
-        }
-
     def _pending_test_writer_audit_files(self, state: TaskState) -> list[str]:
         candidates = state.test_writer_audit_files_written
         if not candidates:
@@ -1895,9 +1887,8 @@ class Orchestrator:
         before_snapshot: dict[str, str | None],
     ) -> tuple[list[str], list[str]]:
         restore_snapshot = dict(before_snapshot)
-        known_state_paths = self._state_known_test_audit_paths(state)
         for path in self._dirty_test_audit_paths():
-            if path not in restore_snapshot and path not in known_state_paths:
+            if path not in restore_snapshot:
                 restore_snapshot[path] = self._read_git_head_project_text(path)
         paths = self._test_files_changed_since_snapshot(restore_snapshot)
         if not paths:

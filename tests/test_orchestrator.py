@@ -3058,6 +3058,57 @@ class TestOrchestratorInterruptResume:
         assert partial_test.read_text(encoding="utf-8") == "def test_generated_behavior():\n    assert True\n"
         assert orch._store.load_text_snapshot(state.task_id, orchestrator_module._TEST_WRITER_AUDIT_SNAPSHOT) is None
 
+    def test_resume_pending_test_writer_audit_restores_unaudited_state_paths_before_rerun(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_review=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        unaudited_test = tmp_path / "tests" / "test_main.py"
+        unaudited_test.parent.mkdir()
+        orch._store.save_text_snapshot(
+            "t1",
+            orchestrator_module._TEST_WRITER_AUDIT_SNAPSHOT,
+            {},
+        )
+        unaudited_test.write_text('test.skip("partial generated placeholder", () => {});\n', encoding="utf-8")
+
+        def test_writer_effect(state: TaskState) -> None:
+            assert not unaudited_test.exists()
+            state.tests_up_to_date = True
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        stubs["test_writer"].result_data = {"files_written": []}
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py", "tests/test_main.py"],
+            test_files_written=["tests/test_main.py"],
+            review_approved=True,
+            tests_up_to_date=False,
+            test_writer_audit_pending=True,
+            test_writer_audit_agent_completed=False,
+            test_writer_audit_gate_counts={"tests/test_main.py": {}},
+        )
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed is False
+        assert len(stubs["test_writer"].calls) == 1
+        assert not unaudited_test.exists()
+        assert state.tests_up_to_date is True
+        assert state.test_writer_audit_pending is False
+        assert "tests/test_main.py" not in state.files_changed
+        assert "tests/test_main.py" not in state.test_files_written
+        assert state.test_execution_gate_records == []
+        assert any(record["action"] == "test_writer_interrupted_output_restored" for record in state.history)
+        assert orch._store.load_text_snapshot(state.task_id, orchestrator_module._TEST_WRITER_AUDIT_SNAPSHOT) is None
+
     def test_resume_pending_test_writer_audit_before_agent_completion_fails_without_snapshot(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
             tmp_path,
