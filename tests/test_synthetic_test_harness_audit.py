@@ -107,6 +107,29 @@ type HarnessRefs = {
     assert findings == []
 
 
+def test_ignores_synthetic_harness_source_snippets_inside_strings():
+    after = """
+test("documents rejected harness examples", () => {
+  const source = `
+class FakeElement {
+  appendChild(node) {}
+}
+class FakeHistory {
+  pushState(state, title, path) {}
+}
+async function fakeFetch(input) {
+  return new Response("{}");
+}
+`;
+  expect(source).toContain("class FakeElement");
+});
+"""
+
+    findings = detect_new_synthetic_test_harnesses(path="tests/harness_audit.test.ts", before=None, after=after)
+
+    assert findings == []
+
+
 def test_cumulative_harness_is_reported_when_file_crosses_threshold():
     before = """
 class FakeElement {

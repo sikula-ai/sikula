@@ -7,6 +7,8 @@ import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
 
+from core.source_masking import masked_source_lines
+
 
 _SKIP_GATE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     (
@@ -84,13 +86,15 @@ _SKIP_GATE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ),
 )
 _PLAYWRIGHT_CONFIGURE_OPEN_RE = re.compile(r"\btest\.describe\.configure\s*\(\s*\{")
-_PLAYWRIGHT_SKIP_MODE_RE = re.compile(r"\bmode\s*:\s*[\"']skip[\"']")
+_PLAYWRIGHT_SKIP_MODE_KEY_RE = re.compile(r"\bmode\s*:")
+_PLAYWRIGHT_SKIP_MODE_VALUE_RE = re.compile(r"\bmode\s*:\s*[\"']skip[\"']")
 
 _ENVIRONMENT_SIGNAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\btypeof\s+(?:globalThis\.)?(?:document|window|navigator)\b"),
     re.compile(r"(?:globalThis\.)?(?:document|window|navigator)\s*[!=]==?\s*undefined\b"),
     re.compile(r"(?:globalThis\.)?(?:document|window|navigator)\s*[!=]==?\s*null\b"),
     re.compile(r"[\"'](?:document|window|navigator)[\"']\s+in\s+globalThis\b"),
+    re.compile(r"[\"']\s+[\"']\s+in\s+globalThis\b"),
     re.compile(r"\b(?:process|import\.meta)\.env(?:\.[A-Za-z_]\w*|\s*\[[^\]]+\])"),
     re.compile(r"\bos\.environ(?:\b|\s*\[|\.get\s*\()"),
     re.compile(r"\bos\.getenv\s*\("),
@@ -191,19 +195,20 @@ def _all_test_execution_gates(*, path: str, text: str | None) -> list[dict]:
         return []
 
     lines = text.splitlines()
+    masked_lines = masked_source_lines(text)
     findings: list[dict] = []
-    for index, line in enumerate(lines):
+    for index, line in enumerate(masked_lines):
         classification = _classify_direct_gate(line)
         if classification:
             category, reason = classification
-            findings.append(_finding(path, index, category, reason, line))
+            findings.append(_finding(path, index, category, reason, lines[index]))
             continue
 
-        if _is_playwright_skip_mode_configuration(lines, index):
-            findings.append(_finding(path, index, "skip", "Playwright skip-mode configuration", line))
+        if _is_playwright_skip_mode_configuration(lines, masked_lines, index):
+            findings.append(_finding(path, index, "skip", "Playwright skip-mode configuration", lines[index]))
             continue
 
-        environment_gate_signature_text = _environment_gate_signature_text(lines, index)
+        environment_gate_signature_text = _environment_gate_signature_text(lines, masked_lines, index)
         if environment_gate_signature_text:
             findings.append(
                 _finding(
@@ -285,14 +290,17 @@ def _classify_direct_gate(line: str) -> tuple[str, str] | None:
     return None
 
 
-def _is_playwright_skip_mode_configuration(lines: list[str], index: int) -> bool:
-    stripped = _strip_line_comment(lines[index]).strip()
-    if not _PLAYWRIGHT_SKIP_MODE_RE.search(stripped):
+def _is_playwright_skip_mode_configuration(raw_lines: list[str], masked_lines: list[str], index: int) -> bool:
+    stripped = _strip_line_comment(masked_lines[index]).strip()
+    raw_stripped = _strip_line_comment(raw_lines[index]).strip()
+    if not _PLAYWRIGHT_SKIP_MODE_KEY_RE.search(stripped):
+        return False
+    if not _PLAYWRIGHT_SKIP_MODE_VALUE_RE.search(raw_stripped):
         return False
     if _PLAYWRIGHT_CONFIGURE_OPEN_RE.search(stripped):
         return True
 
-    for line in reversed(lines[max(0, index - 20) : index]):
+    for line in reversed(masked_lines[max(0, index - 20) : index]):
         previous = _strip_line_comment(line).strip()
         if "}" in previous:
             break
@@ -301,26 +309,29 @@ def _is_playwright_skip_mode_configuration(lines: list[str], index: int) -> bool
     return False
 
 
-def _environment_gate_signature_text(lines: list[str], index: int) -> str | None:
-    stripped = _strip_line_comment(lines[index]).strip()
+def _environment_gate_signature_text(raw_lines: list[str], masked_lines: list[str], index: int) -> str | None:
+    stripped = _strip_line_comment(masked_lines[index]).strip()
     if not stripped:
         return None
 
-    expression_gate = _environment_expression_gate_text(lines, index)
+    expression_gate = _environment_expression_gate_text(raw_lines, masked_lines, index)
     if expression_gate:
         return expression_gate
 
-    header = _control_gate_header(lines, index)
+    header = _control_gate_header(masked_lines, index)
     if header is None:
         return None
     header_lines, header_end_index = header
     header_text = " ".join(header_lines)
+    raw_header_text = _joined_raw_lines(raw_lines, index, header_end_index)
     if not _has_environment_signal(header_text):
         return None
     if _TEST_REGISTRATION_PATTERN.search(header_text):
-        return header_text
-    if any(_TEST_REGISTRATION_PATTERN.search(line) for line in _gated_body_lines(lines, index, header_end_index)):
-        return header_text
+        return raw_header_text
+    if any(
+        _TEST_REGISTRATION_PATTERN.search(line) for line in _gated_body_lines(masked_lines, index, header_end_index)
+    ):
+        return raw_header_text
     return None
 
 
@@ -336,25 +347,36 @@ def _is_environment_expression_gate(stripped: str) -> bool:
     )
 
 
-def _environment_expression_gate_text(lines: list[str], index: int) -> str | None:
-    stripped = _strip_line_comment(lines[index]).strip()
+def _environment_expression_gate_text(raw_lines: list[str], masked_lines: list[str], index: int) -> str | None:
+    stripped = _strip_line_comment(masked_lines[index]).strip()
     if _is_environment_expression_gate(stripped):
-        return stripped
+        return _strip_line_comment(raw_lines[index]).strip()
     if not _is_environment_expression_gate_start(stripped):
         return None
 
     fragments = [stripped]
-    for line in lines[index + 1 : min(len(lines), index + 1 + _MAX_EXPRESSION_GATE_LINES)]:
+    raw_fragments = [_strip_line_comment(raw_lines[index]).strip()]
+    for offset, line in enumerate(
+        masked_lines[index + 1 : min(len(masked_lines), index + 1 + _MAX_EXPRESSION_GATE_LINES)],
+        start=1,
+    ):
         continuation = _strip_line_comment(line).strip()
         if not continuation:
             continue
         fragments.append(continuation)
+        raw_fragments.append(_strip_line_comment(raw_lines[index + offset]).strip())
         joined = " ".join(fragments)
         if _TEST_REGISTRATION_PATTERN.search(joined):
-            return joined
+            return " ".join(raw_fragments)
         if _statement_ends(continuation):
             break
     return None
+
+
+def _joined_raw_lines(raw_lines: list[str], start: int, end: int) -> str:
+    return " ".join(
+        stripped for line in raw_lines[start : end + 1] for stripped in [_strip_line_comment(line).strip()] if stripped
+    )
 
 
 def _is_environment_expression_gate_start(stripped: str) -> bool:

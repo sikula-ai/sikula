@@ -158,6 +158,41 @@ test("runs in normal validation", () => {});
     assert findings == []
 
 
+def test_ignores_execution_gate_source_snippets_inside_strings():
+    findings = detect_new_test_execution_gates(
+        path="tests/audit_fixture.test.ts",
+        before=None,
+        after="""\
+test("documents execution gate snippets", () => {
+  expect(source).toContain("test.skip('placeholder', () => {});");
+  const fixture = `
+test.describe.configure({
+  mode: "skip",
+});
+@pytest.mark.skip(reason="fixture")
+@org.junit.jupiter.api.Disabled("fixture")
+`;
+  expect(fixture).toContain("pytest.mark.skip");
+});
+""",
+    )
+
+    assert findings == []
+
+
+def test_ignores_execution_gate_snippets_inside_comments():
+    findings = detect_new_test_execution_gates(
+        path="tests/test_audit_fixture.py",
+        before=None,
+        after="""\
+def test_documents_gate_comment():
+    assert True  # pytest.skip("example only")
+""",
+    )
+
+    assert findings == []
+
+
 def test_detects_junit4_ignore_gates():
     findings = detect_new_test_execution_gates(
         path="src/test/kotlin/GeneratedTest.kt",
@@ -497,6 +532,15 @@ if (process.env.RUN_BROWSER_TESTS)
             """\
 if (import.meta.env.RUN_BROWSER_TESTS) {
   it("browser behavior", () => {});
+}
+""",
+            1,
+        ),
+        (
+            "tests/clientMain.test.ts",
+            """\
+if ("document" in globalThis) {
+  test("browser behavior", () => {});
 }
 """,
             1,

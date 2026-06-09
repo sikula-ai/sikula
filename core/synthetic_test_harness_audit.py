@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
+from core.source_masking import masked_source_lines
+
 
 _DECL_PREFIX = (
     r"^\s*(?:export\s+)?"
@@ -212,7 +214,8 @@ def _collect_subsystem_evidence(text: str | None) -> dict[str, dict]:
     if not text:
         return evidence_by_subsystem
 
-    for index, line in enumerate(text.splitlines()):
+    raw_lines = text.splitlines()
+    for index, line in enumerate(masked_source_lines(text)):
         stripped = _strip_line_comment(line).strip()
         if not stripped:
             continue
@@ -228,7 +231,7 @@ def _collect_subsystem_evidence(text: str | None) -> dict[str, dict]:
                 },
             )
             if len(evidence["lines"]) < _MAX_EVIDENCE_PER_SUBSYSTEM:
-                evidence["lines"].append({"line": index + 1, "excerpt": stripped})
+                evidence["lines"].append({"line": index + 1, "excerpt": _strip_line_comment(raw_lines[index]).strip()})
     return evidence_by_subsystem
 
 
