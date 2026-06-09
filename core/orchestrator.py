@@ -1261,6 +1261,7 @@ class Orchestrator:
             state,
             source="fixer",
             files_written=fixer_files,
+            before_snapshot=test_gate_before,
         )
         if synthetic_findings:
             will_retry_synthetic_harness = _SYNTHETIC_HARNESS_RECOVERY_MAX_RETRIES > 0 and not state.failed
@@ -1284,22 +1285,22 @@ class Orchestrator:
                 fixer_result = self._run_agent("fixer", state)
                 no_op_retry_after_retained_fix = (
                     not fixer_result.success
-                    and bool(first_pass_remaining_files)
+                    and bool(restored)
                     and (fixer_result.message or "").strip() == "Agent made no file changes"
                 )
                 if state.failed:
                     return False
                 if no_op_retry_after_retained_fix:
-                    retained = ", ".join(sorted(first_pass_remaining_files))
+                    retained = ", ".join(sorted(first_pass_remaining_files)) or "(restored tree only)"
                     log.info(
                         "Fixer retry made no additional file changes after synthetic test harness recovery; "
-                        "continuing to validate retained fixer changes: %s",
+                        "continuing to validate current tree: %s",
                         retained,
                     )
                     state.record(
                         "orchestrator",
                         "synthetic_test_harness_recovery_noop_retry",
-                        f"fixer retry made no additional file changes; validating retained fixer changes: {retained}",
+                        f"fixer retry made no additional file changes; validating current tree: {retained}",
                     )
                     self._store.save(state)
                     retry_files = set()
@@ -1319,6 +1320,7 @@ class Orchestrator:
                     state,
                     source="fixer",
                     files_written=retry_files,
+                    before_snapshot=retry_test_gate_before,
                     include_active=True,
                 )
                 retry_files = set(self._agent_files_still_changed_since_snapshot(retry_files, retry_test_gate_before))
@@ -1711,6 +1713,7 @@ class Orchestrator:
         *,
         source: str,
         files_written,
+        before_snapshot: dict[str, str | None],
         include_active: bool = False,
     ) -> list[dict]:
         paths = sorted(
@@ -1729,7 +1732,7 @@ class Orchestrator:
             findings.extend(
                 detect_new_synthetic_test_harnesses(
                     path=path,
-                    before=self._read_git_head_project_text(path),
+                    before=before_snapshot.get(path),
                     after=self._read_project_text(path),
                 )
             )
@@ -2571,6 +2574,7 @@ class Orchestrator:
             state,
             source="test_writer",
             files_written=files_written,
+            before_snapshot=test_gate_before,
         )
         if synthetic_findings and not state.failed:
             will_retry_synthetic_harness = _SYNTHETIC_HARNESS_RECOVERY_MAX_RETRIES > 0
@@ -2622,6 +2626,7 @@ class Orchestrator:
                     state,
                     source="test_writer",
                     files_written=retry_files_written,
+                    before_snapshot=retry_test_gate_before,
                     include_active=True,
                 )
                 retry_files_written = self._agent_files_still_changed_since_snapshot(

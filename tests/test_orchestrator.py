@@ -2247,6 +2247,48 @@ mod tests {
         assert "tests/client_main.test.ts" not in state.test_files_written
         assert len(state.testability_gaps) == 1
 
+    def test_test_writer_synthetic_harness_audit_uses_pre_agent_dirty_baseline(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        project = repo / "project"
+        test_file = project / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text("test('existing narrow test', () => {});\n", encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add narrow test"], cwd=repo, check=True, capture_output=True)
+        dirty_harness = "\n".join(
+            [
+                "class FakeElement { appendChild() {}; querySelector() {} }",
+                "class FakeHistory { pushState() {} }",
+                "class FakeMouseEvent { preventDefault() {} }",
+            ]
+        )
+        test_file.write_text(dirty_harness, encoding="utf-8")
+        orch, stubs, _ = _make_orchestrator(
+            project,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+
+        def test_writer_effect(state: TaskState) -> None:
+            test_file.write_text(test_file.read_text(encoding="utf-8") + "\ntest('uses helper', () => {});\n")
+            state.tests_up_to_date = True
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        stubs["test_writer"].result_data = {"files_written": ["tests/client_main.test.ts"]}
+        state = _save_state(orch, implementation_prompt="p", files_changed=["tests/client_main.test.ts"])
+
+        assert orch._run_test_write_phase(state)
+
+        assert state.synthetic_test_harness_records == []
+        assert "test('uses helper'" in test_file.read_text(encoding="utf-8")
+
     def test_synthetic_harness_audit_catches_cumulative_test_harness(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
             tmp_path,
@@ -2540,6 +2582,71 @@ mod tests {
             record["action"] == "abort" and "Agent made no file changes" in record["result"] for record in state.history
         )
 
+    def test_fixer_synthetic_harness_recovery_accepts_noop_retry_with_restored_tree_only(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        attempts = {"count": 0}
+
+        def fixer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                stubs["fixer"].result_success = True
+                stubs["fixer"].result_message = None
+                test_file.write_text(
+                    "\n".join(
+                        [
+                            "class FakeElement { appendChild() {}; querySelector() {} }",
+                            "class FakeHistory { pushState() {} }",
+                            "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                state.files_changed.append("tests/client_main.test.ts")
+            else:
+                state.record_testability_gap(
+                    "fixer",
+                    "TESTABILITY GAP:\ntarget: browser route harness\nreason: no stable DOM seam",
+                    target="browser route harness",
+                    reason="no stable DOM seam",
+                )
+                stubs["fixer"].result_success = False
+                stubs["fixer"].result_message = "Agent made no file changes"
+
+        stubs["fixer"].side_effect = fixer_effect
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=[],
+            test_errors=["tests failed"],
+            test_status="failed",
+            review_approved=True,
+            security_approved=True,
+            tests_up_to_date=True,
+        )
+
+        assert orch._run_fix_phase(state, "1/1")
+
+        assert attempts["count"] == 2
+        assert state.failed is False
+        assert not test_file.exists()
+        assert "tests/client_main.test.ts" not in state.files_changed
+        assert any(record["action"] == "synthetic_test_harness_recovery_noop_retry" for record in state.history)
+        assert not any(
+            record["action"] == "abort" and "Agent made no file changes" in record["result"] for record in state.history
+        )
+
     def test_fixer_synthetic_harness_recovery_drops_clean_retry_reported_file(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
             tmp_path,
@@ -2635,6 +2742,47 @@ mod tests {
         assert orch._run_fix_phase(state, "1/1")
 
         assert state.synthetic_test_harness_records == []
+
+    def test_synthetic_harness_audit_uses_pre_agent_dirty_baseline(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        project = repo / "project"
+        test_file = project / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text("test('existing narrow test', () => {});\n", encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add narrow test"], cwd=repo, check=True, capture_output=True)
+        dirty_harness = "\n".join(
+            [
+                "class FakeElement { appendChild() {}; querySelector() {} }",
+                "class FakeHistory { pushState() {} }",
+                "class FakeMouseEvent { preventDefault() {} }",
+            ]
+        )
+        test_file.write_text(dirty_harness, encoding="utf-8")
+        orch, stubs, _ = _make_orchestrator(
+            project,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        state = _save_state(orch, implementation_prompt="p", files_changed=["tests/client_main.test.ts"])
+
+        def fixer_effect(_state: TaskState) -> None:
+            test_file.write_text(test_file.read_text(encoding="utf-8") + "\ntest('uses helper', () => {});\n")
+
+        stubs["fixer"].side_effect = fixer_effect
+        stubs["fixer"].result_data = {"files_written": ["tests/client_main.test.ts"]}
+
+        assert orch._run_fix_phase(state, "1/1")
+
+        assert state.synthetic_test_harness_records == []
+        assert "test('uses helper'" in test_file.read_text(encoding="utf-8")
 
     def test_synthetic_harness_audit_resolves_when_test_is_narrowed(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
