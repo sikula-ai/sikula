@@ -599,6 +599,8 @@ def _opencode_error_from_event(event: dict) -> LLMProviderError | None:
         data = err.get("data", {}) or {}
         headers = data.get("headers") if isinstance(data, dict) else None
         if _opencode_headers_indicate_quota_exhausted(headers):
+            if isinstance(data, dict) and data.get("type") == "usage_limit_reached":
+                return LLMQuotaExceeded("opencode event error: quota exceeded; usage limit (usage_limit)")
             return LLMQuotaExceeded("opencode event error: quota exceeded")
         msg = data.get("message") if isinstance(data, dict) else None
         msg = msg or err.get("message")
@@ -680,6 +682,13 @@ def _opencode_stderr_diagnostic(
             continue
         headers = structured_parts.get("responseHeaders")
         if _opencode_headers_indicate_quota_exhausted(headers):
+            response_body = structured_parts.get("responseBody")
+            body_error = response_body.get("error") if isinstance(response_body, dict) else None
+            if isinstance(body_error, dict) and body_error.get("type") == "usage_limit_reached":
+                return _OpenCodeDiagnostic(
+                    "opencode provider diagnostic: quota exceeded; usage limit (usage_limit)",
+                    LLMQuotaExceeded,
+                )
             return _OpenCodeDiagnostic("opencode provider diagnostic: quota exceeded", LLMQuotaExceeded)
         provider_error = _opencode_diagnostic_provider_error("stderr", json.dumps(structured_parts))
         error_type = type(provider_error) if isinstance(provider_error, LLMFatalError) else None
