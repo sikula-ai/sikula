@@ -153,6 +153,7 @@ class TestTestWriterAgentSuccess:
             "TESTABILITY GAP:\n"
             "target: share sheet opens\n"
             "reason: no UI test harness\n"
+            "covered_by: ShareViewModel tests\n"
             "recommended_action: add UI test helper\n"
             "risk: medium\n"
         )
@@ -168,6 +169,7 @@ class TestTestWriterAgentSuccess:
         assert gap["build_iteration"] == 4
         assert gap["target"] == "share sheet opens"
         assert gap["reason"] == "no UI test harness"
+        assert gap["covered_by"] == "ShareViewModel tests"
         assert gap["recommended_action"] == "add UI test helper"
         assert gap["risk"] == "medium"
         assert any(e["action"] == "testability_gap" for e in state.history)
@@ -237,6 +239,8 @@ class TestTestWriterAgentPrompt:
         prompt = stub_llm.agent_calls[0]
         assert "85%" in prompt
         assert "Within the configured test surface" in prompt
+        assert "coverage target is subordinate to the configured test surface" in prompt
+        assert "covered_by: <existing-surface tests/seams added or preserved, or none>" in prompt
 
     def test_default_coverage_target_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state()
@@ -251,6 +255,8 @@ class TestTestWriterAgentPrompt:
         assert "Use only existing project test infrastructure" in prompt
         assert "Missing out-of-surface harnesses are not by themselves a TESTABILITY GAP" in prompt
         assert "Do not use broad source-inspection tests" in prompt
+        assert "never justify inventing missing runtime infrastructure" in prompt
+        assert "adding skipped tests for behavior the configured validation cannot execute" in prompt
         assert state.test_write_records[0]["test_surface_policy"] == "existing_infrastructure"
 
     def test_complete_test_surface_policy_in_prompt(self, stub_llm: StubLLMClient, file_tool):
@@ -264,6 +270,7 @@ class TestTestWriterAgentPrompt:
         assert "Test surface policy: complete" in prompt
         assert "cover the complete changed behavior" in prompt
         assert "report a TESTABILITY GAP" in prompt
+        assert "synthetic runtime/framework harnesses" in prompt
         assert state.test_write_records[0]["test_surface_policy"] == "complete"
 
     def test_unknown_test_surface_policy_falls_back_to_existing_infrastructure(
@@ -309,6 +316,58 @@ class TestTestWriterAgentPrompt:
         assert "configuration through existing project-standard helpers" in prompt
         assert "stable public seam" in prompt
         assert "brittle framework-internals tests" in prompt
+
+    def test_synthetic_runtime_harness_guard_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state(implementation_prompt="Add browser history navigation")
+        _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "Do not synthesize a" in prompt
+        assert "mini-version of the platform" in prompt
+        assert "selector engines" in prompt
+        assert "navigation/history stacks" in prompt
+        assert "Small local test" in prompt
+        assert "doubles are acceptable only" in prompt
+        assert "Combining multiple test-local fake runtime subsystems" in prompt
+        assert "fake DOM/window" in prompt
+        assert "network/fetch" in prompt
+        assert "Do not build a whole local runtime world" in prompt
+        assert "narrower pure seams" in prompt
+
+    def test_synthetic_harness_audit_context_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state(implementation_prompt="Add browser history navigation")
+        state.record_synthetic_test_harness_audit(
+            "test_writer",
+            [
+                {
+                    "path": "tests/clientMain.test.ts",
+                    "subsystems": ["event_dispatch", "navigation_history", "network_server"],
+                    "recommendation": "Replace with narrower existing-seam coverage.",
+                    "evidence": [
+                        {
+                            "category": "event_dispatch",
+                            "lines": [{"line": 10, "excerpt": "class FakeEventTarget {}"}],
+                        }
+                    ],
+                }
+            ],
+        )
+        _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
+
+        prompt = stub_llm.agent_calls[0]
+        assert "SYNTHETIC TEST HARNESS AUDIT CONTEXT (non-blocking):" in prompt
+        assert "harness does not remain in branch output" in prompt
+        assert "tests/clientMain.test.ts" in prompt
+        assert "event_dispatch, navigation_history, network_server" in prompt
+
+    def test_skipped_test_gap_guard_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state(implementation_prompt="Add browser detail navigation")
+        _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "Do not add skipped, disabled, ignored" in prompt
+        assert "expected to be skipped" in prompt
+        assert "expected to fail" in prompt
+        assert "does not count as coverage" in prompt
+        assert "Do not replace missing coverage with skipped or disabled tests" in prompt
 
     def test_source_inspection_fallback_guard_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state(implementation_prompt="Add navigation contract")
@@ -413,6 +472,7 @@ class TestTestabilityGapParsing:
             "TESTABILITY GAP:\n"
             "target: native share sheet\n"
             "reason: no UI test harness\n"
+            "covered_by: ShareViewModel state transition tests\n"
             "recommended_action: add UI harness\n"
             "risk: medium\n"
         )
@@ -422,11 +482,13 @@ class TestTestabilityGapParsing:
                     "TESTABILITY GAP:\n"
                     "target: native share sheet\n"
                     "reason: no UI test harness\n"
+                    "covered_by: ShareViewModel state transition tests\n"
                     "recommended_action: add UI harness\n"
                     "risk: medium"
                 ),
                 "target": "native share sheet",
                 "reason": "no UI test harness",
+                "covered_by": "ShareViewModel state transition tests",
                 "recommended_action": "add UI harness",
                 "risk": "medium",
             }

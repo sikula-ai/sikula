@@ -690,6 +690,7 @@ class TestTaskAuditReport:
         assert "reviewer warnings: 1" in out
         assert "security reviewer warnings: 1" in out
         assert "testability gaps: 1" in out
+        assert "Testability gaps:" in out
         assert "validation artifacts: 3 (1 cleaned, 1 blocked, 1 cleanup failed)" in out
         assert "LLM retries: 1" in out
         assert "Recovered issues:" in out
@@ -701,6 +702,37 @@ class TestTaskAuditReport:
         assert "fixer used production-confirmed test failure triage: 1" in out
         assert _task_audit_warnings(state)
         assert _task_recovered_issues(state)
+
+    def test_testability_gap_samples_are_deduplicated(self, capsys):
+        from core.state import TaskState
+
+        state = TaskState(task_id="t1", task_description="task")
+        state.done = True
+        state.record_testability_gap(
+            "test_writer",
+            "TESTABILITY GAP:\ntarget: browser navigation",
+            target="browser navigation",
+            reason="configured validation has no browser runtime",
+            covered_by="route contract tests",
+            risk="medium",
+        )
+        state.record_testability_gap(
+            "fixer",
+            "TESTABILITY GAP:\ntarget: browser navigation",
+            target="browser navigation",
+            reason="configured validation has no browser runtime",
+            covered_by="route contract tests",
+            risk="medium",
+        )
+
+        warning_count = _print_task_audit_report(state)
+
+        out = capsys.readouterr().out
+        assert warning_count == 1
+        assert "testability gaps: 2 (1 unique)" in out
+        assert out.count("gap: browser navigation [medium]") == 1
+        assert "reason: configured validation has no browser runtime" in out
+        assert "covered_by: route contract tests" in out
 
     def test_recovered_issues_include_diagnostic_summary_lines(self, capsys):
         from core.state import TaskState
@@ -738,6 +770,28 @@ class TestTaskAuditReport:
         assert "test: CountryDetailScreenContractTest > detail content uses capital fallback() FAILED" in out
         assert "test: java.lang.AssertionError at CountryDetailScreenContractTest.kt:53" in out
         assert "check:detekt: .../CountryDetailScreen.kt:43:19: TopLevelPropertyNaming" in out
+
+    def test_resolved_test_execution_gate_audit_is_recovered_issue(self, capsys):
+        from core.state import TaskState
+
+        state = TaskState(task_id="t1", task_description="task")
+        state.done = True
+        state.build_status = "success"
+        state.test_status = "success"
+        state.check_status = "success"
+        state.record_test_execution_gate_audit(
+            "fixer",
+            [{"path": "tests/clientMain.test.ts", "line": 31, "category": "environment", "excerpt": "if (...)"}],
+        )
+        state.test_execution_gate_records[0]["status"] = "resolved"
+
+        warning_count = _print_task_audit_report(state)
+
+        out = capsys.readouterr().out
+        assert warning_count == 0
+        assert "Audit warnings:" not in out
+        assert "Recovered issues:" in out
+        assert "test execution gate audits recovered: 1" in out
 
     def test_recovered_diagnostics_sample_each_failed_validation_attempt(self, capsys):
         from core.state import TaskState
@@ -872,11 +926,65 @@ class TestPrintReviewSummary:
 
     def test_testability_gaps_are_visible(self, capsys):
         s = self._make_state(review_approved=True, security_approved=True)
-        s.record_testability_gap("test_writer", "TESTABILITY GAP:\ntarget: native share")
+        s.record_testability_gap(
+            "test_writer",
+            "TESTABILITY GAP:\ntarget: native share",
+            target="native share",
+            reason="no device share sheet test surface",
+        )
         _print_review_summary(s, "feature/x", "main", 10.0)
         out = capsys.readouterr().out
         assert "Audit warnings:" in out
         assert "testability gaps: 1" in out
+        assert "Testability gaps:" in out
+        assert "gap: native share" in out
+
+    def test_active_test_execution_gate_audits_are_visible(self, capsys):
+        s = self._make_state(review_approved=True, security_approved=True)
+        s.record_test_execution_gate_audit(
+            "fixer",
+            [{"path": "tests/clientMain.test.ts", "line": 31, "category": "environment", "excerpt": "if (...)"}],
+        )
+        _print_review_summary(s, "feature/x", "main", 10.0)
+        out = capsys.readouterr().out
+        assert "Audit warnings:" in out
+        assert "test execution gate audits: 1 active" in out
+
+    def test_active_synthetic_test_harness_audits_are_visible(self, capsys):
+        s = self._make_state(review_approved=True, security_approved=True)
+        s.record_synthetic_test_harness_audit(
+            "test_writer",
+            [
+                {
+                    "path": "tests/clientMain.test.ts",
+                    "subsystems": ["event_dispatch", "navigation_history", "network_server"],
+                    "evidence": [],
+                }
+            ],
+        )
+        _print_review_summary(s, "feature/x", "main", 10.0)
+        out = capsys.readouterr().out
+        assert "Audit warnings:" in out
+        assert "synthetic test harness audits: 1 active" in out
+
+    def test_resolved_synthetic_test_harness_audits_are_recovered(self, capsys):
+        s = self._make_state(review_approved=True, security_approved=True)
+        s.done = True
+        s.record_synthetic_test_harness_audit(
+            "fixer",
+            [
+                {
+                    "path": "tests/clientMain.test.ts",
+                    "subsystems": ["event_dispatch", "navigation_history", "network_server"],
+                    "evidence": [],
+                }
+            ],
+        )
+        s.synthetic_test_harness_records[0]["status"] = "resolved"
+        _print_review_summary(s, "feature/x", "main", 10.0)
+        out = capsys.readouterr().out
+        assert "Recovered issues:" in out
+        assert "synthetic test harness audits recovered: 1" in out
 
 
 # ---------------------------------------------------------------------------

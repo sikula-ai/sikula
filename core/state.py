@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
+import shutil
 import tempfile
 import threading
 import uuid
@@ -29,6 +31,22 @@ def _short_text(text: str | None, limit: int = 1000) -> str | None:
     if not text:
         return None
     return diagnostic_excerpt(text, limit=limit)
+
+
+def _sanitize_test_execution_gate_finding(finding: dict) -> dict:
+    return {key: value for key, value in finding.items() if key != "excerpt"}
+
+
+def _strip_excerpt_fields(value):
+    if isinstance(value, dict):
+        return {key: _strip_excerpt_fields(item) for key, item in value.items() if key != "excerpt"}
+    if isinstance(value, list):
+        return [_strip_excerpt_fields(item) for item in value]
+    return value
+
+
+def _sanitize_synthetic_test_harness_finding(finding: dict) -> dict:
+    return _strip_excerpt_fields(finding)
 
 
 def runtime_metadata_snapshot() -> dict:
@@ -90,6 +108,8 @@ def _final_summary(state: "TaskState") -> dict:
         "security_reviewer_runs": len(state.security_review_cycle_records),
         "test_writer_runs": len(state.test_write_records),
         "testability_gaps_count": len(state.testability_gaps),
+        "test_execution_gate_audits_count": len(state.test_execution_gate_records),
+        "synthetic_test_harness_audits_count": len(state.synthetic_test_harness_records),
         "analyst_retries_count": len(state.analyst_retry_records),
         "planner_retries_count": len(state.planner_retry_records),
         "llm_retries": sum(1 for entry in state.history if entry.get("action") == "llm_retry"),
@@ -179,6 +199,11 @@ class TaskState:
     review_base_branch: Optional[str] = None
     test_files_written: list[str] = field(default_factory=list)
     tests_up_to_date: bool = False
+    generated_test_fix_counts: dict[str, int] = field(default_factory=dict)
+    test_writer_audit_pending: bool = False
+    test_writer_audit_agent_completed: bool = False
+    test_writer_audit_files_written: list[str] = field(default_factory=list)
+    test_writer_audit_gate_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     fixer_changed_code: bool = (
         False  # set when fixer writes files; cleared after build validates; guards resume skip condition
     )
@@ -189,6 +214,8 @@ class TaskState:
     security_review_cycle_records: list[dict] = field(default_factory=list)
     test_write_records: list[dict] = field(default_factory=list)
     testability_gaps: list[dict] = field(default_factory=list)
+    test_execution_gate_records: list[dict] = field(default_factory=list)
+    synthetic_test_harness_records: list[dict] = field(default_factory=list)
     fix_cycle_records: list[dict] = field(default_factory=list)
     validation_cycle_records: list[dict] = field(default_factory=list)
     validation_artifact_records: list[dict] = field(default_factory=list)
@@ -288,6 +315,7 @@ class TaskState:
         message: str,
         target: str | None = None,
         reason: str | None = None,
+        covered_by: str | None = None,
         recommended_action: str | None = None,
         risk: str | None = None,
     ) -> None:
@@ -305,12 +333,48 @@ class TaskState:
             entry["target"] = target
         if reason:
             entry["reason"] = reason
+        if covered_by:
+            entry["covered_by"] = covered_by
         if recommended_action:
             entry["recommended_action"] = recommended_action
         if risk:
             entry["risk"] = risk
         self.testability_gaps.append(entry)
         self.record(source, "testability_gap", message_excerpt[:500])
+
+    def record_test_execution_gate_audit(self, source: str, findings: list[dict], status: str = "detected") -> None:
+        if not findings:
+            return
+        sanitized_findings = [_sanitize_test_execution_gate_finding(finding) for finding in findings]
+        entry: dict = {
+            "source": source,
+            "step": self.current_step,
+            "build_iteration": self.build_iterations,
+            "status": status,
+            "findings": sanitized_findings,
+            "timestamp": _now(),
+        }
+        if self.active_scope:
+            entry["scope"] = self.active_scope
+        self.test_execution_gate_records.append(entry)
+        self.record(source, "test_execution_gate_audit", f"{len(findings)} newly added execution gate(s)")
+
+    def record_synthetic_test_harness_audit(self, source: str, findings: list[dict], status: str = "detected") -> None:
+        if not findings:
+            return
+        sanitized_findings = [_sanitize_synthetic_test_harness_finding(finding) for finding in findings]
+        entry: dict = {
+            "source": source,
+            "step": self.current_step,
+            "build_iteration": self.build_iterations,
+            "status": status,
+            "findings": sanitized_findings,
+            "timestamp": _now(),
+        }
+        if self.active_scope:
+            entry["scope"] = self.active_scope
+        self.synthetic_test_harness_records.append(entry)
+        self.record(source, "synthetic_test_harness_audit", f"{len(findings)} synthetic test harness finding(s)")
 
     def record_validation(
         self,
@@ -405,6 +469,18 @@ class StateStore:
     def delete(self, task_id: str) -> None:
         raise NotImplementedError
 
+    def save_text_snapshot(self, task_id: str, name: str, snapshot: dict[str, str | None]) -> None:
+        return None
+
+    def load_text_snapshot(self, task_id: str, name: str) -> dict[str, str | None] | None:
+        return None
+
+    def delete_text_snapshot(self, task_id: str, name: str) -> None:
+        return None
+
+    def delete_text_snapshots(self, task_id: str) -> None:
+        return None
+
     def update_active_operation(self, task_id: str, active_operation: dict | None) -> None:
         raise NotImplementedError
 
@@ -438,12 +514,23 @@ class JsonStateStore(StateStore):
     def _path(self, task_id: str) -> Path:
         return self._dir / f"{task_id}.json"
 
+    def _snapshot_dir(self, task_id: str) -> Path:
+        return self._dir / "_snapshots" / task_id
+
+    def _snapshot_path(self, task_id: str, name: str) -> Path:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            raise ValueError(f"Invalid snapshot name: {name!r}")
+        return self._snapshot_dir(task_id) / f"{name}.json"
+
+    def _delete_text_snapshots_unlocked(self, task_id: str) -> None:
+        shutil.rmtree(self._snapshot_dir(task_id), ignore_errors=True)
+
     def _read_json(self, path: Path) -> dict:
         return json.loads(path.read_text())
 
     def _write_json(self, path: Path, data: dict) -> None:
-        self._dir.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=self._dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
         try:
             with os.fdopen(fd, "w") as tmp:
                 tmp.write(json.dumps(data, indent=2))
@@ -506,6 +593,31 @@ class JsonStateStore(StateStore):
     def delete(self, task_id: str) -> None:
         with self._lock:
             self._path(task_id).unlink(missing_ok=True)
+            self._delete_text_snapshots_unlocked(task_id)
+
+    def save_text_snapshot(self, task_id: str, name: str, snapshot: dict[str, str | None]) -> None:
+        with self._lock:
+            data = {str(path): content if content is None else str(content) for path, content in snapshot.items()}
+            self._write_json(self._snapshot_path(task_id, name), {"snapshot": data})
+
+    def load_text_snapshot(self, task_id: str, name: str) -> dict[str, str | None] | None:
+        with self._lock:
+            path = self._snapshot_path(task_id, name)
+            if not path.exists():
+                return None
+            data = self._read_json(path)
+            snapshot = data.get("snapshot")
+            if not isinstance(snapshot, dict):
+                return None
+            return {str(key): value if value is None else str(value) for key, value in snapshot.items()}
+
+    def delete_text_snapshot(self, task_id: str, name: str) -> None:
+        with self._lock:
+            self._snapshot_path(task_id, name).unlink(missing_ok=True)
+
+    def delete_text_snapshots(self, task_id: str) -> None:
+        with self._lock:
+            self._delete_text_snapshots_unlocked(task_id)
 
     def update_active_operation(self, task_id: str, active_operation: dict | None) -> None:
         with self._lock:

@@ -11,6 +11,20 @@ import core.state as state_module
 from core.state import JsonStateStore, TaskState
 
 
+class _NonReentrantLock:
+    def __init__(self) -> None:
+        self.locked = False
+
+    def __enter__(self):
+        if self.locked:
+            raise AssertionError("lock re-entered")
+        self.locked = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.locked = False
+
+
 class TestTaskStateRecord:
     def test_appends_to_history(self):
         state = TaskState(task_id="t1", task_description="task")
@@ -57,6 +71,11 @@ class TestJsonStateStore:
         state = TaskState(task_id="abc123", task_description="test task")
         state.build_iterations = 3
         state.review_approved = True
+        state.generated_test_fix_counts = {"tests/LoginTest.py": 2}
+        state.test_writer_audit_pending = True
+        state.test_writer_audit_agent_completed = True
+        state.test_writer_audit_files_written = ["tests/LoginTest.py"]
+        state.test_writer_audit_gate_counts = {"tests/LoginTest.py": {"skip:abc123": 1}}
         store.save(state)
 
         loaded = store.load("abc123")
@@ -64,6 +83,46 @@ class TestJsonStateStore:
         assert loaded.task_id == "abc123"
         assert loaded.build_iterations == 3
         assert loaded.review_approved is True
+        assert loaded.generated_test_fix_counts == {"tests/LoginTest.py": 2}
+        assert loaded.test_writer_audit_pending is True
+        assert loaded.test_writer_audit_agent_completed is True
+        assert loaded.test_writer_audit_files_written == ["tests/LoginTest.py"]
+        assert loaded.test_writer_audit_gate_counts == {"tests/LoginTest.py": {"skip:abc123": 1}}
+
+    def test_text_snapshots_are_stored_outside_task_json(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="abc123", task_description="test task")
+        store.save(state)
+        store.save_text_snapshot("abc123", "test_writer_audit_before", {"tests/LoginTest.py": "assert True\n"})
+
+        loaded = store.load_text_snapshot("abc123", "test_writer_audit_before")
+        data = json.loads((tmp_path / "abc123.json").read_text())
+
+        assert loaded == {"tests/LoginTest.py": "assert True\n"}
+        assert "assert True" not in json.dumps(data)
+
+    def test_delete_removes_text_snapshots(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="abc123", task_description="test task")
+        store.save(state)
+        store.save_text_snapshot("abc123", "test_writer_audit_before", {"tests/LoginTest.py": "assert True\n"})
+
+        store.delete("abc123")
+
+        assert store.load("abc123") is None
+        assert store.load_text_snapshot("abc123", "test_writer_audit_before") is None
+
+    def test_delete_removes_text_snapshots_without_reentering_lock(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="abc123", task_description="test task")
+        store.save(state)
+        store.save_text_snapshot("abc123", "test_writer_audit_before", {"tests/LoginTest.py": "assert True\n"})
+        store._lock = _NonReentrantLock()  # type: ignore[assignment]
+
+        store.delete("abc123")
+
+        assert store.load("abc123") is None
+        assert store.load_text_snapshot("abc123", "test_writer_audit_before") is None
 
     def test_observability_records_saved_in_pipeline_order(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
@@ -79,6 +138,8 @@ class TestJsonStateStore:
             "security_review_cycle_records",
             "test_write_records",
             "testability_gaps",
+            "test_execution_gate_records",
+            "synthetic_test_harness_records",
             "fix_cycle_records",
         ]
         first = keys.index(record_keys[0])
@@ -167,6 +228,7 @@ class TestJsonStateStore:
         data.pop("runtime_metadata", None)
         data.pop("final_summary", None)
         data.pop("testability_gaps", None)
+        data.pop("test_execution_gate_records", None)
         data.pop("build_loop_key", None)
         data.pop("build_loop_start_iteration", None)
         path.write_text(json.dumps(data))
@@ -178,6 +240,7 @@ class TestJsonStateStore:
         assert loaded.runtime_metadata == {}
         assert loaded.final_summary == {}
         assert loaded.testability_gaps == []
+        assert loaded.test_execution_gate_records == []
         assert loaded.build_loop_key is None
         assert loaded.build_loop_start_iteration == 0
 
@@ -194,6 +257,7 @@ class TestJsonStateStore:
             "TESTABILITY GAP:\ntarget: share sheet",
             target="share sheet",
             reason="no UI harness",
+            covered_by="view model state tests",
             recommended_action="add UI tests",
             risk="medium",
         )
@@ -206,9 +270,74 @@ class TestJsonStateStore:
         assert gap["scope"] == "final_full_task"
         assert gap["target"] == "share sheet"
         assert gap["reason"] == "no UI harness"
+        assert gap["covered_by"] == "view model state tests"
         assert gap["recommended_action"] == "add UI tests"
         assert gap["risk"] == "medium"
         assert state.history[-1]["action"] == "testability_gap"
+
+    def test_record_test_execution_gate_audit_captures_scope_and_metadata(self):
+        state = TaskState(
+            task_id="gate1",
+            task_description="gate task",
+            current_step=1,
+            build_iterations=2,
+            active_scope="final_full_task",
+        )
+
+        state.record_test_execution_gate_audit(
+            "fixer",
+            [
+                {
+                    "path": "tests/clientMain.test.ts",
+                    "line": 31,
+                    "category": "environment",
+                    "reason": "environment-gated test registration",
+                    "excerpt": 'if (typeof document === "undefined") {',
+                    "signature": "environment:abc123",
+                    "baseline_count": 0,
+                    "occurrence": 1,
+                }
+            ],
+        )
+
+        assert len(state.test_execution_gate_records) == 1
+        record = state.test_execution_gate_records[0]
+        assert record["source"] == "fixer"
+        assert record["step"] == 1
+        assert record["build_iteration"] == 2
+        assert record["scope"] == "final_full_task"
+        assert record["status"] == "detected"
+        assert record["findings"][0]["path"] == "tests/clientMain.test.ts"
+        assert record["findings"][0]["signature"] == "environment:abc123"
+        assert "excerpt" not in record["findings"][0]
+        assert state.history[-1]["action"] == "test_execution_gate_audit"
+
+    def test_record_synthetic_test_harness_audit_strips_source_excerpts(self):
+        state = TaskState(task_id="synthetic1", task_description="synthetic task")
+
+        state.record_synthetic_test_harness_audit(
+            "test_writer",
+            [
+                {
+                    "path": "tests/clientMain.test.ts",
+                    "subsystems": ["event_dispatch", "navigation_history", "network_server"],
+                    "excerpt": "class FakeEventTarget {}",
+                    "evidence": [
+                        {
+                            "category": "event_dispatch",
+                            "reason": "event dispatch fake",
+                            "lines": [{"line": 10, "excerpt": "class FakeEventTarget {}"}],
+                        }
+                    ],
+                }
+            ],
+        )
+
+        finding = state.synthetic_test_harness_records[0]["findings"][0]
+        assert finding["path"] == "tests/clientMain.test.ts"
+        assert "excerpt" not in finding
+        assert finding["evidence"][0]["lines"] == [{"line": 10}]
+        assert state.history[-1]["action"] == "synthetic_test_harness_audit"
 
     def test_load_migrates_mixed_review_cycle_records(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
@@ -544,6 +673,7 @@ class TestJsonStateStore:
         assert loaded.final_summary["reviewer_runs"] == 0
         assert loaded.final_summary["security_reviewer_runs"] == 0
         assert loaded.final_summary["testability_gaps_count"] == 0
+        assert loaded.final_summary["test_execution_gate_audits_count"] == 0
         assert loaded.final_summary["planner_retries_count"] == 0
         assert loaded.final_summary["llm_retries"] == 1
 
@@ -576,6 +706,40 @@ class TestJsonStateStore:
 
         assert loaded is not None
         assert loaded.final_summary["testability_gaps_count"] == 1
+
+    def test_final_summary_counts_test_execution_gate_audits(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="summary_gates", task_description="summary gates task", done=True)
+        state.record_test_execution_gate_audit(
+            "test_writer",
+            [{"path": "tests/test_main.py", "line": 5, "category": "skip", "excerpt": "test.skip("}],
+        )
+
+        store.save(state)
+        loaded = store.load("summary_gates")
+
+        assert loaded is not None
+        assert loaded.final_summary["test_execution_gate_audits_count"] == 1
+
+    def test_final_summary_counts_synthetic_test_harness_audits(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="summary_harness", task_description="summary harness task", done=True)
+        state.record_synthetic_test_harness_audit(
+            "test_writer",
+            [
+                {
+                    "path": "tests/clientMain.test.ts",
+                    "subsystems": ["event_dispatch", "navigation_history", "network_server"],
+                    "evidence": [],
+                }
+            ],
+        )
+
+        store.save(state)
+        loaded = store.load("summary_harness")
+
+        assert loaded is not None
+        assert loaded.final_summary["synthetic_test_harness_audits_count"] == 1
 
     def test_final_summary_counts_review_records_separately(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
