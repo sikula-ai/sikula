@@ -50,7 +50,7 @@ def mask_source_literals(text: str | None) -> str:
                 i += 1
                 continue
             if char == "\\" and i + 1 < len(text):
-                result.append("\n" if next_char == "\n" else " ")
+                result.append(" ")
                 result.append("\n" if next_char == "\n" else " ")
                 i += 2
                 continue

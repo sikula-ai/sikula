@@ -193,6 +193,24 @@ def test_documents_gate_comment():
     assert findings == []
 
 
+def test_escaped_physical_newline_string_preserves_gate_line_alignment():
+    findings = detect_new_test_execution_gates(
+        path="tests/audit_fixture.test.ts",
+        before=None,
+        after="""\
+test("documents execution gate snippets", () => {
+  const source = "foo\\
+bar test.skip('fixture', () => {})";
+});
+test.skip("real skip", () => {});
+""",
+    )
+
+    assert len(findings) == 1
+    assert findings[0]["line"] == 5
+    assert findings[0]["reason"] == "skipped JavaScript/TypeScript test"
+
+
 def test_detects_junit4_ignore_gates():
     findings = detect_new_test_execution_gates(
         path="src/test/kotlin/GeneratedTest.kt",

@@ -130,6 +130,24 @@ async function fakeFetch(input) {
     assert findings == []
 
 
+def test_escaped_physical_newline_string_preserves_harness_line_alignment():
+    after = """\
+test("documents rejected harness examples", () => {
+  const source = "foo\\
+class FakeSnippet { appendChild(node) {} }";
+});
+class FakeElement { appendChild(node) {} }
+class FakeHistory { pushState(state, title, path) {} }
+async function fakeFetch(input) { return new Response("{}"); }
+"""
+
+    findings = detect_new_synthetic_test_harnesses(path="tests/harness_audit.test.ts", before=None, after=after)
+
+    assert len(findings) == 1
+    evidence_lines = {line["line"] for subsystem in findings[0]["evidence"] for line in subsystem["lines"]}
+    assert evidence_lines == {5, 6, 7}
+
+
 def test_cumulative_harness_is_reported_when_file_crosses_threshold():
     before = """
 class FakeElement {
