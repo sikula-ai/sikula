@@ -605,10 +605,17 @@ def _opencode_error_from_event(event: dict) -> LLMProviderError | None:
         msg = data.get("message") if isinstance(data, dict) else None
         msg = msg or err.get("message")
         msg = msg or event.get("message")
+        if not msg and isinstance(data, dict):
+            markers = []
+            for key in ("type", "code"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    markers.append(f"{key}: {value.strip()}")
+            msg = "; ".join(markers)
         msg = msg or err.get("name") or "provider error"
     else:
         msg = str(err)
-    return _provider_error("opencode", "event", msg)
+    return _opencode_diagnostic_provider_error("event", msg)
 
 
 def _opencode_stream_error(line: str) -> LLMProviderError | None:
@@ -637,13 +644,11 @@ def _opencode_stdout_diagnostic(stdout: str) -> str:
         state = part.get("state")
         if not isinstance(state, dict) or state.get("status") != "error":
             continue
-        error = str(state.get("error") or "tool call failed").strip()
+        error = str(state.get("error") or "").strip().lower()
         tool = part.get("tool") or "tool"
-        input_data = state.get("input")
-        path = input_data.get("path") if isinstance(input_data, dict) else None
-        if path:
-            return f"{tool} failed: {error} (path: {path})"
-        return f"{tool} failed: {error}"
+        if "rejected permission" in error or ("permission" in error and "reject" in error):
+            return f"{tool} failed: permission rejected"
+        return f"{tool} failed"
     return ""
 
 

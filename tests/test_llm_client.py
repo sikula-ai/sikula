@@ -268,6 +268,8 @@ class TestOpencodeParsText:
             ({"type": "error", "message": "quota exceeded"}, LLMQuotaExceeded),
             ({"type": "error", "error": {"data": {"message": "invalid model"}}}, LLMConfigurationError),
             ({"type": "error", "error": {"message": "invalid model"}}, LLMConfigurationError),
+            ({"type": "error", "error": {"data": {"type": "usage_limit_reached"}}}, LLMQuotaExceeded),
+            ({"type": "error", "error": {"data": {"code": "unsupported_value"}}}, LLMConfigurationError),
         ],
     )
     def test_stream_error_classifies_supported_message_shapes(
@@ -695,7 +697,7 @@ class TestOpenCodeClientCommands:
                         "tool": "grep",
                         "state": {
                             "status": "error",
-                            "input": {"path": "/repo/.siklib/worktrees/task", "pattern": "FixtureInputMap"},
+                            "input": {"path": "/repo/.sikula/worktrees/task", "pattern": "FixtureInputMap"},
                             "error": "The user rejected permission to use this specific tool call.",
                         },
                     },
@@ -703,7 +705,7 @@ class TestOpenCodeClientCommands:
             ),
             stderr=(
                 "\x1b[93m\x1b[1m! \x1b[0mpermission requested: "
-                "external_directory (/repo/.siklib/worktrees/*); auto-rejecting"
+                "external_directory (/repo/.sikula/worktrees/*); auto-rejecting"
             ),
         )
 
@@ -720,8 +722,10 @@ class TestOpenCodeClientCommands:
         assert "safe diagnostic" in message
         assert "permission requested" not in message
         assert "external_directory" not in message
-        assert "grep failed: The user rejected permission to use this specific tool call." in message
-        assert "path: /repo/.siklib/worktrees/task" in message
+        assert "grep failed: permission rejected" in message
+        assert "The user rejected permission to use this specific tool call." not in message
+        assert "/repo/.sikula/worktrees/task" not in message
+        assert "FixtureInputMap" not in message
         assert '"type": "tool_use"' not in message
 
     def test_run_agent_no_text_with_changes_returns_diagnostic_for_audit(self, tmp_path: Path):
@@ -778,6 +782,41 @@ class TestOpenCodeClientCommands:
         assert "SOURCE_CONTENT_SHOULD_NOT_BE_PERSISTED" not in message
         assert "src/secret.py" not in message
         assert '"type": "tool_use"' not in message
+
+    def test_run_agent_no_text_redacts_arbitrary_tool_error(self, tmp_path: Path):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=0,
+            stdout=self._line(
+                {
+                    "type": "tool_use",
+                    "part": {
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {
+                            "status": "error",
+                            "input": {"path": "/repo/private/source.py"},
+                            "error": "stderr contained SECRET_PROMPT_PAYLOAD and source excerpt",
+                        },
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client._run_opencode_streaming", return_value=result),
+            pytest.raises(LLMTransientError) as exc_info,
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        message = str(exc_info.value)
+        assert "bash failed" in message
+        assert "SECRET_PROMPT_PAYLOAD" not in message
+        assert "/repo/private/source.py" not in message
+        assert "source excerpt" not in message
 
     def test_generate_no_text_redacts_unstructured_stderr_diagnostic(self):
         client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
@@ -916,7 +955,7 @@ class TestOpenCodeClientCommands:
                         "tool": "grep",
                         "state": {
                             "status": "error",
-                            "input": {"path": "/repo/.siklib/worktrees/task"},
+                            "input": {"path": "/repo/.sikula/worktrees/task"},
                             "error": "The user rejected permission to use this specific tool call.",
                         },
                     },
@@ -934,8 +973,9 @@ class TestOpenCodeClientCommands:
 
         message = str(exc_info.value)
         assert "opencode agent error: returned no text output" in message
-        assert "grep failed: The user rejected permission to use this specific tool call." in message
-        assert "path: /repo/.siklib/worktrees/task" in message
+        assert "grep failed: permission rejected" in message
+        assert "The user rejected permission to use this specific tool call." not in message
+        assert "/repo/.sikula/worktrees/task" not in message
         assert '"type": "tool_use"' not in message
 
     def test_readonly_failure_reports_stdout_json_error(self, tmp_path: Path):
