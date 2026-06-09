@@ -1768,7 +1768,13 @@ class Orchestrator:
             return bool(result.stdout.strip())
         return self._read_project_text(normalized) != self._read_git_head_project_text(normalized)
 
-    def _prune_clean_test_state_paths(self, state: TaskState, paths: list[str]) -> None:
+    def _prune_clean_test_state_paths(
+        self,
+        state: TaskState,
+        paths: list[str],
+        *,
+        before_snapshot: dict[str, str | None] | None = None,
+    ) -> None:
         clean_paths = {
             path
             for path in (_normalize_project_path(candidate) for candidate in paths)
@@ -1776,9 +1782,26 @@ class Orchestrator:
         }
         if not clean_paths:
             return
-        state.files_changed = [
-            path for path in state.files_changed if _normalize_project_path(str(path)) not in clean_paths
-        ]
+        snapshot = (
+            {
+                _normalize_project_path(path): content
+                for path, content in before_snapshot.items()
+                if _normalize_project_path(path)
+            }
+            if before_snapshot is not None
+            else None
+        )
+        files_changed_prune_paths = clean_paths
+        if state.review_mode in {"review_report", "review_fix"}:
+            files_changed_prune_paths = {
+                path for path in clean_paths if snapshot is not None and path in snapshot and snapshot[path] is None
+            }
+        if files_changed_prune_paths:
+            state.files_changed = [
+                path
+                for path in state.files_changed
+                if _normalize_project_path(str(path)) not in files_changed_prune_paths
+            ]
         state.test_files_written = [
             path for path in state.test_files_written if _normalize_project_path(str(path)) not in clean_paths
         ]
@@ -1853,7 +1876,7 @@ class Orchestrator:
             except OSError as exc:
                 errors.append(f"{path}: {exc}")
 
-        self._prune_clean_test_state_paths(state, restored)
+        self._prune_clean_test_state_paths(state, restored, before_snapshot=before_snapshot)
         self._refresh_test_execution_gate_errors(state)
         return restored, errors
 

@@ -3185,6 +3185,65 @@ class TestOrchestratorInterruptResume:
         assert "symlink component" in errors[0]
         assert outside_file.read_text(encoding="utf-8") == "outside\n"
 
+    def test_review_fix_restore_preserves_branch_diff_test_file(self, tmp_path: Path, monkeypatch):
+        orch, _, _ = _make_orchestrator(tmp_path)
+        test_file = tmp_path / "tests" / "test_main.py"
+        test_file.parent.mkdir()
+        branch_text = "def test_existing_branch_change():\n    assert True\n"
+        test_file.write_text("class FakeElement:\n    pass\n", encoding="utf-8")
+        monkeypatch.setattr(orch, "_path_has_pending_changes", lambda _path: False)
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py", "tests/test_main.py"],
+            test_files_written=["tests/test_main.py"],
+            review_diff=_REVIEW_DIFF,
+            review_mode="review_fix",
+            review_base_branch="main",
+            worktree_base=str(tmp_path),
+        )
+
+        restored, errors = orch._restore_test_file_paths_from_snapshot(
+            state,
+            paths=["tests/test_main.py"],
+            before_snapshot={"tests/test_main.py": branch_text},
+        )
+
+        assert restored == ["tests/test_main.py"]
+        assert errors == []
+        assert test_file.read_text(encoding="utf-8") == branch_text
+        assert "tests/test_main.py" in state.files_changed
+        assert "tests/test_main.py" not in state.test_files_written
+
+    def test_review_fix_restore_prunes_new_generated_test_file(self, tmp_path: Path, monkeypatch):
+        orch, _, _ = _make_orchestrator(tmp_path)
+        test_file = tmp_path / "tests" / "generated_test.py"
+        test_file.parent.mkdir()
+        test_file.write_text("class FakeElement:\n    pass\n", encoding="utf-8")
+        monkeypatch.setattr(orch, "_path_has_pending_changes", lambda _path: False)
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py", "tests/generated_test.py"],
+            test_files_written=["tests/generated_test.py"],
+            review_diff=_REVIEW_DIFF,
+            review_mode="review_fix",
+            review_base_branch="main",
+            worktree_base=str(tmp_path),
+        )
+
+        restored, errors = orch._restore_test_file_paths_from_snapshot(
+            state,
+            paths=["tests/generated_test.py"],
+            before_snapshot={"tests/generated_test.py": None},
+        )
+
+        assert restored == ["tests/generated_test.py"]
+        assert errors == []
+        assert not test_file.exists()
+        assert "tests/generated_test.py" not in state.files_changed
+        assert "tests/generated_test.py" not in state.test_files_written
+
     def test_step_loop_runs_implementer_per_step(self, tmp_path: Path):
         """Step loop: implementer must run once per step."""
         orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=True, run_build=False)
