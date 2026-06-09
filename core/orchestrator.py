@@ -1282,9 +1282,31 @@ class Orchestrator:
                 log.info("Retrying fixer agent after synthetic test harness recovery")
                 retry_test_gate_before = self._test_execution_gate_snapshot()
                 fixer_result = self._run_agent("fixer", state)
-                if state.failed or self._abort_on_failed_agent_result(state, "fixer", fixer_result):
+                no_op_retry_after_retained_fix = (
+                    not fixer_result.success
+                    and bool(first_pass_remaining_files)
+                    and (fixer_result.message or "").strip() == "Agent made no file changes"
+                )
+                if state.failed:
                     return False
-                retry_files = set((fixer_result.data or {}).get("files_written", []))
+                if no_op_retry_after_retained_fix:
+                    retained = ", ".join(sorted(first_pass_remaining_files))
+                    log.info(
+                        "Fixer retry made no additional file changes after synthetic test harness recovery; "
+                        "continuing to validate retained fixer changes: %s",
+                        retained,
+                    )
+                    state.record(
+                        "orchestrator",
+                        "synthetic_test_harness_recovery_noop_retry",
+                        f"fixer retry made no additional file changes; validating retained fixer changes: {retained}",
+                    )
+                    self._store.save(state)
+                    retry_files = set()
+                elif self._abort_on_failed_agent_result(state, "fixer", fixer_result):
+                    return False
+                else:
+                    retry_files = set((fixer_result.data or {}).get("files_written", []))
                 gate_findings.extend(
                     self._audit_test_execution_gates_after_agent(
                         state,

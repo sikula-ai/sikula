@@ -2473,6 +2473,73 @@ mod tests {
         assert state.security_approved is False
         assert state.tests_up_to_date is False
 
+    def test_fixer_synthetic_harness_recovery_accepts_noop_retry_with_retained_fix(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        src_file = tmp_path / "src" / "main.py"
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        src_file.parent.mkdir()
+        test_file.parent.mkdir()
+        attempts = {"count": 0}
+
+        def fixer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                stubs["fixer"].result_success = True
+                stubs["fixer"].result_message = None
+                src_file.write_text("def value():\n    return 1\n", encoding="utf-8")
+                test_file.write_text(
+                    "\n".join(
+                        [
+                            "class FakeElement { appendChild() {}; querySelector() {} }",
+                            "class FakeHistory { pushState() {} }",
+                            "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                state.files_changed.extend(["src/main.py", "tests/client_main.test.ts"])
+            else:
+                stubs["fixer"].result_success = False
+                stubs["fixer"].result_message = "Agent made no file changes"
+
+        stubs["fixer"].side_effect = fixer_effect
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=[],
+            test_errors=["tests failed"],
+            test_status="failed",
+            review_approved=True,
+            security_approved=True,
+            tests_up_to_date=True,
+        )
+
+        assert orch._run_fix_phase(state, "1/1")
+
+        assert attempts["count"] == 2
+        assert state.failed is False
+        assert src_file.exists()
+        assert not test_file.exists()
+        assert "src/main.py" in state.files_changed
+        assert "tests/client_main.test.ts" not in state.files_changed
+        assert state.review_approved is False
+        assert state.security_approved is False
+        assert state.tests_up_to_date is False
+        assert any(record["action"] == "synthetic_test_harness_recovery_noop_retry" for record in state.history)
+        assert not any(
+            record["action"] == "abort" and "Agent made no file changes" in record["result"] for record in state.history
+        )
+
     def test_fixer_synthetic_harness_recovery_drops_clean_retry_reported_file(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
             tmp_path,
