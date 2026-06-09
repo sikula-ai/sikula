@@ -185,6 +185,48 @@ fun generatedEmulatorTest() {}
     ]
 
 
+def test_detects_junit_assumption_gates():
+    findings = detect_new_test_execution_gates(
+        path="src/test/kotlin/GeneratedTest.kt",
+        before=None,
+        after="""\
+@Test
+fun generatedBrowserTest() {
+    Assume.assumeTrue(System.getenv("RUN_BROWSER_TESTS") != null)
+}
+
+@Test
+fun generatedServiceTest() {
+    org.junit.Assume.assumeFalse(serviceUnavailable)
+}
+
+@Test
+fun generatedJupiterTest() {
+    Assumptions.assumingThat(enabled) {}
+}
+
+@Test
+fun generatedStaticImportTest() {
+    assumeNotNull(browser)
+}
+""",
+    )
+
+    assert [finding["line"] for finding in findings] == [3, 8, 13, 18]
+    assert [finding["category"] for finding in findings] == [
+        "assumption",
+        "assumption",
+        "assumption",
+        "assumption",
+    ]
+    assert [finding["reason"] for finding in findings] == [
+        "JUnit assumption-gated test",
+        "JUnit assumption-gated test",
+        "JUnit assumption-gated test",
+        "JUnit assumption-gated test",
+    ]
+
+
 def test_detects_swift_try_xctskip_gates():
     findings = detect_new_test_execution_gates(
         path="Tests/GeneratedTests.swift",
@@ -344,6 +386,40 @@ end
         )
 
 
+def test_detects_multiline_expression_style_env_gated_javascript_registrations():
+    cases = [
+        """\
+process.env.RUN_BROWSER_TESTS &&
+  test("browser behavior", () => {});
+""",
+        """\
+Boolean(process.env.RUN_BROWSER_TESTS) &&
+  test.each(cases)("browser behavior %s", () => {});
+""",
+        """\
+import.meta.env.RUN_BROWSER_TESTS ?
+  it("browser behavior", () => {}) :
+  undefined;
+""",
+        """\
+!process.env.RUN_BROWSER_TESTS ||
+  describe("browser behavior", () => {});
+""",
+    ]
+
+    for after in cases:
+        findings = detect_new_test_execution_gates(path="tests/clientMain.test.ts", before=None, after=after)
+
+        assert len(findings) == 1
+        _assert_public_finding_metadata(
+            findings[0],
+            path="tests/clientMain.test.ts",
+            line=1,
+            category="environment",
+            reason="environment-gated test registration",
+        )
+
+
 def test_ignores_env_var_gated_javascript_test_configuration_without_registration():
     findings = detect_new_test_execution_gates(
         path="tests/clientMain.test.ts",
@@ -373,6 +449,12 @@ test("runs in normal validation", () => {});
 if (shouldConfigureExternalService) {
   const enabled = process.env.RUN_BROWSER_TESTS && configureExternalService();
 }
+
+test("runs in normal validation", () => {});
+""",
+        """\
+const enabled = process.env.RUN_BROWSER_TESTS &&
+  configureExternalService();
 
 test("runs in normal validation", () => {});
 """,

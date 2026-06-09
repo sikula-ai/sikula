@@ -57,7 +57,10 @@ _SKIP_GATE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     (
         "assumption",
         "JUnit assumption-gated test",
-        re.compile(r"\b(?:Assumptions?\.)?(?:assumeTrue|assumeFalse|assumeNoException|assumingThat)\s*\("),
+        re.compile(
+            r"\b(?:(?:(?:org\.junit\.)?Assume|(?:org\.junit\.jupiter\.api\.)?Assumptions)\.)?"
+            r"(?:assumeTrue|assumeFalse|assumeNoException|assumeNotNull|assumeThat|assumingThat)\s*\("
+        ),
     ),
     (
         "skip",
@@ -98,9 +101,12 @@ _ENVIRONMENT_SIGNAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bos\.Getenv\s*\("),
 )
 _ENVIRONMENT_EXPRESSION_OPERATOR_RE = re.compile(r"(?:&&|\|\||\?)")
+_ENVIRONMENT_EXPRESSION_TRAILING_OPERATOR_RE = re.compile(r"(?:&&|\|\||\?)\s*$")
+_ASSIGNMENT_EXPRESSION_START_RE = re.compile(r"^(?:const|let|var)\s+\w+\s*=|\w+\s*=")
 _CONTROL_GATE_START_RE = re.compile(r"^\s*if\b")
 _MAX_GATE_HEADER_LINES = 20
 _MAX_GATED_BODY_LINES = 50
+_MAX_EXPRESSION_GATE_LINES = 10
 
 _TEST_REGISTRATION_PATTERN = re.compile(
     r"\b(?:describe|context|suite|test|it)"
@@ -300,8 +306,9 @@ def _environment_gate_signature_text(lines: list[str], index: int) -> str | None
     if not stripped:
         return None
 
-    if _is_environment_expression_gate(stripped):
-        return stripped
+    expression_gate = _environment_expression_gate_text(lines, index)
+    if expression_gate:
+        return expression_gate
 
     header = _control_gate_header(lines, index)
     if header is None:
@@ -327,6 +334,45 @@ def _is_environment_expression_gate(stripped: str) -> bool:
         and bool(_ENVIRONMENT_EXPRESSION_OPERATOR_RE.search(stripped))
         and bool(_TEST_REGISTRATION_PATTERN.search(stripped))
     )
+
+
+def _environment_expression_gate_text(lines: list[str], index: int) -> str | None:
+    stripped = _strip_line_comment(lines[index]).strip()
+    if _is_environment_expression_gate(stripped):
+        return stripped
+    if not _is_environment_expression_gate_start(stripped):
+        return None
+
+    fragments = [stripped]
+    for line in lines[index + 1 : min(len(lines), index + 1 + _MAX_EXPRESSION_GATE_LINES)]:
+        continuation = _strip_line_comment(line).strip()
+        if not continuation:
+            continue
+        fragments.append(continuation)
+        joined = " ".join(fragments)
+        if _TEST_REGISTRATION_PATTERN.search(joined):
+            return joined
+        if _statement_ends(continuation):
+            break
+    return None
+
+
+def _is_environment_expression_gate_start(stripped: str) -> bool:
+    return (
+        _has_environment_signal(stripped)
+        and bool(_ENVIRONMENT_EXPRESSION_TRAILING_OPERATOR_RE.search(stripped))
+        and not _TEST_REGISTRATION_PATTERN.search(stripped)
+        and not _looks_like_assignment_expression(stripped)
+        and not stripped.startswith("return ")
+    )
+
+
+def _looks_like_assignment_expression(stripped: str) -> bool:
+    return bool(_ASSIGNMENT_EXPRESSION_START_RE.search(stripped))
+
+
+def _statement_ends(stripped: str) -> bool:
+    return stripped.endswith(";") or stripped.endswith("}") or stripped.endswith(")")
 
 
 def _control_gate_header(lines: list[str], index: int) -> tuple[list[str], int] | None:
