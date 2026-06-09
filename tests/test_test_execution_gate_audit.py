@@ -308,6 +308,15 @@ if (
 """,
         ),
         (
+            "tests/clientMain.test.ts",
+            """\
+if (process.env.RUN_BROWSER_TESTS)
+{
+  test("browser behavior", () => {});
+}
+""",
+        ),
+        (
             "tests/client_main_test.py",
             """\
 if (

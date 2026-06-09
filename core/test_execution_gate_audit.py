@@ -393,12 +393,30 @@ def _control_gate_header(lines: list[str], index: int) -> tuple[list[str], int] 
         if "{" in stripped or stripped.endswith(":"):
             return header, index + offset
         if saw_paren and paren_depth <= 0:
+            following_brace = _following_open_brace_line(lines, index, offset)
+            if following_brace:
+                brace_line, brace_index = following_brace
+                header.append(brace_line)
+                return header, brace_index
             return header, index + offset
         if offset == 0 and _has_environment_signal(stripped):
             return header, index
         if offset == 0 and not saw_paren:
             return header, index
     return (header, index + len(header) - 1) if header else None
+
+
+def _following_open_brace_line(lines: list[str], index: int, current_offset: int) -> tuple[str, int] | None:
+    start = index + current_offset + 1
+    stop = min(len(lines), index + _MAX_GATE_HEADER_LINES)
+    for line_index in range(start, stop):
+        stripped = _strip_line_comment(lines[line_index]).strip()
+        if not stripped:
+            continue
+        if stripped.startswith("{"):
+            return stripped, line_index
+        return None
+    return None
 
 
 def _gated_body_lines(lines: list[str], index: int, header_end_index: int | None = None) -> list[str]:
