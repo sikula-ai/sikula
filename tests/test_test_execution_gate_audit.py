@@ -130,15 +130,27 @@ test.describe.configure({ mode: "skip" });
 test.describe.configure({
   mode: 'skip',
 });
+test.describe.configure({
+  mode:
+    "skip",
+});
+test.describe.configure(
+  {
+    mode:
+      'skip',
+  }
+);
 """,
     )
 
-    assert [finding["line"] for finding in findings] == [1, 2, 3, 4, 5, 7]
+    assert [finding["line"] for finding in findings] == [1, 2, 3, 4, 5, 7, 10, 15]
     assert [finding["reason"] for finding in findings] == [
         "Playwright fixme-skipped test",
         "Playwright fixme-skipped test",
         "JavaScript/TypeScript todo test",
         "JavaScript/TypeScript todo test",
+        "Playwright skip-mode configuration",
+        "Playwright skip-mode configuration",
         "Playwright skip-mode configuration",
         "Playwright skip-mode configuration",
     ]
@@ -151,6 +163,10 @@ def test_ignores_unrelated_javascript_skip_mode_values():
         after="""\
 test.describe.configure({ mode: "parallel" });
 const options = { mode: "skip" };
+test.describe.configure({
+  mode:
+    "parallel",
+});
 test("runs in normal validation", () => {});
 """,
     )

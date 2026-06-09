@@ -85,9 +85,10 @@ _SKIP_GATE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         re.compile(r"\bmarkTestSkipped\s*\("),
     ),
 )
-_PLAYWRIGHT_CONFIGURE_OPEN_RE = re.compile(r"\btest\.describe\.configure\s*\(\s*\{")
+_PLAYWRIGHT_CONFIGURE_CALL_RE = re.compile(r"\btest\.describe\.configure\s*\(")
 _PLAYWRIGHT_SKIP_MODE_KEY_RE = re.compile(r"\bmode\s*:")
 _PLAYWRIGHT_SKIP_MODE_VALUE_RE = re.compile(r"\bmode\s*:\s*[\"']skip[\"']")
+_PLAYWRIGHT_SKIP_MODE_LITERAL_RE = re.compile(r"^[\"']skip[\"'](?:\s*(?:,|;|\)|\}|as\b|satisfies\b)|\s*$)")
 
 _ENVIRONMENT_SIGNAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\btypeof\s+(?:globalThis\.)?(?:document|window|navigator)\b"),
@@ -292,20 +293,46 @@ def _classify_direct_gate(line: str) -> tuple[str, str] | None:
 
 def _is_playwright_skip_mode_configuration(raw_lines: list[str], masked_lines: list[str], index: int) -> bool:
     stripped = _strip_line_comment(masked_lines[index]).strip()
-    raw_stripped = _strip_line_comment(raw_lines[index]).strip()
     if not _PLAYWRIGHT_SKIP_MODE_KEY_RE.search(stripped):
         return False
-    if not _PLAYWRIGHT_SKIP_MODE_VALUE_RE.search(raw_stripped):
+    if not _is_inside_playwright_configure(masked_lines, index):
         return False
-    if _PLAYWRIGHT_CONFIGURE_OPEN_RE.search(stripped):
+    return _has_playwright_skip_mode_value(raw_lines, masked_lines, index)
+
+
+def _is_inside_playwright_configure(masked_lines: list[str], index: int) -> bool:
+    current = _strip_line_comment(masked_lines[index]).strip()
+    if _PLAYWRIGHT_CONFIGURE_CALL_RE.search(current) and "{" in current:
         return True
 
+    saw_object_open = False
     for line in reversed(masked_lines[max(0, index - 20) : index]):
         previous = _strip_line_comment(line).strip()
         if "}" in previous:
             break
-        if _PLAYWRIGHT_CONFIGURE_OPEN_RE.search(previous):
+        if "{" in previous:
+            saw_object_open = True
+        if _PLAYWRIGHT_CONFIGURE_CALL_RE.search(previous) and saw_object_open:
             return True
+    return False
+
+
+def _has_playwright_skip_mode_value(raw_lines: list[str], masked_lines: list[str], index: int) -> bool:
+    raw_stripped = _strip_line_comment(raw_lines[index]).strip()
+    if _PLAYWRIGHT_SKIP_MODE_VALUE_RE.search(raw_stripped):
+        return True
+
+    after_colon = _strip_line_comment(masked_lines[index]).split(":", 1)[1].strip()
+    if after_colon:
+        return False
+    for line_index in range(index + 1, min(len(masked_lines), index + 6)):
+        masked_value = _strip_line_comment(masked_lines[line_index]).strip()
+        if not masked_value:
+            continue
+        if "}" in masked_value:
+            return False
+        raw_value = _strip_line_comment(raw_lines[line_index]).strip()
+        return bool(_PLAYWRIGHT_SKIP_MODE_LITERAL_RE.search(raw_value))
     return False
 
 
