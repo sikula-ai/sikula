@@ -1463,14 +1463,6 @@ class Orchestrator:
             snapshot[relative] = self._read_project_text(relative)
         return snapshot
 
-    def _test_execution_gate_count_snapshot_for_configured_files(self) -> dict[str, dict[str, int]]:
-        return {
-            relative: test_execution_gate_signature_counts(self._read_project_text(relative))
-            for path in self._iter_configured_test_files()
-            for relative in [self._relative_project_path(path)]
-            if relative
-        }
-
     def _test_execution_gate_count_snapshot(self, snapshot: dict[str, str | None]) -> dict[str, dict[str, int]]:
         return {path: test_execution_gate_signature_counts(text) for path, text in snapshot.items()}
 
@@ -1511,7 +1503,7 @@ class Orchestrator:
         state.test_writer_audit_pending = True
         state.test_writer_audit_agent_completed = False
         state.test_writer_audit_files_written = []
-        state.test_writer_audit_gate_counts = self._test_execution_gate_count_snapshot_for_configured_files()
+        state.test_writer_audit_gate_counts = self._test_execution_gate_count_snapshot(before_snapshot)
         state.tests_up_to_date = False
         self._store.save(state)
 
@@ -2531,30 +2523,33 @@ class Orchestrator:
             before_gate_counts = dict(state.test_writer_audit_gate_counts)
             files_written = self._pending_test_writer_audit_files(state)
         else:
-            if pending_agent_incomplete:
-                saved_test_gate_before = self._load_test_writer_audit_snapshot(state)
-                if saved_test_gate_before is None:
-                    msg = "pending test-writer audit snapshot missing before agent completed"
-                    state.record("orchestrator", "abort", msg)
-                    state.failed = True
+            with self._active_operation(
+                state,
+                phase="test_writer audit prep",
+                message="Preparing test-writer audit baseline",
+            ):
+                if pending_agent_incomplete:
+                    saved_test_gate_before = self._load_test_writer_audit_snapshot(state)
+                    if saved_test_gate_before is None:
+                        msg = "pending test-writer audit snapshot missing before agent completed"
+                        state.record("orchestrator", "abort", msg)
+                        state.failed = True
+                        self._store.save(state)
+                        return False
+                    test_gate_before = saved_test_gate_before
+                    self._restore_interrupted_test_writer_outputs(state, test_gate_before)
+                    if state.failed:
+                        return False
+                    if not state.test_writer_audit_gate_counts:
+                        state.test_writer_audit_gate_counts = self._test_execution_gate_count_snapshot(test_gate_before)
+                    before_gate_counts = dict(state.test_writer_audit_gate_counts)
+                    state.test_writer_audit_files_written = []
+                    state.tests_up_to_date = False
                     self._store.save(state)
-                    return False
-                test_gate_before = saved_test_gate_before
-                self._restore_interrupted_test_writer_outputs(state, test_gate_before)
-                if state.failed:
-                    return False
-                if not state.test_writer_audit_gate_counts:
-                    state.test_writer_audit_gate_counts = (
-                        self._test_execution_gate_count_snapshot_for_configured_files()
-                    )
-                before_gate_counts = dict(state.test_writer_audit_gate_counts)
-                state.test_writer_audit_files_written = []
-                state.tests_up_to_date = False
-                self._store.save(state)
-            else:
-                test_gate_before = self._test_writer_restore_snapshot(state)
-                self._begin_test_writer_audit_pending(state, test_gate_before)
-                before_gate_counts = dict(state.test_writer_audit_gate_counts)
+                else:
+                    test_gate_before = self._test_writer_restore_snapshot(state)
+                    self._begin_test_writer_audit_pending(state, test_gate_before)
+                    before_gate_counts = dict(state.test_writer_audit_gate_counts)
             result = self._run_agent("test_writer", state)
             if state.failed or self._abort_on_failed_agent_result(state, "test_writer", result):
                 return False
@@ -2603,8 +2598,13 @@ class Orchestrator:
                     log.info("Retrying test writer agent after pending synthetic test harness recovery")
                 else:
                     log.info("Retrying test writer agent after synthetic test harness recovery")
-                retry_test_gate_before = self._test_writer_restore_snapshot(state, extra_paths=files_written)
-                self._begin_test_writer_audit_pending(state, retry_test_gate_before)
+                with self._active_operation(
+                    state,
+                    phase="test_writer audit prep",
+                    message="Preparing test-writer audit baseline",
+                ):
+                    retry_test_gate_before = self._test_writer_restore_snapshot(state, extra_paths=files_written)
+                    self._begin_test_writer_audit_pending(state, retry_test_gate_before)
                 result = self._run_agent("test_writer", state)
                 if state.failed or self._abort_on_failed_agent_result(state, "test_writer", result):
                     return False

@@ -263,6 +263,46 @@ class TestOrchestratorLoop:
 
         assert result.success
 
+    def test_test_writer_audit_prep_records_active_operation_before_agent(self, tmp_path: Path, monkeypatch):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            heartbeat_interval_seconds=60,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+
+        def restore_snapshot_effect(state: TaskState, extra_paths=()) -> dict[str, str | None]:
+            assert list(extra_paths) == []
+            loaded = orch._store.load(state.task_id)
+            assert loaded is not None
+            assert loaded.active_operation is not None
+            assert loaded.active_operation["phase"] == "test_writer audit prep"
+            assert loaded.active_operation["message"] == "Preparing test-writer audit baseline"
+            return {}
+
+        def test_writer_effect(state: TaskState) -> None:
+            loaded = orch._store.load(state.task_id)
+            assert loaded is not None
+            assert loaded.active_operation is not None
+            assert loaded.active_operation["phase"] == "agent"
+            assert loaded.active_operation["agent"] == "test_writer"
+            state.tests_up_to_date = True
+
+        monkeypatch.setattr(orch, "_test_writer_restore_snapshot", restore_snapshot_effect)
+        stubs["test_writer"].side_effect = test_writer_effect
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+
+        changed = orch._run_test_write_phase(state)
+        loaded = orch._store.load(state.task_id)
+
+        assert changed is False
+        assert loaded is not None
+        assert loaded.active_operation is None
+
     def test_run_clears_stale_active_operation_on_resume(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path, heartbeat_interval_seconds=0)
         state = _save_state(orch, implementation_prompt="already analyzed")
@@ -1693,6 +1733,70 @@ class TestOrchestratorFixPhase:
         assert state.test_errors[0].startswith("TEST EXECUTION GATE AUDIT:")
         assert 'test.skip("changed behavior"' not in state.test_errors[0]
         assert "skipped JavaScript/TypeScript test" in state.test_errors[0]
+
+    def test_test_writer_audit_pending_counts_only_saved_snapshot(self, tmp_path: Path, monkeypatch):
+        orch, _, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        monkeypatch.setattr(
+            orch,
+            "_iter_configured_test_files",
+            lambda: (_ for _ in ()).throw(AssertionError("unexpected full test-tree scan")),
+        )
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+
+        orch._begin_test_writer_audit_pending(
+            state,
+            {"tests/target.test.ts": 'test.skip("preexisting target gate", () => {});\n'},
+        )
+
+        assert set(state.test_writer_audit_gate_counts) == {"tests/target.test.ts"}
+        assert len(state.test_writer_audit_gate_counts["tests/target.test.ts"]) == 1
+
+    def test_test_writer_audit_uses_head_baseline_for_newly_reported_existing_file(self, tmp_path: Path):
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        test_file.write_text('test.skip("preexisting project gate", () => {});\n', encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True
+        )
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add preexisting skip"], cwd=tmp_path, check=True, capture_output=True)
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+
+        def test_writer_effect(state: TaskState) -> None:
+            assert "tests/client_main.test.ts" not in state.test_writer_audit_gate_counts
+            test_file.write_text(
+                test_file.read_text(encoding="utf-8") + "test('new behavior', () => {});\n",
+                encoding="utf-8",
+            )
+            state.tests_up_to_date = True
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        stubs["test_writer"].result_data = {"files_written": ["tests/client_main.test.ts"]}
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed
+        assert state.test_execution_gate_records == []
+        assert state.test_errors == []
 
     def test_test_writer_execution_gate_audit_includes_inline_source_tests(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
