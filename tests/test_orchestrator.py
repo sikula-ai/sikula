@@ -1929,6 +1929,62 @@ mod tests {
         assert len(state.test_execution_gate_records) == 1
         assert state.test_errors[0].startswith("TEST EXECUTION GATE AUDIT:")
 
+    def test_test_writer_dot_root_snapshot_omits_unrelated_source_but_keeps_gate_counts(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "node"},
+                "sandbox": {"allowed_test_write_paths": ["."]},
+            },
+        )
+        unrelated = tmp_path / "src" / "unrelated.ts"
+        test_file = tmp_path / "tests" / "existing.test.ts"
+        unrelated.parent.mkdir()
+        test_file.parent.mkdir()
+        unrelated.write_text("export const unrelated = 'do not snapshot';\n", encoding="utf-8")
+        test_file.write_text('test.skip("external service contract", () => {});\n', encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test User", "commit", "-m", "baseline"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        snapshots: list[dict[str, str | None]] = []
+
+        def test_writer_effect(state: TaskState) -> None:
+            snapshot = orch._store.load_text_snapshot("t1", orchestrator_module._TEST_WRITER_AUDIT_SNAPSHOT)
+            assert snapshot is not None
+            snapshots.append(snapshot)
+            test_file.write_text(
+                "\n".join(
+                    [
+                        'test.skip("external service contract", () => {});',
+                        'test.skip("external service contract", () => {});',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            state.tests_up_to_date = True
+            state.files_changed.append("tests/existing.test.ts")
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        stubs["test_writer"].result_data = {"files_written": ["tests/existing.test.ts"]}
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.ts"])
+
+        assert orch._run_test_write_phase(state)
+
+        assert snapshots == [{"src/main.ts": None}]
+        findings = state.test_execution_gate_records[0]["findings"]
+        assert len(findings) == 1
+        assert findings[0]["path"] == "tests/existing.test.ts"
+        assert findings[0]["baseline_count"] == 1
+        assert findings[0]["occurrence"] == 2
+
     def test_resume_recovers_pending_synthetic_harness_and_retries_test_writer(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
             tmp_path,

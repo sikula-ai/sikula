@@ -924,10 +924,10 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
   task baseline, including harnesses assembled across multiple test-writer/fixer passes.
   Those findings are fed back to later test-writer/fixer prompts, surfaced in task
   summaries, and handled with
-  soft recovery: Sikula restores the affected generated test files to the pre-agent
-  snapshot and retries once. If the retry recreates the broad harness, Sikula restores it
-  again, records a `TESTABILITY GAP`, and lets normal validation continue instead of
-  failing solely on the audit.
+  soft recovery: Sikula restores the affected generated test files to the limited
+  pre-agent restore snapshot and retries once. If the retry recreates the broad harness,
+  Sikula restores it again, records a `TESTABILITY GAP`, and lets normal validation
+  continue instead of failing solely on the audit.
   After repeated generated-test fixer passes, Sikula also requires a structured
   `GENERATED TEST RE-TRIAGE` decision before accepting another generated-test edit. If the
   fixer changes generated tests without that block, Sikula restores that pass and retries
@@ -998,8 +998,8 @@ sandbox contracts are documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
   Existing project helper harnesses already present at baseline are not treated as new
   findings, and normal usage of project-standard test infrastructure is not a finding by
   itself. Sikula feeds active findings back into later test-writer/fixer prompts and uses
-  soft recovery: the affected generated test files are restored to the pre-agent snapshot
-  and the agent gets one retry to produce narrower existing-seam coverage or a
+  soft recovery: the affected generated test files are restored to the limited pre-agent
+  restore snapshot and the agent gets one retry to produce narrower existing-seam coverage or a
   `TESTABILITY GAP`. If the retry recreates the broad harness, Sikula restores it again and
   records the gap; these findings do not add `test_errors` or fail the task on their own.
 

@@ -1439,8 +1439,36 @@ class Orchestrator:
             snapshot[relative] = self._read_project_text(relative)
         return snapshot
 
+    def _test_execution_gate_count_snapshot_for_configured_files(self) -> dict[str, dict[str, int]]:
+        return {
+            relative: test_execution_gate_signature_counts(self._read_project_text(relative))
+            for path in self._iter_configured_test_files()
+            for relative in [self._relative_project_path(path)]
+            if relative
+        }
+
     def _test_execution_gate_count_snapshot(self, snapshot: dict[str, str | None]) -> dict[str, dict[str, int]]:
         return {path: test_execution_gate_signature_counts(text) for path, text in snapshot.items()}
+
+    def _test_writer_restore_snapshot(self, state: TaskState, extra_paths=()) -> dict[str, str | None]:
+        snapshot: dict[str, str | None] = {}
+        candidates = [
+            *state.files_changed,
+            *state.test_files_written,
+            *state.test_writer_audit_files_written,
+            *self._dirty_test_audit_paths(),
+            *(str(path) for path in extra_paths),
+        ]
+        for raw_path in candidates:
+            path = _normalize_project_path(str(raw_path))
+            if (
+                path
+                and self._is_configured_test_write_path(path)
+                and _path_looks_like_test_audit_candidate(path)
+                and path not in snapshot
+            ):
+                snapshot[path] = self._read_project_text(path)
+        return snapshot
 
     def _git_baseline_snapshot_for_paths(self, paths) -> dict[str, str | None]:
         snapshot: dict[str, str | None] = {}
@@ -1459,15 +1487,33 @@ class Orchestrator:
         state.test_writer_audit_pending = True
         state.test_writer_audit_agent_completed = False
         state.test_writer_audit_files_written = []
-        state.test_writer_audit_gate_counts = self._test_execution_gate_count_snapshot(before_snapshot)
+        state.test_writer_audit_gate_counts = self._test_execution_gate_count_snapshot_for_configured_files()
         state.tests_up_to_date = False
         self._store.save(state)
 
     def _load_test_writer_audit_snapshot(self, state: TaskState) -> dict[str, str | None] | None:
         return self._store.load_text_snapshot(state.task_id, _TEST_WRITER_AUDIT_SNAPSHOT)
 
+    def _persist_test_writer_audit_restore_baselines(self, state: TaskState, paths) -> dict[str, str | None]:
+        snapshot = self._load_test_writer_audit_snapshot(state) or {}
+        changed = False
+        for raw_path in paths:
+            path = _normalize_project_path(str(raw_path))
+            if (
+                path
+                and self._is_configured_test_write_path(path)
+                and _path_looks_like_test_audit_candidate(path)
+                and path not in snapshot
+            ):
+                snapshot[path] = self._read_git_head_project_text(path)
+                changed = True
+        if changed:
+            self._store.save_text_snapshot(state.task_id, _TEST_WRITER_AUDIT_SNAPSHOT, snapshot)
+        return snapshot
+
     def _record_test_writer_audit_files(self, state: TaskState, files_written) -> list[str]:
         files = list(dict.fromkeys(str(path) for path in files_written if str(path).strip()))
+        self._persist_test_writer_audit_restore_baselines(state, files)
         state.test_writer_audit_agent_completed = True
         state.test_writer_audit_files_written = files
         self._store.save(state)
@@ -1475,17 +1521,40 @@ class Orchestrator:
 
     def _test_files_changed_since_snapshot(self, before_snapshot: dict[str, str | None]) -> list[str]:
         paths = {path for raw_path in before_snapshot for path in [_normalize_project_path(str(raw_path))] if path}
-        paths.update(
-            relative
-            for path in self._iter_configured_test_files()
-            for relative in [self._relative_project_path(path)]
-            if relative
-        )
         changed: list[str] = []
         for path in sorted(paths):
             if before_snapshot.get(path) != self._read_project_text(path):
                 changed.append(path)
         return changed
+
+    def _dirty_test_audit_paths(self) -> list[str]:
+        root = self._config.project_root.resolve()
+        ignored_roots = self._validation_artifact_ignored_roots(root)
+        snapshot = snapshot_validation_dirty_files(root, ignored_roots=ignored_roots)
+        paths = sorted(
+            path
+            for path in snapshot
+            if self._is_configured_test_write_path(path) and _path_looks_like_test_audit_candidate(path)
+        )
+        if paths:
+            return paths
+        return sorted(
+            relative
+            for path in self._iter_configured_test_files()
+            for relative in [self._relative_project_path(path)]
+            if relative
+            and self._is_configured_test_write_path(relative)
+            and _path_looks_like_test_audit_candidate(relative)
+            and self._path_has_pending_changes(relative)
+        )
+
+    def _state_known_test_audit_paths(self, state: TaskState) -> set[str]:
+        return {
+            path
+            for raw_path in [*state.files_changed, *state.test_files_written, *state.test_writer_audit_files_written]
+            for path in [_normalize_project_path(str(raw_path))]
+            if path and self._is_configured_test_write_path(path) and _path_looks_like_test_audit_candidate(path)
+        }
 
     def _pending_test_writer_audit_files(self, state: TaskState) -> list[str]:
         candidates = state.test_writer_audit_files_written
@@ -1803,13 +1872,18 @@ class Orchestrator:
         state: TaskState,
         before_snapshot: dict[str, str | None],
     ) -> tuple[list[str], list[str]]:
-        paths = self._test_files_changed_since_snapshot(before_snapshot)
+        restore_snapshot = dict(before_snapshot)
+        known_state_paths = self._state_known_test_audit_paths(state)
+        for path in self._dirty_test_audit_paths():
+            if path not in restore_snapshot and path not in known_state_paths:
+                restore_snapshot[path] = self._read_git_head_project_text(path)
+        paths = self._test_files_changed_since_snapshot(restore_snapshot)
         if not paths:
             return [], []
         restored, errors = self._restore_test_file_paths_from_snapshot(
             state,
             paths=paths,
-            before_snapshot=before_snapshot,
+            before_snapshot=restore_snapshot,
         )
         if errors:
             state.record(
@@ -2430,13 +2504,18 @@ class Orchestrator:
                 self._restore_interrupted_test_writer_outputs(state, test_gate_before)
                 if state.failed:
                     return False
-                state.test_writer_audit_gate_counts = self._test_execution_gate_count_snapshot(test_gate_before)
+                if not state.test_writer_audit_gate_counts:
+                    state.test_writer_audit_gate_counts = (
+                        self._test_execution_gate_count_snapshot_for_configured_files()
+                    )
+                before_gate_counts = dict(state.test_writer_audit_gate_counts)
                 state.test_writer_audit_files_written = []
                 state.tests_up_to_date = False
                 self._store.save(state)
             else:
-                test_gate_before = self._test_execution_gate_snapshot()
+                test_gate_before = self._test_writer_restore_snapshot(state)
                 self._begin_test_writer_audit_pending(state, test_gate_before)
+                before_gate_counts = dict(state.test_writer_audit_gate_counts)
             result = self._run_agent("test_writer", state)
             if state.failed or self._abort_on_failed_agent_result(state, "test_writer", result):
                 return False
@@ -2444,6 +2523,7 @@ class Orchestrator:
                 state,
                 (result.data or {}).get("files_written", []),
             )
+            test_gate_before = self._load_test_writer_audit_snapshot(state) or test_gate_before
         gate_findings = self._audit_test_execution_gates_after_agent(
             state,
             source="test_writer",
@@ -2483,7 +2563,7 @@ class Orchestrator:
                     log.info("Retrying test writer agent after pending synthetic test harness recovery")
                 else:
                     log.info("Retrying test writer agent after synthetic test harness recovery")
-                retry_test_gate_before = self._test_execution_gate_snapshot()
+                retry_test_gate_before = self._test_writer_restore_snapshot(state, extra_paths=files_written)
                 self._begin_test_writer_audit_pending(state, retry_test_gate_before)
                 result = self._run_agent("test_writer", state)
                 if state.failed or self._abort_on_failed_agent_result(state, "test_writer", result):
@@ -2492,12 +2572,14 @@ class Orchestrator:
                     state,
                     (result.data or {}).get("files_written", []),
                 )
+                retry_test_gate_before = self._load_test_writer_audit_snapshot(state) or retry_test_gate_before
                 gate_findings.extend(
                     self._audit_test_execution_gates_after_agent(
                         state,
                         source="test_writer",
                         files_written=retry_files_written,
                         before_snapshot=retry_test_gate_before,
+                        before_gate_counts=state.test_writer_audit_gate_counts,
                     )
                 )
                 retry_synthetic_findings = self._audit_synthetic_test_harnesses_after_agent(

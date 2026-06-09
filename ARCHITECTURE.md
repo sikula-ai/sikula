@@ -896,16 +896,20 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
     runnable portion while the out-of-surface behaviour remains excluded from the prompt
     coverage target.
     Before running the test writer, Sikula marks a pending post-agent audit, stores
-    per-file execution-gate signature counts in task state, and stores a temporary
-    pre-agent text snapshot in the internal state store outside the task JSON. That snapshot
-    is used only to roll back the interrupted test-writer pass without discarding valid
-    uncommitted test changes from earlier task steps, and it is deleted when the pending
-    audit is cleared. If the process is interrupted after the agent saves
+    per-file execution-gate signature counts in task state, and stores a temporary limited
+    restore snapshot in the internal state store outside the task JSON. The signature counts
+    can cover all configured test/inline-test candidates, but the text snapshot is limited
+    to task-known test artifacts and later to files reported by the test writer; it is not a
+    full source snapshot of broad roots such as `"."`. That snapshot is used only to roll
+    back the interrupted test-writer pass without discarding valid uncommitted test changes
+    from earlier task steps, and it is deleted when the pending audit is cleared. If the
+    process is interrupted after the agent saves
     `tests_up_to_date` but before deterministic audits finish, `resume` completes the
     pending audit instead of skipping test write entirely. If resume sees that the pending
     marker was saved before the test-writer invocation completed, it restores any partial
-    test-writer output to the pre-agent snapshot and reruns the test writer instead of
-    treating the marker as audit-only.
+    unknown dirty test output to the git baseline and task-known test output to the limited
+    restore snapshot, then reruns the test writer instead of treating the marker as
+    audit-only.
     Recovery restores reject symlinked restore paths instead of following them, so rollback
     writes cannot escape the project sandbox boundary.
     After the test writer returns, Sikula audits only test files and inline-test source
@@ -945,9 +949,9 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
   transient resume-safe post-agent audit state; counts are sanitized execution-gate
   signatures, not source excerpts. `test_writer_audit_agent_completed` distinguishes
   "agent finished, audit pending" from "pending marker saved before the agent finished" so
-  resume can rerun the test writer when needed. A temporary pre-agent text snapshot is
-  stored separately in the internal state store and removed after pending audit recovery
-  completes.
+  resume can rerun the test writer when needed. A temporary limited restore snapshot for
+  task-known/reported test files is stored separately in the internal state store and removed
+  after pending audit recovery completes.
 - `state.files_changed` — test file paths appended (de-duplicated)
 - `state.test_files_written` — same paths also appended here (de-duplicated); used by ReviewerAgent to exempt these files from scope violation checks. In `sikula review` mode, the files are still reviewed for correctness and relevance.
 - `state.test_write_records` — one record appended per invocation with `step`, `build_iteration`, `scope`, `test_surface_policy`, `test_writer_prompt`, `test_writer_output` (`None` on exception), `files_written`, and `timestamp`
@@ -1198,7 +1202,7 @@ Sikula processes at once is still unsupported.
 | `test_writer_audit_pending` | `bool` | Orchestrator | Resume-safety marker set before TestWriterAgent runs and cleared after post-agent execution-gate and synthetic-harness audits finish. Allows `resume` to complete audits even if `tests_up_to_date` was saved by the agent before the audit completed. |
 | `test_writer_audit_agent_completed` | `bool` | Orchestrator | Set only after TestWriterAgent returns and its reported `files_written` are saved. If `resume` finds `test_writer_audit_pending` with this flag false, it reruns TestWriterAgent instead of treating the marker as audit-only. |
 | `test_writer_audit_files_written` | `list[str]` | Orchestrator | Files from the pending test-writer invocation that still need post-agent audit. If an interruption happens before this list is saved, the orchestrator falls back to `test_files_written` or the current configured test-file candidates rather than reading observability records for control flow. |
-| `test_writer_audit_gate_counts` | `dict[str, dict[str, int]]` | Orchestrator | Sanitized per-file execution-gate signature counts captured before TestWriterAgent runs. Used only to finish pending execution-gate audits on resume without exposing raw source snapshots in task state. The matching pre-agent text snapshot is stored separately as a temporary internal state-store blob for recovery and removed when the pending audit is cleared. |
+| `test_writer_audit_gate_counts` | `dict[str, dict[str, int]]` | Orchestrator | Sanitized per-file execution-gate signature counts captured before TestWriterAgent runs. Used only to finish pending execution-gate audits on resume without exposing raw source snapshots in task state. A matching limited text restore snapshot for task-known/reported test files is stored separately as a temporary internal state-store blob for recovery and removed when the pending audit is cleared; broad roots such as `"."` do not cause Sikula to persist a full source snapshot. |
 | `fixer_changed_code` | `bool` | Orchestrator | Set True when FixerAgent writes files; used on resume to continue deterministic build/test/check validation before stale semantic gates rerun; cleared after the following compile check succeeds |
 | `tests_up_to_date` | `bool` | TestWriterAgent / Orchestrator | Set True after test write; reset to False when Fixer changes production-impacting files; preserved for test-only fixer changes on recognized test artifact paths so validation can rerun without redundant test-writer passes while security review still reruns for the executable test changes. A pending test-writer audit takes precedence over this flag on resume. |
 | `worktree_path` | `str \| None` | `cmd_run()` / `cmd_review()` in `sikula.py` | Absolute path of the effective project root within the worktree — equals `worktree_base` when `root_path` is itself a git root, or `worktree_base/<rel>` for subdirectory projects; used as `cwd` by all agents; `None` for `--no-isolate` runs |
