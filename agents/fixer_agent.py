@@ -234,6 +234,11 @@ GENERATED TEST RE-TRIAGE RECOVERY:
 - Sikula restored all file writes from that pass before this retry
 - Retry from the current working tree and do not keep patching the generated test harness
   one assertion or fake subsystem at a time
+- If the root cause is the same mechanical error repeated within the failing generated
+  test file(s) (wrong API, wrong import, wrong syntax form), fix every occurrence of
+  that same pattern needed for the current validation failure in one pass. Do not rewrite
+  unrelated assertions, broaden or narrow coverage, or clean up unrelated code just
+  because it is in the same file.
 - If you change generated tests again, include:
   GENERATED TEST RE-TRIAGE:
   strategy: replace_with_narrower_seam_test | remove_malformed_generated_test | report_testability_gap | production_defect

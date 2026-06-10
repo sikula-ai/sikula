@@ -652,6 +652,9 @@ class TestFixerAgentWritePaths:
         assert (tmp_project / "tests" / "LoginTest.py").read_text() == "assert True\n"
         assert len(llm.agent_calls) == 2
         assert "GENERATED TEST RE-TRIAGE RECOVERY" in llm.agent_calls[1]
+        assert "same mechanical error repeated within the failing generated" in llm.agent_calls[1]
+        assert "unrelated assertions" in llm.agent_calls[1]
+        assert "broaden or narrow coverage" in llm.agent_calls[1]
         violation = state.fix_cycle_records[0]["generated_test_retriage_violation"]
         assert violation["generated_test_files"] == ["tests/LoginTest.py"]
         assert violation["restored_files"] == ["tests/LoginTest.py"]
