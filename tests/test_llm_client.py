@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import signal
 import subprocess
 import threading
@@ -19,6 +20,7 @@ from core.llm_client import (
     LLMAuthError,
     LLMConfig,
     LLMConfigurationError,
+    LLMProviderError,
     LLMQuotaExceeded,
     LLMTransientError,
     LLMTimeoutError,
@@ -255,6 +257,51 @@ class TestOpencodeParsText:
     def test_stream_error_returns_provider_error(self):
         error = _opencode_stream_error(self._line({"type": "error", "error": {"data": {"message": "invalid model"}}}))
         assert isinstance(error, LLMConfigurationError)
+
+    @pytest.mark.parametrize(
+        ("event", "expected_error"),
+        [
+            ({"type": "error", "error": {"data": {"message": "not authenticated"}}}, LLMAuthError),
+            ({"type": "error", "error": {"message": "not authenticated"}}, LLMAuthError),
+            ({"type": "error", "error": {"data": {"message": "quota exceeded"}}}, LLMQuotaExceeded),
+            ({"type": "error", "error": {"message": "quota exceeded"}}, LLMQuotaExceeded),
+            ({"type": "error", "message": "quota exceeded"}, LLMQuotaExceeded),
+            ({"type": "error", "error": {"data": {"message": "invalid model"}}}, LLMConfigurationError),
+            ({"type": "error", "error": {"message": "invalid model"}}, LLMConfigurationError),
+            ({"type": "error", "error": {"data": {"type": "usage_limit_reached"}}}, LLMQuotaExceeded),
+            ({"type": "error", "error": {"data": {"code": "unsupported_value"}}}, LLMConfigurationError),
+        ],
+    )
+    def test_stream_error_classifies_supported_message_shapes(
+        self,
+        event: dict,
+        expected_error: type[LLMProviderError],
+    ):
+        error = _opencode_stream_error(self._line(event))
+        assert isinstance(error, expected_error)
+
+        with pytest.raises(expected_error):
+            _opencode_parse_text(self._line(event))
+
+    def test_stream_error_uses_credit_headers_without_exposing_raw_payload(self):
+        event = {
+            "type": "error",
+            "error": {
+                "data": {
+                    "message": "SECRET_PROVIDER_MESSAGE",
+                    "headers": {
+                        "x-codex-credits-balance": "0",
+                        "x-codex-credits-has-credits": "False",
+                    },
+                }
+            },
+        }
+
+        error = _opencode_stream_error(self._line(event))
+
+        assert isinstance(error, LLMQuotaExceeded)
+        assert "quota exceeded" in str(error)
+        assert "SECRET_PROVIDER_MESSAGE" not in str(error)
 
 
 class TestStreamingProcessHelpers:
@@ -532,7 +579,45 @@ class TestOpenCodeClientCommands:
         cmd = mock_run.call_args.args[0]
         assert cmd[:2] == ["opencode", "run"]
         assert "system\n\nuser" not in cmd
+        assert cmd[cmd.index("--title") + 1] == "sikula-generate"
+        assert "--print-logs" in cmd
+        assert cmd[cmd.index("--log-level") + 1] == "ERROR"
         assert mock_run.call_args.kwargs["input"] == "system\n\nuser"
+
+    def test_generate_uses_sanitized_session_title_when_set(self):
+        client = OpenCodeClient(
+            LLMConfig(
+                provider="opencode",
+                model="openai/gpt-5.3-codex",
+                session_title="sikula planner abc123 JSON Numeric Fixtures!",
+            )
+        )
+        with patch("core.llm_client.subprocess.run", return_value=self._run_result()) as mock_run:
+            assert client.generate("system", "user") == "ok"
+
+        cmd = mock_run.call_args.args[0]
+        assert cmd[cmd.index("--title") + 1] == "sikula-planner-abc123-JSON-Numeric-Fixtures"
+
+    def test_generate_warns_for_successful_run_with_provider_log_diagnostic(self, caplog):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = self._run_result()
+        result.stderr = (
+            'ERROR service=llm error={"error":{"message":"Unsupported value: '
+            "'SECRET_PROMPT_PAYLOAD' is not supported with the 'gpt-5.3-codex-spark' model\","
+            '"type":"invalid_request_error","param":"reasoning.effort","code":"unsupported_value"}} stream error'
+        )
+
+        with (
+            caplog.at_level(logging.WARNING, logger="core.llm_client"),
+            patch("core.llm_client.subprocess.run", return_value=result),
+        ):
+            assert client.generate("system", "user") == "ok"
+
+        assert "opencode reported provider diagnostic" in caplog.text
+        assert "configuration error" in caplog.text
+        assert "SECRET_PROMPT_PAYLOAD" not in caplog.text
+        assert "reasoning.effort" not in caplog.text
+        assert "unsupported_value" not in caplog.text
 
     def test_run_readonly_agent_passes_prompt_via_stdin(self, tmp_path: Path):
         client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
@@ -544,6 +629,9 @@ class TestOpenCodeClientCommands:
         assert "prompt" not in cmd
         assert "--agent" in cmd
         assert cmd[cmd.index("--dir") + 1] == str(tmp_path)
+        assert cmd[cmd.index("--title") + 1] == "sikula-readonly"
+        assert "--print-logs" in cmd
+        assert cmd[cmd.index("--log-level") + 1] == "ERROR"
         assert mock_run.call_args.kwargs["input"] == "prompt"
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
         assert "OPENCODE_CONFIG_DIR" in mock_run.call_args.kwargs["env"]
@@ -561,6 +649,7 @@ class TestOpenCodeClientCommands:
         assert "prompt" not in cmd
         assert "--agent" in cmd
         assert cmd[cmd.index("--dir") + 1] == str(tmp_path)
+        assert cmd[cmd.index("--title") + 1] == "sikula-implementer"
         assert mock_run.call_args.kwargs["prompt"] == "prompt"
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
         assert "OPENCODE_CONFIG_DIR" in mock_run.call_args.kwargs["env"]
@@ -568,6 +657,326 @@ class TestOpenCodeClientCommands:
         assert cmd[cmd.index("--log-level") + 1] == "ERROR"
         assert changed == []
         assert output == "ok"
+
+    def test_run_agent_no_text_without_changes_raises_with_structured_diagnostic(self, tmp_path: Path):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=0,
+            stdout=self._line({"type": "message", "sessionID": "ses_123"}),
+            stderr=(
+                'ERROR service=llm error={"error":{"message":"Unsupported value",'
+                '"type":"invalid_request_error","param":"reasoning.effort","code":"unsupported_value"}}'
+            ),
+        )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client._run_opencode_streaming", return_value=result) as mock_run,
+            pytest.raises(LLMConfigurationError) as exc_info,
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        message = str(exc_info.value)
+        assert "returned no text output" in message
+        assert "stderr: opencode provider diagnostic: configuration error" in message
+        assert "unsupported_value" not in message
+        assert "reasoning.effort" not in message
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_run_agent_no_text_without_changes_summarizes_rejected_tool_call(self, tmp_path: Path):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=0,
+            stdout=self._line(
+                {
+                    "type": "tool_use",
+                    "part": {
+                        "type": "tool",
+                        "tool": "grep",
+                        "state": {
+                            "status": "error",
+                            "input": {"path": "/repo/.sikula/worktrees/task", "pattern": "FixtureInputMap"},
+                            "error": "The user rejected permission to use this specific tool call.",
+                        },
+                    },
+                }
+            ),
+            stderr=(
+                "\x1b[93m\x1b[1m! \x1b[0mpermission requested: "
+                "external_directory (/repo/.sikula/worktrees/*); auto-rejecting"
+            ),
+        )
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client._run_opencode_streaming", return_value=result),
+            pytest.raises(LLMTransientError) as exc_info,
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        message = str(exc_info.value)
+        assert "returned no text output" in message
+        assert "safe diagnostic" in message
+        assert "permission requested" not in message
+        assert "external_directory" not in message
+        assert "grep failed: permission rejected" in message
+        assert "The user rejected permission to use this specific tool call." not in message
+        assert "/repo/.sikula/worktrees/task" not in message
+        assert "FixtureInputMap" not in message
+        assert '"type": "tool_use"' not in message
+
+    def test_run_agent_no_text_with_changes_returns_diagnostic_for_audit(self, tmp_path: Path):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=0,
+            stdout=self._line({"type": "message", "sessionID": "ses_123"}),
+            stderr="provider returned no content",
+        )
+
+        snapshots = [{"src/main.py": "before"}, {"src/main.py": "after"}]
+        with (
+            patch("core.llm_client._git_snapshot", side_effect=snapshots),
+            patch("core.llm_client._run_opencode_streaming", return_value=result),
+        ):
+            changed, output = client.run_agent("prompt", tmp_path)
+
+        assert changed == ["src/main.py"]
+        assert "returned no text output" in output
+        assert "safe diagnostic" in output
+        assert "provider returned no content" not in output
+
+    def test_run_agent_no_text_does_not_persist_raw_stdout_events(self, tmp_path: Path):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=0,
+            stdout=self._line(
+                {
+                    "type": "tool_use",
+                    "part": {
+                        "type": "tool",
+                        "tool": "read",
+                        "state": {
+                            "status": "completed",
+                            "input": {"path": "src/secret.py"},
+                            "output": "SOURCE_CONTENT_SHOULD_NOT_BE_PERSISTED",
+                        },
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client._run_opencode_streaming", return_value=result),
+            pytest.raises(LLMTransientError) as exc_info,
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        message = str(exc_info.value)
+        assert "returned no text output" in message
+        assert "SOURCE_CONTENT_SHOULD_NOT_BE_PERSISTED" not in message
+        assert "src/secret.py" not in message
+        assert '"type": "tool_use"' not in message
+
+    def test_run_agent_no_text_redacts_arbitrary_tool_error(self, tmp_path: Path):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=0,
+            stdout=self._line(
+                {
+                    "type": "tool_use",
+                    "part": {
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {
+                            "status": "error",
+                            "input": {"path": "/repo/private/source.py"},
+                            "error": "stderr contained SECRET_PROMPT_PAYLOAD and source excerpt",
+                        },
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client._run_opencode_streaming", return_value=result),
+            pytest.raises(LLMTransientError) as exc_info,
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        message = str(exc_info.value)
+        assert "bash failed" in message
+        assert "SECRET_PROMPT_PAYLOAD" not in message
+        assert "/repo/private/source.py" not in message
+        assert "source excerpt" not in message
+
+    def test_generate_no_text_redacts_unstructured_stderr_diagnostic(self):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=0,
+            stdout=self._line({"type": "message", "sessionID": "ses_123"}),
+            stderr="\x1b[93mwarning\x1b[0m provider returned no content",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", return_value=result),
+            pytest.raises(LLMTransientError) as exc_info,
+        ):
+            client.generate("system", "user")
+
+        message = str(exc_info.value)
+        assert "opencode CLI error: returned no text output" in message
+        assert "stderr:" in message
+        assert "safe diagnostic" in message
+        assert "warning provider returned no content" not in message
+
+    def test_generate_no_text_classifies_fatal_provider_diagnostic(self):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=0,
+            stdout=self._line({"type": "message", "sessionID": "ses_123"}),
+            stderr=(
+                'ERROR service=llm error={"error":{"message":"Unsupported value",'
+                '"type":"invalid_request_error","param":"reasoning.effort","code":"unsupported_value"}}'
+            ),
+        )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMConfigurationError) as exc_info,
+        ):
+            client.generate("system", "user")
+
+        message = str(exc_info.value)
+        assert "opencode CLI error: returned no text output" in message
+        assert "stderr: opencode provider diagnostic: configuration error" in message
+        assert "unsupported_value" not in message
+        assert "reasoning.effort" not in message
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_generate_no_text_redacts_structured_stderr_provider_payload(self):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=0,
+            stdout=self._line({"type": "message", "sessionID": "ses_123"}),
+            stderr=(
+                'ERROR service=llm responseBody={"error":{"message":"Unsupported value: '
+                'SECRET_PROMPT_PAYLOAD",'
+                '"type":"invalid_request_error","param":"reasoning.effort","code":"unsupported_value"}}'
+            ),
+        )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMConfigurationError) as exc_info,
+        ):
+            client.generate("system", "user")
+
+        message = str(exc_info.value)
+        assert "opencode CLI error: returned no text output" in message
+        assert "stderr: opencode provider diagnostic: configuration error" in message
+        assert "SECRET_PROMPT_PAYLOAD" not in message
+        assert "responseBody" not in message
+        assert "reasoning.effort" not in message
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_generate_no_text_classifies_structured_credit_headers_as_fatal(self):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=0,
+            stdout=self._line({"type": "message", "sessionID": "ses_123"}),
+            stderr=(
+                'ERROR service=llm responseHeaders={"x-codex-credits-balance":"0",'
+                '"x-codex-credits-has-credits":"False"}'
+            ),
+        )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMQuotaExceeded) as exc_info,
+        ):
+            client.generate("system", "user")
+
+        message = str(exc_info.value)
+        assert "opencode CLI error: returned no text output" in message
+        assert "stderr: opencode provider diagnostic: quota exceeded" in message
+        assert "responseHeaders" not in message
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_generate_no_text_scans_later_structured_stderr_for_fatal_diagnostic(self):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=0,
+            stdout=self._line({"type": "message", "sessionID": "ses_123"}),
+            stderr=(
+                'ERROR service=llm responseHeaders={"x-request-id":"req_123"}\n'
+                'ERROR service=llm responseHeaders={"x-codex-credits-balance":"0",'
+                '"x-codex-credits-has-credits":"False"}'
+            ),
+        )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMQuotaExceeded) as exc_info,
+        ):
+            client.generate("system", "user")
+
+        message = str(exc_info.value)
+        assert "quota exceeded" in message
+        assert "responseHeaders" not in message
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_readonly_no_text_summarizes_rejected_tool_call(self, tmp_path: Path):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(
+            returncode=0,
+            stdout=self._line(
+                {
+                    "type": "tool_use",
+                    "part": {
+                        "type": "tool",
+                        "tool": "grep",
+                        "state": {
+                            "status": "error",
+                            "input": {"path": "/repo/.sikula/worktrees/task"},
+                            "error": "The user rejected permission to use this specific tool call.",
+                        },
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", return_value=result),
+            pytest.raises(LLMTransientError) as exc_info,
+        ):
+            client.run_readonly_agent("prompt", tmp_path)
+
+        message = str(exc_info.value)
+        assert "opencode agent error: returned no text output" in message
+        assert "grep failed: permission rejected" in message
+        assert "The user rejected permission to use this specific tool call." not in message
+        assert "/repo/.sikula/worktrees/task" not in message
+        assert '"type": "tool_use"' not in message
 
     def test_readonly_failure_reports_stdout_json_error(self, tmp_path: Path):
         client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
@@ -680,14 +1089,73 @@ class TestOpenCodeClientCommands:
 
     def test_generate_invalid_model_is_fatal_and_not_retried(self):
         client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/nope"))
-        result = MagicMock(returncode=1, stdout="", stderr="invalid model: openai/nope")
+        result = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr=(
+                'ERROR service=llm responseBody={"error":{"message":"Invalid model SECRET_PROMPT_PAYLOAD",'
+                '"type":"invalid_request_error","code":"unsupported_value"}}'
+            ),
+        )
         with (
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
-            pytest.raises(LLMConfigurationError, match="invalid model"),
+            pytest.raises(LLMConfigurationError) as exc_info,
         ):
             client.generate("system", "user")
 
+        message = str(exc_info.value)
+        assert "opencode provider diagnostic: configuration error" in message
+        assert "SECRET_PROMPT_PAYLOAD" not in message
+        assert "responseBody" not in message
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_generate_nonzero_unstructured_stderr_is_redacted_before_retry(self):
+        observer = MagicMock()
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex", retry_observer=observer))
+        result = MagicMock(returncode=1, stdout="", stderr="temporary upstream error SECRET_PROMPT_PAYLOAD")
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMTransientError) as exc_info,
+        ):
+            client.generate("system", "user")
+
+        message = str(exc_info.value)
+        assert "opencode CLI error:" in message
+        assert "safe diagnostic" in message
+        assert "SECRET_PROMPT_PAYLOAD" not in message
+        assert mock_run.call_count == 4
+        assert observer.call_count == 3
+        assert all("SECRET_PROMPT_PAYLOAD" not in call.args[0]["error"] for call in observer.call_args_list)
+
+    @pytest.mark.parametrize(
+        ("stderr", "expected_error", "expected_label"),
+        [
+            ("invalid model: SECRET_MODEL_NAME", LLMConfigurationError, "configuration error"),
+            ("not authenticated with SECRET_TOKEN", LLMAuthError, "authentication failed"),
+            ("usage limit has been reached for SECRET_ACCOUNT", LLMQuotaExceeded, "quota exceeded"),
+        ],
+    )
+    def test_generate_nonzero_plain_stderr_fatal_markers_are_redacted_and_not_retried(
+        self,
+        stderr: str,
+        expected_error: type[LLMProviderError],
+        expected_label: str,
+    ):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        result = MagicMock(returncode=1, stdout="", stderr=stderr)
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(expected_error) as exc_info,
+        ):
+            client.generate("system", "user")
+
+        message = str(exc_info.value)
+        assert f"opencode provider diagnostic: {expected_label}" in message
+        assert "SECRET" not in message
         assert mock_run.call_count == 1
         sleep.assert_not_called()
 
@@ -823,7 +1291,7 @@ class TestOpenCodeClientCommands:
 
         with (
             patch("core.llm_client.subprocess.Popen", side_effect=fake_popen),
-            pytest.raises(LLMQuotaExceeded, match="credits-balance"),
+            pytest.raises(LLMQuotaExceeded, match="quota exceeded"),
         ):
             _run_opencode_streaming(
                 ["opencode", "run", "--format", "json"],
@@ -871,7 +1339,7 @@ class TestOpenCodeClientCommands:
 
         with (
             patch("core.llm_client.subprocess.Popen", side_effect=fake_popen),
-            pytest.raises(LLMQuotaExceeded, match="credits-balance"),
+            pytest.raises(LLMQuotaExceeded, match="quota exceeded"),
         ):
             _run_opencode_streaming(
                 ["opencode", "run", "--format", "json"],
@@ -917,7 +1385,7 @@ class TestOpenCodeClientCommands:
 
         with (
             patch("core.llm_client.subprocess.Popen", side_effect=fake_popen),
-            pytest.raises(LLMQuotaExceeded, match="credits-balance"),
+            pytest.raises(LLMQuotaExceeded, match="quota exceeded"),
         ):
             _run_opencode_streaming(
                 ["opencode", "run", "--format", "json"],
@@ -993,7 +1461,7 @@ class TestOpenCodeClientCommands:
                 None,
                 _opencode_log_error,
                 LLMAuthError,
-                "not authenticated",
+                "authentication failed",
             ),
         ],
     )

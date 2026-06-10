@@ -358,11 +358,14 @@ class TestFixerAgentFixCycleRecord:
 
     def test_no_changes_still_creates_record(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = []
+        stub_llm.agent_output = "provider returned no text output"
         state = _make_state()
         state.errors = ["compile error"]
-        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
         assert len(state.fix_cycle_records) == 1
         assert state.fix_cycle_records[0]["files_written"] == []
+        assert state.fix_cycle_records[0]["fixer_output"] == "provider returned no text output"
+        assert result.message == "Agent made no file changes"
 
     def test_record_stores_step_default(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["src/Login.kt"]

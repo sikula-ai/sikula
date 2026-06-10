@@ -62,8 +62,9 @@ class TestImplementerAgentSuccess:
         stub_llm.agent_result = []
         stub_llm.agent_output = "I found nothing to change."
         state = _make_state()
-        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
         assert state.implement_cycle_records[0]["implementer_output"] == "I found nothing to change."
+        assert result.message == "Agent made no file changes"
 
     def test_agent_output_accumulated_across_calls(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["src/A.kt"]

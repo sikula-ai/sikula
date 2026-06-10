@@ -148,6 +148,16 @@ def _phase_scope_label(state: TaskState) -> str:
     return "final full-task " if state.active_scope == _SCOPE_FINAL_FULL_TASK else ""
 
 
+def _agent_session_title(name: str, state: TaskState) -> str:
+    task_part = state.task_id[:8]
+    parts = ["sikula", name.replace("_", "-"), task_part]
+    if state.plan and 0 <= state.current_step < len(state.plan):
+        parts.append(f"step-{state.current_step + 1}")
+    if state.active_scope == _SCOPE_FINAL_FULL_TASK:
+        parts.append("final")
+    return "-".join(part for part in parts if part)[:80].strip("-")
+
+
 def _build_loop_key(state: TaskState) -> str:
     if state.active_scope == _SCOPE_FINAL_FULL_TASK or state.plan_completed:
         return _SCOPE_FINAL_FULL_TASK
@@ -2449,6 +2459,8 @@ class Orchestrator:
         log.info(f"Running {name} agent...")
         t0 = time.perf_counter()
         hist_len = len(state.history)
+        set_session_title = getattr(getattr(agent, "llm", None), "set_session_title", None)
+        previous_title = set_session_title(_agent_session_title(name, state)) if callable(set_session_title) else None
         try:
             with self._active_operation(
                 state,
@@ -2465,6 +2477,9 @@ class Orchestrator:
             state.failed = True
             self._store.save(state)
             return AgentResult(success=False, message=str(exc))
+        finally:
+            if callable(set_session_title):
+                set_session_title(previous_title)
         elapsed_s = time.perf_counter() - t0
         if len(state.history) > hist_len:
             state.history[-1]["elapsed_s"] = round(elapsed_s, 1)
