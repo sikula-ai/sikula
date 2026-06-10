@@ -391,6 +391,15 @@ cmd_review()
         files_changed         = <list of changed files>
 ```
 
+After state creation, `cmd_review()` asks a read-only enrichment agent to inspect the
+review description for local filenames such as screenshots, mockups, specs, PDFs, or
+spreadsheets. Found files are appended to `state.implementation_prompt` under
+`Files referenced in the task` so the reviewer, security reviewer, and `--fix` agents
+share the same PR context. The enrichment prompt uses the explicit
+`NO_REFERENCED_FILES` sentinel for the normal "nothing to inline" case; Sikula converts
+that sentinel to no extra context and leaves `implementation_prompt` as the original
+description. Enrichment failures are non-fatal and only skip this optional context.
+
 **Report-only mode (default — no `--fix`):**
 
 Orchestrator is **not** used. Agents are instantiated and called directly.

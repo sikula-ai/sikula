@@ -352,6 +352,9 @@ def _worktree_error_message(branch: str, stderr: str) -> str:
     return f"Failed to create worktree for branch '{branch}': {stderr}"
 
 
+_NO_REFERENCED_FILES_SENTINEL = "NO_REFERENCED_FILES"
+
+
 _REFERENCED_FILES_PROMPT = """\
 The task description below may reference files by name (images, mockups, PDFs, \
 spreadsheets, specs, or any other attachment). For each file mentioned by name:
@@ -360,7 +363,8 @@ spreadsheets, specs, or any other attachment). For each file mentioned by name:
 
 Return the content of each file found, labelled with its path. \
 If no files are referenced by name, or none can be found after searching, \
-return an empty response.
+return exactly:
+NO_REFERENCED_FILES
 
 Task description:
 {task_description}
@@ -373,8 +377,10 @@ def _enrich_prompt_with_referenced_files(task_description: str, llm_client, proj
 
     prompt = AGENT_SECURITY_PREFIX + _REFERENCED_FILES_PROMPT.format(task_description=task_description)
     try:
-        result = llm_client.run_readonly_agent(prompt, cwd=project_root)
-        return result.strip()
+        result = llm_client.run_readonly_agent(prompt, cwd=project_root).strip()
+        if result == _NO_REFERENCED_FILES_SENTINEL:
+            return ""
+        return result
     except Exception as e:
         log.warning("Referenced file enrichment skipped: %s", e)
         return ""
