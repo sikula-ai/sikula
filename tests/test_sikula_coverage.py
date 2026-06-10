@@ -730,6 +730,61 @@ class TestTaskAuditReport:
         assert "test: tests/login_test.py:12: AssertionError: expected login" in out
         assert _task_failed_issues(state)
 
+    def test_failed_report_ignores_recovered_validation_records(self, capsys):
+        from core.state import TaskState
+
+        state = TaskState(task_id="t1", task_description="task")
+        state.failed = True
+        state.build_status = "success"
+        state.test_status = "success"
+        state.check_status = "success"
+        state.validation_cycle_records.append(
+            {
+                "phase": "test",
+                "status": "failed",
+                "diagnostic_summary": ["tests/login_test.py:12: AssertionError: expected login"],
+            }
+        )
+        state.validation_cycle_records.append({"phase": "test", "status": "success"})
+
+        warning_count = _print_task_audit_report(state)
+
+        out = capsys.readouterr().out
+        assert warning_count == 0
+        assert "Failed issues:" not in out
+        assert "tests/login_test.py" not in out
+        assert _task_failed_issues(state) == []
+
+    def test_failed_report_uses_latest_active_validation_records(self, capsys):
+        from core.state import TaskState
+
+        state = TaskState(task_id="t1", task_description="task")
+        state.failed = True
+        state.test_status = "failed"
+        state.validation_cycle_records.extend(
+            [
+                {
+                    "phase": "test",
+                    "status": "failed",
+                    "diagnostic_summary": ["tests/old_test.py:12: old failure"],
+                },
+                {"phase": "test", "status": "success"},
+                {
+                    "phase": "test",
+                    "status": "failed",
+                    "diagnostic_summary": ["tests/new_test.py:44: current failure"],
+                },
+            ]
+        )
+
+        warning_count = _print_task_audit_report(state)
+
+        out = capsys.readouterr().out
+        assert warning_count == 0
+        assert "Failed issues:" in out
+        assert "tests/new_test.py:44: current failure" in out
+        assert "tests/old_test.py" not in out
+
     def test_testability_gap_samples_are_deduplicated(self, capsys):
         from core.state import TaskState
 

@@ -864,6 +864,37 @@ def _validation_failure_summary(records: list[dict]) -> str | None:
     return ", ".join(parts)
 
 
+def _current_failed_validation_records(state) -> list[dict]:
+    active_phases = {
+        phase
+        for phase, status in (
+            ("build", getattr(state, "build_status", None)),
+            ("test", getattr(state, "test_status", None)),
+            ("check", getattr(state, "check_status", None)),
+        )
+        if status == "failed"
+    }
+    if not active_phases:
+        return []
+
+    latest_by_key: dict[tuple[str, str], tuple[int, dict]] = {}
+    for index, record in enumerate(getattr(state, "validation_cycle_records", [])):
+        phase = str(record.get("phase") or "")
+        if phase not in active_phases:
+            continue
+        status = record.get("status")
+        if status not in {"failed", "success", "skipped"}:
+            continue
+        check_name = str(record.get("check_name") or "") if phase == "check" else ""
+        latest_by_key[(phase, check_name)] = (index, record)
+
+    return [
+        record
+        for _, record in sorted(latest_by_key.values(), key=lambda item: item[0])
+        if record.get("status") == "failed"
+    ]
+
+
 def _validation_failure_diagnostics(records: list[dict], limit: int = _RECOVERED_DIAGNOSTIC_LIMIT) -> list[str]:
     failed_records = [record for record in records if record.get("status") == "failed"]
     label_counts: dict[str, int] = {}
@@ -1117,7 +1148,8 @@ def _task_failed_issues(state) -> list[str]:
     if not state.failed or state.done:
         return []
 
-    validation_failures = _validation_failure_summary(getattr(state, "validation_cycle_records", []))
+    active_validation_records = _current_failed_validation_records(state)
+    validation_failures = _validation_failure_summary(active_validation_records)
     if not validation_failures:
         return []
 
@@ -1125,7 +1157,7 @@ def _task_failed_issues(state) -> list[str]:
         f"validation failed: {validation_failures} "
         f"(showing up to {_RECOVERED_DIAGNOSTIC_LIMIT} sampled diagnostics; see: sikula show {state.task_id})"
     ]
-    failed.extend(_validation_failure_diagnostics(getattr(state, "validation_cycle_records", [])))
+    failed.extend(_validation_failure_diagnostics(active_validation_records))
     return failed
 
 
