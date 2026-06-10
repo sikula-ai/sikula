@@ -128,5 +128,8 @@ Fields:
   methods" unless those names are required by an existing API or convention.
 - External-only context: "Implement the Figma design here: <url>" without adding
   the relevant design file or screenshot to the repo.
+- Review context that mentions an attachment without committing it locally. In
+  `sikula review`, files named in `--description` or `--description-file` are only
+  inlined into the review prompt when Sikula can find them in the review worktree.
 - Hidden business rules: "Use the normal eligibility logic" without describing
   what that means or where it already exists in the codebase.

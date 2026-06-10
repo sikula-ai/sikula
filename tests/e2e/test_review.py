@@ -121,6 +121,44 @@ class TestReportOnlyReview:
         assert state.security_approved is True
         assert state.done is True
 
+    def test_review_ignores_no_referenced_files_enrichment_sentinel(self, git_review_project):
+        project, branch = git_review_project
+        prompts: list[str] = []
+
+        class NoReferencedFilesFake(LLMClient):
+            def generate(self, system, user):
+                return "SINGLE_PASS"
+
+            def run_readonly_agent(self, prompt, cwd):
+                prompts.append(prompt)
+                if "For each file mentioned by name" in prompt:
+                    return "NO_REFERENCED_FILES"
+                return "APPROVED"
+
+            def run_agent(self, prompt, cwd):
+                return [], ""
+
+        with patch("core.llm_client.create_llm_client", return_value=NoReferencedFilesFake()):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_review(
+                    _args(
+                        branch=branch,
+                        base_branch="main",
+                        description="Review calculator branch changes",
+                    ),
+                    _cfg(project),
+                )
+
+        assert exc_info.value.code == 0
+        assert len(prompts) == 3
+        assert "NO_REFERENCED_FILES" in prompts[0]
+        assert "Files referenced in the task" not in prompts[1]
+        assert "NO_REFERENCED_FILES" not in prompts[1]
+
+        store = JsonStateStore(project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.implementation_prompt == "Review calculator branch changes"
+
     def test_rejected_review_records_failed_state(self, git_review_project, fake_llm):
         project, branch = git_review_project
         fake = fake_llm(

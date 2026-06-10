@@ -629,23 +629,30 @@ class TestEnrichPromptWithReferencedFiles:
         result = _enrich_prompt_with_referenced_files("task desc", llm, Path("/tmp"))
         assert result == ""
 
+    def test_returns_empty_string_when_no_referenced_files_sentinel(self):
+        llm = MagicMock()
+        llm.run_readonly_agent.return_value = "  NO_REFERENCED_FILES  "
+        result = _enrich_prompt_with_referenced_files("task desc", llm, Path("/tmp"))
+        assert result == ""
+
     def test_passes_task_description_in_prompt(self):
         llm = MagicMock()
-        llm.run_readonly_agent.return_value = ""
+        llm.run_readonly_agent.return_value = "NO_REFERENCED_FILES"
         _enrich_prompt_with_referenced_files("See Drawer design.png for layout", llm, Path("/tmp"))
         prompt_arg = llm.run_readonly_agent.call_args[0][0]
         assert "Drawer design.png" in prompt_arg
+        assert "NO_REFERENCED_FILES" in prompt_arg
 
     def test_security_prefix_prepended_to_prompt(self):
         llm = MagicMock()
-        llm.run_readonly_agent.return_value = ""
+        llm.run_readonly_agent.return_value = "NO_REFERENCED_FILES"
         _enrich_prompt_with_referenced_files("task", llm, Path("/tmp"))
         prompt_arg = llm.run_readonly_agent.call_args[0][0]
         assert prompt_arg.startswith(AGENT_SECURITY_PREFIX)
 
     def test_passes_project_root_as_cwd(self):
         llm = MagicMock()
-        llm.run_readonly_agent.return_value = ""
+        llm.run_readonly_agent.return_value = "NO_REFERENCED_FILES"
         _enrich_prompt_with_referenced_files("task", llm, Path("/some/project"))
         cwd_arg = llm.run_readonly_agent.call_args.kwargs["cwd"]
         assert cwd_arg == Path("/some/project")
