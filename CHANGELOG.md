@@ -19,6 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   instead of accepting non-executable coverage.
 
 ### Fixed
+- `sikula review` no longer asks the optional referenced-file enrichment agent
+  to return an empty response when no local files are named or found. It now
+  uses an explicit sentinel internally, avoiding unnecessary no-output retries
+  while leaving review behaviour unchanged when there is no extra context.
 - OpenCode runs that exit successfully but produce no assistant text now include cleaned
   stderr and structured tool-call diagnostics in the reported no-output/no-change error,
   so rejected tool calls and provider diagnostics are visible without dumping raw JSON events.
