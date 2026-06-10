@@ -8,6 +8,7 @@ limited to errors the build system or test runner reports.
 
 from __future__ import annotations
 
+import logging
 import posixpath
 import re
 import subprocess
@@ -27,11 +28,14 @@ from agents.base_agent import (
 )
 from agents.build_guidance import write_agent_constraints as _write_agent_constraints
 from core.state import TaskState
+from core.synthetic_test_harness_audit import prompt_context_for_records as _synthetic_harness_prompt_context
 from core.validation_artifacts import (
     detect_validation_artifacts,
     restore_validation_artifacts,
     snapshot_validation_dirty_files,
 )
+
+log = logging.getLogger(__name__)
 
 _AGENT_PROMPT = """\
 You are fixing errors in a {tech_stack} codebase.
@@ -90,6 +94,30 @@ _TEST_ORIGIN_VALIDATION_CONSTRAINT = """\
 - If the failure is caused by a malformed generated test or test harness assumption, fix the
   test or test helper. Do not change production source, build configuration, runtime
   configuration, dependency declarations, or pipeline settings merely to satisfy a malformed test.
+- Do not keep expanding a synthetic runtime/framework harness just to satisfy generated tests.
+  Test-local fakes that reimplement render trees, selector engines, event dispatch,
+  lifecycle schedulers, navigation/history stacks, dependency containers, device/emulator APIs,
+  filesystems, servers, command runners, or other runtime infrastructure are brittle harnesses.
+  Prefer replacing the generated test with coverage through existing project-standard seams, or
+  leave the test unchanged and explain the TESTABILITY GAP if no meaningful seam exists.
+- Treat generated tests/helpers that combine multiple fake runtime subsystems as brittle even
+  if each fake looks small in isolation. Coupled fake DOM/window, event dispatch,
+  navigation/history/router, network/fetch, filesystem, server, scheduler, command-runner,
+  or dependency-container models recreate missing infrastructure. Do not keep fixing one fake
+  subsystem at a time; simplify to narrower pure-seam/public-contract coverage or report the
+  TESTABILITY GAP for behaviour that cannot be executed meaningfully.
+- Do not fix a generated test failure by adding a new skipped, disabled, ignored,
+  expected-failure, assumption-gated, or environment-gated test for the changed behaviour. A
+  test that is expected to be skipped, or expected to fail, in Sikula's configured validation
+  pipeline is not coverage. If missing runtime infrastructure prevents execution, preserve
+  stable-seam coverage where possible and output a structured TESTABILITY GAP block.
+- When outputting a TESTABILITY GAP, use:
+  TESTABILITY GAP:
+  target: <behaviour or contract that remains untested>
+  reason: <missing seam, missing test harness, unavailable helper, etc.>
+  covered_by: <existing-surface tests/seams added or preserved, or none>
+  recommended_action: <project-level test infrastructure or seam needed>
+  risk: low | medium | high
 - If the failing file is listed as a test generated or updated by Sikula earlier in this
   task, you may replace or delete that generated test only when it is malformed/stale,
   depends on unavailable or brittle framework/test harness internals, and does not encode
@@ -132,6 +160,30 @@ _TEST_TEST_CONSTRAINT = """\
   invalid test doubles, or unavailable test APIs), fix the test or test helper. Do not
   change production source, build configuration, runtime configuration, dependency
   declarations, or pipeline settings merely to satisfy a malformed test.
+- Do not keep expanding a synthetic runtime/framework harness just to satisfy generated tests.
+  Test-local fakes that reimplement render trees, selector engines, event dispatch,
+  lifecycle schedulers, navigation/history stacks, dependency containers, device/emulator APIs,
+  filesystems, servers, command runners, or other runtime infrastructure are brittle harnesses.
+  Prefer replacing the generated test with coverage through existing project-standard seams, or
+  leave the test unchanged and explain the TESTABILITY GAP if no meaningful seam exists.
+- Treat generated tests/helpers that combine multiple fake runtime subsystems as brittle even
+  if each fake looks small in isolation. Coupled fake DOM/window, event dispatch,
+  navigation/history/router, network/fetch, filesystem, server, scheduler, command-runner,
+  or dependency-container models recreate missing infrastructure. Do not keep fixing one fake
+  subsystem at a time; simplify to narrower pure-seam/public-contract coverage or report the
+  TESTABILITY GAP for behaviour that cannot be executed meaningfully.
+- Do not fix a generated test failure by adding a new skipped, disabled, ignored,
+  expected-failure, assumption-gated, or environment-gated test for the changed behaviour. A
+  test that is expected to be skipped, or expected to fail, in Sikula's configured validation
+  pipeline is not coverage. If missing runtime infrastructure prevents execution, preserve
+  stable-seam coverage where possible and output a structured TESTABILITY GAP block.
+- When outputting a TESTABILITY GAP, use:
+  TESTABILITY GAP:
+  target: <behaviour or contract that remains untested>
+  reason: <missing seam, missing test harness, unavailable helper, etc.>
+  covered_by: <existing-surface tests/seams added or preserved, or none>
+  recommended_action: <project-level test infrastructure or seam needed>
+  risk: low | medium | high
 - If the failing file is listed as a test generated or updated by Sikula earlier in this
   task, you may replace or delete that generated test only when it is malformed/stale,
   depends on unavailable or brittle framework/test harness internals, and does not encode
@@ -175,11 +227,35 @@ TEST-ONLY SCOPE RECOVERY:
 - If the failure requires production code, choose `production_code`, explain the production
   defect, and leave files unchanged so Sikula can run the production-confirmed pass"""
 
+_GENERATED_TEST_RETRIAGE_RECOVERY_INSTRUCTION = """\
+GENERATED TEST RE-TRIAGE RECOVERY:
+- A previous repeated-generated-test pass changed generated test files but omitted the
+  required GENERATED TEST RE-TRIAGE block: {reason}
+- Sikula restored all file writes from that pass before this retry
+- Retry from the current working tree and do not keep patching the generated test harness
+  one assertion or fake subsystem at a time
+- If you change generated tests again, include:
+  GENERATED TEST RE-TRIAGE:
+  strategy: replace_with_narrower_seam_test | remove_malformed_generated_test | report_testability_gap | production_defect
+  target: <failing generated test or behaviour>
+  reason: <why repeated fixes indicate wrong test surface, malformed test, or production defect>
+  covered_by: <existing-surface tests/seams preserved or added, or none>"""
+
 _CHECK_TEST_CONSTRAINT = """\
 - You MAY modify production or test files if the check errors explicitly reference them
 - Fix ONLY the files named in the check errors — nothing else"""
 
 _DEFAULT_CONTEXT_FILES = ["README.md"]
+_TESTABILITY_GAP_MARKER = "TESTABILITY GAP:"
+_TESTABILITY_GAP_FIELDS = {"target", "reason", "covered_by", "recommended_action", "risk"}
+_GENERATED_TEST_RETRIAGE_MARKER = "GENERATED TEST RE-TRIAGE:"
+_GENERATED_TEST_RETRIAGE_FIELDS = {"strategy", "target", "reason", "covered_by"}
+_GENERATED_TEST_RETRIAGE_STRATEGIES = {
+    "replace_with_narrower_seam_test",
+    "remove_malformed_generated_test",
+    "report_testability_gap",
+    "production_defect",
+}
 _TEST_PATH_MARKERS = {
     "__tests__",
     "acceptancetest",
@@ -619,6 +695,75 @@ def _errors_section(state: TaskState) -> str:
     return "\n\n".join(sections)
 
 
+def _parse_testability_gaps(output: str | None) -> list[dict]:
+    if not output or _TESTABILITY_GAP_MARKER.lower() not in output.lower():
+        return []
+
+    gaps: list[dict] = []
+    current: list[str] = []
+    for line in output.splitlines():
+        if line.strip().lower().startswith(_TESTABILITY_GAP_MARKER.lower()):
+            if current:
+                gaps.append(_gap_from_lines(current))
+            current = [line]
+            continue
+        if current:
+            current.append(line)
+    if current:
+        gaps.append(_gap_from_lines(current))
+    return gaps
+
+
+def _gap_from_lines(lines: list[str]) -> dict:
+    message = "\n".join(lines).strip()
+    gap = {"message": message}
+    for line in lines[1:]:
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        normalized_key = key.strip().lower().replace(" ", "_")
+        if normalized_key in _TESTABILITY_GAP_FIELDS:
+            gap[normalized_key] = value.strip()
+    return gap
+
+
+def _parse_generated_test_retriage(output: str | None) -> dict | None:
+    if not output or _GENERATED_TEST_RETRIAGE_MARKER.lower() not in output.lower():
+        return None
+
+    lines = output.splitlines()
+    block: list[str] = []
+    collecting = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower().startswith(_GENERATED_TEST_RETRIAGE_MARKER.lower()):
+            collecting = True
+            block = [line]
+            continue
+        if not collecting:
+            continue
+        if stripped.endswith(":") and block and ":" not in stripped[:-1]:
+            break
+        block.append(line)
+
+    if not block:
+        return None
+
+    retriage: dict = {"message": "\n".join(block).strip()}
+    for line in block[1:]:
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        normalized_key = key.strip().lower().replace(" ", "_")
+        if normalized_key in _GENERATED_TEST_RETRIAGE_FIELDS:
+            retriage[normalized_key] = value.strip()
+    if any(not str(retriage.get(field, "")).strip() for field in _GENERATED_TEST_RETRIAGE_FIELDS):
+        return None
+    if retriage["strategy"] not in _GENERATED_TEST_RETRIAGE_STRATEGIES:
+        return None
+    return retriage
+
+
 def _generated_test_context(state: TaskState) -> str:
     if not state.test_files_written:
         return ""
@@ -633,6 +778,72 @@ def _generated_test_context(state: TaskState) -> str:
         "real task/guideline/structured-contract coverage, but do not keep repairing a "
         "malformed or brittle generated harness merely because it exists."
     )
+
+
+def _repeated_generated_test_fix_context(state: TaskState) -> str:
+    if not state.test_files_written:
+        return ""
+    generated = set(state.test_files_written)
+    repeated_files = [
+        (path, _generated_test_fix_count(state, path))
+        for path in state.test_files_written
+        if path in generated and _generated_test_fix_count(state, path) >= 2
+    ]
+    if not repeated_files:
+        return ""
+
+    file_list = "\n".join(f"  - {path} ({count} generated-test fix attempts)" for path, count in repeated_files[:20])
+    if len(repeated_files) > 20:
+        file_list += f"\n  ... ({len(repeated_files) - 20} more)"
+    total_attempts = sum(count for _, count in repeated_files)
+    return (
+        "REPEATED GENERATED TEST FIX CONTEXT:\n"
+        f"Sikula has already made {total_attempts} test-only fixer pass(es) against "
+        "test files generated or updated in this task.\n"
+        f"{file_list}\n\n"
+        "Treat another failure in this area as a signal that the generated test harness may "
+        "be the problem. Do not keep patching small pieces of a brittle synthetic runtime "
+        "harness, especially when it combines fake runtime subsystems such as event "
+        "dispatch, navigation/history/router, network/fetch, filesystem, server, scheduler, "
+        "command-runner, or dependency-container models. Re-evaluate whether the test should "
+        "be replaced with coverage through existing project-standard seams, narrowed to a "
+        "stable public contract, or left as a TESTABILITY GAP when no meaningful existing "
+        "seam exists.\n\n"
+        "Before changing generated tests again, explicitly choose the strategy in your final "
+        "response:\n"
+        "GENERATED TEST RE-TRIAGE:\n"
+        "strategy: replace_with_narrower_seam_test | remove_malformed_generated_test | "
+        "report_testability_gap | production_defect\n"
+        "target: <failing generated test or behaviour>\n"
+        "reason: <why repeated fixes indicate wrong test surface, malformed test, or production defect>\n"
+        "covered_by: <existing-surface tests/seams preserved or added, or none>\n\n"
+        "Treat coverage targets as applying only to runnable behaviour inside the configured "
+        "test surface; behaviour outside that surface belongs in a TESTABILITY GAP instead "
+        "of a synthetic runtime harness."
+    )
+
+
+def _repeated_generated_test_retriage_required(state: TaskState) -> bool:
+    return bool(_repeated_generated_test_fix_context(state))
+
+
+def _generated_test_writes(state: TaskState, changed: list[str]) -> list[str]:
+    generated = set(state.test_files_written)
+    return [path for path in changed if path in generated]
+
+
+def _generated_test_fix_count(state: TaskState, path: str) -> int:
+    try:
+        return max(0, int(state.generated_test_fix_counts.get(path, 0)))
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def _record_generated_test_fix_attempt(state: TaskState, paths: list[str]) -> None:
+    if not isinstance(state.generated_test_fix_counts, dict):
+        state.generated_test_fix_counts = {}
+    for path in sorted({str(candidate) for candidate in paths if str(candidate).strip()}):
+        state.generated_test_fix_counts[path] = _generated_test_fix_count(state, path) + 1
 
 
 class FixerAgent(BaseAgent):
@@ -676,6 +887,18 @@ class FixerAgent(BaseAgent):
             generated_test_context = _generated_test_context(state) if uses_test_failure_triage else ""
             if generated_test_context:
                 errors_section += "\n\n" + generated_test_context
+            repeated_generated_test_context = (
+                _repeated_generated_test_fix_context(state) if uses_test_failure_triage else ""
+            )
+            if repeated_generated_test_context:
+                errors_section += "\n\n" + repeated_generated_test_context
+            synthetic_harness_context = (
+                _synthetic_harness_prompt_context(state.synthetic_test_harness_records)
+                if uses_test_failure_triage
+                else ""
+            )
+            if synthetic_harness_context:
+                errors_section += "\n\n" + synthetic_harness_context
             if previous_triage:
                 errors_section += "\n\nCONFIRMED TEST FAILURE TRIAGE:\n" + previous_triage.strip()
             if scope_recovery:
@@ -759,7 +982,20 @@ class FixerAgent(BaseAgent):
                 record["confirmed_test_failure_triage"] = previous_triage
             if scope_recovery:
                 record["scope_recovery"] = scope_recovery
+            generated_test_retriage = _parse_generated_test_retriage(fixer_output)
+            if generated_test_retriage:
+                record["generated_test_retriage"] = generated_test_retriage
             state.fix_cycle_records.append(record)
+            for gap in _parse_testability_gaps(fixer_output):
+                state.record_testability_gap(
+                    self.name,
+                    gap["message"],
+                    target=gap.get("target"),
+                    reason=gap.get("reason"),
+                    covered_by=gap.get("covered_by"),
+                    recommended_action=gap.get("recommended_action"),
+                    risk=gap.get("risk"),
+                )
             return None, changed, fixer_output, dirty_before, artifact_before, allowed_write_paths
 
         def _fail_after_changes(changed: list[str], msg: str) -> AgentResult:
@@ -821,6 +1057,29 @@ class FixerAgent(BaseAgent):
                 action = "test_only_scope_violation_restore_failed"
             state.record(self.name, action, reason[:500])
 
+        def _record_generated_test_retriage_violation(
+            *,
+            reason: str,
+            changed: list[str],
+            generated_test_files: list[str],
+            restored_files: list[str],
+            restore_errors: list[str],
+            will_retry: bool,
+        ) -> None:
+            if state.fix_cycle_records:
+                state.fix_cycle_records[-1]["generated_test_retriage_violation"] = {
+                    "reason": reason,
+                    "files_written": list(changed),
+                    "generated_test_files": list(generated_test_files),
+                    "restored_files": list(restored_files),
+                    "restore_errors": list(restore_errors),
+                    "retry": will_retry,
+                }
+            action = "generated_test_retriage_violation_reverted"
+            if restore_errors:
+                action = "generated_test_retriage_violation_restore_failed"
+            state.record(self.name, action, reason[:500])
+
         if uses_test_failure_triage:
             allowed_write_paths = _write_paths_for_state(state, sandbox, test_origin_validation=test_origin_validation)
             test_constraint = _test_constraint(state, test_origin_validation=test_origin_validation)
@@ -831,6 +1090,9 @@ class FixerAgent(BaseAgent):
             max_test_only_attempts = 2
             for attempt_index in range(max_test_only_attempts):
                 triage_pass = "test_only" if attempt_index == 0 else "test_only_retry"
+                generated_test_retriage_required = _repeated_generated_test_retriage_required(state)
+                if scope_recovery:
+                    log.info("Retrying fixer agent with %s recovery prompt", triage_pass)
                 result, changed, fixer_output, dirty_before, artifact_before, final_allowed_write_paths = _run_once(
                     allowed_write_paths=allowed_write_paths,
                     test_constraint=test_constraint,
@@ -845,7 +1107,57 @@ class FixerAgent(BaseAgent):
                     changed
                 )
                 if not production_writes and not production_request_with_writes:
-                    break
+                    generated_test_files = _generated_test_writes(state, changed)
+                    if generated_test_files:
+                        _record_generated_test_fix_attempt(state, generated_test_files)
+                    missing_generated_test_retriage = (
+                        generated_test_retriage_required
+                        and bool(generated_test_files)
+                        and not _parse_generated_test_retriage(fixer_output)
+                    )
+                    if not missing_generated_test_retriage:
+                        break
+
+                    reason = (
+                        "Repeated generated-test fixer changed generated test files without "
+                        f"GENERATED TEST RE-TRIAGE during the {triage_pass} pass: {generated_test_files}"
+                    )
+                    will_retry = attempt_index + 1 < max_test_only_attempts
+                    restored_files: list[str] = []
+                    restore_errors: list[str] = []
+                    if will_retry:
+                        restored_files, restore_errors = _restore_attempt_writes(changed, artifact_before)
+                        will_retry = not restore_errors
+                    _record_generated_test_retriage_violation(
+                        reason=reason,
+                        changed=changed,
+                        generated_test_files=generated_test_files,
+                        restored_files=restored_files,
+                        restore_errors=restore_errors,
+                        will_retry=will_retry,
+                    )
+                    if restore_errors:
+                        log.error(
+                            "Generated test re-triage violation restore failed for %s: %s",
+                            ", ".join(generated_test_files),
+                            "; ".join(restore_errors),
+                        )
+                        msg = f"{reason}; failed to restore the violating fixer writes: {restore_errors}"
+                        return _fail_after_changes(changed, msg)
+                    if not will_retry:
+                        log.warning(
+                            "Generated test re-triage still missing after retry for %s - continuing after audit",
+                            ", ".join(generated_test_files),
+                        )
+                        state.record(self.name, "generated_test_retriage_violation_continue", reason[:500])
+                        break
+                    log.warning(
+                        "Generated test re-triage missing for %s - restored %s and retrying fixer",
+                        ", ".join(generated_test_files),
+                        ", ".join(restored_files) or "(no files)",
+                    )
+                    scope_recovery = _GENERATED_TEST_RETRIAGE_RECOVERY_INSTRUCTION.format(reason=reason)
+                    continue
 
                 failure_kind = "test-origin validation" if test_origin_validation else "test-failure"
                 if production_writes:
@@ -875,9 +1187,18 @@ class FixerAgent(BaseAgent):
                     will_retry=will_retry,
                 )
                 if restore_errors:
+                    log.error(
+                        "Test-only fixer scope violation restore failed for %s: %s",
+                        ", ".join(violation_files),
+                        "; ".join(restore_errors),
+                    )
                     msg = f"{reason}; failed to restore the violating fixer writes: {restore_errors}"
                     return _fail_after_changes(changed, msg)
                 if not will_retry:
+                    log.warning(
+                        "Test-only fixer scope violation for %s - restored writes and no retry attempts remain",
+                        ", ".join(violation_files),
+                    )
                     msg = f"{reason}; restored violating writes and no retry attempts remain"
                     state.record(self.name, "fix_failed", msg)
                     state.failed = True
@@ -886,6 +1207,11 @@ class FixerAgent(BaseAgent):
                         message=msg[:200],
                         data={"files_written": changed, "restored_files": restored_files},
                     )
+                log.warning(
+                    "Test-only fixer scope violation for %s - restored %s and retrying fixer",
+                    ", ".join(violation_files),
+                    ", ".join(restored_files) or "(no files)",
+                )
                 scope_recovery = _TEST_ONLY_SCOPE_RECOVERY_INSTRUCTION.format(reason=reason)
             if _has_valid_production_test_failure_triage(fixer_output):
                 failure_kind = "test-origin validation" if test_origin_validation else "test-failure"
@@ -895,6 +1221,7 @@ class FixerAgent(BaseAgent):
                     test_origin_validation=test_origin_validation,
                     production_fix_confirmed=True,
                 )
+                log.info("Running fixer agent production-confirmed pass after %s triage", failure_kind)
                 result, changed, fixer_output, dirty_before, _, final_allowed_write_paths = _run_once(
                     allowed_write_paths=allowed_write_paths,
                     test_constraint=_test_constraint(

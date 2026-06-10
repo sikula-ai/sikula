@@ -40,6 +40,7 @@ import posixpath
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -55,6 +56,15 @@ from core.llm_client import LLMClient
 from core.progress import ActiveOperationHeartbeat
 from core.retry_history import llm_retry_history
 from core.state import StateStore, TaskState
+from core.synthetic_test_harness_audit import (
+    active_findings_for_current_files as active_synthetic_harness_findings_for_current_files,
+)
+from core.synthetic_test_harness_audit import detect_new_synthetic_test_harnesses
+from core.test_execution_gate_audit import (
+    active_findings_for_current_files,
+    detect_new_test_execution_gates,
+    test_execution_gate_signature_counts,
+)
 from core.validation_artifacts import (
     detect_validation_artifacts,
     restore_validation_artifacts,
@@ -76,6 +86,9 @@ _FIXER_ERROR_LIMIT = 6000
 _LOG_ERROR_LIMIT = 2000
 _VALIDATION_ARTIFACT_ERROR_LIMIT = 2000
 _VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES = 5
+_TEST_EXECUTION_GATE_AUDIT_MARKER = "TEST EXECUTION GATE AUDIT:"
+_SYNTHETIC_HARNESS_RECOVERY_MAX_RETRIES = 1
+_TEST_WRITER_AUDIT_SNAPSHOT = "test_writer_audit_before"
 _TEST_PATH_MARKERS = {
     "__tests__",
     "androidtest",
@@ -109,6 +122,25 @@ _TEST_FILE_SUFFIXES = (
     "Tests.java",
     "Tests.kt",
     "Tests.swift",
+)
+_TEST_GATE_AUDIT_SOURCE_SUFFIXES = (
+    ".cs",
+    ".dart",
+    ".go",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".kts",
+    ".mjs",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".scala",
+    ".swift",
+    ".ts",
+    ".tsx",
 )
 
 
@@ -170,6 +202,10 @@ def _normalize_project_path(path: str) -> str:
     return normalized.strip("/")
 
 
+def _synthetic_harness_finding_key(finding: dict) -> tuple[str, tuple[str, ...]]:
+    return (str(finding.get("path", "")), tuple(finding.get("subsystems") or []))
+
+
 def _path_is_under_root(path: str, root: str) -> bool:
     normalized_path = _normalize_project_path(path)
     normalized_root = _normalize_project_path(root)
@@ -207,6 +243,15 @@ def _path_looks_like_test_artifact(path: str) -> bool:
         )
         or filename.endswith(tuple(suffix for suffix in _TEST_FILE_SUFFIXES if suffix[0].isupper()))
     )
+
+
+def _path_looks_like_test_audit_candidate(path: str) -> bool:
+    if _path_looks_like_test_artifact(path):
+        return True
+    parts = _path_parts(path)
+    if not parts:
+        return False
+    return parts[-1].lower().endswith(_TEST_GATE_AUDIT_SOURCE_SUFFIXES)
 
 
 @dataclass
@@ -672,11 +717,23 @@ class Orchestrator:
             and not self._session_code_changed
             and not state.fixer_changed_code
         ):
-            state.test_status = "skipped"
-            state.check_status = "skipped"
-            state.done = True
-            self._store.save(state)
-            return
+            if self._active_test_execution_gate_findings(state):
+                self._refresh_test_execution_gate_errors(state)
+                if self._config.run_build:
+                    state.record(
+                        "orchestrator",
+                        "review_fast_path_blocked",
+                        "test execution gate audit requires the build/fix loop",
+                    )
+                    self._store.save(state)
+                elif self._abort_no_build_with_active_test_execution_gates(state):
+                    return
+            else:
+                state.test_status = "skipped"
+                state.check_status = "skipped"
+                state.done = True
+                self._store.save(state)
+                return
 
         # Phase 4: test write
         test_files_changed = self._run_test_write_phase(state)
@@ -690,6 +747,8 @@ class Orchestrator:
 
         # Phase 5: build/fix loop
         if not self._config.run_build:
+            if self._abort_no_build_with_active_test_execution_gates(state):
+                return
             state.test_status = "skipped"
             state.check_status = "skipped"
             state.done = bool(state.files_changed)
@@ -766,6 +825,8 @@ class Orchestrator:
                 return
 
         if not self._config.run_build:
+            if self._abort_no_build_with_active_test_execution_gates(state):
+                return
             state.test_status = "skipped"
             state.check_status = "skipped"
             state.done = True
@@ -951,6 +1012,14 @@ class Orchestrator:
                     "running final validation after last fixer change",
                 )
                 self._store.save(state)
+
+            if self._refresh_test_execution_gate_errors(state):
+                if validation_only:
+                    break
+                if not self._run_fix_phase(state, progress):
+                    return False
+                self._store.save(state)
+                continue
 
             if not state.build_synced:
                 log.info(f"--- Phase: sync ({progress}) ---")
@@ -1156,9 +1225,29 @@ class Orchestrator:
             )
             state.failed = True
 
+    def _validation_error_state_snapshot(self, state: TaskState) -> dict:
+        return {
+            "errors": list(state.errors),
+            "test_errors": list(state.test_errors),
+            "check_errors": list(state.check_errors),
+            "build_status": state.build_status,
+            "test_status": state.test_status,
+            "check_status": state.check_status,
+        }
+
+    def _restore_validation_error_state(self, state: TaskState, snapshot: dict) -> None:
+        state.errors = list(snapshot.get("errors") or [])
+        state.test_errors = list(snapshot.get("test_errors") or [])
+        state.check_errors = list(snapshot.get("check_errors") or [])
+        state.build_status = snapshot.get("build_status")
+        state.test_status = snapshot.get("test_status")
+        state.check_status = snapshot.get("check_status")
+
     def _run_fix_phase(self, state: TaskState, progress: str) -> bool:
         """Run fixer, update sync/review/test flags. Returns True to continue, False if failed."""
         log.info(f"--- Phase: fix ({progress}) ---")
+        validation_before = self._validation_error_state_snapshot(state)
+        test_gate_before = self._test_execution_gate_snapshot()
         fixer_result = self._run_agent("fixer", state)
         if state.failed:
             return False
@@ -1172,6 +1261,92 @@ class Orchestrator:
         # Use files reported by this fixer call — not a set-diff on state.files_changed, which
         # would miss re-edits of files already in the list (skipped by fixer dedup on line 127).
         fixer_files = set((fixer_result.data or {}).get("files_written", []))
+        gate_findings = self._audit_test_execution_gates_after_agent(
+            state,
+            source="fixer",
+            files_written=fixer_files,
+            before_snapshot=test_gate_before,
+        )
+        synthetic_findings = self._audit_synthetic_test_harnesses_after_agent(
+            state,
+            source="fixer",
+            files_written=fixer_files,
+            before_snapshot=test_gate_before,
+        )
+        if synthetic_findings:
+            will_retry_synthetic_harness = _SYNTHETIC_HARNESS_RECOVERY_MAX_RETRIES > 0 and not state.failed
+            restored, restore_errors = self._recover_synthetic_test_harness_after_agent(
+                state,
+                source="fixer",
+                findings=synthetic_findings,
+                before_snapshot=test_gate_before,
+                will_retry=will_retry_synthetic_harness,
+            )
+            first_pass_remaining_files = set(
+                self._agent_files_still_changed_since_snapshot(fixer_files, test_gate_before)
+            )
+            fixer_files = first_pass_remaining_files
+            self._store.save(state)
+            if restored and not restore_errors and will_retry_synthetic_harness:
+                self._restore_validation_error_state(state, validation_before)
+                self._store.save(state)
+                log.info("Retrying fixer agent after synthetic test harness recovery")
+                retry_test_gate_before = self._test_execution_gate_snapshot()
+                fixer_result = self._run_agent("fixer", state)
+                no_op_retry_after_retained_fix = (
+                    not fixer_result.success
+                    and bool(restored)
+                    and (fixer_result.message or "").strip() == "Agent made no file changes"
+                )
+                if state.failed:
+                    return False
+                if no_op_retry_after_retained_fix:
+                    retained = ", ".join(sorted(first_pass_remaining_files)) or "(restored tree only)"
+                    log.info(
+                        "Fixer retry made no additional file changes after synthetic test harness recovery; "
+                        "continuing to validate current tree: %s",
+                        retained,
+                    )
+                    state.record(
+                        "orchestrator",
+                        "synthetic_test_harness_recovery_noop_retry",
+                        f"fixer retry made no additional file changes; validating current tree: {retained}",
+                    )
+                    self._store.save(state)
+                    retry_files = set()
+                elif self._abort_on_failed_agent_result(state, "fixer", fixer_result):
+                    return False
+                else:
+                    retry_files = set((fixer_result.data or {}).get("files_written", []))
+                gate_findings.extend(
+                    self._audit_test_execution_gates_after_agent(
+                        state,
+                        source="fixer",
+                        files_written=retry_files,
+                        before_snapshot=retry_test_gate_before,
+                    )
+                )
+                retry_synthetic_findings = self._audit_synthetic_test_harnesses_after_agent(
+                    state,
+                    source="fixer",
+                    files_written=retry_files,
+                    before_snapshot=retry_test_gate_before,
+                    include_active=True,
+                )
+                retry_files = set(self._agent_files_still_changed_since_snapshot(retry_files, retry_test_gate_before))
+                if retry_synthetic_findings:
+                    self._recover_synthetic_test_harness_after_agent(
+                        state,
+                        source="fixer",
+                        findings=retry_synthetic_findings,
+                        before_snapshot=retry_test_gate_before,
+                        will_retry=False,
+                    )
+                    retry_files = set(
+                        self._agent_files_still_changed_since_snapshot(retry_files, retry_test_gate_before)
+                    )
+                    self._store.save(state)
+                fixer_files = first_pass_remaining_files | retry_files
         self._mark_build_sync_stale_if_needed(fixer_files, "fixer", state)
         if fixer_files:
             test_only_fix = self._fixer_change_is_test_only(fixer_files)
@@ -1196,6 +1371,8 @@ class Orchestrator:
                 state.tests_up_to_date = False
                 if state.active_scope == _SCOPE_FINAL_FULL_TASK:
                     state.final_full_task_review_done = False
+            self._store.save(state)
+        elif gate_findings:
             self._store.save(state)
         return True
 
@@ -1266,13 +1443,18 @@ class Orchestrator:
             return False
         for raw_root in self._configured_test_write_paths():
             root = raw_root.replace("\\", "/").strip()
-            if not root or _normalize_project_path(root) == "":
+            normalized_root = _normalize_project_path(root)
+            if not root:
+                continue
+            if posixpath.normpath(root) == ".":
+                return True
+            if not normalized_root:
                 continue
             if any(ch in root for ch in "*?["):
                 if _path_matches_pattern(normalized_path, root):
                     return True
                 continue
-            if _path_is_under_root(normalized_path, root):
+            if _path_is_under_root(normalized_path, normalized_root):
                 return True
         return False
 
@@ -1281,6 +1463,631 @@ class Orchestrator:
         return bool(paths) and all(
             self._is_configured_test_write_path(path) and _path_looks_like_test_artifact(path) for path in paths
         )
+
+    def _test_execution_gate_snapshot(self) -> dict[str, str | None]:
+        snapshot: dict[str, str | None] = {}
+        for path in self._iter_configured_test_files():
+            relative = self._relative_project_path(path)
+            if not relative:
+                continue
+            snapshot[relative] = self._read_project_text(relative)
+        return snapshot
+
+    def _test_execution_gate_count_snapshot(self, snapshot: dict[str, str | None]) -> dict[str, dict[str, int]]:
+        return {path: test_execution_gate_signature_counts(text) for path, text in snapshot.items()}
+
+    def _test_writer_restore_snapshot(self, state: TaskState, extra_paths=()) -> dict[str, str | None]:
+        snapshot: dict[str, str | None] = {}
+        candidates = [
+            *state.files_changed,
+            *state.test_files_written,
+            *state.test_writer_audit_files_written,
+            *self._dirty_test_audit_paths(),
+            *(str(path) for path in extra_paths),
+        ]
+        for raw_path in candidates:
+            path = _normalize_project_path(str(raw_path))
+            if (
+                path
+                and self._is_configured_test_write_path(path)
+                and _path_looks_like_test_audit_candidate(path)
+                and path not in snapshot
+            ):
+                snapshot[path] = self._read_project_text(path)
+        return snapshot
+
+    def _git_baseline_snapshot_for_paths(self, paths) -> dict[str, str | None]:
+        snapshot: dict[str, str | None] = {}
+        for raw_path in paths:
+            path = _normalize_project_path(str(raw_path))
+            if path:
+                snapshot[path] = self._read_git_head_project_text(path)
+        return snapshot
+
+    def _begin_test_writer_audit_pending(
+        self,
+        state: TaskState,
+        before_snapshot: dict[str, str | None],
+    ) -> None:
+        self._store.save_text_snapshot(state.task_id, _TEST_WRITER_AUDIT_SNAPSHOT, before_snapshot)
+        state.test_writer_audit_pending = True
+        state.test_writer_audit_agent_completed = False
+        state.test_writer_audit_files_written = []
+        state.test_writer_audit_gate_counts = self._test_execution_gate_count_snapshot(before_snapshot)
+        state.tests_up_to_date = False
+        self._store.save(state)
+
+    def _load_test_writer_audit_snapshot(self, state: TaskState) -> dict[str, str | None] | None:
+        return self._store.load_text_snapshot(state.task_id, _TEST_WRITER_AUDIT_SNAPSHOT)
+
+    def _persist_test_writer_audit_restore_baselines(self, state: TaskState, paths) -> dict[str, str | None]:
+        snapshot = self._load_test_writer_audit_snapshot(state) or {}
+        changed = False
+        for raw_path in paths:
+            path = _normalize_project_path(str(raw_path))
+            if (
+                path
+                and self._is_configured_test_write_path(path)
+                and _path_looks_like_test_audit_candidate(path)
+                and path not in snapshot
+            ):
+                baseline = self._read_git_head_project_text(path)
+                snapshot[path] = baseline
+                state.test_writer_audit_gate_counts[path] = test_execution_gate_signature_counts(baseline)
+                changed = True
+        if changed:
+            self._store.save_text_snapshot(state.task_id, _TEST_WRITER_AUDIT_SNAPSHOT, snapshot)
+        return snapshot
+
+    def _record_test_writer_audit_files(self, state: TaskState, files_written) -> list[str]:
+        files = list(dict.fromkeys(str(path) for path in files_written if str(path).strip()))
+        self._persist_test_writer_audit_restore_baselines(state, files)
+        state.test_writer_audit_agent_completed = True
+        state.test_writer_audit_files_written = files
+        self._store.save(state)
+        return files
+
+    def _test_files_changed_since_snapshot(self, before_snapshot: dict[str, str | None]) -> list[str]:
+        paths = {path for raw_path in before_snapshot for path in [_normalize_project_path(str(raw_path))] if path}
+        changed: list[str] = []
+        for path in sorted(paths):
+            if before_snapshot.get(path) != self._read_project_text(path):
+                changed.append(path)
+        return changed
+
+    def _dirty_test_audit_paths(self) -> list[str]:
+        root = self._config.project_root.resolve()
+        ignored_roots = self._validation_artifact_ignored_roots(root)
+        snapshot = snapshot_validation_dirty_files(root, ignored_roots=ignored_roots)
+        paths = sorted(
+            path
+            for path in snapshot
+            if self._is_configured_test_write_path(path) and _path_looks_like_test_audit_candidate(path)
+        )
+        if paths:
+            return paths
+        return sorted(
+            relative
+            for path in self._iter_configured_test_files()
+            for relative in [self._relative_project_path(path)]
+            if relative
+            and self._is_configured_test_write_path(relative)
+            and _path_looks_like_test_audit_candidate(relative)
+            and self._path_has_pending_changes(relative)
+        )
+
+    def _pending_test_writer_audit_files(self, state: TaskState) -> list[str]:
+        candidates = state.test_writer_audit_files_written
+        if not candidates:
+            candidates = state.test_files_written
+        if not candidates:
+            candidates = [
+                relative
+                for path in self._iter_configured_test_files()
+                for relative in [self._relative_project_path(path)]
+                if relative
+            ]
+        return list(dict.fromkeys(str(path) for path in candidates if str(path).strip()))
+
+    def _clear_test_writer_audit_pending(self, state: TaskState) -> None:
+        if (
+            not state.test_writer_audit_pending
+            and not state.test_writer_audit_agent_completed
+            and not state.test_writer_audit_files_written
+            and not state.test_writer_audit_gate_counts
+        ):
+            self._store.delete_text_snapshot(state.task_id, _TEST_WRITER_AUDIT_SNAPSHOT)
+            return
+        state.test_writer_audit_pending = False
+        state.test_writer_audit_agent_completed = False
+        state.test_writer_audit_files_written = []
+        state.test_writer_audit_gate_counts = {}
+        self._store.save(state)
+        self._store.delete_text_snapshot(state.task_id, _TEST_WRITER_AUDIT_SNAPSHOT)
+
+    def _iter_configured_test_files(self):
+        project_root = self._config.project_root.resolve()
+        for raw_root in self._configured_test_write_paths():
+            raw = raw_root.replace("\\", "/").strip()
+            if not raw:
+                continue
+            candidates: list[Path]
+            if any(ch in raw for ch in "*?["):
+                candidates = [path for path in project_root.glob(raw)]
+            else:
+                normalized = _normalize_project_path(raw)
+                root = project_root if not normalized else project_root.joinpath(*Path(normalized).parts)
+                candidates = [root]
+
+            for candidate in candidates:
+                candidate = candidate.resolve(strict=False)
+                if candidate.is_file():
+                    relative = self._relative_project_path(candidate)
+                    if relative and _path_looks_like_test_audit_candidate(relative):
+                        yield candidate
+                    continue
+                if not candidate.is_dir():
+                    continue
+                for path in candidate.rglob("*"):
+                    if not path.is_file():
+                        continue
+                    relative = self._relative_project_path(path)
+                    if not relative or self._path_is_internal(relative):
+                        continue
+                    if _path_looks_like_test_audit_candidate(relative):
+                        yield path
+
+    def _relative_project_path(self, path: Path) -> str | None:
+        try:
+            relative = path.resolve(strict=False).relative_to(self._config.project_root.resolve())
+        except (OSError, ValueError):
+            return None
+        relative_text = relative.as_posix()
+        return relative_text if relative_text and relative_text != "." else None
+
+    def _path_is_internal(self, path: str) -> bool:
+        parts = _path_parts(path)
+        return bool(parts) and parts[0] in {".git", ".sikula"}
+
+    def _read_project_text(self, path: str) -> str | None:
+        normalized = _normalize_project_path(path)
+        if not normalized:
+            return None
+        file_path = self._config.project_root.joinpath(*Path(normalized).parts)
+        try:
+            return file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+    def _read_git_head_project_text(self, path: str) -> str | None:
+        normalized = _normalize_project_path(path)
+        if not normalized:
+            return None
+        try:
+            result = subprocess.run(
+                ["git", "show", f"HEAD:./{normalized}"],
+                capture_output=True,
+                text=True,
+                cwd=self._config.project_root,
+            )
+        except OSError:
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout
+
+    def _audit_test_execution_gates_after_agent(
+        self,
+        state: TaskState,
+        *,
+        source: str,
+        files_written,
+        before_snapshot: dict[str, str | None],
+        before_gate_counts: dict[str, dict[str, int]] | None = None,
+    ) -> list[dict]:
+        paths = sorted(
+            {
+                _normalize_project_path(str(path))
+                for path in files_written
+                if self._is_configured_test_write_path(str(path)) and _path_looks_like_test_audit_candidate(str(path))
+            }
+        )
+        findings: list[dict] = []
+        for path in paths:
+            if not path:
+                continue
+            findings.extend(
+                detect_new_test_execution_gates(
+                    path=path,
+                    before=before_snapshot.get(path),
+                    after=self._read_project_text(path),
+                    before_counts=(before_gate_counts or {}).get(path),
+                )
+            )
+        if not findings:
+            return []
+
+        state.record_test_execution_gate_audit(source, findings)
+        self._refresh_test_execution_gate_errors(state)
+        return findings
+
+    def _audit_synthetic_test_harnesses_after_agent(
+        self,
+        state: TaskState,
+        *,
+        source: str,
+        files_written,
+        before_snapshot: dict[str, str | None],
+        include_active: bool = False,
+    ) -> list[dict]:
+        paths = sorted(
+            {
+                _normalize_project_path(str(path))
+                for path in files_written
+                if self._is_configured_test_write_path(str(path)) and _path_looks_like_test_audit_candidate(str(path))
+            }
+        )
+        active_before = self._refresh_synthetic_test_harness_audits(state)
+        active_keys = {_synthetic_harness_finding_key(finding) for finding in active_before}
+        findings: list[dict] = []
+        for path in paths:
+            if not path:
+                continue
+            findings.extend(
+                detect_new_synthetic_test_harnesses(
+                    path=path,
+                    before=before_snapshot.get(path),
+                    after=self._read_project_text(path),
+                )
+            )
+        new_findings = [finding for finding in findings if _synthetic_harness_finding_key(finding) not in active_keys]
+        if new_findings:
+            state.record_synthetic_test_harness_audit(source, new_findings)
+        self._refresh_synthetic_test_harness_audits(state)
+        return findings if include_active else new_findings
+
+    def _synthetic_harness_paths(self, findings: list[dict]) -> list[str]:
+        return sorted(
+            {
+                normalized
+                for finding in findings
+                for normalized in [_normalize_project_path(str(finding.get("path", "")))]
+                if normalized
+                and self._is_configured_test_write_path(normalized)
+                and _path_looks_like_test_audit_candidate(normalized)
+            }
+        )
+
+    def _path_has_pending_changes(self, path: str) -> bool:
+        normalized = _normalize_project_path(path)
+        if not normalized:
+            return False
+        try:
+            result = subprocess.run(
+                ["git", "status", "--porcelain", "--", normalized],
+                capture_output=True,
+                text=True,
+                cwd=self._config.project_root,
+            )
+        except OSError:
+            result = None
+        if result is not None and result.returncode == 0:
+            return bool(result.stdout.strip())
+        return self._read_project_text(normalized) != self._read_git_head_project_text(normalized)
+
+    def _prune_clean_test_state_paths(
+        self,
+        state: TaskState,
+        paths: list[str],
+        *,
+        before_snapshot: dict[str, str | None] | None = None,
+    ) -> None:
+        clean_paths = {
+            path
+            for path in (_normalize_project_path(candidate) for candidate in paths)
+            if path and not self._path_has_pending_changes(path)
+        }
+        if not clean_paths:
+            return
+        snapshot = (
+            {
+                _normalize_project_path(path): content
+                for path, content in before_snapshot.items()
+                if _normalize_project_path(path)
+            }
+            if before_snapshot is not None
+            else None
+        )
+        files_changed_prune_paths = clean_paths
+        if state.review_mode in {"review_report", "review_fix"}:
+            files_changed_prune_paths = {
+                path for path in clean_paths if snapshot is not None and path in snapshot and snapshot[path] is None
+            }
+        if files_changed_prune_paths:
+            state.files_changed = [
+                path
+                for path in state.files_changed
+                if _normalize_project_path(str(path)) not in files_changed_prune_paths
+            ]
+        state.test_files_written = [
+            path for path in state.test_files_written if _normalize_project_path(str(path)) not in clean_paths
+        ]
+
+    def _agent_files_still_changed_since_snapshot(
+        self,
+        files_written,
+        before_snapshot: dict[str, str | None],
+    ) -> list[str]:
+        still_changed: list[str] = []
+        for raw_path in files_written:
+            path = _normalize_project_path(str(raw_path))
+            if not path:
+                continue
+            if (
+                self._is_configured_test_write_path(path)
+                and _path_looks_like_test_audit_candidate(path)
+                and before_snapshot.get(path) == self._read_project_text(path)
+            ):
+                continue
+            if path not in still_changed:
+                still_changed.append(path)
+        return still_changed
+
+    def _restore_target_project_path(self, path: str) -> tuple[Path | None, str | None]:
+        normalized = _normalize_project_path(path)
+        if not normalized:
+            return None, f"{path}: invalid restore path"
+        project_root = self._config.project_root.resolve()
+        current = project_root
+        for part in Path(normalized).parts:
+            current = current / part
+            try:
+                if current.is_symlink():
+                    relative = current.relative_to(project_root).as_posix()
+                    return None, f"{normalized}: restore path uses symlink component `{relative}`"
+            except OSError as exc:
+                return None, f"{normalized}: could not inspect restore path: {exc}"
+        try:
+            current.resolve(strict=False).relative_to(project_root)
+        except (OSError, ValueError) as exc:
+            return None, f"{normalized}: restore path escapes project root: {exc}"
+        return current, None
+
+    def _restore_test_file_paths_from_snapshot(
+        self,
+        state: TaskState,
+        *,
+        paths: list[str],
+        before_snapshot: dict[str, str | None],
+    ) -> tuple[list[str], list[str]]:
+        restored: list[str] = []
+        errors: list[str] = []
+        for raw_path in paths:
+            path = _normalize_project_path(raw_path)
+            if not path:
+                continue
+            file_path, path_error = self._restore_target_project_path(path)
+            if path_error or file_path is None:
+                errors.append(path_error or f"{path}: invalid restore path")
+                continue
+            before = before_snapshot.get(path)
+            try:
+                if before is None:
+                    if file_path.exists() or file_path.is_symlink():
+                        file_path.unlink()
+                    restored.append(path)
+                else:
+                    file_path.parent.mkdir(parents=True, exist_ok=True)
+                    file_path.write_text(before, encoding="utf-8")
+                    restored.append(path)
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
+
+        self._prune_clean_test_state_paths(state, restored, before_snapshot=before_snapshot)
+        self._refresh_test_execution_gate_errors(state)
+        return restored, errors
+
+    def _restore_test_files_from_snapshot(
+        self,
+        state: TaskState,
+        *,
+        source: str,
+        paths: list[str],
+        before_snapshot: dict[str, str | None],
+        will_retry: bool,
+    ) -> tuple[list[str], list[str]]:
+        restored, errors = self._restore_test_file_paths_from_snapshot(
+            state,
+            paths=paths,
+            before_snapshot=before_snapshot,
+        )
+        if errors:
+            action = "synthetic_test_harness_recovery_failed"
+            result = f"{source} synthetic harness recovery could not restore {', '.join(paths)}: {'; '.join(errors)}"
+        else:
+            action = "synthetic_test_harness_recovered"
+            suffix = "retrying agent" if will_retry else "continuing without the synthetic harness"
+            result = f"{source} synthetic harness restored {', '.join(restored) or '(no files)'}; {suffix}"
+        state.record("orchestrator", action, result[:500])
+        return restored, errors
+
+    def _restore_interrupted_test_writer_outputs(
+        self,
+        state: TaskState,
+        before_snapshot: dict[str, str | None],
+    ) -> tuple[list[str], list[str]]:
+        restore_snapshot = dict(before_snapshot)
+        for path in self._dirty_test_audit_paths():
+            if path not in restore_snapshot:
+                restore_snapshot[path] = self._read_git_head_project_text(path)
+        paths = self._test_files_changed_since_snapshot(restore_snapshot)
+        if not paths:
+            return [], []
+        restored, errors = self._restore_test_file_paths_from_snapshot(
+            state,
+            paths=paths,
+            before_snapshot=restore_snapshot,
+        )
+        if errors:
+            state.record(
+                "orchestrator",
+                "test_writer_interrupted_output_restore_failed",
+                f"could not restore interrupted test-writer output: {'; '.join(errors)}"[:500],
+            )
+            state.failed = True
+        else:
+            state.record(
+                "orchestrator",
+                "test_writer_interrupted_output_restored",
+                f"restored interrupted test-writer output for {', '.join(restored) or '(no files)'}; rerunning agent",
+            )
+        self._store.save(state)
+        return restored, errors
+
+    def _record_synthetic_harness_testability_gap(
+        self,
+        state: TaskState,
+        *,
+        source: str,
+        findings: list[dict],
+    ) -> None:
+        for finding in findings:
+            path = str(finding.get("path") or "<unknown>")
+            target = f"synthetic runtime harness in {path}"
+            reason = (
+                "Generated test recovery still produced a broad synthetic runtime/framework "
+                "harness instead of narrow existing-seam coverage."
+            )
+            if any(
+                gap.get("target") == target and gap.get("reason") == reason
+                for gap in state.testability_gaps
+                if isinstance(gap, dict)
+            ):
+                continue
+            message = (
+                "TESTABILITY GAP:\n"
+                f"target: {target}\n"
+                f"reason: {reason}\n"
+                "covered_by: none\n"
+                "recommended_action: add project-standard runtime/integration test infrastructure, "
+                "expose a stable test seam, or keep this behaviour for human-reviewed integration coverage.\n"
+                "risk: medium"
+            )
+            state.record_testability_gap(
+                "orchestrator",
+                message,
+                target=target,
+                reason=reason,
+                covered_by="none",
+                recommended_action=(
+                    "add project-standard runtime/integration test infrastructure, expose a stable test seam, "
+                    "or keep this behaviour for human-reviewed integration coverage"
+                ),
+                risk="medium",
+            )
+            state.record(
+                "orchestrator",
+                "synthetic_test_harness_recovery_gap",
+                f"{source} recovery removed repeated synthetic harness in {path}",
+            )
+
+    def _recover_synthetic_test_harness_after_agent(
+        self,
+        state: TaskState,
+        *,
+        source: str,
+        findings: list[dict],
+        before_snapshot: dict[str, str | None],
+        will_retry: bool,
+    ) -> tuple[list[str], list[str]]:
+        paths = self._synthetic_harness_paths(findings)
+        if not paths:
+            return [], []
+        restored, errors = self._restore_test_files_from_snapshot(
+            state,
+            source=source,
+            paths=paths,
+            before_snapshot=before_snapshot,
+            will_retry=will_retry,
+        )
+        if not will_retry or errors:
+            self._record_synthetic_harness_testability_gap(state, source=source, findings=findings)
+            self._refresh_synthetic_test_harness_audits(state)
+        return restored, errors
+
+    def _refresh_synthetic_test_harness_audits(self, state: TaskState) -> list[dict]:
+        active_by_key: dict[tuple[str, tuple[str, ...]], dict] = {}
+        for record in state.synthetic_test_harness_records:
+            if record.get("status") == "resolved":
+                continue
+            active = active_synthetic_harness_findings_for_current_files(self._config.project_root, [record])
+            if not active:
+                record["status"] = "resolved"
+                record["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                continue
+            for finding in active:
+                active_by_key[_synthetic_harness_finding_key(finding)] = finding
+        return list(active_by_key.values())
+
+    def _refresh_test_execution_gate_errors(self, state: TaskState) -> bool:
+        if not state.test_execution_gate_records:
+            return False
+
+        self._clear_test_execution_gate_errors(state)
+        active_findings = self._active_test_execution_gate_findings(state)
+        if not active_findings:
+            return False
+
+        error = self._format_test_execution_gate_error(active_findings)
+        state.test_errors.append(error)
+        state.test_status = "failed"
+        return True
+
+    def _clear_test_execution_gate_errors(self, state: TaskState) -> None:
+        state.test_errors = [
+            error for error in state.test_errors if not str(error).startswith(_TEST_EXECUTION_GATE_AUDIT_MARKER)
+        ]
+
+    def _active_test_execution_gate_findings(self, state: TaskState) -> list[dict]:
+        active_by_key: dict[tuple[str, str, str, str, str], dict] = {}
+        for record in state.test_execution_gate_records:
+            if record.get("status") == "resolved":
+                continue
+            active = active_findings_for_current_files(self._config.project_root, [record])
+            if not active:
+                record["status"] = "resolved"
+                record["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                continue
+            for finding in active:
+                key = (
+                    str(finding.get("path", "")),
+                    str(finding.get("signature", "")),
+                    str(finding.get("occurrence", "")),
+                    str(finding.get("category", "")),
+                    str(finding.get("reason", "")),
+                )
+                active_by_key[key] = finding
+        return list(active_by_key.values())
+
+    def _format_test_execution_gate_error(self, findings: list[dict]) -> str:
+        lines = [
+            _TEST_EXECUTION_GATE_AUDIT_MARKER,
+            "Sikula detected newly added execution-gated test coverage in test files it modified.",
+            "A generated or fixed test must not pass by skipping, disabling, ignoring, or environment-gating",
+            "the changed behaviour out of the configured validation pipeline.",
+            "",
+            "Fix this by removing the execution gate and either adding real coverage through an existing",
+            "stable project seam, or deleting the placeholder coverage and reporting a structured TESTABILITY GAP.",
+            "",
+            "Findings:",
+        ]
+        for finding in findings:
+            path = finding.get("path", "<unknown>")
+            line = finding.get("line", "?")
+            category = finding.get("category", "gate")
+            reason = finding.get("reason", "execution gate")
+            lines.append(f"- {path}:{line} [{category}] {reason}")
+        return "\n".join(lines)
 
     def _configured_sync_adopt_paths(self) -> list[str]:
         raw = self._config.project_config.get("build", {}).get("sync_adopt_paths", [])
@@ -1715,15 +2522,162 @@ class Orchestrator:
         )
 
     def _run_test_write_phase(self, state: TaskState) -> bool:
-        if not self._config.run_test_writing or state.tests_up_to_date:
+        if not self._config.run_test_writing:
+            return False
+        if state.tests_up_to_date and not state.test_writer_audit_pending:
+            if not self._config.run_build:
+                self._abort_no_build_with_active_test_execution_gates(state)
             return False
         log.info(f"--- Phase: {_phase_scope_label(state)}test write ---")
-        result = self._run_agent("test_writer", state)
-        if state.failed or self._abort_on_failed_agent_result(state, "test_writer", result):
-            return False
-        files_written = (result.data or {}).get("files_written", [])
+        pending_resume = state.test_writer_audit_pending
+        before_gate_counts: dict[str, dict[str, int]] | None = None
+        pending_snapshot_missing = False
+        pending_agent_incomplete = pending_resume and not state.test_writer_audit_agent_completed
+        if pending_resume and not pending_agent_incomplete:
+            saved_test_gate_before = self._load_test_writer_audit_snapshot(state)
+            pending_snapshot_missing = saved_test_gate_before is None
+            test_gate_before = saved_test_gate_before or {}
+            before_gate_counts = dict(state.test_writer_audit_gate_counts)
+            files_written = self._pending_test_writer_audit_files(state)
+        else:
+            with self._active_operation(
+                state,
+                phase="test_writer audit prep",
+                message="Preparing test-writer audit baseline",
+            ):
+                if pending_agent_incomplete:
+                    saved_test_gate_before = self._load_test_writer_audit_snapshot(state)
+                    if saved_test_gate_before is None:
+                        msg = "pending test-writer audit snapshot missing before agent completed"
+                        state.record("orchestrator", "abort", msg)
+                        state.failed = True
+                        self._store.save(state)
+                        return False
+                    test_gate_before = saved_test_gate_before
+                    self._restore_interrupted_test_writer_outputs(state, test_gate_before)
+                    if state.failed:
+                        return False
+                    if not state.test_writer_audit_gate_counts:
+                        state.test_writer_audit_gate_counts = self._test_execution_gate_count_snapshot(test_gate_before)
+                    before_gate_counts = dict(state.test_writer_audit_gate_counts)
+                    state.test_writer_audit_files_written = []
+                    state.tests_up_to_date = False
+                    self._store.save(state)
+                else:
+                    test_gate_before = self._test_writer_restore_snapshot(state)
+                    self._begin_test_writer_audit_pending(state, test_gate_before)
+                    before_gate_counts = dict(state.test_writer_audit_gate_counts)
+            result = self._run_agent("test_writer", state)
+            if state.failed or self._abort_on_failed_agent_result(state, "test_writer", result):
+                return False
+            files_written = self._record_test_writer_audit_files(
+                state,
+                (result.data or {}).get("files_written", []),
+            )
+            test_gate_before = self._load_test_writer_audit_snapshot(state) or test_gate_before
+        gate_findings = self._audit_test_execution_gates_after_agent(
+            state,
+            source="test_writer",
+            files_written=files_written,
+            before_snapshot=test_gate_before,
+            before_gate_counts=before_gate_counts,
+        )
+        synthetic_findings = self._audit_synthetic_test_harnesses_after_agent(
+            state,
+            source="test_writer",
+            files_written=files_written,
+            before_snapshot=test_gate_before,
+        )
+        if synthetic_findings and not state.failed:
+            will_retry_synthetic_harness = _SYNTHETIC_HARNESS_RECOVERY_MAX_RETRIES > 0
+            recovery_snapshot = test_gate_before
+            if pending_resume and pending_snapshot_missing:
+                recovery_snapshot = self._git_baseline_snapshot_for_paths(
+                    self._synthetic_harness_paths(synthetic_findings)
+                )
+            restored, restore_errors = self._recover_synthetic_test_harness_after_agent(
+                state,
+                source="test_writer",
+                findings=synthetic_findings,
+                before_snapshot=recovery_snapshot,
+                will_retry=will_retry_synthetic_harness,
+            )
+            first_pass_remaining_files = self._agent_files_still_changed_since_snapshot(
+                files_written, recovery_snapshot
+            )
+            files_written = first_pass_remaining_files
+            if restored and not restore_errors and will_retry_synthetic_harness:
+                state.tests_up_to_date = False
+                state.test_writer_audit_agent_completed = False
+            self._store.save(state)
+            if restored and not restore_errors and will_retry_synthetic_harness:
+                if pending_resume:
+                    log.info("Retrying test writer agent after pending synthetic test harness recovery")
+                else:
+                    log.info("Retrying test writer agent after synthetic test harness recovery")
+                with self._active_operation(
+                    state,
+                    phase="test_writer audit prep",
+                    message="Preparing test-writer audit baseline",
+                ):
+                    retry_test_gate_before = self._test_writer_restore_snapshot(state, extra_paths=files_written)
+                    self._begin_test_writer_audit_pending(state, retry_test_gate_before)
+                result = self._run_agent("test_writer", state)
+                if state.failed or self._abort_on_failed_agent_result(state, "test_writer", result):
+                    return False
+                retry_files_written = self._record_test_writer_audit_files(
+                    state,
+                    (result.data or {}).get("files_written", []),
+                )
+                retry_test_gate_before = self._load_test_writer_audit_snapshot(state) or retry_test_gate_before
+                gate_findings.extend(
+                    self._audit_test_execution_gates_after_agent(
+                        state,
+                        source="test_writer",
+                        files_written=retry_files_written,
+                        before_snapshot=retry_test_gate_before,
+                        before_gate_counts=state.test_writer_audit_gate_counts,
+                    )
+                )
+                retry_synthetic_findings = self._audit_synthetic_test_harnesses_after_agent(
+                    state,
+                    source="test_writer",
+                    files_written=retry_files_written,
+                    before_snapshot=retry_test_gate_before,
+                    include_active=True,
+                )
+                retry_files_written = self._agent_files_still_changed_since_snapshot(
+                    retry_files_written,
+                    retry_test_gate_before,
+                )
+                if retry_synthetic_findings:
+                    self._recover_synthetic_test_harness_after_agent(
+                        state,
+                        source="test_writer",
+                        findings=retry_synthetic_findings,
+                        before_snapshot=retry_test_gate_before,
+                        will_retry=False,
+                    )
+                    retry_files_written = self._agent_files_still_changed_since_snapshot(
+                        retry_files_written,
+                        retry_test_gate_before,
+                    )
+                    self._store.save(state)
+                files_written = list(dict.fromkeys([*first_pass_remaining_files, *retry_files_written]))
+        self._clear_test_writer_audit_pending(state)
+        self._abort_no_build_with_active_test_execution_gates(state)
         self._mark_build_sync_stale_if_needed(files_written, "test writer", state)
         return bool(files_written)
+
+    def _abort_no_build_with_active_test_execution_gates(self, state: TaskState) -> bool:
+        if self._config.run_build or not self._active_test_execution_gate_findings(state):
+            return False
+        self._refresh_test_execution_gate_errors(state)
+        msg = "test execution gate audit found issues but the build/fix loop is disabled"
+        state.record("orchestrator", "abort", msg)
+        state.failed = True
+        self._store.save(state)
+        return True
 
     def _run_checks(self, state: TaskState, progress: str) -> bool:
         """Run all configured quality checks in order. Returns True only if all pass."""

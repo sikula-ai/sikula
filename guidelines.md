@@ -299,9 +299,42 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
 - **`AnalystAgent`** must not suggest or generate test file changes — test changes are exclusively the domain of `TestWriterAgent`.
 - **`AnalystAgent`, `ReviewerAgent`, and `TestWriterAgent`** must preserve structured input contracts: parser, validator, expression engine, DSL, config, schema, and rule-engine changes need explicit accepted/rejected cases, materially different rejected input classes, expected-result-type handling when typed contexts exist, and a validation-vs-runtime failure-phase distinction when observable.
 - **`TestWriterAgent`** must only write to paths within `sandbox.allowed_test_write_paths`; production source files are off-limits.
+- **`TestWriterAgent`** must treat coverage targets as scoped to existing project test
+  infrastructure. It must not synthesize runtime/framework harnesses that recreate render
+  trees, selector or event systems, lifecycle schedulers, navigation/history stacks,
+  dependency containers, device/emulator APIs, filesystems, servers, command runners, or
+  similar missing infrastructure. A test/helper that combines several fake runtime
+  subsystems is a synthetic runtime harness, not a collection of harmless small mocks; use
+  project-standard seams, narrow stable contracts, or `TESTABILITY GAP` output instead.
+  Skipped, disabled, ignored, expected-failure, assumption-gated, or environment-gated
+  tests that Sikula's configured validation will not execute do not count as coverage for
+  changed behaviour.
+  The deterministic execution-gate audit must stay scoped to newly added gates in
+  Sikula-modified test files and inline-test source files under configured test write paths
+  so pre-existing project skips and legitimate stale-test fixes do not become false
+  positives.
 - **`ReviewerAgent`** must stay read-only and mode-aware for tests: in normal `sikula run`, changed tests are not standalone reviewer-owned output, but contract-bearing test deletion, relaxation, or replacement with a different invalid fixture is evidence to re-check and report the production contract issue. In `sikula review`, changed tests are branch output and may be reported directly.
 - **`ReviewerAgent`** must treat task-described validation commands as coverage requirements for the configured validation pipeline, not as manual commands for agents to run. Commands are extracted only from explicit validation contexts: backticks, shell code fences, `$`-prompted lines, or command lists under validation-oriented headings/prefixes such as `Verification:` or `Run:`; Markdown blank separator lines after such headings are allowed. Prose that happens to start with a tool name is not a command, and bare tool names such as `cargo` or `npm` are not executable validation commands. If a `sikula run` task command is covered by effective build/test/check config, do not block review only because it has not run yet. A same-tool-family command with materially different flags, targets, scripts, packages, schemes, or paths is only a near match, not coverage; Gradle/Maven wrapper spelling for the same invocation (`./gradlew` vs `gradle`, `./mvnw` vs `mvn`), Python module forms (`python -m pytest` vs `pytest`, `python -m ruff` vs `ruff`), the npm `test` shortcut (`npm test` vs `npm run test`), and pnpm/Yarn package-script shorthands for common validation scripts (`pnpm typecheck` vs `pnpm run typecheck`, `yarn lint` vs `yarn run lint`) are accepted as coverage. If a `sikula run` command is not covered, report a validation coverage gap; this is not implementer-fixable inside the current task worktree, so the operator must update the Sikula config file used for the run (default `.sikula/config.yaml`, or the file passed with `--config`) or the task and rerun. In `sikula review` modes, commands found in PR/review text are informational branch-verification context; do not preflight-abort review/fix or report a validation coverage gap solely because such a command is not covered.
 - **`FixerAgent`** write paths depend on error type: when `state.errors` is non-empty (build failure), only `allowed_write_paths` (production), unless the build/check diagnostics reference only test files or recognized test targets. Test failures and test-origin validation failures start with a test-only triage/fix pass limited to `allowed_test_write_paths`. If that pass reports `production_defect` + `production_code` without changing files, Sikula runs a separate production-enabled fixer pass with `allowed_write_paths` plus `allowed_test_write_paths`. Production writes during a test-only pass are rejected: Sikula restores that pass's writes and retries once; restore failure or a second scope violation fails the task. A production-confirmed pass must actually change production code. Mixed source/test file exceptions must go through the active `BuildTool.is_test_only_change()` hook and must fail closed by default; keep platform syntax rules out of `FixerAgent`.
+- **`FixerAgent`** must not stabilize malformed generated tests by adding skipped/disabled
+  execution gates for changed behaviour that configured validation cannot run. If missing
+  runtime infrastructure prevents meaningful execution, the fixer may output a structured
+  `TESTABILITY GAP`, including `covered_by` when existing-surface tests or seams cover the
+  runnable portion, which Sikula records in task state. If the orchestrator reports a
+  `TEST EXECUTION GATE AUDIT`, the fixer should remove the gate and either add real
+  existing-seam coverage or leave a structured `TESTABILITY GAP`; it must not replace one
+  passing placeholder gate with another. The fixer must also avoid repeatedly repairing a
+  generated test/helper that combines several fake runtime subsystems; simplify to stable
+  seam coverage or report the gap instead of fixing one fake subsystem at a time. When
+  repeated generated-test fixes trigger `GENERATED TEST RE-TRIAGE`, preserve auditability by
+  choosing a platform-neutral strategy rather than adding platform-specific conditions.
+  Synthetic harness recovery belongs in the orchestrator: restore affected generated test
+  files to the pre-agent snapshot, retry once with audit context, and record a
+  `TESTABILITY GAP` if the retry recreates the broad harness. Do not add platform-specific
+  hard gates for individual runtimes.
+  Missing re-triage output after another generated-test edit should be recoverable by
+  restoring that pass and retrying once before validation is run again; a repeated omission
+  should remain auditable without blocking an otherwise valid task solely on prompt format.
 - **`ReviewerAgent` and `SecurityReviewerAgent`** must never write files — use `run_readonly_agent()` only.
 - **`SecurityReviewerAgent`** fail-safe: if the LLM output contains no `APPROVED` signal, no `## Warnings` section, and no `## Security Issues` section, treat it as blocking. Never relax this — ambiguous output from the security reviewer must always fail closed.
 
@@ -345,10 +378,23 @@ For Gradle-based platforms, subclass `GradleBaseTool` (`tools/gradle_tool.py`) i
 `is_build_config_file()` so you only need to implement `sync()`, `compile_check()`, and
 `run_tests()`. See `AndroidGradleTool` and `JvmGradleTool` as reference implementations.
 
-When adding a new platform, update four files: `tools/<platform>_tool.py` (new tool),
+When adding a new platform, update these core files: `tools/<platform>_tool.py` (new tool),
 `core/orchestrator.py` (`_build_tool()`), `sikula.py` (`_build_tool_class()`,
 `_generate_config()`, `_SUPPORTED_BUILD_TOOLS`), and `tools/scanner.py` (`_SIGNATURES` +
-path detection).
+path detection). Update `tests/test_platform_onboarding.py` so the factory, scanner, and
+generated init-config surfaces stay in sync. If the platform supports inline tests in
+source files with suffixes not already covered, update `_TEST_GATE_AUDIT_SOURCE_SUFFIXES`
+in `core/orchestrator.py`. If the platform introduces test framework
+skip/disable/ignore/expected-failure/assumption idioms that are not already covered, also
+update
+`core/test_execution_gate_audit.py` and `tests/test_test_execution_gate_audit.py`. If the
+platform introduces common fake runtime idioms not already covered, update
+`core/synthetic_test_harness_audit.py` and `tests/test_synthetic_test_harness_audit.py`.
+These are the audit registries allowed outside BuildTool code because the audit remains
+platform-neutral and scoped to Sikula-modified tests. For source-controlled outputs updated
+by sync, decide whether `is_sync_adoptable_file()` should classify them. For mixed
+source/test files, leave `is_test_only_change()` conservative unless syntax-aware diff
+analysis can prove the change is test-only.
 
 All methods return `ToolResult`. Treat subprocess exit code 0 as success. Platform-specific
 exit codes (e.g. pytest exit 5 = "no tests collected") may also be treated as success — document

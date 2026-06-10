@@ -15,6 +15,7 @@ from agents.base_agent import AgentResult
 from tests.conftest import StubLLMClient
 from core.orchestrator import Orchestrator, OrchestratorConfig, _build_tool, _fmt_elapsed
 from core.state import JsonStateStore, TaskState
+from core.test_execution_gate_audit import detect_new_test_execution_gates
 from tools.base_tool import Sandbox, ToolResult
 from tools.cargo_tool import CargoTool
 from tools.gradle_android_tool import AndroidGradleTool
@@ -166,6 +167,12 @@ class TestPathClassification:
         assert not orchestrator_module._path_looks_like_test_artifact("feature/latest/src/main/App.ts")
         assert not orchestrator_module._path_looks_like_test_artifact("feature/contest/src/main/App.ts")
 
+    def test_test_audit_candidates_include_source_files_for_inline_tests(self):
+        assert orchestrator_module._path_looks_like_test_audit_candidate("src/lib.rs")
+        assert orchestrator_module._path_looks_like_test_audit_candidate("src/main/kotlin/InlineTests.kt")
+        assert orchestrator_module._path_looks_like_test_audit_candidate("tests/clientMain.test.ts")
+        assert not orchestrator_module._path_looks_like_test_audit_candidate("assets/logo.png")
+
 
 def _make_orchestrator(
     tmp_path: Path,
@@ -278,6 +285,46 @@ class TestOrchestratorLoop:
         result = orch._run_agent("analyst", state)
 
         assert result.success
+
+    def test_test_writer_audit_prep_records_active_operation_before_agent(self, tmp_path: Path, monkeypatch):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            heartbeat_interval_seconds=60,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+
+        def restore_snapshot_effect(state: TaskState, extra_paths=()) -> dict[str, str | None]:
+            assert list(extra_paths) == []
+            loaded = orch._store.load(state.task_id)
+            assert loaded is not None
+            assert loaded.active_operation is not None
+            assert loaded.active_operation["phase"] == "test_writer audit prep"
+            assert loaded.active_operation["message"] == "Preparing test-writer audit baseline"
+            return {}
+
+        def test_writer_effect(state: TaskState) -> None:
+            loaded = orch._store.load(state.task_id)
+            assert loaded is not None
+            assert loaded.active_operation is not None
+            assert loaded.active_operation["phase"] == "agent"
+            assert loaded.active_operation["agent"] == "test_writer"
+            state.tests_up_to_date = True
+
+        monkeypatch.setattr(orch, "_test_writer_restore_snapshot", restore_snapshot_effect)
+        stubs["test_writer"].side_effect = test_writer_effect
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+
+        changed = orch._run_test_write_phase(state)
+        loaded = orch._store.load(state.task_id)
+
+        assert changed is False
+        assert loaded is not None
+        assert loaded.active_operation is None
 
     def test_run_clears_stale_active_operation_on_resume(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path, heartbeat_interval_seconds=0)
@@ -1612,6 +1659,1342 @@ class TestOrchestratorFixPhase:
         assert len(stubs["test_writer"].calls) == 0
         assert any(record["action"] == "test_only_fix" for record in result.history)
 
+    def test_test_only_fix_execution_gate_audit_triggers_followup_fix(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            max_iterations=4,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "test_main.py"
+        test_file.parent.mkdir()
+        test_file.write_text("def test_existing():\n    assert True\n")
+        test_results = [False, True]
+
+        def run_tests() -> ToolResult:
+            build.test_calls += 1
+            success = test_results.pop(0)
+            return ToolResult(success=success, output="", error="" if success else "tests failed")
+
+        attempts = {"count": 0}
+
+        def fixer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            state.errors.clear()
+            state.test_errors.clear()
+            state.check_errors.clear()
+            if attempts["count"] == 1:
+                test_file.write_text(
+                    'if (typeof document === "undefined") {\n'
+                    '  test("client main tests require DOM", () => {});\n'
+                    "} else {\n"
+                    '  test("opens detail", () => {});\n'
+                    "}\n"
+                )
+            else:
+                test_file.write_text("def test_existing_seam():\n    assert True\n")
+            if "tests/test_main.py" not in state.files_changed:
+                state.files_changed.append("tests/test_main.py")
+
+        build.run_tests = run_tests  # type: ignore[method-assign]
+        stubs["fixer"].side_effect = fixer_effect
+        stubs["fixer"].result_data = {"files_written": ["tests/test_main.py"]}
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            build_synced=True,
+            review_approved=True,
+            security_approved=True,
+            tests_up_to_date=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert attempts["count"] == 2
+        assert build.test_calls == 2
+        assert len(result.test_execution_gate_records) == 1
+        assert result.test_execution_gate_records[0]["source"] == "fixer"
+        assert result.test_execution_gate_records[0]["status"] == "resolved"
+        assert not any(str(error).startswith("TEST EXECUTION GATE AUDIT:") for error in result.test_errors)
+        assert any(record["action"] == "test_execution_gate_audit" for record in result.history)
+
+    def test_test_writer_execution_gate_audit_records_pending_test_error(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "test_main.py"
+        test_file.parent.mkdir()
+
+        def test_writer_effect(state: TaskState) -> None:
+            test_file.write_text('test.skip("changed behavior", () => {});\n')
+            state.tests_up_to_date = True
+            state.files_changed.append("tests/test_main.py")
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed
+        assert len(state.test_execution_gate_records) == 1
+        assert state.test_execution_gate_records[0]["source"] == "test_writer"
+        assert "excerpt" not in state.test_execution_gate_records[0]["findings"][0]
+        assert state.test_errors[0].startswith("TEST EXECUTION GATE AUDIT:")
+        assert 'test.skip("changed behavior"' not in state.test_errors[0]
+        assert "skipped JavaScript/TypeScript test" in state.test_errors[0]
+
+    def test_test_writer_audit_pending_counts_only_saved_snapshot(self, tmp_path: Path, monkeypatch):
+        orch, _, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        monkeypatch.setattr(
+            orch,
+            "_iter_configured_test_files",
+            lambda: (_ for _ in ()).throw(AssertionError("unexpected full test-tree scan")),
+        )
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+
+        orch._begin_test_writer_audit_pending(
+            state,
+            {"tests/target.test.ts": 'test.skip("preexisting target gate", () => {});\n'},
+        )
+
+        assert set(state.test_writer_audit_gate_counts) == {"tests/target.test.ts"}
+        assert len(state.test_writer_audit_gate_counts["tests/target.test.ts"]) == 1
+
+    def test_test_writer_audit_uses_head_baseline_for_newly_reported_existing_file(self, tmp_path: Path):
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        test_file.write_text('test.skip("preexisting project gate", () => {});\n', encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True
+        )
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add preexisting skip"], cwd=tmp_path, check=True, capture_output=True)
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+
+        def test_writer_effect(state: TaskState) -> None:
+            assert "tests/client_main.test.ts" not in state.test_writer_audit_gate_counts
+            test_file.write_text(
+                test_file.read_text(encoding="utf-8") + "test('new behavior', () => {});\n",
+                encoding="utf-8",
+            )
+            state.tests_up_to_date = True
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        stubs["test_writer"].result_data = {"files_written": ["tests/client_main.test.ts"]}
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed
+        assert state.test_execution_gate_records == []
+        assert state.test_errors == []
+
+    def test_resume_missing_snapshot_uses_reported_file_gate_counts(self, tmp_path: Path):
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        test_file.write_text('test.skip("preexisting project gate", () => {});\n', encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True
+        )
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add preexisting skip"], cwd=tmp_path, check=True, capture_output=True)
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            test_writer_audit_pending=True,
+            test_writer_audit_agent_completed=True,
+            test_writer_audit_files_written=["tests/client_main.test.ts"],
+        )
+        orch._persist_test_writer_audit_restore_baselines(state, ["tests/client_main.test.ts"])
+        orch._store.delete_text_snapshot(state.task_id, orchestrator_module._TEST_WRITER_AUDIT_SNAPSHOT)
+        test_file.write_text(
+            test_file.read_text(encoding="utf-8") + "test('new behavior', () => {});\n",
+            encoding="utf-8",
+        )
+        orch._store.save(state)
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed
+        assert stubs["test_writer"].calls == []
+        assert state.test_execution_gate_records == []
+        assert state.test_errors == []
+
+    def test_test_writer_execution_gate_audit_includes_inline_source_tests(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "sandbox": {"allowed_test_write_paths": ["src/"]},
+            },
+        )
+        source_file = tmp_path / "src" / "lib.rs"
+        source_file.parent.mkdir()
+        source_file.write_text(
+            """\
+pub fn answer() -> i32 {
+    42
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn existing_contract() {
+        assert_eq!(super::answer(), 42);
+    }
+}
+""",
+            encoding="utf-8",
+        )
+
+        def test_writer_effect(state: TaskState) -> None:
+            source_file.write_text(
+                """\
+pub fn answer() -> i32 {
+    42
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn existing_contract() {
+        assert_eq!(super::answer(), 42);
+    }
+
+    #[ignore]
+    #[test]
+    fn generated_contract() {
+        assert_eq!(super::answer(), 42);
+    }
+}
+""",
+                encoding="utf-8",
+            )
+            state.tests_up_to_date = True
+            state.files_changed.append("src/lib.rs")
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.rs"])
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed
+        assert len(state.test_execution_gate_records) == 1
+        finding = state.test_execution_gate_records[0]["findings"][0]
+        assert finding["path"] == "src/lib.rs"
+        assert finding["reason"] == "Rust ignored test"
+        assert state.test_errors[0].startswith("TEST EXECUTION GATE AUDIT:")
+
+    def test_test_writer_synthetic_harness_audit_includes_inline_source_tests(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "sandbox": {"allowed_test_write_paths": ["src/"]},
+            },
+        )
+        source_file = tmp_path / "src" / "lib.rs"
+        source_file.parent.mkdir()
+        baseline = "pub fn answer() -> i32 {\n    42\n}\n"
+        source_file.write_text(baseline, encoding="utf-8")
+        attempts = {"count": 0}
+
+        def test_writer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                source_file.write_text(
+                    baseline
+                    + """\
+
+#[cfg(test)]
+mod tests {
+    struct FakeElement;
+    struct FakeEventTarget;
+    struct FakeHistory;
+    struct FakeServer;
+}
+""",
+                    encoding="utf-8",
+                )
+            else:
+                saved = orch._store.load("t1")
+                assert saved is not None
+                assert any(record["action"] == "synthetic_test_harness_recovered" for record in saved.history)
+                assert source_file.read_text(encoding="utf-8") == baseline
+                source_file.write_text(
+                    baseline
+                    + """\
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn generated_contract() {
+        assert_eq!(super::answer(), 42);
+    }
+}
+""",
+                    encoding="utf-8",
+                )
+            state.tests_up_to_date = True
+            state.files_changed.append("src/lib.rs")
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        stubs["test_writer"].result_data = {"files_written": ["src/lib.rs"]}
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.rs"])
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed
+        assert attempts["count"] == 2
+        assert len(state.synthetic_test_harness_records) == 1
+        record = state.synthetic_test_harness_records[0]
+        assert record["findings"][0]["path"] == "src/lib.rs"
+        assert record["status"] == "resolved"
+        assert "FakeElement" not in source_file.read_text(encoding="utf-8")
+
+    def test_test_writer_execution_gate_audit_fails_when_build_loop_disabled(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "test_main.py"
+        test_file.parent.mkdir()
+
+        def test_writer_effect(state: TaskState) -> None:
+            test_file.write_text('test.skip("changed behavior", () => {});\n')
+            state.tests_up_to_date = True
+            state.files_changed.append("tests/test_main.py")
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed
+        assert state.failed
+        assert state.history[-1]["action"] == "abort"
+
+    def test_no_build_resume_with_active_execution_gate_audit_fails_even_when_tests_up_to_date(self, tmp_path: Path):
+        orch, _, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "test_main.py"
+        test_file.parent.mkdir()
+        test_file.write_text('test.skip("changed behavior", () => {});\n', encoding="utf-8")
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py", "tests/test_main.py"],
+            tests_up_to_date=True,
+        )
+        state.record_test_execution_gate_audit(
+            "test_writer",
+            detect_new_test_execution_gates(
+                path="tests/test_main.py",
+                before=None,
+                after=test_file.read_text(encoding="utf-8"),
+            ),
+        )
+        orch._store.save(state)
+
+        orch._run_single_pass(state)
+
+        assert state.failed
+        assert state.done is False
+        assert state.test_errors[0].startswith("TEST EXECUTION GATE AUDIT:")
+        assert state.history[-1]["action"] == "abort"
+
+    def test_execution_gate_audit_treats_dot_test_write_root_as_project_root(self, tmp_path: Path):
+        orch, _, _ = _make_orchestrator(
+            tmp_path,
+            project_config={
+                "project": {"build_tool": "rust"},
+                "sandbox": {"allowed_test_write_paths": ["."]},
+            },
+        )
+        source_file = tmp_path / "src" / "lib.rs"
+        source_file.parent.mkdir()
+        source_file.write_text(
+            """\
+#[cfg(test)]
+mod tests {
+    #[ignore]
+    #[test]
+    fn generated_contract_test() {}
+}
+""",
+            encoding="utf-8",
+        )
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/lib.rs"])
+
+        findings = orch._audit_test_execution_gates_after_agent(
+            state,
+            source="test_writer",
+            files_written=["src/lib.rs"],
+            before_snapshot={"src/lib.rs": None},
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["path"] == "src/lib.rs"
+        assert findings[0]["reason"] == "Rust ignored test"
+        assert len(state.test_execution_gate_records) == 1
+        assert state.test_errors[0].startswith("TEST EXECUTION GATE AUDIT:")
+
+    def test_test_writer_dot_root_snapshot_omits_unrelated_source_but_keeps_gate_counts(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "node"},
+                "sandbox": {"allowed_test_write_paths": ["."]},
+            },
+        )
+        unrelated = tmp_path / "src" / "unrelated.ts"
+        test_file = tmp_path / "tests" / "existing.test.ts"
+        unrelated.parent.mkdir()
+        test_file.parent.mkdir()
+        unrelated.write_text("export const unrelated = 'do not snapshot';\n", encoding="utf-8")
+        test_file.write_text('test.skip("external service contract", () => {});\n', encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test User", "commit", "-m", "baseline"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        snapshots: list[dict[str, str | None]] = []
+
+        def test_writer_effect(state: TaskState) -> None:
+            snapshot = orch._store.load_text_snapshot("t1", orchestrator_module._TEST_WRITER_AUDIT_SNAPSHOT)
+            assert snapshot is not None
+            snapshots.append(snapshot)
+            test_file.write_text(
+                "\n".join(
+                    [
+                        'test.skip("external service contract", () => {});',
+                        'test.skip("external service contract", () => {});',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            state.tests_up_to_date = True
+            state.files_changed.append("tests/existing.test.ts")
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        stubs["test_writer"].result_data = {"files_written": ["tests/existing.test.ts"]}
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.ts"])
+
+        assert orch._run_test_write_phase(state)
+
+        assert snapshots == [{"src/main.ts": None}]
+        findings = state.test_execution_gate_records[0]["findings"]
+        assert len(findings) == 1
+        assert findings[0]["path"] == "tests/existing.test.ts"
+        assert findings[0]["baseline_count"] == 1
+        assert findings[0]["occurrence"] == 2
+
+    def test_resume_recovers_pending_synthetic_harness_and_retries_test_writer(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        pre_agent_test = "test('previous valid seam', () => expect(true).toBe(true));\n"
+        test_file.write_text(
+            pre_agent_test
+            + "\n".join(
+                [
+                    "test.skip('generated harness', () => {});",
+                    "class FakeEventTarget { addEventListener() {}; dispatchEvent() {} }",
+                    "class FakeHistory { pushState() {} }",
+                    "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        orch._store.save_text_snapshot(
+            "t1",
+            orchestrator_module._TEST_WRITER_AUDIT_SNAPSHOT,
+            {"tests/client_main.test.ts": pre_agent_test},
+        )
+        attempts = {"count": 0}
+
+        def test_writer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            saved = orch._store.load("t1")
+            assert saved is not None
+            assert any(record["action"] == "synthetic_test_harness_recovered" for record in saved.history)
+            assert "tests/client_main.test.ts" in saved.files_changed
+            assert test_file.read_text(encoding="utf-8") == pre_agent_test
+            test_file.write_text("test('view model seam', () => expect(true).toBe(true));\n", encoding="utf-8")
+            state.tests_up_to_date = True
+            state.files_changed.append("tests/client_main.test.ts")
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        stubs["test_writer"].result_data = {"files_written": ["tests/client_main.test.ts"]}
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py", "tests/client_main.test.ts"],
+            test_files_written=["tests/client_main.test.ts"],
+            tests_up_to_date=True,
+            test_writer_audit_pending=True,
+            test_writer_audit_agent_completed=True,
+            test_writer_audit_gate_counts={"tests/client_main.test.ts": {}},
+        )
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed
+        assert attempts["count"] == 1
+        assert state.test_writer_audit_pending is False
+        assert state.test_writer_audit_files_written == []
+        assert state.test_writer_audit_gate_counts == {}
+        assert orch._store.load_text_snapshot("t1", orchestrator_module._TEST_WRITER_AUDIT_SNAPSHOT) is None
+        assert len(state.test_execution_gate_records) == 1
+        assert state.test_execution_gate_records[0]["findings"][0]["path"] == "tests/client_main.test.ts"
+        assert len(state.synthetic_test_harness_records) == 1
+        assert state.synthetic_test_harness_records[0]["findings"][0]["path"] == "tests/client_main.test.ts"
+        assert state.synthetic_test_harness_records[0]["status"] == "resolved"
+        assert test_file.read_text(encoding="utf-8") == "test('view model seam', () => expect(true).toBe(true));\n"
+
+    def test_test_writer_synthetic_harness_recovery_retries_with_narrow_test(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        attempts = {"count": 0}
+
+        def test_writer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                test_file.write_text(
+                    "\n".join(
+                        [
+                            "class FakeEventTarget { addEventListener() {}; dispatchEvent() {} }",
+                            "class FakeElement extends FakeEventTarget { appendChild() {}; querySelector() {} }",
+                            "class FakeHistory { pushState() {} }",
+                            "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                saved = orch._store.load("t1")
+                assert saved is not None
+                assert saved.tests_up_to_date is False
+                assert saved.test_writer_audit_agent_completed is False
+                assert "tests/client_main.test.ts" not in saved.files_changed
+                assert any(record["action"] == "synthetic_test_harness_recovered" for record in saved.history)
+                test_file.write_text("test('view model seam', () => expect(true).toBe(true));\n", encoding="utf-8")
+            state.tests_up_to_date = True
+            state.files_changed.append("tests/client_main.test.ts")
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed
+        assert attempts["count"] == 2
+        assert state.failed is False
+        assert state.test_errors == []
+        assert len(state.synthetic_test_harness_records) == 1
+        assert state.synthetic_test_harness_records[0]["source"] == "test_writer"
+        assert state.synthetic_test_harness_records[0]["status"] == "resolved"
+        assert test_file.read_text(encoding="utf-8") == "test('view model seam', () => expect(true).toBe(true));\n"
+        assert any(record["action"] == "synthetic_test_harness_audit" for record in state.history)
+        assert any(record["action"] == "synthetic_test_harness_recovered" for record in state.history)
+
+    def test_test_writer_repeated_synthetic_harness_is_removed_and_gap_recorded(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+
+        def test_writer_effect(state: TaskState) -> None:
+            test_file.write_text(
+                "\n".join(
+                    [
+                        "class FakeElement { appendChild() {}; querySelector() {} }",
+                        "class FakeHistory { pushState() {} }",
+                        "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            state.tests_up_to_date = True
+            state.files_changed.append("tests/client_main.test.ts")
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+
+        changed = orch._run_test_write_phase(state)
+
+        assert not changed
+        assert state.failed is False
+        assert not test_file.exists()
+        assert len(state.synthetic_test_harness_records) == 1
+        assert all(record["status"] == "resolved" for record in state.synthetic_test_harness_records)
+        assert len(state.testability_gaps) == 1
+        assert state.testability_gaps[0]["target"] == "synthetic runtime harness in tests/client_main.test.ts"
+        assert "tests/client_main.test.ts" not in state.files_changed
+        assert "tests/client_main.test.ts" not in state.test_files_written
+
+    def test_test_writer_synthetic_harness_recovery_preserves_other_written_tests(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        synthetic_file = tmp_path / "tests" / "client_main.test.ts"
+        narrow_file = tmp_path / "tests" / "view_model.test.ts"
+        synthetic_file.parent.mkdir()
+        attempts = {"count": 0}
+
+        def test_writer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                synthetic_file.write_text(
+                    "\n".join(
+                        [
+                            "class FakeElement { appendChild() {}; querySelector() {} }",
+                            "class FakeHistory { pushState() {} }",
+                            "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                narrow_file.write_text("test('view model seam', () => expect(true).toBe(true));\n", encoding="utf-8")
+                state.files_changed.extend(["tests/client_main.test.ts", "tests/view_model.test.ts"])
+            state.tests_up_to_date = True
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed
+        assert attempts["count"] == 2
+        assert not synthetic_file.exists()
+        assert narrow_file.exists()
+        assert "tests/client_main.test.ts" not in state.files_changed
+        assert "tests/view_model.test.ts" in state.files_changed
+
+    def test_test_writer_synthetic_harness_recovery_drops_clean_retry_reported_file(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        attempts = {"count": 0}
+
+        def test_writer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                test_file.write_text(
+                    "\n".join(
+                        [
+                            "class FakeElement { appendChild() {}; querySelector() {} }",
+                            "class FakeHistory { pushState() {} }",
+                            "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                assert not test_file.exists()
+                state.record_testability_gap(
+                    "test_writer",
+                    "TESTABILITY GAP:\ntarget: browser route harness\nreason: no stable DOM seam",
+                    target="browser route harness",
+                    reason="no stable DOM seam",
+                )
+            state.tests_up_to_date = True
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        stubs["test_writer"].result_data = {"files_written": ["tests/client_main.test.ts"]}
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+
+        changed = orch._run_test_write_phase(state)
+
+        assert not changed
+        assert attempts["count"] == 2
+        assert not test_file.exists()
+        assert "tests/client_main.test.ts" not in state.files_changed
+        assert "tests/client_main.test.ts" not in state.test_files_written
+        assert len(state.testability_gaps) == 1
+
+    def test_test_writer_synthetic_harness_audit_uses_pre_agent_dirty_baseline(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        project = repo / "project"
+        test_file = project / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text("test('existing narrow test', () => {});\n", encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add narrow test"], cwd=repo, check=True, capture_output=True)
+        dirty_harness = "\n".join(
+            [
+                "class FakeElement { appendChild() {}; querySelector() {} }",
+                "class FakeHistory { pushState() {} }",
+                "class FakeMouseEvent { preventDefault() {} }",
+            ]
+        )
+        test_file.write_text(dirty_harness, encoding="utf-8")
+        orch, stubs, _ = _make_orchestrator(
+            project,
+            run_build=False,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+
+        def test_writer_effect(state: TaskState) -> None:
+            test_file.write_text(test_file.read_text(encoding="utf-8") + "\ntest('uses helper', () => {});\n")
+            state.tests_up_to_date = True
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        stubs["test_writer"].result_data = {"files_written": ["tests/client_main.test.ts"]}
+        state = _save_state(orch, implementation_prompt="p", files_changed=["tests/client_main.test.ts"])
+
+        assert orch._run_test_write_phase(state)
+
+        assert state.synthetic_test_harness_records == []
+        assert "test('uses helper'" in test_file.read_text(encoding="utf-8")
+
+    def test_synthetic_harness_audit_catches_cumulative_test_harness(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        test_file.write_text(
+            "\n".join(
+                [
+                    "class FakeElement { appendChild() {}; querySelector() {} }",
+                    "class FakeHistory { pushState() {} }",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        state = _save_state(orch, implementation_prompt="p", files_changed=["tests/client_main.test.ts"])
+        attempts = {"count": 0}
+
+        def fixer_effect(_state: TaskState) -> None:
+            attempts["count"] += 1
+            test_file.write_text(
+                "\n".join(
+                    [
+                        "class FakeElement { appendChild() {}; querySelector() {} }",
+                        "class FakeHistory { pushState() {} }",
+                        "class FakeMouseEvent { preventDefault() {} }",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+        stubs["fixer"].side_effect = fixer_effect
+        stubs["fixer"].result_data = {"files_written": ["tests/client_main.test.ts"]}
+
+        assert orch._run_fix_phase(state, "1/1")
+
+        assert state.failed is False
+        assert state.test_errors == []
+        assert attempts["count"] == 2
+        assert len(state.synthetic_test_harness_records) == 1
+        finding = state.synthetic_test_harness_records[0]["findings"][0]
+        assert set(finding["subsystems"]) == {"event_dispatch", "navigation_history", "render_tree"}
+        assert all(record["status"] == "resolved" for record in state.synthetic_test_harness_records)
+        assert "FakeMouseEvent" not in test_file.read_text(encoding="utf-8")
+        assert len(state.testability_gaps) == 1
+
+        stubs["fixer"].side_effect = lambda _state: test_file.write_text(
+            test_file.read_text(encoding="utf-8") + "\ntest('assertion tweak', () => {});\n",
+            encoding="utf-8",
+        )
+
+        assert orch._run_fix_phase(state, "1/1")
+
+        assert len(state.synthetic_test_harness_records) == 1
+
+    def test_fixer_synthetic_harness_recovery_restores_validation_errors_for_retry(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        attempts = {"count": 0}
+
+        def fixer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                test_file.write_text(
+                    "\n".join(
+                        [
+                            "class FakeElement { appendChild() {}; querySelector() {} }",
+                            "class FakeHistory { pushState() {} }",
+                            "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                state.test_errors.clear()
+                state.test_status = "success"
+            else:
+                saved = orch._store.load("t1")
+                assert saved is not None
+                assert saved.test_errors == ["tests failed"]
+                assert saved.test_status == "failed"
+                assert any(record["action"] == "synthetic_test_harness_recovered" for record in saved.history)
+                assert state.test_errors == ["tests failed"]
+                assert state.test_status == "failed"
+                test_file.write_text("test('view model seam', () => expect(true).toBe(true));\n", encoding="utf-8")
+            state.files_changed.append("tests/client_main.test.ts")
+
+        stubs["fixer"].side_effect = fixer_effect
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            test_errors=["tests failed"],
+            test_status="failed",
+        )
+
+        assert orch._run_fix_phase(state, "1/1")
+
+        assert attempts["count"] == 2
+        assert test_file.read_text(encoding="utf-8") == "test('view model seam', () => expect(true).toBe(true));\n"
+        assert state.synthetic_test_harness_records[0]["status"] == "resolved"
+
+    def test_fixer_synthetic_harness_recovery_aborts_failed_retry(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        attempts = {"count": 0}
+
+        def fixer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                test_file.write_text(
+                    "\n".join(
+                        [
+                            "class FakeElement { appendChild() {}; querySelector() {} }",
+                            "class FakeHistory { pushState() {} }",
+                            "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                state.files_changed.append("tests/client_main.test.ts")
+            else:
+                stubs["fixer"].result_success = False
+                stubs["fixer"].result_message = "provider failure"
+
+        stubs["fixer"].side_effect = fixer_effect
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=[],
+            test_errors=["tests failed"],
+            test_status="failed",
+        )
+
+        assert not orch._run_fix_phase(state, "1/1")
+
+        assert attempts["count"] == 2
+        assert state.failed is True
+        assert any(
+            entry["agent"] == "orchestrator"
+            and entry["action"] == "abort"
+            and entry["result"] == "fixer failed: provider failure"
+            for entry in state.history
+        )
+
+    def test_fixer_synthetic_harness_recovery_preserves_other_changed_files(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        src_file = tmp_path / "src" / "main.py"
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        src_file.parent.mkdir()
+        test_file.parent.mkdir()
+        attempts = {"count": 0}
+
+        def fixer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                src_file.write_text("def value():\n    return 1\n", encoding="utf-8")
+                test_file.write_text(
+                    "\n".join(
+                        [
+                            "class FakeElement { appendChild() {}; querySelector() {} }",
+                            "class FakeHistory { pushState() {} }",
+                            "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                state.test_errors.clear()
+                state.files_changed.extend(["src/main.py", "tests/client_main.test.ts"])
+
+        stubs["fixer"].side_effect = fixer_effect
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=[],
+            test_errors=["tests failed"],
+            test_status="failed",
+            review_approved=True,
+            security_approved=True,
+            tests_up_to_date=True,
+        )
+
+        assert orch._run_fix_phase(state, "1/1")
+
+        assert attempts["count"] == 2
+        assert src_file.exists()
+        assert not test_file.exists()
+        assert "src/main.py" in state.files_changed
+        assert "tests/client_main.test.ts" not in state.files_changed
+        assert state.review_approved is False
+        assert state.security_approved is False
+        assert state.tests_up_to_date is False
+
+    def test_fixer_synthetic_harness_recovery_accepts_noop_retry_with_retained_fix(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        src_file = tmp_path / "src" / "main.py"
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        src_file.parent.mkdir()
+        test_file.parent.mkdir()
+        attempts = {"count": 0}
+
+        def fixer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                stubs["fixer"].result_success = True
+                stubs["fixer"].result_message = None
+                src_file.write_text("def value():\n    return 1\n", encoding="utf-8")
+                test_file.write_text(
+                    "\n".join(
+                        [
+                            "class FakeElement { appendChild() {}; querySelector() {} }",
+                            "class FakeHistory { pushState() {} }",
+                            "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                state.files_changed.extend(["src/main.py", "tests/client_main.test.ts"])
+            else:
+                stubs["fixer"].result_success = False
+                stubs["fixer"].result_message = "Agent made no file changes"
+
+        stubs["fixer"].side_effect = fixer_effect
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=[],
+            test_errors=["tests failed"],
+            test_status="failed",
+            review_approved=True,
+            security_approved=True,
+            tests_up_to_date=True,
+        )
+
+        assert orch._run_fix_phase(state, "1/1")
+
+        assert attempts["count"] == 2
+        assert state.failed is False
+        assert src_file.exists()
+        assert not test_file.exists()
+        assert "src/main.py" in state.files_changed
+        assert "tests/client_main.test.ts" not in state.files_changed
+        assert state.review_approved is False
+        assert state.security_approved is False
+        assert state.tests_up_to_date is False
+        assert any(record["action"] == "synthetic_test_harness_recovery_noop_retry" for record in state.history)
+        assert not any(
+            record["action"] == "abort" and "Agent made no file changes" in record["result"] for record in state.history
+        )
+
+    def test_fixer_synthetic_harness_recovery_accepts_noop_retry_with_restored_tree_only(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        attempts = {"count": 0}
+
+        def fixer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                stubs["fixer"].result_success = True
+                stubs["fixer"].result_message = None
+                test_file.write_text(
+                    "\n".join(
+                        [
+                            "class FakeElement { appendChild() {}; querySelector() {} }",
+                            "class FakeHistory { pushState() {} }",
+                            "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                state.files_changed.append("tests/client_main.test.ts")
+            else:
+                state.record_testability_gap(
+                    "fixer",
+                    "TESTABILITY GAP:\ntarget: browser route harness\nreason: no stable DOM seam",
+                    target="browser route harness",
+                    reason="no stable DOM seam",
+                )
+                stubs["fixer"].result_success = False
+                stubs["fixer"].result_message = "Agent made no file changes"
+
+        stubs["fixer"].side_effect = fixer_effect
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=[],
+            test_errors=["tests failed"],
+            test_status="failed",
+            review_approved=True,
+            security_approved=True,
+            tests_up_to_date=True,
+        )
+
+        assert orch._run_fix_phase(state, "1/1")
+
+        assert attempts["count"] == 2
+        assert state.failed is False
+        assert not test_file.exists()
+        assert "tests/client_main.test.ts" not in state.files_changed
+        assert any(record["action"] == "synthetic_test_harness_recovery_noop_retry" for record in state.history)
+        assert not any(
+            record["action"] == "abort" and "Agent made no file changes" in record["result"] for record in state.history
+        )
+
+    def test_fixer_synthetic_harness_recovery_drops_clean_retry_reported_file(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        attempts = {"count": 0}
+
+        def fixer_effect(state: TaskState) -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                test_file.write_text(
+                    "\n".join(
+                        [
+                            "class FakeElement { appendChild() {}; querySelector() {} }",
+                            "class FakeHistory { pushState() {} }",
+                            "async function fakeFetch(input: Request): Promise<Response> { return new Response('{}'); }",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                assert not test_file.exists()
+                state.record_testability_gap(
+                    "fixer",
+                    "TESTABILITY GAP:\ntarget: browser route harness\nreason: no stable DOM seam",
+                    target="browser route harness",
+                    reason="no stable DOM seam",
+                )
+
+        stubs["fixer"].side_effect = fixer_effect
+        stubs["fixer"].result_data = {"files_written": ["tests/client_main.test.ts"]}
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=[],
+            test_files_written=["tests/client_main.test.ts"],
+            test_errors=["tests failed"],
+            test_status="failed",
+        )
+
+        assert orch._run_fix_phase(state, "1/1")
+
+        assert attempts["count"] == 2
+        assert not test_file.exists()
+        assert "tests/client_main.test.ts" not in state.files_changed
+        assert "tests/client_main.test.ts" not in state.test_files_written
+        assert len(state.testability_gaps) == 1
+
+    def test_synthetic_harness_audit_uses_git_head_project_baseline(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        project = repo / "project"
+        test_file = project / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text(
+            "\n".join(
+                [
+                    "class FakeElement { appendChild() {}; querySelector() {} }",
+                    "class FakeHistory { pushState() {} }",
+                    "class FakeMouseEvent { preventDefault() {} }",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add test harness"], cwd=repo, check=True, capture_output=True)
+        orch, stubs, _ = _make_orchestrator(
+            project,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        state = _save_state(orch, implementation_prompt="p", files_changed=["tests/client_main.test.ts"])
+
+        def fixer_effect(_state: TaskState) -> None:
+            test_file.write_text(test_file.read_text(encoding="utf-8") + "\ntest('uses helper', () => {});\n")
+
+        stubs["fixer"].side_effect = fixer_effect
+        stubs["fixer"].result_data = {"files_written": ["tests/client_main.test.ts"]}
+
+        assert orch._run_fix_phase(state, "1/1")
+
+        assert state.synthetic_test_harness_records == []
+
+    def test_synthetic_harness_audit_uses_pre_agent_dirty_baseline(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        project = repo / "project"
+        test_file = project / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text("test('existing narrow test', () => {});\n", encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add narrow test"], cwd=repo, check=True, capture_output=True)
+        dirty_harness = "\n".join(
+            [
+                "class FakeElement { appendChild() {}; querySelector() {} }",
+                "class FakeHistory { pushState() {} }",
+                "class FakeMouseEvent { preventDefault() {} }",
+            ]
+        )
+        test_file.write_text(dirty_harness, encoding="utf-8")
+        orch, stubs, _ = _make_orchestrator(
+            project,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        state = _save_state(orch, implementation_prompt="p", files_changed=["tests/client_main.test.ts"])
+
+        def fixer_effect(_state: TaskState) -> None:
+            test_file.write_text(test_file.read_text(encoding="utf-8") + "\ntest('uses helper', () => {});\n")
+
+        stubs["fixer"].side_effect = fixer_effect
+        stubs["fixer"].result_data = {"files_written": ["tests/client_main.test.ts"]}
+
+        assert orch._run_fix_phase(state, "1/1")
+
+        assert state.synthetic_test_harness_records == []
+        assert "test('uses helper'" in test_file.read_text(encoding="utf-8")
+
+    def test_synthetic_harness_audit_resolves_when_test_is_narrowed(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        test_file = tmp_path / "tests" / "client_main.test.ts"
+        test_file.parent.mkdir()
+        test_file.write_text("class FakeHistory {}\n", encoding="utf-8")
+        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+        state.record_synthetic_test_harness_audit(
+            "test_writer",
+            [
+                {
+                    "path": "tests/client_main.test.ts",
+                    "subsystems": ["navigation_history", "event_dispatch", "network_server"],
+                    "evidence": [
+                        {
+                            "category": "navigation_history",
+                            "lines": [{"line": 1, "excerpt": "class FakeHistory {}"}],
+                        }
+                    ],
+                }
+            ],
+        )
+
+        def fixer_effect(_state: TaskState) -> None:
+            test_file.write_text("def test_view_model_contract():\n    assert True\n", encoding="utf-8")
+
+        stubs["fixer"].side_effect = fixer_effect
+        stubs["fixer"].result_data = {"files_written": ["tests/client_main.test.ts"]}
+
+        assert orch._run_fix_phase(state, "1/1")
+
+        assert state.synthetic_test_harness_records[0]["status"] == "resolved"
+        assert "resolved_at" in state.synthetic_test_harness_records[0]
+
     def test_final_scope_test_only_fix_resets_final_gate_and_security(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
             tmp_path,
@@ -1942,6 +3325,242 @@ class TestOrchestratorInterruptResume:
         )
         orch.run(task_id="t1")
         assert len(stubs["test_writer"].calls) >= 1
+
+    def test_resume_pending_test_writer_audit_before_agent_completion_reruns_test_writer(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_review=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        partial_test = tmp_path / "tests" / "test_main.py"
+        partial_test.parent.mkdir()
+        orch._store.save_text_snapshot(
+            "t1",
+            orchestrator_module._TEST_WRITER_AUDIT_SNAPSHOT,
+            {},
+        )
+        partial_test.write_text('test.skip("partial generated placeholder", () => {});\n', encoding="utf-8")
+
+        def test_writer_effect(state: TaskState) -> None:
+            assert not partial_test.exists()
+            partial_test.write_text("def test_generated_behavior():\n    assert True\n", encoding="utf-8")
+            state.tests_up_to_date = True
+            state.files_changed.append("tests/test_main.py")
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        stubs["test_writer"].result_data = {"files_written": ["tests/test_main.py"]}
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            review_approved=True,
+            tests_up_to_date=False,
+            test_writer_audit_pending=True,
+            test_writer_audit_agent_completed=False,
+            test_writer_audit_gate_counts={"tests/test_main.py": {}},
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert len(stubs["test_writer"].calls) == 1
+        assert result.tests_up_to_date is True
+        assert result.test_writer_audit_pending is False
+        assert result.test_writer_audit_agent_completed is False
+        assert not result.test_execution_gate_records
+        assert partial_test.read_text(encoding="utf-8") == "def test_generated_behavior():\n    assert True\n"
+        assert orch._store.load_text_snapshot(state.task_id, orchestrator_module._TEST_WRITER_AUDIT_SNAPSHOT) is None
+
+    def test_resume_pending_test_writer_audit_restores_unaudited_state_paths_before_rerun(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_review=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        unaudited_test = tmp_path / "tests" / "test_main.py"
+        unaudited_test.parent.mkdir()
+        orch._store.save_text_snapshot(
+            "t1",
+            orchestrator_module._TEST_WRITER_AUDIT_SNAPSHOT,
+            {},
+        )
+        unaudited_test.write_text('test.skip("partial generated placeholder", () => {});\n', encoding="utf-8")
+
+        def test_writer_effect(state: TaskState) -> None:
+            assert not unaudited_test.exists()
+            state.tests_up_to_date = True
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        stubs["test_writer"].result_data = {"files_written": []}
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py", "tests/test_main.py"],
+            test_files_written=["tests/test_main.py"],
+            review_approved=True,
+            tests_up_to_date=False,
+            test_writer_audit_pending=True,
+            test_writer_audit_agent_completed=False,
+            test_writer_audit_gate_counts={"tests/test_main.py": {}},
+        )
+
+        changed = orch._run_test_write_phase(state)
+
+        assert changed is False
+        assert len(stubs["test_writer"].calls) == 1
+        assert not unaudited_test.exists()
+        assert state.tests_up_to_date is True
+        assert state.test_writer_audit_pending is False
+        assert "tests/test_main.py" not in state.files_changed
+        assert "tests/test_main.py" not in state.test_files_written
+        assert state.test_execution_gate_records == []
+        assert any(record["action"] == "test_writer_interrupted_output_restored" for record in state.history)
+        assert orch._store.load_text_snapshot(state.task_id, orchestrator_module._TEST_WRITER_AUDIT_SNAPSHOT) is None
+
+    def test_resume_pending_test_writer_audit_before_agent_completion_fails_without_snapshot(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_review=True,
+            run_test_writing=True,
+        )
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            review_approved=True,
+            tests_up_to_date=False,
+            test_writer_audit_pending=True,
+            test_writer_audit_agent_completed=False,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed
+        assert len(stubs["test_writer"].calls) == 0
+        assert result.history[-1]["action"] == "abort"
+        assert "snapshot missing" in result.history[-1]["result"]
+
+    def test_restore_test_writer_snapshot_rejects_symlink_parent(self, tmp_path: Path):
+        project = tmp_path / "project"
+        project.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        linked_tests = project / "tests"
+        try:
+            linked_tests.symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation failed: {exc}")
+        orch, _, _ = _make_orchestrator(project)
+        state = _save_state(orch, implementation_prompt="p")
+
+        restored, errors = orch._restore_test_file_paths_from_snapshot(
+            state,
+            paths=["tests/test_main.py"],
+            before_snapshot={"tests/test_main.py": "def test_generated():\n    assert True\n"},
+        )
+
+        assert restored == []
+        assert errors
+        assert "symlink component" in errors[0]
+        assert not (outside / "test_main.py").exists()
+
+    def test_restore_test_writer_snapshot_rejects_symlink_target(self, tmp_path: Path):
+        project = tmp_path / "project"
+        project.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        outside_file = outside / "test_main.py"
+        outside_file.write_text("outside\n", encoding="utf-8")
+        tests_dir = project / "tests"
+        tests_dir.mkdir()
+        linked_test = tests_dir / "test_main.py"
+        try:
+            linked_test.symlink_to(outside_file)
+        except OSError as exc:
+            pytest.skip(f"symlink creation failed: {exc}")
+        orch, _, _ = _make_orchestrator(project)
+        state = _save_state(orch, implementation_prompt="p")
+
+        restored, errors = orch._restore_test_file_paths_from_snapshot(
+            state,
+            paths=["tests/test_main.py"],
+            before_snapshot={"tests/test_main.py": "def test_generated():\n    assert True\n"},
+        )
+
+        assert restored == []
+        assert errors
+        assert "symlink component" in errors[0]
+        assert outside_file.read_text(encoding="utf-8") == "outside\n"
+
+    def test_review_fix_restore_preserves_branch_diff_test_file(self, tmp_path: Path, monkeypatch):
+        orch, _, _ = _make_orchestrator(tmp_path)
+        test_file = tmp_path / "tests" / "test_main.py"
+        test_file.parent.mkdir()
+        branch_text = "def test_existing_branch_change():\n    assert True\n"
+        test_file.write_text("class FakeElement:\n    pass\n", encoding="utf-8")
+        monkeypatch.setattr(orch, "_path_has_pending_changes", lambda _path: False)
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py", "tests/test_main.py"],
+            test_files_written=["tests/test_main.py"],
+            review_diff=_REVIEW_DIFF,
+            review_mode="review_fix",
+            review_base_branch="main",
+            worktree_base=str(tmp_path),
+        )
+
+        restored, errors = orch._restore_test_file_paths_from_snapshot(
+            state,
+            paths=["tests/test_main.py"],
+            before_snapshot={"tests/test_main.py": branch_text},
+        )
+
+        assert restored == ["tests/test_main.py"]
+        assert errors == []
+        assert test_file.read_text(encoding="utf-8") == branch_text
+        assert "tests/test_main.py" in state.files_changed
+        assert "tests/test_main.py" not in state.test_files_written
+
+    def test_review_fix_restore_prunes_new_generated_test_file(self, tmp_path: Path, monkeypatch):
+        orch, _, _ = _make_orchestrator(tmp_path)
+        test_file = tmp_path / "tests" / "generated_test.py"
+        test_file.parent.mkdir()
+        test_file.write_text("class FakeElement:\n    pass\n", encoding="utf-8")
+        monkeypatch.setattr(orch, "_path_has_pending_changes", lambda _path: False)
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py", "tests/generated_test.py"],
+            test_files_written=["tests/generated_test.py"],
+            review_diff=_REVIEW_DIFF,
+            review_mode="review_fix",
+            review_base_branch="main",
+            worktree_base=str(tmp_path),
+        )
+
+        restored, errors = orch._restore_test_file_paths_from_snapshot(
+            state,
+            paths=["tests/generated_test.py"],
+            before_snapshot={"tests/generated_test.py": None},
+        )
+
+        assert restored == ["tests/generated_test.py"]
+        assert errors == []
+        assert not test_file.exists()
+        assert "tests/generated_test.py" not in state.files_changed
+        assert "tests/generated_test.py" not in state.test_files_written
 
     def test_step_loop_runs_implementer_per_step(self, tmp_path: Path):
         """Step loop: implementer must run once per step."""
@@ -2421,6 +4040,58 @@ class TestOrchestratorPreexistingChangesFastPath:
         assert review_scopes == ["task"]
         assert result.plan_completed is False
         assert result.final_full_task_review_done is False
+
+    def test_review_fix_fast_path_runs_build_loop_for_active_execution_gate(self, tmp_path: Path, monkeypatch):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_security_review=False,
+            run_test_writing=False,
+            run_build=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        monkeypatch.setattr(subprocess, "run", _git_diff_refresh_subprocess)
+        test_file = tmp_path / "tests" / "test_main.py"
+        test_file.parent.mkdir()
+        test_file.write_text('test.skip("changed behavior", () => {});\n', encoding="utf-8")
+
+        def fixer_effect(state: TaskState) -> None:
+            test_file.unlink()
+            state.files_changed.append("tests/test_main.py")
+
+        stubs["fixer"].side_effect = fixer_effect
+        stubs["fixer"].result_data = {"files_written": ["tests/test_main.py"]}
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py", "tests/test_main.py"],
+            review_diff=_REVIEW_DIFF,
+            review_mode="review_fix",
+            review_base_branch="main",
+            worktree_base=str(tmp_path),
+            plan_decided=True,
+            tests_up_to_date=True,
+        )
+        state.record_test_execution_gate_audit(
+            "test_writer",
+            detect_new_test_execution_gates(
+                path="tests/test_main.py",
+                before=None,
+                after='test.skip("changed behavior", () => {});\n',
+            ),
+        )
+        orch._store.save(state)
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert len(stubs["fixer"].calls) == 1
+        assert any(entry["action"] == "review_fast_path_blocked" for entry in result.history)
+        assert result.test_execution_gate_records[0]["status"] == "resolved"
+        assert not test_file.exists()
 
     def test_review_fix_skips_validation_coverage_preflight_abort(self, tmp_path: Path, monkeypatch):
         orch, stubs, _ = _make_orchestrator(

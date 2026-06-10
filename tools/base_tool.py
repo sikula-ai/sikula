@@ -71,18 +71,28 @@ class BaseTool:
 class BuildTool(BaseTool):
     """Abstract interface for platform build systems.
 
-    Implement one subclass per platform and register it as the "build" tool
-    in Orchestrator.__init__(). The orchestrator loop calls only these core
-    methods — everything else is platform-specific extras on the subclass.
+    Implement one subclass per platform and register it through _build_tool();
+    Orchestrator.__init__() exposes the selected instance as the "build" tool.
+    The orchestrator loop calls only these core methods — everything else is
+    platform-specific extras on the subclass.
 
     To add a new platform:
       1. Create tools/<platform>_tool.py — subclass BuildTool (or GradleBaseTool for
          Gradle variants); implement sync(), compile_check(), run_tests(), run_check(),
-         is_build_config_file(); optionally override generate_sources() and env_files().
+         is_build_config_file(); optionally override generate_sources(), env_files(),
+         is_sync_adoptable_file(), and is_test_only_change().
       2. Register it in core/orchestrator.py (_build_tool()) and sikula.py
          (_build_tool_class(), _generate_config(), _SUPPORTED_BUILD_TOOLS).
       3. Add detection logic to tools/scanner.py (_SIGNATURES and path detection).
       4. Add a .sikula/config.yaml in the project directory.
+      5. Update tests/test_platform_onboarding.py so factory/scanner/init wiring is covered.
+      6. If the platform supports inline tests in source files with suffixes not already
+         covered, extend _TEST_GATE_AUDIT_SOURCE_SUFFIXES in core/orchestrator.py.
+      7. If the platform uses test-framework skip/disable/ignore/assumption idioms
+         not already covered, extend core/test_execution_gate_audit.py and
+         tests/test_test_execution_gate_audit.py.
+      8. If the platform uses fake runtime idioms not already covered, extend
+         core/synthetic_test_harness_audit.py and tests/test_synthetic_test_harness_audit.py.
     """
 
     def generate_sources(self) -> ToolResult:

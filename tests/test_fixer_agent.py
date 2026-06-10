@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from agents.fixer_agent import (
     _guidelines_files,
     _has_valid_production_test_failure_triage,
     _is_test_origin_validation_failure,
+    _parse_generated_test_retriage,
     _tech_stack,
     _test_constraint,
     _test_failure_production_writes,
@@ -401,10 +403,317 @@ class TestFixerAgentWritePaths:
         assert "malformed generated test or test harness assumption" in prompt
         assert "you may replace or delete that generated test" in prompt
         assert "do not hand-copy production" in prompt
+        assert "Do not keep expanding a synthetic runtime/framework harness" in prompt
+        assert "navigation/history stacks" in prompt
+        assert "combine multiple fake runtime subsystems" in prompt
+        assert "fake DOM/window" in prompt
+        assert "network/fetch" in prompt
+        assert "fixing one fake" in prompt
+        assert "subsystem at a time" in prompt
+        assert "coverage through existing project-standard seams" in prompt
+        assert "Do not fix a generated test failure by adding a new skipped" in prompt
+        assert "expected to be skipped" in prompt
+        assert "structured TESTABILITY GAP block" in prompt
+        assert "covered_by: <existing-surface tests/seams added or preserved, or none>" in prompt
         assert "Treat build files" in prompt
         assert "TEST FAILURE TRIAGE:" in prompt
         assert "classification: production_defect | stale_test | malformed_test | unclear" in prompt
         assert "chosen_fix: production_code | test_code" in prompt
+
+    def test_test_only_prompt_includes_synthetic_harness_audit_context(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["tests/LoginTest.kt"]
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        state.record_synthetic_test_harness_audit(
+            "test_writer",
+            [
+                {
+                    "path": "tests/LoginTest.kt",
+                    "subsystems": ["event_dispatch", "navigation_history", "network_server"],
+                    "recommendation": "Replace with narrower existing-seam coverage.",
+                    "evidence": [
+                        {
+                            "category": "event_dispatch",
+                            "lines": [{"line": 10, "excerpt": "class FakeEventTarget {}"}],
+                        }
+                    ],
+                }
+            ],
+        )
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+
+        prompt = stub_llm.agent_calls[0]
+        assert "SYNTHETIC TEST HARNESS AUDIT CONTEXT (non-blocking):" in prompt
+        assert "harness does not remain in branch output" in prompt
+        assert "tests/LoginTest.kt" in prompt
+        assert "event_dispatch, navigation_history, network_server" in prompt
+
+    def test_repeated_generated_test_failures_add_harness_replacement_context(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["tests/LoginTest.kt"]
+        stub_llm.agent_output = (
+            "TEST FAILURE TRIAGE:\nclassification: malformed_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["tests/LoginTest.kt failed in generated fake navigation harness"]
+        state.test_files_written = ["tests/LoginTest.kt"]
+        state.generated_test_fix_counts = {"tests/LoginTest.kt": 2}
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+
+        prompt = stub_llm.agent_calls[0]
+        assert "REPEATED GENERATED TEST FIX CONTEXT:" in prompt
+        assert "already made 2 test-only fixer pass(es)" in prompt
+        assert "Do not keep patching small pieces of a brittle synthetic runtime harness" in prompt
+        assert "combines fake runtime subsystems" in prompt
+        assert "navigation/history/router" in prompt
+        assert "network/fetch" in prompt
+        assert "existing project-standard seams" in prompt
+        assert "GENERATED TEST RE-TRIAGE:" in prompt
+        assert "replace_with_narrower_seam_test" in prompt
+        assert "remove_malformed_generated_test" in prompt
+        assert "report_testability_gap" in prompt
+        assert "coverage targets as applying only to runnable behaviour" in prompt
+        assert "TESTABILITY GAP" in prompt
+
+    def test_repeated_generated_test_context_ignores_fix_cycle_records(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["tests/LoginTest.kt"]
+        stub_llm.agent_output = (
+            "TEST FAILURE TRIAGE:\nclassification: malformed_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["tests/LoginTest.kt failed in generated fake navigation harness"]
+        state.test_files_written = ["tests/LoginTest.kt"]
+        state.fix_cycle_records = [
+            {"triage_pass": "test_only", "files_written": ["tests/LoginTest.kt"]},
+            {"triage_pass": "test_only", "files_written": ["tests/LoginTest.kt"]},
+        ]
+
+        _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert "REPEATED GENERATED TEST FIX CONTEXT:" not in stub_llm.agent_calls[0]
+        assert state.generated_test_fix_counts == {"tests/LoginTest.kt": 1}
+
+    def test_generated_test_retriage_parser_stops_before_next_structured_block(self):
+        retriage = _parse_generated_test_retriage(
+            "TEST FAILURE TRIAGE:\n"
+            "classification: malformed_test\n"
+            "chosen_fix: test_code\n\n"
+            "GENERATED TEST RE-TRIAGE:\n"
+            "strategy: report_testability_gap\n"
+            "target: generated browser harness\n"
+            "reason: configured tests cannot run browser interactions\n"
+            "covered_by: route contract tests\n\n"
+            "TESTABILITY GAP:\n"
+            "target: browser navigation\n"
+        )
+
+        assert retriage == {
+            "message": (
+                "GENERATED TEST RE-TRIAGE:\n"
+                "strategy: report_testability_gap\n"
+                "target: generated browser harness\n"
+                "reason: configured tests cannot run browser interactions\n"
+                "covered_by: route contract tests"
+            ),
+            "strategy": "report_testability_gap",
+            "target": "generated browser harness",
+            "reason": "configured tests cannot run browser interactions",
+            "covered_by": "route contract tests",
+        }
+
+    def test_generated_test_retriage_parser_requires_required_fields(self):
+        assert _parse_generated_test_retriage("GENERATED TEST RE-TRIAGE:\n") is None
+        assert (
+            _parse_generated_test_retriage(
+                "GENERATED TEST RE-TRIAGE:\n"
+                "strategy: report_testability_gap\n"
+                "target: generated browser harness\n"
+                "reason: configured tests cannot run browser interactions\n"
+            )
+            is None
+        )
+        assert (
+            _parse_generated_test_retriage(
+                "GENERATED TEST RE-TRIAGE:\n"
+                "strategy: keep_patching\n"
+                "target: generated browser harness\n"
+                "reason: configured tests cannot run browser interactions\n"
+                "covered_by: route contract tests\n"
+            )
+            is None
+        )
+
+    def test_test_only_fixer_output_records_testability_gap(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["tests/LoginTest.kt"]
+        stub_llm.agent_output = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: malformed_test\n"
+            "contract_affected: none\n"
+            "chosen_fix: test_code\n\n"
+            "TESTABILITY GAP:\n"
+            "target: browser detail navigation\n"
+            "reason: configured validation has no DOM runtime\n"
+            "covered_by: route parser tests\n"
+            "recommended_action: add project-standard browser test helper\n"
+            "risk: medium\n"
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state(active_scope="final_full_task", build_iterations=3)
+        state.test_errors = ["tests/LoginTest.kt failed because document is not defined"]
+
+        result = _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert result.success
+        assert len(state.testability_gaps) == 1
+        gap = state.testability_gaps[0]
+        assert gap["source"] == "fixer"
+        assert gap["scope"] == "final_full_task"
+        assert gap["build_iteration"] == 3
+        assert gap["target"] == "browser detail navigation"
+        assert gap["reason"] == "configured validation has no DOM runtime"
+        assert gap["covered_by"] == "route parser tests"
+        assert gap["recommended_action"] == "add project-standard browser test helper"
+        assert gap["risk"] == "medium"
+        assert any(entry["action"] == "testability_gap" and entry["agent"] == "fixer" for entry in state.history)
+
+    def test_repeated_generated_test_retriage_is_recorded(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["tests/LoginTest.kt"]
+        stub_llm.agent_output = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: malformed_test\n"
+            "contract_affected: none\n"
+            "chosen_fix: test_code\n\n"
+            "GENERATED TEST RE-TRIAGE:\n"
+            "strategy: replace_with_narrower_seam_test\n"
+            "target: LoginTest generated navigation harness\n"
+            "reason: repeated failures show the test surface is wrong\n"
+            "covered_by: route state tests\n"
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["tests/LoginTest.kt failed in generated fake navigation harness"]
+        state.test_files_written = ["tests/LoginTest.kt"]
+        state.generated_test_fix_counts = {"tests/LoginTest.kt": 2}
+
+        result = _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert result.success
+        retriage = state.fix_cycle_records[-1]["generated_test_retriage"]
+        assert retriage["strategy"] == "replace_with_narrower_seam_test"
+        assert retriage["target"] == "LoginTest generated navigation harness"
+        assert retriage["reason"] == "repeated failures show the test surface is wrong"
+        assert retriage["covered_by"] == "route state tests"
+        assert state.generated_test_fix_counts["tests/LoginTest.kt"] == 3
+
+    def test_missing_generated_test_retriage_restores_attempt_and_retries(self, file_tool, tmp_project: Path, caplog):
+        (tmp_project / "tests").mkdir()
+        (tmp_project / "tests" / "LoginTest.py").write_text("# placeholder test\n")
+        subprocess.run(["git", "add", "."], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add test"], cwd=tmp_project, check=True, capture_output=True)
+
+        test_triage = (
+            "TEST FAILURE TRIAGE:\nclassification: malformed_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        )
+        retriage = (
+            test_triage + "\nGENERATED TEST RE-TRIAGE:\n"
+            "strategy: replace_with_narrower_seam_test\n"
+            "target: generated login harness\n"
+            "reason: repeated generated test failures point to a malformed harness\n"
+            "covered_by: route state tests\n"
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                (
+                    {"tests/LoginTest.py": "assert False\n"},
+                    ["tests/LoginTest.py"],
+                    test_triage + "\nGENERATED TEST RE-TRIAGE:\n",
+                ),
+                (
+                    {"tests/LoginTest.py": "assert True\n"},
+                    ["tests/LoginTest.py"],
+                    retriage,
+                ),
+            ]
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["tests/LoginTest.py failed in generated fake runtime harness"]
+        state.test_files_written = ["tests/LoginTest.py"]
+        state.generated_test_fix_counts = {"tests/LoginTest.py": 2}
+
+        with caplog.at_level(logging.INFO, logger="agents.fixer_agent"):
+            result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert result.success
+        assert (tmp_project / "tests" / "LoginTest.py").read_text() == "assert True\n"
+        assert len(llm.agent_calls) == 2
+        assert "GENERATED TEST RE-TRIAGE RECOVERY" in llm.agent_calls[1]
+        violation = state.fix_cycle_records[0]["generated_test_retriage_violation"]
+        assert violation["generated_test_files"] == ["tests/LoginTest.py"]
+        assert violation["restored_files"] == ["tests/LoginTest.py"]
+        assert violation["retry"] is True
+        retry_record = state.fix_cycle_records[1]
+        assert retry_record["triage_pass"] == "test_only_retry"
+        assert retry_record["generated_test_retriage"]["strategy"] == "replace_with_narrower_seam_test"
+        assert state.generated_test_fix_counts["tests/LoginTest.py"] == 4
+        assert state.files_changed == ["tests/LoginTest.py"]
+        assert any(e["action"] == "generated_test_retriage_violation_reverted" for e in state.history)
+        assert (
+            "Generated test re-triage missing for tests/LoginTest.py - restored tests/LoginTest.py and retrying fixer"
+        ) in caplog.text
+        assert "Retrying fixer agent with test_only_retry recovery prompt" in caplog.text
+
+    def test_repeated_missing_generated_test_retriage_continues_after_retry_audit(
+        self,
+        file_tool,
+        tmp_project: Path,
+        caplog,
+    ):
+        (tmp_project / "tests").mkdir()
+        (tmp_project / "tests" / "LoginTest.py").write_text("# placeholder test\n")
+        subprocess.run(["git", "add", "."], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add test"], cwd=tmp_project, check=True, capture_output=True)
+
+        test_triage = (
+            "TEST FAILURE TRIAGE:\nclassification: malformed_test\ncontract_affected: none\nchosen_fix: test_code\n"
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                (
+                    {"tests/LoginTest.py": "assert False\n"},
+                    ["tests/LoginTest.py"],
+                    test_triage,
+                ),
+                (
+                    {"tests/LoginTest.py": "assert 1 == 1\n"},
+                    ["tests/LoginTest.py"],
+                    test_triage,
+                ),
+            ]
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["tests/LoginTest.py failed in generated fake runtime harness"]
+        state.test_files_written = ["tests/LoginTest.py"]
+        state.generated_test_fix_counts = {"tests/LoginTest.py": 2}
+
+        with caplog.at_level(logging.INFO, logger="agents.fixer_agent"):
+            result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert result.success
+        assert state.failed is False
+        assert (tmp_project / "tests" / "LoginTest.py").read_text() == "assert 1 == 1\n"
+        assert len(llm.agent_calls) == 2
+        assert state.fix_cycle_records[0]["generated_test_retriage_violation"]["retry"] is True
+        assert state.fix_cycle_records[1]["generated_test_retriage_violation"]["retry"] is False
+        assert state.generated_test_fix_counts["tests/LoginTest.py"] == 4
+        assert state.files_changed == ["tests/LoginTest.py"]
+        assert any(e["action"] == "generated_test_retriage_violation_continue" for e in state.history)
+        assert "Generated test re-triage still missing after retry for tests/LoginTest.py" in caplog.text
 
     def test_build_errors_use_production_write_paths(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["src/Login.kt"]

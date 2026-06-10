@@ -20,12 +20,14 @@ from agents.base_agent import (
     tech_stack as _tech_stack,
 )
 from core.state import TaskState
+from core.synthetic_test_harness_audit import prompt_context_for_records as _synthetic_harness_prompt_context
 
 log = logging.getLogger(__name__)
 
 _MAX_DIFF_CHARS = 40_000
 _DEFAULT_COVERAGE_TARGET = 90
 _TESTABILITY_GAP_MARKER = "TESTABILITY GAP:"
+_TESTABILITY_GAP_FIELDS = {"target", "reason", "covered_by", "recommended_action", "risk"}
 _TESTABILITY_GAP_POLICY_FAIL = "fail"
 _TEST_SURFACE_POLICY_COMPLETE = "complete"
 _TEST_SURFACE_POLICY_EXISTING_INFRASTRUCTURE = "existing_infrastructure"
@@ -35,7 +37,7 @@ _TEST_SURFACE_POLICY_INSTRUCTIONS = {
         "complete: Aim to cover the complete changed behavior. If important behavior "
         "cannot be meaningfully tested without adding missing project test infrastructure "
         "or seams, report a TESTABILITY GAP using the structured block below instead of "
-        "substituting broad source-inspection tests."
+        "substituting broad source-inspection tests or synthetic runtime/framework harnesses."
     ),
     _TEST_SURFACE_POLICY_EXISTING_INFRASTRUCTURE: (
         "existing_infrastructure: Use only existing project test infrastructure and "
@@ -46,7 +48,9 @@ _TEST_SURFACE_POLICY_INSTRUCTIONS = {
         "and report a TESTABILITY GAP only when an acceptance contract still cannot be "
         "meaningfully checked within this configured test surface. Do not use broad "
         "source-inspection tests to pretend an out-of-surface UI/browser/device/runtime "
-        "behavior was meaningfully tested."
+        "behavior was meaningfully tested. Coverage targets apply only inside this "
+        "configured surface and never justify inventing missing runtime infrastructure "
+        "or adding skipped tests for behavior the configured validation cannot execute."
     ),
 }
 
@@ -67,6 +71,10 @@ CONSTRAINTS — follow strictly:
 - NEVER modify or delete any production source file
 - NEVER delete existing tests unless they directly conflict with the new behaviour
 - Do not write tests that pass trivially (empty assertions, always-true conditions)
+- Do not add skipped, disabled, ignored, expected-failure, assumption-gated, or
+  environment-gated tests as a substitute for real coverage of changed behaviour. A test that
+  is expected to be skipped, or expected to fail, in Sikula's configured validation pipeline
+  does not count as coverage.
 - Tests must not leave generated source/runtime files, snapshots, reports, caches, or other
   repository changes behind during normal test execution. If a test needs temporary files,
   write them to an OS temp directory or a project-ignored temp/cache path and clean them up.
@@ -96,6 +104,25 @@ TESTING RULES:
 - Within the configured test surface, achieve at least {coverage_target}% branch and line
   coverage on all new or changed code. Think through every branch — including early returns,
   null checks, and error paths — before deciding a test is complete.
+- The coverage target is subordinate to the configured test surface. Do not synthesize a
+  mini-version of the platform, framework, or application runtime to reach coverage.
+  Test-local fakes that reimplement render trees, selector engines, event dispatch,
+  lifecycle schedulers, navigation/history stacks, dependency containers, device/emulator
+  APIs, filesystems, servers, command runners, or other runtime infrastructure count as
+  new harnesses. Use existing project-standard helpers/seams instead. Small local test
+  doubles are acceptable only when they stand in for a narrow dependency of a stable public
+  API and do not recreate the framework or runtime around the code under test.
+- Combining multiple test-local fake runtime subsystems in one test/helper is a strong
+  signal that the test is recreating missing infrastructure, not using existing
+  infrastructure. Examples include any coupled fake DOM/window, event dispatch,
+  navigation/history/router, network/fetch, filesystem, server, scheduler, command-runner,
+  or dependency-container model. Do not build a whole local runtime world around an entry
+  point. Split coverage into narrower pure seams, public contracts, or existing helpers,
+  then report a TESTABILITY GAP for behaviour that still cannot be executed meaningfully.
+- If changed behaviour requires runtime infrastructure that is absent from the configured
+  test surface, do not add a new skipped/disabled/ignored/assumption-gated test to make the
+  test file look complete. Add meaningful coverage through stable existing seams where
+  possible, then output a structured TESTABILITY GAP for the remaining unexecuted behaviour.
 - Nullability requires explicit test cases. Every nullable parameter, return value, or state
   field that takes part in the changed code must have at least one test that exercises the
   null / absent path. Missed null branches are one of the most common causes of coverage gaps.
@@ -165,10 +192,12 @@ TESTING RULES:
   from the test file or repository root, do not depend on the test runner's current working
   directory, and do not require production source, build configuration, dependency
   declarations, runtime configuration, or pipeline settings to change just so the inspection
-  test can pass.
+  test can pass. Do not replace missing coverage with skipped or disabled tests; report the
+  gap instead.
   TESTABILITY GAP:
   target: <behaviour or contract that remains untested>
   reason: <missing seam, missing test harness, unavailable helper, etc.>
+  covered_by: <existing-surface tests/seams added or preserved, or none>
   recommended_action: <project-level test infrastructure or seam needed>
   risk: low | medium | high
 
@@ -178,6 +207,8 @@ WHAT WAS IMPLEMENTED:
 ORIGINAL TASK DESCRIPTION:
 {task_description}
 {step_scope}
+
+{synthetic_harness_audit_context}
 
 Use the original task description to honor explicit testing requirements.
 For multi-step tasks, use CURRENT STEP as the primary scope signal. Do not add
@@ -278,7 +309,7 @@ def _gap_from_lines(lines: list[str]) -> dict:
         if not sep:
             continue
         normalized_key = key.strip().lower().replace(" ", "_")
-        if normalized_key in {"target", "reason", "recommended_action", "risk"}:
+        if normalized_key in _TESTABILITY_GAP_FIELDS:
             gap[normalized_key] = value.strip()
     return gap
 
@@ -351,6 +382,7 @@ class TestWriterAgent(BaseAgent):
             implementation_prompt=state.implementation_prompt,
             task_description=state.task_description,
             step_scope=_step_scope(state),
+            synthetic_harness_audit_context=_synthetic_harness_prompt_context(state.synthetic_test_harness_records),
             files_changed="\n".join(f"  - {f}" for f in state.files_changed),
             diff=diff,
         )
@@ -397,6 +429,7 @@ class TestWriterAgent(BaseAgent):
                 gap["message"],
                 target=gap.get("target"),
                 reason=gap.get("reason"),
+                covered_by=gap.get("covered_by"),
                 recommended_action=gap.get("recommended_action"),
                 risk=gap.get("risk"),
             )
