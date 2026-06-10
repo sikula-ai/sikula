@@ -18,6 +18,7 @@ _reset_failed_state = _sikula._reset_failed_state
 _print_review_summary = _sikula._print_review_summary
 _print_task_audit_report = _sikula._print_task_audit_report
 _task_audit_warnings = _sikula._task_audit_warnings
+_task_failed_issues = _sikula._task_failed_issues
 _task_recovered_issues = _sikula._task_recovered_issues
 _dev_version_suffix = _sikula._dev_version_suffix
 _sikula_version = _sikula._sikula_version
@@ -702,6 +703,32 @@ class TestTaskAuditReport:
         assert "fixer used production-confirmed test failure triage: 1" in out
         assert _task_audit_warnings(state)
         assert _task_recovered_issues(state)
+
+    def test_failed_report_uses_validation_records_when_active_errors_are_empty(self, capsys):
+        from core.state import TaskState
+
+        state = TaskState(task_id="t1", task_description="task")
+        state.failed = True
+        state.test_status = "failed"
+        state.validation_cycle_records.append(
+            {
+                "phase": "test",
+                "status": "failed",
+                "diagnostic_summary": ["tests/login_test.py:12: AssertionError: expected login"],
+            }
+        )
+
+        warning_count = _print_task_audit_report(state)
+
+        out = capsys.readouterr().out
+        assert warning_count == 0
+        assert state.errors == []
+        assert state.test_errors == []
+        assert state.check_errors == []
+        assert "Failed issues:" in out
+        assert "validation failed: test x1 (showing up to 8 sampled diagnostics; see: sikula show t1)" in out
+        assert "test: tests/login_test.py:12: AssertionError: expected login" in out
+        assert _task_failed_issues(state)
 
     def test_testability_gap_samples_are_deduplicated(self, capsys):
         from core.state import TaskState

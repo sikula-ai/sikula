@@ -1080,6 +1080,7 @@ class FixerAgent(BaseAgent):
                 action = "generated_test_retriage_violation_restore_failed"
             state.record(self.name, action, reason[:500])
 
+        violation_continue_restored = False
         if uses_test_failure_triage:
             allowed_write_paths = _write_paths_for_state(state, sandbox, test_origin_validation=test_origin_validation)
             test_constraint = _test_constraint(state, test_origin_validation=test_origin_validation)
@@ -1146,10 +1147,26 @@ class FixerAgent(BaseAgent):
                         return _fail_after_changes(changed, msg)
                     if not will_retry:
                         log.warning(
-                            "Generated test re-triage still missing after retry for %s - continuing after audit",
+                            "Generated test re-triage still missing after retry for %s - restoring writes and continuing",
                             ", ".join(generated_test_files),
                         )
+                        restored_files, restore_errors = _restore_attempt_writes(changed, artifact_before)
+                        if state.fix_cycle_records:
+                            viol = state.fix_cycle_records[-1].get("generated_test_retriage_violation", {})
+                            viol["restored_files"] = restored_files
+                            viol["restore_errors"] = restore_errors
                         state.record(self.name, "generated_test_retriage_violation_continue", reason[:500])
+                        if restore_errors:
+                            log.error(
+                                "Generated test re-triage violation restore failed for %s: %s",
+                                ", ".join(generated_test_files),
+                                "; ".join(restore_errors),
+                            )
+                            return _fail_after_changes(changed, f"{reason}; failed to restore: {restore_errors}")
+                        # Files restored: no net changes on disk. Signal to the success path below
+                        # to skip error-clearing so the next iteration gets correct error context.
+                        violation_continue_restored = True
+                        changed = []
                         break
                     log.warning(
                         "Generated test re-triage missing for %s - restored %s and retrying fixer",
@@ -1251,6 +1268,14 @@ class FixerAgent(BaseAgent):
                 return result
 
         if not changed:
+            if violation_continue_restored:
+                # Writes were restored after a GENERATED TEST RE-TRIAGE protocol violation.
+                # Clear errors as normal — the next test run will repopulate them fresh.
+                state.errors.clear()
+                state.test_errors.clear()
+                state.check_errors.clear()
+                state.record(self.name, "fix_no_net_change", "violation_continue writes restored")
+                return AgentResult(success=True, message="Restored violating writes; no net changes")
             msg = "Agent made no file changes"
             state.record(self.name, "fix_failed", msg)
             return AgentResult(success=False, message=msg)

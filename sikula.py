@@ -1113,6 +1113,22 @@ def _task_recovered_issues(state) -> list[str]:
     return recovered
 
 
+def _task_failed_issues(state) -> list[str]:
+    if not state.failed or state.done:
+        return []
+
+    validation_failures = _validation_failure_summary(getattr(state, "validation_cycle_records", []))
+    if not validation_failures:
+        return []
+
+    failed = [
+        f"validation failed: {validation_failures} "
+        f"(showing up to {_RECOVERED_DIAGNOSTIC_LIMIT} sampled diagnostics; see: sikula show {state.task_id})"
+    ]
+    failed.extend(_validation_failure_diagnostics(getattr(state, "validation_cycle_records", [])))
+    return failed
+
+
 def _print_limited_lines(lines: list[str], task_id: str, limit: int = 8) -> None:
     for line in lines[:limit]:
         print(f"  - {line}")
@@ -1124,6 +1140,7 @@ def _print_limited_lines(lines: list[str], task_id: str, limit: int = 8) -> None
 def _print_task_audit_report(state) -> int:
     warnings = _task_audit_warnings(state)
     recovered = _task_recovered_issues(state)
+    failed = _task_failed_issues(state)
 
     print("Validation:")
     print(f"  build: {_validation_status(state.build_status)}")
@@ -1145,6 +1162,10 @@ def _print_task_audit_report(state) -> int:
     if recovered:
         print("Recovered issues:")
         _print_limited_lines(recovered, state.task_id, limit=_RECOVERED_DIAGNOSTIC_LIMIT + 2)
+
+    if failed:
+        print("Failed issues:")
+        _print_limited_lines(failed, state.task_id, limit=_RECOVERED_DIAGNOSTIC_LIMIT + 2)
 
     return len(warnings)
 

@@ -667,7 +667,7 @@ class TestFixerAgentWritePaths:
         ) in caplog.text
         assert "Retrying fixer agent with test_only_retry recovery prompt" in caplog.text
 
-    def test_repeated_missing_generated_test_retriage_continues_after_retry_audit(
+    def test_repeated_missing_generated_test_retriage_restores_writes_and_continues(
         self,
         file_tool,
         tmp_project: Path,
@@ -704,15 +704,23 @@ class TestFixerAgentWritePaths:
         with caplog.at_level(logging.INFO, logger="agents.fixer_agent"):
             result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
 
+        # Both attempts violated the GENERATED TEST RE-TRIAGE protocol. Second attempt's writes
+        # are restored so no bad fix accumulates on disk. Task continues (success=True) and
+        # errors are cleared so the next test run can append fresh errors without accumulation.
         assert result.success
         assert state.failed is False
-        assert (tmp_project / "tests" / "LoginTest.py").read_text() == "assert 1 == 1\n"
+        assert (tmp_project / "tests" / "LoginTest.py").read_text() == "# placeholder test\n"
         assert len(llm.agent_calls) == 2
         assert state.fix_cycle_records[0]["generated_test_retriage_violation"]["retry"] is True
         assert state.fix_cycle_records[1]["generated_test_retriage_violation"]["retry"] is False
+        assert state.fix_cycle_records[1]["generated_test_retriage_violation"]["restored_files"] == [
+            "tests/LoginTest.py"
+        ]
         assert state.generated_test_fix_counts["tests/LoginTest.py"] == 4
-        assert state.files_changed == ["tests/LoginTest.py"]
+        assert state.files_changed == []
+        assert state.test_errors == []
         assert any(e["action"] == "generated_test_retriage_violation_continue" for e in state.history)
+        assert any(e["action"] == "fix_no_net_change" for e in state.history)
         assert "Generated test re-triage still missing after retry for tests/LoginTest.py" in caplog.text
 
     def test_build_errors_use_production_write_paths(self, stub_llm: StubLLMClient, file_tool):
