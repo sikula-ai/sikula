@@ -971,6 +971,22 @@ def _build_contract_preflight_snapshot(task_path: Path, cfg: dict, project_root:
         return _contract_preflight_error_snapshot(task_path, project_root, exc)
 
 
+def _contract_preflight_config(cfg: dict, overrides: dict) -> dict:
+    from core.validation_coverage import INTERNAL_PIPELINE_CONFIG_KEY
+
+    def _phase(key: str) -> bool:
+        cli_val = overrides.get(key)
+        return cfg.get(key, False) if cli_val is None else cli_val
+
+    effective = dict(cfg)
+    effective[INTERNAL_PIPELINE_CONFIG_KEY] = {
+        "run_build": _phase("run_build"),
+        "run_tests": _phase("run_tests"),
+        "run_checks": _phase("run_checks"),
+    }
+    return effective
+
+
 def _contract_preflight_record_result(snapshot: dict) -> str:
     status = str(snapshot.get("status") or "unknown").upper()
     score = snapshot.get("readiness_score")
@@ -1445,7 +1461,10 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
         description = task_path.read_text().strip()
         state = store.create(description)
         state.task_file = Path(args.task_file).name
-        state.implementation_contract = _build_contract_preflight_snapshot(task_path, cfg, original_project_root)
+        preflight_cfg = _contract_preflight_config(cfg, overrides)
+        state.implementation_contract = _build_contract_preflight_snapshot(
+            task_path, preflight_cfg, original_project_root
+        )
         state.record("orchestrator", "contract_check", _contract_preflight_record_result(state.implementation_contract))
         store.save(state)
         _print_contract_preflight_summary(state.implementation_contract)

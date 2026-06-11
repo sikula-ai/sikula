@@ -662,6 +662,47 @@ class TestCmdRunStateStore:
         assert state.implementation_contract["source"]["sha256"].startswith("sha256:")
         assert not (tmp_path / ".sikula" / "contracts").exists()
 
+    def test_task_file_contract_preflight_uses_cli_phase_overrides(self, tmp_path: Path):
+        task_file = tmp_path / "task.md"
+        task_file.write_text(
+            "# Add endpoint\n\n"
+            "## Scope\nAdd a small endpoint.\n\n"
+            "## Acceptance criteria\n- It returns a successful response.\n\n"
+            "## Validation\n- `pytest`\n- `python -m ruff format --check .`\n"
+        )
+        cfg = _run_cfg(tmp_path)
+        cfg["run_build"] = True
+        cfg["run_tests"] = True
+        cfg["run_checks"] = True
+        cfg["build"] = {"checks": [{"name": "format", "command": "python -m ruff format --check ."}]}
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            task_id = state_store.list_tasks()[0]
+            state = state_store.load(task_id)
+            state.done = True
+            mock.run.return_value = state
+            return mock
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit"),
+        ):
+            cmd_run(
+                _run_args(task_file=str(task_file), no_isolate=True, tests=False, checks=False),
+                cfg,
+            )
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.implementation_contract["validation"] == {
+            "task_command_count": 2,
+            "configured_command_count": 1,
+            "covered_command_count": 0,
+            "coverage_gap_count": 2,
+        }
+
     def test_task_file_contract_preflight_error_is_warning_only(self, tmp_path: Path, capsys):
         task_file = tmp_path / "task.md"
         task_file.write_text("do something")
