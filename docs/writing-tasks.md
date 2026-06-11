@@ -31,6 +31,9 @@ project has a configured Sikula build/test/check pipeline, the task does not
 need to repeat those commands unless it requires additional project-specific
 validation. The readiness score is a preflight signal, not a guarantee that the
 task will succeed.
+Normal `sikula run TASK_FILE` records the same check as a compact, warning-only
+state snapshot and prints a one-line summary before agents start; it does not
+write `.sikula/contracts` artifacts.
 
 The examples use Markdown because it is easier to structure and review, but
 plain-text `.txt` task files are supported too.

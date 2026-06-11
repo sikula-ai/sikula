@@ -54,6 +54,7 @@ Per-agent LLM flags (repeatable, agent name uses _ or -):
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 import json
 import logging
@@ -900,6 +901,123 @@ def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
             print(f"- {write_result.answers_path}")
 
 
+def _contract_preflight_path(path: Path, project_root: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
+def _contract_preflight_snapshot(result, task_path: Path, project_root: Path) -> dict:
+    validation = result.validation or {}
+    return {
+        "schema_version": 1,
+        "checked_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "source": {
+            "path": _contract_preflight_path(task_path, project_root),
+            "format": result.source.get("format"),
+            "sha256": result.source.get("sha256"),
+        },
+        "readiness_score": result.readiness_score,
+        "status": result.status,
+        "ready_for_autonomous_delivery": result.ready_for_autonomous_delivery,
+        "sections_detected": dict(result.sections_detected),
+        "scores": dict(result.scores),
+        "gaps": [
+            {
+                "id": gap.id,
+                "severity": gap.severity,
+                "category": gap.category,
+                "message": gap.message,
+            }
+            for gap in result.gaps
+        ],
+        "clarifying_question_ids": [question.id for question in result.clarifying_questions],
+        "suggested_sections": list(result.suggested_sections),
+        "validation": {
+            "task_command_count": len(validation.get("task_commands") or []),
+            "configured_command_count": len(validation.get("configured_commands") or []),
+            "covered_command_count": len(validation.get("covered_commands") or []),
+            "coverage_gap_count": len(validation.get("coverage_gaps") or []),
+        },
+    }
+
+
+def _contract_preflight_error_snapshot(task_path: Path, project_root: Path, error: Exception) -> dict:
+    source_format = "text" if task_path.suffix.lower() == ".txt" else "markdown"
+    return {
+        "schema_version": 1,
+        "checked_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "source": {
+            "path": _contract_preflight_path(task_path, project_root),
+            "format": source_format,
+            "sha256": None,
+        },
+        "status": "error",
+        "ready_for_autonomous_delivery": False,
+        "error": _short_audit_line(str(error), limit=500),
+    }
+
+
+def _build_contract_preflight_snapshot(task_path: Path, cfg: dict, project_root: Path) -> dict:
+    from core.contract_check import check_contract_file
+
+    try:
+        result = check_contract_file(task_path, project_config=cfg or None)
+        return _contract_preflight_snapshot(result, task_path, project_root)
+    except Exception as exc:
+        log.warning("Implementation contract preflight failed: %s", exc)
+        return _contract_preflight_error_snapshot(task_path, project_root, exc)
+
+
+def _contract_preflight_config(cfg: dict, overrides: dict) -> dict:
+    from core.validation_coverage import INTERNAL_PIPELINE_CONFIG_KEY
+
+    def _phase(key: str) -> bool:
+        cli_val = overrides.get(key)
+        return cfg.get(key, False) if cli_val is None else cli_val
+
+    effective = dict(cfg)
+    effective[INTERNAL_PIPELINE_CONFIG_KEY] = {
+        "run_build": _phase("run_build"),
+        "run_tests": _phase("run_tests"),
+        "run_checks": _phase("run_checks"),
+    }
+    return effective
+
+
+def _contract_preflight_record_result(snapshot: dict) -> str:
+    status = str(snapshot.get("status") or "unknown").upper()
+    score = snapshot.get("readiness_score")
+    if isinstance(score, int):
+        return f"{status} {score}/100"
+    return status
+
+
+def _print_contract_preflight_summary(snapshot: dict) -> None:
+    status = str(snapshot.get("status") or "unknown").upper()
+    score = snapshot.get("readiness_score")
+    if status == "ERROR":
+        print(f"Implementation contract: unavailable (warning-only): {snapshot.get('error', 'unknown error')}")
+        return
+
+    gaps = snapshot.get("gaps") if isinstance(snapshot.get("gaps"), list) else []
+    blocking = sum(1 for gap in gaps if isinstance(gap, dict) and gap.get("severity") == "blocking")
+    questions = snapshot.get("clarifying_question_ids")
+    question_count = len(questions) if isinstance(questions, list) else 0
+    score_text = f"{score}/100" if isinstance(score, int) else "unknown score"
+    details: list[str] = []
+    if gaps:
+        details.append(f"{len(gaps)} gap(s)")
+    if blocking:
+        details.append(f"{blocking} blocking")
+    if question_count:
+        details.append(f"{question_count} follow-up question(s)")
+    suffix = f" ({', '.join(details)})" if details else ""
+    print(f"Implementation contract: {status} {score_text}{suffix}")
+
+
 def _fmt_time(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.0f}s"
@@ -1343,7 +1461,13 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
         description = task_path.read_text().strip()
         state = store.create(description)
         state.task_file = Path(args.task_file).name
+        preflight_cfg = _contract_preflight_config(cfg, overrides)
+        state.implementation_contract = _build_contract_preflight_snapshot(
+            task_path, preflight_cfg, original_project_root
+        )
+        state.record("orchestrator", "contract_check", _contract_preflight_record_result(state.implementation_contract))
         store.save(state)
+        _print_contract_preflight_summary(state.implementation_contract)
 
         if isolate:
             branch = f"sikula/{_branch_stem(args.task_file)}-{state.task_id}"

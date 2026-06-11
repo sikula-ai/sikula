@@ -576,7 +576,17 @@ class TestCmdRunStateStore:
 
     def test_task_file_with_isolate_passes_store_to_build_orchestrator(self, tmp_path: Path):
         task_file = tmp_path / "task.md"
-        task_file.write_text("do something")
+        task_file.write_text(
+            "# Greeting endpoint\n\n"
+            "## Intent\nAdd a greeting endpoint.\n\n"
+            "## Scope\nUpdate `src/app.py` only.\n\n"
+            "## Acceptance Criteria\n- Calling `/hello` returns `Hello`.\n\n"
+            "## Tests\n- Add pytest coverage for the endpoint.\n\n"
+            "## Validation\n- Run `pytest`.\n\n"
+            "## Out of Scope\n- Do not change persistence.\n\n"
+            "## Security and Privacy\n- No auth or personal data changes.\n\n"
+            "## Reviewer Focus\n- Verify the route contract.\n"
+        )
 
         captured: dict = {}
 
@@ -610,6 +620,117 @@ class TestCmdRunStateStore:
         # The store must already contain the task saved before root_path was changed to worktree.
         tasks = captured["state_store"].list_tasks()
         assert len(tasks) == 1
+        state = captured["state_store"].load(tasks[0])
+        assert state.implementation_contract["schema_version"] == 1
+        assert state.implementation_contract["source"]["path"] == "task.md"
+        assert state.implementation_contract["source"]["format"] == "markdown"
+        assert state.implementation_contract["source"]["sha256"].startswith("sha256:")
+        assert isinstance(state.implementation_contract["readiness_score"], int)
+        assert state.implementation_contract["status"] in {"ready", "warn", "weak", "not_ready"}
+        assert isinstance(state.implementation_contract["clarifying_question_ids"], list)
+        assert "validation" in state.implementation_contract
+        assert not (tmp_path / ".sikula" / "contracts").exists()
+
+    def test_task_file_no_isolate_records_contract_preflight(self, tmp_path: Path, capsys):
+        task_file = tmp_path / "task.md"
+        task_file.write_text("Goal: add endpoint\n\nAcceptance criteria:\n- It works\n\nValidation:\n- pytest\n")
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            task_id = state_store.list_tasks()[0]
+            state = state_store.load(task_id)
+            state.done = True
+            mock.run.return_value = state
+            return mock
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            cmd_run(_run_args(task_file=str(task_file), no_isolate=True), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "Implementation contract:" in out
+        exit_mock.assert_called_with(0)
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        task_ids = store.list_tasks()
+        assert len(task_ids) == 1
+        state = store.load(task_ids[0])
+        assert state.implementation_contract["source"]["path"] == "task.md"
+        assert state.implementation_contract["source"]["sha256"].startswith("sha256:")
+        assert not (tmp_path / ".sikula" / "contracts").exists()
+
+    def test_task_file_contract_preflight_uses_cli_phase_overrides(self, tmp_path: Path):
+        task_file = tmp_path / "task.md"
+        task_file.write_text(
+            "# Add endpoint\n\n"
+            "## Scope\nAdd a small endpoint.\n\n"
+            "## Acceptance criteria\n- It returns a successful response.\n\n"
+            "## Validation\n- `pytest`\n- `python -m ruff format --check .`\n"
+        )
+        cfg = _run_cfg(tmp_path)
+        cfg["run_build"] = True
+        cfg["run_tests"] = True
+        cfg["run_checks"] = True
+        cfg["build"] = {"checks": [{"name": "format", "command": "python -m ruff format --check ."}]}
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            task_id = state_store.list_tasks()[0]
+            state = state_store.load(task_id)
+            state.done = True
+            mock.run.return_value = state
+            return mock
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit"),
+        ):
+            cmd_run(
+                _run_args(task_file=str(task_file), no_isolate=True, tests=False, checks=False),
+                cfg,
+            )
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.implementation_contract["validation"] == {
+            "task_command_count": 2,
+            "configured_command_count": 1,
+            "covered_command_count": 0,
+            "coverage_gap_count": 2,
+        }
+
+    def test_task_file_contract_preflight_error_is_warning_only(self, tmp_path: Path, capsys):
+        task_file = tmp_path / "task.md"
+        task_file.write_text("do something")
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            task_id = state_store.list_tasks()[0]
+            state = state_store.load(task_id)
+            state.done = True
+            mock.run.return_value = state
+            return mock
+
+        with (
+            patch("core.contract_check.check_contract_file", side_effect=RuntimeError("contract parser unavailable")),
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            cmd_run(_run_args(task_file=str(task_file), no_isolate=True), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "Implementation contract: unavailable (warning-only)" in out
+        exit_mock.assert_called_with(0)
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.implementation_contract["status"] == "error"
+        assert "contract parser unavailable" in state.implementation_contract["error"]
 
     def test_task_file_run_refuses_current_task_worktree(self, tmp_path: Path, monkeypatch, capsys):
         current_dir = tmp_path / ".sikula" / "worktrees" / "oldtask" / "src"
@@ -658,6 +779,7 @@ class TestCmdRunStateStore:
             return mock
 
         with (
+            patch("core.contract_check.check_contract_file") as check_contract_file,
             patch("sikula.build_orchestrator", side_effect=capture_orch),
             patch("sikula._finalize_worktree", return_value=(True, False, None)),
             patch("sys.exit"),
@@ -666,6 +788,7 @@ class TestCmdRunStateStore:
 
         assert captured.get("state_store") is not None
         assert captured["state_store"].load("abc123") is not None
+        check_contract_file.assert_not_called()
 
     def test_task_id_resume_from_current_worktree_chdirs_before_finalize(self, tmp_path: Path, monkeypatch):
         from core.state import JsonStateStore, TaskState

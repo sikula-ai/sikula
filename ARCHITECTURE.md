@@ -31,7 +31,7 @@
 | `XcodeTool` | `tools/xcode_tool.py` | `BuildTool` implementation for iOS / Xcode |
 | `InitAgent` | `agents/init_agent.py` | Generates `.sikula/guidelines.md` from codebase analysis; called by `cmd_init()` only — not part of the orchestrator loop |
 | `LLMClient` | `core/llm_client.py` | Abstract interface: `generate()` for single-shot text; `run_readonly_agent()` for read-only autonomous agents; `run_agent()` for autonomous file-editing agents |
-| `ContractCheck` helpers | `core/contract_check.py` | Deterministic implementation-contract readiness checks for Markdown/plain-text task files plus explicit report-artifact writing for `sikula contract check --write-report` |
+| `ContractCheck` helpers | `core/contract_check.py` | Deterministic implementation-contract readiness checks for Markdown/plain-text task files; `sikula run` stores a warning-only state snapshot and `sikula contract check --write-report` explicitly writes report artifacts |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
 | `JsonStateStore` | `core/state.py` | Stores each task as `<task_id>.json` in the configured state dir; serializes same-process access and writes via temp-file replacement so heartbeat updates and audit saves cannot interleave partial JSON writes |
 
@@ -51,6 +51,7 @@ cmd_run()
    │     fail before creating TaskState/worktree
    │
    ├─ read task file  →  TaskState created (state.task_id = uuid4().hex)
+   │     + warning-only implementation contract snapshot stored in state
    │
    ├─ isolation (default on, skip with --no-isolate):
    │     git worktree add .sikula/worktrees/<task_id>  -b sikula/<stem>-<task_id>
@@ -118,7 +119,11 @@ specific enough to act as an implementation contract, reports gaps and stable cl
 question IDs, and can emit the same result as JSON. By default it does not write files;
 with `--write-report` it writes an explicit `.sikula/contracts/*.check.json` report and
 matching `.answers.yaml` template for follow-up answers. It does not create `TaskState`,
-start agents, create worktrees, or alter `run`/`resume`/`review` flow. When a Sikula
+start agents, create worktrees, or alter `review` flow. Fresh `sikula run TASK_FILE`
+uses the same deterministic checks to store a compact warning-only snapshot in
+`TaskState.implementation_contract` and print a one-line summary before agents start;
+it does not write `.sikula/contracts` artifacts, and `resume` reuses existing task state
+instead of recomputing the check. When a Sikula
 config is available, it reuses `core.validation_coverage` to compare task-described
 validation commands with the effective configured pipeline and treats the configured
 build/test/check pipeline as validation coverage for tasks that do not require extra
@@ -1186,6 +1191,7 @@ Sikula processes at once is still unsupported.
 | `schema_version` | `int` | `StateStore.create()` | State file schema version; used by `JsonStateStore.load()` to run migrations before constructing `TaskState`; current value is `SCHEMA_VERSION = 2` |
 | `task_file` | `str \| None` | `cmd_run()` in `sikula.py` | Basename of the task file (e.g. `add-login.md`); set on first run via `--task-file`; used by `status` for display; `None` for tasks created before this field was added or when resuming via `--task-id` only |
 | `config_snapshot` | `dict` | Orchestrator | Effective run configuration captured on first run (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `planner.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. Visible in `show <task_id>`. |
+| `implementation_contract` | `dict` | `cmd_run()` in `sikula.py` | Warning-only implementation-contract snapshot for fresh task-file runs: task path/format/hash, readiness status/score, gap metadata, clarifying question IDs, and validation coverage counts. It is additive state metadata only; resume/review flows do not recompute it or use it as a hard gate. |
 | `analyst_prompt` | `str \| None` | AnalystAgent | Full assembled prompt sent to the analyst LLM (system + user sections, including inlined guidelines content); stored before the LLM call so it captures the exact input even on exception; enables post-run analysis of analyst behaviour |
 | `planner_prompt` | `str \| None` | PlannerAgent | Full assembled prompt sent to the planner LLM (system + user sections); stored before the LLM call; `None` when `run_planner: false` or planner not yet reached |
 | `implementation_prompt` | `str \| None` | AnalystAgent | Structured prompt fed to ImplementerAgent; the analyst's key output |

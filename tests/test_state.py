@@ -72,6 +72,7 @@ class TestJsonStateStore:
         state.build_iterations = 3
         state.review_approved = True
         state.generated_test_fix_counts = {"tests/LoginTest.py": 2}
+        state.implementation_contract = {"status": "warn", "readiness_score": 72}
         state.test_writer_audit_pending = True
         state.test_writer_audit_agent_completed = True
         state.test_writer_audit_files_written = ["tests/LoginTest.py"]
@@ -83,6 +84,7 @@ class TestJsonStateStore:
         assert loaded.task_id == "abc123"
         assert loaded.build_iterations == 3
         assert loaded.review_approved is True
+        assert loaded.implementation_contract == {"status": "warn", "readiness_score": 72}
         assert loaded.generated_test_fix_counts == {"tests/LoginTest.py": 2}
         assert loaded.test_writer_audit_pending is True
         assert loaded.test_writer_audit_agent_completed is True
@@ -227,6 +229,7 @@ class TestJsonStateStore:
         data.pop("validation_cycle_records", None)
         data.pop("runtime_metadata", None)
         data.pop("final_summary", None)
+        data.pop("implementation_contract", None)
         data.pop("testability_gaps", None)
         data.pop("test_execution_gate_records", None)
         data.pop("build_loop_key", None)
@@ -239,6 +242,7 @@ class TestJsonStateStore:
         assert loaded.validation_cycle_records == []
         assert loaded.runtime_metadata == {}
         assert loaded.final_summary == {}
+        assert loaded.implementation_contract == {}
         assert loaded.testability_gaps == []
         assert loaded.test_execution_gate_records == []
         assert loaded.build_loop_key is None
