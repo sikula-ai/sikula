@@ -114,7 +114,7 @@ cp <example-config> my-project/.sikula/config.yaml
 **Write and run a task** (see [§4](#4-write-a-task) for what to include):
 
 ```bash
-sikula contract check .sikula/tasks/my-task.md  # optional read-only readiness preflight
+sikula contract check .sikula/tasks/my-task.md  # optional detailed readiness preflight
 sikula run .sikula/tasks/my-task.md
 ```
 
@@ -137,7 +137,7 @@ git diff main...sikula/<branch-name>
 - **Resumable long-running work** — interrupted isolated tasks keep their worktree and can resume from completed phases instead of starting over
 - **Independent review loops** — reviewer and security reviewer run separately from the implementer; blocking issues go back through the implementation loop before the task can finish
 - **Build-aware execution** — Sikula compiles, tests, runs configured checks, and feeds failures to a fixer until the task passes or fails explicitly
-- **Task contract preflight** — `sikula contract check TASK_FILE` inspects a task file before delivery and reports readiness, gaps, configured validation coverage, and stable follow-up question IDs without starting the agent pipeline
+- **Task contract preflight** — `sikula run TASK_FILE` records a warning-only implementation-contract snapshot in task state; `sikula contract check TASK_FILE` provides the same readiness, gap, validation coverage, and stable follow-up question details without starting the agent pipeline
 - **Precise scope control** — the analyst reads your codebase before writing the implementation prompt; the reviewer verifies call sites, structured input contracts, completeness, and scope drift before code reaches you
 - **Fits existing git and CI workflows** — output is a normal git branch and commit, ready for human review and whatever CI you already run
 - **Stack-flexible core** — Android, iOS, JVM, Node.js/TypeScript/JavaScript (including Bun), Python, and Rust are supported through platform-specific build tools; the orchestration stays the same
@@ -389,6 +389,9 @@ template is reset for the new hash. If the project config already defines the
 normal build/test/check pipeline, the task does not need to repeat those
 commands unless it requires additional validation. The score is guidance for
 improving the task, not a guarantee that the eventual Sikula run will succeed.
+Normal `sikula run TASK_FILE` also records a compact, warning-only contract
+snapshot in task state and prints a one-line summary before agents start; it
+does not create `.sikula/contracts` report files.
 
 Focus on requirements and intent. The analyst explores the codebase and works out the implementation details — include anything it cannot infer on its own: API endpoints, third-party service constraints, business rules, out-of-scope items. See `example/android/countries/.sikula/tasks/add-country-detail-screen.md` for a real runnable example, or [Writing Sikula Tasks](docs/writing-tasks.md) for optional task-writing guidance.
 

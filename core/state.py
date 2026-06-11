@@ -167,6 +167,7 @@ class TaskState:
     task_description: str
     schema_version: int = SCHEMA_VERSION
     config_snapshot: dict = field(default_factory=dict)
+    implementation_contract: dict = field(default_factory=dict)
     analyst_prompt: Optional[str] = None
     planner_prompt: Optional[str] = None
     implementation_prompt: Optional[str] = None
