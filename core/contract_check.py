@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -668,7 +668,7 @@ def _artifact_path(path: Path, artifact_base: Path) -> str:
 
 
 def _utc_timestamp() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _parse_markdown_task(text: str) -> _ParsedTask:
