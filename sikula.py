@@ -4,6 +4,7 @@
 Usage (project-centric, run from project root):
   sikula init                        # create .sikula/config.yaml
   sikula init --guidelines --provider codex --model gpt-5.5
+  sikula contract check task.md      # read-only implementation-contract preflight
   sikula run task.md                 # auto-discovers .sikula/config.yaml
   sikula run --task-id <task-id>     # resume existing task
   sikula status
@@ -76,6 +77,7 @@ _BASE = Path(__file__).parent
 # the platform brings new test skip idioms.
 _SUPPORTED_BUILD_TOOLS = {"cargo", "gradle-android", "gradle-jvm", "maven", "node", "xcodebuild", "python"}
 _RECOVERED_DIAGNOSTIC_LIMIT = 8
+_SIKULA_GITIGNORE_ENTRIES = ("state/", "worktrees/", "contracts/")
 
 
 def _git_output(args: list[str], cwd: Path) -> str | None:
@@ -212,6 +214,33 @@ def _resolve_config(config_arg: str | None) -> tuple[Path, Path | None]:
 
     print("No config found. Run 'sikula init' to set up this project, or use --config.")
     sys.exit(1)
+
+
+def _resolve_optional_config(config_arg: str | None) -> tuple[Path, Path | None] | None:
+    if config_arg:
+        return _resolve_config(config_arg)
+
+    project_root = _find_project_root()
+    if not project_root:
+        return None
+    original_root = _original_project_root_from_worktree(project_root)
+    if original_root:
+        return original_root / ".sikula" / "config.yaml", original_root
+    return project_root / ".sikula" / "config.yaml", project_root
+
+
+def _load_runtime_config(config_arg: str | None, *, required: bool = True) -> dict:
+    resolved = _resolve_config(config_arg) if required else _resolve_optional_config(config_arg)
+    if resolved is None:
+        return {}
+
+    config_path, discovered_root = resolved
+    cfg = load_config(config_path)
+    cfg["_config_path"] = str(config_path.resolve())
+    raw = cfg.get("project", {}).get("root_path", ".")
+    cfg["project"]["root_path"] = str(_resolve_root_path(raw, discovered_root, config_path))
+    _load_project_env(Path(cfg["project"]["root_path"]))
+    return cfg
 
 
 def _resolve_root_path(raw: str, discovered_root: Path | None, config_path: Path) -> Path:
@@ -412,6 +441,20 @@ def _ensure_project_gitignore_entry(project_root: Path, entry: str) -> None:
     prefix = "" if not existing or existing.endswith("\n") else "\n"
     with gitignore.open("a") as f:
         f.write(f"{prefix}{entry}\n")
+
+
+def _ensure_sikula_gitignore(sikula_dir: Path) -> None:
+    gitignore = sikula_dir / ".gitignore"
+    existing = gitignore.read_text() if gitignore.exists() else ""
+    lines = existing.splitlines()
+    missing = [entry for entry in _SIKULA_GITIGNORE_ENTRIES if entry not in {line.strip() for line in lines}]
+    if not missing:
+        return
+    content = existing
+    if content and not content.endswith("\n"):
+        content += "\n"
+    content += "".join(f"{entry}\n" for entry in missing)
+    gitignore.write_text(content)
 
 
 def _ensure_provider_gitignore_entry(project_root: Path, provider: str | None) -> None:
@@ -823,6 +866,38 @@ def _reset_failed_state(task_id: str, cfg: dict, store) -> None:
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+
+
+def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
+    from core.contract_check import check_contract_file, render_contract_check, write_contract_report
+
+    project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
+    task_path = _resolve_task_path(args.task_file, project_root)
+    if task_path is None:
+        print(f"Task file not found: {args.task_file}")
+        sys.exit(1)
+
+    result = check_contract_file(task_path, project_config=cfg or None)
+    write_result = None
+    if args.write_report:
+        report_root = project_root if cfg.get("project", {}).get("root_path") else None
+        try:
+            write_result = write_contract_report(result, task_path=task_path, project_root=report_root)
+        except (OSError, ValueError) as exc:
+            print(f"Failed to write contract report: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    if args.json:
+        data = result.to_dict()
+        if write_result:
+            data["written_report"] = write_result.to_dict()
+        print(json.dumps(data, indent=2, sort_keys=True))
+    else:
+        print(render_contract_check(result), end="")
+        if write_result:
+            print("Generated contract artifacts:")
+            print(f"- {write_result.report_path}")
+            print(f"- {write_result.answers_path}")
 
 
 def _fmt_time(seconds: float) -> str:
@@ -2548,10 +2623,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     sikula_dir.mkdir(exist_ok=True)
     (sikula_dir / "tasks").mkdir(exist_ok=True)
-
-    gitignore_path = sikula_dir / ".gitignore"
-    if not gitignore_path.exists():
-        gitignore_path.write_text("state/\nworktrees/\n")
+    _ensure_sikula_gitignore(sikula_dir)
 
     guidelines_files = list(result.guidelines_files)
     # If a previously generated guidelines file exists, keep it in the config even when
@@ -2680,6 +2752,18 @@ def main() -> None:
     )
 
     sub = parser.add_subparsers(dest="command")
+
+    contract_p = sub.add_parser("contract", help="Inspect or improve implementation contracts")
+    contract_sub = contract_p.add_subparsers(dest="contract_command")
+    contract_check_p = contract_sub.add_parser("check", help="Check a task file as an implementation contract")
+    contract_check_p.add_argument("task_file", metavar="TASK_FILE", help="Path to task .txt/.md file")
+    contract_check_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
+    contract_check_p.add_argument(
+        "--write-report",
+        action="store_true",
+        default=False,
+        help="Write .sikula/contracts check report and answers template artifacts",
+    )
 
     run_p = sub.add_parser("run", help="Run a task")
     run_p.add_argument(
@@ -2890,18 +2974,22 @@ def main() -> None:
         cmd_init(args)
         return
 
-    config_path, discovered_root = _resolve_config(args.config)
-    cfg = load_config(config_path)
-    cfg["_config_path"] = str(config_path.resolve())
-    raw = cfg.get("project", {}).get("root_path", ".")
-    cfg["project"]["root_path"] = str(_resolve_root_path(raw, discovered_root, config_path))
-    _load_project_env(Path(cfg["project"]["root_path"]))
+    cfg = _load_runtime_config(
+        args.config,
+        required=args.command != "contract",
+    )
 
     if args.command == "run":
         task_file = args.task_file_pos or args.task_file
         if not task_file and not args.task_id:
             run_p.error("provide TASK_FILE or --task-id")
         cmd_run(args, cfg)
+    elif args.command == "contract":
+        if args.contract_command == "check":
+            cmd_contract_check(args, cfg)
+        else:
+            contract_p.print_help()
+            sys.exit(1)
     elif args.command == "status":
         cmd_status(cfg, args)
     elif args.command == "show":

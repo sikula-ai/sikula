@@ -31,6 +31,7 @@
 | `XcodeTool` | `tools/xcode_tool.py` | `BuildTool` implementation for iOS / Xcode |
 | `InitAgent` | `agents/init_agent.py` | Generates `.sikula/guidelines.md` from codebase analysis; called by `cmd_init()` only — not part of the orchestrator loop |
 | `LLMClient` | `core/llm_client.py` | Abstract interface: `generate()` for single-shot text; `run_readonly_agent()` for read-only autonomous agents; `run_agent()` for autonomous file-editing agents |
+| `ContractCheck` helpers | `core/contract_check.py` | Deterministic implementation-contract readiness checks for Markdown/plain-text task files plus explicit report-artifact writing for `sikula contract check --write-report` |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
 | `JsonStateStore` | `core/state.py` | Stores each task as `<task_id>.json` in the configured state dir; serializes same-process access and writes via temp-file replacement so heartbeat updates and audit saves cannot interleave partial JSON writes |
 
@@ -110,6 +111,22 @@ the original checkout while reading the task file from the preserved worktree. R
 via `sikula run --task-id <task_id>` is supported from inside the worktree; before
 finalization Sikula switches the process directory back to the original project so the
 worktree can be removed safely.
+
+**Contract check command:** `sikula contract check TASK_FILE` is a read-only preflight
+implemented by `core/contract_check.py`. It parses the task file, scores whether it is
+specific enough to act as an implementation contract, reports gaps and stable clarifying
+question IDs, and can emit the same result as JSON. By default it does not write files;
+with `--write-report` it writes an explicit `.sikula/contracts/*.check.json` report and
+matching `.answers.yaml` template for follow-up answers. It does not create `TaskState`,
+start agents, create worktrees, or alter `run`/`resume`/`review` flow. When a Sikula
+config is available, it reuses `core.validation_coverage` to compare task-described
+validation commands with the effective configured pipeline and treats the configured
+build/test/check pipeline as validation coverage for tasks that do not require extra
+commands; without config it still runs the task-content checks and leaves validation
+coverage empty. Answers templates are task-hash scoped: when the task content hash changes,
+existing filled answers are retained only under `previous_answers`, while active `answers`
+are reset for the new hash so future `contract improve` or run preflight logic does not
+treat stale answers as authoritative.
 
 ---
 

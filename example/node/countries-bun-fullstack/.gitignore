@@ -3,4 +3,5 @@ dist/
 coverage/
 .sikula/state/
 .sikula/worktrees/
+.sikula/contracts/
 .DS_Store

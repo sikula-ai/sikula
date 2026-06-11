@@ -5,3 +5,4 @@ build/
 .DS_Store
 .sikula/state/
 .sikula/worktrees/
+.sikula/contracts/
