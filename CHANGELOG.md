@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- `sikula contract check TASK_FILE` now provides a deterministic, by-default read-only
+  implementation-contract readiness preflight for Markdown/plain-text task files, with
+  human-readable and `--json` output covering scope, acceptance criteria,
+  security/privacy, validation coverage, gaps, and stable clarifying question IDs, plus
+  optional `.sikula/contracts` report and hash-scoped answers-template artifacts via
+  `--write-report`; `sikula init` now ignores generated contract artifacts by default.
 - Task terminal summaries now include a platform-neutral audit report with validation status, review status, non-blocking audit warnings, and recovered issues such as validation failures fixed by the build/fix loop.
 - Failed validation records now include high-signal diagnostic summary lines, and task terminal summaries sample and deduplicate those lines across recovered build/test/check failures so successful self-healed runs still reveal the concrete compiler error, failed test, sanitized assertion failure, or linter rule that was repaired without echoing source-code frames or assertion values, with an explicit pointer to `sikula show` for full state details.
 - The test writer now more strongly prefers behavioural seams over broad source-inspection tests, especially for UI implementation details that cannot be meaningfully exercised by existing project test infrastructure.

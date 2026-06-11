@@ -8,6 +8,33 @@ Runnable examples live in each example project's `.sikula/tasks/` directory.
 Those files are real tasks, not mandatory templates. Use this guide when you are
 unsure how much detail to include.
 
+## Check Readiness
+
+Before running a task, you can ask Sikula to inspect whether the task file is
+specific enough to act as an implementation contract:
+
+```bash
+sikula contract check .sikula/tasks/my-task.md
+sikula contract check .sikula/tasks/my-task.md --json
+sikula contract check .sikula/tasks/my-task.md --write-report
+```
+
+The check is read-only unless `--write-report` is passed. It does not edit the
+task, create a branch, or start the agent pipeline. The output highlights
+missing scope boundaries, acceptance criteria, security/privacy notes,
+validation coverage, and follow-up questions with stable IDs. `--write-report`
+creates `.sikula/contracts/*.check.json` and `.answers.yaml` artifacts for
+review or follow-up answers. Filled answers apply only to the exact task hash in
+the template; after the task file changes, old filled answers are moved to
+`previous_answers` and the active answers are reset for the new hash. If the
+project has a configured Sikula build/test/check pipeline, the task does not
+need to repeat those commands unless it requires additional project-specific
+validation. The readiness score is a preflight signal, not a guarantee that the
+task will succeed.
+
+The examples use Markdown because it is easier to structure and review, but
+plain-text `.txt` task files are supported too.
+
 ## Principles
 
 - Describe the user-visible goal and expected behaviour.
