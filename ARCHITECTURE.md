@@ -118,20 +118,25 @@ implemented by `core/contract_check.py`. It parses the task file, scores whether
 specific enough to act as an implementation contract, reports gaps and stable clarifying
 question IDs, and can emit the same result as JSON. By default it does not write files;
 with `--write-report` it writes an explicit `.sikula/contracts/*.check.json` report and
-matching `.answers.yaml` template for follow-up answers. It does not create `TaskState`,
-start agents, create worktrees, or alter `review` flow. Fresh `sikula run TASK_FILE`
-uses the same deterministic checks to store a compact warning-only snapshot in
-`TaskState.implementation_contract` and print a one-line summary before agents start;
-it does not write `.sikula/contracts` artifacts, and `resume` reuses existing task state
-instead of recomputing the check. When a Sikula
-config is available, it reuses `core.validation_coverage` to compare task-described
-validation commands with the effective configured pipeline and treats the configured
-build/test/check pipeline as validation coverage for tasks that do not require extra
-commands; without config it still runs the task-content checks and leaves validation
-coverage empty. Answers templates are task-hash scoped: when the task content hash changes,
-existing filled answers are retained only under `previous_answers`, while active `answers`
-are reset for the new hash so future `contract improve` or run preflight logic does not
-treat stale answers as authoritative.
+matching `.answers.yaml` template for follow-up answers. `sikula contract improve
+TASK_FILE --answers ... --output ...` is the deterministic follow-up step: it verifies the
+answers file hash against the current task content, applies filled answers into a new
+Markdown implementation contract, preserves unanswered questions under `Open questions`,
+and runs the contract check on the output before writing it. It refuses accidental
+overwrites unless `--write` is explicitly used on a Markdown task; plain-text inputs can be
+improved only by writing a new Markdown output file. These commands do not create
+`TaskState`, start agents, create worktrees, or alter `review` flow. Fresh `sikula run
+TASK_FILE` uses the same deterministic checks to store a compact warning-only snapshot in
+`TaskState.implementation_contract` and print a one-line summary before agents start; it
+does not write `.sikula/contracts` artifacts, and `resume` reuses existing task state
+instead of recomputing the check. When a Sikula config is available, it reuses
+`core.validation_coverage` to compare task-described validation commands with the
+effective configured pipeline and treats the configured build/test/check pipeline as
+validation coverage for tasks that do not require extra commands; without config it still
+runs the task-content checks and leaves validation coverage empty. Answers templates are
+task-hash scoped: when the task content hash changes, existing filled answers are retained
+only under `previous_answers`, while active `answers` are reset for the new hash so future
+`contract improve` or run preflight logic does not treat stale answers as authoritative.
 
 ---
 

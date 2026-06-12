@@ -376,6 +376,9 @@ Before starting delivery, you can run a read-only implementation-contract prefli
 sikula contract check .sikula/tasks/my_task.md
 sikula contract check .sikula/tasks/my_task.md --json
 sikula contract check .sikula/tasks/my_task.md --write-report
+sikula contract improve .sikula/tasks/my_task.md \
+  --answers .sikula/contracts/my_task.answers.yaml \
+  --output .sikula/tasks/my_task.v2.md
 ```
 
 By default, this command does not create a branch or write files. It reports a
@@ -383,12 +386,17 @@ readiness score, missing contract gaps, configured validation coverage, and
 stable follow-up question IDs. Use `--write-report` when you want audit
 artifacts in `.sikula/contracts/`: a `.check.json` report and a matching
 `.answers.yaml` template keyed by those question IDs. Filled answers are active
-only for the exact task hash they were written against; if the task file changes,
-old filled answers are retained under `previous_answers` and the active answers
-template is reset for the new hash. If the project config already defines the
-normal build/test/check pipeline, the task does not need to repeat those
-commands unless it requires additional validation. The score is guidance for
-improving the task, not a guarantee that the eventual Sikula run will succeed.
+only for the exact task hash they were written against. After filling answers,
+`sikula contract improve` can deterministically write a stronger Markdown task
+file, preserving unanswered items under `Open questions` and re-running the
+contract check on the output. It refuses stale answer hashes, refuses accidental
+overwrites unless `--write` is used on a Markdown task, and writes Markdown even
+when the original task is plain text. If the task file changes, old filled
+answers are retained under `previous_answers` and the active answers template is
+reset for the new hash. If the project config already defines the normal
+build/test/check pipeline, the task does not need to repeat those commands
+unless it requires additional validation. The score is guidance for improving
+the task, not a guarantee that the eventual Sikula run will succeed.
 Normal `sikula run TASK_FILE` also records a compact, warning-only contract
 snapshot in task state and prints a one-line summary before agents start; it
 does not create `.sikula/contracts` report files.

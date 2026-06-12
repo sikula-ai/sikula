@@ -7,7 +7,13 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-from core.contract_check import check_contract, check_contract_file, render_contract_check, write_contract_report
+from core.contract_check import (
+    check_contract,
+    check_contract_file,
+    improve_contract_from_answers,
+    render_contract_check,
+    write_contract_report,
+)
 from sikula import main
 
 
@@ -409,6 +415,173 @@ def test_write_report_archives_existing_answers_when_task_hash_changes(tmp_path:
     repeated_answers = yaml.safe_load(repeated.answers_path.read_text(encoding="utf-8"))
     assert len(repeated_answers["previous_answers"]) == 1
     assert repeated_answers["answers"]["acceptance.criteria"]["answer"] == ""
+
+
+def test_improve_contract_from_answers_writes_markdown_and_rechecks(tmp_path: Path):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    result = check_contract_file(task_path, project_config=_python_project_config(tmp_path))
+    written = write_contract_report(result, task_path=task_path, project_root=tmp_path)
+    answers = yaml.safe_load(written.answers_path.read_text(encoding="utf-8"))
+    answers["answers"]["scope.boundaries"]["answer"] = (
+        "Add team invite creation and acceptance endpoints. Keep existing membership role names unchanged."
+    )
+    answers["answers"]["scope.boundaries"]["notes"] = "Keep the existing team settings navigation unchanged."
+    answers["answers"]["acceptance.criteria"]["answer"] = (
+        "Owner and admin users can send invites by email.\n"
+        "Members cannot send invites.\n"
+        "Duplicate pending invites return a deterministic error."
+    )
+    answers["answers"]["token.lifecycle"]["answer"] = "Invite tokens expire after 24 hours and cannot be reused."
+    answers["answers"]["privacy.data_handling"]["answer"] = (
+        "Invite tokens are never logged and errors do not reveal whether an email has an account."
+    )
+    answers["answers"]["acceptance.negative_cases"]["notes"] = (
+        "Product owner still needs to decide empty email handling."
+    )
+    written.answers_path.write_text(yaml.safe_dump(answers, sort_keys=False), encoding="utf-8")
+
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    improved = improve_contract_from_answers(
+        task_path,
+        answers_path=written.answers_path,
+        output_path=output_path,
+        project_config=_python_project_config(tmp_path),
+    )
+
+    output = output_path.read_text(encoding="utf-8")
+    assert improved.output_path == output_path
+    assert improved.source_sha256 == result.source["sha256"]
+    assert "scope.boundaries" in improved.answered_question_ids
+    assert "acceptance.criteria" in improved.answered_question_ids
+    assert "acceptance.negative_cases" in improved.open_question_ids
+    assert "## Scope" in output
+    assert (
+        "- Add team invite creation and acceptance endpoints. Keep existing membership role names unchanged." in output
+    )
+    assert "## Acceptance criteria" in output
+    assert "- Owner and admin users can send invites by email." in output
+    assert "- Members cannot send invites." in output
+    assert "## Security and privacy" in output
+    assert "- Invite tokens expire after 24 hours and cannot be reused." in output
+    assert "## Open questions" in output
+    assert "Which invalid, unauthorized, empty, duplicate, or failure cases should be handled?" in output
+    assert "acceptance.negative_cases" not in output
+    assert "Clarification" not in output
+    assert "Source question" not in output
+    assert "`scope.boundaries`" not in output
+    assert "## Notes" in output
+    assert "- Scope: Keep the existing team settings navigation unchanged." in output
+    assert "Product owner still needs to decide empty email handling." in output
+    assert improved.check_result.source["path"] == str(output_path)
+    assert improved.check_result.readiness_score > result.readiness_score
+
+
+def test_improve_contract_rejects_hash_mismatch(tmp_path: Path):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    result = check_contract_file(task_path, project_config=_python_project_config(tmp_path))
+    written = write_contract_report(result, task_path=task_path, project_root=tmp_path)
+    task_path.write_text(
+        "# Add team invites\n\nUsers should be able to invite teammates by email. Add audit logs.", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="different task revision"):
+        improve_contract_from_answers(
+            task_path,
+            answers_path=written.answers_path,
+            output_path=tmp_path / ".sikula" / "tasks" / "team-invites.v2.md",
+            project_config=_python_project_config(tmp_path),
+        )
+
+
+def test_improve_contract_accepts_text_input_but_requires_markdown_output(tmp_path: Path):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.txt"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    result = check_contract_file(task_path, project_config=_python_project_config(tmp_path))
+    written = write_contract_report(result, task_path=task_path, project_root=tmp_path)
+    answers = yaml.safe_load(written.answers_path.read_text(encoding="utf-8"))
+    answers["answers"]["acceptance.criteria"]["answer"] = "Owners can invite teammates by email."
+    written.answers_path.write_text(yaml.safe_dump(answers, sort_keys=False), encoding="utf-8")
+
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    improve_contract_from_answers(
+        task_path,
+        answers_path=written.answers_path,
+        output_path=output_path,
+        project_config=_python_project_config(tmp_path),
+    )
+
+    assert output_path.read_text(encoding="utf-8").startswith("# Improved implementation contract")
+    with pytest.raises(ValueError, match="Markdown"):
+        improve_contract_from_answers(
+            task_path,
+            answers_path=written.answers_path,
+            output_path=tmp_path / ".sikula" / "tasks" / "team-invites.v2.txt",
+            project_config=_python_project_config(tmp_path),
+        )
+    with pytest.raises(ValueError, match="non-Markdown"):
+        improve_contract_from_answers(
+            task_path,
+            answers_path=written.answers_path,
+            write=True,
+            project_config=_python_project_config(tmp_path),
+        )
+
+
+def test_improve_contract_refuses_output_overwrite(tmp_path: Path):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    result = check_contract_file(task_path, project_config=_python_project_config(tmp_path))
+    written = write_contract_report(result, task_path=task_path, project_root=tmp_path)
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    output_path.write_text("manual content\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        improve_contract_from_answers(
+            task_path,
+            answers_path=written.answers_path,
+            output_path=output_path,
+            project_config=_python_project_config(tmp_path),
+        )
+
+
+def test_contract_improve_cli_writes_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    result = check_contract_file(task_path, project_config=_python_project_config(tmp_path))
+    written = write_contract_report(result, task_path=task_path, project_root=tmp_path)
+    answers = yaml.safe_load(written.answers_path.read_text(encoding="utf-8"))
+    answers["answers"]["acceptance.criteria"]["answer"] = "Owners can invite teammates by email."
+    written.answers_path.write_text(yaml.safe_dump(answers, sort_keys=False), encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    monkeypatch.chdir(tmp_path)
+
+    with patch(
+        "sys.argv",
+        [
+            "sikula",
+            "contract",
+            "improve",
+            str(task_path),
+            "--answers",
+            str(written.answers_path),
+            "--output",
+            str(output_path),
+        ],
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    assert output_path.exists()
+    assert "Improved contract written:" in out
+    assert "Applied answers: 1" in out
+    assert "Implementation Contract Readiness:" in out
 
 
 def test_contract_check_cli_json_write_report_stays_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
