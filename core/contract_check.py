@@ -1524,7 +1524,21 @@ def _build_questions(gaps: list[ContractGap], security_sensitive: bool, text: st
 
 
 def _suggested_sections(gaps: list[ContractGap]) -> list[str]:
-    labels = {
+    labels_by_gap_id = {
+        "gap.scope.boundaries": "Scope: describe exact in-scope behaviour and unchanged adjacent behaviour",
+        "gap.acceptance.criteria": "Acceptance criteria: list observable behaviours that must be true",
+        "gap.acceptance.negative_cases": "Acceptance criteria: add negative, edge-case, or rejection behaviour",
+        "gap.scope.out_of_scope": "Out of scope: name adjacent changes that should not be made",
+        "gap.security_privacy.impact": "Security and privacy: state authorization, token, data, or privacy constraints",
+        "gap.security_privacy.section": "Security and privacy: note relevant sensitive-flow constraints",
+        "gap.tests.testability": "Tests: describe behaviours that should be covered by tests",
+        "gap.validation.coverage": "Validation: align task-described commands with the configured Sikula pipeline",
+        "gap.validation.commands": "Validation: list required validation commands or rely on configured Sikula validation",
+        "gap.review.reviewer_focus": "Reviewer focus: call out risky areas for human review",
+        "gap.task_size.too_large": "Scope: split the task or narrow the autonomous delivery boundary",
+        "gap.context.repo_context": "Context: name affected files, APIs, domain rules, or project conventions",
+    }
+    labels_by_category = {
         "scope": "Scope",
         "acceptance_criteria": "Acceptance criteria",
         "out_of_scope": "Out of scope",
@@ -1536,7 +1550,7 @@ def _suggested_sections(gaps: list[ContractGap]) -> list[str]:
     }
     sections: list[str] = []
     for gap in gaps:
-        label = labels.get(gap.category)
+        label = labels_by_gap_id.get(gap.id) or labels_by_category.get(gap.category)
         if label and label not in sections:
             sections.append(label)
     return sections

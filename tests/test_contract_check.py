@@ -221,6 +221,35 @@ Users should be able to filter countries by name.
     assert "Configured Sikula validation pipeline is available." in result.strong_signals
 
 
+def test_suggested_sections_are_specific_to_gap_ids(tmp_path: Path):
+    task = """# Add team invites
+
+Users should be able to invite teammates by email.
+
+## Scope
+- Add team invite creation.
+
+## Acceptance criteria
+- Owners can invite users by email.
+- Invites appear in the pending invite list.
+
+## Out of scope
+- Billing seat enforcement.
+
+## Security and privacy
+- Invite token expiry follows the existing secure token policy.
+
+## Reviewer focus
+- Authorization rules.
+"""
+
+    result = check_contract(task, project_config=_python_project_config(tmp_path))
+
+    assert "Acceptance criteria: add negative, edge-case, or rejection behaviour" in result.suggested_sections
+    assert "Acceptance criteria" not in result.suggested_sections
+    assert "Context: name affected files, APIs, domain rules, or project conventions" in result.suggested_sections
+
+
 def test_human_renderer_groups_gaps_and_questions():
     result = check_contract("# Add team invites\n\nUsers should be able to invite teammates by email.")
 
