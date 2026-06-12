@@ -5,6 +5,7 @@ Usage (project-centric, run from project root):
   sikula init                        # create .sikula/config.yaml
   sikula init --guidelines --provider codex --model gpt-5.5
   sikula contract check task.md      # read-only implementation-contract preflight
+  sikula contract improve task.md --answers .sikula/contracts/task.answers.yaml --output task.v2.md
   sikula run task.md                 # auto-discovers .sikula/config.yaml
   sikula run --task-id <task-id>     # resume existing task
   sikula status
@@ -899,6 +900,43 @@ def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
             print("Generated contract artifacts:")
             print(f"- {write_result.report_path}")
             print(f"- {write_result.answers_path}")
+
+
+def cmd_contract_improve(args: argparse.Namespace, cfg: dict) -> None:
+    from core.contract_check import improve_contract_from_answers, render_contract_check
+
+    project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
+    task_path = _resolve_task_path(args.task_file, project_root)
+    if task_path is None:
+        print(f"Task file not found: {args.task_file}")
+        sys.exit(1)
+
+    answers_path = Path(args.answers)
+    if not answers_path.is_absolute():
+        answers_path = (Path.cwd() / answers_path).resolve()
+    output_path = None
+    if args.output:
+        output_path = Path(args.output)
+        if not output_path.is_absolute():
+            output_path = (Path.cwd() / output_path).resolve()
+
+    try:
+        result = improve_contract_from_answers(
+            task_path,
+            answers_path=answers_path,
+            output_path=output_path,
+            write=args.write,
+            project_config=cfg or None,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"Failed to improve contract: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Improved contract written: {result.output_path}")
+    print(f"Applied answers: {len(result.answered_question_ids)}")
+    print(f"Open questions: {len(result.open_question_ids)}")
+    print("")
+    print(render_contract_check(result.check_result), end="")
 
 
 def _contract_preflight_path(path: Path, project_root: Path) -> str:
@@ -2888,6 +2926,24 @@ def main() -> None:
         default=False,
         help="Write .sikula/contracts check report and answers template artifacts",
     )
+    contract_improve_p = contract_sub.add_parser(
+        "improve",
+        help="Create an improved Markdown implementation contract from an answers file",
+    )
+    contract_improve_p.add_argument("task_file", metavar="TASK_FILE", help="Path to task .txt/.md file")
+    contract_improve_p.add_argument(
+        "--answers",
+        required=True,
+        help="Path to .sikula/contracts/*.answers.yaml created by `sikula contract check --write-report`",
+    )
+    improve_target = contract_improve_p.add_mutually_exclusive_group(required=True)
+    improve_target.add_argument("--output", help="Write the improved Markdown contract to this new file")
+    improve_target.add_argument(
+        "--write",
+        action="store_true",
+        default=False,
+        help="Overwrite the original Markdown task file after verifying the answers hash",
+    )
 
     run_p = sub.add_parser("run", help="Run a task")
     run_p.add_argument(
@@ -3111,6 +3167,8 @@ def main() -> None:
     elif args.command == "contract":
         if args.contract_command == "check":
             cmd_contract_check(args, cfg)
+        elif args.contract_command == "improve":
+            cmd_contract_improve(args, cfg)
         else:
             contract_p.print_help()
             sys.exit(1)

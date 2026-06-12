@@ -17,6 +17,9 @@ specific enough to act as an implementation contract:
 sikula contract check .sikula/tasks/my-task.md
 sikula contract check .sikula/tasks/my-task.md --json
 sikula contract check .sikula/tasks/my-task.md --write-report
+sikula contract improve .sikula/tasks/my-task.md \
+  --answers .sikula/contracts/my-task.answers.yaml \
+  --output .sikula/tasks/my-task.v2.md
 ```
 
 The check is read-only unless `--write-report` is passed. It does not edit the
@@ -25,12 +28,17 @@ missing scope boundaries, acceptance criteria, security/privacy notes,
 validation coverage, and follow-up questions with stable IDs. `--write-report`
 creates `.sikula/contracts/*.check.json` and `.answers.yaml` artifacts for
 review or follow-up answers. Filled answers apply only to the exact task hash in
-the template; after the task file changes, old filled answers are moved to
-`previous_answers` and the active answers are reset for the new hash. If the
-project has a configured Sikula build/test/check pipeline, the task does not
-need to repeat those commands unless it requires additional project-specific
-validation. The readiness score is a preflight signal, not a guarantee that the
-task will succeed.
+the template. After you fill the YAML answers, `sikula contract improve`
+deterministically writes a stronger Markdown task file, keeps unanswered items
+under `Open questions`, and runs the contract check on the output. It refuses
+stale answer hashes and accidental overwrites; for plain-text `.txt` inputs,
+write the improved contract to a new Markdown file with `--output`. After the
+task file changes, old filled answers are moved to `previous_answers` and the
+active answers are reset for the new hash. If the project has a configured
+Sikula build/test/check pipeline, the task does not need to repeat those
+commands unless it requires additional project-specific validation. The
+readiness score is a preflight signal, not a guarantee that the task will
+succeed.
 Normal `sikula run TASK_FILE` records the same check as a compact, warning-only
 state snapshot and prints a one-line summary before agents start; it does not
 write `.sikula/contracts` artifacts.
