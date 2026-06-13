@@ -1,4 +1,6 @@
-# Workflow
+# Pipeline And State
+
+Detailed explanation of Sikula's gated agentic delivery pipeline, task state, and learn/adapt loop.
 
 Sikula is built around four concepts:
 
@@ -10,7 +12,7 @@ Sikula is built around four concepts:
 ```text
 Rough intent
   -> implementation contract
-  -> gated AI delivery pipeline
+  -> gated agentic delivery pipeline
   -> PR-ready branch + state file
   -> better next run
 ```
@@ -19,17 +21,7 @@ Rough intent
 
 The implementation contract is a two-way handshake between you and Sikula: you bring the intent, Sikula checks whether it is clear and deliverable, asks for missing context when needed, and turns it into scope, acceptance criteria, risks, tests, and validation.
 
-Use the contract commands before starting delivery:
-
-```bash
-sikula contract check .sikula/tasks/my-task.md
-sikula contract check .sikula/tasks/my-task.md --write-report
-sikula contract improve .sikula/tasks/my-task.md \
-  --answers .sikula/contracts/my-task.answers.yaml \
-  --output .sikula/tasks/my-task.v2.md
-```
-
-`contract check` is read-only unless `--write-report` is passed. It does not create a branch or start agents. `sikula run TASK_FILE` also records a compact warning-only contract snapshot before agents start.
+Use [Writing Sikula Tasks](writing-tasks.md) for contract commands and task examples. `sikula run TASK_FILE` records a compact, warning-only contract snapshot before agents start.
 
 ## Gated Pipeline
 

@@ -93,29 +93,7 @@ Supported run flags:
 
 ## Per-Agent LLM Overrides
 
-Each agent can use a different provider, model, or timeout.
-
-```yaml
-agents:
-  analyst:
-    llm:
-      model: stronger-model
-  implementer:
-    llm:
-      provider: claude
-      agent_timeout: 2400
-```
-
-CLI overrides layer on top of YAML:
-
-```bash
-sikula run .sikula/tasks/my-task.md \
-  --agent-model analyst=stronger-model \
-  --agent-provider implementer=claude \
-  --agent-timeout implementer=2400
-```
-
-Valid agent names: `analyst`, `planner`, `implementer`, `reviewer`, `security_reviewer`, `test_writer`, `fixer`.
+Each agent can use a different provider, model, or timeout. Keep provider-specific setup, YAML examples, CLI override examples, and valid agent names in [Providers](providers.md).
 
 ## Guidelines
 

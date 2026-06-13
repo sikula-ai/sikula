@@ -1,6 +1,6 @@
-# Quickstart
+# First Run
 
-This guide gets Sikula running on an existing git repository.
+The README shows the shortest happy path. This guide covers install variants, provider authentication, generated guidelines, isolated-run requirements, and result inspection for your first Sikula run.
 
 ## Prerequisites
 
@@ -14,11 +14,34 @@ Install `pipx` from the official guide if it is not available on your system: <h
 
 ## Install
 
+Choose the install path that matches what you are doing:
+
+| Goal | Install |
+|---|---|
+| Use Sikula in your projects | `pipx install sikula` |
+| Use the latest development version from source | `pipx install --editable .` |
+
+For normal project use:
+
 ```bash
 pipx install sikula
 ```
 
-For local development on Sikula itself, use the editable install documented in [CONTRIBUTING.md](../CONTRIBUTING.md).
+For the latest development version from source:
+
+```bash
+git clone https://github.com/sikula-ai/sikula
+cd sikula/
+pipx install --editable .
+```
+
+If you want to run Sikula's own test suite from that checkout, add the dev tools:
+
+```bash
+pipx inject sikula pytest pytest-cov ruff
+```
+
+Contributor details are in [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## Authenticate A Provider
 
@@ -80,15 +103,7 @@ A good task states the user-visible goal, expected behavior, important constrain
 sikula contract check .sikula/tasks/my-task.md
 ```
 
-If the task needs clarification:
-
-```bash
-sikula contract check .sikula/tasks/my-task.md --write-report
-# edit .sikula/contracts/my-task.answers.yaml
-sikula contract improve .sikula/tasks/my-task.md \
-  --answers .sikula/contracts/my-task.answers.yaml \
-  --output .sikula/tasks/my-task.v2.md
-```
+For report generation, answers files, and `contract improve`, see [Writing Sikula Tasks](writing-tasks.md).
 
 ## Run
 
