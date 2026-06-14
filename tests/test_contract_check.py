@@ -1074,6 +1074,50 @@ def test_contract_improve_cli_interactive_writes_answers_and_output(
     assert "## Open questions" in output
 
 
+def test_contract_improve_cli_interactive_rejects_stale_answers_before_prompting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    result = check_contract_file(task_path, project_config=_python_project_config(tmp_path))
+    written = write_contract_report(result, task_path=task_path, project_root=tmp_path)
+    original_answers = written.answers_path.read_text(encoding="utf-8")
+    task_path.write_text(
+        "# Add team invites\n\nUsers should be able to invite teammates by email and role.",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch(
+            "sys.argv",
+            [
+                "sikula",
+                "contract",
+                "improve",
+                str(task_path),
+                "--interactive",
+                "--answers",
+                str(written.answers_path),
+                "--output",
+                str(output_path),
+            ],
+        ),
+        patch("sys.stdin.isatty", return_value=True),
+        patch("builtins.input", side_effect=AssertionError("stale answers must fail before prompting")),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    err = capsys.readouterr().err
+    assert exc.value.code == 1
+    assert "generated for a different task revision" in err
+    assert written.answers_path.read_text(encoding="utf-8") == original_answers
+    assert not output_path.exists()
+
+
 def test_contract_improve_cli_interactive_requires_tty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
     task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
     task_path.parent.mkdir(parents=True)

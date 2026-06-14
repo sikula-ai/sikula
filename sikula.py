@@ -993,7 +993,7 @@ def _write_interactive_contract_answers(
     task_path: Path,
     project_root: Path,
 ) -> Path:
-    from core.contract_check import check_contract_file, write_contract_report
+    from core.contract_check import check_contract_file, load_contract_answers_for_task, write_contract_report
 
     if not sys.stdin.isatty():
         raise ValueError("interactive contract improve requires an interactive terminal on stdin")
@@ -1002,12 +1002,13 @@ def _write_interactive_contract_answers(
         answers_path = _resolve_answers_path(args.answers)
         if not answers_path.exists():
             raise ValueError(f"answers file not found: {answers_path}")
+        result = check_contract_file(task_path, project_config=_contract_cli_project_config(cfg))
+        answers_data = load_contract_answers_for_task(answers_path, result)
     else:
         result = check_contract_file(task_path, project_config=_contract_cli_project_config(cfg))
         report_root = project_root if cfg.get("project", {}).get("root_path") else None
         answers_path = write_contract_report(result, task_path=task_path, project_root=report_root).answers_path
-
-    answers_data = yaml.safe_load(answers_path.read_text(encoding="utf-8")) or {}
+        answers_data = yaml.safe_load(answers_path.read_text(encoding="utf-8")) or {}
     questions = answers_data.get("questions")
     answers = answers_data.get("answers")
     if not isinstance(questions, list):
