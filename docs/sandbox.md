@@ -6,10 +6,16 @@ Sikula combines git isolation, provider-level restrictions where available, prom
 
 By default, `sikula run TASK_FILE` creates a git worktree under `.sikula/worktrees/<task-id>/` and a branch named `sikula/<task-stem>-<task-id>`.
 
-Successful runs are committed to that branch and the worktree is removed. Failed or interrupted runs preserve the worktree for inspection or resume.
+Successful runs are committed to that branch and the worktree is removed. Interrupted or failed runs preserve the worktree for inspection.
 
 ```bash
+# Resume interrupted work
 sikula run --task-id <task-id>
+
+# Retry terminal failed work
+sikula run --task-id <task-id> --reset-failed
+
+# Remove preserved worktrees when you are done inspecting them
 sikula cleanup <task-id> --force
 sikula delete <task-id> --force
 ```

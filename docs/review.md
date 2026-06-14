@@ -42,10 +42,16 @@ sikula review \
 
 `--fix` applies accepted fixes through the normal orchestrator loop. The planner is disabled, reviewer is enabled, and successful fixes are committed back to the reviewed branch with a Sikula commit message.
 
-If the task fails, the worktree is preserved under `.sikula/worktrees/<task-id>/` and can be resumed:
+If `review --fix` is interrupted, the worktree is preserved under `.sikula/worktrees/<task-id>/` and can be resumed:
 
 ```bash
 sikula run --task-id <task-id>
+```
+
+If the task reaches terminal failed state, reset the failed marker before retrying:
+
+```bash
+sikula run --task-id <task-id> --reset-failed
 ```
 
 ## Review Context

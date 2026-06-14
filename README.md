@@ -143,7 +143,7 @@ Use this when code already exists and you want an independent review/security ga
 - **Config or guidelines missing in the task worktree** - commit `.sikula/config.yaml` and any generated `.sikula/guidelines.md` before the first isolated run.
 - **Provider is not authenticated** - run `codex login` or see [Providers](docs/providers.md) for Claude, Gemini, and OpenCode.
 - **Task is too vague** - run `sikula contract check .sikula/tasks/my-task.md` and see [Writing Sikula Tasks](docs/writing-tasks.md).
-- **Run failed after creating a worktree** - inspect `sikula show <task-id>` and `.sikula/worktrees/<task-id>/`.
+- **Run failed after creating a worktree** - inspect `sikula show <task-id>` and `.sikula/worktrees/<task-id>/`; retry with `sikula run --task-id <task-id> --reset-failed`.
 
 ## What You Get
 
