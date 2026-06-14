@@ -445,6 +445,67 @@ class TestStreamingProcessHelpers:
 
         assert processes[0].terminated is True
 
+    def test_streaming_agent_timeout_applies_while_draining_large_output(self, tmp_path: Path):
+        class VerboseHangingProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stdin = StringIO()
+                self.stdout = StringIO("x" * 500_000)
+                self.stderr = StringIO()
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        processes = []
+
+        def fake_popen(*args, **kwargs):
+            process = VerboseHangingProcess(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        class ImmediateThread:
+            def __init__(self, target, args=(), **_kwargs) -> None:
+                self._target = target
+                self._args = args
+
+            def start(self) -> None:
+                self._target(*self._args)
+
+            def is_alive(self) -> bool:
+                return False
+
+            def join(self, timeout=None) -> None:
+                return None
+
+        monotonic_values = iter([0.0, 0.0, 0.002, 0.003, 0.004])
+
+        with (
+            patch("core.llm_client.subprocess.Popen", side_effect=fake_popen),
+            patch("core.llm_client.threading.Thread", side_effect=ImmediateThread),
+            patch("core.llm_client.time.monotonic", side_effect=lambda: next(monotonic_values, 0.005)),
+            pytest.raises(subprocess.TimeoutExpired),
+        ):
+            _run_agent_subprocess_streaming(
+                ["provider", "agent"],
+                cwd=tmp_path,
+                env=None,
+                timeout=0.001,
+                provider="provider",
+            )
+
+        assert processes[0].terminated is True
+
     def test_streaming_agent_propagates_non_pipe_stdin_write_errors(self, tmp_path: Path):
         class FailingStdin:
             def write(self, _text: str) -> int:
@@ -1655,7 +1716,7 @@ class TestOpenCodeClientCommands:
 
             def poll(self):
                 self._polls += 1
-                if self._polls > len(raw_output) + 2:
+                if self._polls > 2:
                     self.returncode = 0
                 return self.returncode
 
@@ -1704,7 +1765,7 @@ class TestOpenCodeClientCommands:
 
             def poll(self):
                 self._polls += 1
-                if self._polls > len(raw_log) + 5:
+                if self._polls > 2:
                     self.returncode = 0
                 return self.returncode
 
@@ -1771,7 +1832,7 @@ class TestOpenCodeClientCommands:
 
             def poll(self):
                 self._polls += 1
-                if self._polls > len(benign_output) + 2:
+                if self._polls > 2:
                     self.returncode = 0
                 return self.returncode
 

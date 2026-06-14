@@ -41,6 +41,7 @@ log = logging.getLogger(__name__)
 _RETRY_DELAYS: tuple[int, ...] = (30, 60, 120)
 _MAX_RETRY_ERROR_CHARS = 1000
 _RETRY_ERROR_HEAD_CHARS = 350
+_STREAM_READ_CHARS = 65536
 
 RetryObserver = Callable[[dict[str, object]], None]
 
@@ -978,8 +979,10 @@ def _run_agent_subprocess_streaming(
             _terminate_process(process, process_group=True)
             raise provider_error
 
-    def _drain_ready_chunks() -> None:
+    def _drain_ready_chunks(deadline: float | None = None) -> None:
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                _raise_timeout()
             try:
                 name, chunk = chunks.get_nowait()
             except queue.Empty:
@@ -1002,8 +1005,11 @@ def _run_agent_subprocess_streaming(
 
     def _reader(name: str, stream) -> None:
         try:
+            read_chunk = getattr(stream, "readline", None)
+            if not callable(read_chunk):
+                read_chunk = stream.read
             while True:
-                chunk = stream.read(1)
+                chunk = read_chunk(_STREAM_READ_CHARS)
                 if not chunk:
                     break
                 chunks.put((name, chunk))
@@ -1032,7 +1038,7 @@ def _run_agent_subprocess_streaming(
 
     deadline = time.monotonic() + timeout
     while True:
-        _drain_ready_chunks()
+        _drain_ready_chunks(deadline)
         _check_writer_error()
         if process.poll() is not None and not any(thread.is_alive() for thread in threads) and chunks.empty():
             break
