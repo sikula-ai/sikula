@@ -684,60 +684,30 @@ def _path_is_within(path: Path, base: Path) -> bool:
         return False
 
 
-def build_orchestrator(cfg: dict, overrides: dict | None = None, state_store=None):
-    from core.llm_client import create_llm_client
-    from core.orchestrator import Orchestrator, OrchestratorConfig
-    from core.state import JsonStateStore
+def _run_phase_flag(cfg: dict, overrides: dict, key: str) -> bool:
+    cli_val = overrides.get(key)
+    return bool(cfg.get(key, False) if cli_val is None else cli_val)
 
-    overrides = overrides or {}
 
-    def _phase(key: str) -> bool:
-        """Return CLI override if set, else config value, else False."""
-        cli_val = overrides.get(key)
-        return cfg.get(key, False) if cli_val is None else cli_val
-
-    run_build = _phase("run_build")
-    run_presync = _phase("run_presync")
-    run_review = _phase("run_review")
-    run_security_review = _phase("run_security_review")
-    run_test_writing = _phase("run_test_writing")
-    run_tests = _phase("run_tests")
-    run_planner = _phase("run_planner")
-    run_build_per_step = _phase("run_build_per_step")
-    run_checks = _phase("run_checks")
-
-    # presync_clean lives under build: in the config — patch the nested dict in-place so
-    # the value reaches the build tool (reads it from project_config["build"]["presync_clean"]).
-    if "presync_clean" in overrides:
-        cfg.setdefault("build", {})["presync_clean"] = overrides["presync_clean"]
-
-    project_root = Path(cfg["project"]["root_path"])
-    sandbox = cfg.get("sandbox", {})
-    base_llm_cfg = cfg.get("llm", {})
+def _effective_agent_llm_cfg(cfg: dict, overrides: dict, name: str) -> dict:
     agents_cfg = cfg.get("agents", {})
     cli_agent_overrides: dict[str, dict] = overrides.get("agent_llms", {})
+    yaml_agent = agents_cfg.get(name, {}).get("llm", {})
+    cli_agent = cli_agent_overrides.get(name, {})
+    return {**yaml_agent, **cli_agent}
 
-    def _agent_llm_cfg(name: str) -> dict:
-        yaml_agent = agents_cfg.get(name, {}).get("llm", {})
-        cli_agent = cli_agent_overrides.get(name, {})
-        return {**yaml_agent, **cli_agent}  # CLI wins over YAML
 
-    max_iterations = int(sandbox.get("max_iterations", 10))
+def _run_config_snapshot(cfg: dict, overrides: dict | None = None) -> dict:
+    overrides = overrides or {}
+    sandbox = cfg.get("sandbox", {})
+    build_snapshot = dict(cfg.get("build", {}))
+    if "presync_clean" in overrides:
+        build_snapshot["presync_clean"] = overrides["presync_clean"]
     max_review_iterations = int(sandbox.get("max_review_iterations", 3))
-    max_security_review_iterations = int(sandbox.get("max_security_review_iterations", max_review_iterations))
-    heartbeat_interval_seconds = _heartbeat_interval_seconds(cfg)
-    if state_store is None:
-        state_store = JsonStateStore(_resolve_state_dir(cfg))
-
-    default_llm = create_llm_client(_make_llm_config(base_llm_cfg, {}))
-    agent_llms = {
-        name: create_llm_client(_make_llm_config(base_llm_cfg, _agent_llm_cfg(name)))
-        for name in _VALID_AGENTS
-        if _agent_llm_cfg(name)
-    }
+    base_llm_cfg = cfg.get("llm", {})
 
     def _agent_snapshot(name: str) -> dict:
-        c = _make_llm_config(base_llm_cfg, _agent_llm_cfg(name))
+        c = _make_llm_config(base_llm_cfg, _effective_agent_llm_cfg(cfg, overrides, name))
         snap: dict = {
             "provider": c.provider,
             "model": c.model,
@@ -748,32 +718,73 @@ def build_orchestrator(cfg: dict, overrides: dict | None = None, state_store=Non
             snap["extra_rules"] = extra_rules
         return snap
 
-    config_snapshot = {
+    return {
         "project": cfg.get("project", {}).get("name"),
-        "run_presync": run_presync,
-        "run_planner": run_planner,
-        "run_review": run_review,
-        "run_security_review": run_security_review,
-        "run_test_writing": run_test_writing,
-        "run_build": run_build,
-        "run_tests": run_tests,
-        "run_build_per_step": run_build_per_step,
-        "run_checks": run_checks,
-        "max_iterations": max_iterations,
+        "run_presync": _run_phase_flag(cfg, overrides, "run_presync"),
+        "run_planner": _run_phase_flag(cfg, overrides, "run_planner"),
+        "run_review": _run_phase_flag(cfg, overrides, "run_review"),
+        "run_security_review": _run_phase_flag(cfg, overrides, "run_security_review"),
+        "run_test_writing": _run_phase_flag(cfg, overrides, "run_test_writing"),
+        "run_build": _run_phase_flag(cfg, overrides, "run_build"),
+        "run_tests": _run_phase_flag(cfg, overrides, "run_tests"),
+        "run_build_per_step": _run_phase_flag(cfg, overrides, "run_build_per_step"),
+        "run_checks": _run_phase_flag(cfg, overrides, "run_checks"),
+        "max_iterations": int(sandbox.get("max_iterations", 10)),
         "max_review_iterations": max_review_iterations,
-        "max_security_review_iterations": max_security_review_iterations,
+        "max_security_review_iterations": int(sandbox.get("max_security_review_iterations", max_review_iterations)),
         "progress": {
-            "heartbeat_interval_seconds": heartbeat_interval_seconds,
+            "heartbeat_interval_seconds": _heartbeat_interval_seconds(cfg),
         },
         "sandbox": {
             "allowed_write_paths": sandbox.get("allowed_write_paths", []),
             "allowed_test_write_paths": sandbox.get("allowed_test_write_paths", []),
             "allowed_read_paths": sandbox.get("allowed_read_paths", ["."]),
         },
-        "build": cfg.get("build", {}),
+        "build": build_snapshot,
         "planner": cfg.get("planner", {}),
         "test_writer": cfg.get("test_writer", {}),
         "agents": {name: _agent_snapshot(name) for name in sorted(_VALID_AGENTS)},
+    }
+
+
+def build_orchestrator(cfg: dict, overrides: dict | None = None, state_store=None):
+    from core.llm_client import create_llm_client
+    from core.orchestrator import Orchestrator, OrchestratorConfig
+    from core.state import JsonStateStore
+
+    overrides = overrides or {}
+
+    # presync_clean lives under build: in the config — patch the nested dict in-place so
+    # the value reaches the build tool (reads it from project_config["build"]["presync_clean"]).
+    if "presync_clean" in overrides:
+        cfg.setdefault("build", {})["presync_clean"] = overrides["presync_clean"]
+
+    config_snapshot = _run_config_snapshot(cfg, overrides)
+    run_build = config_snapshot["run_build"]
+    run_presync = config_snapshot["run_presync"]
+    run_review = config_snapshot["run_review"]
+    run_security_review = config_snapshot["run_security_review"]
+    run_test_writing = config_snapshot["run_test_writing"]
+    run_tests = config_snapshot["run_tests"]
+    run_planner = config_snapshot["run_planner"]
+    run_build_per_step = config_snapshot["run_build_per_step"]
+    run_checks = config_snapshot["run_checks"]
+    max_iterations = config_snapshot["max_iterations"]
+    max_review_iterations = config_snapshot["max_review_iterations"]
+    max_security_review_iterations = config_snapshot["max_security_review_iterations"]
+    heartbeat_interval_seconds = config_snapshot["progress"]["heartbeat_interval_seconds"]
+
+    project_root = Path(cfg["project"]["root_path"])
+    sandbox = cfg.get("sandbox", {})
+    base_llm_cfg = cfg.get("llm", {})
+    if state_store is None:
+        state_store = JsonStateStore(_resolve_state_dir(cfg))
+
+    default_llm = create_llm_client(_make_llm_config(base_llm_cfg, {}))
+    agent_llms = {
+        name: create_llm_client(_make_llm_config(base_llm_cfg, _effective_agent_llm_cfg(cfg, overrides, name)))
+        for name in _VALID_AGENTS
+        if _effective_agent_llm_cfg(cfg, overrides, name)
     }
 
     return Orchestrator(
@@ -1033,15 +1044,11 @@ def _build_contract_preflight_snapshot(task_path: Path, cfg: dict, project_root:
 def _contract_preflight_config(cfg: dict, overrides: dict) -> dict:
     from core.validation_coverage import INTERNAL_PIPELINE_CONFIG_KEY
 
-    def _phase(key: str) -> bool:
-        cli_val = overrides.get(key)
-        return cfg.get(key, False) if cli_val is None else cli_val
-
     effective = dict(cfg)
     effective[INTERNAL_PIPELINE_CONFIG_KEY] = {
-        "run_build": _phase("run_build"),
-        "run_tests": _phase("run_tests"),
-        "run_checks": _phase("run_checks"),
+        "run_build": _run_phase_flag(cfg, overrides, "run_build"),
+        "run_tests": _run_phase_flag(cfg, overrides, "run_tests"),
+        "run_checks": _run_phase_flag(cfg, overrides, "run_checks"),
     }
     return effective
 
@@ -1605,6 +1612,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
         description = task_path.read_text().strip()
         state = store.create(description)
         state.task_file = Path(args.task_file).name
+        state.config_snapshot = _run_config_snapshot(cfg, overrides)
         preflight_cfg = _contract_preflight_config(cfg, overrides)
         state.implementation_contract = _build_contract_preflight_snapshot(
             task_path, preflight_cfg, original_project_root

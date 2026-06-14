@@ -792,6 +792,44 @@ class TestCmdRunStateStore:
         assert state.worktree_path is None
         assert state.worktree_branch is None
 
+    def test_task_file_contract_gate_saves_effective_config_snapshot(self, tmp_path: Path):
+        task_file = tmp_path / "task.md"
+        task_file.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.\n")
+        cfg = _run_cfg(tmp_path)
+        cfg["run_build"] = True
+        cfg["run_tests"] = True
+        cfg["run_checks"] = True
+        cfg["build"] = {"checks": [{"name": "ruff", "command": "ruff check ."}]}
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            pytest.raises(SystemExit) as exc,
+        ):
+            cmd_run(
+                _run_args(
+                    task_file=str(task_file),
+                    no_isolate=True,
+                    require_contract_ready=True,
+                    tests=False,
+                    checks=False,
+                ),
+                cfg,
+            )
+
+        assert exc.value.code == 1
+        build_orchestrator.assert_not_called()
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.failed
+        assert state.contract_gate_blocked
+        assert state.config_snapshot["run_build"] is True
+        assert state.config_snapshot["run_tests"] is False
+        assert state.config_snapshot["run_checks"] is False
+        assert state.config_snapshot["build"] == {"checks": [{"name": "ruff", "command": "ruff check ."}]}
+        assert state.implementation_contract["validation"]["configured_command_count"] == 1
+
     def test_task_file_min_contract_score_gate_aborts_below_threshold(self, tmp_path: Path, capsys):
         task_file = tmp_path / "task.md"
         task_file.write_text(
