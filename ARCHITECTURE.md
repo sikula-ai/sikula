@@ -131,7 +131,9 @@ chat/MCP adapters can reuse the same scoring, question, answer-application, and 
 logic without temporary YAML files or duplicate business rules. `prepare_contract()` returns
 the authoritative workflow state plus user-facing questions, safe `.sikula/tasks/...` path
 hints, resume arguments, revised-answer markers, and next-step guidance; adapters should not
-infer readiness separately. These commands and helpers
+infer readiness separately. `core.contract_prepare_adapter` maps that core result into the
+stable `prepare_implementation_contract` response shape for future MCP transport without
+adding scoring or rewrite logic. These commands and helpers
 do not create `TaskState`, start agents, create worktrees, or alter `review` flow. Fresh `sikula run
 TASK_FILE` uses the same deterministic checks to store a compact warning-only snapshot in
 `TaskState.implementation_contract` and print a one-line summary before agents start; it
