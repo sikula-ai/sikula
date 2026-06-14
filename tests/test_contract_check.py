@@ -10,7 +10,9 @@ import yaml
 from core.contract_check import (
     check_contract,
     check_contract_file,
+    improve_contract_text,
     improve_contract_from_answers,
+    prepare_contract,
     render_contract_check,
     write_contract_report,
 )
@@ -158,6 +160,86 @@ def test_question_ids_are_stable_for_same_task():
 
     assert first == second
     assert first
+
+
+def test_prepare_contract_returns_questions_without_file_side_effects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+    )
+
+    assert result.stage == "needs_user_input"
+    assert result.needs_user_input
+    assert not result.ready_to_save
+    assert not result.ready_to_run
+    assert result.required_next_step == "answer_questions"
+    assert "acceptance.criteria" in result.answers_template
+    assert "token.lifecycle" in result.answers_template
+    assert result.recheck_result is None
+    assert result.status_applies_to_sha256 == result.check_result.source["sha256"]
+    assert not (tmp_path / ".sikula").exists()
+
+
+def test_prepare_contract_uses_project_context_validation_commands():
+    task = """# Add search
+
+## Scope
+- Add search by country name.
+- Keep existing filtering.
+- Keep sorting unchanged.
+
+## Acceptance criteria
+- Search is case-insensitive.
+- Clearing search shows all countries.
+- No results shows an empty state.
+
+## Out of scope
+- Do not add server-side search.
+
+## Validation
+- `npm test`
+"""
+
+    result = prepare_contract(
+        task,
+        contract_name="search.md",
+        project_context={"validation_commands": ["npm test"]},
+    )
+
+    assert result.check_result.validation["coverage_gaps"] == []
+    assert result.check_result.validation["configured_commands"] == [
+        {"phase": "project_context", "name": "validation-1", "command": "npm test"}
+    ]
+    assert all(gap.id != "gap.validation.coverage" for gap in result.unresolved_gaps)
+
+
+def test_prepare_contract_applies_answers_and_rechecks():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={
+            "scope.boundaries": "Add team invite creation and acceptance endpoints.",
+            "acceptance.criteria": "Owners can invite teammates by email.\nMembers cannot invite teammates.",
+            "scope.out_of_scope": "Billing and bulk invites are out of scope.",
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.recheck_result is not None
+    assert "scope.boundaries" in result.answered_question_ids
+    assert "acceptance.criteria" in result.answered_question_ids
+    assert "## Scope" in result.prepared_contract_markdown
+    assert "- Add team invite creation and acceptance endpoints." in result.prepared_contract_markdown
+    assert result.recheck_result.readiness_score > result.check_result.readiness_score
+    assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
+    assert result.required_next_step in {
+        "answer_questions",
+        "save_contract",
+        "save_and_run_contract",
+        "revise_contract",
+    }
 
 
 def test_gap_and_question_ids_are_unique_within_result():
@@ -530,6 +612,43 @@ def test_improve_contract_from_answers_writes_markdown_and_rechecks(tmp_path: Pa
     assert "Product owner still needs to decide empty email handling." in output
     assert improved.check_result.source["path"] == str(output_path)
     assert improved.check_result.readiness_score > result.readiness_score
+
+
+def test_in_memory_improve_matches_file_based_improve(tmp_path: Path):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    result = check_contract_file(task_path, project_config=_python_project_config(tmp_path))
+    written = write_contract_report(result, task_path=task_path, project_root=tmp_path)
+    answers_data = yaml.safe_load(written.answers_path.read_text(encoding="utf-8"))
+    answers_data["answers"]["scope.boundaries"]["answer"] = "Add invite creation and acceptance endpoints."
+    answers_data["answers"]["acceptance.criteria"]["answer"] = (
+        "Owners can invite teammates by email.\nMembers cannot invite teammates."
+    )
+    answers_data["answers"]["scope.out_of_scope"]["answer"] = "Billing changes are out of scope."
+    written.answers_path.write_text(yaml.safe_dump(answers_data, sort_keys=False), encoding="utf-8")
+
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    in_memory = improve_contract_text(
+        task_path.read_text(encoding="utf-8").strip(),
+        contract_name=task_path,
+        questions=answers_data["questions"],
+        answers=answers_data["answers"],
+        source_result=result,
+        output_name=output_path,
+        project_config=_python_project_config(tmp_path),
+    )
+    file_based = improve_contract_from_answers(
+        task_path,
+        answers_path=written.answers_path,
+        output_path=output_path,
+        project_config=_python_project_config(tmp_path),
+    )
+
+    assert in_memory.markdown == output_path.read_text(encoding="utf-8")
+    assert in_memory.answered_question_ids == file_based.answered_question_ids
+    assert in_memory.open_question_ids == file_based.open_question_ids
+    assert in_memory.check_result.to_dict() == file_based.check_result.to_dict()
 
 
 def test_improve_contract_rejects_hash_mismatch(tmp_path: Path):

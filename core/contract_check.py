@@ -257,6 +257,62 @@ class ContractImproveResult:
 
 
 @dataclass(frozen=True)
+class ContractTextImproveResult:
+    markdown: str
+    check_result: ContractCheckResult
+    answered_question_ids: list[str]
+    open_question_ids: list[str]
+    source_sha256: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "markdown": self.markdown,
+            "source_sha256": self.source_sha256,
+            "answered_question_ids": list(self.answered_question_ids),
+            "open_question_ids": list(self.open_question_ids),
+            "check": self.check_result.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class ContractPrepareResult:
+    stage: str
+    needs_user_input: bool
+    ready_to_save: bool
+    ready_to_run: bool
+    required_next_step: str
+    questions_for_user: list[ClarifyingQuestion]
+    answers_template: dict[str, dict[str, Any]]
+    prepared_contract_markdown: str
+    check_result: ContractCheckResult
+    recheck_result: ContractCheckResult | None
+    unresolved_gaps: list[ContractGap]
+    status_applies_to_sha256: str
+    ready_to_run_blockers: list[str] = field(default_factory=list)
+    answered_question_ids: list[str] = field(default_factory=list)
+    open_question_ids: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "needs_user_input": self.needs_user_input,
+            "ready_to_save": self.ready_to_save,
+            "ready_to_run": self.ready_to_run,
+            "required_next_step": self.required_next_step,
+            "questions_for_user": [question.to_dict() for question in self.questions_for_user],
+            "answers_template": {key: dict(value) for key, value in self.answers_template.items()},
+            "prepared_contract_markdown": self.prepared_contract_markdown,
+            "check": self.check_result.to_dict(),
+            "recheck": self.recheck_result.to_dict() if self.recheck_result else None,
+            "unresolved_gaps": [gap.to_dict() for gap in self.unresolved_gaps],
+            "status_applies_to_sha256": self.status_applies_to_sha256,
+            "ready_to_run_blockers": list(self.ready_to_run_blockers),
+            "answered_question_ids": list(self.answered_question_ids),
+            "open_question_ids": list(self.open_question_ids),
+        }
+
+
+@dataclass(frozen=True)
 class _Section:
     heading: str
     normalized_heading: str
@@ -284,10 +340,11 @@ def check_contract(
     source_path: Path | str | None = None,
     source_format: str = "markdown",
     project_config: dict | None = None,
+    configured_validation_commands: list[str] | None = None,
 ) -> ContractCheckResult:
     parsed = _parse_markdown_task(text)
     sections_detected = _sections_detected(parsed)
-    validation = _validation_details(text, project_config)
+    validation = _validation_details(text, project_config, configured_validation_commands)
     security_sensitive = bool(_SECURITY_RISK_RE.search(text))
 
     scores = {
@@ -458,24 +515,238 @@ def improve_contract_from_answers(
     _validate_answers_for_task(answers_data, source_result)
     _reject_unknown_filled_answers(answers, questions)
 
-    rendered, answered_ids, open_ids = _render_improved_contract(task_text, task_path, questions, answers)
-    check_result = check_contract(
-        rendered,
-        source_path=final_output_path,
-        source_format="markdown",
+    improved = improve_contract_text(
+        task_text,
+        contract_name=task_path,
+        questions=questions,
+        answers=answers,
+        source_result=source_result,
+        output_name=final_output_path,
         project_config=project_config,
     )
 
     final_output_path.parent.mkdir(parents=True, exist_ok=True)
-    final_output_path.write_text(rendered, encoding="utf-8")
+    final_output_path.write_text(improved.markdown, encoding="utf-8")
     return ContractImproveResult(
         output_path=final_output_path,
+        check_result=improved.check_result,
+        answered_question_ids=improved.answered_question_ids,
+        open_question_ids=improved.open_question_ids,
+        source_sha256=improved.source_sha256,
+        answers_path=answers_path,
+    )
+
+
+def improve_contract_text(
+    contract_markdown: str,
+    *,
+    contract_name: str | Path | None = None,
+    questions: list[ClarifyingQuestion | dict[str, Any]],
+    answers: dict[str, str | dict[str, Any]],
+    source_result: ContractCheckResult | None = None,
+    output_name: str | Path | None = None,
+    project_config: dict | None = None,
+    configured_validation_commands: list[str] | None = None,
+) -> ContractTextImproveResult:
+    """Apply contract answers without reading or writing workflow files."""
+
+    source_path = _virtual_contract_path(contract_name, default_suffix=".md")
+    source_format = "text" if source_path.suffix.lower() == ".txt" else "markdown"
+    if source_result is None:
+        source_result = check_contract(
+            contract_markdown,
+            source_path=contract_name,
+            source_format=source_format,
+            project_config=project_config,
+            configured_validation_commands=configured_validation_commands,
+        )
+    question_dicts = _question_dicts(questions)
+    normalized_answers = _normalize_contract_answers(answers)
+    _reject_unknown_filled_answers(normalized_answers, question_dicts)
+
+    rendered, answered_ids, open_ids = _render_improved_contract(
+        contract_markdown,
+        source_path,
+        question_dicts,
+        normalized_answers,
+    )
+    check_result = check_contract(
+        rendered,
+        source_path=output_name if output_name is not None else contract_name,
+        source_format="markdown",
+        project_config=project_config,
+        configured_validation_commands=configured_validation_commands,
+    )
+    return ContractTextImproveResult(
+        markdown=rendered,
         check_result=check_result,
         answered_question_ids=answered_ids,
         open_question_ids=open_ids,
         source_sha256=str(source_result.source["sha256"]),
-        answers_path=answers_path,
     )
+
+
+def prepare_contract(
+    contract_markdown: str,
+    contract_name: str | None = None,
+    answers: dict[str, str | dict[str, Any]] | None = None,
+    project_context: dict | None = None,
+) -> ContractPrepareResult:
+    """Prepare an implementation contract through an in-memory check/improve loop."""
+
+    source_format = "text" if contract_name and Path(contract_name).suffix.lower() == ".txt" else "markdown"
+    project_config = None
+    validation_commands = _validation_commands_from_prepare_context(project_context)
+    check_result = check_contract(
+        contract_markdown,
+        source_path=contract_name,
+        source_format=source_format,
+        project_config=project_config,
+        configured_validation_commands=validation_commands,
+    )
+
+    if answers:
+        improved = improve_contract_text(
+            contract_markdown,
+            contract_name=contract_name,
+            questions=check_result.clarifying_questions,
+            answers=answers,
+            source_result=check_result,
+            project_config=project_config,
+            configured_validation_commands=validation_commands,
+        )
+        active_check = improved.check_result
+        questions_for_user = active_check.clarifying_questions
+        needs_user_input = bool(questions_for_user)
+        ready_to_run = active_check.ready_for_autonomous_delivery
+        ready_to_save = not needs_user_input and active_check.status in {"ready", "warn"}
+        stage = "ready" if ready_to_run else "needs_user_input" if needs_user_input else "review"
+        return ContractPrepareResult(
+            stage=stage,
+            needs_user_input=needs_user_input,
+            ready_to_save=ready_to_save,
+            ready_to_run=ready_to_run,
+            required_next_step=_prepare_required_next_step(
+                needs_user_input=needs_user_input,
+                ready_to_save=ready_to_save,
+                ready_to_run=ready_to_run,
+            ),
+            questions_for_user=questions_for_user,
+            answers_template=_prepare_answers_template(active_check),
+            prepared_contract_markdown=improved.markdown,
+            check_result=check_result,
+            recheck_result=active_check,
+            unresolved_gaps=active_check.gaps,
+            status_applies_to_sha256=str(active_check.source["sha256"]),
+            ready_to_run_blockers=_ready_to_run_blockers(active_check),
+            answered_question_ids=improved.answered_question_ids,
+            open_question_ids=improved.open_question_ids,
+        )
+
+    questions_for_user = check_result.clarifying_questions
+    needs_user_input = bool(questions_for_user)
+    ready_to_run = check_result.ready_for_autonomous_delivery
+    ready_to_save = not needs_user_input and check_result.status in {"ready", "warn"}
+    stage = "ready" if ready_to_run else "needs_user_input" if needs_user_input else "review"
+    return ContractPrepareResult(
+        stage=stage,
+        needs_user_input=needs_user_input,
+        ready_to_save=ready_to_save,
+        ready_to_run=ready_to_run,
+        required_next_step=_prepare_required_next_step(
+            needs_user_input=needs_user_input,
+            ready_to_save=ready_to_save,
+            ready_to_run=ready_to_run,
+        ),
+        questions_for_user=questions_for_user,
+        answers_template=_prepare_answers_template(check_result),
+        prepared_contract_markdown=contract_markdown.strip() + "\n",
+        check_result=check_result,
+        recheck_result=None,
+        unresolved_gaps=check_result.gaps,
+        status_applies_to_sha256=str(check_result.source["sha256"]),
+        ready_to_run_blockers=_ready_to_run_blockers(check_result),
+    )
+
+
+def _virtual_contract_path(contract_name: str | Path | None, *, default_suffix: str) -> Path:
+    if contract_name:
+        path = Path(str(contract_name))
+        if path.suffix:
+            return path
+        return path.with_suffix(default_suffix)
+    return Path(f"contract{default_suffix}")
+
+
+def _question_dicts(questions: list[ClarifyingQuestion | dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for question in questions:
+        data = question.to_dict() if isinstance(question, ClarifyingQuestion) else dict(question)
+        question_id = data.get("id")
+        if not isinstance(question_id, str) or not question_id:
+            raise ValueError("Contract question is missing a stable id")
+        if question_id in seen:
+            raise ValueError(f"Contract questions contain duplicate id: {question_id}")
+        seen.add(question_id)
+        normalized.append(data)
+    return normalized
+
+
+def _normalize_contract_answers(answers: dict[str, str | dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    normalized: dict[str, dict[str, Any]] = {}
+    for question_id, answer in answers.items():
+        if not isinstance(question_id, str) or not question_id:
+            raise ValueError("Contract answers must be keyed by stable question id")
+        if isinstance(answer, dict):
+            normalized[question_id] = {
+                "answer": answer.get("answer", ""),
+                "notes": answer.get("notes", ""),
+            }
+        else:
+            normalized[question_id] = {"answer": answer, "notes": ""}
+    return normalized
+
+
+def _prepare_answers_template(result: ContractCheckResult) -> dict[str, dict[str, Any]]:
+    template: dict[str, dict[str, Any]] = {}
+    for question in result.clarifying_questions:
+        entry = question.to_dict()
+        entry["answer"] = ""
+        entry["notes"] = ""
+        template[question.id] = entry
+    return template
+
+
+def _prepare_required_next_step(*, needs_user_input: bool, ready_to_save: bool, ready_to_run: bool) -> str:
+    if needs_user_input:
+        return "answer_questions"
+    if ready_to_run:
+        return "save_and_run_contract"
+    if ready_to_save:
+        return "save_contract"
+    return "revise_contract"
+
+
+def _ready_to_run_blockers(result: ContractCheckResult) -> list[str]:
+    if result.ready_for_autonomous_delivery:
+        return []
+    blockers = [gap.message for gap in result.gaps if gap.severity == "blocking"]
+    if result.status != "ready":
+        blockers.append(f"Readiness status is {result.status}, not ready.")
+    if not blockers and result.gaps:
+        blockers.extend(gap.message for gap in result.gaps)
+    return list(dict.fromkeys(blockers))
+
+
+def _validation_commands_from_prepare_context(project_context: dict | None) -> list[str] | None:
+    if not isinstance(project_context, dict):
+        return None
+    value = project_context.get("validation_commands")
+    if not isinstance(value, list):
+        return None
+    commands = [str(command).strip() for command in value if str(command).strip()]
+    return commands or None
 
 
 def _contract_report_data(result: ContractCheckResult, *, task_path: Path, artifact_base: Path) -> dict[str, Any]:
@@ -1250,15 +1521,30 @@ def _status_for_score(score: int) -> str:
     return "not_ready"
 
 
-def _validation_details(text: str, project_config: dict | None) -> dict[str, Any]:
+def _validation_details(
+    text: str,
+    project_config: dict | None,
+    explicit_validation_commands: list[str] | None,
+) -> dict[str, Any]:
     task_commands = extract_validation_commands(text)
     configured_commands: list[dict[str, str]] = []
     coverage_gaps: list[str] = []
     covered_commands: list[dict[str, Any]] = []
 
+    if explicit_validation_commands:
+        configured_commands.extend(
+            {
+                "phase": "project_context",
+                "name": f"validation-{index}",
+                "command": command,
+            }
+            for index, command in enumerate(explicit_validation_commands, start=1)
+            if command
+        )
     if project_config:
         state = TaskState(task_id="contract_check", task_description=text)
-        configured_commands = configured_validation_commands(project_config, state)
+        configured_commands.extend(configured_validation_commands(project_config, state))
+    if configured_commands:
         for command in task_commands:
             covered, match_kind, configured = validation_command_coverage(command, configured_commands)
             if covered:
