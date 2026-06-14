@@ -10,8 +10,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `sikula contract check TASK_FILE` now provides a deterministic, by-default read-only
   implementation-contract readiness preflight for Markdown/plain-text task files, with
   human-readable and `--json` output covering scope, acceptance criteria,
-  security/privacy, validation coverage, gaps, and stable clarifying question IDs, plus
-  optional `.sikula/contracts` report and hash-scoped answers-template artifacts via
+  security/privacy, validation coverage based on the same enabled build/test/check phases
+  used by `sikula run`, gaps, and stable clarifying question IDs, plus optional
+  `.sikula/contracts` report and hash-scoped answers-template artifacts via
   `--write-report`; `sikula run TASK_FILE` now stores a warning-only contract snapshot
   in task state, supports opt-in pre-agent gates via `--require-contract-ready` and
   `--min-contract-score`, keeps gate-failed pre-worktree states audit-only instead of

@@ -783,6 +783,71 @@ def test_contract_check_cli_json_write_report_stays_json(tmp_path: Path, monkeyp
     assert Path(data["written_report"]["answers_template"]).exists()
 
 
+def test_contract_check_cli_uses_effective_run_pipeline_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    config_path = tmp_path / ".sikula" / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        "project:\n"
+        "  root_path: .\n"
+        "  build_tool: python\n"
+        "build:\n"
+        "  checks:\n"
+        "    - name: ruff\n"
+        "      command: ruff check .\n",
+        encoding="utf-8",
+    )
+    task_path = tmp_path / ".sikula" / "tasks" / "weak.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with patch("sys.argv", ["sikula", "contract", "check", ".sikula/tasks/weak.md", "--json"]):
+        main()
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["readiness_score"] == 30
+    assert data["validation"]["configured_commands"] == []
+    assert any(gap["id"] == "gap.validation.commands" for gap in data["gaps"])
+
+
+def test_contract_check_cli_counts_enabled_run_pipeline_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    config_path = tmp_path / ".sikula" / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        "project:\n"
+        "  root_path: .\n"
+        "  build_tool: python\n"
+        "run_build: true\n"
+        "run_tests: true\n"
+        "run_checks: true\n"
+        "build:\n"
+        "  checks:\n"
+        "    - name: ruff\n"
+        "      command: ruff check .\n",
+        encoding="utf-8",
+    )
+    task_path = tmp_path / ".sikula" / "tasks" / "weak.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with patch("sys.argv", ["sikula", "contract", "check", ".sikula/tasks/weak.md", "--json"]):
+        main()
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["readiness_score"] == 36
+    assert [command["command"] for command in data["validation"]["configured_commands"]] == [
+        "ruff check .",
+        "pytest",
+        "ruff check .",
+    ]
+    assert all(gap["id"] != "gap.validation.commands" for gap in data["gaps"])
+
+
 def test_contract_check_cli_write_report_prints_generated_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ):

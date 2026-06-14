@@ -41,10 +41,11 @@ stale answer hashes and accidental overwrites; for plain-text `.txt` inputs,
 write the improved contract to a new Markdown file with `--output`. After the
 task file changes, old filled answers are moved to `previous_answers` and the
 active answers are reset for the new hash. If the project has a configured
-Sikula build/test/check pipeline, the task does not need to repeat those
-commands unless it requires additional project-specific validation. The
-readiness score is a preflight signal, not a guarantee that the task will
-succeed.
+Sikula build/test/check pipeline and those phases are enabled for a normal
+`sikula run`, the task does not need to repeat those commands unless it requires
+additional project-specific validation. Disabled validation phases do not count
+as contract readiness coverage. The readiness score is a preflight signal, not a
+guarantee that the task will succeed.
 Normal `sikula run TASK_FILE` records the same check as a compact, warning-only
 state snapshot and prints a one-line summary before agents start; it does not
 write `.sikula/contracts` artifacts.

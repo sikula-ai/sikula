@@ -900,7 +900,7 @@ def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
         print(f"Task file not found: {args.task_file}")
         sys.exit(1)
 
-    result = check_contract_file(task_path, project_config=cfg or None)
+    result = check_contract_file(task_path, project_config=_contract_cli_project_config(cfg))
     write_result = None
     if args.write_report:
         report_root = project_root if cfg.get("project", {}).get("root_path") else None
@@ -947,7 +947,7 @@ def cmd_contract_improve(args: argparse.Namespace, cfg: dict) -> None:
             answers_path=answers_path,
             output_path=output_path,
             write=args.write,
-            project_config=cfg or None,
+            project_config=_contract_cli_project_config(cfg),
         )
     except (OSError, ValueError) as exc:
         print(f"Failed to improve contract: {exc}", file=sys.stderr)
@@ -1044,6 +1044,12 @@ def _contract_preflight_config(cfg: dict, overrides: dict) -> dict:
         "run_checks": _phase("run_checks"),
     }
     return effective
+
+
+def _contract_cli_project_config(cfg: dict) -> dict | None:
+    if not cfg:
+        return None
+    return _contract_preflight_config(cfg, {})
 
 
 def _contract_preflight_record_result(snapshot: dict) -> str:

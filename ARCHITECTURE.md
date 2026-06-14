@@ -140,9 +140,9 @@ recomputing or re-gating the check. Review mode uses the existing branch diff as
 primary review artifact; review-context readiness is a separate concern and should not
 reuse the delivery task contract gate. When a Sikula config is available, it reuses
 `core.validation_coverage` to compare task-described validation commands with the
-effective configured pipeline and treats the configured build/test/check pipeline as
-validation coverage for tasks that do not require extra commands; without config it still
-runs the task-content checks and leaves validation coverage empty. Answers templates are
+effective build/test/check phases that `sikula run TASK_FILE` would execute from the same
+config. Disabled phases do not count as validation coverage; without config it still runs
+the task-content checks and leaves validation coverage empty. Answers templates are
 task-hash scoped: when the task content hash changes, existing filled answers are retained
 only under `previous_answers`, while active `answers` are reset for the new hash so future
 `contract improve` or run preflight logic does not treat stale answers as authoritative.
