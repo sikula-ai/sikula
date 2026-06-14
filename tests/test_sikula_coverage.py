@@ -12,6 +12,12 @@ import pytest
 
 _sikula = importlib.import_module("sikula")
 _parse_agent_llm_overrides = _sikula._parse_agent_llm_overrides
+_contract_score_threshold = _sikula._contract_score_threshold
+_contract_gate_task_path = _sikula._contract_gate_task_path
+_contract_gate_blocked_without_worktree = _sikula._contract_gate_blocked_without_worktree
+_contract_gate_next_action = _sikula._contract_gate_next_action
+_contract_readiness_gate_failures = _sikula._contract_readiness_gate_failures
+_print_contract_readiness_gate_failure = _sikula._print_contract_readiness_gate_failure
 _fmt_time = _sikula._fmt_time
 _build_tool_class = _sikula._build_tool_class
 _reset_failed_state = _sikula._reset_failed_state
@@ -59,6 +65,60 @@ class TestParseAgentLlmOverrides:
             _parse_agent_llm_overrides(None, None, ["analyst=abc"])
         assert exc.value.code == 1
         assert "expected int" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Contract readiness CLI helpers
+# ---------------------------------------------------------------------------
+
+
+class TestContractReadinessHelpers:
+    def test_contract_score_threshold_validates_range_and_type(self):
+        assert _contract_score_threshold("85") == 85
+        with pytest.raises(argparse.ArgumentTypeError):
+            _contract_score_threshold("not-a-number")
+        with pytest.raises(argparse.ArgumentTypeError):
+            _contract_score_threshold("-1")
+        with pytest.raises(argparse.ArgumentTypeError):
+            _contract_score_threshold("101")
+
+    def test_contract_gate_helpers_handle_missing_snapshot_path(self):
+        state = argparse.Namespace(task_id="t1", implementation_contract=None, contract_gate_blocked=True)
+        assert _contract_gate_task_path(state) is None
+        assert _contract_gate_next_action(state) == "sikula show t1"
+
+        state.implementation_contract = {"source": "invalid"}
+        assert _contract_gate_task_path(state) is None
+
+    def test_contract_gate_blocked_requires_missing_worktree_context(self):
+        state = argparse.Namespace(
+            contract_gate_blocked=True,
+            worktree_path="/tmp/worktree",
+            worktree_branch=None,
+        )
+        assert not _contract_gate_blocked_without_worktree(state)
+
+        state.worktree_path = None
+        assert _contract_gate_blocked_without_worktree(state)
+
+    def test_contract_readiness_gate_reports_unknown_score(self):
+        failures = _contract_readiness_gate_failures(
+            {"status": "warn", "ready_for_autonomous_delivery": False},
+            require_ready=True,
+            min_score=80,
+        )
+        assert failures == [
+            "contract is not ready (WARN)",
+            "contract score is unavailable; minimum required score is 80/100",
+        ]
+
+    def test_print_contract_readiness_gate_failure_without_source_path(self, capsys):
+        _print_contract_readiness_gate_failure({}, ["contract is not ready (WARN)"], "t1")
+        out = capsys.readouterr().out
+        assert "Implementation contract gate failed:" in out
+        assert "- contract is not ready (WARN)" in out
+        assert "rerun sikula run" in out
+        assert "sikula show t1" in out
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +248,54 @@ class TestResetFailedState:
         assert loaded.check_errors == []
         out = capsys.readouterr().out
         assert "reset" in out
+
+    def test_reset_refuses_contract_gate_failed_state_without_worktree(self, tmp_path: Path, capsys):
+        from core.state import TaskState
+
+        store = self._store(tmp_path)
+        s = TaskState(task_id="t1", task_description="task")
+        s.failed = True
+        s.contract_gate_blocked = True
+        s.build_iterations = 3
+        s.errors = ["contract gate"]
+        s.implementation_contract = {"source": {"path": ".sikula/tasks/task.md"}}
+        store.save(s)
+        cfg = {"project": {"root_path": str(tmp_path)}, "sandbox": {}}
+
+        with pytest.raises(SystemExit) as exc:
+            _reset_failed_state("t1", cfg, store)
+
+        assert exc.value.code == 1
+        loaded = store.load("t1")
+        assert loaded.failed
+        assert loaded.contract_gate_blocked
+        assert loaded.build_iterations == 3
+        assert loaded.errors == ["contract gate"]
+        out = capsys.readouterr().out
+        assert "failed before worktree creation" in out
+        assert "--reset-failed cannot safely resume it" in out
+        assert "sikula contract check .sikula/tasks/task.md --write-report" in out
+
+    def test_reset_allows_contract_gate_marker_when_worktree_exists(self, tmp_path: Path, capsys):
+        from core.state import TaskState
+
+        store = self._store(tmp_path)
+        s = TaskState(task_id="t1", task_description="task")
+        s.failed = True
+        s.contract_gate_blocked = True
+        s.worktree_path = str(tmp_path / "worktree")
+        s.worktree_branch = "sikula/task-t1"
+        s.files_changed = ["src/foo.py"]
+        store.save(s)
+        cfg = {"project": {"root_path": str(tmp_path)}, "sandbox": {}}
+
+        _reset_failed_state("t1", cfg, store)
+
+        loaded = store.load("t1")
+        assert not loaded.failed
+        assert loaded.contract_gate_blocked
+        assert loaded.build_iterations == 0
+        assert "reset" in capsys.readouterr().out
 
     def test_auto_detects_changed_files_from_git_diff(self, tmp_path: Path, capsys):
         from core.state import TaskState

@@ -457,6 +457,13 @@ class Orchestrator:
     def _loop(self, state: TaskState) -> None:
         if state.done or state.failed:
             if state.failed:
+                if state.contract_gate_blocked and not state.worktree_path and not state.worktree_branch:
+                    log.info(
+                        "Task %s already in terminal state (failed by contract readiness gate) — improve the task "
+                        "contract and start a fresh task-file run",
+                        state.task_id,
+                    )
+                    return
                 log.info(
                     "Task %s already in terminal state (failed) — use --reset-failed to retry",
                     state.task_id,

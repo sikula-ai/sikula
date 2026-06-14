@@ -168,6 +168,7 @@ class TaskState:
     schema_version: int = SCHEMA_VERSION
     config_snapshot: dict = field(default_factory=dict)
     implementation_contract: dict = field(default_factory=dict)
+    contract_gate_blocked: bool = False
     analyst_prompt: Optional[str] = None
     planner_prompt: Optional[str] = None
     implementation_prompt: Optional[str] = None

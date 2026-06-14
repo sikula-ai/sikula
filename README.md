@@ -120,11 +120,13 @@ Use this when you want to clarify a task before any agents start changing code.
 
 ```bash
 sikula run .sikula/tasks/my-task.md
+# Optional: abort before agents if the task is not ready enough for delivery
+sikula run .sikula/tasks/my-task.md --require-contract-ready
 sikula status
 git diff <base-branch>...sikula/<task-stem>-<task-id>
 ```
 
-Use this when the task is ready and you want Sikula to run the gated delivery pipeline.
+Use this when the task is ready and you want Sikula to run the gated delivery pipeline. See [Writing Sikula Tasks](docs/writing-tasks.md) for contract readiness gates and task-writing guidance.
 
 **Review an existing branch**
 

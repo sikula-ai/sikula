@@ -42,6 +42,10 @@ Phase flags (--flag / --no-flag): override run_* keys from the project config fo
   --build-per-step / --no-build-per-step     run_build_per_step
   --checks / --no-checks                     run_checks
 
+Contract gate flags (fresh task-file runs only):
+  --require-contract-ready           abort before agents unless the task contract is ready
+  --min-contract-score N             abort before agents unless readiness score is at least N
+
 Per-agent LLM flags (repeatable, agent name uses _ or -):
   --agent-model analyst=gpt-5.5
   --agent-provider analyst=claude
@@ -318,6 +322,16 @@ def _parse_agent_llm_overrides(
     _add(agent_providers, "provider")
     _add(agent_timeouts, "agent_timeout", cast=int, flag="timeout")
     return result
+
+
+def _contract_score_threshold(value: str) -> int:
+    try:
+        score = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--min-contract-score must be an integer from 0 to 100") from exc
+    if score < 0 or score > 100:
+        raise argparse.ArgumentTypeError("--min-contract-score must be between 0 and 100")
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -670,60 +684,30 @@ def _path_is_within(path: Path, base: Path) -> bool:
         return False
 
 
-def build_orchestrator(cfg: dict, overrides: dict | None = None, state_store=None):
-    from core.llm_client import create_llm_client
-    from core.orchestrator import Orchestrator, OrchestratorConfig
-    from core.state import JsonStateStore
+def _run_phase_flag(cfg: dict, overrides: dict, key: str) -> bool:
+    cli_val = overrides.get(key)
+    return bool(cfg.get(key, False) if cli_val is None else cli_val)
 
-    overrides = overrides or {}
 
-    def _phase(key: str) -> bool:
-        """Return CLI override if set, else config value, else False."""
-        cli_val = overrides.get(key)
-        return cfg.get(key, False) if cli_val is None else cli_val
-
-    run_build = _phase("run_build")
-    run_presync = _phase("run_presync")
-    run_review = _phase("run_review")
-    run_security_review = _phase("run_security_review")
-    run_test_writing = _phase("run_test_writing")
-    run_tests = _phase("run_tests")
-    run_planner = _phase("run_planner")
-    run_build_per_step = _phase("run_build_per_step")
-    run_checks = _phase("run_checks")
-
-    # presync_clean lives under build: in the config — patch the nested dict in-place so
-    # the value reaches the build tool (reads it from project_config["build"]["presync_clean"]).
-    if "presync_clean" in overrides:
-        cfg.setdefault("build", {})["presync_clean"] = overrides["presync_clean"]
-
-    project_root = Path(cfg["project"]["root_path"])
-    sandbox = cfg.get("sandbox", {})
-    base_llm_cfg = cfg.get("llm", {})
+def _effective_agent_llm_cfg(cfg: dict, overrides: dict, name: str) -> dict:
     agents_cfg = cfg.get("agents", {})
     cli_agent_overrides: dict[str, dict] = overrides.get("agent_llms", {})
+    yaml_agent = agents_cfg.get(name, {}).get("llm", {})
+    cli_agent = cli_agent_overrides.get(name, {})
+    return {**yaml_agent, **cli_agent}
 
-    def _agent_llm_cfg(name: str) -> dict:
-        yaml_agent = agents_cfg.get(name, {}).get("llm", {})
-        cli_agent = cli_agent_overrides.get(name, {})
-        return {**yaml_agent, **cli_agent}  # CLI wins over YAML
 
-    max_iterations = int(sandbox.get("max_iterations", 10))
+def _run_config_snapshot(cfg: dict, overrides: dict | None = None) -> dict:
+    overrides = overrides or {}
+    sandbox = cfg.get("sandbox", {})
+    build_snapshot = dict(cfg.get("build", {}))
+    if "presync_clean" in overrides:
+        build_snapshot["presync_clean"] = overrides["presync_clean"]
     max_review_iterations = int(sandbox.get("max_review_iterations", 3))
-    max_security_review_iterations = int(sandbox.get("max_security_review_iterations", max_review_iterations))
-    heartbeat_interval_seconds = _heartbeat_interval_seconds(cfg)
-    if state_store is None:
-        state_store = JsonStateStore(_resolve_state_dir(cfg))
-
-    default_llm = create_llm_client(_make_llm_config(base_llm_cfg, {}))
-    agent_llms = {
-        name: create_llm_client(_make_llm_config(base_llm_cfg, _agent_llm_cfg(name)))
-        for name in _VALID_AGENTS
-        if _agent_llm_cfg(name)
-    }
+    base_llm_cfg = cfg.get("llm", {})
 
     def _agent_snapshot(name: str) -> dict:
-        c = _make_llm_config(base_llm_cfg, _agent_llm_cfg(name))
+        c = _make_llm_config(base_llm_cfg, _effective_agent_llm_cfg(cfg, overrides, name))
         snap: dict = {
             "provider": c.provider,
             "model": c.model,
@@ -734,32 +718,73 @@ def build_orchestrator(cfg: dict, overrides: dict | None = None, state_store=Non
             snap["extra_rules"] = extra_rules
         return snap
 
-    config_snapshot = {
+    return {
         "project": cfg.get("project", {}).get("name"),
-        "run_presync": run_presync,
-        "run_planner": run_planner,
-        "run_review": run_review,
-        "run_security_review": run_security_review,
-        "run_test_writing": run_test_writing,
-        "run_build": run_build,
-        "run_tests": run_tests,
-        "run_build_per_step": run_build_per_step,
-        "run_checks": run_checks,
-        "max_iterations": max_iterations,
+        "run_presync": _run_phase_flag(cfg, overrides, "run_presync"),
+        "run_planner": _run_phase_flag(cfg, overrides, "run_planner"),
+        "run_review": _run_phase_flag(cfg, overrides, "run_review"),
+        "run_security_review": _run_phase_flag(cfg, overrides, "run_security_review"),
+        "run_test_writing": _run_phase_flag(cfg, overrides, "run_test_writing"),
+        "run_build": _run_phase_flag(cfg, overrides, "run_build"),
+        "run_tests": _run_phase_flag(cfg, overrides, "run_tests"),
+        "run_build_per_step": _run_phase_flag(cfg, overrides, "run_build_per_step"),
+        "run_checks": _run_phase_flag(cfg, overrides, "run_checks"),
+        "max_iterations": int(sandbox.get("max_iterations", 10)),
         "max_review_iterations": max_review_iterations,
-        "max_security_review_iterations": max_security_review_iterations,
+        "max_security_review_iterations": int(sandbox.get("max_security_review_iterations", max_review_iterations)),
         "progress": {
-            "heartbeat_interval_seconds": heartbeat_interval_seconds,
+            "heartbeat_interval_seconds": _heartbeat_interval_seconds(cfg),
         },
         "sandbox": {
             "allowed_write_paths": sandbox.get("allowed_write_paths", []),
             "allowed_test_write_paths": sandbox.get("allowed_test_write_paths", []),
             "allowed_read_paths": sandbox.get("allowed_read_paths", ["."]),
         },
-        "build": cfg.get("build", {}),
+        "build": build_snapshot,
         "planner": cfg.get("planner", {}),
         "test_writer": cfg.get("test_writer", {}),
         "agents": {name: _agent_snapshot(name) for name in sorted(_VALID_AGENTS)},
+    }
+
+
+def build_orchestrator(cfg: dict, overrides: dict | None = None, state_store=None):
+    from core.llm_client import create_llm_client
+    from core.orchestrator import Orchestrator, OrchestratorConfig
+    from core.state import JsonStateStore
+
+    overrides = overrides or {}
+
+    # presync_clean lives under build: in the config — patch the nested dict in-place so
+    # the value reaches the build tool (reads it from project_config["build"]["presync_clean"]).
+    if "presync_clean" in overrides:
+        cfg.setdefault("build", {})["presync_clean"] = overrides["presync_clean"]
+
+    config_snapshot = _run_config_snapshot(cfg, overrides)
+    run_build = config_snapshot["run_build"]
+    run_presync = config_snapshot["run_presync"]
+    run_review = config_snapshot["run_review"]
+    run_security_review = config_snapshot["run_security_review"]
+    run_test_writing = config_snapshot["run_test_writing"]
+    run_tests = config_snapshot["run_tests"]
+    run_planner = config_snapshot["run_planner"]
+    run_build_per_step = config_snapshot["run_build_per_step"]
+    run_checks = config_snapshot["run_checks"]
+    max_iterations = config_snapshot["max_iterations"]
+    max_review_iterations = config_snapshot["max_review_iterations"]
+    max_security_review_iterations = config_snapshot["max_security_review_iterations"]
+    heartbeat_interval_seconds = config_snapshot["progress"]["heartbeat_interval_seconds"]
+
+    project_root = Path(cfg["project"]["root_path"])
+    sandbox = cfg.get("sandbox", {})
+    base_llm_cfg = cfg.get("llm", {})
+    if state_store is None:
+        state_store = JsonStateStore(_resolve_state_dir(cfg))
+
+    default_llm = create_llm_client(_make_llm_config(base_llm_cfg, {}))
+    agent_llms = {
+        name: create_llm_client(_make_llm_config(base_llm_cfg, _effective_agent_llm_cfg(cfg, overrides, name)))
+        for name in _VALID_AGENTS
+        if _effective_agent_llm_cfg(cfg, overrides, name)
     }
 
     return Orchestrator(
@@ -811,6 +836,13 @@ def _reset_failed_state(task_id: str, cfg: dict, store) -> None:
     if not state.failed:
         print(f"Task {task_id} is not in failed state — nothing to reset")
         return
+
+    if _contract_gate_blocked_without_worktree(state):
+        print(f"Task {task_id} failed before worktree creation because the contract readiness gate blocked delivery.")
+        print("--reset-failed cannot safely resume it; improve the task contract and start a fresh run.")
+        print(f"Suggested next step: {_contract_gate_next_action(state)}")
+        print(f"Inspect state: sikula show {task_id}")
+        sys.exit(1)
 
     state.failed = False
     # Reset iteration counters so their loops are not immediately blocked on resume.
@@ -879,7 +911,7 @@ def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
         print(f"Task file not found: {args.task_file}")
         sys.exit(1)
 
-    result = check_contract_file(task_path, project_config=cfg or None)
+    result = check_contract_file(task_path, project_config=_contract_cli_project_config(cfg))
     write_result = None
     if args.write_report:
         report_root = project_root if cfg.get("project", {}).get("root_path") else None
@@ -926,7 +958,7 @@ def cmd_contract_improve(args: argparse.Namespace, cfg: dict) -> None:
             answers_path=answers_path,
             output_path=output_path,
             write=args.write,
-            project_config=cfg or None,
+            project_config=_contract_cli_project_config(cfg),
         )
     except (OSError, ValueError) as exc:
         print(f"Failed to improve contract: {exc}", file=sys.stderr)
@@ -1012,17 +1044,19 @@ def _build_contract_preflight_snapshot(task_path: Path, cfg: dict, project_root:
 def _contract_preflight_config(cfg: dict, overrides: dict) -> dict:
     from core.validation_coverage import INTERNAL_PIPELINE_CONFIG_KEY
 
-    def _phase(key: str) -> bool:
-        cli_val = overrides.get(key)
-        return cfg.get(key, False) if cli_val is None else cli_val
-
     effective = dict(cfg)
     effective[INTERNAL_PIPELINE_CONFIG_KEY] = {
-        "run_build": _phase("run_build"),
-        "run_tests": _phase("run_tests"),
-        "run_checks": _phase("run_checks"),
+        "run_build": _run_phase_flag(cfg, overrides, "run_build"),
+        "run_tests": _run_phase_flag(cfg, overrides, "run_tests"),
+        "run_checks": _run_phase_flag(cfg, overrides, "run_checks"),
     }
     return effective
+
+
+def _contract_cli_project_config(cfg: dict) -> dict | None:
+    if not cfg:
+        return None
+    return _contract_preflight_config(cfg, {})
 
 
 def _contract_preflight_record_result(snapshot: dict) -> str:
@@ -1031,6 +1065,32 @@ def _contract_preflight_record_result(snapshot: dict) -> str:
     if isinstance(score, int):
         return f"{status} {score}/100"
     return status
+
+
+def _contract_gate_task_path(state) -> str | None:
+    snapshot = getattr(state, "implementation_contract", None)
+    if not isinstance(snapshot, dict):
+        return None
+    source = snapshot.get("source")
+    if not isinstance(source, dict):
+        return None
+    path = source.get("path")
+    return path if isinstance(path, str) and path.strip() else None
+
+
+def _contract_gate_blocked_without_worktree(state) -> bool:
+    return bool(
+        getattr(state, "contract_gate_blocked", False)
+        and not getattr(state, "worktree_path", None)
+        and not getattr(state, "worktree_branch", None)
+    )
+
+
+def _contract_gate_next_action(state) -> str:
+    path = _contract_gate_task_path(state)
+    if path:
+        return f"sikula contract check {path} --write-report"
+    return f"sikula show {state.task_id}"
 
 
 def _print_contract_preflight_summary(snapshot: dict) -> None:
@@ -1054,6 +1114,59 @@ def _print_contract_preflight_summary(snapshot: dict) -> None:
         details.append(f"{question_count} follow-up question(s)")
     suffix = f" ({', '.join(details)})" if details else ""
     print(f"Implementation contract: {status} {score_text}{suffix}")
+
+
+def _contract_readiness_gate_failures(
+    snapshot: dict,
+    *,
+    require_ready: bool,
+    min_score: int | None,
+) -> list[str]:
+    if not require_ready and min_score is None:
+        return []
+
+    failures: list[str] = []
+    status = str(snapshot.get("status") or "unknown").upper()
+    score = snapshot.get("readiness_score")
+
+    if require_ready and not snapshot.get("ready_for_autonomous_delivery"):
+        if status == "ERROR":
+            failures.append("contract check is unavailable; strict readiness requires a valid contract check")
+        elif isinstance(score, int):
+            failures.append(f"contract is not ready ({status} {score}/100)")
+        else:
+            failures.append(f"contract is not ready ({status})")
+
+    if min_score is not None:
+        if not isinstance(score, int):
+            failures.append(f"contract score is unavailable; minimum required score is {min_score}/100")
+        elif score < min_score:
+            failures.append(f"contract score is {score}/100; minimum required score is {min_score}/100")
+
+    return failures
+
+
+def _print_contract_readiness_gate_failure(snapshot: dict, failures: list[str], task_id: str) -> None:
+    print("Implementation contract gate failed:")
+    for failure in failures:
+        print(f"- {failure}")
+
+    source = snapshot.get("source") if isinstance(snapshot.get("source"), dict) else {}
+    path = source.get("path")
+    print("Next steps:")
+    if path:
+        print(f"- Improve the task directly, then rerun: sikula run {path}")
+        print(f"- Or generate answers: sikula contract check {path} --write-report")
+        print(
+            f"- Then apply answers: sikula contract improve {path} "
+            "--answers .sikula/contracts/<task>.answers.yaml --output <task>.v2.md"
+        )
+    else:
+        print("- Improve the task directly, then rerun sikula run.")
+        print(
+            "- Or generate answers with sikula contract check --write-report and apply them with sikula contract improve."
+        )
+    print(f"Task state saved: sikula show {task_id}")
 
 
 def _fmt_time(seconds: float) -> str:
@@ -1499,6 +1612,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
         description = task_path.read_text().strip()
         state = store.create(description)
         state.task_file = Path(args.task_file).name
+        state.config_snapshot = _run_config_snapshot(cfg, overrides)
         preflight_cfg = _contract_preflight_config(cfg, overrides)
         state.implementation_contract = _build_contract_preflight_snapshot(
             task_path, preflight_cfg, original_project_root
@@ -1506,6 +1620,18 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
         state.record("orchestrator", "contract_check", _contract_preflight_record_result(state.implementation_contract))
         store.save(state)
         _print_contract_preflight_summary(state.implementation_contract)
+        gate_failures = _contract_readiness_gate_failures(
+            state.implementation_contract,
+            require_ready=bool(getattr(args, "require_contract_ready", False)),
+            min_score=getattr(args, "min_contract_score", None),
+        )
+        if gate_failures:
+            state.failed = True
+            state.contract_gate_blocked = True
+            state.record("orchestrator", "contract_gate_failed", "; ".join(gate_failures))
+            store.save(state)
+            _print_contract_readiness_gate_failure(state.implementation_contract, gate_failures, state.task_id)
+            sys.exit(1)
 
         if isolate:
             branch = f"sikula/{_branch_stem(args.task_file)}-{state.task_id}"
@@ -1623,7 +1749,11 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
             print("This task is already complete; no work was run.")
         else:
             print("This task has failed; no work was run.")
-            print(f"Use --reset-failed to retry: sikula run --task-id {state.task_id} --reset-failed")
+            if _contract_gate_blocked_without_worktree(state):
+                print("The contract readiness gate blocked delivery before a worktree was created.")
+                print(f"Suggested next step: {_contract_gate_next_action(state)}")
+            else:
+                print(f"Use --reset-failed to retry: sikula run --task-id {state.task_id} --reset-failed")
         print()
         print("Previous run:")
     else:
@@ -1762,6 +1892,8 @@ def _status_next_action(state, status: str) -> str:
     if status == "DONE":
         return "review branch" if state.worktree_branch else "review changes"
     if status == "FAILED":
+        if _contract_gate_blocked_without_worktree(state):
+            return _contract_gate_next_action(state)
         return f"sikula run --task-id {state.task_id} --reset-failed"
     if status == "CLEANED":
         return f"sikula show {state.task_id}"
@@ -2996,6 +3128,19 @@ def main() -> None:
         help="Override run_build_per_step",
     )
     run_p.add_argument("--checks", action=_boa, default=None, help="Override run_checks")
+    run_p.add_argument(
+        "--require-contract-ready",
+        action="store_true",
+        default=False,
+        help="Abort fresh task-file runs before agents unless the implementation contract is ready",
+    )
+    run_p.add_argument(
+        "--min-contract-score",
+        type=_contract_score_threshold,
+        default=None,
+        metavar="0-100",
+        help="Abort fresh task-file runs before agents unless the implementation contract score is at least this value",
+    )
 
     # Per-agent LLM overrides — repeatable; layer on top of agents.<name>.llm in the project config.
     run_p.add_argument(

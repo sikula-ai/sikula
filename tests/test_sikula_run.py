@@ -405,6 +405,8 @@ def _run_args(**kwargs):
         tests=None,
         build_per_step=None,
         checks=None,
+        require_contract_ready=False,
+        min_contract_score=None,
         agent_model=None,
         agent_provider=None,
         agent_timeout=None,
@@ -732,6 +734,232 @@ class TestCmdRunStateStore:
         assert state.implementation_contract["status"] == "error"
         assert "contract parser unavailable" in state.implementation_contract["error"]
 
+    def test_task_file_contract_ready_gate_aborts_before_orchestrator(self, tmp_path: Path, capsys):
+        task_file = tmp_path / "task.md"
+        task_file.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.\n")
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            pytest.raises(SystemExit) as exc,
+        ):
+            cmd_run(
+                _run_args(task_file=str(task_file), no_isolate=True, require_contract_ready=True),
+                _run_cfg(tmp_path),
+            )
+
+        out = capsys.readouterr().out
+        assert exc.value.code == 1
+        assert "Implementation contract gate failed:" in out
+        assert "sikula contract improve" in out
+        build_orchestrator.assert_not_called()
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.failed
+        assert not state.done
+        assert state.contract_gate_blocked
+        assert state.worktree_path is None
+        assert state.implementation_contract["status"] == "not_ready"
+        assert any(entry["action"] == "contract_gate_failed" for entry in state.history)
+
+    def test_task_file_contract_ready_gate_aborts_before_isolated_worktree(self, tmp_path: Path, capsys):
+        task_file = tmp_path / "task.md"
+        task_file.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.\n")
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._require_committed_config_for_isolated_run"),
+            patch("sikula._create_worktree") as create_worktree,
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            pytest.raises(SystemExit) as exc,
+        ):
+            cmd_run(
+                _run_args(task_file=str(task_file), require_contract_ready=True),
+                _run_cfg(tmp_path),
+            )
+
+        out = capsys.readouterr().out
+        assert exc.value.code == 1
+        assert "Implementation contract gate failed:" in out
+        create_worktree.assert_not_called()
+        build_orchestrator.assert_not_called()
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.failed
+        assert state.contract_gate_blocked
+        assert state.worktree_path is None
+        assert state.worktree_branch is None
+
+    def test_task_file_contract_gate_saves_effective_config_snapshot(self, tmp_path: Path):
+        task_file = tmp_path / "task.md"
+        task_file.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.\n")
+        cfg = _run_cfg(tmp_path)
+        cfg["run_build"] = True
+        cfg["run_tests"] = True
+        cfg["run_checks"] = True
+        cfg["build"] = {"checks": [{"name": "ruff", "command": "ruff check ."}]}
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            pytest.raises(SystemExit) as exc,
+        ):
+            cmd_run(
+                _run_args(
+                    task_file=str(task_file),
+                    no_isolate=True,
+                    require_contract_ready=True,
+                    tests=False,
+                    checks=False,
+                ),
+                cfg,
+            )
+
+        assert exc.value.code == 1
+        build_orchestrator.assert_not_called()
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.failed
+        assert state.contract_gate_blocked
+        assert state.config_snapshot["run_build"] is True
+        assert state.config_snapshot["run_tests"] is False
+        assert state.config_snapshot["run_checks"] is False
+        assert state.config_snapshot["build"] == {"checks": [{"name": "ruff", "command": "ruff check ."}]}
+        assert state.implementation_contract["validation"]["configured_command_count"] == 1
+
+    def test_task_file_min_contract_score_gate_aborts_below_threshold(self, tmp_path: Path, capsys):
+        task_file = tmp_path / "task.md"
+        task_file.write_text(
+            "# Add endpoint\n\n"
+            "## Scope\nAdd a small endpoint.\n\n"
+            "## Acceptance criteria\n- It returns a successful response.\n"
+        )
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            pytest.raises(SystemExit) as exc,
+        ):
+            cmd_run(
+                _run_args(task_file=str(task_file), no_isolate=True, min_contract_score=90),
+                _run_cfg(tmp_path),
+            )
+
+        out = capsys.readouterr().out
+        assert exc.value.code == 1
+        assert "minimum required score is 90/100" in out
+        build_orchestrator.assert_not_called()
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.failed
+        assert state.contract_gate_blocked
+        assert any(entry["action"] == "contract_gate_failed" for entry in state.history)
+
+    def test_task_file_contract_gate_passes_ready_task(self, tmp_path: Path):
+        task_file = tmp_path / "task.md"
+        task_file.write_text(
+            "# Team invites\n\n"
+            "## Scope\n"
+            "- Add invite creation endpoint.\n"
+            "- Add invite acceptance endpoint.\n"
+            "- Add pending invite model.\n\n"
+            "## Acceptance criteria\n"
+            "- Owner/admin can invite a user by email.\n"
+            "- Non-admin users cannot invite users.\n"
+            "- Duplicate pending invite returns a deterministic error.\n"
+            "- Expired invite token cannot be accepted.\n"
+            "- Accepted invite token cannot be reused.\n\n"
+            "## Security and privacy\n"
+            "- Invite tokens must be unguessable.\n"
+            "- Invite tokens must not be logged.\n"
+            "- Error messages must not reveal whether an email already has an account.\n\n"
+            "## Out of scope\n"
+            "- Billing seat enforcement.\n"
+            "- Bulk invites.\n"
+            "- Full team settings redesign.\n\n"
+            "## Tests\n"
+            "- Permission tests for allowed and denied inviter roles.\n"
+            "- Token lifecycle tests for expired and reused tokens.\n"
+            "- Duplicate invite test.\n\n"
+            "## Validation\n"
+            "- `pytest`\n"
+            "- `ruff check .`\n\n"
+            "## Reviewer focus\n"
+            "- Authorization rules.\n"
+            "- Token expiry and reuse.\n"
+            "- Email enumeration behaviour.\n"
+        )
+        cfg = _run_cfg(tmp_path)
+        cfg["run_build"] = True
+        cfg["run_tests"] = True
+        cfg["run_checks"] = True
+        cfg["build"] = {"checks": [{"name": "ruff", "command": "ruff check ."}]}
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            task_id = state_store.list_tasks()[0]
+            state = state_store.load(task_id)
+            state.done = True
+            state_store.save(state)
+            mock.run.return_value = state
+            return mock
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator", side_effect=capture_orch) as build_orchestrator,
+            patch("sys.exit") as exit_mock,
+        ):
+            cmd_run(
+                _run_args(
+                    task_file=str(task_file),
+                    no_isolate=True,
+                    require_contract_ready=True,
+                    min_contract_score=80,
+                ),
+                cfg,
+            )
+
+        build_orchestrator.assert_called_once()
+        exit_mock.assert_called_with(0)
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.done
+        assert not state.failed
+        assert state.implementation_contract["ready_for_autonomous_delivery"]
+        assert not any(entry["action"] == "contract_gate_failed" for entry in state.history)
+
+    def test_task_file_contract_preflight_error_blocks_strict_gate(self, tmp_path: Path, capsys):
+        task_file = tmp_path / "task.md"
+        task_file.write_text("do something")
+
+        with (
+            patch("core.contract_check.check_contract_file", side_effect=RuntimeError("contract parser unavailable")),
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            pytest.raises(SystemExit) as exc,
+        ):
+            cmd_run(
+                _run_args(task_file=str(task_file), no_isolate=True, require_contract_ready=True),
+                _run_cfg(tmp_path),
+            )
+
+        out = capsys.readouterr().out
+        assert exc.value.code == 1
+        assert "Implementation contract: unavailable (warning-only)" in out
+        assert "strict readiness requires a valid contract check" in out
+        build_orchestrator.assert_not_called()
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.failed
+        assert state.contract_gate_blocked
+        assert state.implementation_contract["status"] == "error"
+
     def test_task_file_run_refuses_current_task_worktree(self, tmp_path: Path, monkeypatch, capsys):
         current_dir = tmp_path / ".sikula" / "worktrees" / "oldtask" / "src"
         current_dir.mkdir(parents=True)
@@ -784,7 +1012,10 @@ class TestCmdRunStateStore:
             patch("sikula._finalize_worktree", return_value=(True, False, None)),
             patch("sys.exit"),
         ):
-            cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
+            cmd_run(
+                _run_args(task_id="abc123", require_contract_ready=True, min_contract_score=100),
+                _run_cfg(tmp_path),
+            )
 
         assert captured.get("state_store") is not None
         assert captured["state_store"].load("abc123") is not None
@@ -1082,6 +1313,39 @@ class TestCmdRunStateStore:
         assert "Longest phase:" in out
         assert "Build attempts:  10 total (max 10/loop)" in out
         assert "Total time:" not in out
+
+    def test_task_id_contract_gate_failed_prints_contract_check_hint(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        state = TaskState(task_id="abc123", task_description="resume me")
+        state.failed = True
+        state.contract_gate_blocked = True
+        state.implementation_contract = {
+            "source": {
+                "path": ".sikula/tasks/invites.md",
+            }
+        }
+        state.record("orchestrator", "contract_gate_failed", "contract is not ready")
+        store.save(state)
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            mock.run.return_value = state_store.load("abc123")
+            return mock
+
+        with (
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit"),
+        ):
+            cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "This task has failed; no work was run." in out
+        assert "contract readiness gate blocked delivery before a worktree was created" in out
+        assert "sikula contract check .sikula/tasks/invites.md --write-report" in out
+        assert "--reset-failed" not in out
 
     def test_task_id_resume_refuses_cleaned_isolated_task(self, tmp_path: Path, capsys):
         from core.state import JsonStateStore, TaskState

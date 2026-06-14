@@ -41,13 +41,31 @@ stale answer hashes and accidental overwrites; for plain-text `.txt` inputs,
 write the improved contract to a new Markdown file with `--output`. After the
 task file changes, old filled answers are moved to `previous_answers` and the
 active answers are reset for the new hash. If the project has a configured
-Sikula build/test/check pipeline, the task does not need to repeat those
-commands unless it requires additional project-specific validation. The
-readiness score is a preflight signal, not a guarantee that the task will
-succeed.
+Sikula build/test/check pipeline and those phases are enabled for a normal
+`sikula run`, the task does not need to repeat those commands unless it requires
+additional project-specific validation. Disabled validation phases do not count
+as contract readiness coverage. The readiness score is a preflight signal, not a
+guarantee that the task will succeed.
 Normal `sikula run TASK_FILE` records the same check as a compact, warning-only
 state snapshot and prints a one-line summary before agents start; it does not
 write `.sikula/contracts` artifacts.
+
+If a team wants task readiness to be enforced before agents start, fresh task
+runs can opt into strict gates:
+
+```bash
+sikula run .sikula/tasks/my-task.md --require-contract-ready
+sikula run .sikula/tasks/my-task.md --min-contract-score 80
+```
+
+Those gates save the same state snapshot and fail before creating a worktree or
+running agents when the threshold is not met. Because no delivery worktree exists
+yet, a gate-failed state is for audit only and cannot be resumed with
+`--reset-failed`; improve the task contract and start a fresh task-file run. The
+gates do not apply to `resume`, `review`, or `review --fix`. Review mode uses the
+existing branch diff as its primary source of truth; any future review-context
+readiness check should be a separate review-specific gate, not this delivery task
+contract gate.
 
 The examples use Markdown because it is easier to structure and review, but
 plain-text `.txt` task files are supported too.
