@@ -125,7 +125,9 @@ answers file hash against the current task content, applies filled answers into 
 Markdown implementation contract, preserves unanswered questions under `Open questions`,
 and runs the contract check on the output before writing it. It refuses accidental
 overwrites unless `--write` is explicitly used on a Markdown task; plain-text inputs can be
-improved only by writing a new Markdown output file. The same module also exposes
+improved only by writing a new Markdown output file. `--interactive` is a terminal
+convenience layer that creates or reuses the answers YAML, prompts for answers, saves that
+file, and then calls the same deterministic improve/recheck path. The same module also exposes
 side-effect-free in-memory helpers (`improve_contract_text()` and `prepare_contract()`) so
 chat/MCP adapters can reuse the same scoring, question, answer-application, and recheck
 logic without temporary YAML files or duplicate business rules. `prepare_contract()` returns

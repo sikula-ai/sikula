@@ -1018,6 +1018,89 @@ def test_contract_improve_cli_writes_output(tmp_path: Path, monkeypatch: pytest.
     assert "Implementation Contract Readiness:" in out
 
 
+def test_contract_improve_cli_interactive_writes_answers_and_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    monkeypatch.chdir(tmp_path)
+
+    def answer(prompt: str) -> str:
+        if "scope.boundaries" in prompt:
+            return "Add invite creation and acceptance endpoints."
+        if "acceptance.criteria" in prompt:
+            return "Owners can invite teammates by email."
+        return ""
+
+    with (
+        patch(
+            "sys.argv", ["sikula", "contract", "improve", str(task_path), "--interactive", "--output", str(output_path)]
+        ),
+        patch("sys.stdin.isatty", return_value=True),
+        patch("builtins.input", side_effect=answer),
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    answers_path = tmp_path / ".sikula" / "contracts" / "team-invites.answers.yaml"
+    answers = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+    output = output_path.read_text(encoding="utf-8")
+
+    assert "Interactive contract answers:" in out
+    assert "Contract answers written:" in out
+    assert "Improved contract written:" in out
+    assert answers["answers"]["scope.boundaries"]["answer"] == "Add invite creation and acceptance endpoints."
+    assert answers["answers"]["acceptance.criteria"]["answer"] == "Owners can invite teammates by email."
+    assert "## Scope" in output
+    assert "- Add invite creation and acceptance endpoints." in output
+    assert "## Open questions" in output
+
+
+def test_contract_improve_cli_interactive_requires_tty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch(
+            "sys.argv", ["sikula", "contract", "improve", str(task_path), "--interactive", "--output", str(output_path)]
+        ),
+        patch("sys.stdin.isatty", return_value=False),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    err = capsys.readouterr().err
+    assert exc.value.code == 1
+    assert "interactive contract improve requires an interactive terminal" in err
+    assert not output_path.exists()
+
+
+def test_contract_improve_cli_requires_answers_without_interactive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sys.argv", ["sikula", "contract", "improve", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    err = capsys.readouterr().err
+    assert exc.value.code == 1
+    assert "--answers is required unless --interactive is used" in err
+    assert not output_path.exists()
+
+
 def test_contract_check_cli_json_write_report_stays_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
     task_path = tmp_path / "task.md"
     task_path.write_text(

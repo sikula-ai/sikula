@@ -116,6 +116,8 @@ sikula contract check .sikula/tasks/my-task.md --write-report
 sikula contract improve .sikula/tasks/my-task.md \
   --answers .sikula/contracts/my-task.answers.yaml \
   --output .sikula/tasks/my-task.v2.md
+# or answer questions in the terminal
+sikula contract improve .sikula/tasks/my-task.md --interactive --output .sikula/tasks/my-task.v2.md
 ```
 
 Use this when you want to clarify a task before any agents start changing code.

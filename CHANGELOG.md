@@ -20,8 +20,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   and `sikula init` ignores generated contract artifacts by default.
 - `sikula contract improve TASK_FILE --answers ... --output ...` now turns filled
   contract answers into a stronger Markdown task file, preserves unanswered items as
-  open questions, refuses stale answer hashes or accidental overwrites, and re-runs the
-  contract check on the generated output.
+  open questions, refuses stale answer hashes or accidental overwrites, re-runs the
+  contract check on the generated output, and supports `--interactive` terminal prompts
+  that save the answers YAML before running the same improve flow.
 - Contract preparation now has side-effect-free in-memory core helpers for future
   chat/MCP adapters, reusing the same contract scoring, answer application, and recheck
   logic as the file-based CLI flow instead of duplicating business rules, with
