@@ -783,9 +783,7 @@ def test_contract_check_cli_json_write_report_stays_json(tmp_path: Path, monkeyp
     assert Path(data["written_report"]["answers_template"]).exists()
 
 
-def test_contract_check_cli_uses_effective_run_pipeline_flags(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
-):
+def test_contract_check_cli_uses_effective_run_pipeline_flags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
     config_path = tmp_path / ".sikula" / "config.yaml"
     config_path.parent.mkdir(parents=True)
     config_path.write_text(
@@ -812,9 +810,7 @@ def test_contract_check_cli_uses_effective_run_pipeline_flags(
     assert any(gap["id"] == "gap.validation.commands" for gap in data["gaps"])
 
 
-def test_contract_check_cli_counts_enabled_run_pipeline_flags(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
-):
+def test_contract_check_cli_counts_enabled_run_pipeline_flags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
     config_path = tmp_path / ".sikula" / "config.yaml"
     config_path.parent.mkdir(parents=True)
     config_path.write_text(
