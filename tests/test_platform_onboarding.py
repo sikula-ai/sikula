@@ -90,7 +90,6 @@ def test_scanner_detection_surface_matches_supported_build_tools():
 
 def test_platform_onboarding_docs_include_audit_and_buildtool_registries():
     documents = {
-        "README.md": Path("README.md").read_text(encoding="utf-8"),
         "ARCHITECTURE.md": Path("ARCHITECTURE.md").read_text(encoding="utf-8"),
         "guidelines.md": Path("guidelines.md").read_text(encoding="utf-8"),
         "tools/base_tool.py": Path("tools/base_tool.py").read_text(encoding="utf-8"),
@@ -109,3 +108,10 @@ def test_platform_onboarding_docs_include_audit_and_buildtool_registries():
     for entry in required_entries:
         for name, content in documents.items():
             assert entry in content, f"{entry} missing from {name}"
+
+
+def test_readme_points_to_developer_architecture_docs():
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    assert "ARCHITECTURE.md" in readme
+    assert "CONTRIBUTING.md" in readme

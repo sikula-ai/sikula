@@ -1645,7 +1645,7 @@ need strong reasoning to catch subtle issues reliably.
 Four providers are built in: `CodexClient` (`provider: "codex"`), `ClaudeClient` (`provider: "claude"`),
 `GeminiClient` (`provider: "gemini"`), and `OpenCodeClient` (`provider: "opencode"`, model in
 `provider/model` format).
-See `README.md § Adding a new LLM provider` for a step-by-step example. Three methods must be implemented in `core/llm_client.py`:
+See [Providers](docs/providers.md) for provider setup and the extension entry point. Three methods must be implemented in `core/llm_client.py`:
 
 | Method | Used by | Contract |
 |---|---|---|

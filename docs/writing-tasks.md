@@ -1,8 +1,14 @@
 # Writing Sikula Tasks
 
-Sikula does not require a strict task template. A task description should be a
-clear, human-readable request that gives the analyst enough context to produce
-reviewable implementation instructions without guessing.
+Sikula is contract-first. A task description should become an implementation
+contract: a two-way handshake between you and Sikula where you bring the intent,
+Sikula checks whether it is clear and deliverable, asks for missing context when
+needed, and the result becomes scope, acceptance criteria, risks, tests, and
+validation.
+
+Sikula does not require a strict task template. The task should be clear enough
+that the analyst can produce reviewable implementation instructions without
+guessing.
 
 Runnable examples live in each example project's `.sikula/tasks/` directory.
 Those files are real tasks, not mandatory templates. Use this guide when you are
