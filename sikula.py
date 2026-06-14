@@ -42,6 +42,10 @@ Phase flags (--flag / --no-flag): override run_* keys from the project config fo
   --build-per-step / --no-build-per-step     run_build_per_step
   --checks / --no-checks                     run_checks
 
+Contract gate flags (fresh task-file runs only):
+  --require-contract-ready           abort before agents unless the task contract is ready
+  --min-contract-score N             abort before agents unless readiness score is at least N
+
 Per-agent LLM flags (repeatable, agent name uses _ or -):
   --agent-model analyst=gpt-5.5
   --agent-provider analyst=claude
@@ -318,6 +322,16 @@ def _parse_agent_llm_overrides(
     _add(agent_providers, "provider")
     _add(agent_timeouts, "agent_timeout", cast=int, flag="timeout")
     return result
+
+
+def _contract_score_threshold(value: str) -> int:
+    try:
+        score = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--min-contract-score must be an integer from 0 to 100") from exc
+    if score < 0 or score > 100:
+        raise argparse.ArgumentTypeError("--min-contract-score must be between 0 and 100")
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -1056,6 +1070,59 @@ def _print_contract_preflight_summary(snapshot: dict) -> None:
     print(f"Implementation contract: {status} {score_text}{suffix}")
 
 
+def _contract_readiness_gate_failures(
+    snapshot: dict,
+    *,
+    require_ready: bool,
+    min_score: int | None,
+) -> list[str]:
+    if not require_ready and min_score is None:
+        return []
+
+    failures: list[str] = []
+    status = str(snapshot.get("status") or "unknown").upper()
+    score = snapshot.get("readiness_score")
+
+    if require_ready and not snapshot.get("ready_for_autonomous_delivery"):
+        if status == "ERROR":
+            failures.append("contract check is unavailable; strict readiness requires a valid contract check")
+        elif isinstance(score, int):
+            failures.append(f"contract is not ready ({status} {score}/100)")
+        else:
+            failures.append(f"contract is not ready ({status})")
+
+    if min_score is not None:
+        if not isinstance(score, int):
+            failures.append(f"contract score is unavailable; minimum required score is {min_score}/100")
+        elif score < min_score:
+            failures.append(f"contract score is {score}/100; minimum required score is {min_score}/100")
+
+    return failures
+
+
+def _print_contract_readiness_gate_failure(snapshot: dict, failures: list[str], task_id: str) -> None:
+    print("Implementation contract gate failed:")
+    for failure in failures:
+        print(f"- {failure}")
+
+    source = snapshot.get("source") if isinstance(snapshot.get("source"), dict) else {}
+    path = source.get("path")
+    print("Next steps:")
+    if path:
+        print(f"- Improve the task directly, then rerun: sikula run {path}")
+        print(f"- Or generate answers: sikula contract check {path} --write-report")
+        print(
+            f"- Then apply answers: sikula contract improve {path} "
+            "--answers .sikula/contracts/<task>.answers.yaml --output <task>.v2.md"
+        )
+    else:
+        print("- Improve the task directly, then rerun sikula run.")
+        print(
+            "- Or generate answers with sikula contract check --write-report and apply them with sikula contract improve."
+        )
+    print(f"Task state saved: sikula show {task_id}")
+
+
 def _fmt_time(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.0f}s"
@@ -1506,6 +1573,17 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
         state.record("orchestrator", "contract_check", _contract_preflight_record_result(state.implementation_contract))
         store.save(state)
         _print_contract_preflight_summary(state.implementation_contract)
+        gate_failures = _contract_readiness_gate_failures(
+            state.implementation_contract,
+            require_ready=bool(getattr(args, "require_contract_ready", False)),
+            min_score=getattr(args, "min_contract_score", None),
+        )
+        if gate_failures:
+            state.failed = True
+            state.record("orchestrator", "contract_gate_failed", "; ".join(gate_failures))
+            store.save(state)
+            _print_contract_readiness_gate_failure(state.implementation_contract, gate_failures, state.task_id)
+            sys.exit(1)
 
         if isolate:
             branch = f"sikula/{_branch_stem(args.task_file)}-{state.task_id}"
@@ -2996,6 +3074,19 @@ def main() -> None:
         help="Override run_build_per_step",
     )
     run_p.add_argument("--checks", action=_boa, default=None, help="Override run_checks")
+    run_p.add_argument(
+        "--require-contract-ready",
+        action="store_true",
+        default=False,
+        help="Abort fresh task-file runs before agents unless the implementation contract is ready",
+    )
+    run_p.add_argument(
+        "--min-contract-score",
+        type=_contract_score_threshold,
+        default=None,
+        metavar="0-100",
+        help="Abort fresh task-file runs before agents unless the implementation contract score is at least this value",
+    )
 
     # Per-agent LLM overrides — repeatable; layer on top of agents.<name>.llm in the project config.
     run_p.add_argument(

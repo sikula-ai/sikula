@@ -49,6 +49,20 @@ Normal `sikula run TASK_FILE` records the same check as a compact, warning-only
 state snapshot and prints a one-line summary before agents start; it does not
 write `.sikula/contracts` artifacts.
 
+If a team wants task readiness to be enforced before agents start, fresh task
+runs can opt into strict gates:
+
+```bash
+sikula run .sikula/tasks/my-task.md --require-contract-ready
+sikula run .sikula/tasks/my-task.md --min-contract-score 80
+```
+
+Those gates save the same state snapshot and fail before creating a worktree or
+running agents when the threshold is not met. They do not apply to `resume`,
+`review`, or `review --fix`. Review mode uses the existing branch diff as its
+primary source of truth; any future review-context readiness check should be a
+separate review-specific gate, not this delivery task contract gate.
+
 The examples use Markdown because it is easier to structure and review, but
 plain-text `.txt` task files are supported too.
 
