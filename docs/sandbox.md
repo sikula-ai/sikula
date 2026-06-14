@@ -15,9 +15,17 @@ sikula run --task-id <task-id>
 # Retry terminal failed work
 sikula run --task-id <task-id> --reset-failed
 
-# Remove preserved worktrees when you are done inspecting them
+# Preview cleanup/delete actions without removing anything
+sikula cleanup <task-id>
+sikula delete <task-id>
+
+# Remove clean preserved worktrees when you are done inspecting them
 sikula cleanup <task-id> --force
 sikula delete <task-id> --force
+
+# Remove dirty preserved worktrees and discard uncommitted agent changes
+sikula cleanup <task-id> --force --discard
+sikula delete <task-id> --force --discard
 ```
 
 Use `--no-isolate` only for local experiments where you want changes directly in the current working tree.
