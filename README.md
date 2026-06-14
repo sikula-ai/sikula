@@ -160,6 +160,8 @@ Use these projects to inspect working Sikula configs, task files, and validation
 
 For a standalone frontend demo, see [sikula-example-web-project](https://github.com/sikula-ai/sikula-example-web-project): a small Bun, Vite, React, and TypeScript repository with its own Sikula config, task file, guidelines, validation pipeline, and auditable run state.
 
+The Rust example includes commented `extra_rules` files you can enable to see project-specific planner, reviewer, security reviewer, and test writer rules in action.
+
 | Example | Stack |
 |---|---|
 | `example/android/countries/` | Kotlin, Android, Jetpack Compose |
@@ -186,7 +188,7 @@ The main README is the documentation entry point. Deeper guides live under `docs
 | First install, setup, and run | [First Run](docs/first-run.md) |
 | Writing good task files | [Writing Sikula Tasks](docs/writing-tasks.md) |
 | Gated delivery pipeline and state model | [Pipeline And State](docs/pipeline.md) |
-| Project configuration | [Configuration](docs/configuration.md) |
+| Project configuration, guidelines, and agent-specific rules | [Configuration](docs/configuration.md) |
 | Provider setup and model config | [Providers](docs/providers.md) |
 | Worktree isolation, sandboxing, and privacy | [Sandbox](docs/sandbox.md) |
 | Reviewing existing branches | [Reviewing Branches](docs/review.md) |

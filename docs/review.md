@@ -70,7 +70,7 @@ sikula review \
   --no-security-review
 ```
 
-Use `security.context` and `security_reviewer.extra_rules` in `.sikula/config.yaml` to make the security review more project-specific.
+Review mode honors `reviewer.extra_rules` and `security_reviewer.extra_rules`. In `--fix` mode, `test_writer.extra_rules` is also used when the test writer runs. See [Project-Specific Agent Rules](configuration.md#project-specific-agent-rules).
 
 ## CI Use
 

@@ -85,8 +85,6 @@ git add .sikula/
 git commit -m "Add Sikula project setup"
 ```
 
-For local experiments without a worktree branch, use `sikula run --no-isolate`.
-
 ## Write A Task
 
 ```bash
@@ -103,6 +101,12 @@ sikula contract check .sikula/tasks/my-task.md
 ```
 
 For report generation, answers files, and `contract improve`, see [Writing Sikula Tasks](writing-tasks.md).
+
+For local experiments without a worktree branch, use:
+
+```bash
+sikula run .sikula/tasks/my-task.md --no-isolate
+```
 
 ## Run
 

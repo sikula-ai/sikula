@@ -105,6 +105,41 @@ sikula init --guidelines --provider codex --model <model-your-provider-supports>
 
 If `.sikula/config.yaml` already exists, this command preserves the config, writes `.sikula/guidelines.md`, and adds it to `guidelines.context_files` when missing.
 
+## Project-Specific Agent Rules
+
+Use `extra_rules` when one specific agent should follow project rules that do not need to reach every agent.
+
+```yaml
+reviewer:
+  extra_rules: .sikula/reviewer_rules.md
+
+security_reviewer:
+  extra_rules: .sikula/security_rules.md
+
+test_writer:
+  extra_rules: .sikula/test_writer_rules.md
+
+planner:
+  extra_rules: .sikula/planner_rules.md
+```
+
+`extra_rules` files are plain Markdown paths relative to the project root. Sikula appends the file content to the selected agent prompt under `## Project-specific rules`.
+
+Use them for:
+
+- `planner.extra_rules` - task splitting rules.
+- `reviewer.extra_rules` - correctness, architecture, and invariants.
+- `security_reviewer.extra_rules` - compliance, threat model, and data handling.
+- `test_writer.extra_rules` - testing conventions, required doubles, and naming patterns.
+
+Rules apply only when the corresponding agent runs:
+
+- `reviewer` and `security_reviewer` apply in `sikula run`, `sikula review`, and `sikula review --fix`.
+- `test_writer` applies in `sikula run` and `sikula review --fix`.
+- `planner` applies in `sikula run`; review mode does not run the planner.
+
+`guidelines.context_files` are broad project context. `extra_rules` are targeted per-agent instructions. `extra_rules` do not reach the implementer or fixer.
+
 ## Security Context
 
 Use `security.context` to tell the security reviewer what the application does and what threats matter.
