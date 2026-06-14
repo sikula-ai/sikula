@@ -32,6 +32,28 @@ presync -> analyze -> plan -> implement -> review -> security review
   -> test writing -> sync -> build -> tests -> checks -> fixer loop
 ```
 
+The high-level control flow is:
+
+```text
+Task file
+  -> implementation contract snapshot
+  -> presync (optional)
+  -> Analyst
+  -> Planner (optional)
+     -> SINGLE_PASS or planner disabled
+        -> Implementer
+        -> Reviewer -> Security Reviewer -> Test Writer
+        -> Build / Fix loop
+     -> MULTI_STEP
+        -> for each planned step:
+             Implementer -> Reviewer -> Security Reviewer -> Test Writer
+             -> Build / Fix loop (only when run_build_per_step is enabled)
+        -> Final full-task gate:
+             Reviewer -> Security Reviewer -> Test Writer
+        -> Final Build / Fix loop
+  -> Branch ready for human review
+```
+
 Most phases can be enabled or disabled in `.sikula/config.yaml` or with per-run flags. The key gates are:
 
 - `AnalystAgent` reads the task and project context and produces implementation instructions.
