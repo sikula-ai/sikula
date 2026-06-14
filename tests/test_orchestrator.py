@@ -610,6 +610,15 @@ class TestOrchestratorLoop:
         assert "--reset-failed" in caplog.text
         assert "nothing to do" not in caplog.text
 
+    def test_contract_gate_failed_task_does_not_log_reset_hint(self, tmp_path: Path, caplog):
+        orch, stubs, _ = _make_orchestrator(tmp_path)
+        _save_state(orch, failed=True, contract_gate_blocked=True)
+        caplog.set_level("INFO")
+        orch.run(task_id="t1")
+        assert all(len(s.calls) == 0 for s in stubs.values())
+        assert "failed by contract readiness gate" in caplog.text
+        assert "--reset-failed" not in caplog.text
+
     def test_agent_llm_retry_is_recorded_in_history(self, tmp_path: Path):
         orch, _, _ = _make_orchestrator(tmp_path)
         state = TaskState(task_id="t1", task_description="test")
