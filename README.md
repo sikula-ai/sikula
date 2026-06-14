@@ -22,7 +22,7 @@ Default runs use git worktree isolation, so the task happens on a dedicated bran
 
 ## Need Help?
 
-If you want help integrating Sikula into your codebase or discussing alternative licensing terms, visit [sikula.ai](https://sikula.ai).
+If you want help integrating Sikula into your codebase, do not hesitate to reach out through [sikula.ai](https://sikula.ai).
 
 ## Compatibility
 
@@ -52,21 +52,31 @@ This demo shows Sikula taking a task through analysis, implementation, independe
 
 ## Get Started
 
-Prerequisites: Python 3.10+, `git`, `pipx`, a git repository for the target project, and one authenticated LLM CLI provider. If `pipx` is not installed, use the official installation guide: <https://pipx.pypa.io/stable/installation/>.
+Prerequisites: Python 3.10+, `git`, `pipx`, a git repository for the target project, and one authenticated LLM CLI provider.
 
-| Goal | Install |
-|---|---|
-| Use the latest release | `pipx install sikula` |
-| Use the latest development version from source | `pipx install --editable .` |
+### Install Sikula
+
+Use the latest release:
 
 ```bash
-# Install Sikula
 pipx install sikula
+```
 
-# Authenticate the default provider used by generated configs
+Or use the latest development version from source:
+
+```bash
+git clone https://github.com/sikula-ai/sikula
+cd sikula/
+pipx install --editable .
+```
+
+### Set Up Your Project
+
+Generated configs use Codex by default. Claude, Gemini, and OpenCode are supported too; see [Providers](docs/providers.md).
+
+```bash
 codex login
 
-# Initialize Sikula inside your project
 cd my-project/
 sikula init
 
@@ -79,7 +89,7 @@ mkdir -p .sikula/tasks
 $EDITOR .sikula/tasks/my-task.md
 ```
 
-For source installs, other providers, generated guidelines, `--no-isolate`, and contract improvement, see [First Run](docs/first-run.md).
+For other providers, generated guidelines, `--no-isolate`, and contract improvement, see [First Run](docs/first-run.md).
 
 After setup, choose the workflow that fits what you want to do.
 
