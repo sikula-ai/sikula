@@ -177,6 +177,14 @@ def test_prepare_contract_returns_questions_without_file_side_effects(tmp_path: 
     assert result.required_next_step == "answer_questions"
     assert "acceptance.criteria" in result.answers_template
     assert "token.lifecycle" in result.answers_template
+    assert result.safe_task_path == ".sikula/tasks/team-invites.md"
+    assert result.required_user_action == "answer_contract_questions"
+    assert result.primary_user_action == "answer_contract_questions"
+    assert result.user_questions
+    assert result.resume_arguments["contract_markdown"].startswith("# Add team invites")
+    assert result.resume_arguments["status_applies_to_sha256"] == result.status_applies_to_sha256
+    assert "sikula run" not in "\n".join(result.suggested_next_steps)
+    assert "ready_to_run" in result.assistant_response_markdown
     assert result.recheck_result is None
     assert result.status_applies_to_sha256 == result.check_result.source["sha256"]
     assert not (tmp_path / ".sikula").exists()
@@ -240,6 +248,131 @@ def test_prepare_contract_applies_answers_and_rechecks():
         "save_and_run_contract",
         "revise_contract",
     }
+
+
+def test_prepare_contract_marks_repeated_questions_as_revised_answer_needed():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"acceptance.negative_cases": "ok"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.needs_user_input
+    assert "acceptance.negative_cases" in result.answered_question_ids
+    assert "acceptance.negative_cases" in result.revised_answer_question_ids
+    question = next(question for question in result.user_questions if question["id"] == "acceptance.negative_cases")
+    assert question["requires_revised_answer"] is True
+    assert "more specific answer" in question["reason"]
+    assert result.answers_template["acceptance.negative_cases"]["requires_revised_answer"] is True
+    assert result.required_user_action == "answer_contract_questions"
+
+
+def test_prepare_contract_ready_result_includes_safe_save_and_run_guidance():
+    task = """# Team invites
+
+## Scope
+- Add invite creation endpoint.
+- Add invite acceptance endpoint.
+- Add pending invite model.
+
+## Acceptance criteria
+- Owner/admin can invite a user by email.
+- Non-admin users cannot invite users.
+- Duplicate pending invite returns a deterministic error.
+- Expired invite token cannot be accepted.
+- Accepted invite token cannot be reused.
+
+## Security and privacy
+- Invite tokens must be unguessable.
+- Invite tokens must not be logged.
+- Error messages must not reveal whether an email already has an account.
+
+## Out of scope
+- Billing seat enforcement.
+- Bulk invites.
+- Full team settings redesign.
+
+## Tests
+- Permission tests for allowed and denied inviter roles.
+- Token lifecycle tests for expired and reused tokens.
+- Duplicate invite test.
+
+## Validation
+- `pytest`
+- `ruff check .`
+
+## Reviewer focus
+- Authorization rules.
+- Token expiry and reuse.
+- Email enumeration behaviour.
+"""
+
+    result = prepare_contract(
+        task,
+        contract_name="../../Team Invites; rm -rf *.md",
+        project_context={
+            "sikula_configured": True,
+            "validation_commands": ["pytest", "ruff check ."],
+        },
+    )
+
+    assert result.ready_to_save
+    assert result.ready_to_run
+    assert result.required_next_step == "save_and_run_contract"
+    assert result.safe_task_path == ".sikula/tasks/team-invites-rm-rf.md"
+    assert result.suggested_next_steps == [
+        "Save the prepared contract to `.sikula/tasks/team-invites-rm-rf.md`.",
+        "Run `sikula run .sikula/tasks/team-invites-rm-rf.md`.",
+    ]
+    assert result.resume_arguments["project_context"] == {
+        "sikula_configured": True,
+        "validation_commands": ["pytest", "ruff check ."],
+    }
+    assert result.to_dict()["authoritative_output_markdown"] == result.prepared_contract_markdown
+
+
+def test_prepare_contract_ready_without_config_does_not_suggest_run():
+    task = """# Country search
+
+## Scope
+- Add search by country name.
+- Keep existing region filtering.
+- Keep sorting unchanged.
+
+## Acceptance criteria
+- Matching is case-insensitive.
+- Clearing search shows the full list.
+- No matching countries shows an empty state.
+- Existing region filters still apply.
+
+## Out of scope
+- Do not add server-side search.
+- Do not change sorting.
+- Do not change country details.
+
+## Tests
+- Search matching test.
+- Empty state test.
+- Filter interaction test.
+
+## Validation
+- `npm test`
+
+## Reviewer focus
+- Search/filter interaction.
+"""
+
+    result = prepare_contract(
+        task,
+        contract_name="Country Search",
+        project_context={"validation_commands": ["npm test"]},
+    )
+
+    assert result.ready_to_run
+    assert result.required_next_step == "save_and_run_contract"
+    assert any("sikula init" in step for step in result.suggested_next_steps)
+    assert all("sikula run" not in step for step in result.suggested_next_steps)
 
 
 def test_gap_and_question_ids_are_unique_within_result():

@@ -128,7 +128,10 @@ overwrites unless `--write` is explicitly used on a Markdown task; plain-text in
 improved only by writing a new Markdown output file. The same module also exposes
 side-effect-free in-memory helpers (`improve_contract_text()` and `prepare_contract()`) so
 chat/MCP adapters can reuse the same scoring, question, answer-application, and recheck
-logic without temporary YAML files or duplicate business rules. These commands and helpers
+logic without temporary YAML files or duplicate business rules. `prepare_contract()` returns
+the authoritative workflow state plus user-facing questions, safe `.sikula/tasks/...` path
+hints, resume arguments, revised-answer markers, and next-step guidance; adapters should not
+infer readiness separately. These commands and helpers
 do not create `TaskState`, start agents, create worktrees, or alter `review` flow. Fresh `sikula run
 TASK_FILE` uses the same deterministic checks to store a compact warning-only snapshot in
 `TaskState.implementation_contract` and print a one-line summary before agents start; it
