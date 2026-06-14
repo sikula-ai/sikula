@@ -648,13 +648,24 @@ def prepare_contract(
             open_question_ids=improved.open_question_ids,
         )
 
+    prepared_contract_markdown = contract_markdown.strip() + "\n"
+    output_check_result = check_result
+    if prepared_contract_markdown != contract_markdown:
+        output_check_result = check_contract(
+            prepared_contract_markdown,
+            source_path=safe_task_path,
+            source_format="markdown",
+            project_config=project_config,
+            configured_validation_commands=validation_commands,
+        )
+
     return _build_prepare_result(
         contract_name=contract_name,
         project_context=project_context,
         safe_task_path=safe_task_path,
-        check_result=check_result,
+        check_result=output_check_result,
         recheck_result=None,
-        prepared_contract_markdown=contract_markdown.strip() + "\n",
+        prepared_contract_markdown=prepared_contract_markdown,
     )
 
 

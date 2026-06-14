@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
@@ -188,6 +189,21 @@ def test_prepare_contract_returns_questions_without_file_side_effects(tmp_path: 
     assert result.recheck_result is None
     assert result.status_applies_to_sha256 == result.check_result.source["sha256"]
     assert not (tmp_path / ".sikula").exists()
+
+
+def test_prepare_contract_checks_normalized_output_without_answers():
+    task = "# Add team invites\n\nUsers should be able to invite teammates by email."
+
+    result = prepare_contract(task, contract_name="team-invites.md")
+
+    expected_markdown = task + "\n"
+    expected_sha = "sha256:" + sha256(expected_markdown.encode("utf-8")).hexdigest()
+    assert result.prepared_contract_markdown == expected_markdown
+    assert result.authoritative_output_markdown == expected_markdown
+    assert result.resume_arguments["contract_markdown"] == expected_markdown
+    assert result.status_applies_to_sha256 == expected_sha
+    assert result.check_result.source["sha256"] == expected_sha
+    assert result.resume_arguments["status_applies_to_sha256"] == expected_sha
 
 
 def test_prepare_contract_uses_project_context_validation_commands():
