@@ -78,11 +78,19 @@ Generated configs use Codex by default. Claude, Gemini, and OpenCode are support
 codex login
 
 cd my-project/
+
+# Basic setup — detects build tool, language, platform, package manager, source paths
 sikula init
 
-# Review TODOs, then commit config before the first isolated run
-git add .sikula/config.yaml .sikula/.gitignore
-git commit -m "Add Sikula config"
+# With LLM-generated guidelines — reads the codebase and writes .sikula/guidelines.md
+sikula init --provider codex --model gpt-5.5 --guidelines
+
+# You can also add generated guidelines later; existing config is preserved
+sikula init --guidelines
+
+# Review TODOs, then commit config and generated guidelines before the first isolated run
+git add .sikula/
+git commit -m "Add Sikula project setup"
 
 # Write a task
 mkdir -p .sikula/tasks
@@ -195,9 +203,11 @@ See [Sandbox](docs/sandbox.md), [SECURITY.md](SECURITY.md), and [PRIVACY.md](PRI
 
 ## Contributing
 
-Feedback, bug reports, task-result reports, documentation fixes, and small corrections are welcome. For larger changes, open an issue or discussion first so we can align on scope.
+Sikula is a maintainer-led project. Feedback, bug reports, task-result reports, documentation fixes, and small corrections are especially helpful.
 
-Pull requests require a signed Contributor License Agreement. See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md).
+For code changes beyond small fixes, please open an issue or discussion before starting so we can align on scope and keep the project focused.
+
+Pull request contributions require the [CLA](CLA.md). See [CONTRIBUTING.md](CONTRIBUTING.md) for contributor setup and development guidelines.
 
 ## Security
 

@@ -21,9 +21,8 @@ Use `--no-isolate` only for local experiments where you want changes directly in
 Isolated worktrees start from `HEAD`. Before the first isolated run, commit `.sikula/config.yaml` and any files listed under `guidelines.context_files`.
 
 ```bash
-git add .sikula/config.yaml .sikula/.gitignore
-git add .sikula/guidelines.md  # if generated
-git commit -m "Add Sikula config"
+git add .sikula/
+git commit -m "Add Sikula project setup"
 ```
 
 ## Filesystem Scope

@@ -81,9 +81,8 @@ If `.sikula/config.yaml` already contains `llm.provider` and `llm.model`, you ca
 Default Sikula runs create a git worktree from `HEAD`. Config and guideline files must be tracked and clean, otherwise the task worktree cannot see them.
 
 ```bash
-git add .sikula/config.yaml .sikula/.gitignore
-git add .sikula/guidelines.md  # if generated
-git commit -m "Add Sikula config"
+git add .sikula/
+git commit -m "Add Sikula project setup"
 ```
 
 For local experiments without a worktree branch, use `sikula run --no-isolate`.
