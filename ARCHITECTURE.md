@@ -52,6 +52,7 @@ cmd_run()
    │
    ├─ read task file  →  TaskState created (state.task_id = uuid4().hex)
    │     + warning-only implementation contract snapshot stored in state
+   │     + optional contract readiness gate may mark state failed before worktree
    │
    ├─ isolation (default on, skip with --no-isolate):
    │     git worktree add .sikula/worktrees/<task_id>  -b sikula/<stem>-<task_id>
@@ -132,10 +133,12 @@ does not write `.sikula/contracts` artifacts. Fresh task-file runs can opt into 
 pre-agent gating with `--require-contract-ready` or `--min-contract-score N`; the gate
 runs only after the snapshot has been saved and before worktree creation or orchestrator
 startup. A failed gate marks the task state failed and records an audit history entry, but
-does not start agents. `resume`, `review`, and `review --fix` reuse existing task state
-instead of recomputing or re-gating the check. Review mode uses the existing branch diff
-as the primary review artifact; review-context readiness is a separate concern and should
-not reuse the delivery task contract gate. When a Sikula config is available, it reuses
+does not start agents. Because no worktree or branch exists yet, that failed state is not
+resumable via `--reset-failed`; improve the task contract and start a fresh task-file run
+instead. `resume`, `review`, and `review --fix` reuse existing task state instead of
+recomputing or re-gating the check. Review mode uses the existing branch diff as the
+primary review artifact; review-context readiness is a separate concern and should not
+reuse the delivery task contract gate. When a Sikula config is available, it reuses
 `core.validation_coverage` to compare task-described validation commands with the
 effective configured pipeline and treats the configured build/test/check pipeline as
 validation coverage for tasks that do not require extra commands; without config it still
@@ -1203,6 +1206,7 @@ Sikula processes at once is still unsupported.
 | `task_file` | `str \| None` | `cmd_run()` in `sikula.py` | Basename of the task file (e.g. `add-login.md`); set on first run via `--task-file`; used by `status` for display; `None` for tasks created before this field was added or when resuming via `--task-id` only |
 | `config_snapshot` | `dict` | Orchestrator | Effective run configuration captured on first run (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `planner.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. Visible in `show <task_id>`. |
 | `implementation_contract` | `dict` | `cmd_run()` in `sikula.py` | Implementation-contract snapshot for fresh task-file runs: task path/format/hash, readiness status/score, gap metadata, clarifying question IDs, and validation coverage counts. By default it is warning-only additive metadata. Fresh `run TASK_FILE` can opt into pre-agent gating with `--require-contract-ready` or `--min-contract-score N`; resume/review flows do not recompute or re-gate it. |
+| `contract_gate_blocked` | `bool` | `cmd_run()` in `sikula.py` | True when an opt-in contract readiness gate failed before worktree creation or agent startup. Such states are kept for audit but are not reset via `--reset-failed`; users should improve the task contract and start a fresh task-file run. |
 | `analyst_prompt` | `str \| None` | AnalystAgent | Full assembled prompt sent to the analyst LLM (system + user sections, including inlined guidelines content); stored before the LLM call so it captures the exact input even on exception; enables post-run analysis of analyst behaviour |
 | `planner_prompt` | `str \| None` | PlannerAgent | Full assembled prompt sent to the planner LLM (system + user sections); stored before the LLM call; `None` when `run_planner: false` or planner not yet reached |
 | `implementation_prompt` | `str \| None` | AnalystAgent | Structured prompt fed to ImplementerAgent; the analyst's key output |

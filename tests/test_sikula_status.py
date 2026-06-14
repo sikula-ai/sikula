@@ -255,6 +255,41 @@ class TestCmdStatusOutput:
             }
         ]
 
+    def test_status_contract_gate_failed_suggests_contract_check_not_reset(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        s = TaskState(task_id="t1", task_description="my task")
+        s.failed = True
+        s.contract_gate_blocked = True
+        s.implementation_contract = {"source": {"path": ".sikula/tasks/my-task.md"}}
+        store.save(s)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=False, verbose=True, status_filter=[]))
+
+        out = capsys.readouterr().out
+        assert "FAILED" in out
+        assert "next: sikula contract check .sikula/tasks/my-task.md --write-report" in out
+        assert "--reset-failed" not in out
+
+    def test_status_json_contract_gate_failed_next_action(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        s = TaskState(task_id="t1", task_description="my task")
+        s.failed = True
+        s.contract_gate_blocked = True
+        s.implementation_contract = {"source": {"path": ".sikula/tasks/my-task.md"}}
+        store.save(s)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=True, verbose=False, status_filter=[]))
+
+        rows = json.loads(capsys.readouterr().out)
+        assert rows[0]["status"] == "FAILED"
+        assert rows[0]["next_action"] == "sikula contract check .sikula/tasks/my-task.md --write-report"
+
     def test_status_json_includes_active_operation_when_present(self, tmp_path: Path, capsys):
         import os
         from core.state import JsonStateStore, TaskState

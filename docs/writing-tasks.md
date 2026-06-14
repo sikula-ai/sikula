@@ -58,10 +58,13 @@ sikula run .sikula/tasks/my-task.md --min-contract-score 80
 ```
 
 Those gates save the same state snapshot and fail before creating a worktree or
-running agents when the threshold is not met. They do not apply to `resume`,
-`review`, or `review --fix`. Review mode uses the existing branch diff as its
-primary source of truth; any future review-context readiness check should be a
-separate review-specific gate, not this delivery task contract gate.
+running agents when the threshold is not met. Because no delivery worktree exists
+yet, a gate-failed state is for audit only and cannot be resumed with
+`--reset-failed`; improve the task contract and start a fresh task-file run. The
+gates do not apply to `resume`, `review`, or `review --fix`. Review mode uses the
+existing branch diff as its primary source of truth; any future review-context
+readiness check should be a separate review-specific gate, not this delivery task
+contract gate.
 
 The examples use Markdown because it is easier to structure and review, but
 plain-text `.txt` task files are supported too.

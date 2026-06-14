@@ -21,7 +21,7 @@ Rough intent
 
 The implementation contract is a two-way handshake between you and Sikula: you bring the intent, Sikula checks whether it is clear and deliverable, asks for missing context when needed, and turns it into scope, acceptance criteria, risks, tests, and validation.
 
-Use [Writing Sikula Tasks](writing-tasks.md) for contract commands and task examples. `sikula run TASK_FILE` records a compact, warning-only contract snapshot before agents start. Fresh task-file runs can opt into pre-agent readiness gates with `--require-contract-ready` or `--min-contract-score N`; review modes use the existing branch diff as their primary artifact and do not reuse the delivery task contract gate.
+Use [Writing Sikula Tasks](writing-tasks.md) for contract commands and task examples. `sikula run TASK_FILE` records a compact, warning-only contract snapshot before agents start. Fresh task-file runs can opt into pre-agent readiness gates with `--require-contract-ready` or `--min-contract-score N`; gate-failed states are kept for audit but must be restarted from the task file after the contract is improved, not reset through `--task-id`. Review modes use the existing branch diff as their primary artifact and do not reuse the delivery task contract gate.
 
 ## Gated Pipeline
 

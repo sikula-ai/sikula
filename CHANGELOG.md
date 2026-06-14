@@ -14,8 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   optional `.sikula/contracts` report and hash-scoped answers-template artifacts via
   `--write-report`; `sikula run TASK_FILE` now stores a warning-only contract snapshot
   in task state, supports opt-in pre-agent gates via `--require-contract-ready` and
-  `--min-contract-score`, and `sikula init` ignores generated contract artifacts by
-  default.
+  `--min-contract-score`, keeps gate-failed pre-worktree states audit-only instead of
+  resettable through `--task-id --reset-failed`, and `sikula init` ignores generated
+  contract artifacts by default.
 - `sikula contract improve TASK_FILE --answers ... --output ...` now turns filled
   contract answers into a stronger Markdown task file, preserves unanswered items as
   open questions, refuses stale answer hashes or accidental overwrites, and re-runs the

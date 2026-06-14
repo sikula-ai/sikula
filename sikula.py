@@ -826,6 +826,13 @@ def _reset_failed_state(task_id: str, cfg: dict, store) -> None:
         print(f"Task {task_id} is not in failed state — nothing to reset")
         return
 
+    if _contract_gate_blocked_without_worktree(state):
+        print(f"Task {task_id} failed before worktree creation because the contract readiness gate blocked delivery.")
+        print("--reset-failed cannot safely resume it; improve the task contract and start a fresh run.")
+        print(f"Suggested next step: {_contract_gate_next_action(state)}")
+        print(f"Inspect state: sikula show {task_id}")
+        sys.exit(1)
+
     state.failed = False
     # Reset iteration counters so their loops are not immediately blocked on resume.
     # review_approved, security_approved, and tests_up_to_date are intentionally kept —
@@ -1045,6 +1052,32 @@ def _contract_preflight_record_result(snapshot: dict) -> str:
     if isinstance(score, int):
         return f"{status} {score}/100"
     return status
+
+
+def _contract_gate_task_path(state) -> str | None:
+    snapshot = getattr(state, "implementation_contract", None)
+    if not isinstance(snapshot, dict):
+        return None
+    source = snapshot.get("source")
+    if not isinstance(source, dict):
+        return None
+    path = source.get("path")
+    return path if isinstance(path, str) and path.strip() else None
+
+
+def _contract_gate_blocked_without_worktree(state) -> bool:
+    return bool(
+        getattr(state, "contract_gate_blocked", False)
+        and not getattr(state, "worktree_path", None)
+        and not getattr(state, "worktree_branch", None)
+    )
+
+
+def _contract_gate_next_action(state) -> str:
+    path = _contract_gate_task_path(state)
+    if path:
+        return f"sikula contract check {path} --write-report"
+    return f"sikula show {state.task_id}"
 
 
 def _print_contract_preflight_summary(snapshot: dict) -> None:
@@ -1580,6 +1613,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
         )
         if gate_failures:
             state.failed = True
+            state.contract_gate_blocked = True
             state.record("orchestrator", "contract_gate_failed", "; ".join(gate_failures))
             store.save(state)
             _print_contract_readiness_gate_failure(state.implementation_contract, gate_failures, state.task_id)
@@ -1701,7 +1735,11 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
             print("This task is already complete; no work was run.")
         else:
             print("This task has failed; no work was run.")
-            print(f"Use --reset-failed to retry: sikula run --task-id {state.task_id} --reset-failed")
+            if _contract_gate_blocked_without_worktree(state):
+                print("The contract readiness gate blocked delivery before a worktree was created.")
+                print(f"Suggested next step: {_contract_gate_next_action(state)}")
+            else:
+                print(f"Use --reset-failed to retry: sikula run --task-id {state.task_id} --reset-failed")
         print()
         print("Previous run:")
     else:
@@ -1840,6 +1878,8 @@ def _status_next_action(state, status: str) -> str:
     if status == "DONE":
         return "review branch" if state.worktree_branch else "review changes"
     if status == "FAILED":
+        if _contract_gate_blocked_without_worktree(state):
+            return _contract_gate_next_action(state)
         return f"sikula run --task-id {state.task_id} --reset-failed"
     if status == "CLEANED":
         return f"sikula show {state.task_id}"
