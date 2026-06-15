@@ -1188,6 +1188,7 @@ def _render_improved_contract(
     questions: list[dict[str, Any]],
     answers: dict[str, dict[str, Any]],
 ) -> tuple[str, list[str], list[str]]:
+    task_text = _strip_generated_open_questions_section(task_text)
     lines = _improved_contract_base_lines(task_text, task_path)
     section_entries: dict[str, list[tuple[dict[str, Any], str, str]]] = {}
     answered_notes: list[tuple[str, str]] = []
@@ -1236,6 +1237,23 @@ def _render_improved_contract(
             lines.append(f"- {label}: {_single_line(notes)}")
 
     return "\n".join(lines).rstrip() + "\n", answered_ids, open_ids
+
+
+def _strip_generated_open_questions_section(task_text: str) -> str:
+    lines: list[str] = []
+    skipping = False
+
+    for line in task_text.splitlines():
+        heading_match = _HEADING_RE.match(line)
+        if heading_match and _normalize_heading(heading_match.group(2)) == "open questions":
+            skipping = True
+            continue
+        if skipping and heading_match:
+            skipping = False
+        if not skipping:
+            lines.append(line)
+
+    return "\n".join(lines).strip()
 
 
 def _improved_contract_base_lines(task_text: str, task_path: Path) -> list[str]:

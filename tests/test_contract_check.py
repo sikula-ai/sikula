@@ -286,6 +286,28 @@ def test_prepare_contract_marks_repeated_questions_as_revised_answer_needed():
     assert result.required_user_action == "answer_contract_questions"
 
 
+def test_prepare_contract_strips_stale_open_questions_between_answer_rounds():
+    first = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"scope.boundaries": "Add invite creation and acceptance endpoints."},
+        project_context={"validation_commands": ["pytest"]},
+    )
+    stale_question = "What observable behaviours must be true when this task is complete?"
+    assert "## Open questions" in first.prepared_contract_markdown
+    assert stale_question in first.prepared_contract_markdown
+
+    second = prepare_contract(
+        first.resume_arguments["contract_markdown"],
+        contract_name="team-invites.md",
+        answers={"acceptance.negative_cases": "Duplicate invites return a deterministic error."},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "- Duplicate invites return a deterministic error." in second.prepared_contract_markdown
+    assert stale_question not in second.prepared_contract_markdown
+
+
 def test_prepare_contract_ready_result_includes_safe_save_and_run_guidance():
     task = """# Team invites
 
