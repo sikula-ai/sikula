@@ -20,6 +20,9 @@ from core.validation_coverage import (
 )
 
 SCHEMA_VERSION = 1
+_GENERATED_ANSWER_ENTRY_END_MARKER = "<!-- /sikula:generated-answer -->"
+_GENERATED_ANSWER_ENTRY_RE = re.compile(r"^\s*<!--\s*sikula:generated-answer:\s*([^>]+?)\s*-->\s*$")
+_GENERATED_OPEN_QUESTIONS_MARKER = "<!-- sikula:generated-open-questions -->"
 
 _STATUS_THRESHOLDS = (
     (85, "ready"),
@@ -257,6 +260,82 @@ class ContractImproveResult:
 
 
 @dataclass(frozen=True)
+class ContractTextImproveResult:
+    markdown: str
+    check_result: ContractCheckResult
+    answered_question_ids: list[str]
+    open_question_ids: list[str]
+    source_sha256: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "markdown": self.markdown,
+            "source_sha256": self.source_sha256,
+            "answered_question_ids": list(self.answered_question_ids),
+            "open_question_ids": list(self.open_question_ids),
+            "check": self.check_result.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class ContractPrepareResult:
+    stage: str
+    needs_user_input: bool
+    ready_to_save: bool
+    ready_to_run: bool
+    required_next_step: str
+    questions_for_user: list[ClarifyingQuestion]
+    answers_template: dict[str, dict[str, Any]]
+    prepared_contract_markdown: str
+    check_result: ContractCheckResult
+    recheck_result: ContractCheckResult | None
+    unresolved_gaps: list[ContractGap]
+    status_applies_to_sha256: str
+    ready_to_run_blockers: list[str] = field(default_factory=list)
+    answered_question_ids: list[str] = field(default_factory=list)
+    open_question_ids: list[str] = field(default_factory=list)
+    revised_answer_question_ids: list[str] = field(default_factory=list)
+    user_questions: list[dict[str, Any]] = field(default_factory=list)
+    resume_arguments: dict[str, Any] = field(default_factory=dict)
+    authoritative_output_markdown: str = ""
+    suggested_next_steps: list[str] = field(default_factory=list)
+    required_user_action: str = ""
+    primary_user_action: str = ""
+    assistant_response_markdown: str = ""
+    safe_task_path: str | None = None
+    anti_loop_guidance: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "needs_user_input": self.needs_user_input,
+            "ready_to_save": self.ready_to_save,
+            "ready_to_run": self.ready_to_run,
+            "required_next_step": self.required_next_step,
+            "questions_for_user": [question.to_dict() for question in self.questions_for_user],
+            "answers_template": {key: dict(value) for key, value in self.answers_template.items()},
+            "prepared_contract_markdown": self.prepared_contract_markdown,
+            "check": self.check_result.to_dict(),
+            "recheck": self.recheck_result.to_dict() if self.recheck_result else None,
+            "unresolved_gaps": [gap.to_dict() for gap in self.unresolved_gaps],
+            "status_applies_to_sha256": self.status_applies_to_sha256,
+            "ready_to_run_blockers": list(self.ready_to_run_blockers),
+            "answered_question_ids": list(self.answered_question_ids),
+            "open_question_ids": list(self.open_question_ids),
+            "revised_answer_question_ids": list(self.revised_answer_question_ids),
+            "user_questions": [dict(question) for question in self.user_questions],
+            "resume_arguments": dict(self.resume_arguments),
+            "authoritative_output_markdown": self.authoritative_output_markdown,
+            "suggested_next_steps": list(self.suggested_next_steps),
+            "required_user_action": self.required_user_action,
+            "primary_user_action": self.primary_user_action,
+            "assistant_response_markdown": self.assistant_response_markdown,
+            "safe_task_path": self.safe_task_path,
+            "anti_loop_guidance": dict(self.anti_loop_guidance),
+        }
+
+
+@dataclass(frozen=True)
 class _Section:
     heading: str
     normalized_heading: str
@@ -284,11 +363,13 @@ def check_contract(
     source_path: Path | str | None = None,
     source_format: str = "markdown",
     project_config: dict | None = None,
+    configured_validation_commands: list[str] | None = None,
 ) -> ContractCheckResult:
-    parsed = _parse_markdown_task(text)
+    evaluation_text = _strip_generated_open_questions_section(text)
+    parsed = _parse_markdown_task(evaluation_text)
     sections_detected = _sections_detected(parsed)
-    validation = _validation_details(text, project_config)
-    security_sensitive = bool(_SECURITY_RISK_RE.search(text))
+    validation = _validation_details(evaluation_text, project_config, configured_validation_commands)
+    security_sensitive = bool(_SECURITY_RISK_RE.search(evaluation_text))
 
     scores = {
         "intent_clarity": _score_intent(parsed),
@@ -311,7 +392,7 @@ def check_contract(
     elif gaps:
         weighted_score = min(weighted_score, 84)
     status = _status_for_score(weighted_score)
-    questions = _build_questions(gaps, security_sensitive, text)
+    questions = _build_questions(gaps, security_sensitive, evaluation_text)
     suggested_sections = _suggested_sections(gaps)
     strong_signals = _strong_signals(scores, sections_detected, validation)
 
@@ -452,30 +533,462 @@ def improve_contract_from_answers(
 
     task_text = task_path.read_text(encoding="utf-8").strip()
     source_result = check_contract_file(task_path, project_config=project_config)
-    answers_data = _load_contract_answers(answers_path)
+    answers_data = load_contract_answers_for_task(answers_path, source_result)
     questions = _answers_questions(answers_data)
     answers = _answers_mapping(answers_data)
-    _validate_answers_for_task(answers_data, source_result)
     _reject_unknown_filled_answers(answers, questions)
 
-    rendered, answered_ids, open_ids = _render_improved_contract(task_text, task_path, questions, answers)
-    check_result = check_contract(
-        rendered,
-        source_path=final_output_path,
-        source_format="markdown",
+    improved = improve_contract_text(
+        task_text,
+        contract_name=task_path,
+        questions=questions,
+        answers=answers,
+        source_result=source_result,
+        output_name=final_output_path,
         project_config=project_config,
     )
 
     final_output_path.parent.mkdir(parents=True, exist_ok=True)
-    final_output_path.write_text(rendered, encoding="utf-8")
+    final_output_path.write_text(improved.markdown, encoding="utf-8")
     return ContractImproveResult(
         output_path=final_output_path,
+        check_result=improved.check_result,
+        answered_question_ids=improved.answered_question_ids,
+        open_question_ids=improved.open_question_ids,
+        source_sha256=improved.source_sha256,
+        answers_path=answers_path,
+    )
+
+
+def improve_contract_text(
+    contract_markdown: str,
+    *,
+    contract_name: str | Path | None = None,
+    questions: list[ClarifyingQuestion | dict[str, Any]],
+    answers: dict[str, str | dict[str, Any]],
+    source_result: ContractCheckResult | None = None,
+    output_name: str | Path | None = None,
+    project_config: dict | None = None,
+    configured_validation_commands: list[str] | None = None,
+) -> ContractTextImproveResult:
+    """Apply contract answers without reading or writing workflow files."""
+
+    source_path = _virtual_contract_path(contract_name, default_suffix=".md")
+    source_format = "text" if source_path.suffix.lower() == ".txt" else "markdown"
+    if source_result is None:
+        source_result = check_contract(
+            contract_markdown,
+            source_path=contract_name,
+            source_format=source_format,
+            project_config=project_config,
+            configured_validation_commands=configured_validation_commands,
+        )
+    question_dicts = _question_dicts(questions)
+    normalized_answers = _normalize_contract_answers(answers)
+    _reject_unknown_filled_answers(normalized_answers, question_dicts)
+
+    rendered, answered_ids, open_ids = _render_improved_contract(
+        contract_markdown,
+        source_path,
+        question_dicts,
+        normalized_answers,
+    )
+    check_result = check_contract(
+        rendered,
+        source_path=output_name if output_name is not None else contract_name,
+        source_format="markdown",
+        project_config=project_config,
+        configured_validation_commands=configured_validation_commands,
+    )
+    rendered, open_ids = _reconcile_rendered_open_questions(
+        rendered,
+        check_result.clarifying_questions,
+        normalized_answers,
+    )
+    check_result = check_contract(
+        rendered,
+        source_path=output_name if output_name is not None else contract_name,
+        source_format="markdown",
+        project_config=project_config,
+        configured_validation_commands=configured_validation_commands,
+    )
+    return ContractTextImproveResult(
+        markdown=rendered,
         check_result=check_result,
         answered_question_ids=answered_ids,
         open_question_ids=open_ids,
         source_sha256=str(source_result.source["sha256"]),
-        answers_path=answers_path,
     )
+
+
+def prepare_contract(
+    contract_markdown: str,
+    contract_name: str | None = None,
+    answers: dict[str, str | dict[str, Any]] | None = None,
+    project_context: dict | None = None,
+) -> ContractPrepareResult:
+    """Prepare an implementation contract through an in-memory check/improve loop."""
+
+    source_format = "text" if contract_name and Path(contract_name).suffix.lower() == ".txt" else "markdown"
+    project_config = None
+    validation_commands = _validation_commands_from_prepare_context(project_context)
+    safe_task_path = _safe_task_path_hint(contract_name, contract_markdown)
+    check_result = check_contract(
+        contract_markdown,
+        source_path=contract_name,
+        source_format=source_format,
+        project_config=project_config,
+        configured_validation_commands=validation_commands,
+    )
+
+    if answers:
+        # Chat/MCP prepare clients may resend an accumulated answer map across rounds.
+        # Only answers for the currently active questions should be applied here;
+        # earlier answers are already represented in the returned Markdown.
+        active_answers = _answers_for_questions(answers, check_result.clarifying_questions)
+        improved = improve_contract_text(
+            contract_markdown,
+            contract_name=contract_name,
+            questions=check_result.clarifying_questions,
+            answers=active_answers,
+            source_result=check_result,
+            output_name=safe_task_path,
+            project_config=project_config,
+            configured_validation_commands=validation_commands,
+        )
+        return _build_prepare_result(
+            contract_name=contract_name,
+            project_context=project_context,
+            safe_task_path=safe_task_path,
+            check_result=check_result,
+            recheck_result=improved.check_result,
+            prepared_contract_markdown=improved.markdown,
+            answered_question_ids=improved.answered_question_ids,
+            open_question_ids=improved.open_question_ids,
+        )
+
+    prepared_contract_markdown = contract_markdown.strip() + "\n"
+    output_check_result = check_result
+    if prepared_contract_markdown != contract_markdown:
+        output_check_result = check_contract(
+            prepared_contract_markdown,
+            source_path=safe_task_path,
+            source_format="markdown",
+            project_config=project_config,
+            configured_validation_commands=validation_commands,
+        )
+
+    return _build_prepare_result(
+        contract_name=contract_name,
+        project_context=project_context,
+        safe_task_path=safe_task_path,
+        check_result=output_check_result,
+        recheck_result=None,
+        prepared_contract_markdown=prepared_contract_markdown,
+    )
+
+
+def _build_prepare_result(
+    *,
+    contract_name: str | None,
+    project_context: dict | None,
+    safe_task_path: str,
+    check_result: ContractCheckResult,
+    recheck_result: ContractCheckResult | None,
+    prepared_contract_markdown: str,
+    answered_question_ids: list[str] | None = None,
+    open_question_ids: list[str] | None = None,
+) -> ContractPrepareResult:
+    active_check = recheck_result or check_result
+    answered_ids = list(answered_question_ids or [])
+    questions_for_user = active_check.clarifying_questions
+    active_question_ids = [question.id for question in questions_for_user]
+    open_ids = list(dict.fromkeys([*(open_question_ids or []), *active_question_ids]))
+    revised_answer_question_ids = [question.id for question in questions_for_user if question.id in set(answered_ids)]
+    needs_user_input = bool(questions_for_user)
+    ready_to_run = active_check.ready_for_autonomous_delivery
+    ready_to_save = not needs_user_input and active_check.status in {"ready", "warn"}
+    stage = "ready" if ready_to_run else "needs_user_input" if needs_user_input else "review"
+    required_next_step = _prepare_required_next_step(
+        needs_user_input=needs_user_input,
+        ready_to_save=ready_to_save,
+        ready_to_run=ready_to_run,
+    )
+    required_user_action = _required_user_action(required_next_step)
+    user_questions = _prepare_user_questions(questions_for_user, revised_answer_question_ids)
+    answers_template = _prepare_answers_template(active_check, revised_answer_question_ids)
+    resume_arguments = _prepare_resume_arguments(
+        contract_markdown=prepared_contract_markdown,
+        contract_name=contract_name,
+        project_context=project_context,
+        status_applies_to_sha256=str(active_check.source["sha256"]),
+    )
+    suggested_next_steps = _prepare_suggested_next_steps(
+        required_next_step=required_next_step,
+        safe_task_path=safe_task_path,
+        sikula_configured=_prepare_sikula_configured(project_context),
+    )
+    assistant_response_markdown = _prepare_assistant_response_markdown(
+        active_check=active_check,
+        required_user_action=required_user_action,
+        suggested_next_steps=suggested_next_steps,
+        revised_answer_question_ids=revised_answer_question_ids,
+    )
+    return ContractPrepareResult(
+        stage=stage,
+        needs_user_input=needs_user_input,
+        ready_to_save=ready_to_save,
+        ready_to_run=ready_to_run,
+        required_next_step=required_next_step,
+        questions_for_user=questions_for_user,
+        answers_template=answers_template,
+        prepared_contract_markdown=prepared_contract_markdown,
+        check_result=check_result,
+        recheck_result=recheck_result,
+        unresolved_gaps=active_check.gaps,
+        status_applies_to_sha256=str(active_check.source["sha256"]),
+        ready_to_run_blockers=_ready_to_run_blockers(active_check),
+        answered_question_ids=answered_ids,
+        open_question_ids=open_ids,
+        revised_answer_question_ids=revised_answer_question_ids,
+        user_questions=user_questions,
+        resume_arguments=resume_arguments,
+        authoritative_output_markdown=prepared_contract_markdown,
+        suggested_next_steps=suggested_next_steps,
+        required_user_action=required_user_action,
+        primary_user_action=required_user_action,
+        assistant_response_markdown=assistant_response_markdown,
+        safe_task_path=safe_task_path,
+        anti_loop_guidance=_prepare_anti_loop_guidance(),
+    )
+
+
+def _virtual_contract_path(contract_name: str | Path | None, *, default_suffix: str) -> Path:
+    if contract_name:
+        path = Path(str(contract_name))
+        if path.suffix:
+            return path
+        return path.with_suffix(default_suffix)
+    return Path(f"contract{default_suffix}")
+
+
+def _question_dicts(questions: list[ClarifyingQuestion | dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for question in questions:
+        data = question.to_dict() if isinstance(question, ClarifyingQuestion) else dict(question)
+        question_id = data.get("id")
+        if not isinstance(question_id, str) or not question_id:
+            raise ValueError("Contract question is missing a stable id")
+        if question_id in seen:
+            raise ValueError(f"Contract questions contain duplicate id: {question_id}")
+        seen.add(question_id)
+        normalized.append(data)
+    return normalized
+
+
+def _normalize_contract_answers(answers: dict[str, str | dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    normalized: dict[str, dict[str, Any]] = {}
+    for question_id, answer in answers.items():
+        if not isinstance(question_id, str) or not question_id:
+            raise ValueError("Contract answers must be keyed by stable question id")
+        if isinstance(answer, dict):
+            normalized[question_id] = {
+                "answer": answer.get("answer", ""),
+                "notes": answer.get("notes", ""),
+            }
+        else:
+            normalized[question_id] = {"answer": answer, "notes": ""}
+    return normalized
+
+
+def _answers_for_questions(
+    answers: dict[str, str | dict[str, Any]],
+    questions: list[ClarifyingQuestion],
+) -> dict[str, dict[str, Any]]:
+    normalized_answers = _normalize_contract_answers(answers)
+    active_ids = {question.id for question in questions}
+    return {question_id: answer for question_id, answer in normalized_answers.items() if question_id in active_ids}
+
+
+def _prepare_answers_template(
+    result: ContractCheckResult,
+    revised_answer_question_ids: list[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    revised_ids = set(revised_answer_question_ids or [])
+    template: dict[str, dict[str, Any]] = {}
+    for question in result.clarifying_questions:
+        entry = question.to_dict()
+        entry["answer"] = ""
+        entry["notes"] = ""
+        entry["requires_revised_answer"] = question.id in revised_ids
+        template[question.id] = entry
+    return template
+
+
+def _prepare_user_questions(
+    questions: list[ClarifyingQuestion],
+    revised_answer_question_ids: list[str],
+) -> list[dict[str, Any]]:
+    revised_ids = set(revised_answer_question_ids)
+    user_questions: list[dict[str, Any]] = []
+    for question in questions:
+        data = question.to_dict()
+        data["requires_revised_answer"] = question.id in revised_ids
+        if question.id in revised_ids:
+            data["reason"] = "The previous answer did not resolve this contract gap; provide a more specific answer."
+        user_questions.append(data)
+    return user_questions
+
+
+def _prepare_required_next_step(*, needs_user_input: bool, ready_to_save: bool, ready_to_run: bool) -> str:
+    if needs_user_input:
+        return "answer_questions"
+    if ready_to_run:
+        return "save_and_run_contract"
+    if ready_to_save:
+        return "save_contract"
+    return "revise_contract"
+
+
+def _required_user_action(required_next_step: str) -> str:
+    return {
+        "answer_questions": "answer_contract_questions",
+        "save_and_run_contract": "save_contract_and_run_sikula",
+        "save_contract": "save_contract",
+        "revise_contract": "revise_contract",
+    }.get(required_next_step, "review_contract")
+
+
+def _ready_to_run_blockers(result: ContractCheckResult) -> list[str]:
+    if result.ready_for_autonomous_delivery:
+        return []
+    blockers = [gap.message for gap in result.gaps if gap.severity == "blocking"]
+    if result.status != "ready":
+        blockers.append(f"Readiness status is {result.status}, not ready.")
+    if not blockers and result.gaps:
+        blockers.extend(gap.message for gap in result.gaps)
+    return list(dict.fromkeys(blockers))
+
+
+def _safe_task_path_hint(contract_name: str | None, contract_markdown: str) -> str:
+    title = _contract_path_source_name(contract_name, contract_markdown)
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    slug = re.sub(r"-+", "-", slug)[:80].strip("-")
+    return f".sikula/tasks/{slug or 'task'}.md"
+
+
+def _contract_path_source_name(contract_name: str | None, contract_markdown: str) -> str:
+    if contract_name:
+        name = Path(str(contract_name)).stem
+        if name:
+            return name
+    parsed = _parse_markdown_task(contract_markdown)
+    if parsed.title:
+        return parsed.title
+    for line in contract_markdown.splitlines():
+        stripped = line.strip().strip("#").strip()
+        if stripped:
+            return stripped
+    return "task"
+
+
+def _prepare_resume_arguments(
+    *,
+    contract_markdown: str,
+    contract_name: str | None,
+    project_context: dict | None,
+    status_applies_to_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "contract_markdown": contract_markdown,
+        "contract_name": contract_name,
+        "project_context": _prepare_project_context_for_resume(project_context),
+        "status_applies_to_sha256": status_applies_to_sha256,
+    }
+
+
+def _prepare_project_context_for_resume(project_context: dict | None) -> dict[str, Any]:
+    if not isinstance(project_context, dict):
+        return {}
+    allowed_keys = {
+        "known_constraints",
+        "package_manager",
+        "sikula_configured",
+        "stack",
+        "validation_commands",
+    }
+    return {key: value for key, value in project_context.items() if key in allowed_keys}
+
+
+def _prepare_sikula_configured(project_context: dict | None) -> bool:
+    return bool(project_context.get("sikula_configured")) if isinstance(project_context, dict) else False
+
+
+def _prepare_suggested_next_steps(
+    *,
+    required_next_step: str,
+    safe_task_path: str,
+    sikula_configured: bool,
+) -> list[str]:
+    if required_next_step == "answer_questions":
+        return ["Answer the listed contract questions, then call prepare_contract again with those answers."]
+    if required_next_step == "revise_contract":
+        return ["Revise the contract manually, then run the contract check again."]
+    if required_next_step == "save_contract":
+        return [f"Save the prepared contract to `{safe_task_path}` before running delivery."]
+    if required_next_step == "save_and_run_contract":
+        steps = [f"Save the prepared contract to `{safe_task_path}`."]
+        if sikula_configured:
+            steps.append(f"Run `sikula run {safe_task_path}`.")
+        else:
+            steps.append("Run `sikula init` or configure `.sikula/config.yaml` before delivery.")
+        return steps
+    return []
+
+
+def _prepare_assistant_response_markdown(
+    *,
+    active_check: ContractCheckResult,
+    required_user_action: str,
+    suggested_next_steps: list[str],
+    revised_answer_question_ids: list[str],
+) -> str:
+    changed = "Prepared contract is ready for the next step."
+    if revised_answer_question_ids:
+        changed = "Some previous answers still need more detail."
+    elif active_check.clarifying_questions:
+        changed = "Contract needs user input before autonomous delivery."
+    next_step = suggested_next_steps[0] if suggested_next_steps else "Review the contract readiness result."
+    note = "Do not start `sikula run` until `ready_to_run` is true."
+    if active_check.ready_for_autonomous_delivery:
+        note = "Readiness applies to the returned Markdown hash."
+    return "\n".join(
+        [
+            f"Status: {active_check.status.upper()} ({active_check.readiness_score}/100)",
+            f"Changed: {changed}",
+            f"Next step: {next_step}",
+            f"Required action: {required_user_action}",
+            f"Note: {note}",
+        ]
+    )
+
+
+def _prepare_anti_loop_guidance() -> dict[str, Any]:
+    return {
+        "max_prepare_attempts_without_new_user_input": 1,
+        "on_repeated_question_ids": "Ask the user for revised answers; do not keep improving automatically.",
+    }
+
+
+def _validation_commands_from_prepare_context(project_context: dict | None) -> list[str] | None:
+    if not isinstance(project_context, dict):
+        return None
+    value = project_context.get("validation_commands")
+    if not isinstance(value, list):
+        return None
+    commands = [str(command).strip() for command in value if str(command).strip()]
+    return commands or None
 
 
 def _contract_report_data(result: ContractCheckResult, *, task_path: Path, artifact_base: Path) -> dict[str, Any]:
@@ -621,6 +1134,16 @@ def _load_contract_answers(path: Path) -> dict[str, Any]:
     return data
 
 
+def load_contract_answers_for_task(path: Path, result: ContractCheckResult) -> dict[str, Any]:
+    """Load answers YAML and verify that it belongs to the checked task revision."""
+
+    data = _load_contract_answers(path)
+    _answers_questions(data)
+    _answers_mapping(data)
+    _validate_answers_for_task(data, result)
+    return data
+
+
 def _answers_questions(data: dict[str, Any]) -> list[dict[str, Any]]:
     questions = data.get("questions")
     if not isinstance(questions, list):
@@ -694,6 +1217,9 @@ def _render_improved_contract(
     questions: list[dict[str, Any]],
     answers: dict[str, dict[str, Any]],
 ) -> tuple[str, list[str], list[str]]:
+    answered_question_ids = [question["id"] for question in questions if _answer_text(answers.get(question["id"], {}))]
+    task_text = _strip_generated_answer_entries(task_text, answered_question_ids)
+    task_text = _strip_generated_open_questions_section(task_text)
     lines = _improved_contract_base_lines(task_text, task_path)
     section_entries: dict[str, list[tuple[dict[str, Any], str, str]]] = {}
     answered_notes: list[tuple[str, str]] = []
@@ -719,22 +1245,10 @@ def _render_improved_contract(
         if not entries:
             continue
         lines.extend(["", f"## {section}", ""])
-        for _question, answer_text, _notes in entries:
-            _append_answer_entry(lines, section, answer_text)
+        for question, answer_text, _notes in entries:
+            _append_answer_entry(lines, question["id"], section, answer_text)
 
-    if open_ids:
-        lines.extend(["", "## Open questions", ""])
-        for question in questions:
-            if question["id"] not in open_ids:
-                continue
-            lines.append(f"- {question.get('question', '')}")
-            why = str(question.get("why_it_matters", "")).strip()
-            if why:
-                lines.append(f"  - Why it matters: {why}")
-            notes = _answer_notes(answers.get(question["id"], {}))
-            if notes:
-                lines.append(f"  - Notes: {_single_line(notes)}")
-            lines.append(f"  - Blocks delivery: {'yes' if question.get('blocks_delivery') else 'no'}")
+    _append_open_questions(lines, [question for question in questions if question["id"] in open_ids], answers)
 
     if answered_notes:
         lines.extend(["", "## Notes", ""])
@@ -742,6 +1256,167 @@ def _render_improved_contract(
             lines.append(f"- {label}: {_single_line(notes)}")
 
     return "\n".join(lines).rstrip() + "\n", answered_ids, open_ids
+
+
+def _reconcile_rendered_open_questions(
+    rendered: str,
+    active_questions: list[ClarifyingQuestion],
+    answers: dict[str, dict[str, Any]],
+) -> tuple[str, list[str]]:
+    question_dicts = _question_dicts(active_questions)
+    lines = _strip_generated_open_questions_section(rendered).splitlines()
+    _append_open_questions(lines, question_dicts, answers)
+    return "\n".join(lines).rstrip() + "\n", [question["id"] for question in question_dicts]
+
+
+def _append_open_questions(
+    lines: list[str],
+    questions: list[dict[str, Any]],
+    answers: dict[str, dict[str, Any]],
+) -> None:
+    if not questions:
+        return
+
+    lines.extend(["", "## Open questions", "", _GENERATED_OPEN_QUESTIONS_MARKER, ""])
+    for question in questions:
+        lines.append(f"- {question.get('question', '')}")
+        why = str(question.get("why_it_matters", "")).strip()
+        if why:
+            lines.append(f"  - Why it matters: {why}")
+        notes = _answer_notes(answers.get(question["id"], {}))
+        if notes:
+            lines.append(f"  - Notes: {_single_line(notes)}")
+        lines.append(f"  - Blocks delivery: {'yes' if question.get('blocks_delivery') else 'no'}")
+
+
+def _strip_generated_open_questions_section(task_text: str) -> str:
+    source_lines = task_text.splitlines()
+    lines: list[str] = []
+    index = 0
+
+    while index < len(source_lines):
+        line = source_lines[index]
+        heading_match = _HEADING_RE.match(line)
+        if heading_match and _normalize_heading(heading_match.group(2)) == "open questions":
+            section_end = index + 1
+            while section_end < len(source_lines) and not _HEADING_RE.match(source_lines[section_end]):
+                section_end += 1
+            section_body = source_lines[index + 1 : section_end]
+            if _is_generated_open_questions_section(section_body):
+                index = section_end
+                continue
+            lines.extend(source_lines[index:section_end])
+            index = section_end
+            continue
+
+        lines.append(line)
+        index += 1
+
+    return "\n".join(lines).strip()
+
+
+def _strip_generated_answer_entries(task_text: str, question_ids: list[str]) -> str:
+    target_ids = set(question_ids)
+    if not target_ids:
+        return task_text.strip()
+
+    source_lines = task_text.splitlines()
+    lines: list[str] = []
+    index = 0
+    target_sections = {_normalize_heading(_contract_section_for_question(question_id)) for question_id in target_ids}
+
+    while index < len(source_lines):
+        line = source_lines[index]
+        heading_match = _HEADING_RE.match(line)
+        if heading_match:
+            section_end = index + 1
+            while section_end < len(source_lines) and not _HEADING_RE.match(source_lines[section_end]):
+                section_end += 1
+            section_body = source_lines[index + 1 : section_end]
+            normalized_heading = _normalize_heading(heading_match.group(2))
+            if normalized_heading in target_sections:
+                stripped_body, removed_marked_entry = _strip_marked_answer_entries(section_body, target_ids)
+                if removed_marked_entry:
+                    stripped_body = _trim_blank_lines(stripped_body)
+                    if stripped_body:
+                        lines.append(line)
+                        lines.extend(stripped_body)
+                    index = section_end
+                    continue
+            lines.extend(source_lines[index:section_end])
+            index = section_end
+            continue
+
+        lines.append(line)
+        index += 1
+
+    return "\n".join(lines).strip()
+
+
+def _strip_marked_answer_entries(section_body: list[str], target_ids: set[str]) -> tuple[list[str], bool]:
+    lines: list[str] = []
+    index = 0
+    removed = False
+
+    while index < len(section_body):
+        line = section_body[index]
+        marker_match = _GENERATED_ANSWER_ENTRY_RE.match(line)
+        if not marker_match:
+            lines.append(line)
+            index += 1
+            continue
+
+        marker_ids = {value.strip() for value in marker_match.group(1).split(",") if value.strip()}
+        remove_entry = bool(marker_ids & target_ids)
+        entry_end = index + 1
+        while entry_end < len(section_body) and section_body[entry_end].strip() != _GENERATED_ANSWER_ENTRY_END_MARKER:
+            entry_end += 1
+        if entry_end < len(section_body):
+            entry_end += 1
+        if remove_entry:
+            removed = True
+        else:
+            lines.extend(section_body[index:entry_end])
+        index = entry_end
+
+    return lines, removed
+
+
+def _trim_blank_lines(lines: list[str]) -> list[str]:
+    start = 0
+    end = len(lines)
+    while start < end and not lines[start].strip():
+        start += 1
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    return lines[start:end]
+
+
+def _is_generated_open_questions_section(section_body: list[str]) -> bool:
+    stripped = [line.strip() for line in section_body if line.strip()]
+    if _GENERATED_OPEN_QUESTIONS_MARKER in stripped:
+        return True
+    if not stripped:
+        return False
+
+    saw_question = False
+    current_has_blocks_delivery = False
+    for line in section_body:
+        if not line.strip():
+            continue
+        if re.match(r"^[-*+]\s+", line):
+            if saw_question and not current_has_blocks_delivery:
+                return False
+            saw_question = True
+            current_has_blocks_delivery = False
+            continue
+        if re.match(r"^\s{2,}[-*+]\s+(Why it matters|Notes|Blocks delivery):", line):
+            if "Blocks delivery:" in line:
+                current_has_blocks_delivery = True
+            continue
+        return False
+
+    return saw_question and current_has_blocks_delivery
 
 
 def _improved_contract_base_lines(task_text: str, task_path: Path) -> list[str]:
@@ -810,16 +1485,24 @@ def _ordered_improved_sections(section_entries: dict[str, list[tuple[dict[str, A
 
 def _append_answer_entry(
     lines: list[str],
+    question_id: str,
     section: str,
     answer_text: str,
 ) -> None:
+    lines.append(_generated_answer_entry_marker(question_id))
     if section == "Validation":
         for command in _answer_lines(answer_text):
             lines.append(f"- `{_clean_answer_bullet(command).strip('`')}`")
+        lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
         return
 
     for answer_line in _answer_lines(answer_text):
         lines.append(f"- {_clean_answer_bullet(answer_line)}")
+    lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
+
+
+def _generated_answer_entry_marker(question_id: str) -> str:
+    return f"<!-- sikula:generated-answer: {question_id} -->"
 
 
 def _answer_lines(value: str) -> list[str]:
@@ -1250,15 +1933,30 @@ def _status_for_score(score: int) -> str:
     return "not_ready"
 
 
-def _validation_details(text: str, project_config: dict | None) -> dict[str, Any]:
+def _validation_details(
+    text: str,
+    project_config: dict | None,
+    explicit_validation_commands: list[str] | None,
+) -> dict[str, Any]:
     task_commands = extract_validation_commands(text)
     configured_commands: list[dict[str, str]] = []
     coverage_gaps: list[str] = []
     covered_commands: list[dict[str, Any]] = []
 
+    if explicit_validation_commands:
+        configured_commands.extend(
+            {
+                "phase": "project_context",
+                "name": f"validation-{index}",
+                "command": command,
+            }
+            for index, command in enumerate(explicit_validation_commands, start=1)
+            if command
+        )
     if project_config:
         state = TaskState(task_id="contract_check", task_description=text)
-        configured_commands = configured_validation_commands(project_config, state)
+        configured_commands.extend(configured_validation_commands(project_config, state))
+    if configured_commands:
         for command in task_commands:
             covered, match_kind, configured = validation_command_coverage(command, configured_commands)
             if covered:

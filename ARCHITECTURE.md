@@ -125,8 +125,18 @@ answers file hash against the current task content, applies filled answers into 
 Markdown implementation contract, preserves unanswered questions under `Open questions`,
 and runs the contract check on the output before writing it. It refuses accidental
 overwrites unless `--write` is explicitly used on a Markdown task; plain-text inputs can be
-improved only by writing a new Markdown output file. These commands do not create
-`TaskState`, start agents, create worktrees, or alter `review` flow. Fresh `sikula run
+improved only by writing a new Markdown output file. `--interactive` is a terminal
+convenience layer that creates or reuses the answers YAML, prompts for answers, saves that
+file, and then calls the same deterministic improve/recheck path. The same module also exposes
+side-effect-free in-memory helpers (`improve_contract_text()` and `prepare_contract()`) so
+chat/MCP adapters can reuse the same scoring, question, answer-application, and recheck
+logic without temporary YAML files or duplicate business rules. `prepare_contract()` returns
+the authoritative workflow state plus user-facing questions, safe `.sikula/tasks/...` path
+hints, resume arguments, revised-answer markers, and next-step guidance; adapters should not
+infer readiness separately. `core.contract_prepare_adapter` maps that core result into the
+stable `prepare_implementation_contract` response shape for future MCP transport without
+adding scoring or rewrite logic. These commands and helpers
+do not create `TaskState`, start agents, create worktrees, or alter `review` flow. Fresh `sikula run
 TASK_FILE` uses the same deterministic checks to store a compact warning-only snapshot in
 `TaskState.implementation_contract` and print a one-line summary before agents start; it
 does not write `.sikula/contracts` artifacts. Fresh task-file runs can opt into strict

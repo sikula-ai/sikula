@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,7 +11,9 @@ import yaml
 from core.contract_check import (
     check_contract,
     check_contract_file,
+    improve_contract_text,
     improve_contract_from_answers,
+    prepare_contract,
     render_contract_check,
     write_contract_report,
 )
@@ -158,6 +161,402 @@ def test_question_ids_are_stable_for_same_task():
 
     assert first == second
     assert first
+
+
+def test_check_contract_ignores_generated_open_questions_for_readiness():
+    task = "# Add team invites\n\nUsers should be able to invite teammates by email.\n"
+    generated_open_questions = (
+        task
+        + "\n## Open questions\n\n"
+        + "<!-- sikula:generated-open-questions -->\n\n"
+        + "- What observable behaviours must be true when this task is complete?\n"
+        + "  - Why it matters: Acceptance criteria are the contract used by implementer, reviewer, and test writer.\n"
+        + "  - Blocks delivery: yes\n"
+    )
+
+    base = check_contract(task)
+    generated = check_contract(generated_open_questions)
+
+    assert generated.source["sha256"] == "sha256:" + sha256(generated_open_questions.encode("utf-8")).hexdigest()
+    assert generated.readiness_score == base.readiness_score
+    assert [gap.id for gap in generated.gaps] == [gap.id for gap in base.gaps]
+    assert [question.id for question in generated.clarifying_questions] == [
+        question.id for question in base.clarifying_questions
+    ]
+
+
+def test_prepare_contract_returns_questions_without_file_side_effects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+    )
+
+    assert result.stage == "needs_user_input"
+    assert result.needs_user_input
+    assert not result.ready_to_save
+    assert not result.ready_to_run
+    assert result.required_next_step == "answer_questions"
+    assert "acceptance.criteria" in result.answers_template
+    assert "token.lifecycle" in result.answers_template
+    assert result.safe_task_path == ".sikula/tasks/team-invites.md"
+    assert result.required_user_action == "answer_contract_questions"
+    assert result.primary_user_action == "answer_contract_questions"
+    assert result.user_questions
+    assert result.open_question_ids == [question.id for question in result.questions_for_user]
+    assert result.resume_arguments["contract_markdown"].startswith("# Add team invites")
+    assert result.resume_arguments["status_applies_to_sha256"] == result.status_applies_to_sha256
+    assert "sikula run" not in "\n".join(result.suggested_next_steps)
+    assert "ready_to_run" in result.assistant_response_markdown
+    assert result.recheck_result is None
+    assert result.status_applies_to_sha256 == result.check_result.source["sha256"]
+    assert not (tmp_path / ".sikula").exists()
+
+
+def test_prepare_contract_checks_normalized_output_without_answers():
+    task = "# Add team invites\n\nUsers should be able to invite teammates by email."
+
+    result = prepare_contract(task, contract_name="team-invites.md")
+
+    expected_markdown = task + "\n"
+    expected_sha = "sha256:" + sha256(expected_markdown.encode("utf-8")).hexdigest()
+    assert result.prepared_contract_markdown == expected_markdown
+    assert result.authoritative_output_markdown == expected_markdown
+    assert result.resume_arguments["contract_markdown"] == expected_markdown
+    assert result.status_applies_to_sha256 == expected_sha
+    assert result.check_result.source["sha256"] == expected_sha
+    assert result.resume_arguments["status_applies_to_sha256"] == expected_sha
+
+
+def test_prepare_contract_uses_project_context_validation_commands():
+    task = """# Add search
+
+## Scope
+- Add search by country name.
+- Keep existing filtering.
+- Keep sorting unchanged.
+
+## Acceptance criteria
+- Search is case-insensitive.
+- Clearing search shows all countries.
+- No results shows an empty state.
+
+## Out of scope
+- Do not add server-side search.
+
+## Validation
+- `npm test`
+"""
+
+    result = prepare_contract(
+        task,
+        contract_name="search.md",
+        project_context={"validation_commands": ["npm test"]},
+    )
+
+    assert result.check_result.validation["coverage_gaps"] == []
+    assert result.check_result.validation["configured_commands"] == [
+        {"phase": "project_context", "name": "validation-1", "command": "npm test"}
+    ]
+    assert all(gap.id != "gap.validation.coverage" for gap in result.unresolved_gaps)
+
+
+def test_prepare_contract_applies_answers_and_rechecks():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={
+            "scope.boundaries": "Add team invite creation and acceptance endpoints.",
+            "acceptance.criteria": "Owners can invite teammates by email.\nMembers cannot invite teammates.",
+            "scope.out_of_scope": "Billing and bulk invites are out of scope.",
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.recheck_result is not None
+    assert "scope.boundaries" in result.answered_question_ids
+    assert "acceptance.criteria" in result.answered_question_ids
+    assert "## Scope" in result.prepared_contract_markdown
+    assert "- Add team invite creation and acceptance endpoints." in result.prepared_contract_markdown
+    assert result.recheck_result.readiness_score > result.check_result.readiness_score
+    assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
+    assert result.required_next_step in {
+        "answer_questions",
+        "save_contract",
+        "save_and_run_contract",
+        "revise_contract",
+    }
+
+
+def test_prepare_contract_reconciles_open_questions_after_recheck():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={
+            "scope.boundaries": "Add invite creation and acceptance endpoints.",
+            "acceptance.criteria": (
+                "Owners can invite teammates by email. Duplicate invites return a deterministic error. "
+                "Expired invite tokens cannot be accepted. Reused invite tokens cannot be accepted."
+            ),
+            "scope.out_of_scope": "Billing and bulk invites are out of scope.",
+            "token.lifecycle": "Invite tokens expire after 24 hours and cannot be reused.",
+            "privacy.data_handling": "Do not log invite tokens or reveal whether an email already has an account.",
+            "reviewer.focus": "Authorization, duplicate invite handling, and token lifecycle.",
+            "context.domain_rules": "Follow existing team membership service patterns.",
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert not result.needs_user_input
+    assert result.ready_to_save
+    assert result.open_question_ids == []
+    assert result.questions_for_user == []
+    assert "## Open questions" not in result.prepared_contract_markdown
+    assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
+
+
+def test_prepare_contract_keeps_current_open_questions_after_final_recheck():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={
+            "scope.boundaries": "Add invite creation and acceptance endpoints.",
+            "scope.out_of_scope": "Billing changes are out of scope.",
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.needs_user_input
+    assert "acceptance.criteria" in result.open_question_ids
+    assert "## Open questions" in result.prepared_contract_markdown
+    assert "<!-- sikula:generated-open-questions -->" in result.prepared_contract_markdown
+    assert "What observable behaviours must be true when this task is complete?" in result.prepared_contract_markdown
+    assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
+
+
+def test_prepare_contract_marks_repeated_questions_as_revised_answer_needed():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"acceptance.negative_cases": "ok"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.needs_user_input
+    assert "acceptance.negative_cases" in result.answered_question_ids
+    assert {question.id for question in result.questions_for_user}.issubset(set(result.open_question_ids))
+    assert "acceptance.negative_cases" in result.revised_answer_question_ids
+    question = next(question for question in result.user_questions if question["id"] == "acceptance.negative_cases")
+    assert question["requires_revised_answer"] is True
+    assert "more specific answer" in question["reason"]
+    assert result.answers_template["acceptance.negative_cases"]["requires_revised_answer"] is True
+    assert result.required_user_action == "answer_contract_questions"
+
+
+def test_prepare_contract_strips_stale_open_questions_between_answer_rounds():
+    first = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"scope.boundaries": "Add invite creation and acceptance endpoints."},
+        project_context={"validation_commands": ["pytest"]},
+    )
+    stale_question = next(
+        question.question for question in first.questions_for_user if question.id == "acceptance.negative_cases"
+    )
+    assert "## Open questions" in first.prepared_contract_markdown
+    assert stale_question in first.prepared_contract_markdown
+
+    second = prepare_contract(
+        first.resume_arguments["contract_markdown"],
+        contract_name="team-invites.md",
+        answers={"acceptance.negative_cases": "Duplicate invites return a deterministic error."},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "- Duplicate invites return a deterministic error." in second.prepared_contract_markdown
+    assert stale_question not in second.prepared_contract_markdown
+
+
+def test_prepare_contract_replaces_revised_generated_answers():
+    first = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"acceptance.negative_cases": "ok"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "acceptance.negative_cases" in first.revised_answer_question_ids
+    assert "- ok" in first.prepared_contract_markdown
+
+    second = prepare_contract(
+        first.resume_arguments["contract_markdown"],
+        contract_name="team-invites.md",
+        answers={
+            "acceptance.negative_cases": (
+                "Duplicate pending invites return a deterministic error. Empty emails are rejected."
+            )
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "## Acceptance criteria" in second.prepared_contract_markdown
+    assert second.prepared_contract_markdown.count("## Acceptance criteria") == 1
+    assert "- Duplicate pending invites return a deterministic error. Empty emails are rejected." in (
+        second.prepared_contract_markdown
+    )
+    assert "- ok" not in second.prepared_contract_markdown
+
+
+def test_prepare_contract_preserves_human_open_questions_section():
+    task = """# Add team invites
+
+Users should be able to invite teammates by email.
+
+## Open questions
+
+- Confirm the invite email copy with product.
+"""
+
+    result = prepare_contract(
+        task,
+        contract_name="team-invites.md",
+        answers={"scope.boundaries": "Add invite creation and acceptance endpoints."},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "## Open questions" in result.prepared_contract_markdown
+    assert "- Confirm the invite email copy with product." in result.prepared_contract_markdown
+
+
+def test_prepare_contract_resume_accepts_accumulated_answers():
+    first = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"scope.boundaries": "Add invite creation and acceptance endpoints."},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    second = prepare_contract(
+        first.resume_arguments["contract_markdown"],
+        contract_name="team-invites.md",
+        answers={
+            "scope.boundaries": "Add invite creation and acceptance endpoints.",
+            "acceptance.negative_cases": "Duplicate invites return a deterministic error.",
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "- Add invite creation and acceptance endpoints." in second.prepared_contract_markdown
+    assert "- Duplicate invites return a deterministic error." in second.prepared_contract_markdown
+    assert "acceptance.negative_cases" in second.answered_question_ids
+
+
+def test_prepare_contract_ready_result_includes_safe_save_and_run_guidance():
+    task = """# Team invites
+
+## Scope
+- Add invite creation endpoint.
+- Add invite acceptance endpoint.
+- Add pending invite model.
+
+## Acceptance criteria
+- Owner/admin can invite a user by email.
+- Non-admin users cannot invite users.
+- Duplicate pending invite returns a deterministic error.
+- Expired invite token cannot be accepted.
+- Accepted invite token cannot be reused.
+
+## Security and privacy
+- Invite tokens must be unguessable.
+- Invite tokens must not be logged.
+- Error messages must not reveal whether an email already has an account.
+
+## Out of scope
+- Billing seat enforcement.
+- Bulk invites.
+- Full team settings redesign.
+
+## Tests
+- Permission tests for allowed and denied inviter roles.
+- Token lifecycle tests for expired and reused tokens.
+- Duplicate invite test.
+
+## Validation
+- `pytest`
+- `ruff check .`
+
+## Reviewer focus
+- Authorization rules.
+- Token expiry and reuse.
+- Email enumeration behaviour.
+"""
+
+    result = prepare_contract(
+        task,
+        contract_name="../../Team Invites; rm -rf *.md",
+        project_context={
+            "sikula_configured": True,
+            "validation_commands": ["pytest", "ruff check ."],
+        },
+    )
+
+    assert result.ready_to_save
+    assert result.ready_to_run
+    assert result.required_next_step == "save_and_run_contract"
+    assert result.safe_task_path == ".sikula/tasks/team-invites-rm-rf.md"
+    assert result.suggested_next_steps == [
+        "Save the prepared contract to `.sikula/tasks/team-invites-rm-rf.md`.",
+        "Run `sikula run .sikula/tasks/team-invites-rm-rf.md`.",
+    ]
+    assert result.resume_arguments["project_context"] == {
+        "sikula_configured": True,
+        "validation_commands": ["pytest", "ruff check ."],
+    }
+    assert result.to_dict()["authoritative_output_markdown"] == result.prepared_contract_markdown
+
+
+def test_prepare_contract_ready_without_config_does_not_suggest_run():
+    task = """# Country search
+
+## Scope
+- Add search by country name.
+- Keep existing region filtering.
+- Keep sorting unchanged.
+
+## Acceptance criteria
+- Matching is case-insensitive.
+- Clearing search shows the full list.
+- No matching countries shows an empty state.
+- Existing region filters still apply.
+
+## Out of scope
+- Do not add server-side search.
+- Do not change sorting.
+- Do not change country details.
+
+## Tests
+- Search matching test.
+- Empty state test.
+- Filter interaction test.
+
+## Validation
+- `npm test`
+
+## Reviewer focus
+- Search/filter interaction.
+"""
+
+    result = prepare_contract(
+        task,
+        contract_name="Country Search",
+        project_context={"validation_commands": ["npm test"]},
+    )
+
+    assert result.ready_to_run
+    assert result.required_next_step == "save_and_run_contract"
+    assert any("sikula init" in step for step in result.suggested_next_steps)
+    assert all("sikula run" not in step for step in result.suggested_next_steps)
 
 
 def test_gap_and_question_ids_are_unique_within_result():
@@ -500,7 +899,7 @@ def test_improve_contract_from_answers_writes_markdown_and_rechecks(tmp_path: Pa
     assert improved.source_sha256 == result.source["sha256"]
     assert "scope.boundaries" in improved.answered_question_ids
     assert "acceptance.criteria" in improved.answered_question_ids
-    assert "acceptance.negative_cases" in improved.open_question_ids
+    assert "acceptance.negative_cases" not in improved.open_question_ids
     assert "## Scope" in output
     assert (
         "- Add team invite creation and acceptance endpoints. Keep existing membership role names unchanged." in output
@@ -518,8 +917,7 @@ def test_improve_contract_from_answers_writes_markdown_and_rechecks(tmp_path: Pa
     assert "- Follow the existing TeamService invite patterns." in output
     assert "## Clarifications" in output
     assert "- Keep the existing invite email copy unchanged." in output
-    assert "## Open questions" in output
-    assert "Which invalid, unauthorized, empty, duplicate, or failure cases should be handled?" in output
+    assert "## Open questions" not in output
     assert "acceptance.negative_cases" not in output
     assert "- Clarification `" not in output
     assert "Source question" not in output
@@ -527,9 +925,45 @@ def test_improve_contract_from_answers_writes_markdown_and_rechecks(tmp_path: Pa
     assert "## Notes" in output
     assert "- Scope: Keep the existing team settings navigation unchanged." in output
     assert "- Clarifications: Custom note." in output
-    assert "Product owner still needs to decide empty email handling." in output
     assert improved.check_result.source["path"] == str(output_path)
     assert improved.check_result.readiness_score > result.readiness_score
+
+
+def test_in_memory_improve_matches_file_based_improve(tmp_path: Path):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    result = check_contract_file(task_path, project_config=_python_project_config(tmp_path))
+    written = write_contract_report(result, task_path=task_path, project_root=tmp_path)
+    answers_data = yaml.safe_load(written.answers_path.read_text(encoding="utf-8"))
+    answers_data["answers"]["scope.boundaries"]["answer"] = "Add invite creation and acceptance endpoints."
+    answers_data["answers"]["acceptance.criteria"]["answer"] = (
+        "Owners can invite teammates by email.\nMembers cannot invite teammates."
+    )
+    answers_data["answers"]["scope.out_of_scope"]["answer"] = "Billing changes are out of scope."
+    written.answers_path.write_text(yaml.safe_dump(answers_data, sort_keys=False), encoding="utf-8")
+
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    in_memory = improve_contract_text(
+        task_path.read_text(encoding="utf-8").strip(),
+        contract_name=task_path,
+        questions=answers_data["questions"],
+        answers=answers_data["answers"],
+        source_result=result,
+        output_name=output_path,
+        project_config=_python_project_config(tmp_path),
+    )
+    file_based = improve_contract_from_answers(
+        task_path,
+        answers_path=written.answers_path,
+        output_path=output_path,
+        project_config=_python_project_config(tmp_path),
+    )
+
+    assert in_memory.markdown == output_path.read_text(encoding="utf-8")
+    assert in_memory.answered_question_ids == file_based.answered_question_ids
+    assert in_memory.open_question_ids == file_based.open_question_ids
+    assert in_memory.check_result.to_dict() == file_based.check_result.to_dict()
 
 
 def test_improve_contract_rejects_hash_mismatch(tmp_path: Path):
@@ -764,6 +1198,133 @@ def test_contract_improve_cli_writes_output(tmp_path: Path, monkeypatch: pytest.
     assert "Improved contract written:" in out
     assert "Applied answers: 1" in out
     assert "Implementation Contract Readiness:" in out
+
+
+def test_contract_improve_cli_interactive_writes_answers_and_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    monkeypatch.chdir(tmp_path)
+
+    def answer(prompt: str) -> str:
+        if "scope.boundaries" in prompt:
+            return "Add invite creation and acceptance endpoints."
+        if "acceptance.criteria" in prompt:
+            return "Owners can invite teammates by email."
+        return ""
+
+    with (
+        patch(
+            "sys.argv", ["sikula", "contract", "improve", str(task_path), "--interactive", "--output", str(output_path)]
+        ),
+        patch("sys.stdin.isatty", return_value=True),
+        patch("builtins.input", side_effect=answer),
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    answers_path = tmp_path / ".sikula" / "contracts" / "team-invites.answers.yaml"
+    answers = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+    output = output_path.read_text(encoding="utf-8")
+
+    assert "Interactive contract answers:" in out
+    assert "Contract answers written:" in out
+    assert "Improved contract written:" in out
+    assert answers["answers"]["scope.boundaries"]["answer"] == "Add invite creation and acceptance endpoints."
+    assert answers["answers"]["acceptance.criteria"]["answer"] == "Owners can invite teammates by email."
+    assert "## Scope" in output
+    assert "- Add invite creation and acceptance endpoints." in output
+    assert "## Open questions" in output
+
+
+def test_contract_improve_cli_interactive_rejects_stale_answers_before_prompting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    result = check_contract_file(task_path, project_config=_python_project_config(tmp_path))
+    written = write_contract_report(result, task_path=task_path, project_root=tmp_path)
+    original_answers = written.answers_path.read_text(encoding="utf-8")
+    task_path.write_text(
+        "# Add team invites\n\nUsers should be able to invite teammates by email and role.",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch(
+            "sys.argv",
+            [
+                "sikula",
+                "contract",
+                "improve",
+                str(task_path),
+                "--interactive",
+                "--answers",
+                str(written.answers_path),
+                "--output",
+                str(output_path),
+            ],
+        ),
+        patch("sys.stdin.isatty", return_value=True),
+        patch("builtins.input", side_effect=AssertionError("stale answers must fail before prompting")),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    err = capsys.readouterr().err
+    assert exc.value.code == 1
+    assert "generated for a different task revision" in err
+    assert written.answers_path.read_text(encoding="utf-8") == original_answers
+    assert not output_path.exists()
+
+
+def test_contract_improve_cli_interactive_requires_tty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch(
+            "sys.argv", ["sikula", "contract", "improve", str(task_path), "--interactive", "--output", str(output_path)]
+        ),
+        patch("sys.stdin.isatty", return_value=False),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    err = capsys.readouterr().err
+    assert exc.value.code == 1
+    assert "interactive contract improve requires an interactive terminal" in err
+    assert not output_path.exists()
+
+
+def test_contract_improve_cli_requires_answers_without_interactive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sys.argv", ["sikula", "contract", "improve", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    err = capsys.readouterr().err
+    assert exc.value.code == 1
+    assert "--answers is required unless --interactive is used" in err
+    assert not output_path.exists()
 
 
 def test_contract_check_cli_json_write_report_stays_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):

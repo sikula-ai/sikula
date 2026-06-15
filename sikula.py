@@ -6,6 +6,7 @@ Usage (project-centric, run from project root):
   sikula init --guidelines --provider codex --model gpt-5.5
   sikula contract check task.md      # read-only implementation-contract preflight
   sikula contract improve task.md --answers .sikula/contracts/task.answers.yaml --output task.v2.md
+  sikula contract improve task.md --interactive --output task.v2.md
   sikula run task.md                 # auto-discovers .sikula/config.yaml
   sikula run --task-id <task-id>     # resume existing task
   sikula status
@@ -943,9 +944,17 @@ def cmd_contract_improve(args: argparse.Namespace, cfg: dict) -> None:
         print(f"Task file not found: {args.task_file}")
         sys.exit(1)
 
-    answers_path = Path(args.answers)
-    if not answers_path.is_absolute():
-        answers_path = (Path.cwd() / answers_path).resolve()
+    if args.interactive:
+        try:
+            answers_path = _write_interactive_contract_answers(args, cfg, task_path, project_root)
+        except (EOFError, OSError, ValueError) as exc:
+            print(f"Failed to collect contract answers: {exc}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        if not args.answers:
+            print("Failed to improve contract: --answers is required unless --interactive is used", file=sys.stderr)
+            sys.exit(1)
+        answers_path = _resolve_answers_path(args.answers)
     output_path = None
     if args.output:
         output_path = Path(args.output)
@@ -969,6 +978,74 @@ def cmd_contract_improve(args: argparse.Namespace, cfg: dict) -> None:
     print(f"Open questions: {len(result.open_question_ids)}")
     print("")
     print(render_contract_check(result.check_result), end="")
+
+
+def _resolve_answers_path(value: str) -> Path:
+    answers_path = Path(value)
+    if not answers_path.is_absolute():
+        answers_path = (Path.cwd() / answers_path).resolve()
+    return answers_path
+
+
+def _write_interactive_contract_answers(
+    args: argparse.Namespace,
+    cfg: dict,
+    task_path: Path,
+    project_root: Path,
+) -> Path:
+    from core.contract_check import check_contract_file, load_contract_answers_for_task, write_contract_report
+
+    if not sys.stdin.isatty():
+        raise ValueError("interactive contract improve requires an interactive terminal on stdin")
+
+    if args.answers:
+        answers_path = _resolve_answers_path(args.answers)
+        if not answers_path.exists():
+            raise ValueError(f"answers file not found: {answers_path}")
+        result = check_contract_file(task_path, project_config=_contract_cli_project_config(cfg))
+        answers_data = load_contract_answers_for_task(answers_path, result)
+    else:
+        result = check_contract_file(task_path, project_config=_contract_cli_project_config(cfg))
+        report_root = project_root if cfg.get("project", {}).get("root_path") else None
+        answers_path = write_contract_report(result, task_path=task_path, project_root=report_root).answers_path
+        answers_data = yaml.safe_load(answers_path.read_text(encoding="utf-8")) or {}
+    questions = answers_data.get("questions")
+    answers = answers_data.get("answers")
+    if not isinstance(questions, list):
+        raise ValueError(f"answers file is missing the questions list: {answers_path}")
+    if not isinstance(answers, dict):
+        raise ValueError(f"answers file is missing the answers mapping: {answers_path}")
+
+    print(f"Interactive contract answers: {answers_path}")
+    if not questions:
+        print("No follow-up questions found; answers file is unchanged.")
+        return answers_path
+
+    for question in questions:
+        if not isinstance(question, dict) or not isinstance(question.get("id"), str) or not question["id"]:
+            raise ValueError(f"answers file contains an invalid question entry: {answers_path}")
+        question_id = question["id"]
+        answer_entry = answers.setdefault(question_id, {"answer": "", "notes": ""})
+        if not isinstance(answer_entry, dict):
+            raise ValueError(f"answers file contains an invalid answer entry for {question_id}: {answers_path}")
+        current_answer = str(answer_entry.get("answer") or "").strip()
+        print("")
+        print(f"[{question_id}] {question.get('question', '')}")
+        why = str(question.get("why_it_matters") or "").strip()
+        if why:
+            print(f"Why it matters: {why}")
+        prompt = f"Answer [{question_id}]"
+        if current_answer:
+            prompt += f" [{current_answer}]"
+        response = input(prompt + ": ").strip()
+        if response or not current_answer:
+            answer_entry["answer"] = response
+        answer_entry.setdefault("notes", "")
+
+    answers_path.write_text(yaml.safe_dump(answers_data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    print("")
+    print(f"Contract answers written: {answers_path}")
+    return answers_path
 
 
 def _contract_preflight_path(path: Path, project_root: Path) -> str:
@@ -3065,8 +3142,13 @@ def main() -> None:
     contract_improve_p.add_argument("task_file", metavar="TASK_FILE", help="Path to task .txt/.md file")
     contract_improve_p.add_argument(
         "--answers",
-        required=True,
         help="Path to .sikula/contracts/*.answers.yaml created by `sikula contract check --write-report`",
+    )
+    contract_improve_p.add_argument(
+        "--interactive",
+        action="store_true",
+        default=False,
+        help="Prompt for missing contract answers before writing the improved contract",
     )
     improve_target = contract_improve_p.add_mutually_exclusive_group(required=True)
     improve_target.add_argument("--output", help="Write the improved Markdown contract to this new file")

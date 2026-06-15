@@ -26,6 +26,9 @@ sikula contract check .sikula/tasks/my-task.md --write-report
 sikula contract improve .sikula/tasks/my-task.md \
   --answers .sikula/contracts/my-task.answers.yaml \
   --output .sikula/tasks/my-task.v2.md
+sikula contract improve .sikula/tasks/my-task.md \
+  --interactive \
+  --output .sikula/tasks/my-task.v2.md
 ```
 
 The check is read-only unless `--write-report` is passed. It does not edit the
@@ -38,9 +41,13 @@ the template. After you fill the YAML answers, `sikula contract improve`
 deterministically writes a stronger Markdown task file, keeps unanswered items
 under `Open questions`, and runs the contract check on the output. It refuses
 stale answer hashes and accidental overwrites; for plain-text `.txt` inputs,
-write the improved contract to a new Markdown file with `--output`. After the
-task file changes, old filled answers are moved to `previous_answers` and the
-active answers are reset for the new hash. If the project has a configured
+write the improved contract to a new Markdown file with `--output`.
+`--interactive` is a convenience mode for terminal use: it creates or reuses the
+answers template, prompts for the follow-up answers, saves the answers YAML, and
+then runs the same deterministic improve/recheck flow. Blank interactive answers
+remain open questions. After the task file changes, old filled answers are moved
+to `previous_answers` and the active answers are reset for the new hash. If the
+project has a configured
 Sikula build/test/check pipeline and those phases are enabled for a normal
 `sikula run`, the task does not need to repeat those commands unless it requires
 additional project-specific validation. Disabled validation phases do not count
