@@ -267,6 +267,33 @@ def test_prepare_contract_applies_answers_and_rechecks():
     }
 
 
+def test_prepare_contract_reconciles_open_questions_after_recheck():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={
+            "scope.boundaries": "Add invite creation and acceptance endpoints.",
+            "acceptance.criteria": (
+                "Owners can invite teammates by email. Duplicate invites return a deterministic error. "
+                "Expired invite tokens cannot be accepted. Reused invite tokens cannot be accepted."
+            ),
+            "scope.out_of_scope": "Billing and bulk invites are out of scope.",
+            "token.lifecycle": "Invite tokens expire after 24 hours and cannot be reused.",
+            "privacy.data_handling": "Do not log invite tokens or reveal whether an email already has an account.",
+            "reviewer.focus": "Authorization, duplicate invite handling, and token lifecycle.",
+            "context.domain_rules": "Follow existing team membership service patterns.",
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert not result.needs_user_input
+    assert result.ready_to_save
+    assert result.open_question_ids == []
+    assert result.questions_for_user == []
+    assert "## Open questions" not in result.prepared_contract_markdown
+    assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
+
+
 def test_prepare_contract_marks_repeated_questions_as_revised_answer_needed():
     result = prepare_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
@@ -293,7 +320,9 @@ def test_prepare_contract_strips_stale_open_questions_between_answer_rounds():
         answers={"scope.boundaries": "Add invite creation and acceptance endpoints."},
         project_context={"validation_commands": ["pytest"]},
     )
-    stale_question = "What observable behaviours must be true when this task is complete?"
+    stale_question = next(
+        question.question for question in first.questions_for_user if question.id == "acceptance.negative_cases"
+    )
     assert "## Open questions" in first.prepared_contract_markdown
     assert stale_question in first.prepared_contract_markdown
 
@@ -755,7 +784,7 @@ def test_improve_contract_from_answers_writes_markdown_and_rechecks(tmp_path: Pa
     assert improved.source_sha256 == result.source["sha256"]
     assert "scope.boundaries" in improved.answered_question_ids
     assert "acceptance.criteria" in improved.answered_question_ids
-    assert "acceptance.negative_cases" in improved.open_question_ids
+    assert "acceptance.negative_cases" not in improved.open_question_ids
     assert "## Scope" in output
     assert (
         "- Add team invite creation and acceptance endpoints. Keep existing membership role names unchanged." in output
@@ -773,8 +802,7 @@ def test_improve_contract_from_answers_writes_markdown_and_rechecks(tmp_path: Pa
     assert "- Follow the existing TeamService invite patterns." in output
     assert "## Clarifications" in output
     assert "- Keep the existing invite email copy unchanged." in output
-    assert "## Open questions" in output
-    assert "Which invalid, unauthorized, empty, duplicate, or failure cases should be handled?" in output
+    assert "## Open questions" not in output
     assert "acceptance.negative_cases" not in output
     assert "- Clarification `" not in output
     assert "Source question" not in output
@@ -782,7 +810,6 @@ def test_improve_contract_from_answers_writes_markdown_and_rechecks(tmp_path: Pa
     assert "## Notes" in output
     assert "- Scope: Keep the existing team settings navigation unchanged." in output
     assert "- Clarifications: Custom note." in output
-    assert "Product owner still needs to decide empty email handling." in output
     assert improved.check_result.source["path"] == str(output_path)
     assert improved.check_result.readiness_score > result.readiness_score
 

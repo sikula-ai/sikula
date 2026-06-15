@@ -596,6 +596,18 @@ def improve_contract_text(
         project_config=project_config,
         configured_validation_commands=configured_validation_commands,
     )
+    rendered, open_ids = _reconcile_rendered_open_questions(
+        rendered,
+        check_result.clarifying_questions,
+        normalized_answers,
+    )
+    check_result = check_contract(
+        rendered,
+        source_path=output_name if output_name is not None else contract_name,
+        source_format="markdown",
+        project_config=project_config,
+        configured_validation_commands=configured_validation_commands,
+    )
     return ContractTextImproveResult(
         markdown=rendered,
         check_result=check_result,
@@ -1217,19 +1229,7 @@ def _render_improved_contract(
         for _question, answer_text, _notes in entries:
             _append_answer_entry(lines, section, answer_text)
 
-    if open_ids:
-        lines.extend(["", "## Open questions", ""])
-        for question in questions:
-            if question["id"] not in open_ids:
-                continue
-            lines.append(f"- {question.get('question', '')}")
-            why = str(question.get("why_it_matters", "")).strip()
-            if why:
-                lines.append(f"  - Why it matters: {why}")
-            notes = _answer_notes(answers.get(question["id"], {}))
-            if notes:
-                lines.append(f"  - Notes: {_single_line(notes)}")
-            lines.append(f"  - Blocks delivery: {'yes' if question.get('blocks_delivery') else 'no'}")
+    _append_open_questions(lines, [question for question in questions if question["id"] in open_ids], answers)
 
     if answered_notes:
         lines.extend(["", "## Notes", ""])
@@ -1237,6 +1237,37 @@ def _render_improved_contract(
             lines.append(f"- {label}: {_single_line(notes)}")
 
     return "\n".join(lines).rstrip() + "\n", answered_ids, open_ids
+
+
+def _reconcile_rendered_open_questions(
+    rendered: str,
+    active_questions: list[ClarifyingQuestion],
+    answers: dict[str, dict[str, Any]],
+) -> tuple[str, list[str]]:
+    question_dicts = _question_dicts(active_questions)
+    lines = _strip_generated_open_questions_section(rendered).splitlines()
+    _append_open_questions(lines, question_dicts, answers)
+    return "\n".join(lines).rstrip() + "\n", [question["id"] for question in question_dicts]
+
+
+def _append_open_questions(
+    lines: list[str],
+    questions: list[dict[str, Any]],
+    answers: dict[str, dict[str, Any]],
+) -> None:
+    if not questions:
+        return
+
+    lines.extend(["", "## Open questions", ""])
+    for question in questions:
+        lines.append(f"- {question.get('question', '')}")
+        why = str(question.get("why_it_matters", "")).strip()
+        if why:
+            lines.append(f"  - Why it matters: {why}")
+        notes = _answer_notes(answers.get(question["id"], {}))
+        if notes:
+            lines.append(f"  - Notes: {_single_line(notes)}")
+        lines.append(f"  - Blocks delivery: {'yes' if question.get('blocks_delivery') else 'no'}")
 
 
 def _strip_generated_open_questions_section(task_text: str) -> str:
