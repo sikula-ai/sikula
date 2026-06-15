@@ -14,7 +14,10 @@ Runs after ImplementerAgent, before the build loop. Checks:
   7. Structured input contracts — for parsers, validators, expression engines, DSLs,
      configs, schemas, or rule engines, are accepted/rejected inputs and typed contexts
      enforced by production validation?
-  8. Design compliance — if design/spec files are present in the implementation prompt,
+  8. External boundary contracts — do API clients, route builders, serializers,
+     config/file readers, and similar adapters preserve explicit data shape and
+     encoding contracts from the task?
+  9. Design compliance — if design/spec files are present in the implementation prompt,
      verify that the UI implementation matches the design.
 
 Returns approved (success=True) or issues (success=False + state.review_issues populated).
@@ -164,6 +167,16 @@ Review steps:
       - You may still report a real correctness/completeness problem that is visible in
         code. Do not turn deterministic formatter/linter state into a review-loop blocker
         when it is covered by the configured pipeline.
+   k. External boundary contract consistency — for changed API clients,
+      serializers/deserializers, route builders, URL/path/query construction, file/config
+      readers or writers, IPC/event payloads, or other adapters at system boundaries,
+      compare the production data shape and boundary semantics against explicit task or
+      project-guideline contracts. Report an issue when the implementation contradicts
+      those contracts, including cardinality/envelope mismatches (for example single
+      object vs. list/array), required vs. optional value changes, encoded vs. raw route
+      or path segments, success payload vs. error envelope handling, or typed value vs.
+      string fallback mismatches. Do this even if tests pass or generated tests mirror the
+      implementation's incorrect assumption.
 {build_tool_review_policy}
 
 {test_review_policy}
