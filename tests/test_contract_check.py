@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from hashlib import sha256
 from pathlib import Path
+import sys
+import types
 from unittest.mock import patch
 
 import pytest
@@ -17,7 +19,7 @@ from core.contract_check import (
     render_contract_check,
     write_contract_report,
 )
-from sikula import main
+from sikula import _read_interactive_contract_answer, main
 
 
 def _python_project_config(tmp_path: Path) -> dict:
@@ -1275,6 +1277,33 @@ def test_contract_improve_cli_interactive_writes_answers_and_output(
     assert "## Scope" in output
     assert "- Add invite creation and acceptance endpoints." in output
     assert "## Open questions" in output
+
+
+def test_contract_improve_cli_interactive_prefills_existing_answers_for_line_editing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    hooks = []
+    inserted = []
+    bindings = []
+    prompts = []
+
+    fake_readline = types.SimpleNamespace(
+        parse_and_bind=lambda binding: bindings.append(binding),
+        insert_text=lambda text: inserted.append(text),
+        set_startup_hook=lambda hook=None: hooks.append(hook),
+    )
+    monkeypatch.setitem(sys.modules, "readline", fake_readline)
+
+    with patch("builtins.input", side_effect=lambda prompt: prompts.append(prompt) or "Edited answer"):
+        response = _read_interactive_contract_answer("Answer [scope.boundaries]", "Existing answer")
+
+    assert response == "Edited answer"
+    assert prompts == ["Answer [scope.boundaries]: "]
+    assert bindings
+    assert hooks[0] is not None
+    hooks[0]()
+    assert inserted == ["Existing answer"]
+    assert hooks[-1] is None
 
 
 def test_contract_improve_cli_interactive_rejects_stale_answers_before_prompting(
