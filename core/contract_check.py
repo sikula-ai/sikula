@@ -363,10 +363,11 @@ def check_contract(
     project_config: dict | None = None,
     configured_validation_commands: list[str] | None = None,
 ) -> ContractCheckResult:
-    parsed = _parse_markdown_task(text)
+    evaluation_text = _strip_generated_open_questions_section(text)
+    parsed = _parse_markdown_task(evaluation_text)
     sections_detected = _sections_detected(parsed)
-    validation = _validation_details(text, project_config, configured_validation_commands)
-    security_sensitive = bool(_SECURITY_RISK_RE.search(text))
+    validation = _validation_details(evaluation_text, project_config, configured_validation_commands)
+    security_sensitive = bool(_SECURITY_RISK_RE.search(evaluation_text))
 
     scores = {
         "intent_clarity": _score_intent(parsed),
@@ -389,7 +390,7 @@ def check_contract(
     elif gaps:
         weighted_score = min(weighted_score, 84)
     status = _status_for_score(weighted_score)
-    questions = _build_questions(gaps, security_sensitive, text)
+    questions = _build_questions(gaps, security_sensitive, evaluation_text)
     suggested_sections = _suggested_sections(gaps)
     strong_signals = _strong_signals(scores, sections_detected, validation)
 

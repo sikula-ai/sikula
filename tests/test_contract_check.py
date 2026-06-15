@@ -163,6 +163,28 @@ def test_question_ids_are_stable_for_same_task():
     assert first
 
 
+def test_check_contract_ignores_generated_open_questions_for_readiness():
+    task = "# Add team invites\n\nUsers should be able to invite teammates by email.\n"
+    generated_open_questions = (
+        task
+        + "\n## Open questions\n\n"
+        + "<!-- sikula:generated-open-questions -->\n\n"
+        + "- What observable behaviours must be true when this task is complete?\n"
+        + "  - Why it matters: Acceptance criteria are the contract used by implementer, reviewer, and test writer.\n"
+        + "  - Blocks delivery: yes\n"
+    )
+
+    base = check_contract(task)
+    generated = check_contract(generated_open_questions)
+
+    assert generated.source["sha256"] == "sha256:" + sha256(generated_open_questions.encode("utf-8")).hexdigest()
+    assert generated.readiness_score == base.readiness_score
+    assert [gap.id for gap in generated.gaps] == [gap.id for gap in base.gaps]
+    assert [question.id for question in generated.clarifying_questions] == [
+        question.id for question in base.clarifying_questions
+    ]
+
+
 def test_prepare_contract_returns_questions_without_file_side_effects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.chdir(tmp_path)
 
@@ -291,6 +313,25 @@ def test_prepare_contract_reconciles_open_questions_after_recheck():
     assert result.open_question_ids == []
     assert result.questions_for_user == []
     assert "## Open questions" not in result.prepared_contract_markdown
+    assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
+
+
+def test_prepare_contract_keeps_current_open_questions_after_final_recheck():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={
+            "scope.boundaries": "Add invite creation and acceptance endpoints.",
+            "scope.out_of_scope": "Billing changes are out of scope.",
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.needs_user_input
+    assert "acceptance.criteria" in result.open_question_ids
+    assert "## Open questions" in result.prepared_contract_markdown
+    assert "<!-- sikula:generated-open-questions -->" in result.prepared_contract_markdown
+    assert "What observable behaviours must be true when this task is complete?" in result.prepared_contract_markdown
     assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
 
 
