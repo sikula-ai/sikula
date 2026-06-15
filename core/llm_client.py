@@ -17,6 +17,7 @@ To add another provider subclass LLMClient and register it in create_llm_client(
 
 from __future__ import annotations
 
+import codecs
 import errno
 import hashlib
 import json
@@ -1005,11 +1006,31 @@ def _run_agent_subprocess_streaming(
 
     def _reader(name: str, stream) -> None:
         try:
-            read_chunk = getattr(stream, "readline", None)
-            if not callable(read_chunk):
-                read_chunk = stream.read
+            try:
+                fd = stream.fileno()
+            except (AttributeError, OSError, ValueError):
+                fd = None
+
+            if fd is not None:
+                encoding = getattr(stream, "encoding", None) or "utf-8"
+                try:
+                    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+                except LookupError:
+                    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                while True:
+                    data = os.read(fd, _STREAM_READ_CHARS)
+                    if not data:
+                        break
+                    chunk = decoder.decode(data, final=False)
+                    if chunk:
+                        chunks.put((name, chunk))
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    chunks.put((name, tail))
+                return
+
             while True:
-                chunk = read_chunk(_STREAM_READ_CHARS)
+                chunk = stream.read(_STREAM_READ_CHARS)
                 if not chunk:
                     break
                 chunks.put((name, chunk))

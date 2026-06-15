@@ -5,8 +5,10 @@ from __future__ import annotations
 import errno
 import json
 import logging
+import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from io import StringIO
@@ -505,6 +507,97 @@ class TestStreamingProcessHelpers:
             )
 
         assert processes[0].terminated is True
+
+    def test_streaming_agent_parses_unterminated_pipe_error_before_timeout(self, tmp_path: Path):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b'{"type":"error","error":"not authenticated"}')
+
+        class LivePipeErrorProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stdin = StringIO()
+                self.stdout = os.fdopen(read_fd, "r", encoding="utf-8")
+                self.stderr = StringIO()
+                self.returncode = None
+                self.terminated = False
+                self._write_fd_closed = False
+
+            def poll(self):
+                return self.returncode
+
+            def _close_write_fd(self) -> None:
+                if self._write_fd_closed:
+                    return
+                self._write_fd_closed = True
+                try:
+                    os.close(write_fd)
+                except OSError:
+                    pass
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+                self._close_write_fd()
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+                self._close_write_fd()
+
+        processes = []
+
+        def fake_popen(*args, **kwargs):
+            process = LivePipeErrorProcess(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        started_at = time.monotonic()
+        try:
+            with (
+                patch("core.llm_client.subprocess.Popen", side_effect=fake_popen),
+                pytest.raises(LLMAuthError, match="not authenticated"),
+            ):
+                _run_agent_subprocess_streaming(
+                    ["provider", "agent"],
+                    cwd=tmp_path,
+                    env=None,
+                    timeout=1,
+                    provider="provider",
+                    stdout_error_parser=_opencode_stream_error,
+                )
+        finally:
+            if processes:
+                processes[0]._close_write_fd()
+            else:
+                try:
+                    os.close(write_fd)
+                except OSError:
+                    pass
+
+        assert processes[0].terminated is True
+        assert time.monotonic() - started_at < 0.5
+
+    def test_streaming_agent_parses_unterminated_real_subprocess_error_before_timeout(self, tmp_path: Path):
+        script = (
+            "import sys, time\n"
+            'sys.stdout.write(\'{"type":"error","error":"not authenticated"}\')\n'
+            "sys.stdout.flush()\n"
+            "time.sleep(30)\n"
+        )
+
+        started_at = time.monotonic()
+        with pytest.raises(LLMAuthError, match="not authenticated"):
+            _run_agent_subprocess_streaming(
+                [sys.executable, "-c", script],
+                cwd=tmp_path,
+                env=None,
+                timeout=5,
+                provider="provider",
+                stdout_error_parser=_opencode_stream_error,
+            )
+
+        assert time.monotonic() - started_at < 1
 
     def test_streaming_agent_propagates_non_pipe_stdin_write_errors(self, tmp_path: Path):
         class FailingStdin:
