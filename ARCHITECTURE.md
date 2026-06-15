@@ -1671,6 +1671,16 @@ when the provider CLI supports that mode. Reviewer, analyst, and implementation 
 exceed operating-system command-line argument limits on large tasks. If a provider CLI requires
 the prompt as an option value for non-interactive mode, preserve that provider contract.
 
+CLI-backed agent calls use `_run_agent_subprocess_streaming()` for subprocess lifecycle
+management. It starts stdout/stderr reader threads, reads real provider pipes with non-line
+`os.read()` chunks plus incremental text decoding, streams chunks through queues, keeps
+provider output for diagnostics and structured error parsing, and enforces `agent_timeout`
+while both waiting for the provider process and draining queued provider output. The non-line
+pipe read is intentional: structured provider errors may be emitted without a trailing newline
+while the provider process remains alive. The timeout path terminates the whole provider process
+group before raising `subprocess.TimeoutExpired`, which the built-in provider wrappers convert
+into `LLMTimeoutError`.
+
 ---
 
 ## Retry behaviour (`core/llm_client.py`)
