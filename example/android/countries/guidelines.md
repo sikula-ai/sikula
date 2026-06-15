@@ -159,6 +159,14 @@ internal interface CountriesRepository {
 - Implement the domain interface.
 - Wrap all remote calls in `runCatching { ... }`.
 - Map DTOs to domain models before returning.
+- The REST Countries API is a public API dependency and can fail or return deprecation/error
+  payloads. When a task touches country data fetching, keep the repository remote-first but add or
+  reuse a local request-failure fallback in the data layer. The fallback must use the same DTO shape
+  as the remote response (`name.common`, `cca2`, `capital`, `region`, `population`) so remote and
+  fallback data share the same DTO-to-domain mapper.
+- Reuse one fallback dataset for list and detail lookups. Do not duplicate fallback country values
+  across separate list/detail implementations, and do not add persistent caching, local storage, or
+  offline sync unless a task explicitly asks for it.
 
 ```kotlin
 internal class CountriesRepositoryImpl(

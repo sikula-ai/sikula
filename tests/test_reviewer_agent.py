@@ -279,6 +279,17 @@ class TestReviewerAgentPrompt:
         assert "validates" in prompt
         assert "API that does not know the expected result type" in prompt
 
+    def test_external_boundary_contract_checks_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "External boundary contract consistency" in prompt
+        assert "API clients" in prompt
+        assert "object vs. list/array" in prompt
+        assert "encoded vs. raw route" in prompt
+        assert "even if tests pass" in prompt
+
     def test_entry_point_async_boundary_checks_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()

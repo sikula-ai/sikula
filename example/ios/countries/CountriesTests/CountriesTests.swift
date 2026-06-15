@@ -39,6 +39,62 @@ final class CountryModelTests: XCTestCase {
     }
 }
 
+final class CountriesRepositoryImplTests: XCTestCase {
+    func testFetchAllReturnsMappedRemoteCountries() async throws {
+        let repository = CountriesRepositoryImpl(fetchDTOs: {
+            [
+                CountryDTO(
+                    name: CountryDTO.Name(common: "Germany"),
+                    cca2: "DE",
+                    capital: ["Berlin"],
+                    region: "Europe",
+                    population: 83_240_525
+                )
+            ]
+        })
+
+        let result = try await repository.fetchAll()
+
+        XCTAssertEqual(result.map(\.name), ["Germany"])
+        XCTAssertEqual(result.first?.flagEmoji, "🇩🇪")
+    }
+
+    func testFetchAllFallsBackToLocalCountriesWhenRemoteFails() async throws {
+        let repository = CountriesRepositoryImpl(fetchDTOs: {
+            throw URLError(.cannotDecodeContentData)
+        })
+
+        let result = try await repository.fetchAll()
+
+        XCTAssertEqual(result.map(\.name), FallbackCountryDTOs.countries.map(\.name.common))
+    }
+
+    func testFetchAllPreservesCancellationInsteadOfFallingBack() async {
+        let repository = CountriesRepositoryImpl(fetchDTOs: {
+            throw CancellationError()
+        })
+
+        do {
+            _ = try await repository.fetchAll()
+            XCTFail("Expected cancellation to be thrown")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+    }
+}
+
+final class FallbackCountryDTOsTests: XCTestCase {
+    func testFallbackCountriesUseRemoteDTOShape() {
+        XCTAssertEqual(FallbackCountryDTOs.countries.first?.name.common, "Argentina")
+        XCTAssertEqual(FallbackCountryDTOs.countries.first?.cca2, "AR")
+        XCTAssertEqual(FallbackCountryDTOs.countries.first?.capital, ["Buenos Aires"])
+    }
+
+    func testFallbackCountryLookupIsCaseInsensitive() {
+        XCTAssertEqual(FallbackCountryDTOs.country(cca2: "de")?.name.common, "Germany")
+    }
+}
+
 @MainActor
 final class CountriesViewModelTests: XCTestCase {
     func testInitialStateHasIsLoadingTrue() {

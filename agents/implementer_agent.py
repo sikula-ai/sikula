@@ -89,8 +89,16 @@ the last planned step.\
 _REVIEW_FIX_SECTION = """\
 
 REVIEW ISSUES TO FIX:
-A previous review of your implementation found the following problems. Fix them before
-proceeding — the task requirements above still apply in full.
+A previous review or security review of your implementation found the following
+blocking or corrective problems. This remediation scope takes priority over the current step boundary:
+fix the listed issue even when it requires touching files outside CURRENT STEP, while
+still respecting the allowed write paths and keeping the change minimal.
+
+Do not report the current step as already complete until each listed issue is
+addressed. If a listed issue is already fixed or cannot be fixed safely, leave files
+unchanged and explain that exact reason with file-specific evidence.
+
+The original task requirements above still apply in full.
 
 {issues}\
 """

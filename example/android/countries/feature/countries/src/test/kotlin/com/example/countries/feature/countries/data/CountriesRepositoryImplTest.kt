@@ -5,6 +5,7 @@ import com.example.countries.library.testing.AbstractTest
 import io.kotest.matchers.shouldBe
 import io.mockk.coEvery
 import io.mockk.mockk
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Test
 
@@ -103,13 +104,33 @@ internal class CountriesRepositoryImplTest : AbstractTest() {
     }
 
     @Test
-    fun `fetchCountries propagates api exception as failure`() = runTest {
+    fun `fetchCountries falls back to local countries when api throws`() = runTest {
         val error = RuntimeException("timeout")
         coEvery { api.fetchCountries() } throws error
 
         val result = repository.fetchCountries()
 
-        result.isFailure shouldBe true
-        result.exceptionOrNull() shouldBe error
+        result.isSuccess shouldBe true
+        result.getOrThrow().map { it.name } shouldBe FallbackCountryDtos.countries.map { it.name.common }
+    }
+
+    @Test
+    fun `fetchCountries preserves cancellation instead of falling back`() = runTest {
+        val cancellation = CancellationException("cancelled")
+        coEvery { api.fetchCountries() } throws cancellation
+
+        var caught: Throwable? = null
+        try {
+            repository.fetchCountries()
+        } catch (error: CancellationException) {
+            caught = error
+        }
+
+        caught shouldBe cancellation
+    }
+
+    @Test
+    fun `fallback country lookup matches cca2 case insensitively`() {
+        FallbackCountryDtos.countryByCode("de")?.name?.common shouldBe "Germany"
     }
 }

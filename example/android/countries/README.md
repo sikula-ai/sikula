@@ -60,7 +60,9 @@ library/
 
 ## Data
 
-Data provided by [REST Countries](https://restcountries.com) (MPL 2.0).
+Data is loaded from [REST Countries](https://restcountries.com) (MPL 2.0) when available.
+The app includes a small local fallback dataset with the same DTO shape so the example remains
+usable when the public API is unavailable.
 
 Dependency direction: `system` → `presentation` → `domain` ← `data`.
 The domain layer has no knowledge of Retrofit, Moshi, or Compose.
