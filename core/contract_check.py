@@ -20,6 +20,9 @@ from core.validation_coverage import (
 )
 
 SCHEMA_VERSION = 1
+_GENERATED_ANSWER_ENTRY_END_MARKER = "<!-- /sikula:generated-answer -->"
+_GENERATED_ANSWER_ENTRY_RE = re.compile(r"^\s*<!--\s*sikula:generated-answer:\s*([^>]+?)\s*-->\s*$")
+_GENERATED_OPEN_QUESTIONS_MARKER = "<!-- sikula:generated-open-questions -->"
 
 _STATUS_THRESHOLDS = (
     (85, "ready"),
@@ -142,7 +145,6 @@ _CONTEXT_RE = re.compile(
 _HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 _TEXT_HEADING_RE = re.compile(r"^\s{0,3}([A-Za-z][A-Za-z0-9 /&_-]{1,60}):\s*$")
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$")
-_GENERATED_OPEN_QUESTIONS_MARKER = "<!-- sikula:generated-open-questions -->"
 
 
 @dataclass(frozen=True)
@@ -1215,6 +1217,8 @@ def _render_improved_contract(
     questions: list[dict[str, Any]],
     answers: dict[str, dict[str, Any]],
 ) -> tuple[str, list[str], list[str]]:
+    answered_question_ids = [question["id"] for question in questions if _answer_text(answers.get(question["id"], {}))]
+    task_text = _strip_generated_answer_entries(task_text, answered_question_ids)
     task_text = _strip_generated_open_questions_section(task_text)
     lines = _improved_contract_base_lines(task_text, task_path)
     section_entries: dict[str, list[tuple[dict[str, Any], str, str]]] = {}
@@ -1241,8 +1245,8 @@ def _render_improved_contract(
         if not entries:
             continue
         lines.extend(["", f"## {section}", ""])
-        for _question, answer_text, _notes in entries:
-            _append_answer_entry(lines, section, answer_text)
+        for question, answer_text, _notes in entries:
+            _append_answer_entry(lines, question["id"], section, answer_text)
 
     _append_open_questions(lines, [question for question in questions if question["id"] in open_ids], answers)
 
@@ -1309,6 +1313,83 @@ def _strip_generated_open_questions_section(task_text: str) -> str:
         index += 1
 
     return "\n".join(lines).strip()
+
+
+def _strip_generated_answer_entries(task_text: str, question_ids: list[str]) -> str:
+    target_ids = set(question_ids)
+    if not target_ids:
+        return task_text.strip()
+
+    source_lines = task_text.splitlines()
+    lines: list[str] = []
+    index = 0
+    target_sections = {_normalize_heading(_contract_section_for_question(question_id)) for question_id in target_ids}
+
+    while index < len(source_lines):
+        line = source_lines[index]
+        heading_match = _HEADING_RE.match(line)
+        if heading_match:
+            section_end = index + 1
+            while section_end < len(source_lines) and not _HEADING_RE.match(source_lines[section_end]):
+                section_end += 1
+            section_body = source_lines[index + 1 : section_end]
+            normalized_heading = _normalize_heading(heading_match.group(2))
+            if normalized_heading in target_sections:
+                stripped_body, removed_marked_entry = _strip_marked_answer_entries(section_body, target_ids)
+                if removed_marked_entry:
+                    stripped_body = _trim_blank_lines(stripped_body)
+                    if stripped_body:
+                        lines.append(line)
+                        lines.extend(stripped_body)
+                    index = section_end
+                    continue
+            lines.extend(source_lines[index:section_end])
+            index = section_end
+            continue
+
+        lines.append(line)
+        index += 1
+
+    return "\n".join(lines).strip()
+
+
+def _strip_marked_answer_entries(section_body: list[str], target_ids: set[str]) -> tuple[list[str], bool]:
+    lines: list[str] = []
+    index = 0
+    removed = False
+
+    while index < len(section_body):
+        line = section_body[index]
+        marker_match = _GENERATED_ANSWER_ENTRY_RE.match(line)
+        if not marker_match:
+            lines.append(line)
+            index += 1
+            continue
+
+        marker_ids = {value.strip() for value in marker_match.group(1).split(",") if value.strip()}
+        remove_entry = bool(marker_ids & target_ids)
+        entry_end = index + 1
+        while entry_end < len(section_body) and section_body[entry_end].strip() != _GENERATED_ANSWER_ENTRY_END_MARKER:
+            entry_end += 1
+        if entry_end < len(section_body):
+            entry_end += 1
+        if remove_entry:
+            removed = True
+        else:
+            lines.extend(section_body[index:entry_end])
+        index = entry_end
+
+    return lines, removed
+
+
+def _trim_blank_lines(lines: list[str]) -> list[str]:
+    start = 0
+    end = len(lines)
+    while start < end and not lines[start].strip():
+        start += 1
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    return lines[start:end]
 
 
 def _is_generated_open_questions_section(section_body: list[str]) -> bool:
@@ -1404,16 +1485,24 @@ def _ordered_improved_sections(section_entries: dict[str, list[tuple[dict[str, A
 
 def _append_answer_entry(
     lines: list[str],
+    question_id: str,
     section: str,
     answer_text: str,
 ) -> None:
+    lines.append(_generated_answer_entry_marker(question_id))
     if section == "Validation":
         for command in _answer_lines(answer_text):
             lines.append(f"- `{_clean_answer_bullet(command).strip('`')}`")
+        lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
         return
 
     for answer_line in _answer_lines(answer_text):
         lines.append(f"- {_clean_answer_bullet(answer_line)}")
+    lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
+
+
+def _generated_answer_entry_marker(question_id: str) -> str:
+    return f"<!-- sikula:generated-answer: {question_id} -->"
 
 
 def _answer_lines(value: str) -> list[str]:

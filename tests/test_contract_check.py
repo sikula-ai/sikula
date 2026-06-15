@@ -378,6 +378,36 @@ def test_prepare_contract_strips_stale_open_questions_between_answer_rounds():
     assert stale_question not in second.prepared_contract_markdown
 
 
+def test_prepare_contract_replaces_revised_generated_answers():
+    first = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"acceptance.negative_cases": "ok"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "acceptance.negative_cases" in first.revised_answer_question_ids
+    assert "- ok" in first.prepared_contract_markdown
+
+    second = prepare_contract(
+        first.resume_arguments["contract_markdown"],
+        contract_name="team-invites.md",
+        answers={
+            "acceptance.negative_cases": (
+                "Duplicate pending invites return a deterministic error. Empty emails are rejected."
+            )
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "## Acceptance criteria" in second.prepared_contract_markdown
+    assert second.prepared_contract_markdown.count("## Acceptance criteria") == 1
+    assert "- Duplicate pending invites return a deterministic error. Empty emails are rejected." in (
+        second.prepared_contract_markdown
+    )
+    assert "- ok" not in second.prepared_contract_markdown
+
+
 def test_prepare_contract_preserves_human_open_questions_section():
     task = """# Add team invites
 
