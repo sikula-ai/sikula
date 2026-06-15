@@ -337,6 +337,29 @@ def test_prepare_contract_strips_stale_open_questions_between_answer_rounds():
     assert stale_question not in second.prepared_contract_markdown
 
 
+def test_prepare_contract_resume_accepts_accumulated_answers():
+    first = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"scope.boundaries": "Add invite creation and acceptance endpoints."},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    second = prepare_contract(
+        first.resume_arguments["contract_markdown"],
+        contract_name="team-invites.md",
+        answers={
+            "scope.boundaries": "Add invite creation and acceptance endpoints.",
+            "acceptance.negative_cases": "Duplicate invites return a deterministic error.",
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "- Add invite creation and acceptance endpoints." in second.prepared_contract_markdown
+    assert "- Duplicate invites return a deterministic error." in second.prepared_contract_markdown
+    assert "acceptance.negative_cases" in second.answered_question_ids
+
+
 def test_prepare_contract_ready_result_includes_safe_save_and_run_guidance():
     task = """# Team invites
 

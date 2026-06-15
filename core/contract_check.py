@@ -638,11 +638,15 @@ def prepare_contract(
     )
 
     if answers:
+        # Chat/MCP prepare clients may resend an accumulated answer map across rounds.
+        # Only answers for the currently active questions should be applied here;
+        # earlier answers are already represented in the returned Markdown.
+        active_answers = _answers_for_questions(answers, check_result.clarifying_questions)
         improved = improve_contract_text(
             contract_markdown,
             contract_name=contract_name,
             questions=check_result.clarifying_questions,
-            answers=answers,
+            answers=active_answers,
             source_result=check_result,
             output_name=safe_task_path,
             project_config=project_config,
@@ -792,6 +796,15 @@ def _normalize_contract_answers(answers: dict[str, str | dict[str, Any]]) -> dic
         else:
             normalized[question_id] = {"answer": answer, "notes": ""}
     return normalized
+
+
+def _answers_for_questions(
+    answers: dict[str, str | dict[str, Any]],
+    questions: list[ClarifyingQuestion],
+) -> dict[str, dict[str, Any]]:
+    normalized_answers = _normalize_contract_answers(answers)
+    active_ids = {question.id for question in questions}
+    return {question_id: answer for question_id, answer in normalized_answers.items() if question_id in active_ids}
 
 
 def _prepare_answers_template(
