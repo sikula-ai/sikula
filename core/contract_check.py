@@ -681,8 +681,9 @@ def _build_prepare_result(
 ) -> ContractPrepareResult:
     active_check = recheck_result or check_result
     answered_ids = list(answered_question_ids or [])
-    open_ids = list(open_question_ids or [])
     questions_for_user = active_check.clarifying_questions
+    active_question_ids = [question.id for question in questions_for_user]
+    open_ids = list(dict.fromkeys([*(open_question_ids or []), *active_question_ids]))
     revised_answer_question_ids = [question.id for question in questions_for_user if question.id in set(answered_ids)]
     needs_user_input = bool(questions_for_user)
     ready_to_run = active_check.ready_for_autonomous_delivery

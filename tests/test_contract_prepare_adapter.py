@@ -62,6 +62,7 @@ def test_prepare_response_returns_questions_without_file_side_effects(tmp_path: 
     assert response["ready_to_run"] is False
     assert response["required_next_step"] == "answer_questions"
     assert response["user_questions"]
+    assert response["open_question_ids"] == [question["id"] for question in response["user_questions"]]
     assert "acceptance.criteria" in response["answers_template"]
     assert response["authoritative_output_markdown"].startswith("# Add team invites")
     assert response["resume_arguments"]["status_applies_to_sha256"] == response["status_applies_to_sha256"]
@@ -99,6 +100,7 @@ def test_prepare_response_marks_repeated_answer_questions():
     )
 
     assert "acceptance.negative_cases" in response["answered_question_ids"]
+    assert {question["id"] for question in response["user_questions"]}.issubset(set(response["open_question_ids"]))
     assert "acceptance.negative_cases" in response["revised_answer_question_ids"]
     question = next(
         question for question in response["user_questions"] if question["id"] == "acceptance.negative_cases"

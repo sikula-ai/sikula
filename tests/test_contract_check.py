@@ -182,6 +182,7 @@ def test_prepare_contract_returns_questions_without_file_side_effects(tmp_path: 
     assert result.required_user_action == "answer_contract_questions"
     assert result.primary_user_action == "answer_contract_questions"
     assert result.user_questions
+    assert result.open_question_ids == [question.id for question in result.questions_for_user]
     assert result.resume_arguments["contract_markdown"].startswith("# Add team invites")
     assert result.resume_arguments["status_applies_to_sha256"] == result.status_applies_to_sha256
     assert "sikula run" not in "\n".join(result.suggested_next_steps)
@@ -276,6 +277,7 @@ def test_prepare_contract_marks_repeated_questions_as_revised_answer_needed():
 
     assert result.needs_user_input
     assert "acceptance.negative_cases" in result.answered_question_ids
+    assert {question.id for question in result.questions_for_user}.issubset(set(result.open_question_ids))
     assert "acceptance.negative_cases" in result.revised_answer_question_ids
     question = next(question for question in result.user_questions if question["id"] == "acceptance.negative_cases")
     assert question["requires_revised_answer"] is True
