@@ -11,7 +11,11 @@ It checks task clarity through an implementation contract, runs the work through
 Most AI coding tools optimize for producing a diff. Sikula optimizes for the delivery path around that diff: is the task clear, did the change stay in scope, did independent agents review it, did validation pass, and can a human audit what happened?
 
 ```text
-Rough intent -> implementation contract -> gated agentic delivery pipeline -> PR-ready branch + state file -> better next run
+Rough intent
+  -> implementation contract
+  -> gated agentic delivery pipeline
+  -> PR-ready branch + state file
+  -> better next run
 ```
 
 - **Before coding**, the implementation contract checks whether the request is clear and deliverable, then turns it into scope, acceptance criteria, risks, tests, and validation.
