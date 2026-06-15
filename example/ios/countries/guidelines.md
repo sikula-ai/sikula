@@ -63,6 +63,17 @@ Tests live in `CountriesTests/`.
 - Uses `URLSession.shared` with `async/await`. No Combine, no third-party networking.
 - Returns DTOs — no domain types.
 
+### Remote Data Fallback
+
+- REST Countries is a public API dependency and can fail or return deprecation/error payloads.
+  When a task touches country data fetching, keep the app remote-first but add or reuse a local
+  request-failure fallback in the Data layer.
+- The fallback must use the same DTO shape as the remote response (`name.common`, `cca2`, `capital`,
+  `region`, `population`) so remote and fallback data share the same DTO-to-domain mapper.
+- Reuse one fallback dataset for list and detail lookups. Do not duplicate fallback country values
+  across separate list/detail implementations, and do not add persistent caching, local storage, or
+  offline sync unless a task explicitly asks for it.
+
 ### Repository Implementation
 
 - `CountriesRepositoryImpl` in `Countries/Data/CountriesRepositoryImpl.swift`.

@@ -8,5 +8,9 @@ internal class CountriesRepositoryImpl(
 ) : CountriesRepository {
 
     override suspend fun fetchCountries(): Result<List<Country>> =
-        runCatching { api.fetchCountries().map { it.toDomain() } }
+        runCatching {
+            runCatching { api.fetchCountries() }
+                .getOrElse { FallbackCountryDtos.countries }
+                .map { it.toDomain() }
+        }
 }
