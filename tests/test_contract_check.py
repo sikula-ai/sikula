@@ -279,6 +279,7 @@ def test_prepare_contract_applies_answers_and_rechecks():
     assert "acceptance.criteria" in result.answered_question_ids
     assert "## Scope" in result.prepared_contract_markdown
     assert "- Add team invite creation and acceptance endpoints." in result.prepared_contract_markdown
+    assert "sikula:generated-" not in result.prepared_contract_markdown
     assert result.recheck_result.readiness_score > result.check_result.readiness_score
     assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
     assert result.required_next_step in {
@@ -330,9 +331,22 @@ def test_prepare_contract_keeps_current_open_questions_after_final_recheck():
     assert result.needs_user_input
     assert "acceptance.criteria" in result.open_question_ids
     assert "## Open questions" in result.prepared_contract_markdown
-    assert "<!-- sikula:generated-open-questions -->" in result.prepared_contract_markdown
+    assert "sikula:generated-open-questions" not in result.prepared_contract_markdown
     assert "What observable behaviours must be true when this task is complete?" in result.prepared_contract_markdown
     assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
+
+
+def test_prepare_contract_splits_escaped_newlines_in_text_answers():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"scope.boundaries": "Create invites\\nAccept invites"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "- Create invites" in result.prepared_contract_markdown
+    assert "- Accept invites" in result.prepared_contract_markdown
+    assert "Create invites\\nAccept invites" not in result.prepared_contract_markdown
 
 
 def test_prepare_contract_marks_repeated_questions_as_revised_answer_needed():
@@ -347,11 +361,34 @@ def test_prepare_contract_marks_repeated_questions_as_revised_answer_needed():
     assert "acceptance.negative_cases" in result.answered_question_ids
     assert {question.id for question in result.questions_for_user}.issubset(set(result.open_question_ids))
     assert "acceptance.negative_cases" in result.revised_answer_question_ids
+    assert "- ok" not in result.prepared_contract_markdown
     question = next(question for question in result.user_questions if question["id"] == "acceptance.negative_cases")
     assert question["requires_revised_answer"] is True
     assert "more specific answer" in question["reason"]
     assert result.answers_template["acceptance.negative_cases"]["requires_revised_answer"] is True
     assert result.required_user_action == "answer_contract_questions"
+
+
+def test_prepare_contract_readiness_ignores_internal_answer_markers():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={
+            "scope.boundaries": "Add invite creation and acceptance endpoints.",
+            "acceptance.criteria": "Owners can invite teammates by email.",
+            "acceptance.negative_cases": "Duplicate invites return a deterministic error.",
+            "scope.out_of_scope": "Billing changes are out of scope.",
+            "token.lifecycle": "Invite tokens expire after 24 hours and cannot be reused.",
+            "privacy.data_handling": "Invite tokens must not be logged.",
+            "reviewer.focus": "Authorization and token lifecycle.",
+            "context.domain_rules": "domain",
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "context.domain_rules" in result.revised_answer_question_ids
+    assert "- domain" not in result.prepared_contract_markdown
+    assert "sikula:generated-" not in result.prepared_contract_markdown
 
 
 def test_prepare_contract_strips_stale_open_questions_between_answer_rounds():
@@ -387,7 +424,7 @@ def test_prepare_contract_replaces_revised_generated_answers():
     )
 
     assert "acceptance.negative_cases" in first.revised_answer_question_ids
-    assert "- ok" in first.prepared_contract_markdown
+    assert "- ok" not in first.prepared_contract_markdown
 
     second = prepare_contract(
         first.resume_arguments["contract_markdown"],

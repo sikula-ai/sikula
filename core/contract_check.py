@@ -594,7 +594,7 @@ def improve_contract_text(
         normalized_answers,
     )
     check_result = check_contract(
-        rendered,
+        _strip_generated_markers(rendered),
         source_path=output_name if output_name is not None else contract_name,
         source_format="markdown",
         project_config=project_config,
@@ -605,6 +605,7 @@ def improve_contract_text(
         check_result.clarifying_questions,
         normalized_answers,
     )
+    rendered = _strip_generated_markers(rendered)
     check_result = check_contract(
         rendered,
         source_path=output_name if output_name is not None else contract_name,
@@ -1264,6 +1265,7 @@ def _reconcile_rendered_open_questions(
     answers: dict[str, dict[str, Any]],
 ) -> tuple[str, list[str]]:
     question_dicts = _question_dicts(active_questions)
+    rendered = _strip_generated_answer_entries(rendered, [question["id"] for question in question_dicts])
     lines = _strip_generated_open_questions_section(rendered).splitlines()
     _append_open_questions(lines, question_dicts, answers)
     return "\n".join(lines).rstrip() + "\n", [question["id"] for question in question_dicts]
@@ -1340,7 +1342,11 @@ def _strip_generated_answer_entries(task_text: str, question_ids: list[str]) -> 
                     stripped_body = _trim_blank_lines(stripped_body)
                     if stripped_body:
                         lines.append(line)
+                        if stripped_body[0].strip():
+                            lines.append("")
                         lines.extend(stripped_body)
+                        if stripped_body[-1].strip():
+                            lines.append("")
                     index = section_end
                     continue
             lines.extend(source_lines[index:section_end])
@@ -1380,6 +1386,30 @@ def _strip_marked_answer_entries(section_body: list[str], target_ids: set[str]) 
         index = entry_end
 
     return lines, removed
+
+
+def _strip_generated_markers(task_text: str) -> str:
+    lines: list[str] = []
+    source_lines = task_text.splitlines()
+    index = 0
+    while index < len(source_lines):
+        line = source_lines[index]
+        stripped = line.strip()
+        if _GENERATED_ANSWER_ENTRY_RE.match(line):
+            index += 1
+            continue
+        if stripped == _GENERATED_ANSWER_ENTRY_END_MARKER:
+            index += 1
+            continue
+        if stripped == _GENERATED_OPEN_QUESTIONS_MARKER:
+            if index + 1 < len(source_lines) and not source_lines[index + 1].strip():
+                index += 2
+                continue
+            index += 1
+            continue
+        lines.append(line)
+        index += 1
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _trim_blank_lines(lines: list[str]) -> list[str]:
@@ -1496,7 +1526,7 @@ def _append_answer_entry(
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
         return
 
-    for answer_line in _answer_lines(answer_text):
+    for answer_line in _answer_lines(answer_text, split_escaped_newlines=True):
         lines.append(f"- {_clean_answer_bullet(answer_line)}")
     lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
 
@@ -1505,7 +1535,9 @@ def _generated_answer_entry_marker(question_id: str) -> str:
     return f"<!-- sikula:generated-answer: {question_id} -->"
 
 
-def _answer_lines(value: str) -> list[str]:
+def _answer_lines(value: str, *, split_escaped_newlines: bool = False) -> list[str]:
+    if split_escaped_newlines:
+        value = value.replace("\\r\\n", "\n").replace("\\n", "\n")
     return [line.strip() for line in value.splitlines() if line.strip()]
 
 
