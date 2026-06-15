@@ -37,6 +37,17 @@ def _sub(returncode=0, stdout="", stderr=""):
     return r
 
 
+def _subprocess_sequence(*results):
+    pending = iter(results)
+
+    def run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd[:1] == ["git"]:
+            return next(pending)
+        return _sub()
+
+    return run
+
+
 def _args(**kwargs):
     defaults = dict(
         branch="feat/x",
@@ -95,7 +106,7 @@ def _run_review(
     with (
         patch("sikula._find_git_root", return_value=tmp_path),
         patch("sikula._ensure_gitignore"),
-        patch("subprocess.run", side_effect=subprocess_results),
+        patch("subprocess.run", side_effect=_subprocess_sequence(*subprocess_results)),
         patch("sikula._enrich_prompt_with_referenced_files", return_value=""),
         patch("agents.reviewer_agent.ReviewerAgent", return_value=mock_reviewer),
         patch("agents.security_reviewer_agent.SecurityReviewerAgent", return_value=mock_security),

@@ -1140,13 +1140,11 @@ class Orchestrator:
                 state.failed = True
                 self._store.save(state)
                 return
-            self._session_code_changed = True
-            self._mark_build_sync_stale_if_needed(
-                (implementer_result.data or {}).get("files_written", []),
-                "review fix",
-                state,
-            )
-            state.tests_up_to_date = False
+            files_written = (implementer_result.data or {}).get("files_written", [])
+            if files_written:
+                self._session_code_changed = True
+                self._mark_build_sync_stale_if_needed(files_written, "review fix", state)
+                state.tests_up_to_date = False
             self._store.save(state)
 
         if not state.review_approved and not state.failed:
@@ -1208,13 +1206,11 @@ class Orchestrator:
                 state.failed = True
                 self._store.save(state)
                 return
-            self._session_code_changed = True
-            self._mark_build_sync_stale_if_needed(
-                (implementer_result.data or {}).get("files_written", []),
-                "security fix",
-                state,
-            )
-            state.tests_up_to_date = False
+            files_written = (implementer_result.data or {}).get("files_written", [])
+            if files_written:
+                self._session_code_changed = True
+                self._mark_build_sync_stale_if_needed(files_written, "security fix", state)
+                state.tests_up_to_date = False
             self._store.save(state)
             self._run_review_loop(state)
             if state.failed:

@@ -325,6 +325,27 @@ class TestImplementerAgentPrompt:
         assert "missing null check" in prompt
         assert "wrong return type" in prompt
 
+    def test_review_issues_override_current_step_scope(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        state.plan = ["Add UI", "Wire navigation"]
+        state.current_step = 0
+        state.review_issues = [
+            "## Security Issues\n\n"
+            "### Unsafe URL construction\n"
+            "File: data/ApiClient.kt\n"
+            "Fix: validate the path parameter."
+        ]
+
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        prompt = stub_llm.agent_calls[0]
+        assert "CURRENT STEP (1/2): Add UI" in prompt
+        assert "REVIEW ISSUES TO FIX" in prompt
+        assert "A previous review or security review" in prompt
+        assert "remediation scope takes priority over the current step boundary" in prompt
+        assert "even when it requires touching files outside CURRENT STEP" in prompt
+        assert "data/ApiClient.kt" in prompt
+
     def test_no_review_section_without_issues(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)

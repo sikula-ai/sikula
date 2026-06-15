@@ -1017,6 +1017,42 @@ class TestOrchestratorReviewLoop:
         assert len(stubs["reviewer"].calls) == 2
         assert len(stubs["implementer"].calls) == 1
 
+    def test_noop_review_fix_does_not_mark_code_or_tests_stale(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_build=False,
+            max_review_iterations=1,
+        )
+        call_count = {"n": 0}
+
+        def reviewer_effect(state: TaskState) -> None:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                state.review_approved = False
+                state.review_issues = ["false positive already addressed"]
+            else:
+                state.review_approved = True
+                state.review_issues.clear()
+
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].result_data = {"files_written": []}
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            tests_up_to_date=True,
+            build_synced=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert result.tests_up_to_date is True
+        assert result.build_synced is True
+        assert len(stubs["reviewer"].calls) == 2
+        assert len(stubs["implementer"].calls) == 1
+
     def test_review_fix_implementer_failure_aborts_task(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path, run_review=True, run_build=False, max_review_iterations=3)
 
@@ -1122,6 +1158,51 @@ class TestOrchestratorSecurityLoop:
         assert not result.failed
         assert len(stubs["implementer"].calls) == 1
         assert len(stubs["reviewer"].calls) >= 1
+
+    def test_noop_security_fix_does_not_mark_code_or_tests_stale(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_security_review=True,
+            run_review=True,
+            run_build=False,
+            max_security_review_iterations=1,
+            max_review_iterations=1,
+        )
+        security_calls = {"n": 0}
+
+        def security_effect(state: TaskState) -> None:
+            security_calls["n"] += 1
+            if security_calls["n"] == 1:
+                state.security_approved = False
+                state.review_issues = ["false positive already addressed"]
+            else:
+                state.security_approved = True
+                state.review_issues.clear()
+
+        def reviewer_effect(state: TaskState) -> None:
+            state.review_approved = True
+            state.review_issues.clear()
+
+        stubs["security_reviewer"].side_effect = security_effect
+        stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].result_data = {"files_written": []}
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            review_approved=True,
+            tests_up_to_date=True,
+            build_synced=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert result.tests_up_to_date is True
+        assert result.build_synced is True
+        assert len(stubs["security_reviewer"].calls) == 2
+        assert len(stubs["implementer"].calls) == 1
+        assert len(stubs["reviewer"].calls) == 1
 
     def test_security_fix_implementer_failure_aborts_task(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
@@ -4315,6 +4396,7 @@ class TestOrchestratorPreexistingChangesFastPath:
                 state.review_issues = ["needs fix"]
 
         stubs["reviewer"].side_effect = reviewer_effect
+        stubs["implementer"].result_data = {"files_written": ["src/main.py"]}
         _save_state(
             orch, implementation_prompt="p", files_changed=["src/main.py"], build_synced=True, review_diff=_REVIEW_DIFF
         )
