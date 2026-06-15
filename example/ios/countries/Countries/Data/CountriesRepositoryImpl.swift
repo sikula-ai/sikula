@@ -1,3 +1,5 @@
+import Foundation
+
 struct CountriesRepositoryImpl: CountriesRepository {
     private let fetchDTOs: () async throws -> [CountryDTO]
 
@@ -13,6 +15,12 @@ struct CountriesRepositoryImpl: CountriesRepository {
         do {
             return try await fetchDTOs().map(\.asDomain)
         } catch {
+            if error is CancellationError {
+                throw error
+            }
+            if let urlError = error as? URLError, urlError.code == .cancelled {
+                throw error
+            }
             return FallbackCountryDTOs.countries.map(\.asDomain)
         }
     }

@@ -68,6 +68,19 @@ final class CountriesRepositoryImplTests: XCTestCase {
 
         XCTAssertEqual(result.map(\.name), FallbackCountryDTOs.countries.map(\.name.common))
     }
+
+    func testFetchAllPreservesCancellationInsteadOfFallingBack() async {
+        let repository = CountriesRepositoryImpl(fetchDTOs: {
+            throw CancellationError()
+        })
+
+        do {
+            _ = try await repository.fetchAll()
+            XCTFail("Expected cancellation to be thrown")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+    }
 }
 
 final class FallbackCountryDTOsTests: XCTestCase {
