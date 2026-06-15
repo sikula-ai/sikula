@@ -1521,7 +1521,7 @@ def _append_answer_entry(
 ) -> None:
     lines.append(_generated_answer_entry_marker(question_id))
     if section == "Validation":
-        for command in _answer_lines(answer_text):
+        for command in _answer_lines(answer_text, split_escaped_newlines=True):
             lines.append(f"- `{_clean_answer_bullet(command).strip('`')}`")
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
         return

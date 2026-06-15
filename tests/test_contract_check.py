@@ -19,7 +19,7 @@ from core.contract_check import (
     render_contract_check,
     write_contract_report,
 )
-from sikula import _read_interactive_contract_answer, main
+from sikula import _read_interactive_contract_answer, _should_store_interactive_answer, main
 
 
 def _python_project_config(tmp_path: Path) -> dict:
@@ -349,6 +349,20 @@ def test_prepare_contract_splits_escaped_newlines_in_text_answers():
     assert "- Create invites" in result.prepared_contract_markdown
     assert "- Accept invites" in result.prepared_contract_markdown
     assert "Create invites\\nAccept invites" not in result.prepared_contract_markdown
+
+
+def test_prepare_contract_splits_escaped_newlines_in_validation_answers():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"validation.commands": "pytest\\nruff check ."},
+    )
+
+    assert "validation.commands" in result.answered_question_ids
+    assert "validation.commands" not in result.revised_answer_question_ids
+    assert "- `pytest`" in result.prepared_contract_markdown
+    assert "- `ruff check .`" in result.prepared_contract_markdown
+    assert "pytest\\nruff check" not in result.prepared_contract_markdown
 
 
 def test_prepare_contract_marks_repeated_questions_as_revised_answer_needed():
@@ -1295,15 +1309,22 @@ def test_contract_improve_cli_interactive_prefills_existing_answers_for_line_edi
     monkeypatch.setitem(sys.modules, "readline", fake_readline)
 
     with patch("builtins.input", side_effect=lambda prompt: prompts.append(prompt) or "Edited answer"):
-        response = _read_interactive_contract_answer("Answer [scope.boundaries]", "Existing answer")
+        response, default_inserted = _read_interactive_contract_answer("Answer [scope.boundaries]", "Existing answer")
 
     assert response == "Edited answer"
+    assert default_inserted is True
     assert prompts == ["Answer [scope.boundaries]: "]
     assert bindings
     assert hooks[0] is not None
     hooks[0]()
     assert inserted == ["Existing answer"]
     assert hooks[-1] is None
+
+
+def test_contract_improve_cli_interactive_stores_empty_response_after_line_editing_clear():
+    assert _should_store_interactive_answer("", "Existing answer", default_inserted=True) is True
+    assert _should_store_interactive_answer("", "Existing answer", default_inserted=False) is False
+    assert _should_store_interactive_answer("Replacement", "Existing answer", default_inserted=True) is True
 
 
 def test_contract_improve_cli_interactive_rejects_stale_answers_before_prompting(
