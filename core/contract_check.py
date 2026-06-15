@@ -142,6 +142,7 @@ _CONTEXT_RE = re.compile(
 _HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 _TEXT_HEADING_RE = re.compile(r"^\s{0,3}([A-Za-z][A-Za-z0-9 /&_-]{1,60}):\s*$")
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$")
+_GENERATED_OPEN_QUESTIONS_MARKER = "<!-- sikula:generated-open-questions -->"
 
 
 @dataclass(frozen=True)
@@ -1271,7 +1272,7 @@ def _append_open_questions(
     if not questions:
         return
 
-    lines.extend(["", "## Open questions", ""])
+    lines.extend(["", "## Open questions", "", _GENERATED_OPEN_QUESTIONS_MARKER, ""])
     for question in questions:
         lines.append(f"- {question.get('question', '')}")
         why = str(question.get("why_it_matters", "")).strip()
@@ -1284,20 +1285,56 @@ def _append_open_questions(
 
 
 def _strip_generated_open_questions_section(task_text: str) -> str:
+    source_lines = task_text.splitlines()
     lines: list[str] = []
-    skipping = False
+    index = 0
 
-    for line in task_text.splitlines():
+    while index < len(source_lines):
+        line = source_lines[index]
         heading_match = _HEADING_RE.match(line)
         if heading_match and _normalize_heading(heading_match.group(2)) == "open questions":
-            skipping = True
+            section_end = index + 1
+            while section_end < len(source_lines) and not _HEADING_RE.match(source_lines[section_end]):
+                section_end += 1
+            section_body = source_lines[index + 1 : section_end]
+            if _is_generated_open_questions_section(section_body):
+                index = section_end
+                continue
+            lines.extend(source_lines[index:section_end])
+            index = section_end
             continue
-        if skipping and heading_match:
-            skipping = False
-        if not skipping:
-            lines.append(line)
+
+        lines.append(line)
+        index += 1
 
     return "\n".join(lines).strip()
+
+
+def _is_generated_open_questions_section(section_body: list[str]) -> bool:
+    stripped = [line.strip() for line in section_body if line.strip()]
+    if _GENERATED_OPEN_QUESTIONS_MARKER in stripped:
+        return True
+    if not stripped:
+        return False
+
+    saw_question = False
+    current_has_blocks_delivery = False
+    for line in section_body:
+        if not line.strip():
+            continue
+        if re.match(r"^[-*+]\s+", line):
+            if saw_question and not current_has_blocks_delivery:
+                return False
+            saw_question = True
+            current_has_blocks_delivery = False
+            continue
+        if re.match(r"^\s{2,}[-*+]\s+(Why it matters|Notes|Blocks delivery):", line):
+            if "Blocks delivery:" in line:
+                current_has_blocks_delivery = True
+            continue
+        return False
+
+    return saw_question and current_has_blocks_delivery
 
 
 def _improved_contract_base_lines(task_text: str, task_path: Path) -> list[str]:

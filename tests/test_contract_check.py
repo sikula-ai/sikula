@@ -337,6 +337,27 @@ def test_prepare_contract_strips_stale_open_questions_between_answer_rounds():
     assert stale_question not in second.prepared_contract_markdown
 
 
+def test_prepare_contract_preserves_human_open_questions_section():
+    task = """# Add team invites
+
+Users should be able to invite teammates by email.
+
+## Open questions
+
+- Confirm the invite email copy with product.
+"""
+
+    result = prepare_contract(
+        task,
+        contract_name="team-invites.md",
+        answers={"scope.boundaries": "Add invite creation and acceptance endpoints."},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "## Open questions" in result.prepared_contract_markdown
+    assert "- Confirm the invite email copy with product." in result.prepared_contract_markdown
+
+
 def test_prepare_contract_resume_accepts_accumulated_answers():
     first = prepare_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
