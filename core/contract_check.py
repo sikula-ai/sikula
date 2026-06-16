@@ -714,7 +714,7 @@ def prepare_contract(
         check_result=output_check_result,
         recheck_result=None,
         prepared_contract_markdown=prepared_contract_markdown,
-        resume_contract_markdown=prepared_contract_markdown,
+        resume_contract_markdown=contract_markdown.strip() + "\n",
     )
 
 
@@ -1847,60 +1847,58 @@ def _generated_answers_available_for_task(path: Path, task_path: Path, artifact_
 
 def _generated_answer_entries_from_resume(resume_markdown: str, clean_markdown: str) -> list[dict[str, Any]]:
     clean_lines = clean_markdown.splitlines()
-    search_start = 0
+    resume_lines = resume_markdown.splitlines()
+    clean_index = 0
+    resume_index = 0
     entries: list[dict[str, Any]] = []
-    for block in _generated_answer_blocks(resume_markdown):
-        body_lines = block["body_lines"]
-        if not body_lines:
+
+    while resume_index < len(resume_lines):
+        line = resume_lines[resume_index]
+        marker_match = _GENERATED_ANSWER_ENTRY_RE.match(line)
+        if marker_match:
+            question_ids = [value.strip() for value in marker_match.group(1).split(",") if value.strip()]
+            body_start = clean_index
+            body_lines: list[str] = []
+            resume_index += 1
+            while (
+                resume_index < len(resume_lines)
+                and resume_lines[resume_index].strip() != _GENERATED_ANSWER_ENTRY_END_MARKER
+            ):
+                body_lines.append(resume_lines[resume_index])
+                clean_index += 1
+                resume_index += 1
+            if resume_index < len(resume_lines):
+                resume_index += 1
+            body_end = body_start + len(body_lines)
+            if not body_lines or clean_lines[body_start:body_end] != body_lines:
+                continue
+            for question_id in question_ids:
+                entries.append(
+                    {
+                        "question_id": question_id,
+                        "section": _contract_section_for_question(question_id),
+                        "start_line": body_start + 1,
+                        "end_line": body_end,
+                        "line_count": len(body_lines),
+                        "body_sha256": _lines_sha256(body_lines),
+                    }
+                )
             continue
-        start = _find_line_sequence(clean_lines, body_lines, search_start)
-        if start is None:
-            start = _find_line_sequence(clean_lines, body_lines, 0)
-        if start is None:
+
+        stripped = line.strip()
+        if stripped == _GENERATED_OPEN_QUESTIONS_MARKER:
+            resume_index += 1
+            if resume_index < len(resume_lines) and not resume_lines[resume_index].strip():
+                resume_index += 1
             continue
-        end = start + len(body_lines)
-        for question_id in block["question_ids"]:
-            entries.append(
-                {
-                    "question_id": question_id,
-                    "section": _contract_section_for_question(question_id),
-                    "start_line": start + 1,
-                    "end_line": end,
-                    "line_count": len(body_lines),
-                    "body_sha256": _lines_sha256(body_lines),
-                }
-            )
-        search_start = end
+
+        if stripped == _GENERATED_ANSWER_ENTRY_END_MARKER:
+            resume_index += 1
+            continue
+
+        clean_index += 1
+        resume_index += 1
     return entries
-
-
-def _generated_answer_blocks(resume_markdown: str) -> list[dict[str, Any]]:
-    blocks: list[dict[str, Any]] = []
-    lines = resume_markdown.splitlines()
-    index = 0
-    while index < len(lines):
-        marker_match = _GENERATED_ANSWER_ENTRY_RE.match(lines[index])
-        if not marker_match:
-            index += 1
-            continue
-        question_ids = [value.strip() for value in marker_match.group(1).split(",") if value.strip()]
-        entry_start = index + 1
-        entry_end = entry_start
-        while entry_end < len(lines) and lines[entry_end].strip() != _GENERATED_ANSWER_ENTRY_END_MARKER:
-            entry_end += 1
-        blocks.append({"question_ids": question_ids, "body_lines": lines[entry_start:entry_end]})
-        index = entry_end + 1 if entry_end < len(lines) else entry_end
-    return blocks
-
-
-def _find_line_sequence(lines: list[str], target_lines: list[str], start: int) -> int | None:
-    if not target_lines or len(target_lines) > len(lines):
-        return None
-    max_start = len(lines) - len(target_lines)
-    for index in range(max(start, 0), max_start + 1):
-        if lines[index : index + len(target_lines)] == target_lines:
-            return index
-    return None
 
 
 def _lines_sha256(lines: list[str]) -> str:

@@ -530,6 +530,34 @@ def test_prepare_contract_resume_arguments_preserve_generated_markers_for_later_
     assert "validation.commands" not in second.revised_answer_question_ids
 
 
+def test_prepare_contract_preserves_resume_markers_without_new_answers():
+    first = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"validation.commands": "pytest"},
+    )
+
+    idle = prepare_contract(
+        first.resume_arguments["contract_markdown"],
+        contract_name="team-invites.md",
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "sikula:generated-answer" not in idle.prepared_contract_markdown
+    assert "<!-- sikula:generated-answer: validation.commands -->" in idle.resume_arguments["contract_markdown"]
+
+    second = prepare_contract(
+        idle.resume_arguments["contract_markdown"],
+        contract_name="team-invites.md",
+        answers={"validation.commands": "ruff check ."},
+        project_context={"validation_commands": ["ruff check ."]},
+    )
+
+    assert "- `pytest`" not in second.prepared_contract_markdown
+    assert "- `ruff check .`" in second.prepared_contract_markdown
+    assert "validation.commands" not in second.revised_answer_question_ids
+
+
 def test_prepare_contract_preserves_human_open_questions_section():
     task = """# Add team invites
 
@@ -1137,6 +1165,63 @@ def test_file_based_improve_uses_metadata_for_later_answer_revisions(tmp_path: P
     assert "sikula:generated-answer" not in second_output
     assert "validation.commands" not in improved.open_question_ids
     assert all(gap.id != "gap.validation.coverage" for gap in improved.check_result.gaps)
+
+
+def test_file_based_improve_metadata_anchors_duplicate_answer_lines_to_generated_block(tmp_path: Path):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text(
+        """# Add team invites
+
+Users should be able to invite teammates by email.
+
+## Context
+
+Example documentation:
+
+```text
+- `pytest`
+```
+""",
+        encoding="utf-8",
+    )
+    first_result = check_contract_file(task_path)
+    first_written = write_contract_report(first_result, task_path=task_path, project_root=tmp_path)
+    first_answers = yaml.safe_load(first_written.answers_path.read_text(encoding="utf-8"))
+    first_answers["answers"]["validation.commands"]["answer"] = "pytest"
+    first_written.answers_path.write_text(yaml.safe_dump(first_answers, sort_keys=False), encoding="utf-8")
+
+    first_output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    improve_contract_from_answers(task_path, answers_path=first_written.answers_path, output_path=first_output_path)
+    first_output = first_output_path.read_text(encoding="utf-8")
+    assert first_output.count("- `pytest`") == 2
+    metadata_path = tmp_path / ".sikula" / "contracts" / "team-invites.v2.generated-answers.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata_entry = metadata["generated_answers"][0]
+    assert first_output.splitlines()[metadata_entry["start_line"] - 1 : metadata_entry["end_line"]] == ["- `pytest`"]
+    assert metadata_entry["start_line"] > first_output.splitlines().index("- `pytest`") + 1
+
+    ruff_only_config = _python_project_config(tmp_path)
+    ruff_only_config["run_tests"] = False
+    second_result = check_contract_file(first_output_path, project_config=ruff_only_config)
+    second_written = write_contract_report(second_result, task_path=first_output_path, project_root=tmp_path)
+    second_answers = yaml.safe_load(second_written.answers_path.read_text(encoding="utf-8"))
+    second_answers["answers"]["validation.commands"]["answer"] = "ruff check ."
+    second_written.answers_path.write_text(yaml.safe_dump(second_answers, sort_keys=False), encoding="utf-8")
+
+    second_output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v3.md"
+    improve_contract_from_answers(
+        first_output_path,
+        answers_path=second_written.answers_path,
+        output_path=second_output_path,
+        project_config=ruff_only_config,
+    )
+
+    second_output = second_output_path.read_text(encoding="utf-8")
+    assert second_output.count("- `pytest`") == 1
+    assert "```text\n- `pytest`\n```" in second_output
+    assert "- `ruff check .`" in second_output
+    assert "sikula:generated-answer" not in second_output
 
 
 def test_file_based_improve_ignores_metadata_after_manual_task_edit(tmp_path: Path):
