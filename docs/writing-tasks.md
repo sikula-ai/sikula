@@ -42,6 +42,9 @@ deterministically writes a stronger Markdown task file, keeps unanswered items
 under `Open questions`, and runs the contract check on the output. It refuses
 stale answer hashes and accidental overwrites; for plain-text `.txt` inputs,
 write the improved contract to a new Markdown file with `--output`.
+The Markdown task output stays clean; Sikula stores generated-answer metadata
+under `.sikula/contracts` so later `contract improve` runs can safely replace
+earlier generated answers.
 `--interactive` is a convenience mode for terminal use: it creates or reuses the
 answers template, prompts for the follow-up answers, saves the answers YAML, and
 then runs the same deterministic improve/recheck flow. Blank interactive answers
