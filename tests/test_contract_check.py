@@ -1224,6 +1224,71 @@ Example documentation:
     assert "sikula:generated-answer" not in second_output
 
 
+def test_file_based_improve_loads_hashed_metadata_for_same_stem_tasks(tmp_path: Path):
+    first_task_path = tmp_path / "first" / "task.md"
+    second_task_path = tmp_path / "second" / "task.md"
+    first_task_path.parent.mkdir(parents=True)
+    second_task_path.parent.mkdir(parents=True)
+    first_task_path.write_text("# Add search\n\nUsers should be able to search countries by name.", encoding="utf-8")
+    second_task_path.write_text("# Add sort\n\nUsers should be able to sort countries by name.", encoding="utf-8")
+
+    first_result = check_contract_file(first_task_path)
+    first_written = write_contract_report(first_result, task_path=first_task_path, project_root=tmp_path)
+    first_answers = yaml.safe_load(first_written.answers_path.read_text(encoding="utf-8"))
+    first_answers["answers"]["validation.commands"]["answer"] = "pytest"
+    first_written.answers_path.write_text(yaml.safe_dump(first_answers, sort_keys=False), encoding="utf-8")
+    first_output_path = tmp_path / "first" / "task.v2.md"
+    improve_contract_from_answers(
+        first_task_path,
+        answers_path=first_written.answers_path,
+        output_path=first_output_path,
+    )
+    assert (tmp_path / ".sikula" / "contracts" / "task.v2.generated-answers.json").exists()
+
+    second_result = check_contract_file(second_task_path)
+    second_written = write_contract_report(second_result, task_path=second_task_path, project_root=tmp_path)
+    second_answers = yaml.safe_load(second_written.answers_path.read_text(encoding="utf-8"))
+    second_answers["answers"]["validation.commands"]["answer"] = "pytest"
+    second_written.answers_path.write_text(yaml.safe_dump(second_answers, sort_keys=False), encoding="utf-8")
+    second_output_path = tmp_path / "second" / "task.v2.md"
+    improve_contract_from_answers(
+        second_task_path,
+        answers_path=second_written.answers_path,
+        output_path=second_output_path,
+    )
+    hashed_metadata_paths = sorted((tmp_path / ".sikula" / "contracts").glob("task.v2-*.generated-answers.json"))
+    assert len(hashed_metadata_paths) == 1
+
+    ruff_only_config = _python_project_config(tmp_path)
+    ruff_only_config["run_tests"] = False
+    second_revision_result = check_contract_file(second_output_path, project_config=ruff_only_config)
+    second_revision_written = write_contract_report(
+        second_revision_result,
+        task_path=second_output_path,
+        project_root=tmp_path,
+    )
+    assert second_revision_written.answers_path == tmp_path / ".sikula" / "contracts" / "task.v2.answers.yaml"
+    second_revision_answers = yaml.safe_load(second_revision_written.answers_path.read_text(encoding="utf-8"))
+    second_revision_answers["answers"]["validation.commands"]["answer"] = "ruff check ."
+    second_revision_written.answers_path.write_text(
+        yaml.safe_dump(second_revision_answers, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    second_revision_output_path = tmp_path / "second" / "task.v3.md"
+    improve_contract_from_answers(
+        second_output_path,
+        answers_path=second_revision_written.answers_path,
+        output_path=second_revision_output_path,
+        project_config=ruff_only_config,
+    )
+
+    second_revision_output = second_revision_output_path.read_text(encoding="utf-8")
+    assert "- `pytest`" not in second_revision_output
+    assert "- `ruff check .`" in second_revision_output
+    assert "sikula:generated-answer" not in second_revision_output
+
+
 def test_file_based_improve_ignores_metadata_after_manual_task_edit(tmp_path: Path):
     task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
     task_path.parent.mkdir(parents=True)

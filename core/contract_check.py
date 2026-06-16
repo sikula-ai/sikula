@@ -545,7 +545,7 @@ def improve_contract_from_answers(
     generated_answer_entries = _load_generated_answer_entries(
         task_path,
         source_sha256=str(source_result.source["sha256"]),
-        answers_path=answers_path,
+        contract_dir=contract_dir,
         artifact_base=artifact_base,
     )
 
@@ -1757,10 +1757,13 @@ def _load_generated_answer_entries(
     task_path: Path,
     *,
     source_sha256: str,
-    answers_path: Path,
+    contract_dir: Path,
     artifact_base: Path,
 ) -> list[dict[str, Any]]:
-    path = _generated_answers_path_for_answers(answers_path)
+    try:
+        path = _contract_generated_answers_path(task_path, contract_dir, artifact_base)
+    except FileExistsError:
+        return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -1800,15 +1803,6 @@ def _write_generated_answer_entries(
     }
     generated_answers_path.parent.mkdir(parents=True, exist_ok=True)
     generated_answers_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-
-def _generated_answers_path_for_answers(answers_path: Path) -> Path:
-    name = answers_path.name
-    if name.endswith(".answers.yaml"):
-        stem = name[: -len(".answers.yaml")]
-    else:
-        stem = answers_path.stem
-    return answers_path.with_name(f"{stem}{_GENERATED_ANSWERS_ARTIFACT_SUFFIX}")
 
 
 def _contract_generated_answers_path(task_path: Path, contract_dir: Path, artifact_base: Path) -> Path:
