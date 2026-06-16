@@ -338,31 +338,42 @@ def test_prepare_contract_keeps_current_open_questions_after_final_recheck():
     assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
 
 
-def test_prepare_contract_splits_escaped_newlines_in_text_answers():
+def test_prepare_contract_splits_actual_newlines_in_text_answers():
     result = prepare_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
-        answers={"scope.boundaries": "Create invites\\nAccept invites"},
+        answers={"scope.boundaries": "Create invites\nAccept invites"},
         project_context={"validation_commands": ["pytest"]},
     )
 
     assert "- Create invites" in result.prepared_contract_markdown
     assert "- Accept invites" in result.prepared_contract_markdown
-    assert "Create invites\\nAccept invites" not in result.prepared_contract_markdown
 
 
-def test_prepare_contract_splits_escaped_newlines_in_validation_answers():
+def test_prepare_contract_splits_actual_newlines_in_validation_answers():
     result = prepare_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
-        answers={"validation.commands": "pytest\\nruff check ."},
+        answers={"validation.commands": "pytest\nruff check ."},
     )
 
     assert "validation.commands" in result.answered_question_ids
     assert "validation.commands" not in result.revised_answer_question_ids
     assert "- `pytest`" in result.prepared_contract_markdown
     assert "- `ruff check .`" in result.prepared_contract_markdown
-    assert "pytest\\nruff check" not in result.prepared_contract_markdown
+
+
+def test_prepare_contract_preserves_literal_backslash_n_in_validation_answers():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"validation.commands": "python -c \"print('line\\nvalue')\""},
+    )
+
+    assert "validation.commands" in result.answered_question_ids
+    assert "validation.commands" not in result.revised_answer_question_ids
+    assert "- `python -c \"print('line\\nvalue')\"`" in result.prepared_contract_markdown
+    assert "- `value')\"`" not in result.prepared_contract_markdown
 
 
 def test_prepare_contract_marks_repeated_questions_as_revised_answer_needed():

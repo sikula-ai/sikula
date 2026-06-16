@@ -1531,12 +1531,12 @@ def _append_answer_entry(
 ) -> None:
     lines.append(_generated_answer_entry_marker(question_id))
     if section == "Validation":
-        for command in _answer_lines(answer_text, split_escaped_newlines=True):
+        for command in _answer_lines(answer_text):
             lines.append(f"- `{_clean_answer_bullet(command).strip('`')}`")
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
         return
 
-    for answer_line in _answer_lines(answer_text, split_escaped_newlines=True):
+    for answer_line in _answer_lines(answer_text):
         lines.append(f"- {_clean_answer_bullet(answer_line)}")
     lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
 
@@ -1545,9 +1545,7 @@ def _generated_answer_entry_marker(question_id: str) -> str:
     return f"<!-- sikula:generated-answer: {question_id} -->"
 
 
-def _answer_lines(value: str, *, split_escaped_newlines: bool = False) -> list[str]:
-    if split_escaped_newlines:
-        value = value.replace("\\r\\n", "\n").replace("\\n", "\n")
+def _answer_lines(value: str) -> list[str]:
     return [line.strip() for line in value.splitlines() if line.strip()]
 
 
