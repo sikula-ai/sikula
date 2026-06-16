@@ -461,6 +461,29 @@ def test_prepare_contract_replaces_revised_generated_answers():
     assert "- ok" not in second.prepared_contract_markdown
 
 
+def test_prepare_contract_resume_arguments_preserve_generated_markers_for_later_revisions():
+    first = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"validation.commands": "pytest"},
+    )
+
+    assert "sikula:generated-answer" not in first.prepared_contract_markdown
+    assert "<!-- sikula:generated-answer: validation.commands -->" in first.resume_arguments["contract_markdown"]
+
+    second = prepare_contract(
+        first.resume_arguments["contract_markdown"],
+        contract_name="team-invites.md",
+        answers={"validation.commands": "ruff check ."},
+        project_context={"validation_commands": ["ruff check ."]},
+    )
+
+    assert "- `pytest`" not in second.prepared_contract_markdown
+    assert "- `ruff check .`" in second.prepared_contract_markdown
+    assert "sikula:generated-answer" not in second.prepared_contract_markdown
+    assert "validation.commands" not in second.revised_answer_question_ids
+
+
 def test_prepare_contract_preserves_human_open_questions_section():
     task = """# Add team invites
 

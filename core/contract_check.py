@@ -262,6 +262,7 @@ class ContractImproveResult:
 @dataclass(frozen=True)
 class ContractTextImproveResult:
     markdown: str
+    resume_markdown: str
     check_result: ContractCheckResult
     answered_question_ids: list[str]
     open_question_ids: list[str]
@@ -270,6 +271,7 @@ class ContractTextImproveResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "markdown": self.markdown,
+            "resume_markdown": self.resume_markdown,
             "source_sha256": self.source_sha256,
             "answered_question_ids": list(self.answered_question_ids),
             "open_question_ids": list(self.open_question_ids),
@@ -575,9 +577,10 @@ def improve_contract_text(
 
     source_path = _virtual_contract_path(contract_name, default_suffix=".md")
     source_format = "text" if source_path.suffix.lower() == ".txt" else "markdown"
+    source_evaluation_markdown = _strip_generated_markers(contract_markdown)
     if source_result is None:
         source_result = check_contract(
-            contract_markdown,
+            source_evaluation_markdown,
             source_path=contract_name,
             source_format=source_format,
             project_config=project_config,
@@ -605,7 +608,8 @@ def improve_contract_text(
         check_result.clarifying_questions,
         normalized_answers,
     )
-    rendered = _strip_generated_markers(rendered)
+    resume_markdown = rendered
+    rendered = _strip_generated_markers(resume_markdown)
     check_result = check_contract(
         rendered,
         source_path=output_name if output_name is not None else contract_name,
@@ -615,6 +619,7 @@ def improve_contract_text(
     )
     return ContractTextImproveResult(
         markdown=rendered,
+        resume_markdown=resume_markdown,
         check_result=check_result,
         answered_question_ids=answered_ids,
         open_question_ids=open_ids,
@@ -634,8 +639,9 @@ def prepare_contract(
     project_config = None
     validation_commands = _validation_commands_from_prepare_context(project_context)
     safe_task_path = _safe_task_path_hint(contract_name, contract_markdown)
+    evaluation_contract_markdown = _strip_generated_markers(contract_markdown)
     check_result = check_contract(
-        contract_markdown,
+        evaluation_contract_markdown,
         source_path=contract_name,
         source_format=source_format,
         project_config=project_config,
@@ -664,13 +670,14 @@ def prepare_contract(
             check_result=check_result,
             recheck_result=improved.check_result,
             prepared_contract_markdown=improved.markdown,
+            resume_contract_markdown=improved.resume_markdown,
             answered_question_ids=improved.answered_question_ids,
             open_question_ids=improved.open_question_ids,
         )
 
-    prepared_contract_markdown = contract_markdown.strip() + "\n"
+    prepared_contract_markdown = evaluation_contract_markdown.strip() + "\n"
     output_check_result = check_result
-    if prepared_contract_markdown != contract_markdown:
+    if prepared_contract_markdown != evaluation_contract_markdown:
         output_check_result = check_contract(
             prepared_contract_markdown,
             source_path=safe_task_path,
@@ -686,6 +693,7 @@ def prepare_contract(
         check_result=output_check_result,
         recheck_result=None,
         prepared_contract_markdown=prepared_contract_markdown,
+        resume_contract_markdown=prepared_contract_markdown,
     )
 
 
@@ -697,6 +705,7 @@ def _build_prepare_result(
     check_result: ContractCheckResult,
     recheck_result: ContractCheckResult | None,
     prepared_contract_markdown: str,
+    resume_contract_markdown: str | None = None,
     answered_question_ids: list[str] | None = None,
     open_question_ids: list[str] | None = None,
 ) -> ContractPrepareResult:
@@ -718,8 +727,9 @@ def _build_prepare_result(
     required_user_action = _required_user_action(required_next_step)
     user_questions = _prepare_user_questions(questions_for_user, revised_answer_question_ids)
     answers_template = _prepare_answers_template(active_check, revised_answer_question_ids)
+    resume_markdown = resume_contract_markdown or prepared_contract_markdown
     resume_arguments = _prepare_resume_arguments(
-        contract_markdown=prepared_contract_markdown,
+        contract_markdown=resume_markdown,
         contract_name=contract_name,
         project_context=project_context,
         status_applies_to_sha256=str(active_check.source["sha256"]),
