@@ -37,7 +37,8 @@ Tests live in `CountriesTests/`.
 ### Repository Protocol
 
 - Defined in `Countries/Domain/CountriesRepository.swift`.
-- `protocol CountriesRepository` with `func fetchAll() async throws -> [Country]`.
+- `protocol CountriesRepository` defines the async throwing operations needed by the feature flow
+  (for example list fetch and detail fetch operations).
 - Domain defines the protocol; Data layer provides the implementation.
 
 ### Use Cases
@@ -62,6 +63,12 @@ Tests live in `CountriesTests/`.
 - `CountriesAPIClient` in `Countries/Data/CountriesAPIClient.swift`.
 - Uses `URLSession.shared` with `async/await`. No Combine, no third-party networking.
 - Returns DTOs — no domain types.
+- Static URLs may be created directly. URLs that include dynamic path or query values from API
+  responses, navigation arguments, user input, or decoded data must not be built with raw string
+  interpolation and force unwrapping.
+- Validate dynamic identifiers against the expected format before using them in URLs, or throw
+  `URLError(.badURL)` so repository fallback/error handling can run.
+- Use `URLComponents`, `URLQueryItem`, or another safe URL construction pattern for dynamic URLs.
 
 ### Remote Data Fallback
 
@@ -134,6 +141,9 @@ final class CountriesViewModel {
 - Use `NavigationStack` at the root view.
 - Use `NavigationLink` for push navigation.
 - Pass only the data needed to the destination view, not the entire ViewModel.
+- When navigating from a list to a detail screen, pass the stable identifier plus any already-loaded
+  display data needed for the initial title/header. The detail screen may refresh data
+  asynchronously, but the first render must not be blank or visibly jump.
 
 ### Pull-to-refresh
 
@@ -168,7 +178,7 @@ This is the correct SwiftUI pattern — the view does not call the use case dire
 ```swift
 NavigationLink {
     CountryDetailView(
-        viewModel: CountryDetailViewModel(cca2: country.cca2, useCase: detailUseCase)
+        viewModel: CountryDetailViewModel(country: country, useCase: detailUseCase)
     )
 } label: {
     CountryRowView(country: country)
@@ -194,6 +204,8 @@ CountriesListView(
 ```
 
 For new screens, follow the same pattern: create ViewModel at the call site and pass it in.
+For multiple use cases in the same feature flow, share one repository instance rather than creating
+separate repository instances for each use case.
 
 ---
 
@@ -201,6 +213,8 @@ For new screens, follow the same pattern: create ViewModel at the call site and 
 
 - Use cases and repository implementations throw typed errors or `URLError` — never swallow errors silently.
 - ViewModels catch errors in `do/catch` and store `error: String?` for the view.
+- Preserve task cancellation. Do not convert `CancellationError` or `URLError.cancelled` into
+  fallback data or user-visible error state.
 - Views show an inline error message and a retry button — no full-screen error screens unless specified.
 - Never use `try!` or `try?` in production code.
 
@@ -213,6 +227,10 @@ For new screens, follow the same pattern: create ViewModel at the call site and 
 - Use the existing unit/integration test setup for example tasks.
 - Do not add new UI automation, screenshot, emulator, or simulator test infrastructure unless
   the task explicitly asks for it.
+- Do not test SwiftUI layout or navigation by source-inspecting view files. If the project has no
+  SwiftUI rendering, snapshot, or UI test harness, cover ViewModel, use case, repository, DTO, and
+  string behavior with executable tests and record a testability gap for rendered UI/navigation
+  behavior.
 
 ### Unit Tests
 
