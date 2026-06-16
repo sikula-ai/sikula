@@ -987,6 +987,51 @@ def _resolve_answers_path(value: str) -> Path:
     return answers_path
 
 
+def _read_interactive_contract_answer(prompt: str, current_answer: str) -> tuple[str, bool]:
+    default_inserted = _prepare_interactive_line_editing(current_answer)
+    prompt_text = prompt if default_inserted or not current_answer else f"{prompt} [{current_answer}]"
+    try:
+        return input(prompt_text + ": ").strip(), default_inserted
+    finally:
+        if default_inserted:
+            _clear_interactive_line_editing()
+
+
+def _prepare_interactive_line_editing(current_answer: str) -> bool:
+    try:
+        import readline
+    except (ImportError, OSError):
+        return False
+
+    for binding in ("set editing-mode emacs", "bind -e"):
+        try:
+            readline.parse_and_bind(binding)
+        except (AttributeError, OSError, ValueError):
+            continue
+
+    if not current_answer:
+        return False
+
+    try:
+        readline.set_startup_hook(lambda: readline.insert_text(current_answer))
+    except (AttributeError, OSError, ValueError):
+        return False
+    return True
+
+
+def _clear_interactive_line_editing() -> None:
+    try:
+        import readline
+
+        readline.set_startup_hook()
+    except (ImportError, AttributeError, OSError, ValueError):
+        pass
+
+
+def _should_store_interactive_answer(response: str, current_answer: str, default_inserted: bool) -> bool:
+    return bool(response) or not current_answer or default_inserted
+
+
 def _write_interactive_contract_answers(
     args: argparse.Namespace,
     cfg: dict,
@@ -1035,10 +1080,8 @@ def _write_interactive_contract_answers(
         if why:
             print(f"Why it matters: {why}")
         prompt = f"Answer [{question_id}]"
-        if current_answer:
-            prompt += f" [{current_answer}]"
-        response = input(prompt + ": ").strip()
-        if response or not current_answer:
+        response, default_inserted = _read_interactive_contract_answer(prompt, current_answer)
+        if _should_store_interactive_answer(response, current_answer, default_inserted):
             answer_entry["answer"] = response
         answer_entry.setdefault("notes", "")
 

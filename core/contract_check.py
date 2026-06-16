@@ -22,6 +22,7 @@ from core.validation_coverage import (
 SCHEMA_VERSION = 1
 _GENERATED_ANSWER_ENTRY_END_MARKER = "<!-- /sikula:generated-answer -->"
 _GENERATED_ANSWER_ENTRY_RE = re.compile(r"^\s*<!--\s*sikula:generated-answer:\s*([^>]+?)\s*-->\s*$")
+_GENERATED_ANSWERS_ARTIFACT_SUFFIX = ".generated-answers.json"
 _GENERATED_OPEN_QUESTIONS_MARKER = "<!-- sikula:generated-open-questions -->"
 
 _STATUS_THRESHOLDS = (
@@ -262,6 +263,7 @@ class ContractImproveResult:
 @dataclass(frozen=True)
 class ContractTextImproveResult:
     markdown: str
+    resume_markdown: str
     check_result: ContractCheckResult
     answered_question_ids: list[str]
     open_question_ids: list[str]
@@ -270,6 +272,7 @@ class ContractTextImproveResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "markdown": self.markdown,
+            "resume_markdown": self.resume_markdown,
             "source_sha256": self.source_sha256,
             "answered_question_ids": list(self.answered_question_ids),
             "open_question_ids": list(self.open_question_ids),
@@ -365,7 +368,7 @@ def check_contract(
     project_config: dict | None = None,
     configured_validation_commands: list[str] | None = None,
 ) -> ContractCheckResult:
-    evaluation_text = _strip_generated_open_questions_section(text)
+    evaluation_text = _strip_generated_markers(_strip_generated_open_questions_section(text))
     parsed = _parse_markdown_task(evaluation_text)
     sections_detected = _sections_detected(parsed)
     validation = _validation_details(evaluation_text, project_config, configured_validation_commands)
@@ -537,6 +540,14 @@ def improve_contract_from_answers(
     questions = _answers_questions(answers_data)
     answers = _answers_mapping(answers_data)
     _reject_unknown_filled_answers(answers, questions)
+    contract_dir = answers_path.parent
+    artifact_base = _artifact_base_dir(project_root=None, contract_dir=contract_dir)
+    generated_answer_entries = _load_generated_answer_entries(
+        task_path,
+        source_sha256=str(source_result.source["sha256"]),
+        contract_dir=contract_dir,
+        artifact_base=artifact_base,
+    )
 
     improved = improve_contract_text(
         task_text,
@@ -546,10 +557,20 @@ def improve_contract_from_answers(
         source_result=source_result,
         output_name=final_output_path,
         project_config=project_config,
+        generated_answer_entries=generated_answer_entries,
     )
+
+    generated_answers_path = _contract_generated_answers_path(final_output_path, contract_dir, artifact_base)
+    _ensure_contract_path(generated_answers_path, contract_dir)
 
     final_output_path.parent.mkdir(parents=True, exist_ok=True)
     final_output_path.write_text(improved.markdown, encoding="utf-8")
+    _write_generated_answer_entries(
+        final_output_path,
+        improved=improved,
+        generated_answers_path=generated_answers_path,
+        artifact_base=artifact_base,
+    )
     return ContractImproveResult(
         output_path=final_output_path,
         check_result=improved.check_result,
@@ -570,14 +591,16 @@ def improve_contract_text(
     output_name: str | Path | None = None,
     project_config: dict | None = None,
     configured_validation_commands: list[str] | None = None,
+    generated_answer_entries: list[dict[str, Any]] | None = None,
 ) -> ContractTextImproveResult:
     """Apply contract answers without reading or writing workflow files."""
 
     source_path = _virtual_contract_path(contract_name, default_suffix=".md")
     source_format = "text" if source_path.suffix.lower() == ".txt" else "markdown"
+    source_evaluation_markdown = _strip_generated_markers(contract_markdown)
     if source_result is None:
         source_result = check_contract(
-            contract_markdown,
+            source_evaluation_markdown,
             source_path=contract_name,
             source_format=source_format,
             project_config=project_config,
@@ -592,9 +615,10 @@ def improve_contract_text(
         source_path,
         question_dicts,
         normalized_answers,
+        generated_answer_entries=generated_answer_entries,
     )
     check_result = check_contract(
-        rendered,
+        _strip_generated_markers(rendered),
         source_path=output_name if output_name is not None else contract_name,
         source_format="markdown",
         project_config=project_config,
@@ -605,6 +629,8 @@ def improve_contract_text(
         check_result.clarifying_questions,
         normalized_answers,
     )
+    resume_markdown = rendered
+    rendered = _strip_generated_markers(resume_markdown)
     check_result = check_contract(
         rendered,
         source_path=output_name if output_name is not None else contract_name,
@@ -614,6 +640,7 @@ def improve_contract_text(
     )
     return ContractTextImproveResult(
         markdown=rendered,
+        resume_markdown=resume_markdown,
         check_result=check_result,
         answered_question_ids=answered_ids,
         open_question_ids=open_ids,
@@ -633,8 +660,9 @@ def prepare_contract(
     project_config = None
     validation_commands = _validation_commands_from_prepare_context(project_context)
     safe_task_path = _safe_task_path_hint(contract_name, contract_markdown)
+    evaluation_contract_markdown = _strip_generated_markers(contract_markdown)
     check_result = check_contract(
-        contract_markdown,
+        evaluation_contract_markdown,
         source_path=contract_name,
         source_format=source_format,
         project_config=project_config,
@@ -663,13 +691,14 @@ def prepare_contract(
             check_result=check_result,
             recheck_result=improved.check_result,
             prepared_contract_markdown=improved.markdown,
+            resume_contract_markdown=improved.resume_markdown,
             answered_question_ids=improved.answered_question_ids,
             open_question_ids=improved.open_question_ids,
         )
 
-    prepared_contract_markdown = contract_markdown.strip() + "\n"
+    prepared_contract_markdown = evaluation_contract_markdown.strip() + "\n"
     output_check_result = check_result
-    if prepared_contract_markdown != contract_markdown:
+    if prepared_contract_markdown != evaluation_contract_markdown:
         output_check_result = check_contract(
             prepared_contract_markdown,
             source_path=safe_task_path,
@@ -685,6 +714,7 @@ def prepare_contract(
         check_result=output_check_result,
         recheck_result=None,
         prepared_contract_markdown=prepared_contract_markdown,
+        resume_contract_markdown=contract_markdown.strip() + "\n",
     )
 
 
@@ -696,6 +726,7 @@ def _build_prepare_result(
     check_result: ContractCheckResult,
     recheck_result: ContractCheckResult | None,
     prepared_contract_markdown: str,
+    resume_contract_markdown: str | None = None,
     answered_question_ids: list[str] | None = None,
     open_question_ids: list[str] | None = None,
 ) -> ContractPrepareResult:
@@ -717,8 +748,9 @@ def _build_prepare_result(
     required_user_action = _required_user_action(required_next_step)
     user_questions = _prepare_user_questions(questions_for_user, revised_answer_question_ids)
     answers_template = _prepare_answers_template(active_check, revised_answer_question_ids)
+    resume_markdown = resume_contract_markdown or prepared_contract_markdown
     resume_arguments = _prepare_resume_arguments(
-        contract_markdown=prepared_contract_markdown,
+        contract_markdown=resume_markdown,
         contract_name=contract_name,
         project_context=project_context,
         status_applies_to_sha256=str(active_check.source["sha256"]),
@@ -1216,9 +1248,16 @@ def _render_improved_contract(
     task_path: Path,
     questions: list[dict[str, Any]],
     answers: dict[str, dict[str, Any]],
+    *,
+    generated_answer_entries: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[str], list[str]]:
     answered_question_ids = [question["id"] for question in questions if _answer_text(answers.get(question["id"], {}))]
     task_text = _strip_generated_answer_entries(task_text, answered_question_ids)
+    task_text = _strip_tracked_generated_answer_entries(
+        task_text,
+        answered_question_ids,
+        generated_answer_entries or [],
+    )
     task_text = _strip_generated_open_questions_section(task_text)
     lines = _improved_contract_base_lines(task_text, task_path)
     section_entries: dict[str, list[tuple[dict[str, Any], str, str]]] = {}
@@ -1264,6 +1303,7 @@ def _reconcile_rendered_open_questions(
     answers: dict[str, dict[str, Any]],
 ) -> tuple[str, list[str]]:
     question_dicts = _question_dicts(active_questions)
+    rendered = _strip_generated_answer_entries(rendered, [question["id"] for question in question_dicts])
     lines = _strip_generated_open_questions_section(rendered).splitlines()
     _append_open_questions(lines, question_dicts, answers)
     return "\n".join(lines).rstrip() + "\n", [question["id"] for question in question_dicts]
@@ -1340,12 +1380,97 @@ def _strip_generated_answer_entries(task_text: str, question_ids: list[str]) -> 
                     stripped_body = _trim_blank_lines(stripped_body)
                     if stripped_body:
                         lines.append(line)
+                        if stripped_body[0].strip():
+                            lines.append("")
                         lines.extend(stripped_body)
+                        if stripped_body[-1].strip():
+                            lines.append("")
                     index = section_end
                     continue
             lines.extend(source_lines[index:section_end])
             index = section_end
             continue
+
+        lines.append(line)
+        index += 1
+
+    return "\n".join(lines).strip()
+
+
+def _strip_tracked_generated_answer_entries(
+    task_text: str,
+    question_ids: list[str],
+    entries: list[dict[str, Any]],
+) -> str:
+    source_lines = task_text.splitlines()
+    ranges = _validated_generated_answer_ranges(source_lines, question_ids, entries)
+    if not ranges:
+        return task_text.strip()
+
+    return _remove_generated_answer_ranges(source_lines, ranges)
+
+
+def _validated_generated_answer_ranges(
+    source_lines: list[str],
+    question_ids: list[str],
+    entries: list[dict[str, Any]],
+) -> list[tuple[int, int]]:
+    target_ids = set(question_ids)
+    ranges: list[tuple[int, int]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        question_id = str(entry.get("question_id") or "").strip()
+        if question_id not in target_ids:
+            continue
+        try:
+            start = int(entry.get("start_line", 0)) - 1
+            end = int(entry.get("end_line", 0))
+        except (TypeError, ValueError):
+            continue
+        if start < 0 or end <= start or end > len(source_lines):
+            continue
+        body_lines = source_lines[start:end]
+        if str(entry.get("body_sha256") or "") != _lines_sha256(body_lines):
+            continue
+        ranges.append((start, end))
+    return sorted(set(ranges))
+
+
+def _remove_generated_answer_ranges(source_lines: list[str], ranges: list[tuple[int, int]]) -> str:
+    def should_remove(line_index: int) -> bool:
+        return any(start <= line_index < end for start, end in ranges)
+
+    lines: list[str] = []
+    index = 0
+    while index < len(source_lines):
+        if should_remove(index):
+            index += 1
+            continue
+
+        line = source_lines[index]
+        heading_match = _HEADING_RE.match(line)
+        if heading_match:
+            section_end = index + 1
+            while section_end < len(source_lines) and not _HEADING_RE.match(source_lines[section_end]):
+                section_end += 1
+            if any(start < section_end and end > index for start, end in ranges):
+                stripped_body = _trim_blank_lines(
+                    [
+                        source_lines[body_index]
+                        for body_index in range(index + 1, section_end)
+                        if not should_remove(body_index)
+                    ]
+                )
+                if stripped_body:
+                    lines.append(line)
+                    if stripped_body[0].strip():
+                        lines.append("")
+                    lines.extend(stripped_body)
+                    if stripped_body[-1].strip():
+                        lines.append("")
+                index = section_end
+                continue
 
         lines.append(line)
         index += 1
@@ -1380,6 +1505,30 @@ def _strip_marked_answer_entries(section_body: list[str], target_ids: set[str]) 
         index = entry_end
 
     return lines, removed
+
+
+def _strip_generated_markers(task_text: str) -> str:
+    lines: list[str] = []
+    source_lines = task_text.splitlines()
+    index = 0
+    while index < len(source_lines):
+        line = source_lines[index]
+        stripped = line.strip()
+        if _GENERATED_ANSWER_ENTRY_RE.match(line):
+            index += 1
+            continue
+        if stripped == _GENERATED_ANSWER_ENTRY_END_MARKER:
+            index += 1
+            continue
+        if stripped == _GENERATED_OPEN_QUESTIONS_MARKER:
+            if index + 1 < len(source_lines) and not source_lines[index + 1].strip():
+                index += 2
+                continue
+            index += 1
+            continue
+        lines.append(line)
+        index += 1
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _trim_blank_lines(lines: list[str]) -> list[str]:
@@ -1602,6 +1751,152 @@ def _assert_generated_or_same_task_yaml(path: Path, task_path: Path, artifact_ba
     if _yaml_answers_available_for_task(path, task_path, artifact_base):
         return
     raise FileExistsError(f"Refusing to overwrite non-contract answers file: {path}")
+
+
+def _load_generated_answer_entries(
+    task_path: Path,
+    *,
+    source_sha256: str,
+    contract_dir: Path,
+    artifact_base: Path,
+) -> list[dict[str, Any]]:
+    try:
+        path = _contract_generated_answers_path(task_path, contract_dir, artifact_base)
+    except FileExistsError:
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    if data.get("generated_by") != "sikula.contract_improve":
+        return []
+    if not _task_path_matches(data.get("task"), task_path, artifact_base):
+        return []
+    task = data.get("task")
+    if not isinstance(task, dict) or task.get("sha256") != source_sha256:
+        return []
+    entries = data.get("generated_answers")
+    return entries if isinstance(entries, list) else []
+
+
+def _write_generated_answer_entries(
+    output_path: Path,
+    *,
+    improved: ContractTextImproveResult,
+    generated_answers_path: Path,
+    artifact_base: Path,
+) -> None:
+    data = {
+        "schema_version": 1,
+        "generated_by": "sikula.contract_improve",
+        "created_at": _utc_timestamp(),
+        "task": {
+            "path": _artifact_path(output_path, artifact_base),
+            "sha256": "sha256:" + sha256(improved.markdown.strip().encode("utf-8")).hexdigest(),
+        },
+        "generated_answers": _generated_answer_entries_from_resume(
+            improved.resume_markdown,
+            improved.markdown,
+        ),
+    }
+    generated_answers_path.parent.mkdir(parents=True, exist_ok=True)
+    generated_answers_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _contract_generated_answers_path(task_path: Path, contract_dir: Path, artifact_base: Path) -> Path:
+    stem = _select_generated_answers_stem(task_path, contract_dir, artifact_base)
+    return contract_dir / f"{stem}{_GENERATED_ANSWERS_ARTIFACT_SUFFIX}"
+
+
+def _select_generated_answers_stem(task_path: Path, contract_dir: Path, artifact_base: Path) -> str:
+    base = _safe_report_stem(task_path.stem)
+    candidate = contract_dir / f"{base}{_GENERATED_ANSWERS_ARTIFACT_SUFFIX}"
+    if _generated_answers_available_for_task(candidate, task_path, artifact_base):
+        return base
+
+    hashed = f"{base}-{sha256(str(task_path).encode('utf-8')).hexdigest()[:8]}"
+    hashed_candidate = contract_dir / f"{hashed}{_GENERATED_ANSWERS_ARTIFACT_SUFFIX}"
+    if not _generated_answers_available_for_task(hashed_candidate, task_path, artifact_base):
+        raise FileExistsError(
+            f"Contract generated-answer metadata already exists for a different task: {hashed_candidate}"
+        )
+    return hashed
+
+
+def _generated_answers_available_for_task(path: Path, task_path: Path, artifact_base: Path) -> bool:
+    if not path.exists():
+        return True
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return data.get("generated_by") == "sikula.contract_improve" and _task_path_matches(
+        data.get("task"), task_path, artifact_base
+    )
+
+
+def _generated_answer_entries_from_resume(resume_markdown: str, clean_markdown: str) -> list[dict[str, Any]]:
+    clean_lines = clean_markdown.splitlines()
+    resume_lines = resume_markdown.splitlines()
+    clean_index = 0
+    resume_index = 0
+    entries: list[dict[str, Any]] = []
+
+    while resume_index < len(resume_lines):
+        line = resume_lines[resume_index]
+        marker_match = _GENERATED_ANSWER_ENTRY_RE.match(line)
+        if marker_match:
+            question_ids = [value.strip() for value in marker_match.group(1).split(",") if value.strip()]
+            body_start = clean_index
+            body_lines: list[str] = []
+            resume_index += 1
+            while (
+                resume_index < len(resume_lines)
+                and resume_lines[resume_index].strip() != _GENERATED_ANSWER_ENTRY_END_MARKER
+            ):
+                body_lines.append(resume_lines[resume_index])
+                clean_index += 1
+                resume_index += 1
+            if resume_index < len(resume_lines):
+                resume_index += 1
+            body_end = body_start + len(body_lines)
+            if not body_lines or clean_lines[body_start:body_end] != body_lines:
+                continue
+            for question_id in question_ids:
+                entries.append(
+                    {
+                        "question_id": question_id,
+                        "section": _contract_section_for_question(question_id),
+                        "start_line": body_start + 1,
+                        "end_line": body_end,
+                        "line_count": len(body_lines),
+                        "body_sha256": _lines_sha256(body_lines),
+                    }
+                )
+            continue
+
+        stripped = line.strip()
+        if stripped == _GENERATED_OPEN_QUESTIONS_MARKER:
+            resume_index += 1
+            if resume_index < len(resume_lines) and not resume_lines[resume_index].strip():
+                resume_index += 1
+            continue
+
+        if stripped == _GENERATED_ANSWER_ENTRY_END_MARKER:
+            resume_index += 1
+            continue
+
+        clean_index += 1
+        resume_index += 1
+    return entries
+
+
+def _lines_sha256(lines: list[str]) -> str:
+    return "sha256:" + sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
 def _source_path_matches(source: Any, task_path: Path, artifact_base: Path) -> bool:

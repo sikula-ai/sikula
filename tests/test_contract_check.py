@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from hashlib import sha256
 from pathlib import Path
+import sys
+import types
 from unittest.mock import patch
 
 import pytest
@@ -17,7 +19,7 @@ from core.contract_check import (
     render_contract_check,
     write_contract_report,
 )
-from sikula import main
+from sikula import _read_interactive_contract_answer, _should_store_interactive_answer, main
 
 
 def _python_project_config(tmp_path: Path) -> dict:
@@ -96,6 +98,41 @@ def test_strong_task_is_ready_when_validation_is_covered(tmp_path: Path):
     assert result.sections_detected["acceptance_criteria"]
     assert result.sections_detected["security_privacy"]
     assert result.sections_detected["validation"]
+
+
+def test_check_contract_ignores_generated_answer_markers():
+    clean_task = """# Team invites
+
+## Acceptance criteria
+- Owner/admin can invite a user by email.
+- Non-admin users cannot invite users.
+
+## Validation
+- `ruff check .`
+"""
+    marked_task = """# Team invites
+
+## Acceptance criteria
+<!-- sikula:generated-answer: acceptance.criteria -->
+- Owner/admin can invite a user by email.
+- Non-admin users cannot invite users.
+<!-- /sikula:generated-answer -->
+
+## Validation
+<!-- sikula:generated-answer: validation.commands -->
+- `ruff check .`
+<!-- /sikula:generated-answer -->
+"""
+
+    clean = check_contract(clean_task, configured_validation_commands=["ruff check ."])
+    marked = check_contract(marked_task, configured_validation_commands=["ruff check ."])
+
+    assert marked.readiness_score == clean.readiness_score
+    assert marked.status == clean.status
+    assert marked.scores == clean.scores
+    assert marked.validation == clean.validation
+    assert marked.gaps == clean.gaps
+    assert marked.source["sha256"] != clean.source["sha256"]
 
 
 def test_json_output_schema_is_stable(tmp_path: Path):
@@ -279,6 +316,7 @@ def test_prepare_contract_applies_answers_and_rechecks():
     assert "acceptance.criteria" in result.answered_question_ids
     assert "## Scope" in result.prepared_contract_markdown
     assert "- Add team invite creation and acceptance endpoints." in result.prepared_contract_markdown
+    assert "sikula:generated-" not in result.prepared_contract_markdown
     assert result.recheck_result.readiness_score > result.check_result.readiness_score
     assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
     assert result.required_next_step in {
@@ -330,9 +368,47 @@ def test_prepare_contract_keeps_current_open_questions_after_final_recheck():
     assert result.needs_user_input
     assert "acceptance.criteria" in result.open_question_ids
     assert "## Open questions" in result.prepared_contract_markdown
-    assert "<!-- sikula:generated-open-questions -->" in result.prepared_contract_markdown
+    assert "sikula:generated-open-questions" not in result.prepared_contract_markdown
     assert "What observable behaviours must be true when this task is complete?" in result.prepared_contract_markdown
     assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
+
+
+def test_prepare_contract_splits_actual_newlines_in_text_answers():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"scope.boundaries": "Create invites\nAccept invites"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "- Create invites" in result.prepared_contract_markdown
+    assert "- Accept invites" in result.prepared_contract_markdown
+
+
+def test_prepare_contract_splits_actual_newlines_in_validation_answers():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"validation.commands": "pytest\nruff check ."},
+    )
+
+    assert "validation.commands" in result.answered_question_ids
+    assert "validation.commands" not in result.revised_answer_question_ids
+    assert "- `pytest`" in result.prepared_contract_markdown
+    assert "- `ruff check .`" in result.prepared_contract_markdown
+
+
+def test_prepare_contract_preserves_literal_backslash_n_in_validation_answers():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"validation.commands": "python -c \"print('line\\nvalue')\""},
+    )
+
+    assert "validation.commands" in result.answered_question_ids
+    assert "validation.commands" not in result.revised_answer_question_ids
+    assert "- `python -c \"print('line\\nvalue')\"`" in result.prepared_contract_markdown
+    assert "- `value')\"`" not in result.prepared_contract_markdown
 
 
 def test_prepare_contract_marks_repeated_questions_as_revised_answer_needed():
@@ -347,11 +423,34 @@ def test_prepare_contract_marks_repeated_questions_as_revised_answer_needed():
     assert "acceptance.negative_cases" in result.answered_question_ids
     assert {question.id for question in result.questions_for_user}.issubset(set(result.open_question_ids))
     assert "acceptance.negative_cases" in result.revised_answer_question_ids
+    assert "- ok" not in result.prepared_contract_markdown
     question = next(question for question in result.user_questions if question["id"] == "acceptance.negative_cases")
     assert question["requires_revised_answer"] is True
     assert "more specific answer" in question["reason"]
     assert result.answers_template["acceptance.negative_cases"]["requires_revised_answer"] is True
     assert result.required_user_action == "answer_contract_questions"
+
+
+def test_prepare_contract_readiness_ignores_internal_answer_markers():
+    result = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={
+            "scope.boundaries": "Add invite creation and acceptance endpoints.",
+            "acceptance.criteria": "Owners can invite teammates by email.",
+            "acceptance.negative_cases": "Duplicate invites return a deterministic error.",
+            "scope.out_of_scope": "Billing changes are out of scope.",
+            "token.lifecycle": "Invite tokens expire after 24 hours and cannot be reused.",
+            "privacy.data_handling": "Invite tokens must not be logged.",
+            "reviewer.focus": "Authorization and token lifecycle.",
+            "context.domain_rules": "domain",
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "context.domain_rules" in result.revised_answer_question_ids
+    assert "- domain" not in result.prepared_contract_markdown
+    assert "sikula:generated-" not in result.prepared_contract_markdown
 
 
 def test_prepare_contract_strips_stale_open_questions_between_answer_rounds():
@@ -387,7 +486,7 @@ def test_prepare_contract_replaces_revised_generated_answers():
     )
 
     assert "acceptance.negative_cases" in first.revised_answer_question_ids
-    assert "- ok" in first.prepared_contract_markdown
+    assert "- ok" not in first.prepared_contract_markdown
 
     second = prepare_contract(
         first.resume_arguments["contract_markdown"],
@@ -406,6 +505,57 @@ def test_prepare_contract_replaces_revised_generated_answers():
         second.prepared_contract_markdown
     )
     assert "- ok" not in second.prepared_contract_markdown
+
+
+def test_prepare_contract_resume_arguments_preserve_generated_markers_for_later_revisions():
+    first = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"validation.commands": "pytest"},
+    )
+
+    assert "sikula:generated-answer" not in first.prepared_contract_markdown
+    assert "<!-- sikula:generated-answer: validation.commands -->" in first.resume_arguments["contract_markdown"]
+
+    second = prepare_contract(
+        first.resume_arguments["contract_markdown"],
+        contract_name="team-invites.md",
+        answers={"validation.commands": "ruff check ."},
+        project_context={"validation_commands": ["ruff check ."]},
+    )
+
+    assert "- `pytest`" not in second.prepared_contract_markdown
+    assert "- `ruff check .`" in second.prepared_contract_markdown
+    assert "sikula:generated-answer" not in second.prepared_contract_markdown
+    assert "validation.commands" not in second.revised_answer_question_ids
+
+
+def test_prepare_contract_preserves_resume_markers_without_new_answers():
+    first = prepare_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"validation.commands": "pytest"},
+    )
+
+    idle = prepare_contract(
+        first.resume_arguments["contract_markdown"],
+        contract_name="team-invites.md",
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "sikula:generated-answer" not in idle.prepared_contract_markdown
+    assert "<!-- sikula:generated-answer: validation.commands -->" in idle.resume_arguments["contract_markdown"]
+
+    second = prepare_contract(
+        idle.resume_arguments["contract_markdown"],
+        contract_name="team-invites.md",
+        answers={"validation.commands": "ruff check ."},
+        project_context={"validation_commands": ["ruff check ."]},
+    )
+
+    assert "- `pytest`" not in second.prepared_contract_markdown
+    assert "- `ruff check .`" in second.prepared_contract_markdown
+    assert "validation.commands" not in second.revised_answer_question_ids
 
 
 def test_prepare_contract_preserves_human_open_questions_section():
@@ -922,6 +1072,7 @@ def test_improve_contract_from_answers_writes_markdown_and_rechecks(tmp_path: Pa
     assert "- Clarification `" not in output
     assert "Source question" not in output
     assert "`scope.boundaries`" not in output
+    assert "sikula:generated-answer" not in output
     assert "## Notes" in output
     assert "- Scope: Keep the existing team settings navigation unchanged." in output
     assert "- Clarifications: Custom note." in output
@@ -960,10 +1111,220 @@ def test_in_memory_improve_matches_file_based_improve(tmp_path: Path):
         project_config=_python_project_config(tmp_path),
     )
 
-    assert in_memory.markdown == output_path.read_text(encoding="utf-8")
+    saved_output = output_path.read_text(encoding="utf-8")
+    assert in_memory.markdown == saved_output
+    assert in_memory.resume_markdown != saved_output
+    assert "sikula:generated-answer" not in in_memory.markdown
+    assert "sikula:generated-answer" not in saved_output
     assert in_memory.answered_question_ids == file_based.answered_question_ids
     assert in_memory.open_question_ids == file_based.open_question_ids
     assert in_memory.check_result.to_dict() == file_based.check_result.to_dict()
+
+
+def test_file_based_improve_uses_metadata_for_later_answer_revisions(tmp_path: Path):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    first_result = check_contract_file(task_path)
+    first_written = write_contract_report(first_result, task_path=task_path, project_root=tmp_path)
+    first_answers = yaml.safe_load(first_written.answers_path.read_text(encoding="utf-8"))
+    first_answers["answers"]["validation.commands"]["answer"] = "pytest"
+    first_written.answers_path.write_text(yaml.safe_dump(first_answers, sort_keys=False), encoding="utf-8")
+
+    first_output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    improve_contract_from_answers(task_path, answers_path=first_written.answers_path, output_path=first_output_path)
+    first_output = first_output_path.read_text(encoding="utf-8")
+    assert "sikula:generated-answer" not in first_output
+    assert "- `pytest`" in first_output
+    metadata_path = tmp_path / ".sikula" / "contracts" / "team-invites.v2.generated-answers.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["generated_by"] == "sikula.contract_improve"
+    assert metadata["task"]["sha256"] == "sha256:" + sha256(first_output.strip().encode("utf-8")).hexdigest()
+    assert metadata["generated_answers"][0]["question_id"] == "validation.commands"
+    assert "pytest" not in metadata_path.read_text(encoding="utf-8")
+
+    ruff_only_config = _python_project_config(tmp_path)
+    ruff_only_config["run_tests"] = False
+    second_result = check_contract_file(first_output_path, project_config=ruff_only_config)
+    second_written = write_contract_report(second_result, task_path=first_output_path, project_root=tmp_path)
+    second_answers = yaml.safe_load(second_written.answers_path.read_text(encoding="utf-8"))
+    second_answers["answers"]["validation.commands"]["answer"] = "ruff check ."
+    second_written.answers_path.write_text(yaml.safe_dump(second_answers, sort_keys=False), encoding="utf-8")
+
+    second_output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v3.md"
+    improved = improve_contract_from_answers(
+        first_output_path,
+        answers_path=second_written.answers_path,
+        output_path=second_output_path,
+        project_config=ruff_only_config,
+    )
+
+    second_output = second_output_path.read_text(encoding="utf-8")
+    assert "- `pytest`" not in second_output
+    assert "- `ruff check .`" in second_output
+    assert "sikula:generated-answer" not in second_output
+    assert "validation.commands" not in improved.open_question_ids
+    assert all(gap.id != "gap.validation.coverage" for gap in improved.check_result.gaps)
+
+
+def test_file_based_improve_metadata_anchors_duplicate_answer_lines_to_generated_block(tmp_path: Path):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text(
+        """# Add team invites
+
+Users should be able to invite teammates by email.
+
+## Context
+
+Example documentation:
+
+```text
+- `pytest`
+```
+""",
+        encoding="utf-8",
+    )
+    first_result = check_contract_file(task_path)
+    first_written = write_contract_report(first_result, task_path=task_path, project_root=tmp_path)
+    first_answers = yaml.safe_load(first_written.answers_path.read_text(encoding="utf-8"))
+    first_answers["answers"]["validation.commands"]["answer"] = "pytest"
+    first_written.answers_path.write_text(yaml.safe_dump(first_answers, sort_keys=False), encoding="utf-8")
+
+    first_output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    improve_contract_from_answers(task_path, answers_path=first_written.answers_path, output_path=first_output_path)
+    first_output = first_output_path.read_text(encoding="utf-8")
+    assert first_output.count("- `pytest`") == 2
+    metadata_path = tmp_path / ".sikula" / "contracts" / "team-invites.v2.generated-answers.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata_entry = metadata["generated_answers"][0]
+    assert first_output.splitlines()[metadata_entry["start_line"] - 1 : metadata_entry["end_line"]] == ["- `pytest`"]
+    assert metadata_entry["start_line"] > first_output.splitlines().index("- `pytest`") + 1
+
+    ruff_only_config = _python_project_config(tmp_path)
+    ruff_only_config["run_tests"] = False
+    second_result = check_contract_file(first_output_path, project_config=ruff_only_config)
+    second_written = write_contract_report(second_result, task_path=first_output_path, project_root=tmp_path)
+    second_answers = yaml.safe_load(second_written.answers_path.read_text(encoding="utf-8"))
+    second_answers["answers"]["validation.commands"]["answer"] = "ruff check ."
+    second_written.answers_path.write_text(yaml.safe_dump(second_answers, sort_keys=False), encoding="utf-8")
+
+    second_output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v3.md"
+    improve_contract_from_answers(
+        first_output_path,
+        answers_path=second_written.answers_path,
+        output_path=second_output_path,
+        project_config=ruff_only_config,
+    )
+
+    second_output = second_output_path.read_text(encoding="utf-8")
+    assert second_output.count("- `pytest`") == 1
+    assert "```text\n- `pytest`\n```" in second_output
+    assert "- `ruff check .`" in second_output
+    assert "sikula:generated-answer" not in second_output
+
+
+def test_file_based_improve_loads_hashed_metadata_for_same_stem_tasks(tmp_path: Path):
+    first_task_path = tmp_path / "first" / "task.md"
+    second_task_path = tmp_path / "second" / "task.md"
+    first_task_path.parent.mkdir(parents=True)
+    second_task_path.parent.mkdir(parents=True)
+    first_task_path.write_text("# Add search\n\nUsers should be able to search countries by name.", encoding="utf-8")
+    second_task_path.write_text("# Add sort\n\nUsers should be able to sort countries by name.", encoding="utf-8")
+
+    first_result = check_contract_file(first_task_path)
+    first_written = write_contract_report(first_result, task_path=first_task_path, project_root=tmp_path)
+    first_answers = yaml.safe_load(first_written.answers_path.read_text(encoding="utf-8"))
+    first_answers["answers"]["validation.commands"]["answer"] = "pytest"
+    first_written.answers_path.write_text(yaml.safe_dump(first_answers, sort_keys=False), encoding="utf-8")
+    first_output_path = tmp_path / "first" / "task.v2.md"
+    improve_contract_from_answers(
+        first_task_path,
+        answers_path=first_written.answers_path,
+        output_path=first_output_path,
+    )
+    assert (tmp_path / ".sikula" / "contracts" / "task.v2.generated-answers.json").exists()
+
+    second_result = check_contract_file(second_task_path)
+    second_written = write_contract_report(second_result, task_path=second_task_path, project_root=tmp_path)
+    second_answers = yaml.safe_load(second_written.answers_path.read_text(encoding="utf-8"))
+    second_answers["answers"]["validation.commands"]["answer"] = "pytest"
+    second_written.answers_path.write_text(yaml.safe_dump(second_answers, sort_keys=False), encoding="utf-8")
+    second_output_path = tmp_path / "second" / "task.v2.md"
+    improve_contract_from_answers(
+        second_task_path,
+        answers_path=second_written.answers_path,
+        output_path=second_output_path,
+    )
+    hashed_metadata_paths = sorted((tmp_path / ".sikula" / "contracts").glob("task.v2-*.generated-answers.json"))
+    assert len(hashed_metadata_paths) == 1
+
+    ruff_only_config = _python_project_config(tmp_path)
+    ruff_only_config["run_tests"] = False
+    second_revision_result = check_contract_file(second_output_path, project_config=ruff_only_config)
+    second_revision_written = write_contract_report(
+        second_revision_result,
+        task_path=second_output_path,
+        project_root=tmp_path,
+    )
+    assert second_revision_written.answers_path == tmp_path / ".sikula" / "contracts" / "task.v2.answers.yaml"
+    second_revision_answers = yaml.safe_load(second_revision_written.answers_path.read_text(encoding="utf-8"))
+    second_revision_answers["answers"]["validation.commands"]["answer"] = "ruff check ."
+    second_revision_written.answers_path.write_text(
+        yaml.safe_dump(second_revision_answers, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    second_revision_output_path = tmp_path / "second" / "task.v3.md"
+    improve_contract_from_answers(
+        second_output_path,
+        answers_path=second_revision_written.answers_path,
+        output_path=second_revision_output_path,
+        project_config=ruff_only_config,
+    )
+
+    second_revision_output = second_revision_output_path.read_text(encoding="utf-8")
+    assert "- `pytest`" not in second_revision_output
+    assert "- `ruff check .`" in second_revision_output
+    assert "sikula:generated-answer" not in second_revision_output
+
+
+def test_file_based_improve_ignores_metadata_after_manual_task_edit(tmp_path: Path):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    first_result = check_contract_file(task_path)
+    first_written = write_contract_report(first_result, task_path=task_path, project_root=tmp_path)
+    first_answers = yaml.safe_load(first_written.answers_path.read_text(encoding="utf-8"))
+    first_answers["answers"]["validation.commands"]["answer"] = "pytest"
+    first_written.answers_path.write_text(yaml.safe_dump(first_answers, sort_keys=False), encoding="utf-8")
+
+    first_output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v2.md"
+    improve_contract_from_answers(task_path, answers_path=first_written.answers_path, output_path=first_output_path)
+    first_output_path.write_text(
+        first_output_path.read_text(encoding="utf-8").replace("- `pytest`", "- `pytest`\n- Keep manual note."),
+        encoding="utf-8",
+    )
+
+    ruff_only_config = _python_project_config(tmp_path)
+    ruff_only_config["run_tests"] = False
+    second_result = check_contract_file(first_output_path, project_config=ruff_only_config)
+    second_written = write_contract_report(second_result, task_path=first_output_path, project_root=tmp_path)
+    second_answers = yaml.safe_load(second_written.answers_path.read_text(encoding="utf-8"))
+    second_answers["answers"]["validation.commands"]["answer"] = "ruff check ."
+    second_written.answers_path.write_text(yaml.safe_dump(second_answers, sort_keys=False), encoding="utf-8")
+
+    second_output_path = tmp_path / ".sikula" / "tasks" / "team-invites.v3.md"
+    improve_contract_from_answers(
+        first_output_path,
+        answers_path=second_written.answers_path,
+        output_path=second_output_path,
+        project_config=ruff_only_config,
+    )
+
+    second_output = second_output_path.read_text(encoding="utf-8")
+    assert "- `pytest`" in second_output
+    assert "- Keep manual note." in second_output
 
 
 def test_improve_contract_rejects_hash_mismatch(tmp_path: Path):
@@ -1238,6 +1599,40 @@ def test_contract_improve_cli_interactive_writes_answers_and_output(
     assert "## Scope" in output
     assert "- Add invite creation and acceptance endpoints." in output
     assert "## Open questions" in output
+
+
+def test_contract_improve_cli_interactive_prefills_existing_answers_for_line_editing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    hooks = []
+    inserted = []
+    bindings = []
+    prompts = []
+
+    fake_readline = types.SimpleNamespace(
+        parse_and_bind=lambda binding: bindings.append(binding),
+        insert_text=lambda text: inserted.append(text),
+        set_startup_hook=lambda hook=None: hooks.append(hook),
+    )
+    monkeypatch.setitem(sys.modules, "readline", fake_readline)
+
+    with patch("builtins.input", side_effect=lambda prompt: prompts.append(prompt) or "Edited answer"):
+        response, default_inserted = _read_interactive_contract_answer("Answer [scope.boundaries]", "Existing answer")
+
+    assert response == "Edited answer"
+    assert default_inserted is True
+    assert prompts == ["Answer [scope.boundaries]: "]
+    assert bindings
+    assert hooks[0] is not None
+    hooks[0]()
+    assert inserted == ["Existing answer"]
+    assert hooks[-1] is None
+
+
+def test_contract_improve_cli_interactive_stores_empty_response_after_line_editing_clear():
+    assert _should_store_interactive_answer("", "Existing answer", default_inserted=True) is True
+    assert _should_store_interactive_answer("", "Existing answer", default_inserted=False) is False
+    assert _should_store_interactive_answer("Replacement", "Existing answer", default_inserted=True) is True
 
 
 def test_contract_improve_cli_interactive_rejects_stale_answers_before_prompting(
