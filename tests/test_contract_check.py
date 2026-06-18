@@ -2252,6 +2252,73 @@ def test_contract_prepare_cli_writes_ready_contract_without_answers(
     assert f"Next step: sikula run {output_path}" in out
 
 
+def test_contract_prepare_cli_project_context_blocker_does_not_write_answers_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.refined.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text(
+        """# Team invites
+
+## Scope
+- Add invite creation endpoint.
+- Add invite acceptance endpoint.
+- Add pending invite model.
+
+## Acceptance criteria
+- Owner/admin can invite a user by email.
+- Non-admin users cannot invite users.
+- Duplicate pending invite returns a deterministic error.
+- Expired invite token cannot be accepted.
+- Accepted invite token cannot be reused.
+
+## Security and privacy
+- Invite tokens must be unguessable.
+- Invite tokens must not be logged.
+- Error messages must not reveal whether an email already has an account.
+
+## Out of scope
+- Billing seat enforcement.
+- Bulk invites.
+- Full team settings redesign.
+
+## Tests
+- Permission tests for allowed and denied inviter roles.
+- Token lifecycle tests for expired and reused tokens.
+- Duplicate invite test.
+
+## Validation
+- `pytest`
+- `ruff check .`
+
+## Reviewer focus
+- Authorization rules.
+- Token expiry and reuse.
+- Email enumeration behaviour.
+""",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / ".sikula" / "contracts" / "team-invites.contract.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": []}),
+        patch("sys.argv", ["sikula", "contract", "prepare", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    assert exc.value.code == 1
+    assert not output_path.exists()
+    assert not (tmp_path / ".sikula" / "contract-reports").exists()
+    assert "Contract preparation needs project context before writing an implementation contract." in out
+    assert "No effective validation commands were found in the Sikula project config." in out
+    assert "Contract preparation answers template written:" not in out
+    assert "Fill the answers file" not in out
+    assert "sikula contract prepare" in out
+
+
 def test_contract_prepare_cli_existing_output_prints_hint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
     task_path = tmp_path / ".sikula" / "tasks" / "team-invites.refined.md"
     task_path.parent.mkdir(parents=True)

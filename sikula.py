@@ -1037,6 +1037,28 @@ def _print_open_question_details(user_questions: list[dict]) -> None:
             print(f"{index}. {question_text}")
 
 
+def _print_contract_prepare_project_context_required(result, task_file: str) -> None:
+    blocker_messages = {
+        "missing_project_context": "No project context was provided.",
+        "missing_validation_commands": "No effective validation commands were found in the Sikula project config.",
+    }
+    print("Contract preparation needs project context before writing an implementation contract.")
+    blockers = [
+        blocker_messages.get(str(blocker), str(blocker))
+        for blocker in getattr(result, "ready_to_run_blockers", [])
+        if str(blocker) in blocker_messages
+    ]
+    if blockers:
+        print("Project context blockers:")
+        for blocker in blockers:
+            print(f"- {blocker}")
+    _print_open_question_details(getattr(result, "user_questions", []))
+    print("Next step:")
+    print("- Run from a Sikula-configured project, or pass --config /path/to/.sikula/config.yaml.")
+    print("- Configure effective build, test, lint, or check validation commands, then rerun:")
+    print(f"  sikula contract prepare {task_file}")
+
+
 def _print_existing_output_next_step_note(output_path: Path) -> None:
     print("Output note:")
     print(f"- {output_path} already exists.")
@@ -1142,6 +1164,12 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         answers=answers,
         project_context=project_context,
     )
+    if result.required_next_step == "provide_project_context":
+        _print_contract_prepare_project_context_required(result, args.task_file)
+        if output_path.exists():
+            _print_existing_output_next_step_note(output_path)
+        sys.exit(1)
+
     if result.needs_user_input and not answers_supplied:
         answers_path = _write_prepare_answers_template(
             generated_by="sikula.contract_prepare",
