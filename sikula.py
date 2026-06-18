@@ -1410,7 +1410,23 @@ def _write_prepare_answers_template(
 def _prepare_answers_path(source_path: Path, cfg: dict, *, generated_by: str) -> Path:
     phase = generated_by.removeprefix("sikula.").replace("_", "-")
     stem = _strip_known_task_suffixes(source_path.stem)
-    return _resolve_contract_report_dir(cfg) / f"{stem}.{phase}.answers.yaml"
+    return _prepare_answers_report_dir(source_path, cfg) / f"{stem}.{phase}.answers.yaml"
+
+
+def _prepare_answers_report_dir(source_path: Path, cfg: dict) -> Path:
+    if cfg.get("_config_path"):
+        return _resolve_contract_report_dir(cfg)
+    return _infer_task_local_contract_report_dir(source_path)
+
+
+def _infer_task_local_contract_report_dir(source_path: Path) -> Path:
+    resolved = source_path.resolve()
+    for parent in resolved.parents:
+        if parent.name == "tasks" and parent.parent.name == ".sikula":
+            return parent.parent / "contract-reports"
+        if parent.name == ".sikula":
+            return parent / "contract-reports"
+    return Path.cwd().resolve() / ".sikula" / "contract-reports"
 
 
 def _prepare_answers_template(

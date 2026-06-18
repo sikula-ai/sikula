@@ -1982,6 +1982,34 @@ def test_task_refine_cli_without_answers_writes_template_before_output(
     assert {"scope.boundaries", "acceptance.criteria"}.issubset(answers["answers"])
 
 
+def test_task_refine_cli_without_config_uses_task_local_answers_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    caller_dir = tmp_path / "caller"
+    caller_dir.mkdir()
+    task_dir = tmp_path / "repo" / ".sikula" / "tasks"
+    task_dir.mkdir(parents=True)
+    task_path = task_dir / "team-invites.md"
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = task_dir / "team-invites.refined.md"
+    monkeypatch.chdir(caller_dir)
+
+    with (
+        patch("sys.argv", ["sikula", "task", "refine", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    task_report_dir = tmp_path / "repo" / ".sikula" / "contract-reports"
+    caller_report_dir = caller_dir / ".sikula" / "contract-reports"
+    assert exc.value.code == 1
+    assert "Task refinement answers template written:" in out
+    assert (task_report_dir / "team-invites.task-refine.answers.yaml").exists()
+    assert not caller_report_dir.exists()
+    assert not output_path.exists()
+
+
 def test_task_refine_cli_regenerates_stale_default_answers_template(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ):
