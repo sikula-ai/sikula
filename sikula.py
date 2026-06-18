@@ -1126,6 +1126,19 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
 
     task_text = task_path.read_text(encoding="utf-8")
     project_context = _prepare_project_context_from_config(cfg)
+    output_path = _resolve_output_path(args.output) if args.output else _default_contract_path(task_path, cfg)
+    if project_context is None or not project_context.get("validation_commands"):
+        result = prepare_implementation_contract(
+            task_text,
+            contract_name=output_path.name,
+            project_context=project_context,
+        )
+        if result.required_next_step == "provide_project_context":
+            _print_contract_prepare_project_context_required(result, args.task_file)
+            if output_path.exists():
+                _print_existing_output_next_step_note(output_path)
+            sys.exit(1)
+
     answers: dict[str, dict] = {}
     answers_supplied = bool(args.interactive or args.answers)
     if args.interactive:
@@ -1157,7 +1170,6 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
             print(f"Failed to load contract answers: {exc}", file=sys.stderr)
             sys.exit(1)
 
-    output_path = _resolve_output_path(args.output) if args.output else _default_contract_path(task_path, cfg)
     result = prepare_implementation_contract(
         task_text,
         contract_name=output_path.name,
@@ -1483,26 +1495,33 @@ def _text_sha256(text: str) -> str:
     return "sha256:" + sha256(text.strip().encode("utf-8")).hexdigest()
 
 
-def _prepare_project_context_from_config(cfg: dict) -> dict:
+def _prepare_project_context_from_config(cfg: dict) -> dict | None:
     from core.state import TaskState
     from core.validation_coverage import configured_validation_commands
 
-    effective = _contract_cli_project_config(cfg) or {}
-    state = TaskState(task_id="contract_prepare", task_description="")
-    configured = configured_validation_commands(effective, state)
+    effective = _contract_cli_project_config(cfg)
+    if effective is None:
+        return None
     project = effective.get("project", {}) if isinstance(effective.get("project"), dict) else {}
     build = effective.get("build", {}) if isinstance(effective.get("build"), dict) else {}
+    build_tool = str(project.get("build_tool") or "").strip()
+    configured: list[dict[str, str]] = []
+    if build_tool in _SUPPORTED_BUILD_TOOLS:
+        state = TaskState(task_id="contract_prepare", task_description="")
+        configured = configured_validation_commands(effective, state)
     stack_parts = [
         str(project.get("language") or "").strip(),
         str(project.get("platform") or "").strip(),
-        str(project.get("build_tool") or "").strip(),
+        build_tool,
         str(project.get("ui") or "").strip(),
     ]
     stack = " / ".join(part for part in stack_parts if part and part != "TODO")
     return {
         "stack": stack or None,
         "package_manager": build.get("package_manager"),
-        "validation_commands": [entry["command"] for entry in configured if entry.get("command")],
+        "validation_commands": [
+            entry["command"] for entry in configured if entry.get("command") and entry.get("phase") != "check_autofix"
+        ],
     }
 
 
