@@ -47,6 +47,69 @@ def _ready_contract() -> str:
 """
 
 
+def test_prepare_task_description_response_returns_product_questions_without_delivery_fields(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+
+    response = contract_prepare_adapter.prepare_task_description_response(
+        "Users should be able to invite teammates by email.",
+        task_name="team-invites.md",
+    )
+
+    assert response["schema_version"] == 1
+    assert response["workflow"] == "prepare_task_description"
+    assert response["stage"] == "needs_user_input"
+    assert response["needs_user_input"] is True
+    assert response["required_next_step"] == "answer_questions"
+    assert response["required_user_action"] == "answer_task_description_questions"
+    assert response["user_questions"]
+    assert "acceptance.criteria" in response["answers_template"]
+    assert response["authoritative_output_markdown"] == response["prepared_task_markdown"]
+    assert "ready_to_run" not in response
+    assert "ready_to_save" not in response
+    assert "ready_to_run_blockers" not in response
+    assert "check" not in response
+    assert "recheck" not in response
+    assert not (tmp_path / ".sikula").exists()
+
+
+def test_prepare_task_description_response_ready_result_points_to_contract_preparation():
+    response = contract_prepare_adapter.prepare_task_description_response(
+        """# Add team invites
+
+## Goal
+
+Users should be able to invite teammates by email.
+
+## Scope
+
+- Add invite creation from team settings.
+- Send the invite to the entered email address.
+- Keep existing billing unchanged.
+
+## Acceptance criteria
+
+- A valid email can be invited.
+- Duplicate pending invites show a deterministic error.
+- Empty emails are rejected.
+- Existing members are not invited again.
+
+## Out of scope
+
+- Billing seat enforcement.
+- Bulk invites.
+""",
+        task_name="team-invites.md",
+    )
+
+    assert response["workflow"] == "prepare_task_description"
+    assert response["needs_user_input"] is False
+    assert response["required_next_step"] == "prepare_implementation_contract"
+    assert response["primary_user_action"] == "prepare_implementation_contract"
+    assert response["user_questions"] == []
+
+
 def test_prepare_response_returns_questions_without_file_side_effects(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
@@ -60,6 +123,8 @@ def test_prepare_response_returns_questions_without_file_side_effects(tmp_path: 
     assert response["stage"] == "needs_project_context"
     assert response["needs_user_input"] is True
     assert response["ready_to_run"] is False
+    assert "ready_to_run_blockers" in response
+    assert "check" in response
     assert response["required_next_step"] == "provide_project_context"
     assert response["user_questions"]
     assert response["ready_to_run_blockers"][0] == "missing_project_context"
@@ -125,7 +190,64 @@ def test_prepare_response_marks_repeated_answer_questions():
     assert response["anti_loop_guidance"]["max_prepare_attempts_without_new_user_input"] == 1
 
 
-def test_prepare_response_adapter_only_maps_core_result(monkeypatch):
+def test_prepare_task_description_response_adapter_only_maps_core_result(monkeypatch):
+    class FakeResult:
+        def to_dict(self) -> dict[str, Any]:
+            return {
+                "stage": "custom_stage",
+                "needs_user_input": False,
+                "required_next_step": "custom_next_step",
+                "answers_template": {"q": {"answer": ""}},
+                "resume_arguments": {"brief": "x"},
+                "authoritative_output_markdown": "x",
+                "suggested_next_steps": ["custom step"],
+                "user_questions": [{"id": "q"}],
+                "primary_user_action": "custom_action",
+                "required_user_action": "custom_action",
+                "assistant_response_markdown": "custom markdown",
+                "answered_question_ids": ["q"],
+                "open_question_ids": ["q"],
+                "revised_answer_question_ids": ["q"],
+                "anti_loop_guidance": {"custom": True},
+                "prepared_task_markdown": "x",
+                "assumptions": ["a"],
+                "non_goals": ["n"],
+                "ready_to_run": True,
+                "check": {"should": "not leak"},
+            }
+
+    def fake_prepare_task_description(*_args, **_kwargs):
+        return FakeResult()
+
+    monkeypatch.setattr(contract_prepare_adapter, "prepare_task_description", fake_prepare_task_description)
+
+    response = contract_prepare_adapter.prepare_task_description_response("brief")
+
+    assert response == {
+        "schema_version": 1,
+        "workflow": "prepare_task_description",
+        "stage": "custom_stage",
+        "needs_user_input": False,
+        "required_next_step": "custom_next_step",
+        "answers_template": {"q": {"answer": ""}},
+        "resume_arguments": {"brief": "x"},
+        "authoritative_output_markdown": "x",
+        "suggested_next_steps": ["custom step"],
+        "user_questions": [{"id": "q"}],
+        "primary_user_action": "custom_action",
+        "required_user_action": "custom_action",
+        "assistant_response_markdown": "custom markdown",
+        "answered_question_ids": ["q"],
+        "open_question_ids": ["q"],
+        "revised_answer_question_ids": ["q"],
+        "anti_loop_guidance": {"custom": True},
+        "prepared_task_markdown": "x",
+        "assumptions": ["a"],
+        "non_goals": ["n"],
+    }
+
+
+def test_prepare_implementation_contract_response_adapter_only_maps_core_result(monkeypatch):
     class FakeResult:
         def to_dict(self) -> dict[str, Any]:
             return {

@@ -38,6 +38,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   validation commands into the returned Markdown before rechecking readiness, so
   the prepared delivery artifact contains the technical context used for its
   `ready_to_run` decision.
+- Contract preparation adapters now expose separate MCP-ready response shapes for
+  product task-description preparation and implementation-contract preparation,
+  keeping implementation readiness fields out of product-task responses.
 - Task terminal summaries now include a platform-neutral audit report with validation status, review status, non-blocking audit warnings, and recovered issues such as validation failures fixed by the build/fix loop.
 - Failed validation records now include high-signal diagnostic summary lines, and task terminal summaries sample and deduplicate those lines across recovered build/test/check failures so successful self-healed runs still reveal the concrete compiler error, failed test, sanitized assertion failure, or linter rule that was repaired without echoing source-code frames or assertion values, with an explicit pointer to `sikula show` for full state details.
 - The test writer now more strongly prefers behavioural seams over broad source-inspection tests, especially for UI implementation details that cannot be meaningfully exercised by existing project test infrastructure.

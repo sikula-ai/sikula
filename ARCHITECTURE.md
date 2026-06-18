@@ -143,9 +143,10 @@ should not infer readiness separately. Chat/MCP callers must provide effective p
 context, especially validation commands, before the core result can report
 `ready_to_run=true`; client-reported local config presence is guidance only and is not a
 readiness signal.
-`core.contract_prepare_adapter` maps that core result into the stable
-`prepare_implementation_contract` response shape for future MCP transport without adding
-scoring or rewrite logic. These commands and helpers
+`core.contract_prepare_adapter` maps those core results into stable
+`prepare_task_description` and `prepare_implementation_contract` response shapes for
+future MCP transport without adding scoring or rewrite logic; task-description responses
+do not expose implementation-contract readiness fields. These commands and helpers
 do not create `TaskState`, start agents, create worktrees, or alter `review` flow. Fresh `sikula run
 TASK_FILE` uses the same deterministic checks to store a compact warning-only snapshot in
 `TaskState.implementation_contract` and print a one-line summary before agents start; it
