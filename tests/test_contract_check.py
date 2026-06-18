@@ -1100,6 +1100,29 @@ def test_contract_check_cli_json_without_project_config(tmp_path: Path, monkeypa
     assert not (tmp_path / ".sikula" / "contract-reports").exists()
 
 
+def test_contract_check_cli_write_report_without_config_uses_task_local_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    caller_dir = tmp_path / "caller"
+    caller_dir.mkdir()
+    task_dir = tmp_path / "repo" / ".sikula" / "tasks"
+    task_dir.mkdir(parents=True)
+    task_path = task_dir / "team-invites.md"
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    monkeypatch.chdir(caller_dir)
+
+    with patch("sys.argv", ["sikula", "contract", "check", str(task_path), "--write-report"]):
+        main()
+
+    out = capsys.readouterr().out
+    task_report_dir = tmp_path / "repo" / ".sikula" / "contract-reports"
+    caller_report_dir = caller_dir / ".sikula" / "contract-reports"
+    assert "Generated contract report artifacts:" in out
+    assert (task_report_dir / "team-invites.check.json").exists()
+    assert (task_report_dir / "team-invites.answers.yaml").exists()
+    assert not caller_report_dir.exists()
+
+
 def test_write_report_creates_check_json_and_answers_template(tmp_path: Path):
     task_dir = tmp_path / ".sikula" / "tasks"
     task_dir.mkdir(parents=True)

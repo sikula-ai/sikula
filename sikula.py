@@ -1088,12 +1088,13 @@ def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
     write_result = None
     if args.write_report:
         report_root = project_root if cfg.get("project", {}).get("root_path") else None
+        report_dir = _resolve_contract_report_dir(cfg) if cfg.get("_config_path") else None
         try:
             write_result = write_contract_report(
                 result,
                 task_path=task_path,
                 project_root=report_root,
-                report_dir=_resolve_contract_report_dir(cfg),
+                report_dir=report_dir,
             )
         except (OSError, ValueError) as exc:
             print(f"Failed to write contract report: {exc}", file=sys.stderr)
