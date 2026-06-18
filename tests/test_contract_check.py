@@ -100,6 +100,65 @@ def test_strong_task_is_ready_when_validation_is_covered(tmp_path: Path):
     assert result.sections_detected["validation"]
 
 
+def test_long_well_bounded_contract_does_not_warn_about_task_size(tmp_path: Path):
+    context = " ".join(["Existing API, service, route, model, and repository conventions should stay aligned."] * 125)
+    task = f"""# Team invites
+
+## Scope
+- Add invite creation endpoint.
+- Add invite acceptance endpoint.
+- Add pending invite model.
+
+## Acceptance criteria
+- Owner/admin can invite a user by email.
+- Non-admin users cannot invite users.
+- Duplicate pending invite returns a deterministic error.
+- Expired invite token cannot be accepted.
+- Accepted invite token cannot be reused.
+
+## Security and privacy
+- Invite tokens must be unguessable.
+- Invite tokens must not be logged.
+- Error messages must not reveal whether an email already has an account.
+
+## Out of scope
+- Billing seat enforcement.
+- Bulk invites.
+- Full team settings redesign.
+
+## Tests
+- Permission tests for allowed and denied inviter roles.
+- Token lifecycle tests for expired and reused tokens.
+- Duplicate invite test.
+
+## Validation
+- `pytest`
+- `ruff check .`
+
+## Reviewer focus
+- Authorization rules.
+- Token expiry and reuse.
+- Email enumeration behaviour.
+
+## Context
+- {context}
+"""
+
+    result = check_contract(task, source_path="task.md", project_config=_python_project_config(tmp_path))
+
+    assert result.ready_for_autonomous_delivery
+    assert "gap.task_size.too_large" not in {gap.id for gap in result.gaps}
+    assert "The task may be too large for a single autonomous delivery run." not in render_contract_check(result)
+
+
+def test_long_vague_task_still_warns_about_task_size():
+    task = "# Update product experience\n\n" + "Improve the product experience for users. " * 260
+
+    result = check_contract(task, configured_validation_commands=["pytest"])
+
+    assert "gap.task_size.too_large" in {gap.id for gap in result.gaps}
+
+
 def test_check_contract_ignores_generated_answer_markers():
     clean_task = """# Team invites
 
@@ -1839,6 +1898,8 @@ def test_task_refine_cli_interactive_writes_clean_refined_task(tmp_path: Path, m
             )
         if "acceptance.negative_cases" in prompt:
             return "Duplicate and invalid email invites show deterministic errors."
+        if "scope.out_of_scope" in prompt:
+            return "Do not add billing seat enforcement or team settings redesign."
         return ""
 
     with (
@@ -1859,6 +1920,7 @@ def test_task_refine_cli_interactive_writes_clean_refined_task(tmp_path: Path, m
     assert "sikula:generated" not in output
     assert "Add invite creation from team settings." in output
     assert "A valid email can be invited from team settings." in output
+    assert f"Next step: sikula contract prepare {output_path}" in out
 
 
 def test_task_refine_cli_without_answers_writes_template_before_output(
@@ -1884,11 +1946,59 @@ def test_task_refine_cli_without_answers_writes_template_before_output(
     assert not output_path.exists()
     assert "Task refinement needs answers before writing a refined task description." in out
     assert "Task refinement answers template written:" in out
+    assert "Open question details:" in out
+    assert "[scope.boundaries] What exactly is in scope" in out
     assert "contract prepare may still ask delivery questions" in out
     assert "sikula task refine" in out
     assert answers["generated_by"] == "sikula.task_refine"
     assert answers["task"]["sha256"].startswith("sha256:")
     assert {"scope.boundaries", "acceptance.criteria"}.issubset(answers["answers"])
+
+
+def test_task_refine_cli_with_partial_answers_prints_remaining_questions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.refined.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sys.argv", ["sikula", "task", "refine", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit),
+    ):
+        main()
+
+    capsys.readouterr()
+    answers_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.task-refine.answers.yaml"
+    answers = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+    answers["answers"]["scope.boundaries"]["answer"] = "Add invite creation from team settings."
+    answers_path.write_text(yaml.safe_dump(answers, sort_keys=False), encoding="utf-8")
+
+    with patch(
+        "sys.argv",
+        [
+            "sikula",
+            "task",
+            "refine",
+            str(task_path),
+            "--answers",
+            str(answers_path),
+            "--output",
+            str(output_path),
+        ],
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    assert output_path.exists()
+    assert "Refined task description written:" in out
+    assert "Applied answers: 1" in out
+    assert "Open question details:" in out
+    assert "[acceptance.criteria] What observable behaviours should prove this product task is complete?" in out
+    assert "Fill/update the answers file:" in out
+    assert "new --output path" in out
 
 
 def test_task_refine_cli_rejects_directory_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
@@ -1905,6 +2015,44 @@ def test_task_refine_cli_rejects_directory_input(tmp_path: Path, monkeypatch: py
     err = capsys.readouterr().err
     assert exc.value.code == 1
     assert "Task path is not a file:" in err
+
+
+def test_task_refine_cli_existing_output_prints_hint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
+    task_path = tmp_path / ".sikula" / "tasks" / "country-search.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text(
+        """# Add country search
+
+## Scope
+- Add search by country name.
+- Keep region filtering unchanged.
+- Keep country sorting unchanged.
+
+## Acceptance criteria
+- Typing a country name filters the list.
+- Matching is case-insensitive.
+- Clearing the search restores the full list.
+
+## Out of scope
+- Do not add server-side search.
+- Do not redesign country rows.
+""",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / ".sikula" / "tasks" / "country-search.refined.md"
+    output_path.write_text("# Existing refined task\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sys.argv", ["sikula", "task", "refine", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    err = capsys.readouterr().err
+    assert exc.value.code == 1
+    assert "refusing to overwrite existing output file" in err
+    assert "Choose a new --output path" in err
 
 
 def test_contract_prepare_cli_interactive_prefills_existing_answers_for_line_editing(
@@ -2030,6 +2178,8 @@ def test_contract_prepare_cli_without_answers_writes_template_before_output(
     assert not output_path.exists()
     assert "Contract preparation needs answers before writing an implementation contract." in out
     assert "Contract preparation answers template written:" in out
+    assert "Open question details:" in out
+    assert "[acceptance.criteria] What observable behaviours must be true" in out
     assert "sikula contract prepare" in out
     assert answers["generated_by"] == "sikula.contract_prepare"
     assert answers["task"]["sha256"].startswith("sha256:")
@@ -2099,6 +2249,72 @@ def test_contract_prepare_cli_writes_ready_contract_without_answers(
     assert not (tmp_path / ".sikula" / "contract-reports").exists()
     assert "Implementation contract written:" in out
     assert "Open questions:" in out
+    assert f"Next step: sikula run {output_path}" in out
+
+
+def test_contract_prepare_cli_existing_output_prints_hint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.refined.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text(
+        """# Team invites
+
+## Scope
+- Add invite creation endpoint.
+- Add invite acceptance endpoint.
+- Add pending invite model.
+
+## Acceptance criteria
+- Owner/admin can invite a user by email.
+- Non-admin users cannot invite users.
+- Duplicate pending invite returns a deterministic error.
+- Expired invite token cannot be accepted.
+- Accepted invite token cannot be reused.
+
+## Security and privacy
+- Invite tokens must be unguessable.
+- Invite tokens must not be logged.
+- Error messages must not reveal whether an email already has an account.
+
+## Out of scope
+- Billing seat enforcement.
+- Bulk invites.
+- Full team settings redesign.
+
+## Tests
+- Permission tests for allowed and denied inviter roles.
+- Token lifecycle tests for expired and reused tokens.
+- Duplicate invite test.
+
+## Validation
+- `pytest`
+- `ruff check .`
+
+## Reviewer focus
+- Authorization rules.
+- Token expiry and reuse.
+- Email enumeration behaviour.
+""",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / ".sikula" / "contracts" / "team-invites.contract.md"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("# Existing contract\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch(
+            "sikula._prepare_project_context_from_config",
+            return_value={"validation_commands": ["pytest", "ruff check ."]},
+        ),
+        patch("sys.argv", ["sikula", "contract", "prepare", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    err = capsys.readouterr().err
+    assert exc.value.code == 1
+    assert "refusing to overwrite existing output file" in err
+    assert "Choose a new --output path" in err
 
 
 def test_contract_check_cli_json_write_report_stays_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):

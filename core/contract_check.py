@@ -493,9 +493,9 @@ def check_contract(
         "testability": _score_testability(parsed, sections_detected, validation),
         "validation": _score_validation(validation),
         "reviewer_focus": _score_reviewer_focus(parsed, sections_detected, security_sensitive),
-        "task_size": _score_task_size(parsed),
         "repo_context_sufficiency": _score_repo_context(parsed, security_sensitive),
     }
+    scores["task_size"] = _score_task_size(parsed, scores)
     weighted_score = _weighted_score(scores)
 
     gaps = _build_gaps(parsed, sections_detected, scores, validation, security_sensitive)
@@ -2812,7 +2812,17 @@ def _score_reviewer_focus(
     return 78
 
 
-def _score_task_size(parsed: _ParsedTask) -> int:
+def _large_task_has_clear_delivery_boundary(scores: dict[str, int]) -> bool:
+    return (
+        scores["scope_clarity"] >= 75
+        and scores["acceptance_criteria"] >= 75
+        and scores["out_of_scope"] >= 80
+        and scores["testability"] >= 65
+        and scores["validation"] >= 65
+    )
+
+
+def _score_task_size(parsed: _ParsedTask, scores: dict[str, int]) -> int:
     if parsed.word_count < 8:
         return 15
     if parsed.word_count < 35:
@@ -2821,6 +2831,8 @@ def _score_task_size(parsed: _ParsedTask) -> int:
         return 90
     if parsed.word_count <= 1000:
         return 65
+    if _large_task_has_clear_delivery_boundary(scores):
+        return 85
     return 35
 
 
@@ -3019,7 +3031,7 @@ def _build_gaps(
                 "The task is too short to serve as an implementation contract.",
             )
         )
-    elif parsed.word_count > 1000:
+    elif parsed.word_count > 1000 and not _large_task_has_clear_delivery_boundary(scores):
         gaps.append(
             ContractGap(
                 "gap.task_size.too_large",

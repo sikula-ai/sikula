@@ -978,14 +978,18 @@ def cmd_task_refine(args: argparse.Namespace, cfg: dict) -> None:
         print(f"Task refinement answers template written: {answers_path}")
         print(f"Applied answers: {len(result.answered_question_ids)}")
         print(f"Open questions: {len(result.open_question_ids)}")
+        _print_open_question_details(result.user_questions)
         _print_task_refinement_scope_note()
         print("Next step:")
         print(f"- Fill the answers file, then run: sikula task refine {args.task_file} --answers {answers_path}")
         print(f"- Or answer in the terminal: sikula task refine {args.task_file} --interactive")
+        if output_path.exists():
+            _print_existing_output_next_step_note(output_path)
         sys.exit(1)
 
     if output_path.exists():
         print(f"Failed to refine task: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
+        _print_existing_output_hint(output_path)
         sys.exit(1)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -994,17 +998,55 @@ def cmd_task_refine(args: argparse.Namespace, cfg: dict) -> None:
     print(f"Refined task description written: {output_path}")
     print(f"Applied answers: {len(result.answered_question_ids)}")
     print(f"Open questions: {len(result.open_question_ids)}")
+    _print_open_question_details(result.user_questions)
     _print_task_refinement_scope_note()
     if result.needs_user_input:
-        print("Next step: answer the open product task questions, then run task refine again.")
+        answers_path = (
+            _resolve_answers_path(args.answers)
+            if args.answers
+            else _prepare_answers_path(
+                task_path,
+                cfg,
+                generated_by="sikula.task_refine",
+            )
+        )
+        print("Next step:")
+        print(f"- Fill/update the answers file: {answers_path}")
+        print("- Then rerun task refine with a new --output path, or remove/rename the output written above first.")
     else:
-        print("Next step: sikula contract prepare")
+        print(f"Next step: sikula contract prepare {output_path}")
 
 
 def _print_task_refinement_scope_note() -> None:
     print(
         "Note: task refine only resolves product task-description questions; "
         "contract prepare may still ask delivery questions."
+    )
+
+
+def _print_open_question_details(user_questions: list[dict]) -> None:
+    if not user_questions:
+        return
+    print("Open question details:")
+    for index, question in enumerate(user_questions, start=1):
+        question_id = str(question.get("id") or "").strip()
+        question_text = str(question.get("question") or "").strip()
+        if question_id and question_text:
+            print(f"{index}. [{question_id}] {question_text}")
+        elif question_text:
+            print(f"{index}. {question_text}")
+
+
+def _print_existing_output_next_step_note(output_path: Path) -> None:
+    print("Output note:")
+    print(f"- {output_path} already exists.")
+    print("- Choose a new --output path, or remove/rename that file before rerunning.")
+
+
+def _print_existing_output_hint(output_path: Path) -> None:
+    print(f"Hint: {output_path} already exists.", file=sys.stderr)
+    print(
+        "Choose a new --output path, or remove/rename the existing file if you intend to replace it.", file=sys.stderr
     )
 
 
@@ -1113,13 +1155,17 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         print(f"Contract preparation answers template written: {answers_path}")
         print(f"Applied answers: {len(result.answered_question_ids)}")
         print(f"Open questions: {len(result.open_question_ids)}")
+        _print_open_question_details(result.user_questions)
         print("Next step:")
         print(f"- Fill the answers file, then run: sikula contract prepare {args.task_file} --answers {answers_path}")
         print(f"- Or answer in the terminal: sikula contract prepare {args.task_file} --interactive")
+        if output_path.exists():
+            _print_existing_output_next_step_note(output_path)
         sys.exit(1)
 
     if output_path.exists():
         print(f"Failed to prepare contract: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
+        _print_existing_output_hint(output_path)
         sys.exit(1)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1130,6 +1176,28 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
     print(f"Open questions: {len(result.open_question_ids)}")
     print("")
     print(render_contract_check(result.recheck_result or result.check_result), end="")
+    if result.ready_to_run:
+        print("")
+        print(f"Next step: sikula run {output_path}")
+    elif result.needs_user_input:
+        answers_path = (
+            _resolve_answers_path(args.answers)
+            if args.answers
+            else _prepare_answers_path(
+                task_path,
+                cfg,
+                generated_by="sikula.contract_prepare",
+            )
+        )
+        print("")
+        print("Next step:")
+        print(f"- Fill/update the answers file: {answers_path}")
+        print(
+            "- Then rerun contract prepare with a new --output path, or remove/rename the output written above first."
+        )
+    else:
+        print("")
+        print(f"Next step: review the contract check output above before running sikula run {output_path}")
 
 
 def _resolve_answers_path(value: str) -> Path:
