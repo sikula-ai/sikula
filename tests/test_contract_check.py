@@ -15,11 +15,13 @@ from core.contract_check import (
     check_contract_file,
     improve_contract_text,
     improve_contract_from_answers,
+    load_generated_answer_entries_for_contract,
     prepare_implementation_contract,
     render_contract_check,
     write_contract_report,
+    write_prepared_contract,
 )
-from sikula import _read_interactive_contract_answer, _should_store_interactive_answer, main
+from sikula import _prepare_answers_path, _read_interactive_contract_answer, _should_store_interactive_answer, main
 
 
 def _python_project_config(tmp_path: Path) -> dict:
@@ -1932,7 +1934,9 @@ def test_contract_prepare_cli_uses_metadata_for_later_answer_revisions(
 ):
     task_path = tmp_path / ".sikula" / "tasks" / "dashboard-filter.md"
     task_path.parent.mkdir(parents=True)
-    task_path.write_text("# Add dashboard filter\n\nUsers should be able to filter dashboard entries.", encoding="utf-8")
+    task_path.write_text(
+        "# Add dashboard filter\n\nUsers should be able to filter dashboard entries.", encoding="utf-8"
+    )
     result = check_contract_file(task_path, project_config=_python_project_config(tmp_path))
     written = write_contract_report(result, task_path=task_path, project_root=tmp_path)
     answers = yaml.safe_load(written.answers_path.read_text(encoding="utf-8"))
@@ -2006,6 +2010,64 @@ def test_contract_prepare_cli_uses_metadata_for_later_answer_revisions(
     assert "- `pytest`" not in second_output
     assert "- `ruff check .`" in second_output
     assert "sikula:generated-answer" not in second_output
+
+
+def test_write_prepared_contract_loads_metadata_and_ignores_stale_or_invalid_entries(tmp_path: Path):
+    result = prepare_implementation_contract(
+        "# Add dashboard filter\n\nUsers should be able to filter dashboard entries.",
+        contract_name="dashboard-filter.contract.md",
+        answers={
+            "scope.boundaries": "Add filtering by label.",
+            "acceptance.criteria": "Users can filter dashboard entries by label. No matches show an empty state.",
+            "scope.out_of_scope": "Do not redesign the dashboard.",
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+    output_path = tmp_path / ".sikula" / "contracts" / "dashboard-filter.contract.md"
+    written = write_prepared_contract(result, output_path=output_path, project_root=tmp_path)
+    output_text = output_path.read_text(encoding="utf-8")
+
+    entries = load_generated_answer_entries_for_contract(output_path, source_text=output_text, project_root=tmp_path)
+    assert {entry["question_id"] for entry in entries} == {
+        "scope.boundaries",
+        "scope.out_of_scope",
+        "project_context.validation_commands",
+    }
+
+    assert (
+        load_generated_answer_entries_for_contract(
+            output_path,
+            source_text=output_text + "\nmanual edit",
+            project_root=tmp_path,
+        )
+        == []
+    )
+
+    written.generated_answers_path.write_text("{not json", encoding="utf-8")
+    assert load_generated_answer_entries_for_contract(output_path, source_text=output_text, project_root=tmp_path) == []
+
+
+def test_write_prepared_contract_uses_hashed_metadata_for_same_stem_outputs(tmp_path: Path):
+    result = prepare_implementation_contract(
+        "# Add invite flow\n\nUsers should be able to invite teammates.",
+        contract_name="invite.contract.md",
+        answers={
+            "scope.boundaries": "Add invite creation.",
+            "acceptance.criteria": "Owners can invite teammates by email.",
+            "scope.out_of_scope": "Billing changes are out of scope.",
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+    first_output_path = tmp_path / ".sikula" / "contracts" / "web" / "invite.contract.md"
+    second_output_path = tmp_path / ".sikula" / "contracts" / "mobile" / "invite.contract.md"
+
+    first_written = write_prepared_contract(result, output_path=first_output_path, project_root=tmp_path)
+    second_written = write_prepared_contract(result, output_path=second_output_path, project_root=tmp_path)
+
+    assert first_written.generated_answers_path.name == "invite.contract.generated-answers.json"
+    assert second_written.generated_answers_path.name.startswith("invite.contract-")
+    assert second_written.generated_answers_path.name.endswith(".generated-answers.json")
+    assert first_written.generated_answers_path != second_written.generated_answers_path
 
 
 def test_contract_prepare_cli_interactive_writes_answers_and_output(
@@ -2501,6 +2563,97 @@ def test_contract_prepare_cli_same_stem_answers_templates_use_task_specific_path
     hashed_answers = yaml.safe_load(hashed_answers_paths[0].read_text(encoding="utf-8"))
     assert base_answers["task"]["path"] == ".sikula/tasks/web/invite.md"
     assert hashed_answers["task"]["path"] == ".sikula/tasks/mobile/invite.md"
+
+
+def test_prepare_answers_path_rejects_base_and_hashed_collisions(tmp_path: Path):
+    source_path = tmp_path / ".sikula" / "tasks" / "mobile" / "invite.md"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("# Add mobile invite\n", encoding="utf-8")
+    report_dir = tmp_path / ".sikula" / "contract-reports"
+    report_dir.mkdir(parents=True)
+    cfg = {
+        "_config_path": str(tmp_path / ".sikula" / "config.yaml"),
+        "project": {"root_path": str(tmp_path)},
+        "tasks": {"contract_report_dir": ".sikula/contract-reports"},
+    }
+    base_path = report_dir / "invite.contract-prepare.answers.yaml"
+    hashed_path = report_dir / (
+        f"invite-{sha256(str(source_path.resolve()).encode('utf-8')).hexdigest()[:8]}.contract-prepare.answers.yaml"
+    )
+    other_task_template = {
+        "schema_version": 1,
+        "generated_by": "sikula.contract_prepare",
+        "task": {
+            "path": ".sikula/tasks/web/invite.md",
+            "sha256": "sha256:other",
+        },
+        "answers": {},
+    }
+    base_path.write_text(yaml.safe_dump(other_task_template, sort_keys=False), encoding="utf-8")
+    hashed_path.write_text(yaml.safe_dump(other_task_template, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="answers path already exists for a different task"):
+        _prepare_answers_path(source_path, cfg, generated_by="sikula.contract_prepare")
+
+
+@pytest.mark.parametrize(
+    "base_contents",
+    [
+        "not: [valid",
+        "- not a mapping\n",
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "generated_by": "sikula.contract_check",
+                "task": {"path": ".sikula/tasks/mobile/invite.md"},
+            },
+            sort_keys=False,
+        ),
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "generated_by": "sikula.contract_prepare",
+                "task": {"path": ""},
+            },
+            sort_keys=False,
+        ),
+    ],
+)
+def test_prepare_answers_path_hashes_when_base_file_is_not_same_prepare_task(
+    tmp_path: Path,
+    base_contents: str,
+):
+    source_path = tmp_path / ".sikula" / "tasks" / "mobile" / "invite.md"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("# Add mobile invite\n", encoding="utf-8")
+    report_dir = tmp_path / ".sikula" / "contract-reports"
+    report_dir.mkdir(parents=True)
+    cfg = {
+        "_config_path": str(tmp_path / ".sikula" / "config.yaml"),
+        "project": {"root_path": str(tmp_path)},
+        "tasks": {"contract_report_dir": ".sikula/contract-reports"},
+    }
+    base_path = report_dir / "invite.contract-prepare.answers.yaml"
+    base_path.write_text(base_contents, encoding="utf-8")
+
+    answers_path = _prepare_answers_path(source_path, cfg, generated_by="sikula.contract_prepare")
+
+    assert answers_path != base_path
+    assert answers_path.name.startswith("invite-")
+    assert answers_path.name.endswith(".contract-prepare.answers.yaml")
+
+
+def test_prepare_answers_path_without_config_falls_back_to_cwd_reports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source_path = tmp_path / "task.md"
+    source_path.write_text("# Add task\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    answers_path = _prepare_answers_path(source_path, {}, generated_by="sikula.task_refine")
+
+    assert answers_path == tmp_path / ".sikula" / "contract-reports" / "task.task-refine.answers.yaml"
 
 
 def test_contract_prepare_cli_regenerates_stale_default_answers_template(

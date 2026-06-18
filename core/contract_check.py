@@ -1047,9 +1047,7 @@ def _answered_generated_entry_ids(
 ) -> list[str]:
     normalized_answers = _normalize_contract_answers(answers)
     entry_ids = {
-        str(entry.get("question_id") or "").strip()
-        for entry in generated_answer_entries
-        if isinstance(entry, dict)
+        str(entry.get("question_id") or "").strip() for entry in generated_answer_entries if isinstance(entry, dict)
     }
     return [
         question_id
