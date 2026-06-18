@@ -666,6 +666,37 @@ def test_prepare_implementation_contract_replaces_revised_generated_answers():
     assert "- ok" not in second.prepared_contract_markdown
 
 
+def test_prepare_implementation_contract_clears_revised_generated_answers(tmp_path: Path):
+    first = prepare_implementation_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.md",
+        answers={"reviewer.focus": "Authorization checks and token lifecycle handling."},
+        project_context={"validation_commands": ["pytest"]},
+    )
+    output_path = tmp_path / ".sikula" / "contracts" / "team-invites.contract.md"
+    write_prepared_contract(first, output_path=output_path, project_root=tmp_path)
+    output_text = output_path.read_text(encoding="utf-8")
+    generated_answer_entries = load_generated_answer_entries_for_contract(
+        output_path,
+        source_text=output_text,
+        project_root=tmp_path,
+    )
+
+    assert "- Authorization checks and token lifecycle handling." in output_text
+
+    second = prepare_implementation_contract(
+        output_text,
+        contract_name="team-invites.md",
+        answers={"reviewer.focus": {"answer": "", "notes": ""}},
+        project_context={"validation_commands": ["pytest"]},
+        generated_answer_entries=generated_answer_entries,
+    )
+
+    assert "- Authorization checks and token lifecycle handling." not in second.prepared_contract_markdown
+    assert "reviewer.focus" not in second.answered_question_ids
+    assert "reviewer.focus" in second.open_question_ids
+
+
 def test_prepare_implementation_contract_resume_arguments_preserve_generated_markers_for_later_revisions():
     first = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",

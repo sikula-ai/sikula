@@ -1049,11 +1049,7 @@ def _answered_generated_entry_ids(
     entry_ids = {
         str(entry.get("question_id") or "").strip() for entry in generated_answer_entries if isinstance(entry, dict)
     }
-    return [
-        question_id
-        for question_id, answer in normalized_answers.items()
-        if question_id in entry_ids and _answer_text(answer)
-    ]
+    return [question_id for question_id in normalized_answers if question_id in entry_ids]
 
 
 def _generated_answer_questions_for_answers(
