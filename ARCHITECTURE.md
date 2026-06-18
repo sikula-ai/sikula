@@ -128,14 +128,17 @@ overwrites unless `--write` is explicitly used on a Markdown task; plain-text in
 improved only by writing a new Markdown output file. `--interactive` is a terminal
 convenience layer that creates or reuses the answers YAML, prompts for answers, saves that
 file, and then calls the same deterministic improve/recheck path. The same module also exposes
-side-effect-free in-memory helpers (`improve_contract_text()` and `prepare_contract()`) so
+side-effect-free in-memory helpers (`improve_contract_text()` and `prepare_implementation_contract()`) so
 chat/MCP adapters can reuse the same scoring, question, answer-application, and recheck
-logic without temporary YAML files or duplicate business rules. `prepare_contract()` returns
+logic without temporary YAML files or duplicate business rules. `prepare_implementation_contract()` returns
 the authoritative workflow state plus user-facing questions, safe `.sikula/tasks/...` path
 hints, resume arguments, revised-answer markers, and next-step guidance; adapters should not
-infer readiness separately. `core.contract_prepare_adapter` maps that core result into the
-stable `prepare_implementation_contract` response shape for future MCP transport without
-adding scoring or rewrite logic. These commands and helpers
+infer readiness separately. Chat/MCP callers must provide effective project context,
+especially validation commands, before the core result can report `ready_to_run=true`;
+client-reported local config presence is guidance only and is not a readiness signal.
+`core.contract_prepare_adapter` maps that core result into the stable
+`prepare_implementation_contract` response shape for future MCP transport without adding
+scoring or rewrite logic. These commands and helpers
 do not create `TaskState`, start agents, create worktrees, or alter `review` flow. Fresh `sikula run
 TASK_FILE` uses the same deterministic checks to store a compact warning-only snapshot in
 `TaskState.implementation_contract` and print a one-line summary before agents start; it

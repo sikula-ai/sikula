@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from core.contract_check import prepare_contract
+from core.contract_check import prepare_implementation_contract
 
 PREPARE_IMPLEMENTATION_CONTRACT_RESPONSE_SCHEMA_VERSION = 1
 
@@ -18,7 +18,7 @@ def prepare_implementation_contract_response(
 ) -> dict[str, Any]:
     """Return a stable response shape for chat/MCP prepare workflows."""
 
-    result = prepare_contract(
+    result = prepare_implementation_contract(
         contract_markdown,
         contract_name=contract_name,
         answers=answers,

@@ -15,7 +15,7 @@ from core.contract_check import (
     check_contract_file,
     improve_contract_text,
     improve_contract_from_answers,
-    prepare_contract,
+    prepare_implementation_contract,
     render_contract_check,
     write_contract_report,
 )
@@ -222,25 +222,28 @@ def test_check_contract_ignores_generated_open_questions_for_readiness():
     ]
 
 
-def test_prepare_contract_returns_questions_without_file_side_effects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_prepare_implementation_contract_returns_questions_and_requires_context_without_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     monkeypatch.chdir(tmp_path)
 
-    result = prepare_contract(
+    result = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
     )
 
-    assert result.stage == "needs_user_input"
+    assert result.stage == "needs_project_context"
     assert result.needs_user_input
     assert not result.ready_to_save
     assert not result.ready_to_run
-    assert result.required_next_step == "answer_questions"
+    assert result.required_next_step == "provide_project_context"
     assert "acceptance.criteria" in result.answers_template
     assert "token.lifecycle" in result.answers_template
     assert result.safe_task_path == ".sikula/tasks/team-invites.md"
-    assert result.required_user_action == "answer_contract_questions"
-    assert result.primary_user_action == "answer_contract_questions"
+    assert result.required_user_action == "provide_project_context"
+    assert result.primary_user_action == "provide_project_context"
     assert result.user_questions
+    assert result.ready_to_run_blockers[0] == "missing_project_context"
     assert result.open_question_ids == [question.id for question in result.questions_for_user]
     assert result.resume_arguments["contract_markdown"].startswith("# Add team invites")
     assert result.resume_arguments["status_applies_to_sha256"] == result.status_applies_to_sha256
@@ -251,10 +254,10 @@ def test_prepare_contract_returns_questions_without_file_side_effects(tmp_path: 
     assert not (tmp_path / ".sikula").exists()
 
 
-def test_prepare_contract_checks_normalized_output_without_answers():
+def test_prepare_implementation_contract_checks_normalized_output_without_answers():
     task = "# Add team invites\n\nUsers should be able to invite teammates by email."
 
-    result = prepare_contract(task, contract_name="team-invites.md")
+    result = prepare_implementation_contract(task, contract_name="team-invites.md")
 
     expected_markdown = task + "\n"
     expected_sha = "sha256:" + sha256(expected_markdown.encode("utf-8")).hexdigest()
@@ -266,7 +269,7 @@ def test_prepare_contract_checks_normalized_output_without_answers():
     assert result.resume_arguments["status_applies_to_sha256"] == expected_sha
 
 
-def test_prepare_contract_uses_project_context_validation_commands():
+def test_prepare_implementation_contract_uses_project_context_validation_commands():
     task = """# Add search
 
 ## Scope
@@ -286,7 +289,7 @@ def test_prepare_contract_uses_project_context_validation_commands():
 - `npm test`
 """
 
-    result = prepare_contract(
+    result = prepare_implementation_contract(
         task,
         contract_name="search.md",
         project_context={"validation_commands": ["npm test"]},
@@ -299,8 +302,8 @@ def test_prepare_contract_uses_project_context_validation_commands():
     assert all(gap.id != "gap.validation.coverage" for gap in result.unresolved_gaps)
 
 
-def test_prepare_contract_applies_answers_and_rechecks():
-    result = prepare_contract(
+def test_prepare_implementation_contract_applies_answers_and_rechecks():
+    result = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
         answers={
@@ -327,8 +330,8 @@ def test_prepare_contract_applies_answers_and_rechecks():
     }
 
 
-def test_prepare_contract_reconciles_open_questions_after_recheck():
-    result = prepare_contract(
+def test_prepare_implementation_contract_reconciles_open_questions_after_recheck():
+    result = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
         answers={
@@ -354,8 +357,8 @@ def test_prepare_contract_reconciles_open_questions_after_recheck():
     assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
 
 
-def test_prepare_contract_keeps_current_open_questions_after_final_recheck():
-    result = prepare_contract(
+def test_prepare_implementation_contract_keeps_current_open_questions_after_final_recheck():
+    result = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
         answers={
@@ -373,8 +376,8 @@ def test_prepare_contract_keeps_current_open_questions_after_final_recheck():
     assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
 
 
-def test_prepare_contract_splits_actual_newlines_in_text_answers():
-    result = prepare_contract(
+def test_prepare_implementation_contract_splits_actual_newlines_in_text_answers():
+    result = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
         answers={"scope.boundaries": "Create invites\nAccept invites"},
@@ -385,8 +388,8 @@ def test_prepare_contract_splits_actual_newlines_in_text_answers():
     assert "- Accept invites" in result.prepared_contract_markdown
 
 
-def test_prepare_contract_splits_actual_newlines_in_validation_answers():
-    result = prepare_contract(
+def test_prepare_implementation_contract_splits_actual_newlines_in_validation_answers():
+    result = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
         answers={"validation.commands": "pytest\nruff check ."},
@@ -398,8 +401,8 @@ def test_prepare_contract_splits_actual_newlines_in_validation_answers():
     assert "- `ruff check .`" in result.prepared_contract_markdown
 
 
-def test_prepare_contract_preserves_literal_backslash_n_in_validation_answers():
-    result = prepare_contract(
+def test_prepare_implementation_contract_preserves_literal_backslash_n_in_validation_answers():
+    result = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
         answers={"validation.commands": "python -c \"print('line\\nvalue')\""},
@@ -411,8 +414,8 @@ def test_prepare_contract_preserves_literal_backslash_n_in_validation_answers():
     assert "- `value')\"`" not in result.prepared_contract_markdown
 
 
-def test_prepare_contract_marks_repeated_questions_as_revised_answer_needed():
-    result = prepare_contract(
+def test_prepare_implementation_contract_marks_repeated_questions_as_revised_answer_needed():
+    result = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
         answers={"acceptance.negative_cases": "ok"},
@@ -431,8 +434,8 @@ def test_prepare_contract_marks_repeated_questions_as_revised_answer_needed():
     assert result.required_user_action == "answer_contract_questions"
 
 
-def test_prepare_contract_readiness_ignores_internal_answer_markers():
-    result = prepare_contract(
+def test_prepare_implementation_contract_readiness_ignores_internal_answer_markers():
+    result = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
         answers={
@@ -453,8 +456,8 @@ def test_prepare_contract_readiness_ignores_internal_answer_markers():
     assert "sikula:generated-" not in result.prepared_contract_markdown
 
 
-def test_prepare_contract_strips_stale_open_questions_between_answer_rounds():
-    first = prepare_contract(
+def test_prepare_implementation_contract_strips_stale_open_questions_between_answer_rounds():
+    first = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
         answers={"scope.boundaries": "Add invite creation and acceptance endpoints."},
@@ -466,7 +469,7 @@ def test_prepare_contract_strips_stale_open_questions_between_answer_rounds():
     assert "## Open questions" in first.prepared_contract_markdown
     assert stale_question in first.prepared_contract_markdown
 
-    second = prepare_contract(
+    second = prepare_implementation_contract(
         first.resume_arguments["contract_markdown"],
         contract_name="team-invites.md",
         answers={"acceptance.negative_cases": "Duplicate invites return a deterministic error."},
@@ -477,8 +480,8 @@ def test_prepare_contract_strips_stale_open_questions_between_answer_rounds():
     assert stale_question not in second.prepared_contract_markdown
 
 
-def test_prepare_contract_replaces_revised_generated_answers():
-    first = prepare_contract(
+def test_prepare_implementation_contract_replaces_revised_generated_answers():
+    first = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
         answers={"acceptance.negative_cases": "ok"},
@@ -488,7 +491,7 @@ def test_prepare_contract_replaces_revised_generated_answers():
     assert "acceptance.negative_cases" in first.revised_answer_question_ids
     assert "- ok" not in first.prepared_contract_markdown
 
-    second = prepare_contract(
+    second = prepare_implementation_contract(
         first.resume_arguments["contract_markdown"],
         contract_name="team-invites.md",
         answers={
@@ -507,8 +510,8 @@ def test_prepare_contract_replaces_revised_generated_answers():
     assert "- ok" not in second.prepared_contract_markdown
 
 
-def test_prepare_contract_resume_arguments_preserve_generated_markers_for_later_revisions():
-    first = prepare_contract(
+def test_prepare_implementation_contract_resume_arguments_preserve_generated_markers_for_later_revisions():
+    first = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
         answers={"validation.commands": "pytest"},
@@ -517,7 +520,7 @@ def test_prepare_contract_resume_arguments_preserve_generated_markers_for_later_
     assert "sikula:generated-answer" not in first.prepared_contract_markdown
     assert "<!-- sikula:generated-answer: validation.commands -->" in first.resume_arguments["contract_markdown"]
 
-    second = prepare_contract(
+    second = prepare_implementation_contract(
         first.resume_arguments["contract_markdown"],
         contract_name="team-invites.md",
         answers={"validation.commands": "ruff check ."},
@@ -530,14 +533,14 @@ def test_prepare_contract_resume_arguments_preserve_generated_markers_for_later_
     assert "validation.commands" not in second.revised_answer_question_ids
 
 
-def test_prepare_contract_preserves_resume_markers_without_new_answers():
-    first = prepare_contract(
+def test_prepare_implementation_contract_preserves_resume_markers_without_new_answers():
+    first = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
         answers={"validation.commands": "pytest"},
     )
 
-    idle = prepare_contract(
+    idle = prepare_implementation_contract(
         first.resume_arguments["contract_markdown"],
         contract_name="team-invites.md",
         project_context={"validation_commands": ["pytest"]},
@@ -546,7 +549,7 @@ def test_prepare_contract_preserves_resume_markers_without_new_answers():
     assert "sikula:generated-answer" not in idle.prepared_contract_markdown
     assert "<!-- sikula:generated-answer: validation.commands -->" in idle.resume_arguments["contract_markdown"]
 
-    second = prepare_contract(
+    second = prepare_implementation_contract(
         idle.resume_arguments["contract_markdown"],
         contract_name="team-invites.md",
         answers={"validation.commands": "ruff check ."},
@@ -558,7 +561,7 @@ def test_prepare_contract_preserves_resume_markers_without_new_answers():
     assert "validation.commands" not in second.revised_answer_question_ids
 
 
-def test_prepare_contract_preserves_human_open_questions_section():
+def test_prepare_implementation_contract_preserves_human_open_questions_section():
     task = """# Add team invites
 
 Users should be able to invite teammates by email.
@@ -568,7 +571,7 @@ Users should be able to invite teammates by email.
 - Confirm the invite email copy with product.
 """
 
-    result = prepare_contract(
+    result = prepare_implementation_contract(
         task,
         contract_name="team-invites.md",
         answers={"scope.boundaries": "Add invite creation and acceptance endpoints."},
@@ -579,15 +582,15 @@ Users should be able to invite teammates by email.
     assert "- Confirm the invite email copy with product." in result.prepared_contract_markdown
 
 
-def test_prepare_contract_resume_accepts_accumulated_answers():
-    first = prepare_contract(
+def test_prepare_implementation_contract_resume_accepts_accumulated_answers():
+    first = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
         contract_name="team-invites.md",
         answers={"scope.boundaries": "Add invite creation and acceptance endpoints."},
         project_context={"validation_commands": ["pytest"]},
     )
 
-    second = prepare_contract(
+    second = prepare_implementation_contract(
         first.resume_arguments["contract_markdown"],
         contract_name="team-invites.md",
         answers={
@@ -602,7 +605,7 @@ def test_prepare_contract_resume_accepts_accumulated_answers():
     assert "acceptance.negative_cases" in second.answered_question_ids
 
 
-def test_prepare_contract_ready_result_includes_safe_save_and_run_guidance():
+def test_prepare_implementation_contract_ready_result_includes_safe_save_and_run_guidance():
     task = """# Team invites
 
 ## Scope
@@ -642,11 +645,10 @@ def test_prepare_contract_ready_result_includes_safe_save_and_run_guidance():
 - Email enumeration behaviour.
 """
 
-    result = prepare_contract(
+    result = prepare_implementation_contract(
         task,
         contract_name="../../Team Invites; rm -rf *.md",
         project_context={
-            "sikula_configured": True,
             "validation_commands": ["pytest", "ruff check ."],
         },
     )
@@ -657,16 +659,15 @@ def test_prepare_contract_ready_result_includes_safe_save_and_run_guidance():
     assert result.safe_task_path == ".sikula/tasks/team-invites-rm-rf.md"
     assert result.suggested_next_steps == [
         "Save the prepared contract to `.sikula/tasks/team-invites-rm-rf.md`.",
-        "Run `sikula run .sikula/tasks/team-invites-rm-rf.md`.",
+        "Run `sikula run .sikula/tasks/team-invites-rm-rf.md` from a locally configured Sikula project.",
     ]
     assert result.resume_arguments["project_context"] == {
-        "sikula_configured": True,
         "validation_commands": ["pytest", "ruff check ."],
     }
     assert result.to_dict()["authoritative_output_markdown"] == result.prepared_contract_markdown
 
 
-def test_prepare_contract_ready_without_config_does_not_suggest_run():
+def test_prepare_implementation_contract_ready_without_project_context_requires_context():
     task = """# Country search
 
 ## Scope
@@ -697,16 +698,65 @@ def test_prepare_contract_ready_without_config_does_not_suggest_run():
 - Search/filter interaction.
 """
 
-    result = prepare_contract(
+    result = prepare_implementation_contract(
         task,
         contract_name="Country Search",
-        project_context={"validation_commands": ["npm test"]},
     )
 
-    assert result.ready_to_run
-    assert result.required_next_step == "save_and_run_contract"
-    assert any("sikula init" in step for step in result.suggested_next_steps)
+    assert result.stage == "needs_project_context"
+    assert result.needs_user_input is True
+    assert result.ready_to_save is False
+    assert result.ready_to_run is False
+    assert result.required_next_step == "provide_project_context"
+    assert result.required_user_action == "provide_project_context"
+    assert result.ready_to_run_blockers == ["missing_project_context"]
+    assert result.resume_arguments["project_context"] == {}
+    assert "validation_commands" in result.suggested_next_steps[0]
     assert all("sikula run" not in step for step in result.suggested_next_steps)
+
+
+def test_prepare_implementation_contract_empty_validation_context_blocks_run():
+    task = """# Country search
+
+## Scope
+- Add search by country name.
+- Keep sorting unchanged.
+
+## Acceptance criteria
+- Matching is case-insensitive.
+- Clearing search shows the full list.
+- No matching countries shows an empty state.
+
+## Out of scope
+- Do not add server-side search.
+
+## Tests
+- Search matching test.
+
+## Validation
+- `npm test`
+
+## Reviewer focus
+- Search/filter interaction.
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name="Country Search",
+        project_context={"sikula_configured": True, "validation_commands": []},
+    )
+
+    assert result.ready_to_save is False
+    assert result.ready_to_run is False
+    assert result.required_next_step == "provide_project_context"
+    assert "missing_validation_commands" in result.ready_to_run_blockers
+    assert result.resume_arguments["project_context"] == {
+        "validation_commands": [],
+        "delivery_environment": {
+            "local_sikula_config_present": True,
+            "source": "client_reported",
+        },
+    }
 
 
 def test_gap_and_question_ids_are_unique_within_result():

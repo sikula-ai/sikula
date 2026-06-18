@@ -281,7 +281,44 @@ class ContractTextImproveResult:
 
 
 @dataclass(frozen=True)
+class PrepareDeliveryEnvironment:
+    local_sikula_config_present: bool | None = None
+    source: str = "client_reported"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "local_sikula_config_present": self.local_sikula_config_present,
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True)
+class PrepareProjectContext:
+    validation_commands: list[str] = field(default_factory=list)
+    stack: str | None = None
+    package_manager: str | None = None
+    known_constraints: str | None = None
+    delivery_environment: PrepareDeliveryEnvironment | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "validation_commands": list(self.validation_commands),
+        }
+        if self.stack:
+            data["stack"] = self.stack
+        if self.package_manager:
+            data["package_manager"] = self.package_manager
+        if self.known_constraints:
+            data["known_constraints"] = self.known_constraints
+        if self.delivery_environment:
+            data["delivery_environment"] = self.delivery_environment.to_dict()
+        return data
+
+
+@dataclass(frozen=True)
 class ContractPrepareResult:
+    """Prepared implementation-contract workflow state for chat/API adapters."""
+
     stage: str
     needs_user_input: bool
     ready_to_save: bool
@@ -648,19 +685,21 @@ def improve_contract_text(
     )
 
 
-def prepare_contract(
-    contract_markdown: str,
+def prepare_implementation_contract(
+    task_description_markdown: str,
     contract_name: str | None = None,
     answers: dict[str, str | dict[str, Any]] | None = None,
-    project_context: dict | None = None,
+    project_context: PrepareProjectContext | dict[str, Any] | None = None,
 ) -> ContractPrepareResult:
     """Prepare an implementation contract through an in-memory check/improve loop."""
 
     source_format = "text" if contract_name and Path(contract_name).suffix.lower() == ".txt" else "markdown"
     project_config = None
-    validation_commands = _validation_commands_from_prepare_context(project_context)
-    safe_task_path = _safe_task_path_hint(contract_name, contract_markdown)
-    evaluation_contract_markdown = _strip_generated_markers(contract_markdown)
+    normalized_project_context = _normalize_prepare_project_context(project_context)
+    project_context_blockers = _prepare_project_context_blockers(normalized_project_context)
+    validation_commands = _validation_commands_from_prepare_context(normalized_project_context)
+    safe_task_path = _safe_task_path_hint(contract_name, task_description_markdown)
+    evaluation_contract_markdown = _strip_generated_markers(task_description_markdown)
     check_result = check_contract(
         evaluation_contract_markdown,
         source_path=contract_name,
@@ -675,7 +714,7 @@ def prepare_contract(
         # earlier answers are already represented in the returned Markdown.
         active_answers = _answers_for_questions(answers, check_result.clarifying_questions)
         improved = improve_contract_text(
-            contract_markdown,
+            task_description_markdown,
             contract_name=contract_name,
             questions=check_result.clarifying_questions,
             answers=active_answers,
@@ -686,7 +725,8 @@ def prepare_contract(
         )
         return _build_prepare_result(
             contract_name=contract_name,
-            project_context=project_context,
+            project_context=normalized_project_context,
+            project_context_blockers=project_context_blockers,
             safe_task_path=safe_task_path,
             check_result=check_result,
             recheck_result=improved.check_result,
@@ -709,19 +749,21 @@ def prepare_contract(
 
     return _build_prepare_result(
         contract_name=contract_name,
-        project_context=project_context,
+        project_context=normalized_project_context,
+        project_context_blockers=project_context_blockers,
         safe_task_path=safe_task_path,
         check_result=output_check_result,
         recheck_result=None,
         prepared_contract_markdown=prepared_contract_markdown,
-        resume_contract_markdown=contract_markdown.strip() + "\n",
+        resume_contract_markdown=task_description_markdown.strip() + "\n",
     )
 
 
 def _build_prepare_result(
     *,
     contract_name: str | None,
-    project_context: dict | None,
+    project_context: PrepareProjectContext | None,
+    project_context_blockers: list[str],
     safe_task_path: str,
     check_result: ContractCheckResult,
     recheck_result: ContractCheckResult | None,
@@ -736,12 +778,24 @@ def _build_prepare_result(
     active_question_ids = [question.id for question in questions_for_user]
     open_ids = list(dict.fromkeys([*(open_question_ids or []), *active_question_ids]))
     revised_answer_question_ids = [question.id for question in questions_for_user if question.id in set(answered_ids)]
-    needs_user_input = bool(questions_for_user)
-    ready_to_run = active_check.ready_for_autonomous_delivery
-    ready_to_save = not needs_user_input and active_check.status in {"ready", "warn"}
-    stage = "ready" if ready_to_run else "needs_user_input" if needs_user_input else "review"
+    has_contract_questions = bool(questions_for_user)
+    needs_user_input = has_contract_questions or bool(project_context_blockers)
+    ready_to_run = active_check.ready_for_autonomous_delivery and not project_context_blockers
+    ready_to_save = (
+        not has_contract_questions and active_check.status in {"ready", "warn"} and not project_context_blockers
+    )
+    stage = (
+        "ready"
+        if ready_to_run
+        else "needs_project_context"
+        if project_context_blockers
+        else "needs_user_input"
+        if has_contract_questions
+        else "review"
+    )
     required_next_step = _prepare_required_next_step(
-        needs_user_input=needs_user_input,
+        has_contract_questions=has_contract_questions,
+        project_context_blockers=project_context_blockers,
         ready_to_save=ready_to_save,
         ready_to_run=ready_to_run,
     )
@@ -758,10 +812,11 @@ def _build_prepare_result(
     suggested_next_steps = _prepare_suggested_next_steps(
         required_next_step=required_next_step,
         safe_task_path=safe_task_path,
-        sikula_configured=_prepare_sikula_configured(project_context),
     )
     assistant_response_markdown = _prepare_assistant_response_markdown(
         active_check=active_check,
+        project_context_blockers=project_context_blockers,
+        ready_to_run=ready_to_run,
         required_user_action=required_user_action,
         suggested_next_steps=suggested_next_steps,
         revised_answer_question_ids=revised_answer_question_ids,
@@ -779,7 +834,7 @@ def _build_prepare_result(
         recheck_result=recheck_result,
         unresolved_gaps=active_check.gaps,
         status_applies_to_sha256=str(active_check.source["sha256"]),
-        ready_to_run_blockers=_ready_to_run_blockers(active_check),
+        ready_to_run_blockers=_ready_to_run_blockers(active_check, project_context_blockers),
         answered_question_ids=answered_ids,
         open_question_ids=open_ids,
         revised_answer_question_ids=revised_answer_question_ids,
@@ -873,8 +928,16 @@ def _prepare_user_questions(
     return user_questions
 
 
-def _prepare_required_next_step(*, needs_user_input: bool, ready_to_save: bool, ready_to_run: bool) -> str:
-    if needs_user_input:
+def _prepare_required_next_step(
+    *,
+    has_contract_questions: bool,
+    project_context_blockers: list[str],
+    ready_to_save: bool,
+    ready_to_run: bool,
+) -> str:
+    if project_context_blockers:
+        return "provide_project_context"
+    if has_contract_questions:
         return "answer_questions"
     if ready_to_run:
         return "save_and_run_contract"
@@ -886,16 +949,18 @@ def _prepare_required_next_step(*, needs_user_input: bool, ready_to_save: bool, 
 def _required_user_action(required_next_step: str) -> str:
     return {
         "answer_questions": "answer_contract_questions",
+        "provide_project_context": "provide_project_context",
         "save_and_run_contract": "save_contract_and_run_sikula",
         "save_contract": "save_contract",
         "revise_contract": "revise_contract",
     }.get(required_next_step, "review_contract")
 
 
-def _ready_to_run_blockers(result: ContractCheckResult) -> list[str]:
-    if result.ready_for_autonomous_delivery:
+def _ready_to_run_blockers(result: ContractCheckResult, project_context_blockers: list[str]) -> list[str]:
+    if result.ready_for_autonomous_delivery and not project_context_blockers:
         return []
-    blockers = [gap.message for gap in result.gaps if gap.severity == "blocking"]
+    blockers = list(project_context_blockers)
+    blockers.extend(gap.message for gap in result.gaps if gap.severity == "blocking")
     if result.status != "ready":
         blockers.append(f"Readiness status is {result.status}, not ready.")
     if not blockers and result.gaps:
@@ -925,11 +990,71 @@ def _contract_path_source_name(contract_name: str | None, contract_markdown: str
     return "task"
 
 
+def _normalize_prepare_project_context(
+    project_context: PrepareProjectContext | dict[str, Any] | None,
+) -> PrepareProjectContext | None:
+    if project_context is None:
+        return None
+    if isinstance(project_context, PrepareProjectContext):
+        return project_context
+    if not isinstance(project_context, dict):
+        raise TypeError("project_context must be a PrepareProjectContext or dict")
+
+    delivery_environment = _normalize_prepare_delivery_environment(project_context)
+    validation_commands = _normalize_prepare_validation_commands(project_context.get("validation_commands"))
+    return PrepareProjectContext(
+        validation_commands=validation_commands,
+        stack=_prepare_optional_string(project_context.get("stack")),
+        package_manager=_prepare_optional_string(project_context.get("package_manager")),
+        known_constraints=_prepare_optional_string(project_context.get("known_constraints")),
+        delivery_environment=delivery_environment,
+    )
+
+
+def _normalize_prepare_delivery_environment(project_context: dict[str, Any]) -> PrepareDeliveryEnvironment | None:
+    value = project_context.get("delivery_environment")
+    if isinstance(value, PrepareDeliveryEnvironment):
+        return value
+    if isinstance(value, dict):
+        present = value.get("local_sikula_config_present")
+        return PrepareDeliveryEnvironment(
+            local_sikula_config_present=bool(present) if present is not None else None,
+            source=str(value.get("source") or "client_reported"),
+        )
+    if "sikula_configured" in project_context:
+        return PrepareDeliveryEnvironment(
+            local_sikula_config_present=bool(project_context.get("sikula_configured")),
+            source="client_reported",
+        )
+    return None
+
+
+def _normalize_prepare_validation_commands(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(command).strip() for command in value if str(command).strip()]
+
+
+def _prepare_optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _prepare_project_context_blockers(project_context: PrepareProjectContext | None) -> list[str]:
+    if project_context is None:
+        return ["missing_project_context"]
+    if not project_context.validation_commands:
+        return ["missing_validation_commands"]
+    return []
+
+
 def _prepare_resume_arguments(
     *,
     contract_markdown: str,
     contract_name: str | None,
-    project_context: dict | None,
+    project_context: PrepareProjectContext | None,
     status_applies_to_sha256: str,
 ) -> dict[str, Any]:
     return {
@@ -940,48 +1065,41 @@ def _prepare_resume_arguments(
     }
 
 
-def _prepare_project_context_for_resume(project_context: dict | None) -> dict[str, Any]:
-    if not isinstance(project_context, dict):
+def _prepare_project_context_for_resume(project_context: PrepareProjectContext | None) -> dict[str, Any]:
+    if project_context is None:
         return {}
-    allowed_keys = {
-        "known_constraints",
-        "package_manager",
-        "sikula_configured",
-        "stack",
-        "validation_commands",
-    }
-    return {key: value for key, value in project_context.items() if key in allowed_keys}
-
-
-def _prepare_sikula_configured(project_context: dict | None) -> bool:
-    return bool(project_context.get("sikula_configured")) if isinstance(project_context, dict) else False
+    return project_context.to_dict()
 
 
 def _prepare_suggested_next_steps(
     *,
     required_next_step: str,
     safe_task_path: str,
-    sikula_configured: bool,
 ) -> list[str]:
     if required_next_step == "answer_questions":
-        return ["Answer the listed contract questions, then call prepare_contract again with those answers."]
+        return ["Answer the listed contract questions, then call prepare_implementation_contract again."]
+    if required_next_step == "provide_project_context":
+        return [
+            "Provide project context with effective validation_commands, then call "
+            "prepare_implementation_contract again."
+        ]
     if required_next_step == "revise_contract":
         return ["Revise the contract manually, then run the contract check again."]
     if required_next_step == "save_contract":
         return [f"Save the prepared contract to `{safe_task_path}` before running delivery."]
     if required_next_step == "save_and_run_contract":
-        steps = [f"Save the prepared contract to `{safe_task_path}`."]
-        if sikula_configured:
-            steps.append(f"Run `sikula run {safe_task_path}`.")
-        else:
-            steps.append("Run `sikula init` or configure `.sikula/config.yaml` before delivery.")
-        return steps
+        return [
+            f"Save the prepared contract to `{safe_task_path}`.",
+            f"Run `sikula run {safe_task_path}` from a locally configured Sikula project.",
+        ]
     return []
 
 
 def _prepare_assistant_response_markdown(
     *,
     active_check: ContractCheckResult,
+    project_context_blockers: list[str],
+    ready_to_run: bool,
     required_user_action: str,
     suggested_next_steps: list[str],
     revised_answer_question_ids: list[str],
@@ -989,11 +1107,13 @@ def _prepare_assistant_response_markdown(
     changed = "Prepared contract is ready for the next step."
     if revised_answer_question_ids:
         changed = "Some previous answers still need more detail."
+    elif project_context_blockers:
+        changed = "Project context is required before autonomous delivery."
     elif active_check.clarifying_questions:
         changed = "Contract needs user input before autonomous delivery."
     next_step = suggested_next_steps[0] if suggested_next_steps else "Review the contract readiness result."
     note = "Do not start `sikula run` until `ready_to_run` is true."
-    if active_check.ready_for_autonomous_delivery:
+    if ready_to_run:
         note = "Readiness applies to the returned Markdown hash."
     return "\n".join(
         [
@@ -1013,14 +1133,10 @@ def _prepare_anti_loop_guidance() -> dict[str, Any]:
     }
 
 
-def _validation_commands_from_prepare_context(project_context: dict | None) -> list[str] | None:
-    if not isinstance(project_context, dict):
+def _validation_commands_from_prepare_context(project_context: PrepareProjectContext | None) -> list[str] | None:
+    if project_context is None:
         return None
-    value = project_context.get("validation_commands")
-    if not isinstance(value, list):
-        return None
-    commands = [str(command).strip() for command in value if str(command).strip()]
-    return commands or None
+    return list(project_context.validation_commands) or None
 
 
 def _contract_report_data(result: ContractCheckResult, *, task_path: Path, artifact_base: Path) -> dict[str, Any]:

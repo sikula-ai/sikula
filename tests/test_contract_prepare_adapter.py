@@ -57,11 +57,12 @@ def test_prepare_response_returns_questions_without_file_side_effects(tmp_path: 
 
     assert response["schema_version"] == 1
     assert response["workflow"] == "prepare_implementation_contract"
-    assert response["stage"] == "needs_user_input"
+    assert response["stage"] == "needs_project_context"
     assert response["needs_user_input"] is True
     assert response["ready_to_run"] is False
-    assert response["required_next_step"] == "answer_questions"
+    assert response["required_next_step"] == "provide_project_context"
     assert response["user_questions"]
+    assert response["ready_to_run_blockers"][0] == "missing_project_context"
     assert response["open_question_ids"] == [question["id"] for question in response["user_questions"]]
     assert "acceptance.criteria" in response["answers_template"]
     assert response["authoritative_output_markdown"].startswith("# Add team invites")
@@ -75,7 +76,6 @@ def test_prepare_response_ready_contract_includes_safe_run_guidance():
         _ready_contract(),
         contract_name="../../Team Invites; rm -rf *.md",
         project_context={
-            "sikula_configured": True,
             "validation_commands": ["pytest", "ruff check ."],
         },
     )
@@ -86,9 +86,24 @@ def test_prepare_response_ready_contract_includes_safe_run_guidance():
     assert response["safe_task_path"] == ".sikula/tasks/team-invites-rm-rf.md"
     assert response["suggested_next_steps"] == [
         "Save the prepared contract to `.sikula/tasks/team-invites-rm-rf.md`.",
-        "Run `sikula run .sikula/tasks/team-invites-rm-rf.md`.",
+        "Run `sikula run .sikula/tasks/team-invites-rm-rf.md` from a locally configured Sikula project.",
     ]
     assert response["check"]["source"]["sha256"] == response["status_applies_to_sha256"]
+
+
+def test_prepare_response_ready_contract_requires_project_context():
+    response = contract_prepare_adapter.prepare_implementation_contract_response(
+        _ready_contract(),
+        contract_name="team-invites.md",
+    )
+
+    assert response["stage"] == "needs_project_context"
+    assert response["needs_user_input"] is True
+    assert response["ready_to_save"] is False
+    assert response["ready_to_run"] is False
+    assert response["required_next_step"] == "provide_project_context"
+    assert response["ready_to_run_blockers"] == ["missing_project_context"]
+    assert "validation_commands" in response["suggested_next_steps"][0]
 
 
 def test_prepare_response_marks_repeated_answer_questions():
@@ -139,10 +154,12 @@ def test_prepare_response_adapter_only_maps_core_result(monkeypatch):
                 "recheck": None,
             }
 
-    def fake_prepare_contract(*_args, **_kwargs):
+    def fake_prepare_implementation_contract(*_args, **_kwargs):
         return FakeResult()
 
-    monkeypatch.setattr(contract_prepare_adapter, "prepare_contract", fake_prepare_contract)
+    monkeypatch.setattr(
+        contract_prepare_adapter, "prepare_implementation_contract", fake_prepare_implementation_contract
+    )
 
     response = contract_prepare_adapter.prepare_implementation_contract_response("brief")
 
