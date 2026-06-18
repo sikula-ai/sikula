@@ -134,12 +134,15 @@ question, answer-application, and recheck logic without temporary YAML files or 
 business rules. `prepare_task_description()` prepares the product brief side of the flow:
 it can normalize a product request into task-description Markdown and ask product-level
 clarifying questions, but it does not evaluate Sikula delivery readiness or return run
-guidance. `prepare_implementation_contract()` returns the authoritative delivery workflow
-state plus user-facing questions, safe `.sikula/tasks/...` path hints, resume arguments,
-revised-answer markers, and next-step guidance; adapters should not infer readiness
-separately. Chat/MCP callers must provide effective project context,
-especially validation commands, before the core result can report `ready_to_run=true`;
-client-reported local config presence is guidance only and is not a readiness signal.
+guidance. `prepare_implementation_contract()` turns the task description into the delivery
+artifact by preserving product sections and adding project context plus validation commands
+from the effective project context, then rechecking the returned Markdown. It returns the
+authoritative delivery workflow state plus user-facing questions, safe `.sikula/tasks/...`
+path hints, resume arguments, revised-answer markers, and next-step guidance; adapters
+should not infer readiness separately. Chat/MCP callers must provide effective project
+context, especially validation commands, before the core result can report
+`ready_to_run=true`; client-reported local config presence is guidance only and is not a
+readiness signal.
 `core.contract_prepare_adapter` maps that core result into the stable
 `prepare_implementation_contract` response shape for future MCP transport without adding
 scoring or rewrite logic. These commands and helpers

@@ -667,6 +667,160 @@ def test_prepare_implementation_contract_ready_result_includes_safe_save_and_run
     assert result.to_dict()["authoritative_output_markdown"] == result.prepared_contract_markdown
 
 
+def test_prepare_implementation_contract_enriches_task_description_with_project_context():
+    task = """# Country search
+
+## Scope
+- Add search by country name.
+- Keep existing region filtering.
+- Keep sorting unchanged.
+
+## Acceptance criteria
+- Matching is case-insensitive.
+- Clearing search shows the full list.
+- No matching countries shows an empty state.
+- Existing region filters still apply.
+
+## Out of scope
+- Do not add server-side search.
+- Do not change sorting.
+- Do not change country details.
+
+## Tests
+- Search matching test.
+- Empty state test.
+- Filter interaction test.
+
+## Reviewer focus
+- Search/filter interaction.
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name="country-search.md",
+        project_context={
+            "stack": "TypeScript/React",
+            "package_manager": "pnpm",
+            "known_constraints": "Keep the existing countries list route and filter behaviour.",
+            "validation_commands": ["pnpm test", "pnpm lint"],
+        },
+    )
+
+    assert result.ready_to_run
+    assert result.recheck_result is not None
+    assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
+    assert "## Project context" in result.prepared_contract_markdown
+    assert "- Stack: TypeScript/React" in result.prepared_contract_markdown
+    assert "- Package manager: pnpm" in result.prepared_contract_markdown
+    assert "- Known constraints: Keep the existing countries list route and filter behaviour." in (
+        result.prepared_contract_markdown
+    )
+    assert "## Validation" in result.prepared_contract_markdown
+    assert "- `pnpm test`" in result.prepared_contract_markdown
+    assert "- `pnpm lint`" in result.prepared_contract_markdown
+    assert "sikula:generated-" not in result.prepared_contract_markdown
+    assert "<!-- sikula:generated-answer: project_context.details -->" in result.resume_arguments["contract_markdown"]
+    assert (
+        "<!-- sikula:generated-answer: project_context.validation_commands -->"
+        in (result.resume_arguments["contract_markdown"])
+    )
+
+
+def test_prepare_implementation_contract_does_not_duplicate_existing_validation_commands():
+    task = """# Country search
+
+## Scope
+- Add search by country name.
+- Keep existing region filtering.
+- Keep sorting unchanged.
+
+## Acceptance criteria
+- Matching is case-insensitive.
+- Clearing search shows the full list.
+- No matching countries shows an empty state.
+- Existing region filters still apply.
+
+## Out of scope
+- Do not add server-side search.
+- Do not change sorting.
+- Do not change country details.
+
+## Tests
+- Search matching test.
+- Empty state test.
+- Filter interaction test.
+
+## Validation
+- `pnpm test`
+
+## Reviewer focus
+- Search/filter interaction.
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name="country-search.md",
+        project_context={"validation_commands": ["pnpm test", "pnpm lint"]},
+    )
+
+    assert result.ready_to_run
+    assert result.prepared_contract_markdown.count("- `pnpm test`") == 1
+    assert result.prepared_contract_markdown.count("- `pnpm lint`") == 1
+
+
+def test_prepare_implementation_contract_replaces_generated_project_context_on_resume():
+    task = """# Country search
+
+## Scope
+- Add search by country name.
+- Keep existing region filtering.
+- Keep sorting unchanged.
+
+## Acceptance criteria
+- Matching is case-insensitive.
+- Clearing search shows the full list.
+- No matching countries shows an empty state.
+- Existing region filters still apply.
+
+## Out of scope
+- Do not add server-side search.
+- Do not change sorting.
+- Do not change country details.
+
+## Tests
+- Search matching test.
+- Empty state test.
+- Filter interaction test.
+
+## Reviewer focus
+- Search/filter interaction.
+"""
+
+    first = prepare_implementation_contract(
+        task,
+        contract_name="country-search.md",
+        project_context={
+            "stack": "React",
+            "validation_commands": ["npm test"],
+        },
+    )
+    second = prepare_implementation_contract(
+        first.resume_arguments["contract_markdown"],
+        contract_name="country-search.md",
+        project_context={
+            "stack": "Vue",
+            "validation_commands": ["npm run test"],
+        },
+    )
+
+    assert "- Stack: React" not in second.prepared_contract_markdown
+    assert "- `npm test`" not in second.prepared_contract_markdown
+    assert "- Stack: Vue" in second.prepared_contract_markdown
+    assert "- `npm run test`" in second.prepared_contract_markdown
+    assert second.prepared_contract_markdown.count("## Project context") == 1
+    assert second.prepared_contract_markdown.count("## Validation") == 1
+
+
 def test_prepare_implementation_contract_ready_without_project_context_requires_context():
     task = """# Country search
 

@@ -24,6 +24,10 @@ _GENERATED_ANSWER_ENTRY_END_MARKER = "<!-- /sikula:generated-answer -->"
 _GENERATED_ANSWER_ENTRY_RE = re.compile(r"^\s*<!--\s*sikula:generated-answer:\s*([^>]+?)\s*-->\s*$")
 _GENERATED_ANSWERS_ARTIFACT_SUFFIX = ".generated-answers.json"
 _GENERATED_OPEN_QUESTIONS_MARKER = "<!-- sikula:generated-open-questions -->"
+_IMPLEMENTATION_CONTEXT_ENTRY_IDS = [
+    "project_context.details",
+    "project_context.validation_commands",
+]
 
 _STATUS_THRESHOLDS = (
     (85, "ready"),
@@ -113,6 +117,7 @@ _SECTION_ALIASES = {
     },
     "repo_context": {
         "context",
+        "project context",
         "product context",
         "repo context",
         "architecture",
@@ -855,23 +860,37 @@ def prepare_implementation_contract(
             project_config=project_config,
             configured_validation_commands=validation_commands,
         )
+        prepared_contract_markdown, resume_contract_markdown = _enrich_implementation_contract_markdown(
+            improved.resume_markdown,
+            normalized_project_context,
+        )
+        enriched_check_result = check_contract(
+            prepared_contract_markdown,
+            source_path=safe_task_path,
+            source_format="markdown",
+            project_config=project_config,
+            configured_validation_commands=validation_commands,
+        )
         return _build_prepare_result(
             contract_name=contract_name,
             project_context=normalized_project_context,
             project_context_blockers=project_context_blockers,
             safe_task_path=safe_task_path,
             check_result=check_result,
-            recheck_result=improved.check_result,
-            prepared_contract_markdown=improved.markdown,
-            resume_contract_markdown=improved.resume_markdown,
+            recheck_result=enriched_check_result,
+            prepared_contract_markdown=prepared_contract_markdown,
+            resume_contract_markdown=resume_contract_markdown,
             answered_question_ids=improved.answered_question_ids,
             open_question_ids=improved.open_question_ids,
         )
 
-    prepared_contract_markdown = evaluation_contract_markdown.strip() + "\n"
-    output_check_result = check_result
-    if prepared_contract_markdown != evaluation_contract_markdown:
-        output_check_result = check_contract(
+    prepared_contract_markdown, resume_contract_markdown = _enrich_implementation_contract_markdown(
+        task_description_markdown,
+        normalized_project_context,
+    )
+    recheck_result = None
+    if prepared_contract_markdown != evaluation_contract_markdown.strip() + "\n":
+        recheck_result = check_contract(
             prepared_contract_markdown,
             source_path=safe_task_path,
             source_format="markdown",
@@ -884,10 +903,10 @@ def prepare_implementation_contract(
         project_context=normalized_project_context,
         project_context_blockers=project_context_blockers,
         safe_task_path=safe_task_path,
-        check_result=output_check_result,
-        recheck_result=None,
+        check_result=check_result,
+        recheck_result=recheck_result,
         prepared_contract_markdown=prepared_contract_markdown,
-        resume_contract_markdown=task_description_markdown.strip() + "\n",
+        resume_contract_markdown=resume_contract_markdown,
     )
 
 
@@ -1355,6 +1374,75 @@ def _insert_or_append_section_entries(lines: list[str], section: str, entries: l
     if section_end < len(lines) and insertion and insertion[-1].strip():
         insertion.append("")
     lines[section_end:section_end] = insertion
+
+
+def _enrich_implementation_contract_markdown(
+    contract_markdown: str,
+    project_context: PrepareProjectContext | None,
+) -> tuple[str, str]:
+    source = contract_markdown.strip()
+    source = _strip_generated_answer_entries(source, _IMPLEMENTATION_CONTEXT_ENTRY_IDS)
+    lines = source.splitlines()
+
+    if project_context is not None:
+        current_markdown = "\n".join(lines)
+        project_context_entries = _implementation_project_context_entry_lines(project_context, current_markdown)
+        if project_context_entries:
+            _insert_or_append_section_entries(lines, "Project context", project_context_entries)
+
+        current_markdown = "\n".join(lines)
+        validation_entries = _implementation_validation_entry_lines(project_context, current_markdown)
+        if validation_entries:
+            _insert_or_append_section_entries(lines, "Validation", validation_entries)
+
+    resume_markdown = "\n".join(lines).rstrip() + "\n"
+    return _strip_generated_markers(resume_markdown), resume_markdown
+
+
+def _implementation_project_context_entry_lines(
+    project_context: PrepareProjectContext,
+    current_markdown: str,
+) -> list[str]:
+    existing_context = _section_content(_parse_markdown_task(current_markdown), "repo_context")
+    entries: list[str] = []
+    for label, value in [
+        ("Stack", project_context.stack),
+        ("Package manager", project_context.package_manager),
+        ("Known constraints", project_context.known_constraints),
+    ]:
+        if not value:
+            continue
+        line = f"- {label}: {_single_line(value)}"
+        if line not in existing_context:
+            entries.append(line)
+    if not entries:
+        return []
+    return [
+        _generated_answer_entry_marker("project_context.details"),
+        *entries,
+        _GENERATED_ANSWER_ENTRY_END_MARKER,
+    ]
+
+
+def _implementation_validation_entry_lines(
+    project_context: PrepareProjectContext,
+    current_markdown: str,
+) -> list[str]:
+    existing_commands = set(extract_validation_commands(current_markdown))
+    commands = [
+        command for command in project_context.validation_commands if command and command not in existing_commands
+    ]
+    if not commands:
+        return []
+    return [
+        _generated_answer_entry_marker("project_context.validation_commands"),
+        *[f"- `{_clean_validation_command(command)}`" for command in commands],
+        _GENERATED_ANSWER_ENTRY_END_MARKER,
+    ]
+
+
+def _clean_validation_command(command: str) -> str:
+    return _single_line(command).strip("`")
 
 
 def _normalize_prepare_project_context(
@@ -2107,6 +2195,10 @@ def _contract_section_for_question(question_id: str) -> str:
         return "Goal"
     if question_id == "context.product":
         return "Product context"
+    if question_id == "project_context.details":
+        return "Project context"
+    if question_id == "project_context.validation_commands":
+        return "Validation"
     if question_id in {"scope.boundaries"}:
         return "Scope"
     if question_id in {"acceptance.criteria", "acceptance.negative_cases"}:
