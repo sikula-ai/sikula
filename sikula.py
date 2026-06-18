@@ -1333,6 +1333,7 @@ def _collect_prepare_answers_interactive(
     if not sys.stdin.isatty():
         raise ValueError(f"interactive {label} requires an interactive terminal on stdin")
 
+    explicit_answers_path = answers_path is not None
     answers_path = answers_path or _prepare_answers_path(source_path, cfg, generated_by=generated_by)
     answers_data = _prepare_answers_template(
         generated_by=generated_by,
@@ -1343,8 +1344,9 @@ def _collect_prepare_answers_interactive(
     )
     if answers_path.exists():
         existing = _load_prepare_answers_data(answers_path)
-        _validate_prepare_answers_for_source(existing, source_path=source_path, source_text=source_text)
-        answers_data = _merge_prepare_answers(existing, answers_data)
+        if explicit_answers_path:
+            _validate_prepare_answers_for_source(existing, source_path=source_path, source_text=source_text)
+        answers_data = _merge_prepare_answers(existing, answers_data, archive_stale=not explicit_answers_path)
 
     answers = answers_data.setdefault("answers", {})
     print(f"Interactive {label} answers: {answers_path}")
@@ -1399,8 +1401,7 @@ def _write_prepare_answers_template(
     )
     if answers_path.exists():
         existing = _load_prepare_answers_data(answers_path)
-        _validate_prepare_answers_for_source(existing, source_path=source_path, source_text=source_text)
-        answers_data = _merge_prepare_answers(existing, answers_data)
+        answers_data = _merge_prepare_answers(existing, answers_data, archive_stale=True)
     answers_path.parent.mkdir(parents=True, exist_ok=True)
     answers_path.write_text(yaml.safe_dump(answers_data, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return answers_path
@@ -1439,10 +1440,22 @@ def _prepare_answers_template(
     }
 
 
-def _merge_prepare_answers(existing: dict, next_data: dict) -> dict:
+def _merge_prepare_answers(existing: dict, next_data: dict, *, archive_stale: bool = False) -> dict:
+    previous_answers = _prepare_previous_answers(existing)
+    if previous_answers:
+        next_data["previous_answers"] = previous_answers
+
     existing_answers = existing.get("answers")
     next_answers = next_data.get("answers")
     if not isinstance(existing_answers, dict) or not isinstance(next_answers, dict):
+        return next_data
+    existing_sha = _prepare_answers_task_sha(existing)
+    next_sha = _prepare_answers_task_sha(next_data)
+    if existing_sha != next_sha:
+        if archive_stale:
+            archived = _archive_prepare_answers(existing)
+            if archived:
+                next_data.setdefault("previous_answers", []).append(archived)
         return next_data
     for question_id, template in list(next_answers.items()):
         answer = existing_answers.get(question_id)
@@ -1454,6 +1467,54 @@ def _merge_prepare_answers(existing: dict, next_data: dict) -> dict:
         else:
             next_answers[question_id] = template
     return next_data
+
+
+def _prepare_answers_task_sha(data: dict) -> str | None:
+    task = data.get("task")
+    if not isinstance(task, dict):
+        return None
+    value = task.get("sha256")
+    return value if isinstance(value, str) and value else None
+
+
+def _prepare_previous_answers(data: dict) -> list[dict]:
+    previous = data.get("previous_answers")
+    if not isinstance(previous, list):
+        return []
+    return [entry for entry in previous if isinstance(entry, dict)]
+
+
+def _archive_prepare_answers(data: dict) -> dict | None:
+    filled = _filled_prepare_answers(data.get("answers"))
+    if not filled:
+        return None
+    task = data.get("task") if isinstance(data.get("task"), dict) else {}
+    return {
+        "archived_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "task": {
+            "path": task.get("path"),
+            "sha256": task.get("sha256"),
+        },
+        "questions": data.get("questions") if isinstance(data.get("questions"), list) else [],
+        "answers": filled,
+    }
+
+
+def _filled_prepare_answers(value) -> dict[str, dict]:
+    if not isinstance(value, dict):
+        return {}
+    filled: dict[str, dict] = {}
+    for question_id, answer in value.items():
+        if not isinstance(question_id, str) or not isinstance(answer, dict):
+            continue
+        answer_text = answer.get("answer", "")
+        notes = answer.get("notes", "")
+        if answer_text or notes:
+            filled[question_id] = {
+                "answer": answer_text,
+                "notes": notes,
+            }
+    return filled
 
 
 def _load_prepare_answers(path: Path, *, source_path: Path, source_text: str) -> dict[str, dict]:

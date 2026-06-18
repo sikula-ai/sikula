@@ -1982,6 +1982,50 @@ def test_task_refine_cli_without_answers_writes_template_before_output(
     assert {"scope.boundaries", "acceptance.criteria"}.issubset(answers["answers"])
 
 
+def test_task_refine_cli_regenerates_stale_default_answers_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.refined.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sys.argv", ["sikula", "task", "refine", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit),
+    ):
+        main()
+
+    capsys.readouterr()
+    answers_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.task-refine.answers.yaml"
+    first_answers = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+    first_sha = first_answers["task"]["sha256"]
+    first_answers["answers"]["scope.boundaries"]["answer"] = "Add invite creation from team settings."
+    answers_path.write_text(yaml.safe_dump(first_answers, sort_keys=False), encoding="utf-8")
+    task_path.write_text(
+        "# Add team invites\n\nUsers should be able to invite teammates by email and role.",
+        encoding="utf-8",
+    )
+
+    with (
+        patch("sys.argv", ["sikula", "task", "refine", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    regenerated = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+    assert exc.value.code == 1
+    assert "Task refinement answers template written:" in out
+    assert regenerated["task"]["sha256"] != first_sha
+    assert regenerated["answers"]["scope.boundaries"]["answer"] == ""
+    assert regenerated["previous_answers"][0]["task"]["sha256"] == first_sha
+    assert regenerated["previous_answers"][0]["answers"]["scope.boundaries"]["answer"] == (
+        "Add invite creation from team settings."
+    )
+
+
 def test_task_refine_cli_with_partial_answers_prints_remaining_questions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ):
@@ -2214,6 +2258,52 @@ def test_contract_prepare_cli_without_answers_writes_template_before_output(
     assert answers["generated_by"] == "sikula.contract_prepare"
     assert answers["task"]["sha256"].startswith("sha256:")
     assert "acceptance.criteria" in answers["answers"]
+
+
+def test_contract_prepare_cli_regenerates_stale_default_answers_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "contracts" / "team-invites.contract.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["pytest"]}),
+        patch("sys.argv", ["sikula", "contract", "prepare", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit),
+    ):
+        main()
+
+    capsys.readouterr()
+    answers_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.contract-prepare.answers.yaml"
+    first_answers = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+    first_sha = first_answers["task"]["sha256"]
+    first_answers["answers"]["acceptance.criteria"]["answer"] = "Owners can invite teammates by email."
+    answers_path.write_text(yaml.safe_dump(first_answers, sort_keys=False), encoding="utf-8")
+    task_path.write_text(
+        "# Add team invites\n\nUsers should be able to invite teammates by email and role.",
+        encoding="utf-8",
+    )
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["pytest"]}),
+        patch("sys.argv", ["sikula", "contract", "prepare", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    regenerated = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+    assert exc.value.code == 1
+    assert "Contract preparation answers template written:" in out
+    assert regenerated["task"]["sha256"] != first_sha
+    assert regenerated["answers"]["acceptance.criteria"]["answer"] == ""
+    assert regenerated["previous_answers"][0]["task"]["sha256"] == first_sha
+    assert regenerated["previous_answers"][0]["answers"]["acceptance.criteria"]["answer"] == (
+        "Owners can invite teammates by email."
+    )
 
 
 def test_contract_prepare_cli_writes_ready_contract_without_answers(
