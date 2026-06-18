@@ -67,6 +67,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1664,6 +1665,26 @@ def _text_sha256(text: str) -> str:
     return "sha256:" + sha256(text.strip().encode("utf-8")).hexdigest()
 
 
+def _is_placeholder_validation_command(command: str) -> bool:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    return any(token.strip().strip("\"'`<>[]{}():,;").upper() == "TODO" for token in tokens)
+
+
+def _contract_prepare_validation_commands(configured: list[dict[str, str]]) -> list[str]:
+    commands: list[str] = []
+    for entry in configured:
+        command = str(entry.get("command") or "").strip()
+        if not command or entry.get("phase") == "check_autofix":
+            continue
+        if _is_placeholder_validation_command(command):
+            continue
+        commands.append(command)
+    return commands
+
+
 def _prepare_project_context_from_config(cfg: dict) -> dict | None:
     from core.state import TaskState
     from core.validation_coverage import configured_validation_commands
@@ -1688,9 +1709,7 @@ def _prepare_project_context_from_config(cfg: dict) -> dict | None:
     return {
         "stack": stack or None,
         "package_manager": build.get("package_manager"),
-        "validation_commands": [
-            entry["command"] for entry in configured if entry.get("command") and entry.get("phase") != "check_autofix"
-        ],
+        "validation_commands": _contract_prepare_validation_commands(configured),
     }
 
 

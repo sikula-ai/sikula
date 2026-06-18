@@ -21,7 +21,13 @@ from core.contract_check import (
     write_contract_report,
     write_prepared_contract,
 )
-from sikula import _prepare_answers_path, _read_interactive_contract_answer, _should_store_interactive_answer, main
+from sikula import (
+    _prepare_answers_path,
+    _prepare_project_context_from_config,
+    _read_interactive_contract_answer,
+    _should_store_interactive_answer,
+    main,
+)
 
 
 def _python_project_config(tmp_path: Path) -> dict:
@@ -32,6 +38,44 @@ def _python_project_config(tmp_path: Path) -> dict:
         "run_checks": True,
         "build": {"checks": [{"name": "ruff", "command": "ruff check ."}]},
     }
+
+
+def test_contract_prepare_project_context_filters_placeholder_validation_commands(tmp_path: Path):
+    cfg = {
+        "project": {
+            "build_tool": "xcodebuild",
+            "language": "Swift",
+            "platform": "iOS",
+            "root_path": str(tmp_path),
+        },
+        "run_build": True,
+        "run_tests": True,
+        "run_checks": True,
+        "build": {"scheme": "TODO"},
+    }
+
+    context = _prepare_project_context_from_config(cfg)
+
+    assert context is not None
+    assert context["stack"] == "Swift / iOS / xcodebuild"
+    assert context["validation_commands"] == []
+
+
+def test_contract_prepare_project_context_keeps_effective_validation_commands(tmp_path: Path):
+    cfg = _python_project_config(tmp_path)
+    cfg["build"] = {
+        "compile_command": "TODO",
+        "test_command": "pytest",
+        "checks": [
+            {"name": "placeholder", "command": "TODO"},
+            {"name": "ruff", "command": "ruff check .", "fix_command": "ruff format ."},
+        ],
+    }
+
+    context = _prepare_project_context_from_config(cfg)
+
+    assert context is not None
+    assert context["validation_commands"] == ["pytest", "ruff check ."]
 
 
 def test_weak_security_sensitive_task_reports_blocking_gaps():
