@@ -92,7 +92,9 @@ mkdir -p .sikula/tasks
 $EDITOR .sikula/tasks/my-task.md
 ```
 
-A good task states the user-visible goal, expected behavior, important constraints, out-of-scope items, and any required validation beyond the configured build/test/check pipeline.
+A good product task description states the user-visible goal, expected behavior,
+important constraints, out-of-scope items, and any required validation beyond
+the configured build/test/check pipeline.
 
 ## Check The Implementation Contract
 
@@ -100,7 +102,9 @@ A good task states the user-visible goal, expected behavior, important constrain
 sikula contract check .sikula/tasks/my-task.md
 ```
 
-For report generation, answers files, and `contract improve`, see [Writing Sikula Tasks](writing-tasks.md).
+Use this before running to see whether the task file is specific enough to act
+as the implementation contract. For report generation, answers files, and
+`contract improve`, see [Writing Sikula Tasks](writing-tasks.md).
 
 For local experiments without a worktree branch, use:
 

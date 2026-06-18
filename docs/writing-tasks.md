@@ -1,10 +1,15 @@
 # Writing Sikula Tasks
 
-Sikula is contract-first. A task description should become an implementation
-contract: a two-way handshake between you and Sikula where you bring the intent,
-Sikula checks whether it is clear and deliverable, asks for missing context when
-needed, and the result becomes scope, acceptance criteria, risks, tests, and
-validation.
+Sikula is contract-first. A product task description says what should change for
+users or the business. Before agents change code, that description should become
+an implementation contract: the delivery artifact Sikula can run, with scope,
+acceptance criteria, constraints, risks, tests, and validation.
+
+The public CLI keeps this flow explicit. `sikula contract check` inspects a
+task or contract file. `sikula contract improve` writes a stronger Markdown
+implementation contract from answers. `sikula run` then runs the file you pass
+to it; it records a warning-only readiness snapshot, but it does not rewrite a
+product brief into a contract during the run.
 
 Sikula does not require a strict task template. The task should be clear enough
 that the analyst can produce reviewable implementation instructions without
@@ -16,8 +21,8 @@ unsure how much detail to include.
 
 ## Check Readiness
 
-Before running a task, you can ask Sikula to inspect whether the task file is
-specific enough to act as an implementation contract:
+Before running a task, you can ask Sikula to inspect whether the task or
+contract file is specific enough to act as an implementation contract:
 
 ```bash
 sikula contract check .sikula/tasks/my-task.md
@@ -38,10 +43,11 @@ validation coverage, and follow-up questions with stable IDs. `--write-report`
 creates `.sikula/contracts/*.check.json` and `.answers.yaml` artifacts for
 review or follow-up answers. Filled answers apply only to the exact task hash in
 the template. After you fill the YAML answers, `sikula contract improve`
-deterministically writes a stronger Markdown task file, keeps unanswered items
-under `Open questions`, and runs the contract check on the output. It refuses
-stale answer hashes and accidental overwrites; for plain-text `.txt` inputs,
-write the improved contract to a new Markdown file with `--output`.
+deterministically writes a stronger Markdown implementation contract, keeps
+unanswered items under `Open questions`, and runs the contract check on the
+output. It refuses stale answer hashes and accidental overwrites; for plain-text
+`.txt` inputs, write the improved contract to a new Markdown file with
+`--output`.
 The Markdown task output stays clean; Sikula stores generated-answer metadata
 under `.sikula/contracts` so later `contract improve` runs can safely replace
 earlier generated answers.
@@ -56,9 +62,11 @@ Sikula build/test/check pipeline and those phases are enabled for a normal
 additional project-specific validation. Disabled validation phases do not count
 as contract readiness coverage. The readiness score is a preflight signal, not a
 guarantee that the task will succeed.
-Normal `sikula run TASK_FILE` records the same check as a compact, warning-only
-state snapshot and prints a one-line summary before agents start; it does not
-write `.sikula/contracts` artifacts.
+Normal `sikula run TASK_FILE` assumes `TASK_FILE` is the delivery task or
+implementation contract you want to execute. It records the same check as a
+compact, warning-only state snapshot and prints a one-line summary before
+agents start; it does not write `.sikula/contracts` artifacts or improve the
+file automatically.
 
 If a team wants task readiness to be enforced before agents start, fresh task
 runs can opt into strict gates:
@@ -71,7 +79,8 @@ sikula run .sikula/tasks/my-task.md --min-contract-score 80
 Those gates save the same state snapshot and fail before creating a worktree or
 running agents when the threshold is not met. Because no delivery worktree exists
 yet, a gate-failed state is for audit only and cannot be resumed with
-`--reset-failed`; improve the task contract and start a fresh task-file run. The
+`--reset-failed`; improve the implementation contract and start a fresh
+task-file run. The
 gates do not apply to `resume`, `review`, or `review --fix`. Review mode uses the
 existing branch diff as its primary source of truth; any future review-context
 readiness check should be a separate review-specific gate, not this delivery task

@@ -2,25 +2,25 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/sikula)](https://pypi.org/project/sikula/) [![Python versions](https://img.shields.io/pypi/pyversions/sikula)](https://pypi.org/project/sikula/) [![CI](https://github.com/sikula-ai/sikula/actions/workflows/ci.yml/badge.svg)](https://github.com/sikula-ai/sikula/actions/workflows/ci.yml) [![codecov](https://codecov.io/gh/sikula-ai/sikula/graph/badge.svg)](https://codecov.io/gh/sikula-ai/sikula) [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](LICENSE)
 
-Sikula is a local AI software delivery pipeline for turning written engineering tasks into reviewed, tested git branches.
+Sikula is a local AI software delivery pipeline for turning task descriptions into reviewed, tested git branches.
 
-It checks task clarity through an implementation contract, runs the work through a gated agentic delivery pipeline, and records the run in an auditable state file you can inspect to understand the result and improve the next run.
+It helps turn product intent into an implementation contract, runs that contract through a gated agentic delivery pipeline, and records the run in an auditable state file you can inspect to understand the result and improve the next run.
 
 ## Why Sikula
 
 Most AI coding tools optimize for producing a diff. Sikula optimizes for the delivery path around that diff: is the task clear, did the change stay in scope, did independent agents review it, did validation pass, and can a human audit what happened?
 
 ```text
-Rough intent
+Product task description
   -> implementation contract
   -> gated agentic delivery pipeline
   -> PR-ready branch + state file
   -> better next run
 ```
 
-- **Before coding**, the implementation contract checks whether the request is clear and deliverable, then turns it into scope, acceptance criteria, risks, tests, and validation.
+- **Before coding**, a product task description can be checked and improved into an implementation contract with scope, acceptance criteria, risks, tests, and validation.
 - **During the run**, separate agents implement, review, security-review, write tests, and fix build/test/check failures. Each agent can use the LLM provider, model, and timeout that fits its job.
-- **After completion**, Sikula leaves a normal git branch plus an auditable state file. That record helps improve future task contracts, project guidelines, and delivery decisions.
+- **After completion**, Sikula leaves a normal git branch plus an auditable state file. That record helps improve future implementation contracts, project guidelines, and delivery decisions.
 
 Default runs use git worktree isolation, so the task happens on a dedicated branch and worktree instead of modifying your main checkout directly.
 
@@ -107,7 +107,7 @@ After setup, choose the workflow that fits what you want to do.
 
 ## Ways To Use Sikula
 
-**Check and improve a task contract**
+**Prepare and check an implementation contract**
 
 ```bash
 sikula contract check .sikula/tasks/my-task.md
@@ -120,7 +120,7 @@ sikula contract improve .sikula/tasks/my-task.md \
 sikula contract improve .sikula/tasks/my-task.md --interactive --output .sikula/tasks/my-task.v2.md
 ```
 
-Use this when you want to clarify a task before any agents start changing code.
+Use this when you want to clarify a product task description into an implementation contract before any agents start changing code. The commands are explicit: `contract improve` writes the Markdown file you later pass to `sikula run`; `sikula run` does not rewrite the task file for you.
 
 **Run a task into a branch**
 
@@ -132,7 +132,7 @@ sikula status
 git diff <base-branch>...sikula/<task-stem>-<task-id>
 ```
 
-Use this when the task is ready and you want Sikula to run the gated delivery pipeline. See [Writing Sikula Tasks](docs/writing-tasks.md) for contract readiness gates and task-writing guidance.
+Use this when the task file is ready to act as the implementation contract and you want Sikula to run the gated delivery pipeline. See [Writing Sikula Tasks](docs/writing-tasks.md) for contract readiness gates and task-writing guidance.
 
 **Review an existing branch**
 
