@@ -852,11 +852,19 @@ def prepare_implementation_contract(
         # Chat/MCP prepare clients may resend an accumulated answer map across rounds.
         # Only answers for the currently active questions should be applied here;
         # earlier answers are already represented in the returned Markdown.
-        active_answers = _answers_for_questions(answers, check_result.clarifying_questions)
+        active_questions = _prepare_active_questions_for_answers(
+            task_description_markdown,
+            normalized_project_context,
+            check_result=check_result,
+            safe_task_path=safe_task_path,
+            project_config=project_config,
+            configured_validation_commands=validation_commands,
+        )
+        active_answers = _answers_for_questions(answers, active_questions)
         improved = improve_contract_text(
             task_description_markdown,
             contract_name=contract_name,
-            questions=check_result.clarifying_questions,
+            questions=active_questions,
             answers=active_answers,
             source_result=check_result,
             output_name=safe_task_path,
@@ -911,6 +919,45 @@ def prepare_implementation_contract(
         prepared_contract_markdown=prepared_contract_markdown,
         resume_contract_markdown=resume_contract_markdown,
     )
+
+
+def _prepare_active_questions_for_answers(
+    contract_markdown: str,
+    project_context: PrepareProjectContext | None,
+    *,
+    check_result: ContractCheckResult,
+    safe_task_path: str,
+    project_config: dict | None,
+    configured_validation_commands: list[str] | None,
+) -> list[ClarifyingQuestion]:
+    questions = list(check_result.clarifying_questions)
+    if project_context is None:
+        return questions
+
+    enriched_markdown, _resume_markdown = _enrich_implementation_contract_markdown(contract_markdown, project_context)
+    if enriched_markdown == _strip_generated_markers(contract_markdown).strip() + "\n":
+        return questions
+
+    enriched_check_result = check_contract(
+        enriched_markdown,
+        source_path=safe_task_path,
+        source_format="markdown",
+        project_config=project_config,
+        configured_validation_commands=configured_validation_commands,
+    )
+    return _merge_clarifying_questions(questions, enriched_check_result.clarifying_questions)
+
+
+def _merge_clarifying_questions(*question_groups: list[ClarifyingQuestion]) -> list[ClarifyingQuestion]:
+    merged: list[ClarifyingQuestion] = []
+    seen: set[str] = set()
+    for questions in question_groups:
+        for question in questions:
+            if question.id in seen:
+                continue
+            seen.add(question.id)
+            merged.append(question)
+    return merged
 
 
 def _build_prepare_result(

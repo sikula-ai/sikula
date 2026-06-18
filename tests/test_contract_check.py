@@ -416,6 +416,57 @@ def test_prepare_implementation_contract_reconciles_open_questions_after_recheck
     assert result.status_applies_to_sha256 == result.recheck_result.source["sha256"]
 
 
+def test_prepare_implementation_contract_applies_project_context_recheck_only_answers():
+    task = "# Add dashboard filter\n\nUsers should be able to filter dashboard entries."
+    project_context = {
+        "known_constraints": "The filter is applied to private account emails and auth tokens must not be leaked.",
+        "validation_commands": ["pytest"],
+    }
+
+    first = prepare_implementation_contract(
+        task,
+        contract_name="dashboard-filter.md",
+        answers={
+            "scope.boundaries": "Add dashboard filtering.",
+            "acceptance.criteria": (
+                "Users can filter dashboard entries by label. Empty filters show all entries. "
+                "No matches show an empty state."
+            ),
+            "scope.out_of_scope": "Do not redesign the dashboard.",
+        },
+        project_context=project_context,
+    )
+
+    assert "token.lifecycle" not in [question.id for question in first.check_result.clarifying_questions]
+    assert "token.lifecycle" in [question.id for question in first.questions_for_user]
+
+    second = prepare_implementation_contract(
+        task,
+        contract_name="dashboard-filter.md",
+        answers={
+            "scope.boundaries": "Add dashboard filtering.",
+            "acceptance.criteria": (
+                "Users can filter dashboard entries by label. Empty filters show all entries. "
+                "No matches show an empty state."
+            ),
+            "acceptance.negative_cases": "Invalid filters are ignored without leaking private account email values.",
+            "scope.out_of_scope": "Do not redesign the dashboard.",
+            "token.lifecycle": "Filtering must not display, log, or change auth token values.",
+            "privacy.data_handling": "Do not log or reveal private account email values in errors.",
+            "reviewer.focus": "Privacy handling and filter correctness.",
+            "context.domain_rules": "Follow existing dashboard filtering patterns.",
+        },
+        project_context=project_context,
+    )
+
+    assert "token.lifecycle" in second.answered_question_ids
+    assert "privacy.data_handling" in second.answered_question_ids
+    assert "token.lifecycle" not in second.open_question_ids
+    assert "privacy.data_handling" not in second.open_question_ids
+    assert "- Filtering must not display, log, or change auth token values." in second.prepared_contract_markdown
+    assert "- Do not log or reveal private account email values in errors." in second.prepared_contract_markdown
+
+
 def test_prepare_implementation_contract_keeps_current_open_questions_after_final_recheck():
     result = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
