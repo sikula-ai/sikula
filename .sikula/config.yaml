@@ -46,6 +46,11 @@ sandbox:
   max_security_review_iterations: 3
 
 tasks:
+  task_description_dir: .sikula/tasks/
+  contract_dir: .sikula/contracts/
+  contract_report_dir: .sikula/contract-reports/
+  refined_suffix: .refined.md
+  contract_suffix: .contract.md
   state_dir: .sikula/state/
 
 progress:

@@ -148,10 +148,10 @@ def test_prepare_response_ready_contract_includes_safe_run_guidance():
     assert response["needs_user_input"] is False
     assert response["ready_to_save"] is True
     assert response["ready_to_run"] is True
-    assert response["safe_task_path"] == ".sikula/tasks/team-invites-rm-rf.md"
+    assert response["safe_task_path"] == ".sikula/contracts/team-invites-rm-rf.contract.md"
     assert response["suggested_next_steps"] == [
-        "Save the prepared contract to `.sikula/tasks/team-invites-rm-rf.md`.",
-        "Run `sikula run .sikula/tasks/team-invites-rm-rf.md` from a locally configured Sikula project.",
+        "Save the prepared contract to `.sikula/contracts/team-invites-rm-rf.contract.md`.",
+        "Run `sikula run .sikula/contracts/team-invites-rm-rf.contract.md` from a locally configured Sikula project.",
     ]
     assert response["check"]["source"]["sha256"] == response["status_applies_to_sha256"]
 
@@ -266,7 +266,7 @@ def test_prepare_implementation_contract_response_adapter_only_maps_core_result(
                 "required_user_action": "custom_action",
                 "assistant_response_markdown": "custom markdown",
                 "status_applies_to_sha256": "sha256:abc",
-                "safe_task_path": ".sikula/tasks/custom.md",
+                "safe_task_path": ".sikula/contracts/custom.contract.md",
                 "ready_to_run_blockers": ["custom blocker"],
                 "answered_question_ids": ["q"],
                 "open_question_ids": ["q"],
@@ -303,7 +303,7 @@ def test_prepare_implementation_contract_response_adapter_only_maps_core_result(
         "required_user_action": "custom_action",
         "assistant_response_markdown": "custom markdown",
         "status_applies_to_sha256": "sha256:abc",
-        "safe_task_path": ".sikula/tasks/custom.md",
+        "safe_task_path": ".sikula/contracts/custom.contract.md",
         "ready_to_run_blockers": ["custom blocker"],
         "answered_question_ids": ["q"],
         "open_question_ids": ["q"],

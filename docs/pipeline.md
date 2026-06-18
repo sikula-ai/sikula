@@ -21,7 +21,7 @@ Product task description
 
 The product task description captures the user or business intent. The implementation contract is the delivery artifact Sikula can run: it preserves that intent while making scope, acceptance criteria, constraints, risks, tests, and validation explicit.
 
-Use [Writing Sikula Tasks](writing-tasks.md) for contract commands and task examples. `sikula contract check TASK_FILE` and `sikula run TASK_FILE` use the same effective build/test/check phases from the Sikula config when scoring validation coverage. `sikula contract improve` is the explicit step that writes an improved Markdown implementation contract from answers. `sikula run TASK_FILE` then runs the file you pass to it and records a compact, warning-only contract snapshot before agents start; it does not rewrite the task file automatically. Fresh task-file runs can opt into pre-agent readiness gates with `--require-contract-ready` or `--min-contract-score N`; gate-failed states are kept for audit but must be restarted from the task file after the contract is improved, not reset through `--task-id`. Review modes use the existing branch diff as their primary artifact and do not reuse the delivery contract-readiness gate.
+Use [Writing Sikula Tasks](writing-tasks.md) for contract commands and task examples. `sikula contract check TASK_FILE` and `sikula run TASK_FILE` use the same effective build/test/check phases from the Sikula config when scoring validation coverage. `sikula task refine` is the explicit product-description refinement step, and `sikula contract prepare` is the explicit step that writes a project-aware Markdown implementation contract from a task description and answers. `sikula run TASK_FILE` then runs the file you pass to it and records a compact, warning-only contract snapshot before agents start; it does not rewrite the task file automatically. Fresh task-file runs can opt into pre-agent readiness gates with `--require-contract-ready` or `--min-contract-score N`; gate-failed states are kept for audit but must be restarted from the task file after the contract is prepared, not reset through `--task-id`. Review modes use the existing branch diff as their primary artifact and do not reuse the delivery contract-readiness gate.
 
 ## Gated Pipeline
 
@@ -93,7 +93,7 @@ State is useful for audit and debugging. It may contain sensitive source or prom
 
 Sikula does not learn by silently mutating model weights. The learning loop is explicit:
 
-- Improve future implementation contracts with `contract check` and `contract improve`.
+- Improve future implementation contracts with `contract check`, `task refine`, and `contract prepare`.
 - Add project conventions to `.sikula/guidelines.md` or existing guidance docs.
 - Tune `.sikula/config.yaml` based on validation failures, testability gaps, and review findings.
 - Keep useful architecture and testing rules in committed project docs so agents receive them on future runs.

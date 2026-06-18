@@ -12,17 +12,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   human-readable and `--json` output covering scope, acceptance criteria,
   security/privacy, validation coverage based on the same enabled build/test/check phases
   used by `sikula run`, gaps, and stable clarifying question IDs, plus optional
-  `.sikula/contracts` report and hash-scoped answers-template artifacts via
+  `.sikula/contract-reports` report and hash-scoped answers-template artifacts via
   `--write-report`; `sikula run TASK_FILE` now stores a warning-only contract snapshot
   in task state, supports opt-in pre-agent gates via `--require-contract-ready` and
   `--min-contract-score`, keeps gate-failed pre-worktree states audit-only with the
   effective run config snapshot instead of resettable through `--task-id --reset-failed`,
-  and `sikula init` ignores generated contract artifacts by default.
-- `sikula contract improve TASK_FILE --answers ... --output ...` now turns filled
-  contract answers into a stronger Markdown implementation contract, preserves unanswered
-  items as open questions, refuses stale answer hashes or accidental overwrites, re-runs
-  the contract check on the generated output, and supports `--interactive` terminal
-  prompts that save the answers YAML before running the same improve flow.
+  and `sikula init` ignores generated contract report artifacts by default.
+- `sikula task refine TASK_FILE --output ...` and `sikula contract prepare TASK_FILE
+  --answers ... --output ...` now separate product task-description refinement from
+  project-aware implementation-contract preparation. The prepare step turns filled
+  answers into a Markdown contract under `.sikula/contracts`, preserves unanswered items
+  as open questions, refuses stale answer hashes or accidental overwrites, re-runs the
+  contract check on the generated output, and supports `--interactive` terminal prompts
+  that save answers YAML under `.sikula/contract-reports`. Non-interactive refine and
+  prepare runs with unanswered questions now write answers templates first and defer
+  Markdown output until answers are supplied.
 - Contract preparation now has side-effect-free in-memory core helpers for future
   chat/MCP adapters, reusing the same contract scoring, answer application, and recheck
   logic as the file-based CLI flow instead of duplicating business rules. The

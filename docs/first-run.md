@@ -104,7 +104,7 @@ sikula contract check .sikula/tasks/my-task.md
 
 Use this before running to see whether the task file is specific enough to act
 as the implementation contract. For report generation, answers files, and
-`contract improve`, see [Writing Sikula Tasks](writing-tasks.md).
+`task refine` and `contract prepare`, see [Writing Sikula Tasks](writing-tasks.md).
 
 For local experiments without a worktree branch, use:
 

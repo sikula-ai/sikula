@@ -20,6 +20,7 @@ from core.validation_coverage import (
 )
 
 SCHEMA_VERSION = 1
+DEFAULT_CONTRACT_REPORT_DIR = ".sikula/contract-reports"
 _GENERATED_ANSWER_ENTRY_END_MARKER = "<!-- /sikula:generated-answer -->"
 _GENERATED_ANSWER_ENTRY_RE = re.compile(r"^\s*<!--\s*sikula:generated-answer:\s*([^>]+?)\s*-->\s*$")
 _GENERATED_ANSWERS_ARTIFACT_SUFFIX = ".generated-answers.json"
@@ -574,9 +575,10 @@ def contract_report_paths(
     task_path: Path,
     *,
     project_root: Path | None = None,
+    report_dir: Path | str | None = None,
 ) -> ContractReportPaths:
     task_path = task_path.resolve()
-    contract_dir = _contract_report_dir(task_path, project_root=project_root)
+    contract_dir = _contract_report_dir(task_path, project_root=project_root, report_dir=report_dir)
     artifact_base = _artifact_base_dir(project_root=project_root, contract_dir=contract_dir)
     stem = _select_report_stem(task_path, contract_dir, artifact_base)
     return ContractReportPaths(
@@ -590,9 +592,10 @@ def write_contract_report(
     *,
     task_path: Path,
     project_root: Path | None = None,
+    report_dir: Path | str | None = None,
 ) -> ContractReportWriteResult:
     task_path = task_path.resolve()
-    paths = contract_report_paths(task_path, project_root=project_root)
+    paths = contract_report_paths(task_path, project_root=project_root, report_dir=report_dir)
     paths.report_path.parent.mkdir(parents=True, exist_ok=True)
     _ensure_contract_path(paths.report_path, paths.report_path.parent)
     _ensure_contract_path(paths.answers_path, paths.answers_path.parent)
@@ -1130,12 +1133,12 @@ def _safe_task_path_hint(contract_name: str | None, contract_markdown: str) -> s
     title = _contract_path_source_name(contract_name, contract_markdown)
     slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
     slug = re.sub(r"-+", "-", slug)[:80].strip("-")
-    return f".sikula/tasks/{slug or 'task'}.md"
+    return f".sikula/contracts/{slug or 'task'}.contract.md"
 
 
 def _contract_path_source_name(contract_name: str | None, contract_markdown: str) -> str:
     if contract_name:
-        name = Path(str(contract_name)).stem
+        name = _strip_contract_path_suffixes(Path(str(contract_name)).stem)
         if name:
             return name
     parsed = _parse_markdown_task(contract_markdown)
@@ -1146,6 +1149,13 @@ def _contract_path_source_name(contract_name: str | None, contract_markdown: str
         if stripped:
             return stripped
     return "task"
+
+
+def _strip_contract_path_suffixes(stem: str) -> str:
+    for suffix in (".refined", ".contract", ".v2", ".v3"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
 
 
 def _normalize_prepare_product_context(
@@ -2283,22 +2293,34 @@ def _single_line(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def _contract_report_dir(task_path: Path, *, project_root: Path | None) -> Path:
+def _contract_report_dir(
+    task_path: Path,
+    *,
+    project_root: Path | None,
+    report_dir: Path | str | None = None,
+) -> Path:
+    if report_dir is not None:
+        path = Path(report_dir)
+        if path.is_absolute():
+            return path.resolve()
+        base = project_root.resolve() if project_root is not None else Path.cwd().resolve()
+        return (base / path).resolve()
+
     if project_root is not None:
-        return project_root.resolve() / ".sikula" / "contracts"
+        return project_root.resolve() / DEFAULT_CONTRACT_REPORT_DIR
 
     for parent in task_path.parents:
         if parent.name == ".sikula":
-            return parent / "contracts"
+            return parent / "contract-reports"
         if parent.name == "tasks" and parent.parent.name == ".sikula":
-            return parent.parent / "contracts"
-    return Path.cwd().resolve() / ".sikula" / "contracts"
+            return parent.parent / "contract-reports"
+    return Path.cwd().resolve() / DEFAULT_CONTRACT_REPORT_DIR
 
 
 def _artifact_base_dir(*, project_root: Path | None, contract_dir: Path) -> Path:
     if project_root is not None:
         return project_root.resolve()
-    if contract_dir.name == "contracts" and contract_dir.parent.name == ".sikula":
+    if contract_dir.name == "contract-reports" and contract_dir.parent.name == ".sikula":
         return contract_dir.parent.parent.resolve()
     return Path.cwd().resolve()
 
@@ -2387,7 +2409,7 @@ def _load_generated_answer_entries(
         return []
     if not isinstance(data, dict):
         return []
-    if data.get("generated_by") != "sikula.contract_improve":
+    if data.get("generated_by") != "sikula.contract_prepare":
         return []
     if not _task_path_matches(data.get("task"), task_path, artifact_base):
         return []
@@ -2407,7 +2429,7 @@ def _write_generated_answer_entries(
 ) -> None:
     data = {
         "schema_version": 1,
-        "generated_by": "sikula.contract_improve",
+        "generated_by": "sikula.contract_prepare",
         "created_at": _utc_timestamp(),
         "task": {
             "path": _artifact_path(output_path, artifact_base),
@@ -2451,7 +2473,7 @@ def _generated_answers_available_for_task(path: Path, task_path: Path, artifact_
         return False
     if not isinstance(data, dict):
         return False
-    return data.get("generated_by") == "sikula.contract_improve" and _task_path_matches(
+    return data.get("generated_by") == "sikula.contract_prepare" and _task_path_matches(
         data.get("task"), task_path, artifact_base
     )
 

@@ -101,7 +101,7 @@ mkdir -p .sikula/tasks
 $EDITOR .sikula/tasks/my-task.md
 ```
 
-For other providers, generated guidelines, `--no-isolate`, and contract improvement, see [First Run](docs/first-run.md).
+For other providers, generated guidelines, `--no-isolate`, and contract preparation, see [First Run](docs/first-run.md).
 
 After setup, choose the workflow that fits what you want to do.
 
@@ -111,16 +111,19 @@ After setup, choose the workflow that fits what you want to do.
 
 ```bash
 sikula contract check .sikula/tasks/my-task.md
-sikula contract check .sikula/tasks/my-task.md --write-report
-# edit .sikula/contracts/my-task.answers.yaml
-sikula contract improve .sikula/tasks/my-task.md \
-  --answers .sikula/contracts/my-task.answers.yaml \
-  --output .sikula/tasks/my-task.v2.md
-# or answer questions in the terminal
-sikula contract improve .sikula/tasks/my-task.md --interactive --output .sikula/tasks/my-task.v2.md
+sikula task refine .sikula/tasks/my-task.md --interactive --output .sikula/tasks/my-task.refined.md
+sikula contract check .sikula/tasks/my-task.refined.md --write-report
+# edit .sikula/contract-reports/my-task.refined.answers.yaml
+sikula contract prepare .sikula/tasks/my-task.refined.md \
+  --answers .sikula/contract-reports/my-task.refined.answers.yaml \
+  --output .sikula/contracts/my-task.contract.md
+# or answer contract-preparation questions in the terminal
+sikula contract prepare .sikula/tasks/my-task.refined.md \
+  --interactive \
+  --output .sikula/contracts/my-task.contract.md
 ```
 
-Use this when you want to clarify a product task description into an implementation contract before any agents start changing code. The commands are explicit: `contract improve` writes the Markdown file you later pass to `sikula run`; `sikula run` does not rewrite the task file for you.
+Use this when you want to clarify a product task description into an implementation contract before any agents start changing code. The commands are explicit: `task refine` is an optional product-description refinement step, `contract prepare` writes the project-aware Markdown contract you later pass to `sikula run`, and `sikula run` does not rewrite the task file for you. You can skip `task refine` and run `contract prepare` directly on the original task description when you want one step that asks both product-level and delivery-readiness questions.
 
 **Run a task into a branch**
 

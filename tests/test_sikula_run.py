@@ -631,7 +631,7 @@ class TestCmdRunStateStore:
         assert state.implementation_contract["status"] in {"ready", "warn", "weak", "not_ready"}
         assert isinstance(state.implementation_contract["clarifying_question_ids"], list)
         assert "validation" in state.implementation_contract
-        assert not (tmp_path / ".sikula" / "contracts").exists()
+        assert not (tmp_path / ".sikula" / "contract-reports").exists()
 
     def test_task_file_no_isolate_records_contract_preflight(self, tmp_path: Path, capsys):
         task_file = tmp_path / "task.md"
@@ -662,7 +662,7 @@ class TestCmdRunStateStore:
         state = store.load(task_ids[0])
         assert state.implementation_contract["source"]["path"] == "task.md"
         assert state.implementation_contract["source"]["sha256"].startswith("sha256:")
-        assert not (tmp_path / ".sikula" / "contracts").exists()
+        assert not (tmp_path / ".sikula" / "contract-reports").exists()
 
     def test_task_file_contract_preflight_uses_cli_phase_overrides(self, tmp_path: Path):
         task_file = tmp_path / "task.md"
@@ -751,7 +751,7 @@ class TestCmdRunStateStore:
         out = capsys.readouterr().out
         assert exc.value.code == 1
         assert "Implementation contract gate failed:" in out
-        assert "sikula contract improve" in out
+        assert "sikula contract prepare" in out
         build_orchestrator.assert_not_called()
 
         store = JsonStateStore(tmp_path / ".sikula" / "state")

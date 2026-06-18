@@ -114,35 +114,32 @@ via `sikula run --task-id <task_id>` is supported from inside the worktree; befo
 finalization Sikula switches the process directory back to the original project so the
 worktree can be removed safely.
 
-**Contract check command:** `sikula contract check TASK_FILE` is a read-only preflight
-implemented by `core/contract_check.py`. It parses the task file, scores whether it is
-specific enough to act as an implementation contract, reports gaps and stable clarifying
-question IDs, and can emit the same result as JSON. By default it does not write files;
-with `--write-report` it writes an explicit `.sikula/contracts/*.check.json` report and
-matching `.answers.yaml` template for follow-up answers. `sikula contract improve
-TASK_FILE --answers ... --output ...` is the deterministic follow-up step: it verifies the
-answers file hash against the current task content, applies filled answers into a new
-Markdown implementation contract, preserves unanswered questions under `Open questions`,
-and runs the contract check on the output before writing it. It refuses accidental
-overwrites unless `--write` is explicitly used on a Markdown task; plain-text inputs can be
-improved only by writing a new Markdown output file. `--interactive` is a terminal
-convenience layer that creates or reuses the answers YAML, prompts for answers, saves that
-file, and then calls the same deterministic improve/recheck path. The same module also exposes
-side-effect-free in-memory helpers (`prepare_task_description()`, `improve_contract_text()`,
-and `prepare_implementation_contract()`) so chat/MCP adapters can reuse the same scoring,
+**Contract check and preparation commands:** `sikula contract check TASK_FILE` is a
+read-only preflight implemented by `core/contract_check.py`. It parses the task file,
+scores whether it is specific enough to act as an implementation contract, reports gaps
+and stable clarifying question IDs, and can emit the same result as JSON. By default it
+does not write files; with `--write-report` it writes an explicit
+`.sikula/contract-reports/*.check.json` report and matching `.answers.yaml` template for
+follow-up answers. `sikula task refine TASK_FILE --output ...` prepares the product brief
+side of the flow: it can normalize a product request into task-description Markdown and
+ask product-level clarifying questions, but it does not evaluate Sikula delivery
+readiness or return run guidance. `sikula contract prepare TASK_FILE --answers ...
+--output ...` turns the task description into the delivery artifact by applying answers,
+preserving product sections, adding project context plus validation commands from the
+effective project config, and rechecking the returned Markdown. It refuses stale answer
+hashes and accidental overwrites. `--interactive` is a terminal convenience layer for
+both refine and prepare: it creates or reuses an answers YAML, prompts for answers, saves
+that file under `.sikula/contract-reports`, and then writes the clean Markdown output.
+The same module also exposes side-effect-free in-memory helpers
+(`prepare_task_description()`, `improve_contract_text()`, and
+`prepare_implementation_contract()`) so chat/MCP adapters can reuse the same scoring,
 question, answer-application, and recheck logic without temporary YAML files or duplicate
-business rules. `prepare_task_description()` prepares the product brief side of the flow:
-it can normalize a product request into task-description Markdown and ask product-level
-clarifying questions, but it does not evaluate Sikula delivery readiness or return run
-guidance. `prepare_implementation_contract()` turns the task description into the delivery
-artifact by preserving product sections and adding project context plus validation commands
-from the effective project context, then rechecking the returned Markdown. It returns the
-authoritative delivery workflow state plus user-facing questions, safe `.sikula/tasks/...`
-path hints, resume arguments, revised-answer markers, and next-step guidance; adapters
-should not infer readiness separately. Chat/MCP callers must provide effective project
-context, especially validation commands, before the core result can report
-`ready_to_run=true`; client-reported local config presence is guidance only and is not a
-readiness signal.
+business rules. `prepare_implementation_contract()` returns the authoritative delivery
+workflow state plus user-facing questions, safe `.sikula/contracts/*.contract.md` path
+hints, resume arguments, revised-answer markers, and next-step guidance; adapters should
+not infer readiness separately. Chat/MCP callers must provide effective project context,
+especially validation commands, before the core result can report `ready_to_run=true`;
+client-reported local config presence is guidance only and is not a readiness signal.
 `core.contract_prepare_adapter` maps those core results into stable
 `prepare_task_description` and `prepare_implementation_contract` response shapes for
 future MCP transport without adding scoring or rewrite logic; task-description responses
@@ -150,13 +147,13 @@ do not expose implementation-contract readiness fields. These commands and helpe
 do not create `TaskState`, start agents, create worktrees, or alter `review` flow. Fresh `sikula run
 TASK_FILE` uses the same deterministic checks to store a compact warning-only snapshot in
 `TaskState.implementation_contract` and print a one-line summary before agents start; it
-does not write `.sikula/contracts` artifacts. Fresh task-file runs can opt into strict
+does not write `.sikula/contract-reports` artifacts. Fresh task-file runs can opt into strict
 pre-agent gating with `--require-contract-ready` or `--min-contract-score N`; the gate
 runs only after the snapshot has been saved and before worktree creation or orchestrator
 startup. A failed gate marks the task state failed, stores the effective run
 `config_snapshot`, and records an audit history entry, but does not start agents. Because
 no worktree or branch exists yet, that failed state is not resumable via `--reset-failed`;
-improve the implementation contract and start a fresh task-file run instead. `resume`, `review`,
+prepare the implementation contract and start a fresh task-file run instead. `resume`, `review`,
 and `review --fix` reuse existing task state instead of recomputing or re-gating the
 check. Review mode uses the existing branch diff as the
 primary review artifact; review-context readiness is a separate concern and should not
@@ -167,7 +164,7 @@ config. Disabled phases do not count as validation coverage; without config it s
 the task-content checks and leaves validation coverage empty. Answers templates are
 task-hash scoped: when the task content hash changes, existing filled answers are retained
 only under `previous_answers`, while active `answers` are reset for the new hash so future
-`contract improve` or run preflight logic does not treat stale answers as authoritative.
+`contract prepare` or run preflight logic does not treat stale answers as authoritative.
 
 ---
 
@@ -1228,7 +1225,7 @@ Sikula processes at once is still unsupported.
 | `task_file` | `str \| None` | `cmd_run()` in `sikula.py` | Basename of the task file (e.g. `add-login.md`); set on first run via `--task-file`; used by `status` for display; `None` for tasks created before this field was added or when resuming via `--task-id` only |
 | `config_snapshot` | `dict` | `cmd_run()` / Orchestrator | Effective run configuration captured on first run before agents start (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `planner.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. It is also saved for contract-gate failures that exit before `Orchestrator.run()`. Visible in `show <task_id>`. |
 | `implementation_contract` | `dict` | `cmd_run()` in `sikula.py` | Implementation-contract snapshot for fresh task-file runs: task path/format/hash, readiness status/score, gap metadata, clarifying question IDs, and validation coverage counts. By default it is warning-only additive metadata. Fresh `run TASK_FILE` can opt into pre-agent gating with `--require-contract-ready` or `--min-contract-score N`; resume/review flows do not recompute or re-gate it. |
-| `contract_gate_blocked` | `bool` | `cmd_run()` in `sikula.py` | True when an opt-in contract readiness gate failed before worktree creation or agent startup. Such states are kept for audit but are not reset via `--reset-failed`; users should improve the implementation contract and start a fresh task-file run. |
+| `contract_gate_blocked` | `bool` | `cmd_run()` in `sikula.py` | True when an opt-in contract readiness gate failed before worktree creation or agent startup. Such states are kept for audit but are not reset via `--reset-failed`; users should prepare the implementation contract and start a fresh task-file run. |
 | `analyst_prompt` | `str \| None` | AnalystAgent | Full assembled prompt sent to the analyst LLM (system + user sections, including inlined guidelines content); stored before the LLM call so it captures the exact input even on exception; enables post-run analysis of analyst behaviour |
 | `planner_prompt` | `str \| None` | PlannerAgent | Full assembled prompt sent to the planner LLM (system + user sections); stored before the LLM call; `None` when `run_planner: false` or planner not yet reached |
 | `implementation_prompt` | `str \| None` | AnalystAgent | Structured prompt fed to ImplementerAgent; the analyst's key output |
