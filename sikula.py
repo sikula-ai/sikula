@@ -1114,7 +1114,12 @@ def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
 
 
 def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
-    from core.contract_check import prepare_implementation_contract, render_contract_check
+    from core.contract_check import (
+        load_generated_answer_entries_for_contract,
+        prepare_implementation_contract,
+        render_contract_check,
+        write_prepared_contract,
+    )
 
     project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
     task_path = _resolve_task_path(args.task_file, project_root)
@@ -1128,11 +1133,20 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
     task_text = task_path.read_text(encoding="utf-8")
     project_context = _prepare_project_context_from_config(cfg)
     output_path = _resolve_output_path(args.output) if args.output else _default_contract_path(task_path, cfg)
+    report_root = project_root if cfg.get("project", {}).get("root_path") else None
+    report_dir = _resolve_contract_report_dir(cfg) if cfg.get("_config_path") else None
+    generated_answer_entries = load_generated_answer_entries_for_contract(
+        task_path,
+        source_text=task_text,
+        project_root=report_root,
+        report_dir=report_dir,
+    )
     if project_context is None or not project_context.get("validation_commands"):
         result = prepare_implementation_contract(
             task_text,
             contract_name=output_path.name,
             project_context=project_context,
+            generated_answer_entries=generated_answer_entries,
         )
         if result.required_next_step == "provide_project_context":
             _print_contract_prepare_project_context_required(result, args.task_file)
@@ -1148,6 +1162,7 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
                 task_text,
                 contract_name=task_path.name,
                 project_context=project_context,
+                generated_answer_entries=generated_answer_entries,
             )
             answers = _collect_prepare_answers_interactive(
                 generated_by="sikula.contract_prepare",
@@ -1176,6 +1191,7 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         contract_name=output_path.name,
         answers=answers,
         project_context=project_context,
+        generated_answer_entries=generated_answer_entries,
     )
     if result.required_next_step == "provide_project_context":
         _print_contract_prepare_project_context_required(result, args.task_file)
@@ -1209,8 +1225,16 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         _print_existing_output_hint(output_path)
         sys.exit(1)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(result.prepared_contract_markdown, encoding="utf-8")
+    try:
+        write_prepared_contract(
+            result,
+            output_path=output_path,
+            project_root=report_root,
+            report_dir=report_dir,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"Failed to prepare contract: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"Implementation contract written: {output_path}")
     print(f"Applied answers: {len(result.answered_question_ids)}")
@@ -1414,13 +1438,66 @@ def _write_prepare_answers_template(
 def _prepare_answers_path(source_path: Path, cfg: dict, *, generated_by: str) -> Path:
     phase = generated_by.removeprefix("sikula.").replace("_", "-")
     stem = _strip_known_task_suffixes(source_path.stem)
-    return _prepare_answers_report_dir(source_path, cfg) / f"{stem}.{phase}.answers.yaml"
+    report_dir = _prepare_answers_report_dir(source_path, cfg)
+    artifact_base = _prepare_answers_artifact_base(report_dir, cfg)
+    base = report_dir / f"{stem}.{phase}.answers.yaml"
+    if _prepare_answers_path_available_for_task(base, source_path, artifact_base, generated_by):
+        return base
+
+    hashed_stem = f"{stem}-{sha256(str(source_path.resolve()).encode('utf-8')).hexdigest()[:8]}"
+    hashed = report_dir / f"{hashed_stem}.{phase}.answers.yaml"
+    if not _prepare_answers_path_available_for_task(hashed, source_path, artifact_base, generated_by):
+        raise FileExistsError(f"answers path already exists for a different task: {hashed}")
+    return hashed
 
 
 def _prepare_answers_report_dir(source_path: Path, cfg: dict) -> Path:
     if cfg.get("_config_path"):
         return _resolve_contract_report_dir(cfg)
     return _infer_task_local_contract_report_dir(source_path)
+
+
+def _prepare_answers_artifact_base(report_dir: Path, cfg: dict) -> Path:
+    project_root = cfg.get("project", {}).get("root_path")
+    if project_root:
+        return Path(project_root).resolve()
+    if report_dir.name == "contract-reports" and report_dir.parent.name == ".sikula":
+        return report_dir.parent.parent.resolve()
+    return Path.cwd().resolve()
+
+
+def _prepare_answers_path_available_for_task(
+    path: Path,
+    source_path: Path,
+    artifact_base: Path,
+    generated_by: str,
+) -> bool:
+    if not path.exists():
+        return True
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if data.get("schema_version") != 1 or data.get("generated_by") != generated_by:
+        return False
+    return _prepare_answers_task_path_matches(data.get("task"), source_path, artifact_base)
+
+
+def _prepare_answers_task_path_matches(task: object, source_path: Path, artifact_base: Path) -> bool:
+    if not isinstance(task, dict):
+        return False
+    value = task.get("path")
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        path = Path(value)
+        if not path.is_absolute():
+            path = artifact_base / path
+        return path.resolve() == source_path.resolve()
+    except OSError:
+        return False
 
 
 def _infer_task_local_contract_report_dir(source_path: Path) -> Path:

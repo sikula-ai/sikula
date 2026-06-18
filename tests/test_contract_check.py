@@ -1916,6 +1916,96 @@ def test_contract_prepare_cli_writes_output_from_answers(tmp_path: Path, monkeyp
     assert "Applied answers: 1" in out
     assert "Implementation Contract Readiness:" in out
     assert "A valid email can be invited." in output_path.read_text(encoding="utf-8")
+    metadata_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.contract.generated-answers.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["generated_by"] == "sikula.contract_prepare"
+    assert metadata["task"]["path"] == ".sikula/contracts/team-invites.contract.md"
+    assert metadata["task"]["sha256"] == (
+        "sha256:" + sha256(output_path.read_text(encoding="utf-8").strip().encode("utf-8")).hexdigest()
+    )
+    assert metadata["generated_answers"][0]["question_id"] == "acceptance.criteria"
+    assert "A valid email can be invited" not in metadata_path.read_text(encoding="utf-8")
+
+
+def test_contract_prepare_cli_uses_metadata_for_later_answer_revisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    task_path = tmp_path / ".sikula" / "tasks" / "dashboard-filter.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add dashboard filter\n\nUsers should be able to filter dashboard entries.", encoding="utf-8")
+    result = check_contract_file(task_path, project_config=_python_project_config(tmp_path))
+    written = write_contract_report(result, task_path=task_path, project_root=tmp_path)
+    answers = yaml.safe_load(written.answers_path.read_text(encoding="utf-8"))
+    answers["answers"]["scope.boundaries"]["answer"] = "Add filtering by label."
+    answers["answers"]["acceptance.criteria"]["answer"] = (
+        "Users can filter dashboard entries by label. No matches show an empty state."
+    )
+    answers["answers"]["scope.out_of_scope"]["answer"] = "Do not redesign the dashboard."
+    written.answers_path.write_text(yaml.safe_dump(answers, sort_keys=False), encoding="utf-8")
+    first_output_path = tmp_path / ".sikula" / "contracts" / "dashboard-filter.contract.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["pytest"]}),
+        patch(
+            "sys.argv",
+            [
+                "sikula",
+                "contract",
+                "prepare",
+                str(task_path),
+                "--answers",
+                str(written.answers_path),
+                "--output",
+                str(first_output_path),
+            ],
+        ),
+    ):
+        main()
+
+    capsys.readouterr()
+    first_output = first_output_path.read_text(encoding="utf-8")
+    assert "- Add filtering by label." in first_output
+    assert "- `pytest`" in first_output
+
+    revision_result = check_contract_file(first_output_path, project_config=_python_project_config(tmp_path))
+    revision_written = write_contract_report(revision_result, task_path=first_output_path, project_root=tmp_path)
+    revision_answers = yaml.safe_load(revision_written.answers_path.read_text(encoding="utf-8"))
+    revision_answers.setdefault("answers", {})["scope.boundaries"] = {
+        "answer": "Add filtering by label and owner.",
+        "notes": "",
+    }
+    revision_answers["answers"]["acceptance.criteria"] = {
+        "answer": "Users can filter dashboard entries by label and owner. No matches show an empty state.",
+        "notes": "",
+    }
+    revision_written.answers_path.write_text(yaml.safe_dump(revision_answers, sort_keys=False), encoding="utf-8")
+    second_output_path = tmp_path / ".sikula" / "contracts" / "dashboard-filter.v2.contract.md"
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["ruff check ."]}),
+        patch(
+            "sys.argv",
+            [
+                "sikula",
+                "contract",
+                "prepare",
+                str(first_output_path),
+                "--answers",
+                str(revision_written.answers_path),
+                "--output",
+                str(second_output_path),
+            ],
+        ),
+    ):
+        main()
+
+    second_output = second_output_path.read_text(encoding="utf-8")
+    assert "- Add filtering by label." not in second_output
+    assert "- Add filtering by label and owner." in second_output
+    assert "- `pytest`" not in second_output
+    assert "- `ruff check .`" in second_output
+    assert "sikula:generated-answer" not in second_output
 
 
 def test_contract_prepare_cli_interactive_writes_answers_and_output(
@@ -2373,6 +2463,46 @@ def test_contract_prepare_cli_without_answers_writes_template_before_output(
     assert "acceptance.criteria" in answers["answers"]
 
 
+def test_contract_prepare_cli_same_stem_answers_templates_use_task_specific_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    web_task_path = tmp_path / ".sikula" / "tasks" / "web" / "invite.md"
+    mobile_task_path = tmp_path / ".sikula" / "tasks" / "mobile" / "invite.md"
+    web_task_path.parent.mkdir(parents=True)
+    mobile_task_path.parent.mkdir(parents=True)
+    task_text = "# Add team invites\n\nUsers should be able to invite teammates by email."
+    web_task_path.write_text(task_text, encoding="utf-8")
+    mobile_task_path.write_text(task_text, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["pytest"]}),
+        patch("sys.argv", ["sikula", "contract", "prepare", str(web_task_path)]),
+        pytest.raises(SystemExit) as first_exit,
+    ):
+        main()
+
+    capsys.readouterr()
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["pytest"]}),
+        patch("sys.argv", ["sikula", "contract", "prepare", str(mobile_task_path)]),
+        pytest.raises(SystemExit) as second_exit,
+    ):
+        main()
+
+    assert first_exit.value.code == 1
+    assert second_exit.value.code == 1
+    report_dir = tmp_path / ".sikula" / "contract-reports"
+    base_answers_path = report_dir / "invite.contract-prepare.answers.yaml"
+    hashed_answers_paths = sorted(report_dir.glob("invite-*.contract-prepare.answers.yaml"))
+    assert base_answers_path.exists()
+    assert len(hashed_answers_paths) == 1
+    base_answers = yaml.safe_load(base_answers_path.read_text(encoding="utf-8"))
+    hashed_answers = yaml.safe_load(hashed_answers_paths[0].read_text(encoding="utf-8"))
+    assert base_answers["task"]["path"] == ".sikula/tasks/web/invite.md"
+    assert hashed_answers["task"]["path"] == ".sikula/tasks/mobile/invite.md"
+
+
 def test_contract_prepare_cli_regenerates_stale_default_answers_template(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ):
@@ -2479,7 +2609,11 @@ def test_contract_prepare_cli_writes_ready_contract_without_answers(
 
     out = capsys.readouterr().out
     assert output_path.exists()
-    assert not (tmp_path / ".sikula" / "contract-reports").exists()
+    metadata_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.contract.generated-answers.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["generated_by"] == "sikula.contract_prepare"
+    assert metadata["task"]["path"] == ".sikula/contracts/team-invites.contract.md"
+    assert metadata["generated_answers"] == []
     assert "Implementation contract written:" in out
     assert "Open questions:" in out
     assert f"Next step: sikula run {output_path}" in out

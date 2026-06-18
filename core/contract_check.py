@@ -268,6 +268,18 @@ class ContractImproveResult:
 
 
 @dataclass(frozen=True)
+class ContractPrepareWriteResult:
+    output_path: Path
+    generated_answers_path: Path
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "output_path": str(self.output_path),
+            "generated_answers": str(self.generated_answers_path),
+        }
+
+
+@dataclass(frozen=True)
 class ContractTextImproveResult:
     markdown: str
     resume_markdown: str
@@ -678,7 +690,8 @@ def improve_contract_from_answers(
     final_output_path.write_text(improved.markdown, encoding="utf-8")
     _write_generated_answer_entries(
         final_output_path,
-        improved=improved,
+        markdown=improved.markdown,
+        resume_markdown=improved.resume_markdown,
         generated_answers_path=generated_answers_path,
         artifact_base=artifact_base,
     )
@@ -689,6 +702,51 @@ def improve_contract_from_answers(
         open_question_ids=improved.open_question_ids,
         source_sha256=improved.source_sha256,
         answers_path=answers_path,
+    )
+
+
+def write_prepared_contract(
+    result: ContractPrepareResult,
+    *,
+    output_path: Path,
+    project_root: Path | None = None,
+    report_dir: Path | str | None = None,
+) -> ContractPrepareWriteResult:
+    output_path = output_path.resolve()
+    contract_dir = _contract_report_dir(output_path, project_root=project_root, report_dir=report_dir)
+    artifact_base = _artifact_base_dir(project_root=project_root, contract_dir=contract_dir)
+    generated_answers_path = _contract_generated_answers_path(output_path, contract_dir, artifact_base)
+    _ensure_contract_path(generated_answers_path, contract_dir)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(result.prepared_contract_markdown, encoding="utf-8")
+    resume_markdown = str(result.resume_arguments.get("contract_markdown") or result.prepared_contract_markdown)
+    _write_generated_answer_entries(
+        output_path,
+        markdown=result.prepared_contract_markdown,
+        resume_markdown=resume_markdown,
+        generated_answers_path=generated_answers_path,
+        artifact_base=artifact_base,
+    )
+    return ContractPrepareWriteResult(output_path=output_path, generated_answers_path=generated_answers_path)
+
+
+def load_generated_answer_entries_for_contract(
+    task_path: Path,
+    *,
+    source_text: str,
+    project_root: Path | None = None,
+    report_dir: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    task_path = task_path.resolve()
+    contract_dir = _contract_report_dir(task_path, project_root=project_root, report_dir=report_dir)
+    artifact_base = _artifact_base_dir(project_root=project_root, contract_dir=contract_dir)
+    source_sha256 = "sha256:" + sha256(source_text.strip().encode("utf-8")).hexdigest()
+    return _load_generated_answer_entries(
+        task_path,
+        source_sha256=source_sha256,
+        contract_dir=contract_dir,
+        artifact_base=artifact_base,
     )
 
 
@@ -830,6 +888,7 @@ def prepare_implementation_contract(
     contract_name: str | None = None,
     answers: dict[str, str | dict[str, Any]] | None = None,
     project_context: PrepareProjectContext | dict[str, Any] | None = None,
+    generated_answer_entries: list[dict[str, Any]] | None = None,
 ) -> ContractPrepareResult:
     """Prepare an implementation contract through an in-memory check/improve loop."""
 
@@ -839,7 +898,12 @@ def prepare_implementation_contract(
     project_context_blockers = _prepare_project_context_blockers(normalized_project_context)
     validation_commands = _validation_commands_from_prepare_context(normalized_project_context)
     safe_task_path = _safe_task_path_hint(contract_name, task_description_markdown)
-    evaluation_contract_markdown = _strip_generated_markers(task_description_markdown)
+    source_contract_markdown = _strip_revisable_generated_entries(
+        task_description_markdown,
+        answers=answers,
+        generated_answer_entries=generated_answer_entries or [],
+    )
+    evaluation_contract_markdown = _strip_generated_markers(source_contract_markdown)
     check_result = check_contract(
         evaluation_contract_markdown,
         source_path=contract_name,
@@ -853,16 +917,18 @@ def prepare_implementation_contract(
         # Only answers for the currently active questions should be applied here;
         # earlier answers are already represented in the returned Markdown.
         active_questions = _prepare_active_questions_for_answers(
-            task_description_markdown,
+            source_contract_markdown,
             normalized_project_context,
+            answers=answers,
             check_result=check_result,
             safe_task_path=safe_task_path,
             project_config=project_config,
             configured_validation_commands=validation_commands,
+            generated_answer_entries=generated_answer_entries,
         )
         active_answers = _answers_for_questions(answers, active_questions)
         improved = improve_contract_text(
-            task_description_markdown,
+            source_contract_markdown,
             contract_name=contract_name,
             questions=active_questions,
             answers=active_answers,
@@ -870,10 +936,12 @@ def prepare_implementation_contract(
             output_name=safe_task_path,
             project_config=project_config,
             configured_validation_commands=validation_commands,
+            generated_answer_entries=generated_answer_entries,
         )
         prepared_contract_markdown, resume_contract_markdown = _enrich_implementation_contract_markdown(
             improved.resume_markdown,
             normalized_project_context,
+            generated_answer_entries=generated_answer_entries,
         )
         enriched_check_result = check_contract(
             prepared_contract_markdown,
@@ -896,8 +964,9 @@ def prepare_implementation_contract(
         )
 
     prepared_contract_markdown, resume_contract_markdown = _enrich_implementation_contract_markdown(
-        task_description_markdown,
+        source_contract_markdown,
         normalized_project_context,
+        generated_answer_entries=generated_answer_entries,
     )
     recheck_result = None
     if prepared_contract_markdown != evaluation_contract_markdown.strip() + "\n":
@@ -925,16 +994,26 @@ def _prepare_active_questions_for_answers(
     contract_markdown: str,
     project_context: PrepareProjectContext | None,
     *,
+    answers: dict[str, str | dict[str, Any]],
     check_result: ContractCheckResult,
     safe_task_path: str,
     project_config: dict | None,
     configured_validation_commands: list[str] | None,
+    generated_answer_entries: list[dict[str, Any]] | None,
 ) -> list[ClarifyingQuestion]:
     questions = list(check_result.clarifying_questions)
+    questions = _merge_clarifying_questions(
+        questions,
+        _generated_answer_questions_for_answers(answers, generated_answer_entries or []),
+    )
     if project_context is None:
         return questions
 
-    enriched_markdown, _resume_markdown = _enrich_implementation_contract_markdown(contract_markdown, project_context)
+    enriched_markdown, _resume_markdown = _enrich_implementation_contract_markdown(
+        contract_markdown,
+        project_context,
+        generated_answer_entries=generated_answer_entries,
+    )
     if enriched_markdown == _strip_generated_markers(contract_markdown).strip() + "\n":
         return questions
 
@@ -946,6 +1025,64 @@ def _prepare_active_questions_for_answers(
         configured_validation_commands=configured_validation_commands,
     )
     return _merge_clarifying_questions(questions, enriched_check_result.clarifying_questions)
+
+
+def _strip_revisable_generated_entries(
+    contract_markdown: str,
+    *,
+    answers: dict[str, str | dict[str, Any]] | None,
+    generated_answer_entries: list[dict[str, Any]],
+) -> str:
+    if not generated_answer_entries:
+        return contract_markdown
+    question_ids = [*_IMPLEMENTATION_CONTEXT_ENTRY_IDS]
+    if answers:
+        question_ids.extend(_answered_generated_entry_ids(answers, generated_answer_entries))
+    return _strip_tracked_generated_answer_entries(contract_markdown, question_ids, generated_answer_entries)
+
+
+def _answered_generated_entry_ids(
+    answers: dict[str, str | dict[str, Any]],
+    generated_answer_entries: list[dict[str, Any]],
+) -> list[str]:
+    normalized_answers = _normalize_contract_answers(answers)
+    entry_ids = {
+        str(entry.get("question_id") or "").strip()
+        for entry in generated_answer_entries
+        if isinstance(entry, dict)
+    }
+    return [
+        question_id
+        for question_id, answer in normalized_answers.items()
+        if question_id in entry_ids and _answer_text(answer)
+    ]
+
+
+def _generated_answer_questions_for_answers(
+    answers: dict[str, str | dict[str, Any]],
+    generated_answer_entries: list[dict[str, Any]],
+) -> list[ClarifyingQuestion]:
+    normalized_answers = _normalize_contract_answers(answers)
+    questions: list[ClarifyingQuestion] = []
+    seen: set[str] = set()
+    for entry in generated_answer_entries:
+        if not isinstance(entry, dict):
+            continue
+        question_id = str(entry.get("question_id") or "").strip()
+        if not question_id or question_id in seen:
+            continue
+        if not _answer_text(normalized_answers.get(question_id)):
+            continue
+        seen.add(question_id)
+        questions.append(
+            ClarifyingQuestion(
+                question_id,
+                question_id,
+                "This answer updates a previously prepared generated contract section.",
+                False,
+            )
+        )
+    return questions
 
 
 def _merge_clarifying_questions(*question_groups: list[ClarifyingQuestion]) -> list[ClarifyingQuestion]:
@@ -1436,9 +1573,16 @@ def _insert_or_append_section_entries(lines: list[str], section: str, entries: l
 def _enrich_implementation_contract_markdown(
     contract_markdown: str,
     project_context: PrepareProjectContext | None,
+    *,
+    generated_answer_entries: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
     source = contract_markdown.strip()
     source = _strip_generated_answer_entries(source, _IMPLEMENTATION_CONTEXT_ENTRY_IDS)
+    source = _strip_tracked_generated_answer_entries(
+        source,
+        _IMPLEMENTATION_CONTEXT_ENTRY_IDS,
+        generated_answer_entries or [],
+    )
     lines = source.splitlines()
 
     if project_context is not None:
@@ -2470,7 +2614,8 @@ def _load_generated_answer_entries(
 def _write_generated_answer_entries(
     output_path: Path,
     *,
-    improved: ContractTextImproveResult,
+    markdown: str,
+    resume_markdown: str,
     generated_answers_path: Path,
     artifact_base: Path,
 ) -> None:
@@ -2480,11 +2625,11 @@ def _write_generated_answer_entries(
         "created_at": _utc_timestamp(),
         "task": {
             "path": _artifact_path(output_path, artifact_base),
-            "sha256": "sha256:" + sha256(improved.markdown.strip().encode("utf-8")).hexdigest(),
+            "sha256": "sha256:" + sha256(markdown.strip().encode("utf-8")).hexdigest(),
         },
         "generated_answers": _generated_answer_entries_from_resume(
-            improved.resume_markdown,
-            improved.markdown,
+            resume_markdown,
+            markdown,
         ),
     }
     generated_answers_path.parent.mkdir(parents=True, exist_ok=True)
