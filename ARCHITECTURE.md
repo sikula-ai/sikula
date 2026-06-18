@@ -128,12 +128,16 @@ overwrites unless `--write` is explicitly used on a Markdown task; plain-text in
 improved only by writing a new Markdown output file. `--interactive` is a terminal
 convenience layer that creates or reuses the answers YAML, prompts for answers, saves that
 file, and then calls the same deterministic improve/recheck path. The same module also exposes
-side-effect-free in-memory helpers (`improve_contract_text()` and `prepare_implementation_contract()`) so
-chat/MCP adapters can reuse the same scoring, question, answer-application, and recheck
-logic without temporary YAML files or duplicate business rules. `prepare_implementation_contract()` returns
-the authoritative workflow state plus user-facing questions, safe `.sikula/tasks/...` path
-hints, resume arguments, revised-answer markers, and next-step guidance; adapters should not
-infer readiness separately. Chat/MCP callers must provide effective project context,
+side-effect-free in-memory helpers (`prepare_task_description()`, `improve_contract_text()`,
+and `prepare_implementation_contract()`) so chat/MCP adapters can reuse the same scoring,
+question, answer-application, and recheck logic without temporary YAML files or duplicate
+business rules. `prepare_task_description()` prepares the product brief side of the flow:
+it can normalize a product request into task-description Markdown and ask product-level
+clarifying questions, but it does not evaluate Sikula delivery readiness or return run
+guidance. `prepare_implementation_contract()` returns the authoritative delivery workflow
+state plus user-facing questions, safe `.sikula/tasks/...` path hints, resume arguments,
+revised-answer markers, and next-step guidance; adapters should not infer readiness
+separately. Chat/MCP callers must provide effective project context,
 especially validation commands, before the core result can report `ready_to_run=true`;
 client-reported local config presence is guidance only and is not a readiness signal.
 `core.contract_prepare_adapter` maps that core result into the stable

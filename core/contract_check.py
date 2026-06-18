@@ -113,6 +113,7 @@ _SECTION_ALIASES = {
     },
     "repo_context": {
         "context",
+        "product context",
         "repo context",
         "architecture",
         "implementation notes",
@@ -281,6 +282,23 @@ class ContractTextImproveResult:
 
 
 @dataclass(frozen=True)
+class PrepareProductContext:
+    audience: str | None = None
+    product_area: str | None = None
+    known_constraints: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+        if self.audience:
+            data["audience"] = self.audience
+        if self.product_area:
+            data["product_area"] = self.product_area
+        if self.known_constraints:
+            data["known_constraints"] = self.known_constraints
+        return data
+
+
+@dataclass(frozen=True)
 class PrepareDeliveryEnvironment:
     local_sikula_config_present: bool | None = None
     source: str = "client_reported"
@@ -371,6 +389,54 @@ class ContractPrepareResult:
             "primary_user_action": self.primary_user_action,
             "assistant_response_markdown": self.assistant_response_markdown,
             "safe_task_path": self.safe_task_path,
+            "anti_loop_guidance": dict(self.anti_loop_guidance),
+        }
+
+
+@dataclass(frozen=True)
+class TaskDescriptionPrepareResult:
+    """Prepared product task-description workflow state for chat/API adapters."""
+
+    stage: str
+    needs_user_input: bool
+    required_next_step: str
+    questions_for_user: list[ClarifyingQuestion]
+    answers_template: dict[str, dict[str, Any]]
+    prepared_task_markdown: str
+    answered_question_ids: list[str] = field(default_factory=list)
+    open_question_ids: list[str] = field(default_factory=list)
+    revised_answer_question_ids: list[str] = field(default_factory=list)
+    user_questions: list[dict[str, Any]] = field(default_factory=list)
+    resume_arguments: dict[str, Any] = field(default_factory=dict)
+    authoritative_output_markdown: str = ""
+    suggested_next_steps: list[str] = field(default_factory=list)
+    required_user_action: str = ""
+    primary_user_action: str = ""
+    assistant_response_markdown: str = ""
+    assumptions: list[str] = field(default_factory=list)
+    non_goals: list[str] = field(default_factory=list)
+    anti_loop_guidance: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "needs_user_input": self.needs_user_input,
+            "required_next_step": self.required_next_step,
+            "questions_for_user": [question.to_dict() for question in self.questions_for_user],
+            "answers_template": {key: dict(value) for key, value in self.answers_template.items()},
+            "prepared_task_markdown": self.prepared_task_markdown,
+            "answered_question_ids": list(self.answered_question_ids),
+            "open_question_ids": list(self.open_question_ids),
+            "revised_answer_question_ids": list(self.revised_answer_question_ids),
+            "user_questions": [dict(question) for question in self.user_questions],
+            "resume_arguments": dict(self.resume_arguments),
+            "authoritative_output_markdown": self.authoritative_output_markdown,
+            "suggested_next_steps": list(self.suggested_next_steps),
+            "required_user_action": self.required_user_action,
+            "primary_user_action": self.primary_user_action,
+            "assistant_response_markdown": self.assistant_response_markdown,
+            "assumptions": list(self.assumptions),
+            "non_goals": list(self.non_goals),
             "anti_loop_guidance": dict(self.anti_loop_guidance),
         }
 
@@ -685,6 +751,72 @@ def improve_contract_text(
     )
 
 
+def prepare_task_description(
+    brief: str,
+    task_name: str | None = None,
+    product_context: PrepareProductContext | dict[str, Any] | None = None,
+    answers: dict[str, str | dict[str, Any]] | None = None,
+) -> TaskDescriptionPrepareResult:
+    """Prepare a product task description without scoring Sikula delivery readiness."""
+
+    normalized_product_context = _normalize_prepare_product_context(product_context)
+    source_markdown = _strip_generated_markers(_strip_generated_open_questions_section(brief)).strip()
+    source_markdown = source_markdown or brief.strip()
+    initial_markdown = _render_task_description_base(source_markdown, task_name, normalized_product_context)
+    initial_questions = _build_task_description_questions(initial_markdown)
+    active_answers = _answers_for_questions(answers or {}, initial_questions)
+    prepared_markdown, resume_markdown, answered_ids = _render_prepared_task_description(
+        initial_markdown,
+        questions=initial_questions,
+        answers=active_answers,
+    )
+    final_questions = _build_task_description_questions(prepared_markdown)
+    resume_markdown, open_question_ids = _reconcile_rendered_open_questions(
+        resume_markdown,
+        final_questions,
+        active_answers,
+    )
+    prepared_markdown = _strip_generated_markers(resume_markdown)
+    final_question_ids = [question.id for question in final_questions]
+    revised_answer_question_ids = [question.id for question in final_questions if question.id in set(answered_ids)]
+    open_question_ids = list(dict.fromkeys([*open_question_ids, *final_question_ids]))
+    needs_user_input = bool(final_questions)
+    required_next_step = "answer_questions" if needs_user_input else "prepare_implementation_contract"
+    required_user_action = _task_description_required_user_action(required_next_step)
+    suggested_next_steps = _task_description_suggested_next_steps(required_next_step)
+
+    return TaskDescriptionPrepareResult(
+        stage="needs_user_input" if needs_user_input else "ready",
+        needs_user_input=needs_user_input,
+        required_next_step=required_next_step,
+        questions_for_user=final_questions,
+        answers_template=_prepare_answers_template_for_questions(final_questions, revised_answer_question_ids),
+        prepared_task_markdown=prepared_markdown,
+        answered_question_ids=answered_ids,
+        open_question_ids=open_question_ids,
+        revised_answer_question_ids=revised_answer_question_ids,
+        user_questions=_prepare_user_questions(final_questions, revised_answer_question_ids),
+        resume_arguments={
+            "brief": resume_markdown,
+            "task_name": task_name,
+            "product_context": _prepare_product_context_for_resume(normalized_product_context),
+        },
+        authoritative_output_markdown=prepared_markdown,
+        suggested_next_steps=suggested_next_steps,
+        required_user_action=required_user_action,
+        primary_user_action=required_user_action,
+        assistant_response_markdown=_task_description_assistant_response_markdown(
+            needs_user_input=needs_user_input,
+            revised_answer_question_ids=revised_answer_question_ids,
+            suggested_next_steps=suggested_next_steps,
+            required_user_action=required_user_action,
+        ),
+        assumptions=[],
+        non_goals=[],
+        anti_loop_guidance=_prepare_anti_loop_guidance(),
+    )
+
+
 def prepare_implementation_contract(
     task_description_markdown: str,
     contract_name: str | None = None,
@@ -902,9 +1034,16 @@ def _prepare_answers_template(
     result: ContractCheckResult,
     revised_answer_question_ids: list[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
+    return _prepare_answers_template_for_questions(result.clarifying_questions, revised_answer_question_ids)
+
+
+def _prepare_answers_template_for_questions(
+    questions: list[ClarifyingQuestion],
+    revised_answer_question_ids: list[str] | None = None,
+) -> dict[str, dict[str, Any]]:
     revised_ids = set(revised_answer_question_ids or [])
     template: dict[str, dict[str, Any]] = {}
-    for question in result.clarifying_questions:
+    for question in questions:
         entry = question.to_dict()
         entry["answer"] = ""
         entry["notes"] = ""
@@ -988,6 +1127,234 @@ def _contract_path_source_name(contract_name: str | None, contract_markdown: str
         if stripped:
             return stripped
     return "task"
+
+
+def _normalize_prepare_product_context(
+    product_context: PrepareProductContext | dict[str, Any] | None,
+) -> PrepareProductContext | None:
+    if product_context is None:
+        return None
+    if isinstance(product_context, PrepareProductContext):
+        return product_context
+    if not isinstance(product_context, dict):
+        raise TypeError("product_context must be a PrepareProductContext or dict")
+    return PrepareProductContext(
+        audience=_prepare_optional_string(product_context.get("audience")),
+        product_area=_prepare_optional_string(product_context.get("product_area")),
+        known_constraints=_prepare_optional_string(product_context.get("known_constraints")),
+    )
+
+
+def _prepare_product_context_for_resume(product_context: PrepareProductContext | None) -> dict[str, Any]:
+    if product_context is None:
+        return {}
+    return product_context.to_dict()
+
+
+def _render_task_description_base(
+    brief_markdown: str,
+    task_name: str | None,
+    product_context: PrepareProductContext | None,
+) -> str:
+    brief_markdown = brief_markdown.strip()
+    parsed = _parse_markdown_task(brief_markdown)
+    title = _task_description_title(task_name, parsed, brief_markdown)
+    if _task_description_has_known_sections(parsed):
+        lines = brief_markdown.splitlines()
+    else:
+        body = _task_description_body_without_title(brief_markdown, parsed)
+        lines = [f"# {title}", ""]
+        if body:
+            lines.extend(["## Goal", "", *body.splitlines()])
+    _append_product_context(lines, product_context)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _task_description_title(task_name: str | None, parsed: _ParsedTask, brief_markdown: str) -> str:
+    if task_name:
+        return Path(str(task_name)).stem.replace("-", " ").strip() or "Product task"
+    if parsed.title:
+        return parsed.title
+    for line in brief_markdown.splitlines():
+        stripped = line.strip().lstrip("#").strip()
+        if stripped:
+            return stripped[:80]
+    return "Product task"
+
+
+def _task_description_has_known_sections(parsed: _ParsedTask) -> bool:
+    for section in parsed.sections:
+        if section.normalized_heading == "preamble":
+            continue
+        if section.heading == parsed.title:
+            continue
+        if _known_section_heading(section.heading):
+            return True
+    return False
+
+
+def _task_description_body_without_title(brief_markdown: str, parsed: _ParsedTask) -> str:
+    lines = brief_markdown.splitlines()
+    if lines and _HEADING_RE.match(lines[0]) and parsed.title:
+        return "\n".join(lines[1:]).strip()
+    return brief_markdown
+
+
+def _append_product_context(lines: list[str], product_context: PrepareProductContext | None) -> None:
+    if product_context is None or not product_context.to_dict():
+        return
+    parsed = _parse_markdown_task("\n".join(lines))
+    if _section_content(parsed, "repo_context").strip():
+        return
+
+    entries: list[str] = []
+    if product_context.audience:
+        entries.append(f"- Audience: {product_context.audience}")
+    if product_context.product_area:
+        entries.append(f"- Product area: {product_context.product_area}")
+    if product_context.known_constraints:
+        entries.append(f"- Known constraints: {product_context.known_constraints}")
+    if not entries:
+        return
+    lines.extend(["", "## Product context", "", *entries])
+
+
+def _build_task_description_questions(markdown: str) -> list[ClarifyingQuestion]:
+    parsed = _parse_markdown_task(_strip_generated_open_questions_section(_strip_generated_markers(markdown)))
+    sections_detected = _sections_detected(parsed)
+    questions: list[ClarifyingQuestion] = []
+
+    def add(question: ClarifyingQuestion) -> None:
+        if all(existing.id != question.id for existing in questions):
+            questions.append(question)
+
+    if parsed.word_count < 5:
+        add(
+            ClarifyingQuestion(
+                "product.goal",
+                "What user-facing outcome should this task deliver?",
+                "The task description needs a clear product goal before it can become an implementation contract.",
+                True,
+            )
+        )
+    if _score_scope(parsed, sections_detected) < 50:
+        add(
+            ClarifyingQuestion(
+                "scope.boundaries",
+                "What exactly is in scope, and what related behaviour should remain unchanged?",
+                "Clear product boundaries prevent unrelated feature drift during delivery.",
+                True,
+            )
+        )
+    if _score_acceptance(parsed, sections_detected) < 50:
+        add(
+            ClarifyingQuestion(
+                "acceptance.criteria",
+                "What observable behaviours should prove this product task is complete?",
+                "Observable acceptance criteria keep implementation, review, and tests aligned on product intent.",
+                True,
+            )
+        )
+    if not sections_detected["out_of_scope"]:
+        add(
+            ClarifyingQuestion(
+                "scope.out_of_scope",
+                "Which adjacent product changes are explicitly out of scope?",
+                "Out-of-scope boundaries help preserve existing behaviour and avoid accidental product expansion.",
+                False,
+            )
+        )
+    return questions
+
+
+def _render_prepared_task_description(
+    base_markdown: str,
+    *,
+    questions: list[ClarifyingQuestion],
+    answers: dict[str, dict[str, Any]],
+) -> tuple[str, str, list[str]]:
+    answered_question_ids = [question.id for question in questions if _answer_text(answers.get(question.id, {}))]
+    task_text = _strip_generated_answer_entries(base_markdown, answered_question_ids)
+    task_text = _strip_generated_open_questions_section(task_text)
+    lines = task_text.strip().splitlines()
+
+    section_entries: dict[str, list[tuple[ClarifyingQuestion, str]]] = {}
+    for question in questions:
+        answer_text = _answer_text(answers.get(question.id, {}))
+        if not answer_text:
+            continue
+        section = _task_description_section_for_question(question.id)
+        section_entries.setdefault(section, []).append((question, answer_text))
+
+    for section in _ordered_task_description_sections(section_entries):
+        entries = section_entries[section]
+        rendered_entries = _task_description_answer_entry_lines(entries)
+        _insert_or_append_section_entries(lines, section, rendered_entries)
+
+    open_questions = [question.to_dict() for question in questions if question.id not in set(answered_question_ids)]
+    _append_open_questions(lines, open_questions, answers)
+    resume_markdown = "\n".join(lines).rstrip() + "\n"
+    return _strip_generated_markers(resume_markdown), resume_markdown, answered_question_ids
+
+
+def _task_description_section_for_question(question_id: str) -> str:
+    if question_id == "product.goal":
+        return "Goal"
+    if question_id == "scope.boundaries":
+        return "Scope"
+    if question_id == "acceptance.criteria":
+        return "Acceptance criteria"
+    if question_id == "scope.out_of_scope":
+        return "Out of scope"
+    if question_id == "context.product":
+        return "Product context"
+    return "Clarifications"
+
+
+def _ordered_task_description_sections(section_entries: dict[str, list[tuple[ClarifyingQuestion, str]]]) -> list[str]:
+    preferred = ["Goal", "Scope", "Acceptance criteria", "Out of scope", "Product context", "Clarifications"]
+    return [section for section in preferred if section in section_entries] + sorted(
+        section for section in section_entries if section not in preferred
+    )
+
+
+def _task_description_answer_entry_lines(entries: list[tuple[ClarifyingQuestion, str]]) -> list[str]:
+    lines: list[str] = []
+    for question, answer_text in entries:
+        lines.append(_generated_answer_entry_marker(question.id))
+        for answer_line in _answer_lines(answer_text):
+            lines.append(f"- {_clean_answer_bullet(answer_line)}")
+        lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
+    return lines
+
+
+def _insert_or_append_section_entries(lines: list[str], section: str, entries: list[str]) -> None:
+    normalized_section = _normalize_heading(section)
+    section_start: int | None = None
+    section_end = len(lines)
+    for index, line in enumerate(lines):
+        heading_match = _HEADING_RE.match(line)
+        if not heading_match:
+            continue
+        if _normalize_heading(heading_match.group(2)) == normalized_section:
+            section_start = index
+            section_end = index + 1
+            while section_end < len(lines) and not _HEADING_RE.match(lines[section_end]):
+                section_end += 1
+            break
+
+    if section_start is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend([f"## {section}", "", *entries])
+        return
+
+    insertion = list(entries)
+    if section_end > section_start + 1 and lines[section_end - 1].strip():
+        insertion.insert(0, "")
+    if section_end < len(lines) and insertion and insertion[-1].strip():
+        insertion.append("")
+    lines[section_end:section_end] = insertion
 
 
 def _normalize_prepare_project_context(
@@ -1093,6 +1460,44 @@ def _prepare_suggested_next_steps(
             f"Run `sikula run {safe_task_path}` from a locally configured Sikula project.",
         ]
     return []
+
+
+def _task_description_required_user_action(required_next_step: str) -> str:
+    return {
+        "answer_questions": "answer_task_description_questions",
+        "prepare_implementation_contract": "prepare_implementation_contract",
+    }.get(required_next_step, "review_task_description")
+
+
+def _task_description_suggested_next_steps(required_next_step: str) -> list[str]:
+    if required_next_step == "answer_questions":
+        return ["Answer the listed product task questions, then call prepare_task_description again."]
+    if required_next_step == "prepare_implementation_contract":
+        return ["Use the returned task description as input to prepare_implementation_contract with project context."]
+    return ["Review the prepared task description."]
+
+
+def _task_description_assistant_response_markdown(
+    *,
+    needs_user_input: bool,
+    revised_answer_question_ids: list[str],
+    suggested_next_steps: list[str],
+    required_user_action: str,
+) -> str:
+    changed = "Prepared product task description is ready for implementation-contract preparation."
+    if revised_answer_question_ids:
+        changed = "Some previous product-task answers still need more detail."
+    elif needs_user_input:
+        changed = "Product task description needs user input before implementation-contract preparation."
+    next_step = suggested_next_steps[0] if suggested_next_steps else "Review the prepared task description."
+    return "\n".join(
+        [
+            f"Changed: {changed}",
+            f"Next step: {next_step}",
+            f"Required action: {required_user_action}",
+            "Note: This result does not evaluate Sikula delivery readiness.",
+        ]
+    )
 
 
 def _prepare_assistant_response_markdown(
@@ -1698,6 +2103,10 @@ def _improved_contract_base_lines(task_text: str, task_path: Path) -> list[str]:
 
 
 def _contract_section_for_question(question_id: str) -> str:
+    if question_id == "product.goal":
+        return "Goal"
+    if question_id == "context.product":
+        return "Product context"
     if question_id in {"scope.boundaries"}:
         return "Scope"
     if question_id in {"acceptance.criteria", "acceptance.negative_cases"}:
