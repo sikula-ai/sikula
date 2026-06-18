@@ -1258,7 +1258,11 @@ def _resolve_output_path(value: str) -> Path:
 def _default_refined_task_path(task_path: Path, cfg: dict) -> Path:
     suffix = str(cfg.get("tasks", {}).get("refined_suffix") or ".refined.md")
     stem = _strip_known_task_suffixes(task_path.stem)
-    return _resolve_task_description_dir(cfg) / f"{stem}{suffix}"
+    if cfg.get("_config_path"):
+        task_description_dir = _resolve_task_description_dir(cfg)
+    else:
+        task_description_dir = _infer_task_local_description_dir(task_path)
+    return task_description_dir / f"{stem}{suffix}"
 
 
 def _default_contract_path(task_path: Path, cfg: dict) -> Path:
@@ -1427,6 +1431,16 @@ def _infer_task_local_contract_report_dir(source_path: Path) -> Path:
         if parent.name == ".sikula":
             return parent / "contract-reports"
     return Path.cwd().resolve() / ".sikula" / "contract-reports"
+
+
+def _infer_task_local_description_dir(source_path: Path) -> Path:
+    resolved = source_path.resolve()
+    for parent in resolved.parents:
+        if parent.name == "tasks" and parent.parent.name == ".sikula":
+            return parent
+        if parent.name == ".sikula":
+            return parent / "tasks"
+    return Path.cwd().resolve() / ".sikula" / "tasks"
 
 
 def _prepare_answers_template(
