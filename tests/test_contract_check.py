@@ -3169,7 +3169,10 @@ def test_contract_prepare_cli_auto_does_not_replace_supplied_answers(
         "answer": "Human-filled acceptance criteria should stay.",
         "notes": "Human-filled notes should stay.",
     }
-    assert answers["answers"]["scope.boundaries"] == {"answer": "", "notes": ""}
+    assert answers["answers"]["scope.boundaries"] == {
+        "answer": "Add email invites only.",
+        "notes": "Supported by the task.",
+    }
     assert "Add email invites only." in output
     assert "Human-filled acceptance criteria should stay." in output
     assert "Auto-generated acceptance criteria" not in output

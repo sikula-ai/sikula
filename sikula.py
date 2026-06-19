@@ -1430,15 +1430,27 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         print("")
         print(f"Next step: sikula run {output_path}")
     elif result.needs_user_input:
-        answers_path = (
-            _resolve_answers_path(args.answers)
-            if args.answers
-            else _prepare_answers_path(
-                task_path,
-                cfg,
+        if args.auto and args.answers and auto_answer_count:
+            answers_path = _write_prepare_answers_template(
                 generated_by="sikula.contract_prepare",
+                source_path=task_path,
+                source_text=task_text,
+                project_root=project_root,
+                questions=result.user_questions,
+                cfg=cfg,
+                answers=answers,
+                answers_path=_resolve_answers_path(args.answers),
             )
-        )
+        else:
+            answers_path = (
+                _resolve_answers_path(args.answers)
+                if args.answers
+                else _prepare_answers_path(
+                    task_path,
+                    cfg,
+                    generated_by="sikula.contract_prepare",
+                )
+            )
         print("")
         print("Next step:")
         print(f"- Fill/update the answers file: {answers_path}")
@@ -1605,8 +1617,10 @@ def _write_prepare_answers_template(
     questions: list[dict],
     cfg: dict,
     answers: dict[str, dict] | None = None,
+    answers_path: Path | None = None,
 ) -> Path:
-    answers_path = _prepare_answers_path(source_path, cfg, generated_by=generated_by)
+    explicit_answers_path = answers_path is not None
+    answers_path = answers_path or _prepare_answers_path(source_path, cfg, generated_by=generated_by)
     artifact_base = _prepare_answers_artifact_base(answers_path.parent, cfg)
     answers_data = _prepare_answers_template(
         generated_by=generated_by,
@@ -1617,7 +1631,9 @@ def _write_prepare_answers_template(
     )
     if answers_path.exists():
         existing = _load_prepare_answers_data(answers_path)
-        answers_data = _merge_prepare_answers(existing, answers_data, archive_stale=True)
+        if explicit_answers_path:
+            _validate_prepare_answers_for_source(existing, source_path=source_path, source_text=source_text)
+        answers_data = _merge_prepare_answers(existing, answers_data, archive_stale=not explicit_answers_path)
     if answers:
         _prefill_prepare_answers(answers_data, answers)
     answers_path.parent.mkdir(parents=True, exist_ok=True)
