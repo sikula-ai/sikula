@@ -26,7 +26,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   contract check on the generated output, and supports `--interactive` terminal prompts
   that save answers YAML under `.sikula/contract-reports`. Non-interactive refine and
   prepare runs with unanswered questions now write answers templates first and defer
-  Markdown output until answers are supplied.
+  Markdown output until answers are supplied; `task refine --auto` can use a
+  read-only `task_preparer` LLM agent to normalize rough or non-English product
+  requests before the deterministic product-question pass, while
+  `contract prepare --auto` uses the same agent to propose answers supported by
+  the task, repository, guidelines, and Sikula config before the same
+  deterministic prepare/recheck logic writes or defers the contract. Both auto
+  modes now record prompt/raw-response audit artifacts, including provider
+  failures and malformed auto responses that fail parsing, under
+  `.sikula/contract-reports/*.auto-llm.jsonl`; auto answers only fill empty
+  supplied/template answer entries, and `contract prepare --auto` refuses
+  existing output paths before creating an LLM client or ignoring filled default
+  answers that were not passed with `--answers`.
 - Contract preparation now has side-effect-free in-memory core helpers for future
   chat/MCP adapters, reusing the same contract scoring, answer application, and recheck
   logic as the file-based CLI flow instead of duplicating business rules. The

@@ -5,7 +5,7 @@ Usage (project-centric, run from project root):
   sikula init                        # create .sikula/config.yaml
   sikula init --guidelines --provider codex --model gpt-5.5
   sikula contract check task.md      # read-only implementation-contract preflight
-  sikula task refine task.md --interactive --output task.refined.md
+  sikula task refine task.md --auto --output task.refined.md
   sikula contract prepare task.refined.md --output .sikula/contracts/task.contract.md
   sikula run task.md                 # auto-discovers .sikula/config.yaml
   sikula run --task-id <task-id>     # resume existing task
@@ -52,7 +52,8 @@ Per-agent LLM flags (repeatable, agent name uses _ or -):
   --agent-provider analyst=claude
   --agent-timeout implementer=2400
   CLI values layer on top of YAML agents.<name>.llm overrides.
-  Valid agents: analyst, planner, implementer, reviewer, security_reviewer, test_writer, fixer
+  Valid run/review agents: analyst, planner, implementer, reviewer, security_reviewer, test_writer, fixer
+  task refine --auto and contract prepare --auto accept task_preparer overrides.
 
 --task-file accepts absolute paths or paths relative to CWD.
 """
@@ -194,6 +195,7 @@ _VALID_AGENTS = {
     "test_writer",
     "fixer",
 }
+_VALID_PREPARATION_AGENTS = {"task_preparer"}
 
 log = logging.getLogger(__name__)
 
@@ -319,17 +321,20 @@ def _parse_agent_llm_overrides(
     agent_models: list[str] | None,
     agent_providers: list[str] | None,
     agent_timeouts: list[str] | None,
+    *,
+    valid_agents: set[str] | None = None,
 ) -> dict[str, dict]:
     """Parse --agent-model / --agent-provider / --agent-timeout into per-agent override dicts."""
     result: dict[str, dict] = {}
+    allowed_agents = valid_agents or _VALID_AGENTS
 
     def _add(entries: list[str] | None, field: str, cast=str, flag: str | None = None) -> None:
         flag_name = f"--agent-{flag or field}"
         for entry in entries or []:
             raw_agent, sep, val = entry.partition("=")
             agent = raw_agent.strip().replace("-", "_")
-            if agent not in _VALID_AGENTS:
-                print(f"Unknown agent '{agent}'. Valid agents: {', '.join(sorted(_VALID_AGENTS))}")
+            if agent not in allowed_agents:
+                print(f"Unknown agent '{agent}'. Valid agents: {', '.join(sorted(allowed_agents))}")
                 sys.exit(1)
             if not sep or not val.strip():
                 print(f"Invalid {flag_name} value '{entry}'. Expected format: AGENT=VALUE")
@@ -923,8 +928,63 @@ def _reset_failed_state(task_id: str, cfg: dict, store) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _create_task_preparation_agent(args: argparse.Namespace, cfg: dict):
+    from agents.task_preparation_agent import TaskPreparationAgent
+    from core.llm_client import create_llm_client
+
+    overrides = {
+        "agent_llms": _parse_agent_llm_overrides(
+            getattr(args, "agent_model", None),
+            getattr(args, "agent_provider", None),
+            getattr(args, "agent_timeout", None),
+            valid_agents=_VALID_PREPARATION_AGENTS,
+        )
+    }
+    base_llm_cfg = cfg.get("llm", {}) if isinstance(cfg.get("llm"), dict) else {}
+    llm = create_llm_client(_make_llm_config(base_llm_cfg, _effective_agent_llm_cfg(cfg, overrides, "task_preparer")))
+    return TaskPreparationAgent(llm=llm, project_config=cfg)
+
+
+def _run_task_refine_auto(
+    *,
+    args: argparse.Namespace,
+    cfg: dict,
+    project_root: Path,
+    source_path: Path,
+    task_text: str,
+    task_name: str,
+    output_path: Path,
+    answers: dict[str, dict],
+):
+    from core.task_auto_refine import auto_refine_task_description
+
+    audit_recorder, _audit_path = _make_auto_preparation_audit_recorder(
+        generated_by="sikula.task_refine",
+        source_path=source_path,
+        source_text=task_text,
+        output_path=output_path,
+        cfg=cfg,
+    )
+    agent = _create_task_preparation_agent(args, cfg)
+    return auto_refine_task_description(
+        task_text,
+        task_name=task_name,
+        answers=answers,
+        normalize_provider=lambda request: agent.normalize_task_description(
+            request,
+            project_root=project_root,
+            audit_recorder=audit_recorder,
+        ),
+        audit_recorder=audit_recorder,
+    )
+
+
 def cmd_task_refine(args: argparse.Namespace, cfg: dict) -> None:
     from core.contract_check import prepare_task_description
+
+    if args.auto and args.interactive:
+        print("Failed to refine task: --auto cannot be combined with --interactive", file=sys.stderr)
+        sys.exit(2)
 
     project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
     task_path = _resolve_task_path(args.task_file, project_root)
@@ -964,6 +1024,59 @@ def cmd_task_refine(args: argparse.Namespace, cfg: dict) -> None:
             sys.exit(1)
 
     output_path = _resolve_output_path(args.output) if args.output else _default_refined_task_path(task_path, cfg)
+    if args.auto:
+        if output_path.exists():
+            print(f"Failed to refine task: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
+            _print_existing_output_hint(output_path)
+            sys.exit(1)
+        try:
+            auto_result = _run_task_refine_auto(
+                args=args,
+                cfg=cfg,
+                project_root=project_root,
+                source_path=task_path,
+                task_text=task_text,
+                task_name=task_path.name,
+                output_path=output_path,
+                answers=answers,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Failed to auto-refine task: {exc}", file=sys.stderr)
+            sys.exit(1)
+        result = auto_result.result
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(result.prepared_task_markdown, encoding="utf-8")
+
+        print(f"Refined task description written: {output_path}")
+        print("Auto-normalized task description: yes")
+        if auto_result.input_language:
+            print(f"Input language: {auto_result.input_language}")
+        if auto_result.normalized_to_english:
+            print("Normalized to English: yes")
+        if auto_result.warnings:
+            print("Auto-refine warnings:")
+            for warning in auto_result.warnings:
+                print(f"- {warning}")
+        print(f"Applied answers: {len(result.answered_question_ids)}")
+        print(f"Open questions: {len(result.open_question_ids)}")
+        _print_open_question_details(result.user_questions)
+        _print_task_refinement_scope_note()
+        if result.needs_user_input:
+            answers_path = _write_prepare_answers_template(
+                generated_by="sikula.task_refine",
+                source_path=output_path,
+                source_text=result.prepared_task_markdown,
+                project_root=project_root,
+                questions=result.user_questions,
+                cfg=cfg,
+            )
+            print("Next step:")
+            print(f"- Fill the answers file, then run: sikula task refine {output_path} --answers {answers_path}")
+            print("- Use a new --output path, or remove/rename the refined task written above first.")
+        else:
+            print(f"Next step: sikula contract prepare {output_path}")
+        return
+
     result = prepare_task_description(task_text, task_name=task_path.name, answers=answers)
     if result.needs_user_input and not answers_supplied:
         answers_path = _write_prepare_answers_template(
@@ -1113,6 +1226,43 @@ def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
             print(f"- {write_result.answers_path}")
 
 
+def _run_contract_prepare_auto(
+    *,
+    args: argparse.Namespace,
+    cfg: dict,
+    project_root: Path,
+    source_path: Path,
+    task_text: str,
+    output_path: Path,
+    project_context: dict | None,
+    generated_answer_entries: list[dict],
+    answers: dict[str, dict],
+):
+    from core.contract_auto_prepare import auto_prepare_implementation_contract
+
+    agent = _create_task_preparation_agent(args, cfg)
+    audit_recorder, _audit_path = _make_auto_preparation_audit_recorder(
+        generated_by="sikula.contract_prepare",
+        source_path=source_path,
+        source_text=task_text,
+        output_path=output_path,
+        cfg=cfg,
+    )
+    return auto_prepare_implementation_contract(
+        task_text,
+        contract_name=output_path.name,
+        project_context=project_context,
+        generated_answer_entries=generated_answer_entries,
+        initial_answers=answers,
+        answer_provider=lambda request: agent.propose_contract_answers(
+            request,
+            project_root=project_root,
+            audit_recorder=audit_recorder,
+        ),
+        audit_recorder=audit_recorder,
+    )
+
+
 def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
     from core.contract_check import (
         load_generated_answer_entries_for_contract,
@@ -1120,6 +1270,10 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         render_contract_check,
         write_prepared_contract,
     )
+
+    if args.auto and args.interactive:
+        print("Failed to prepare contract: --auto cannot be combined with --interactive", file=sys.stderr)
+        sys.exit(2)
 
     project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
     task_path = _resolve_task_path(args.task_file, project_root)
@@ -1156,6 +1310,7 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
 
     answers: dict[str, dict] = {}
     answers_supplied = bool(args.interactive or args.answers)
+    existing_default_answers_path = None
     if args.interactive:
         try:
             first = prepare_implementation_contract(
@@ -1185,6 +1340,12 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         except (OSError, ValueError) as exc:
             print(f"Failed to load contract answers: {exc}", file=sys.stderr)
             sys.exit(1)
+    elif args.auto:
+        existing_default_answers_path = _existing_prepare_answers_path(
+            task_path,
+            cfg,
+            generated_by="sikula.contract_prepare",
+        )
 
     result = prepare_implementation_contract(
         task_text,
@@ -1199,6 +1360,83 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
             _print_existing_output_next_step_note(output_path)
         sys.exit(1)
 
+    auto_answer_count = 0
+    if args.auto and output_path.exists():
+        print(f"Failed to prepare contract: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
+        _print_existing_output_hint(output_path)
+        sys.exit(1)
+
+    if args.auto and existing_default_answers_path:
+        try:
+            has_current_filled_default_answers = _prepare_default_answers_has_current_filled_values(
+                answers_path=existing_default_answers_path,
+                generated_by="sikula.contract_prepare",
+                source_path=task_path,
+                source_text=task_text,
+                project_root=project_root,
+                questions=result.user_questions,
+                cfg=cfg,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"Failed to inspect existing contract answers: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if has_current_filled_default_answers:
+            print(
+                "Failed to auto-prepare contract: existing contract answers contain filled values; "
+                f"rerun with --answers {existing_default_answers_path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if args.auto and result.user_questions:
+        try:
+            auto_result = _run_contract_prepare_auto(
+                args=args,
+                cfg=cfg,
+                project_root=project_root,
+                source_path=task_path,
+                task_text=task_text,
+                output_path=output_path,
+                project_context=project_context,
+                generated_answer_entries=generated_answer_entries,
+                answers=answers,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Failed to auto-prepare contract: {exc}", file=sys.stderr)
+            sys.exit(1)
+        result = auto_result.result
+        answers = auto_result.answers
+        auto_answer_count = len(auto_result.auto_answers)
+        if args.answers and auto_answer_count:
+            try:
+                _write_prepare_answers_template(
+                    generated_by="sikula.contract_prepare",
+                    source_path=task_path,
+                    source_text=task_text,
+                    project_root=project_root,
+                    questions=result.user_questions,
+                    cfg=cfg,
+                    answers=answers,
+                    answers_path=_resolve_answers_path(args.answers),
+                )
+            except (OSError, ValueError) as exc:
+                print(f"Failed to update contract answers: {exc}", file=sys.stderr)
+                sys.exit(1)
+        elif existing_default_answers_path and auto_answer_count and not result.needs_user_input:
+            try:
+                _write_prepare_answers_template(
+                    generated_by="sikula.contract_prepare",
+                    source_path=task_path,
+                    source_text=task_text,
+                    project_root=project_root,
+                    questions=result.user_questions,
+                    cfg=cfg,
+                    answers=answers,
+                )
+            except (OSError, ValueError) as exc:
+                print(f"Failed to update contract answers: {exc}", file=sys.stderr)
+                sys.exit(1)
+
     if result.needs_user_input and not answers_supplied:
         answers_path = _write_prepare_answers_template(
             generated_by="sikula.contract_prepare",
@@ -1207,9 +1445,12 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
             project_root=project_root,
             questions=result.user_questions,
             cfg=cfg,
+            answers=answers if args.auto else None,
         )
         print("Contract preparation needs answers before writing an implementation contract.")
         print(f"Contract preparation answers template written: {answers_path}")
+        if args.auto:
+            print(f"Auto-applied answers: {auto_answer_count}")
         print(f"Applied answers: {len(result.answered_question_ids)}")
         print(f"Open questions: {len(result.open_question_ids)}")
         _print_open_question_details(result.user_questions)
@@ -1237,6 +1478,8 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         sys.exit(1)
 
     print(f"Implementation contract written: {output_path}")
+    if args.auto:
+        print(f"Auto-applied answers: {auto_answer_count}")
     print(f"Applied answers: {len(result.answered_question_ids)}")
     print(f"Open questions: {len(result.open_question_ids)}")
     print("")
@@ -1419,8 +1662,11 @@ def _write_prepare_answers_template(
     project_root: Path,
     questions: list[dict],
     cfg: dict,
+    answers: dict[str, dict] | None = None,
+    answers_path: Path | None = None,
 ) -> Path:
-    answers_path = _prepare_answers_path(source_path, cfg, generated_by=generated_by)
+    explicit_answers_path = answers_path is not None
+    answers_path = answers_path or _prepare_answers_path(source_path, cfg, generated_by=generated_by)
     artifact_base = _prepare_answers_artifact_base(answers_path.parent, cfg)
     answers_data = _prepare_answers_template(
         generated_by=generated_by,
@@ -1431,10 +1677,76 @@ def _write_prepare_answers_template(
     )
     if answers_path.exists():
         existing = _load_prepare_answers_data(answers_path)
-        answers_data = _merge_prepare_answers(existing, answers_data, archive_stale=True)
+        if explicit_answers_path:
+            _validate_prepare_answers_for_source(existing, source_path=source_path, source_text=source_text)
+        answers_data = _merge_prepare_answers(existing, answers_data, archive_stale=not explicit_answers_path)
+    if answers:
+        _prefill_prepare_answers(answers_data, answers)
     answers_path.parent.mkdir(parents=True, exist_ok=True)
     answers_path.write_text(yaml.safe_dump(answers_data, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return answers_path
+
+
+def _make_auto_preparation_audit_recorder(
+    *,
+    generated_by: str,
+    source_path: Path,
+    source_text: str,
+    output_path: Path,
+    cfg: dict,
+):
+    audit_path = _prepare_auto_preparation_audit_path(source_path, cfg, generated_by=generated_by)
+    artifact_base = _prepare_answers_artifact_base(audit_path.parent, cfg)
+    task_metadata = {
+        "path": _contract_preflight_path(source_path, artifact_base),
+        "sha256": _text_sha256(source_text),
+    }
+    output_metadata = {
+        "path": _contract_preflight_path(output_path, artifact_base),
+    }
+
+    def record_auto_preparation_audit(record: dict) -> None:
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "generated_by": generated_by,
+            "recorded_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "task": task_metadata,
+            "output": output_metadata,
+            "record": record,
+        }
+        with audit_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+            handle.write("\n")
+
+    return record_auto_preparation_audit, audit_path
+
+
+def _prepare_auto_preparation_audit_path(source_path: Path, cfg: dict, *, generated_by: str) -> Path:
+    answers_path = _prepare_answers_path(source_path, cfg, generated_by=generated_by)
+    suffix = ".answers.yaml"
+    if answers_path.name.endswith(suffix):
+        return answers_path.with_name(f"{answers_path.name[: -len(suffix)]}.auto-llm.jsonl")
+    return answers_path.with_suffix(".auto-llm.jsonl")
+
+
+def _prefill_prepare_answers(answers_data: dict, answers: dict[str, dict]) -> None:
+    template_answers = answers_data.setdefault("answers", {})
+    if not isinstance(template_answers, dict):
+        return
+    for question_id, answer in answers.items():
+        if not isinstance(question_id, str) or not isinstance(answer, dict):
+            continue
+        entry = template_answers.setdefault(question_id, {"answer": "", "notes": ""})
+        if not isinstance(entry, dict):
+            entry = {"answer": "", "notes": ""}
+            template_answers[question_id] = entry
+        existing_answer = str(entry.get("answer") or "").strip()
+        existing_notes = str(entry.get("notes") or "").strip()
+        if existing_answer or existing_notes:
+            continue
+        entry["answer"] = str(answer.get("answer") or "")
+        entry["notes"] = str(answer.get("notes") or "")
 
 
 def _prepare_answers_path(source_path: Path, cfg: dict, *, generated_by: str) -> Path:
@@ -1451,6 +1763,39 @@ def _prepare_answers_path(source_path: Path, cfg: dict, *, generated_by: str) ->
     if not _prepare_answers_path_available_for_task(hashed, source_path, artifact_base, generated_by):
         raise FileExistsError(f"answers path already exists for a different task: {hashed}")
     return hashed
+
+
+def _existing_prepare_answers_path(source_path: Path, cfg: dict, *, generated_by: str) -> Path | None:
+    try:
+        answers_path = _prepare_answers_path(source_path, cfg, generated_by=generated_by)
+    except FileExistsError:
+        return None
+    return answers_path if answers_path.exists() else None
+
+
+def _prepare_default_answers_has_current_filled_values(
+    *,
+    answers_path: Path,
+    generated_by: str,
+    source_path: Path,
+    source_text: str,
+    project_root: Path,
+    questions: list[dict],
+    cfg: dict,
+) -> bool:
+    existing = _load_prepare_answers_data(answers_path)
+    if _prepare_answers_task_sha(existing) != _text_sha256(source_text):
+        _write_prepare_answers_template(
+            generated_by=generated_by,
+            source_path=source_path,
+            source_text=source_text,
+            project_root=project_root,
+            questions=questions,
+            cfg=cfg,
+        )
+        return False
+    _validate_prepare_answers_for_source(existing, source_path=source_path, source_text=source_text)
+    return bool(_filled_prepare_answers(existing.get("answers")))
 
 
 def _prepare_answers_report_dir(source_path: Path, cfg: dict) -> Path:
@@ -1575,6 +1920,15 @@ def _merge_prepare_answers(existing: dict, next_data: dict, *, archive_stale: bo
             }
         else:
             next_answers[question_id] = template
+    for question_id, answer in existing_answers.items():
+        if question_id in next_answers or not isinstance(question_id, str) or not isinstance(answer, dict):
+            continue
+        normalized = {
+            "answer": answer.get("answer", ""),
+            "notes": answer.get("notes", ""),
+        }
+        if str(normalized["answer"] or "").strip() or str(normalized["notes"] or "").strip():
+            next_answers[question_id] = normalized
     return next_data
 
 
@@ -3802,6 +4156,12 @@ def main() -> None:
     task_refine_p.add_argument("task_file", metavar="TASK_FILE", help="Path to task .txt/.md file")
     task_refine_p.add_argument("--answers", help="Path to a Sikula answers YAML file")
     task_refine_p.add_argument(
+        "--auto",
+        action="store_true",
+        default=False,
+        help="Use a read-only LLM assistant to normalize the task description before deterministic refinement",
+    )
+    task_refine_p.add_argument(
         "--interactive",
         action="store_true",
         default=False,
@@ -3810,6 +4170,27 @@ def main() -> None:
     task_refine_p.add_argument(
         "--output",
         help="Write the refined Markdown task description to this file; defaults to tasks.<stem>.refined.md",
+    )
+    task_refine_p.add_argument(
+        "--agent-model",
+        action="append",
+        default=None,
+        metavar="AGENT=MODEL",
+        help="Override model for task_preparer, e.g. --agent-model task_preparer=gpt-5.5",
+    )
+    task_refine_p.add_argument(
+        "--agent-provider",
+        action="append",
+        default=None,
+        metavar="AGENT=PROVIDER",
+        help="Override provider for task_preparer, e.g. --agent-provider task_preparer=claude",
+    )
+    task_refine_p.add_argument(
+        "--agent-timeout",
+        action="append",
+        default=None,
+        metavar="AGENT=SECONDS",
+        help="Override timeout for task_preparer, e.g. --agent-timeout task_preparer=1200",
     )
 
     contract_p = sub.add_parser("contract", help="Inspect or prepare implementation contracts")
@@ -3833,6 +4214,12 @@ def main() -> None:
         help="Path to .sikula/contract-reports/*.answers.yaml created by Sikula prepare/check tooling",
     )
     contract_prepare_p.add_argument(
+        "--auto",
+        action="store_true",
+        default=False,
+        help="Use a read-only LLM assistant to answer supported contract-preparation questions",
+    )
+    contract_prepare_p.add_argument(
         "--interactive",
         action="store_true",
         default=False,
@@ -3841,6 +4228,27 @@ def main() -> None:
     contract_prepare_p.add_argument(
         "--output",
         help="Write the implementation contract to this file; defaults to contracts.<stem>.contract.md",
+    )
+    contract_prepare_p.add_argument(
+        "--agent-model",
+        action="append",
+        default=None,
+        metavar="AGENT=MODEL",
+        help="Override model for task_preparer, e.g. --agent-model task_preparer=gpt-5.5",
+    )
+    contract_prepare_p.add_argument(
+        "--agent-provider",
+        action="append",
+        default=None,
+        metavar="AGENT=PROVIDER",
+        help="Override provider for task_preparer, e.g. --agent-provider task_preparer=claude",
+    )
+    contract_prepare_p.add_argument(
+        "--agent-timeout",
+        action="append",
+        default=None,
+        metavar="AGENT=SECONDS",
+        help="Override timeout for task_preparer, e.g. --agent-timeout task_preparer=1200",
     )
 
     run_p = sub.add_parser("run", help="Run a task")

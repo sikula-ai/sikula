@@ -37,6 +37,9 @@ contract file is specific enough to act as an implementation contract:
 sikula contract check .sikula/tasks/my-task.md
 sikula contract check .sikula/tasks/my-task.md --json
 sikula task refine .sikula/tasks/my-task.md \
+  --auto \
+  --output .sikula/tasks/my-task.refined.md
+sikula task refine .sikula/tasks/my-task.md \
   --interactive \
   --output .sikula/tasks/my-task.refined.md
 sikula contract check .sikula/tasks/my-task.refined.md --write-report
@@ -45,6 +48,9 @@ sikula contract prepare .sikula/tasks/my-task.refined.md \
   --output .sikula/contracts/my-task.contract.md
 sikula contract prepare .sikula/tasks/my-task.refined.md \
   --interactive \
+  --output .sikula/contracts/my-task.contract.md
+sikula contract prepare .sikula/tasks/my-task.refined.md \
+  --auto \
   --output .sikula/contracts/my-task.contract.md
 ```
 
@@ -58,14 +64,24 @@ hash in the template.
 
 `sikula task refine` is for the product-level description. It should preserve
 the product intent and avoid project-specific implementation details so the
-refined task can still be reused across platforms. It only resolves
-product task-description questions; `sikula contract prepare` may still ask
-delivery questions about privacy, tests, validation, reviewer focus, or other
+refined task can still be reused across platforms. `sikula task refine --auto`
+uses the read-only `task_preparer` LLM agent to normalize a rough or non-English
+request into clean English product-task Markdown, then runs the same
+deterministic product-question pass. The LLM does not answer delivery questions
+and does not write files directly. Its prompt and raw response are recorded in
+`.sikula/contract-reports/*.auto-llm.jsonl` for local audit before the
+normalized task is applied, including provider failures or malformed responses
+that cannot be parsed.
+Task refine only resolves product
+task-description questions; `sikula contract prepare` may still ask delivery
+questions about privacy, tests, validation, reviewer focus, or other
 implementation-contract readiness gaps. If a non-interactive refine run finds
 open product questions and no answers were supplied, it writes an answers
 template under `.sikula/contract-reports/` and does not write the refined
 Markdown output yet. Use `--interactive` to answer immediately, or fill the
-answers YAML and rerun with `--answers`.
+answers YAML and rerun with `--answers`. In `--auto` mode, Sikula writes the
+normalized refined Markdown first and scopes any generated answers template to
+that new refined file.
 
 ### Direct Prepare Vs Refine First
 
@@ -96,6 +112,23 @@ questions and no answers were supplied, it writes an answers template under
 `.sikula/contract-reports/` and does not write the implementation contract yet.
 Use `--interactive` to answer immediately, or fill the answers YAML and rerun
 with `--answers`.
+
+`sikula contract prepare --auto` uses a read-only `task_preparer` LLM agent
+to propose answers for currently open preparation questions when the answer is
+supported by the task description, repository, project guidelines, or Sikula
+config. Sikula still applies those answers through the deterministic contract
+prepare core and re-runs the readiness check; the LLM does not write the
+contract Markdown directly. Its prompt and raw response are recorded in
+`.sikula/contract-reports/*.auto-llm.jsonl` before auto answers are applied, and
+provider failures or malformed responses are still recorded before the command
+fails. Existing answers templates are preserved: auto answers only fill empty
+entries, including answers supplied with `--answers`. The command refuses an
+existing output path before creating the LLM client. If a default answers
+template already contains filled values, pass it explicitly with `--answers` so
+Sikula treats those values as authored input. If
+product, security, privacy, or validation policy still needs a human answer,
+Sikula writes the normal answers YAML with any auto-applied answers prefilled
+and does not write the contract yet.
 
 `--interactive` is a convenience mode for terminal use: it creates or reuses the
 answers template, prompts for follow-up answers, saves the answers YAML, and
