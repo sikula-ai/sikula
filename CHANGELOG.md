@@ -26,7 +26,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   contract check on the generated output, and supports `--interactive` terminal prompts
   that save answers YAML under `.sikula/contract-reports`. Non-interactive refine and
   prepare runs with unanswered questions now write answers templates first and defer
-  Markdown output until answers are supplied.
+  Markdown output until answers are supplied; `contract prepare --auto` can use a
+  read-only `task_preparer` LLM agent to propose answers supported by the task,
+  repository, guidelines, and Sikula config before the same deterministic
+  prepare/recheck logic writes or defers the contract.
 - Contract preparation now has side-effect-free in-memory core helpers for future
   chat/MCP adapters, reusing the same contract scoring, answer application, and recheck
   logic as the file-based CLI flow instead of duplicating business rules. The

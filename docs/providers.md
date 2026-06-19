@@ -46,7 +46,7 @@ sikula run .sikula/tasks/my-task.md \
 
 The analyst, reviewer, and security reviewer usually benefit most from stronger reasoning. The implementer, test writer, and fixer often need enough timeout for large codebases.
 
-Valid agent names are `analyst`, `planner`, `implementer`, `reviewer`, `security_reviewer`, `test_writer`, and `fixer`.
+Valid `run` and `review` agent names are `analyst`, `planner`, `implementer`, `reviewer`, `security_reviewer`, `test_writer`, and `fixer`. `sikula contract prepare --auto` also accepts `task_preparer` overrides.
 
 ## Authentication
 

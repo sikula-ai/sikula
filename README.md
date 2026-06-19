@@ -121,6 +121,10 @@ sikula contract prepare .sikula/tasks/my-task.refined.md \
 sikula contract prepare .sikula/tasks/my-task.refined.md \
   --interactive \
   --output .sikula/contracts/my-task.contract.md
+# or let a read-only LLM assistant answer only questions supported by the repo
+sikula contract prepare .sikula/tasks/my-task.refined.md \
+  --auto \
+  --output .sikula/contracts/my-task.contract.md
 ```
 
 Use this when you want to clarify a product task description into an implementation contract before any agents start changing code. The commands are explicit: `task refine` is an optional product-description refinement step, `contract prepare` writes the project-aware Markdown contract you later pass to `sikula run`, and `sikula run` does not rewrite the task file for you. You can skip `task refine` and run `contract prepare` directly on the original task description when you want one step that asks both product-level and delivery-readiness questions.

@@ -46,6 +46,9 @@ sikula contract prepare .sikula/tasks/my-task.refined.md \
 sikula contract prepare .sikula/tasks/my-task.refined.md \
   --interactive \
   --output .sikula/contracts/my-task.contract.md
+sikula contract prepare .sikula/tasks/my-task.refined.md \
+  --auto \
+  --output .sikula/contracts/my-task.contract.md
 ```
 
 The check is read-only unless `--write-report` is passed. It does not edit the
@@ -96,6 +99,15 @@ questions and no answers were supplied, it writes an answers template under
 `.sikula/contract-reports/` and does not write the implementation contract yet.
 Use `--interactive` to answer immediately, or fill the answers YAML and rerun
 with `--answers`.
+
+`sikula contract prepare --auto` uses a read-only `task_preparer` LLM agent
+to propose answers for currently open preparation questions when the answer is
+supported by the task description, repository, project guidelines, or Sikula
+config. Sikula still applies those answers through the deterministic contract
+prepare core and re-runs the readiness check; the LLM does not write the
+contract Markdown directly. If product, security, privacy, or validation policy
+still needs a human answer, Sikula writes the normal answers YAML with any
+auto-applied answers prefilled and does not write the contract yet.
 
 `--interactive` is a convenience mode for terminal use: it creates or reuses the
 answers template, prompts for follow-up answers, saves the answers YAML, and
