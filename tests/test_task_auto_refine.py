@@ -160,6 +160,71 @@ Users should be able to invite teammates by email.
     assert audit_records == [{"phase": "task_refine_auto_answers", "round_index": 1}]
 
 
+def test_auto_refine_task_description_can_revise_prior_auto_answers():
+    def normalize_provider(_request):
+        return TaskAutoRefineDraft(
+            task_markdown="""# Add team invites
+
+Users should be able to invite teammates by email.
+
+## Scope
+
+- Add invite creation from team settings.
+
+## Out of scope
+
+- Do not add billing seat enforcement.
+"""
+        )
+
+    seen_rounds = []
+
+    def answer_provider(request):
+        seen_rounds.append(request.round_index)
+        if request.round_index == 1:
+            return TaskAutoAnswerBatch(
+                answers={
+                    "acceptance.criteria": {
+                        "answer": "It works.",
+                        "notes": "",
+                    }
+                }
+            )
+        return TaskAutoAnswerBatch(
+            answers={
+                "acceptance.criteria": {
+                    "answer": (
+                        "A valid email can be invited from team settings. Empty or invalid email input is rejected. "
+                        "Duplicate pending invites show a deterministic error."
+                    ),
+                    "notes": "",
+                }
+            }
+        )
+
+    result = auto_refine_task_description(
+        "invite teammates",
+        task_name="team-invites.md",
+        normalize_provider=normalize_provider,
+        answer_provider=answer_provider,
+    )
+
+    assert seen_rounds == [1, 2]
+    assert result.rounds == 2
+    assert result.result.needs_user_input is False
+    assert result.auto_answers == {
+        "acceptance.criteria": {
+            "answer": (
+                "A valid email can be invited from team settings. Empty or invalid email input is rejected. "
+                "Duplicate pending invites show a deterministic error."
+            ),
+            "notes": "",
+        }
+    }
+    assert "It works." not in result.result.prepared_task_markdown
+    assert "Duplicate pending invites show a deterministic error." in result.result.prepared_task_markdown
+
+
 def test_auto_refine_task_description_keeps_existing_human_answers_over_auto_answers():
     def normalize_provider(_request):
         return TaskAutoRefineDraft(

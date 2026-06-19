@@ -146,6 +146,9 @@ def auto_refine_task_description(
         for record in draft.audit_records:
             audit_recorder(record)
     applied_answers = _normalize_answers(answers or {})
+    human_answer_ids = {
+        question_id for question_id, answer in applied_answers.items() if not _answer_entry_empty(answer)
+    }
     result = prepare_task_description(
         draft.task_markdown,
         task_name=task_name,
@@ -187,7 +190,7 @@ def auto_refine_task_description(
                 question_id: answer
                 for question_id, answer in batch.answers.items()
                 if question_id in active_ids
-                and _answer_entry_empty(applied_answers.get(question_id))
+                and question_id not in human_answer_ids
                 and _answer_changed(applied_answers.get(question_id), answer)
             }
             if not new_answers:
