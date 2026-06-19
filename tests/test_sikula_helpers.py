@@ -224,6 +224,12 @@ class TestBranchStem:
     def test_underscores_become_dashes(self):
         assert _branch_stem("my_task.md") == "my-task"
 
+    def test_dots_become_dashes(self):
+        assert _branch_stem("my.task.refined.md") == "my-task-refined"
+
+    def test_mixed_punctuation_collapses_to_single_dash(self):
+        assert _branch_stem("my...task__v1.2!!.md") == "my-task-v1-2"
+
     def test_empty_stem_returns_task(self):
         assert _branch_stem("!!.md") == "task"
 
