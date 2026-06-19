@@ -5,7 +5,7 @@ Usage (project-centric, run from project root):
   sikula init                        # create .sikula/config.yaml
   sikula init --guidelines --provider codex --model gpt-5.5
   sikula contract check task.md      # read-only implementation-contract preflight
-  sikula task refine task.md --interactive --output task.refined.md
+  sikula task refine task.md --auto --output task.refined.md
   sikula contract prepare task.refined.md --output .sikula/contracts/task.contract.md
   sikula run task.md                 # auto-discovers .sikula/config.yaml
   sikula run --task-id <task-id>     # resume existing task
@@ -53,7 +53,7 @@ Per-agent LLM flags (repeatable, agent name uses _ or -):
   --agent-timeout implementer=2400
   CLI values layer on top of YAML agents.<name>.llm overrides.
   Valid run/review agents: analyst, planner, implementer, reviewer, security_reviewer, test_writer, fixer
-  Contract prepare --auto accepts task_preparer overrides.
+  task refine --auto and contract prepare --auto accept task_preparer overrides.
 
 --task-file accepts absolute paths or paths relative to CWD.
 """
@@ -195,7 +195,7 @@ _VALID_AGENTS = {
     "test_writer",
     "fixer",
 }
-_VALID_CONTRACT_PREPARE_AGENTS = {"task_preparer"}
+_VALID_PREPARATION_AGENTS = {"task_preparer"}
 
 log = logging.getLogger(__name__)
 
@@ -928,8 +928,49 @@ def _reset_failed_state(task_id: str, cfg: dict, store) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _create_task_preparation_agent(args: argparse.Namespace, cfg: dict):
+    from agents.task_preparation_agent import TaskPreparationAgent
+    from core.llm_client import create_llm_client
+
+    overrides = {
+        "agent_llms": _parse_agent_llm_overrides(
+            getattr(args, "agent_model", None),
+            getattr(args, "agent_provider", None),
+            getattr(args, "agent_timeout", None),
+            valid_agents=_VALID_PREPARATION_AGENTS,
+        )
+    }
+    base_llm_cfg = cfg.get("llm", {}) if isinstance(cfg.get("llm"), dict) else {}
+    llm = create_llm_client(_make_llm_config(base_llm_cfg, _effective_agent_llm_cfg(cfg, overrides, "task_preparer")))
+    return TaskPreparationAgent(llm=llm, project_config=cfg)
+
+
+def _run_task_refine_auto(
+    *,
+    args: argparse.Namespace,
+    cfg: dict,
+    project_root: Path,
+    task_text: str,
+    task_name: str,
+    answers: dict[str, dict],
+):
+    from core.task_auto_refine import auto_refine_task_description
+
+    agent = _create_task_preparation_agent(args, cfg)
+    return auto_refine_task_description(
+        task_text,
+        task_name=task_name,
+        answers=answers,
+        normalize_provider=lambda request: agent.normalize_task_description(request, project_root=project_root),
+    )
+
+
 def cmd_task_refine(args: argparse.Namespace, cfg: dict) -> None:
     from core.contract_check import prepare_task_description
+
+    if args.auto and args.interactive:
+        print("Failed to refine task: --auto cannot be combined with --interactive", file=sys.stderr)
+        sys.exit(2)
 
     project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
     task_path = _resolve_task_path(args.task_file, project_root)
@@ -969,6 +1010,57 @@ def cmd_task_refine(args: argparse.Namespace, cfg: dict) -> None:
             sys.exit(1)
 
     output_path = _resolve_output_path(args.output) if args.output else _default_refined_task_path(task_path, cfg)
+    if args.auto:
+        if output_path.exists():
+            print(f"Failed to refine task: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
+            _print_existing_output_hint(output_path)
+            sys.exit(1)
+        try:
+            auto_result = _run_task_refine_auto(
+                args=args,
+                cfg=cfg,
+                project_root=project_root,
+                task_text=task_text,
+                task_name=task_path.name,
+                answers=answers,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Failed to auto-refine task: {exc}", file=sys.stderr)
+            sys.exit(1)
+        result = auto_result.result
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(result.prepared_task_markdown, encoding="utf-8")
+
+        print(f"Refined task description written: {output_path}")
+        print("Auto-normalized task description: yes")
+        if auto_result.input_language:
+            print(f"Input language: {auto_result.input_language}")
+        if auto_result.normalized_to_english:
+            print("Normalized to English: yes")
+        if auto_result.warnings:
+            print("Auto-refine warnings:")
+            for warning in auto_result.warnings:
+                print(f"- {warning}")
+        print(f"Applied answers: {len(result.answered_question_ids)}")
+        print(f"Open questions: {len(result.open_question_ids)}")
+        _print_open_question_details(result.user_questions)
+        _print_task_refinement_scope_note()
+        if result.needs_user_input:
+            answers_path = _write_prepare_answers_template(
+                generated_by="sikula.task_refine",
+                source_path=output_path,
+                source_text=result.prepared_task_markdown,
+                project_root=project_root,
+                questions=result.user_questions,
+                cfg=cfg,
+            )
+            print("Next step:")
+            print(f"- Fill the answers file, then run: sikula task refine {output_path} --answers {answers_path}")
+            print("- Use a new --output path, or remove/rename the refined task written above first.")
+        else:
+            print(f"Next step: sikula contract prepare {output_path}")
+        return
+
     result = prepare_task_description(task_text, task_name=task_path.name, answers=answers)
     if result.needs_user_input and not answers_supplied:
         answers_path = _write_prepare_answers_template(
@@ -1129,21 +1221,9 @@ def _run_contract_prepare_auto(
     generated_answer_entries: list[dict],
     answers: dict[str, dict],
 ):
-    from agents.task_preparation_agent import TaskPreparationAgent
     from core.contract_auto_prepare import auto_prepare_implementation_contract
-    from core.llm_client import create_llm_client
 
-    overrides = {
-        "agent_llms": _parse_agent_llm_overrides(
-            getattr(args, "agent_model", None),
-            getattr(args, "agent_provider", None),
-            getattr(args, "agent_timeout", None),
-            valid_agents=_VALID_CONTRACT_PREPARE_AGENTS,
-        )
-    }
-    base_llm_cfg = cfg.get("llm", {}) if isinstance(cfg.get("llm"), dict) else {}
-    llm = create_llm_client(_make_llm_config(base_llm_cfg, _effective_agent_llm_cfg(cfg, overrides, "task_preparer")))
-    agent = TaskPreparationAgent(llm=llm, project_config=cfg)
+    agent = _create_task_preparation_agent(args, cfg)
     return auto_prepare_implementation_contract(
         task_text,
         contract_name=output_path.name,
@@ -3890,6 +3970,12 @@ def main() -> None:
     task_refine_p.add_argument("task_file", metavar="TASK_FILE", help="Path to task .txt/.md file")
     task_refine_p.add_argument("--answers", help="Path to a Sikula answers YAML file")
     task_refine_p.add_argument(
+        "--auto",
+        action="store_true",
+        default=False,
+        help="Use a read-only LLM assistant to normalize the task description before deterministic refinement",
+    )
+    task_refine_p.add_argument(
         "--interactive",
         action="store_true",
         default=False,
@@ -3898,6 +3984,27 @@ def main() -> None:
     task_refine_p.add_argument(
         "--output",
         help="Write the refined Markdown task description to this file; defaults to tasks.<stem>.refined.md",
+    )
+    task_refine_p.add_argument(
+        "--agent-model",
+        action="append",
+        default=None,
+        metavar="AGENT=MODEL",
+        help="Override model for task_preparer, e.g. --agent-model task_preparer=gpt-5.5",
+    )
+    task_refine_p.add_argument(
+        "--agent-provider",
+        action="append",
+        default=None,
+        metavar="AGENT=PROVIDER",
+        help="Override provider for task_preparer, e.g. --agent-provider task_preparer=claude",
+    )
+    task_refine_p.add_argument(
+        "--agent-timeout",
+        action="append",
+        default=None,
+        metavar="AGENT=SECONDS",
+        help="Override timeout for task_preparer, e.g. --agent-timeout task_preparer=1200",
     )
 
     contract_p = sub.add_parser("contract", help="Inspect or prepare implementation contracts")

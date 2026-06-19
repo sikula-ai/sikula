@@ -106,6 +106,17 @@ def test_task_preparer_override_is_valid_for_contract_prepare_auto():
     }
 
 
+def test_task_preparer_override_is_valid_for_preparation_commands():
+    overrides = _parse_agent_llm_overrides(
+        ["task_preparer=gpt-5.5"],
+        None,
+        None,
+        valid_agents={"task_preparer"},
+    )
+
+    assert overrides == {"task_preparer": {"model": "gpt-5.5"}}
+
+
 def test_weak_security_sensitive_task_reports_blocking_gaps():
     result = check_contract("# Add team invites\n\nUsers should be able to invite teammates by email.")
 
@@ -2522,6 +2533,166 @@ def test_task_refine_cli_existing_output_prints_hint(tmp_path: Path, monkeypatch
 
     with (
         patch("sys.argv", ["sikula", "task", "refine", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    err = capsys.readouterr().err
+    assert exc.value.code == 1
+    assert "refusing to overwrite existing output file" in err
+    assert "Choose a new --output path" in err
+
+
+def test_task_refine_cli_auto_writes_normalized_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
+    class FakeLLM:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+            self.prompts.append(prompt)
+            assert cwd == tmp_path
+            return json.dumps(
+                {
+                    "task_markdown": """# Add team invites
+
+## Goal
+
+Users can invite teammates by email.
+
+## Scope
+
+- Add invite creation from team settings.
+
+## Acceptance criteria
+
+- A valid email can be invited from team settings.
+- Invalid email input is rejected.
+- Duplicate pending invites show a deterministic error.
+
+## Out of scope
+
+- Do not add billing seat enforcement.
+""",
+                    "input_language": "cs",
+                    "normalized_to_english": True,
+                }
+            )
+
+    fake_llm = FakeLLM()
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Pozvat kolegy\n\nUzivatel muze pozvat kolegu emailem.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.refined.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("core.llm_client.create_llm_client", return_value=fake_llm),
+        patch(
+            "sys.argv",
+            [
+                "sikula",
+                "task",
+                "refine",
+                str(task_path),
+                "--auto",
+                "--agent-model",
+                "task_preparer=gpt-5.5",
+                "--output",
+                str(output_path),
+            ],
+        ),
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    output = output_path.read_text(encoding="utf-8")
+    assert len(fake_llm.prompts) == 1
+    assert "Preserve the user's product intent" in fake_llm.prompts[0]
+    assert "Uzivatel muze pozvat kolegu emailem." in fake_llm.prompts[0]
+    assert "Auto-normalized task description: yes" in out
+    assert "Input language: cs" in out
+    assert "Normalized to English: yes" in out
+    assert f"Next step: sikula contract prepare {output_path}" in out
+    assert "## Open questions" not in output
+    assert "Users can invite teammates by email." in output
+
+
+def test_task_refine_cli_auto_writes_answers_template_for_remaining_questions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    class FakeLLM:
+        def run_readonly_agent(self, _prompt: str, cwd: Path) -> str:
+            assert cwd == tmp_path
+            return json.dumps(
+                {
+                    "task_markdown": "# Add team invites\n\nUsers can invite teammates by email.",
+                    "input_language": "en",
+                    "warnings": ["scope still needs product confirmation"],
+                }
+            )
+
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.refined.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("core.llm_client.create_llm_client", return_value=FakeLLM()),
+        patch("sys.argv", ["sikula", "task", "refine", str(task_path), "--auto", "--output", str(output_path)]),
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    answers_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.task-refine.answers.yaml"
+    answers = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+    output = output_path.read_text(encoding="utf-8")
+
+    assert output_path.exists()
+    assert "Auto-refine warnings:" in out
+    assert "scope still needs product confirmation" in out
+    assert "Open question details:" in out
+    assert "Use a new --output path" in out
+    assert answers["generated_by"] == "sikula.task_refine"
+    assert answers["task"]["path"] == ".sikula/tasks/team-invites.refined.md"
+    assert {"scope.boundaries", "acceptance.criteria"}.issubset(answers["answers"])
+    assert "## Open questions" in output
+
+
+def test_task_refine_cli_auto_rejects_interactive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sys.argv", ["sikula", "task", "refine", str(task_path), "--auto", "--interactive"]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    err = capsys.readouterr().err
+    assert exc.value.code == 2
+    assert "--auto cannot be combined with --interactive" in err
+
+
+def test_task_refine_cli_auto_existing_output_does_not_call_llm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.refined.md"
+    output_path.write_text("# Existing refined task\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("core.llm_client.create_llm_client", side_effect=AssertionError("LLM must not be created")),
+        patch("sys.argv", ["sikula", "task", "refine", str(task_path), "--auto", "--output", str(output_path)]),
         pytest.raises(SystemExit) as exc,
     ):
         main()

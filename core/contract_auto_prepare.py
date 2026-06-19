@@ -46,7 +46,7 @@ ContractAutoAnswerProvider = Callable[[ContractAutoPrepareRequest], ContractAuto
 def parse_contract_auto_answer_output(output: str, active_question_ids: set[str]) -> ContractAutoAnswerBatch:
     """Parse read-only LLM answer JSON for active contract questions."""
 
-    payload = _load_json_object(output)
+    payload = load_auto_json_object(output)
     raw_answers = payload.get("answers", {})
     if raw_answers is None:
         raw_answers = {}
@@ -155,26 +155,26 @@ def auto_prepare_implementation_contract(
     )
 
 
-def _load_json_object(output: str) -> dict[str, Any]:
+def load_auto_json_object(output: str) -> dict[str, Any]:
     text = output.strip()
     if not text:
-        raise ValueError("auto contract answer output is empty")
+        raise ValueError("auto LLM output is empty")
     if text.startswith("```"):
         text = _strip_fenced_json(text)
 
     decoder = json.JSONDecoder()
     start = text.find("{")
     if start < 0:
-        raise ValueError("auto contract answer output did not contain a JSON object")
+        raise ValueError("auto LLM output did not contain a JSON object")
     try:
         payload, end = decoder.raw_decode(text[start:])
     except json.JSONDecodeError as exc:
-        raise ValueError("auto contract answer output is not valid JSON") from exc
+        raise ValueError("auto LLM output is not valid JSON") from exc
     trailing = text[start + end :].strip()
     if "{" in trailing:
-        raise ValueError("auto contract answer output contains multiple JSON objects")
+        raise ValueError("auto LLM output contains multiple JSON objects")
     if not isinstance(payload, dict):
-        raise ValueError("auto contract answer output must be a JSON object")
+        raise ValueError("auto LLM output must be a JSON object")
     return payload
 
 

@@ -37,6 +37,9 @@ contract file is specific enough to act as an implementation contract:
 sikula contract check .sikula/tasks/my-task.md
 sikula contract check .sikula/tasks/my-task.md --json
 sikula task refine .sikula/tasks/my-task.md \
+  --auto \
+  --output .sikula/tasks/my-task.refined.md
+sikula task refine .sikula/tasks/my-task.md \
   --interactive \
   --output .sikula/tasks/my-task.refined.md
 sikula contract check .sikula/tasks/my-task.refined.md --write-report
@@ -61,14 +64,20 @@ hash in the template.
 
 `sikula task refine` is for the product-level description. It should preserve
 the product intent and avoid project-specific implementation details so the
-refined task can still be reused across platforms. It only resolves
-product task-description questions; `sikula contract prepare` may still ask
-delivery questions about privacy, tests, validation, reviewer focus, or other
+refined task can still be reused across platforms. `sikula task refine --auto`
+uses the read-only `task_preparer` LLM agent to normalize a rough or non-English
+request into clean English product-task Markdown, then runs the same
+deterministic product-question pass. The LLM does not answer delivery questions
+and does not write files directly. Task refine only resolves product
+task-description questions; `sikula contract prepare` may still ask delivery
+questions about privacy, tests, validation, reviewer focus, or other
 implementation-contract readiness gaps. If a non-interactive refine run finds
 open product questions and no answers were supplied, it writes an answers
 template under `.sikula/contract-reports/` and does not write the refined
 Markdown output yet. Use `--interactive` to answer immediately, or fill the
-answers YAML and rerun with `--answers`.
+answers YAML and rerun with `--answers`. In `--auto` mode, Sikula writes the
+normalized refined Markdown first and scopes any generated answers template to
+that new refined file.
 
 ### Direct Prepare Vs Refine First
 
