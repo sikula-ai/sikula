@@ -1679,6 +1679,10 @@ def _prefill_prepare_answers(answers_data: dict, answers: dict[str, dict]) -> No
         if not isinstance(entry, dict):
             entry = {"answer": "", "notes": ""}
             template_answers[question_id] = entry
+        existing_answer = str(entry.get("answer") or "").strip()
+        existing_notes = str(entry.get("notes") or "").strip()
+        if existing_answer or existing_notes:
+            continue
         entry["answer"] = str(answer.get("answer") or "")
         entry["notes"] = str(answer.get("notes") or "")
 
@@ -1821,6 +1825,15 @@ def _merge_prepare_answers(existing: dict, next_data: dict, *, archive_stale: bo
             }
         else:
             next_answers[question_id] = template
+    for question_id, answer in existing_answers.items():
+        if question_id in next_answers or not isinstance(question_id, str) or not isinstance(answer, dict):
+            continue
+        normalized = {
+            "answer": answer.get("answer", ""),
+            "notes": answer.get("notes", ""),
+        }
+        if str(normalized["answer"] or "").strip() or str(normalized["notes"] or "").strip():
+            next_answers[question_id] = normalized
     return next_data
 
 

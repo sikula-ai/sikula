@@ -70,7 +70,8 @@ request into clean English product-task Markdown, then runs the same
 deterministic product-question pass. The LLM does not answer delivery questions
 and does not write files directly. Its prompt and raw response are recorded in
 `.sikula/contract-reports/*.auto-llm.jsonl` for local audit before the
-normalized task is applied, including malformed responses that cannot be parsed.
+normalized task is applied, including provider failures or malformed responses
+that cannot be parsed.
 Task refine only resolves product
 task-description questions; `sikula contract prepare` may still ask delivery
 questions about privacy, tests, validation, reviewer focus, or other
@@ -119,8 +120,9 @@ config. Sikula still applies those answers through the deterministic contract
 prepare core and re-runs the readiness check; the LLM does not write the
 contract Markdown directly. Its prompt and raw response are recorded in
 `.sikula/contract-reports/*.auto-llm.jsonl` before auto answers are applied, and
-malformed responses are still recorded before the command fails. The command
-refuses an existing output path before creating the LLM client. If
+provider failures or malformed responses are still recorded before the command
+fails. Existing answers templates are preserved: auto answers only fill empty
+entries. The command refuses an existing output path before creating the LLM client. If
 product, security, privacy, or validation policy still needs a human answer,
 Sikula writes the normal answers YAML with any auto-applied answers prefilled
 and does not write the contract yet.

@@ -19,6 +19,16 @@ class CapturingLLM:
         return self.output
 
 
+class FailingLLM:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.prompts: list[str] = []
+
+    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+        self.prompts.append(prompt)
+        raise self.error
+
+
 def test_task_preparer_contract_prompt_disallows_unreferenced_sikula_artifacts(tmp_path: Path):
     llm = CapturingLLM('{"answers": {}}')
     agent = TaskPreparationAgent(
@@ -106,6 +116,37 @@ def test_task_preparer_contract_answer_records_parse_failure(tmp_path: Path):
     assert "not valid JSON" in record["parsed"]["error"]
 
 
+def test_task_preparer_contract_answer_records_provider_failure(tmp_path: Path):
+    llm = FailingLLM(RuntimeError("provider timeout"))
+    agent = TaskPreparationAgent(llm=llm)
+    audit_records: list[dict] = []
+
+    with pytest.raises(RuntimeError, match="provider timeout"):
+        agent.propose_contract_answers(
+            ContractAutoPrepareRequest(
+                contract_markdown="# Add team invites\n",
+                contract_name="team-invites.contract.md",
+                project_context={"validation_commands": ["pytest"]},
+                user_questions=[{"id": "scope.boundaries", "question": "What is in scope?"}],
+                round_index=2,
+            ),
+            project_root=tmp_path,
+            audit_recorder=audit_records.append,
+        )
+
+    assert len(audit_records) == 1
+    record = audit_records[0]
+    assert record["phase"] == "contract_prepare_auto"
+    assert record["round_index"] == 2
+    assert "Active questions:" in record["prompt"]
+    assert record["raw_output"] is None
+    assert record["parsed"] == {
+        "status": "failed",
+        "error_type": "RuntimeError",
+        "error": "provider timeout",
+    }
+
+
 def test_task_preparer_refine_prompt_disallows_unreferenced_sikula_artifacts(tmp_path: Path):
     llm = CapturingLLM('{"task_markdown": "# Add team invites\\n\\nUsers can invite teammates by email."}')
     agent = TaskPreparationAgent(
@@ -183,3 +224,31 @@ def test_task_preparer_refine_records_parse_failure(tmp_path: Path):
     assert record["raw_output"] == llm.output
     assert record["parsed"]["status"] == "failed"
     assert "not valid JSON" in record["parsed"]["error"]
+
+
+def test_task_preparer_refine_records_provider_failure(tmp_path: Path):
+    llm = FailingLLM(RuntimeError("provider timeout"))
+    agent = TaskPreparationAgent(llm=llm)
+    audit_records: list[dict] = []
+
+    with pytest.raises(RuntimeError, match="provider timeout"):
+        agent.normalize_task_description(
+            TaskAutoRefineRequest(
+                brief="Uzivatel muze pozvat kolegu emailem.",
+                task_name="team-invites.txt",
+            ),
+            project_root=tmp_path,
+            audit_recorder=audit_records.append,
+        )
+
+    assert len(audit_records) == 1
+    record = audit_records[0]
+    assert record["phase"] == "task_refine_auto"
+    assert record["round_index"] == 1
+    assert "Raw task description:" in record["prompt"]
+    assert record["raw_output"] is None
+    assert record["parsed"] == {
+        "status": "failed",
+        "error_type": "RuntimeError",
+        "error": "provider timeout",
+    }

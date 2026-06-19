@@ -170,11 +170,22 @@ class TaskPreparationAgent:
             if isinstance(question, dict) and str(question.get("id") or "").strip()
         }
         prompt = self._build_prompt(request)
-        output = self.llm.run_readonly_agent(prompt, cwd=project_root)
+        try:
+            output = self.llm.run_readonly_agent(prompt, cwd=project_root)
+        except Exception as exc:
+            self._record_failure(
+                audit_recorder,
+                phase="contract_prepare_auto",
+                round_index=request.round_index,
+                prompt=prompt,
+                output=None,
+                error=exc,
+            )
+            raise
         try:
             batch = parse_contract_auto_answer_output(output, active_ids)
         except ValueError as exc:
-            self._record_parse_failure(
+            self._record_failure(
                 audit_recorder,
                 phase="contract_prepare_auto",
                 round_index=request.round_index,
@@ -208,11 +219,22 @@ class TaskPreparationAgent:
         audit_recorder: AutoPreparationAuditRecorder | None = None,
     ) -> TaskAutoRefineDraft:
         prompt = self._build_task_normalization_prompt(request)
-        output = self.llm.run_readonly_agent(prompt, cwd=project_root)
+        try:
+            output = self.llm.run_readonly_agent(prompt, cwd=project_root)
+        except Exception as exc:
+            self._record_failure(
+                audit_recorder,
+                phase="task_refine_auto",
+                round_index=1,
+                prompt=prompt,
+                output=None,
+                error=exc,
+            )
+            raise
         try:
             draft = parse_task_auto_refine_output(output)
         except ValueError as exc:
-            self._record_parse_failure(
+            self._record_failure(
                 audit_recorder,
                 phase="task_refine_auto",
                 round_index=1,
@@ -262,15 +284,15 @@ class TaskPreparationAgent:
             brief=request.brief,
         )
 
-    def _record_parse_failure(
+    def _record_failure(
         self,
         audit_recorder: AutoPreparationAuditRecorder | None,
         *,
         phase: str,
         round_index: int,
         prompt: str,
-        output: str,
-        error: ValueError,
+        output: str | None,
+        error: Exception,
     ) -> None:
         if audit_recorder is None:
             return
@@ -282,6 +304,7 @@ class TaskPreparationAgent:
                 "raw_output": output,
                 "parsed": {
                     "status": "failed",
+                    "error_type": type(error).__name__,
                     "error": str(error),
                 },
             }
