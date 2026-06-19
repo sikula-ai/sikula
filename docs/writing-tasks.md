@@ -122,7 +122,8 @@ contract Markdown directly. Its prompt and raw response are recorded in
 `.sikula/contract-reports/*.auto-llm.jsonl` before auto answers are applied, and
 provider failures or malformed responses are still recorded before the command
 fails. Existing answers templates are preserved: auto answers only fill empty
-entries. The command refuses an existing output path before creating the LLM client. If
+entries, including answers supplied with `--answers`. The command refuses an
+existing output path before creating the LLM client. If
 product, security, privacy, or validation policy still needs a human answer,
 Sikula writes the normal answers YAML with any auto-applied answers prefilled
 and does not write the contract yet.

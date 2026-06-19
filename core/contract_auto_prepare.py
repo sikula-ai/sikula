@@ -146,7 +146,9 @@ def auto_prepare_implementation_contract(
         new_answers = {
             question_id: answer
             for question_id, answer in batch.answers.items()
-            if question_id in active_ids and _answer_changed(answers.get(question_id), answer)
+            if question_id in active_ids
+            and _answer_entry_empty(answers.get(question_id))
+            and _answer_changed(answers.get(question_id), answer)
         }
         if not new_answers:
             break
@@ -222,6 +224,14 @@ def _normalize_answers(raw_answers: dict[str, dict[str, Any]]) -> dict[str, dict
             continue
         answers[question_id] = normalized
     return answers
+
+
+def _answer_entry_empty(existing: dict[str, Any] | None) -> bool:
+    if existing is None:
+        return True
+    existing_answer = str(existing.get("answer") or "").strip()
+    existing_notes = str(existing.get("notes") or "").strip()
+    return not existing_answer and not existing_notes
 
 
 def _normalize_unanswered(raw_unanswered: Any) -> list[dict[str, str]]:

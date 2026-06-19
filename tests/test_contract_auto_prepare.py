@@ -99,6 +99,51 @@ def test_auto_prepare_implementation_contract_applies_answer_rounds():
     assert result.answers["acceptance.criteria"]["answer"].startswith("Admins can invite valid emails")
 
 
+def test_auto_prepare_implementation_contract_preserves_supplied_answers_for_revised_questions():
+    def provider(request):
+        assert "acceptance.criteria" in {question["id"] for question in request.user_questions}
+        return ContractAutoAnswerBatch(
+            answers={
+                "acceptance.criteria": {
+                    "answer": "Auto-generated acceptance criteria should not replace human text.",
+                    "notes": "Auto-generated notes should not replace human notes.",
+                },
+                "scope.boundaries": {
+                    "answer": "Add email invites only.",
+                    "notes": "Supported by the task.",
+                },
+            }
+        )
+
+    result = auto_prepare_implementation_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.contract.md",
+        project_context={"validation_commands": ["pytest"]},
+        initial_answers={
+            "acceptance.criteria": {
+                "answer": "Human-filled acceptance criteria should stay.",
+                "notes": "Human-filled notes should stay.",
+            }
+        },
+        answer_provider=provider,
+        max_rounds=1,
+    )
+
+    assert result.rounds == 1
+    assert result.auto_answers == {
+        "scope.boundaries": {
+            "answer": "Add email invites only.",
+            "notes": "Supported by the task.",
+        }
+    }
+    assert result.answers["acceptance.criteria"] == {
+        "answer": "Human-filled acceptance criteria should stay.",
+        "notes": "Human-filled notes should stay.",
+    }
+    assert "Auto-generated acceptance criteria" not in result.result.prepared_contract_markdown
+    assert "Human-filled acceptance criteria should stay." in result.result.prepared_contract_markdown
+
+
 def test_auto_prepare_implementation_contract_records_audit_records():
     events = []
 

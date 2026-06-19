@@ -3093,6 +3093,88 @@ def test_contract_prepare_cli_auto_does_not_overwrite_existing_answers_template(
     }
 
 
+def test_contract_prepare_cli_auto_does_not_replace_supplied_answers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    class FakeLLM:
+        def run_readonly_agent(self, _prompt: str, cwd: Path) -> str:
+            assert cwd == tmp_path
+            return json.dumps(
+                {
+                    "answers": {
+                        "acceptance.criteria": {
+                            "answer": "Auto-generated acceptance criteria should not replace human text.",
+                            "notes": "Auto-generated notes should not replace human notes.",
+                        },
+                        "scope.boundaries": {
+                            "answer": "Add email invites only.",
+                            "notes": "Supported by the task.",
+                        },
+                    }
+                }
+            )
+
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "contracts" / "team-invites.contract.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["pytest"]}),
+        patch("sys.argv", ["sikula", "contract", "prepare", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit),
+    ):
+        main()
+    capsys.readouterr()
+
+    answers_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.contract-prepare.answers.yaml"
+    existing_answers = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+    existing_answers["answers"]["acceptance.criteria"] = {
+        "answer": "Human-filled acceptance criteria should stay.",
+        "notes": "Human-filled notes should stay.",
+    }
+    answers_path.write_text(yaml.safe_dump(existing_answers, sort_keys=False), encoding="utf-8")
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["pytest"]}),
+        patch("core.llm_client.create_llm_client", return_value=FakeLLM()),
+        patch(
+            "sys.argv",
+            [
+                "sikula",
+                "contract",
+                "prepare",
+                str(task_path),
+                "--auto",
+                "--answers",
+                str(answers_path),
+                "--output",
+                str(output_path),
+            ],
+        ),
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    answers = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+    output = output_path.read_text(encoding="utf-8")
+
+    assert output_path.exists()
+    assert "Auto-applied answers: 1" in out
+    assert "Implementation contract written:" in out
+    assert answers["answers"]["acceptance.criteria"] == {
+        "answer": "Human-filled acceptance criteria should stay.",
+        "notes": "Human-filled notes should stay.",
+    }
+    assert answers["answers"]["scope.boundaries"] == {"answer": "", "notes": ""}
+    assert "Add email invites only." in output
+    assert "Human-filled acceptance criteria should stay." in output
+    assert "Auto-generated acceptance criteria" not in output
+
+
 def test_contract_prepare_cli_auto_records_parse_failure_audit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -34,9 +34,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   deterministic prepare/recheck logic writes or defers the contract. Both auto
   modes now record prompt/raw-response audit artifacts, including provider
   failures and malformed auto responses that fail parsing, under
-  `.sikula/contract-reports/*.auto-llm.jsonl`; auto answers only prefill empty
-  answers-template entries, and `contract prepare --auto` refuses existing output
-  paths before creating an LLM client.
+  `.sikula/contract-reports/*.auto-llm.jsonl`; auto answers only fill empty
+  supplied/template answer entries, and `contract prepare --auto` refuses
+  existing output paths before creating an LLM client.
 - Contract preparation now has side-effect-free in-memory core helpers for future
   chat/MCP adapters, reusing the same contract scoring, answer application, and recheck
   logic as the file-based CLI flow instead of duplicating business rules. The
