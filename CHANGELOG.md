@@ -12,23 +12,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   human-readable and `--json` output covering scope, acceptance criteria,
   security/privacy, validation coverage based on the same enabled build/test/check phases
   used by `sikula run`, gaps, and stable clarifying question IDs, plus optional
-  `.sikula/contracts` report and hash-scoped answers-template artifacts via
+  `.sikula/contract-reports` report and hash-scoped answers-template artifacts via
   `--write-report`; `sikula run TASK_FILE` now stores a warning-only contract snapshot
   in task state, supports opt-in pre-agent gates via `--require-contract-ready` and
   `--min-contract-score`, keeps gate-failed pre-worktree states audit-only with the
   effective run config snapshot instead of resettable through `--task-id --reset-failed`,
-  and `sikula init` ignores generated contract artifacts by default.
-- `sikula contract improve TASK_FILE --answers ... --output ...` now turns filled
-  contract answers into a stronger Markdown task file, preserves unanswered items as
-  open questions, refuses stale answer hashes or accidental overwrites, re-runs the
+  and `sikula init` ignores generated contract report artifacts by default.
+- `sikula task refine TASK_FILE --output ...` and `sikula contract prepare TASK_FILE
+  --answers ... --output ...` now separate product task-description refinement from
+  project-aware implementation-contract preparation. The prepare step turns filled
+  answers into a Markdown contract under `.sikula/contracts`, preserves unanswered items
+  as open questions, refuses stale answer hashes or accidental overwrites, re-runs the
   contract check on the generated output, and supports `--interactive` terminal prompts
-  that save the answers YAML before running the same improve flow.
+  that save answers YAML under `.sikula/contract-reports`. Non-interactive refine and
+  prepare runs with unanswered questions now write answers templates first and defer
+  Markdown output until answers are supplied.
 - Contract preparation now has side-effect-free in-memory core helpers for future
   chat/MCP adapters, reusing the same contract scoring, answer application, and recheck
-  logic as the file-based CLI flow instead of duplicating business rules, with
-  MCP-ready workflow metadata such as user questions, resume arguments, safe task-path
-  hints, revised-answer markers, next-step guidance, and a stable
-  `prepare_implementation_contract` response adapter.
+  logic as the file-based CLI flow instead of duplicating business rules. The
+  prepare workflow now separates product task-description refinement from
+  project-aware implementation-contract preparation, renders effective project
+  context and validation commands into the returned Markdown, reports missing
+  project/validation context as structured blockers, and exposes separate
+  MCP-ready adapter response shapes for both stages.
 - Task terminal summaries now include a platform-neutral audit report with validation status, review status, non-blocking audit warnings, and recovered issues such as validation failures fixed by the build/fix loop.
 - Failed validation records now include high-signal diagnostic summary lines, and task terminal summaries sample and deduplicate those lines across recovered build/test/check failures so successful self-healed runs still reveal the concrete compiler error, failed test, sanitized assertion failure, or linter rule that was repaired without echoing source-code frames or assertion values, with an explicit pointer to `sikula show` for full state details.
 - The test writer now more strongly prefers behavioural seams over broad source-inspection tests, especially for UI implementation details that cannot be meaningfully exercised by existing project test infrastructure.

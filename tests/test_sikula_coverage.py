@@ -1286,7 +1286,8 @@ class TestCmdInitEdgeCases:
         lines = (tmp_path / ".sikula" / ".gitignore").read_text().splitlines()
         assert "state/" in lines
         assert "worktrees/" in lines
-        assert "contracts/" in lines
+        assert "contract-reports/" in lines
+        assert "contracts/" not in lines
 
     def test_init_updates_existing_sikula_gitignore_without_duplicates(self, tmp_path: Path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -1300,7 +1301,8 @@ class TestCmdInitEdgeCases:
         assert lines.count("state/") == 1
         assert "custom-cache/" in lines
         assert "worktrees/" in lines
-        assert "contracts/" in lines
+        assert "contract-reports/" in lines
+        assert "contracts/" not in lines
 
     def test_init_adds_env_to_root_gitignore_inside_git_repo(self, tmp_path: Path, monkeypatch):
         subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)

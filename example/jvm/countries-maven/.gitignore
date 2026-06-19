@@ -4,4 +4,4 @@ target/
 .DS_Store
 .sikula/state/
 .sikula/worktrees/
-.sikula/contracts/
+.sikula/contract-reports/

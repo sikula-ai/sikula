@@ -5,8 +5,8 @@ Usage (project-centric, run from project root):
   sikula init                        # create .sikula/config.yaml
   sikula init --guidelines --provider codex --model gpt-5.5
   sikula contract check task.md      # read-only implementation-contract preflight
-  sikula contract improve task.md --answers .sikula/contracts/task.answers.yaml --output task.v2.md
-  sikula contract improve task.md --interactive --output task.v2.md
+  sikula task refine task.md --interactive --output task.refined.md
+  sikula contract prepare task.refined.md --output .sikula/contracts/task.contract.md
   sikula run task.md                 # auto-discovers .sikula/config.yaml
   sikula run --task-id <task-id>     # resume existing task
   sikula status
@@ -61,11 +61,13 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -84,7 +86,7 @@ _BASE = Path(__file__).parent
 # the platform brings new test skip idioms.
 _SUPPORTED_BUILD_TOOLS = {"cargo", "gradle-android", "gradle-jvm", "maven", "node", "xcodebuild", "python"}
 _RECOVERED_DIAGNOSTIC_LIMIT = 8
-_SIKULA_GITIGNORE_ENTRIES = ("state/", "worktrees/", "contracts/")
+_SIKULA_GITIGNORE_ENTRIES = ("state/", "worktrees/", "contract-reports/")
 
 
 def _git_output(args: list[str], cwd: Path) -> str | None:
@@ -267,6 +269,25 @@ def _resolve_root_path(raw: str, discovered_root: Path | None, config_path: Path
 def _resolve_state_dir(cfg: dict) -> Path:
     """Resolve state_dir relative to project_root; absolute paths are used as-is."""
     raw = cfg.get("tasks", {}).get("state_dir", ".sikula/state")
+    return _resolve_project_path(cfg, raw)
+
+
+def _resolve_task_description_dir(cfg: dict) -> Path:
+    raw = cfg.get("tasks", {}).get("task_description_dir", ".sikula/tasks")
+    return _resolve_project_path(cfg, raw)
+
+
+def _resolve_contract_dir(cfg: dict) -> Path:
+    raw = cfg.get("tasks", {}).get("contract_dir", ".sikula/contracts")
+    return _resolve_project_path(cfg, raw)
+
+
+def _resolve_contract_report_dir(cfg: dict) -> Path:
+    raw = cfg.get("tasks", {}).get("contract_report_dir", ".sikula/contract-reports")
+    return _resolve_project_path(cfg, raw)
+
+
+def _resolve_project_path(cfg: dict, raw: str) -> Path:
     p = Path(raw)
     if p.is_absolute():
         return p
@@ -840,7 +861,7 @@ def _reset_failed_state(task_id: str, cfg: dict, store) -> None:
 
     if _contract_gate_blocked_without_worktree(state):
         print(f"Task {task_id} failed before worktree creation because the contract readiness gate blocked delivery.")
-        print("--reset-failed cannot safely resume it; improve the task contract and start a fresh run.")
+        print("--reset-failed cannot safely resume it; prepare the task contract and start a fresh run.")
         print(f"Suggested next step: {_contract_gate_next_action(state)}")
         print(f"Inspect state: sikula show {task_id}")
         sys.exit(1)
@@ -903,6 +924,155 @@ def _reset_failed_state(task_id: str, cfg: dict, store) -> None:
 # ---------------------------------------------------------------------------
 
 
+def cmd_task_refine(args: argparse.Namespace, cfg: dict) -> None:
+    from core.contract_check import prepare_task_description
+
+    project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
+    task_path = _resolve_task_path(args.task_file, project_root)
+    if task_path is None:
+        print(f"Task file not found: {args.task_file}")
+        sys.exit(1)
+    if not task_path.is_file():
+        print(f"Task path is not a file: {args.task_file}", file=sys.stderr)
+        sys.exit(1)
+
+    task_text = task_path.read_text(encoding="utf-8")
+    answers: dict[str, dict] = {}
+    answers_supplied = bool(args.interactive or args.answers)
+    if args.interactive:
+        try:
+            first = prepare_task_description(task_text, task_name=task_path.name)
+            answers = _collect_prepare_answers_interactive(
+                generated_by="sikula.task_refine",
+                label="task refinement",
+                source_path=task_path,
+                source_text=task_text,
+                project_root=project_root,
+                questions=first.user_questions,
+                cfg=cfg,
+                answers_path=_resolve_answers_path(args.answers) if args.answers else None,
+            )
+        except (EOFError, OSError, ValueError) as exc:
+            print(f"Failed to collect task refinement answers: {exc}", file=sys.stderr)
+            sys.exit(1)
+    elif args.answers:
+        try:
+            answers = _load_prepare_answers(
+                _resolve_answers_path(args.answers), source_path=task_path, source_text=task_text
+            )
+        except (OSError, ValueError) as exc:
+            print(f"Failed to load task refinement answers: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    output_path = _resolve_output_path(args.output) if args.output else _default_refined_task_path(task_path, cfg)
+    result = prepare_task_description(task_text, task_name=task_path.name, answers=answers)
+    if result.needs_user_input and not answers_supplied:
+        answers_path = _write_prepare_answers_template(
+            generated_by="sikula.task_refine",
+            source_path=task_path,
+            source_text=task_text,
+            project_root=project_root,
+            questions=result.user_questions,
+            cfg=cfg,
+        )
+        print("Task refinement needs answers before writing a refined task description.")
+        print(f"Task refinement answers template written: {answers_path}")
+        print(f"Applied answers: {len(result.answered_question_ids)}")
+        print(f"Open questions: {len(result.open_question_ids)}")
+        _print_open_question_details(result.user_questions)
+        _print_task_refinement_scope_note()
+        print("Next step:")
+        print(f"- Fill the answers file, then run: sikula task refine {args.task_file} --answers {answers_path}")
+        print(f"- Or answer in the terminal: sikula task refine {args.task_file} --interactive")
+        if output_path.exists():
+            _print_existing_output_next_step_note(output_path)
+        sys.exit(1)
+
+    if output_path.exists():
+        print(f"Failed to refine task: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
+        _print_existing_output_hint(output_path)
+        sys.exit(1)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(result.prepared_task_markdown, encoding="utf-8")
+
+    print(f"Refined task description written: {output_path}")
+    print(f"Applied answers: {len(result.answered_question_ids)}")
+    print(f"Open questions: {len(result.open_question_ids)}")
+    _print_open_question_details(result.user_questions)
+    _print_task_refinement_scope_note()
+    if result.needs_user_input:
+        answers_path = (
+            _resolve_answers_path(args.answers)
+            if args.answers
+            else _prepare_answers_path(
+                task_path,
+                cfg,
+                generated_by="sikula.task_refine",
+            )
+        )
+        print("Next step:")
+        print(f"- Fill/update the answers file: {answers_path}")
+        print("- Then rerun task refine with a new --output path, or remove/rename the output written above first.")
+    else:
+        print(f"Next step: sikula contract prepare {output_path}")
+
+
+def _print_task_refinement_scope_note() -> None:
+    print(
+        "Note: task refine only resolves product task-description questions; "
+        "contract prepare may still ask delivery questions."
+    )
+
+
+def _print_open_question_details(user_questions: list[dict]) -> None:
+    if not user_questions:
+        return
+    print("Open question details:")
+    for index, question in enumerate(user_questions, start=1):
+        question_id = str(question.get("id") or "").strip()
+        question_text = str(question.get("question") or "").strip()
+        if question_id and question_text:
+            print(f"{index}. [{question_id}] {question_text}")
+        elif question_text:
+            print(f"{index}. {question_text}")
+
+
+def _print_contract_prepare_project_context_required(result, task_file: str) -> None:
+    blocker_messages = {
+        "missing_project_context": "No project context was provided.",
+        "missing_validation_commands": "No effective validation commands were found in the Sikula project config.",
+    }
+    print("Contract preparation needs project context before writing an implementation contract.")
+    blockers = [
+        blocker_messages.get(str(blocker), str(blocker))
+        for blocker in getattr(result, "ready_to_run_blockers", [])
+        if str(blocker) in blocker_messages
+    ]
+    if blockers:
+        print("Project context blockers:")
+        for blocker in blockers:
+            print(f"- {blocker}")
+    _print_open_question_details(getattr(result, "user_questions", []))
+    print("Next step:")
+    print("- Run from a Sikula-configured project, or pass --config /path/to/.sikula/config.yaml.")
+    print("- Configure effective build, test, lint, or check validation commands, then rerun:")
+    print(f"  sikula contract prepare {task_file}")
+
+
+def _print_existing_output_next_step_note(output_path: Path) -> None:
+    print("Output note:")
+    print(f"- {output_path} already exists.")
+    print("- Choose a new --output path, or remove/rename that file before rerunning.")
+
+
+def _print_existing_output_hint(output_path: Path) -> None:
+    print(f"Hint: {output_path} already exists.", file=sys.stderr)
+    print(
+        "Choose a new --output path, or remove/rename the existing file if you intend to replace it.", file=sys.stderr
+    )
+
+
 def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
     from core.contract_check import check_contract_file, render_contract_check, write_contract_report
 
@@ -911,13 +1081,22 @@ def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
     if task_path is None:
         print(f"Task file not found: {args.task_file}")
         sys.exit(1)
+    if not task_path.is_file():
+        print(f"Task path is not a file: {args.task_file}", file=sys.stderr)
+        sys.exit(1)
 
     result = check_contract_file(task_path, project_config=_contract_cli_project_config(cfg))
     write_result = None
     if args.write_report:
         report_root = project_root if cfg.get("project", {}).get("root_path") else None
+        report_dir = _resolve_contract_report_dir(cfg) if cfg.get("_config_path") else None
         try:
-            write_result = write_contract_report(result, task_path=task_path, project_root=report_root)
+            write_result = write_contract_report(
+                result,
+                task_path=task_path,
+                project_root=report_root,
+                report_dir=report_dir,
+            )
         except (OSError, ValueError) as exc:
             print(f"Failed to write contract report: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -930,54 +1109,161 @@ def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
     else:
         print(render_contract_check(result), end="")
         if write_result:
-            print("Generated contract artifacts:")
+            print("Generated contract report artifacts:")
             print(f"- {write_result.report_path}")
             print(f"- {write_result.answers_path}")
 
 
-def cmd_contract_improve(args: argparse.Namespace, cfg: dict) -> None:
-    from core.contract_check import improve_contract_from_answers, render_contract_check
+def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
+    from core.contract_check import (
+        load_generated_answer_entries_for_contract,
+        prepare_implementation_contract,
+        render_contract_check,
+        write_prepared_contract,
+    )
 
     project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
     task_path = _resolve_task_path(args.task_file, project_root)
     if task_path is None:
         print(f"Task file not found: {args.task_file}")
         sys.exit(1)
+    if not task_path.is_file():
+        print(f"Task path is not a file: {args.task_file}", file=sys.stderr)
+        sys.exit(1)
 
+    task_text = task_path.read_text(encoding="utf-8")
+    project_context = _prepare_project_context_from_config(cfg)
+    output_path = _resolve_output_path(args.output) if args.output else _default_contract_path(task_path, cfg)
+    report_root = project_root if cfg.get("project", {}).get("root_path") else None
+    report_dir = _resolve_contract_report_dir(cfg) if cfg.get("_config_path") else None
+    generated_answer_entries = load_generated_answer_entries_for_contract(
+        task_path,
+        source_text=task_text,
+        project_root=report_root,
+        report_dir=report_dir,
+    )
+    if project_context is None or not project_context.get("validation_commands"):
+        result = prepare_implementation_contract(
+            task_text,
+            contract_name=output_path.name,
+            project_context=project_context,
+            generated_answer_entries=generated_answer_entries,
+        )
+        if result.required_next_step == "provide_project_context":
+            _print_contract_prepare_project_context_required(result, args.task_file)
+            if output_path.exists():
+                _print_existing_output_next_step_note(output_path)
+            sys.exit(1)
+
+    answers: dict[str, dict] = {}
+    answers_supplied = bool(args.interactive or args.answers)
     if args.interactive:
         try:
-            answers_path = _write_interactive_contract_answers(args, cfg, task_path, project_root)
+            first = prepare_implementation_contract(
+                task_text,
+                contract_name=task_path.name,
+                project_context=project_context,
+                generated_answer_entries=generated_answer_entries,
+            )
+            answers = _collect_prepare_answers_interactive(
+                generated_by="sikula.contract_prepare",
+                label="contract preparation",
+                source_path=task_path,
+                source_text=task_text,
+                project_root=project_root,
+                questions=first.user_questions,
+                cfg=cfg,
+                answers_path=_resolve_answers_path(args.answers) if args.answers else None,
+            )
         except (EOFError, OSError, ValueError) as exc:
             print(f"Failed to collect contract answers: {exc}", file=sys.stderr)
             sys.exit(1)
-    else:
-        if not args.answers:
-            print("Failed to improve contract: --answers is required unless --interactive is used", file=sys.stderr)
+    elif args.answers:
+        try:
+            answers = _load_prepare_answers(
+                _resolve_answers_path(args.answers), source_path=task_path, source_text=task_text
+            )
+        except (OSError, ValueError) as exc:
+            print(f"Failed to load contract answers: {exc}", file=sys.stderr)
             sys.exit(1)
-        answers_path = _resolve_answers_path(args.answers)
-    output_path = None
-    if args.output:
-        output_path = Path(args.output)
-        if not output_path.is_absolute():
-            output_path = (Path.cwd() / output_path).resolve()
 
-    try:
-        result = improve_contract_from_answers(
-            task_path,
-            answers_path=answers_path,
-            output_path=output_path,
-            write=args.write,
-            project_config=_contract_cli_project_config(cfg),
-        )
-    except (OSError, ValueError) as exc:
-        print(f"Failed to improve contract: {exc}", file=sys.stderr)
+    result = prepare_implementation_contract(
+        task_text,
+        contract_name=output_path.name,
+        answers=answers,
+        project_context=project_context,
+        generated_answer_entries=generated_answer_entries,
+    )
+    if result.required_next_step == "provide_project_context":
+        _print_contract_prepare_project_context_required(result, args.task_file)
+        if output_path.exists():
+            _print_existing_output_next_step_note(output_path)
         sys.exit(1)
 
-    print(f"Improved contract written: {result.output_path}")
+    if result.needs_user_input and not answers_supplied:
+        answers_path = _write_prepare_answers_template(
+            generated_by="sikula.contract_prepare",
+            source_path=task_path,
+            source_text=task_text,
+            project_root=project_root,
+            questions=result.user_questions,
+            cfg=cfg,
+        )
+        print("Contract preparation needs answers before writing an implementation contract.")
+        print(f"Contract preparation answers template written: {answers_path}")
+        print(f"Applied answers: {len(result.answered_question_ids)}")
+        print(f"Open questions: {len(result.open_question_ids)}")
+        _print_open_question_details(result.user_questions)
+        print("Next step:")
+        print(f"- Fill the answers file, then run: sikula contract prepare {args.task_file} --answers {answers_path}")
+        print(f"- Or answer in the terminal: sikula contract prepare {args.task_file} --interactive")
+        if output_path.exists():
+            _print_existing_output_next_step_note(output_path)
+        sys.exit(1)
+
+    if output_path.exists():
+        print(f"Failed to prepare contract: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
+        _print_existing_output_hint(output_path)
+        sys.exit(1)
+
+    try:
+        write_prepared_contract(
+            result,
+            output_path=output_path,
+            project_root=report_root,
+            report_dir=report_dir,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"Failed to prepare contract: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Implementation contract written: {output_path}")
     print(f"Applied answers: {len(result.answered_question_ids)}")
     print(f"Open questions: {len(result.open_question_ids)}")
     print("")
-    print(render_contract_check(result.check_result), end="")
+    print(render_contract_check(result.recheck_result or result.check_result), end="")
+    if result.ready_to_run:
+        print("")
+        print(f"Next step: sikula run {output_path}")
+    elif result.needs_user_input:
+        answers_path = (
+            _resolve_answers_path(args.answers)
+            if args.answers
+            else _prepare_answers_path(
+                task_path,
+                cfg,
+                generated_by="sikula.contract_prepare",
+            )
+        )
+        print("")
+        print("Next step:")
+        print(f"- Fill/update the answers file: {answers_path}")
+        print(
+            "- Then rerun contract prepare with a new --output path, or remove/rename the output written above first."
+        )
+    else:
+        print("")
+        print(f"Next step: review the contract check output above before running sikula run {output_path}")
 
 
 def _resolve_answers_path(value: str) -> Path:
@@ -985,6 +1271,36 @@ def _resolve_answers_path(value: str) -> Path:
     if not answers_path.is_absolute():
         answers_path = (Path.cwd() / answers_path).resolve()
     return answers_path
+
+
+def _resolve_output_path(value: str) -> Path:
+    output_path = Path(value)
+    if not output_path.is_absolute():
+        output_path = (Path.cwd() / output_path).resolve()
+    return output_path
+
+
+def _default_refined_task_path(task_path: Path, cfg: dict) -> Path:
+    suffix = str(cfg.get("tasks", {}).get("refined_suffix") or ".refined.md")
+    stem = _strip_known_task_suffixes(task_path.stem)
+    if cfg.get("_config_path"):
+        task_description_dir = _resolve_task_description_dir(cfg)
+    else:
+        task_description_dir = _infer_task_local_description_dir(task_path)
+    return task_description_dir / f"{stem}{suffix}"
+
+
+def _default_contract_path(task_path: Path, cfg: dict) -> Path:
+    suffix = str(cfg.get("tasks", {}).get("contract_suffix") or ".contract.md")
+    stem = _strip_known_task_suffixes(task_path.stem)
+    return _resolve_contract_dir(cfg) / f"{stem}{suffix}"
+
+
+def _strip_known_task_suffixes(stem: str) -> str:
+    for suffix in (".refined", ".contract", ".v2", ".v3"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
 
 
 def _read_interactive_contract_answer(prompt: str, current_answer: str) -> tuple[str, bool]:
@@ -1032,47 +1348,51 @@ def _should_store_interactive_answer(response: str, current_answer: str, default
     return bool(response) or not current_answer or default_inserted
 
 
-def _write_interactive_contract_answers(
-    args: argparse.Namespace,
-    cfg: dict,
-    task_path: Path,
+def _collect_prepare_answers_interactive(
+    *,
+    generated_by: str,
+    label: str,
+    source_path: Path,
+    source_text: str,
     project_root: Path,
-) -> Path:
-    from core.contract_check import check_contract_file, load_contract_answers_for_task, write_contract_report
-
+    questions: list[dict],
+    cfg: dict,
+    answers_path: Path | None = None,
+) -> dict[str, dict]:
     if not sys.stdin.isatty():
-        raise ValueError("interactive contract improve requires an interactive terminal on stdin")
+        raise ValueError(f"interactive {label} requires an interactive terminal on stdin")
 
-    if args.answers:
-        answers_path = _resolve_answers_path(args.answers)
-        if not answers_path.exists():
-            raise ValueError(f"answers file not found: {answers_path}")
-        result = check_contract_file(task_path, project_config=_contract_cli_project_config(cfg))
-        answers_data = load_contract_answers_for_task(answers_path, result)
-    else:
-        result = check_contract_file(task_path, project_config=_contract_cli_project_config(cfg))
-        report_root = project_root if cfg.get("project", {}).get("root_path") else None
-        answers_path = write_contract_report(result, task_path=task_path, project_root=report_root).answers_path
-        answers_data = yaml.safe_load(answers_path.read_text(encoding="utf-8")) or {}
-    questions = answers_data.get("questions")
-    answers = answers_data.get("answers")
-    if not isinstance(questions, list):
-        raise ValueError(f"answers file is missing the questions list: {answers_path}")
-    if not isinstance(answers, dict):
-        raise ValueError(f"answers file is missing the answers mapping: {answers_path}")
+    explicit_answers_path = answers_path is not None
+    answers_path = answers_path or _prepare_answers_path(source_path, cfg, generated_by=generated_by)
+    artifact_base = _prepare_answers_artifact_base(answers_path.parent, cfg)
+    answers_data = _prepare_answers_template(
+        generated_by=generated_by,
+        source_path=source_path,
+        source_text=source_text,
+        project_root=artifact_base,
+        questions=questions,
+    )
+    if answers_path.exists():
+        existing = _load_prepare_answers_data(answers_path)
+        if explicit_answers_path:
+            _validate_prepare_answers_for_source(existing, source_path=source_path, source_text=source_text)
+        answers_data = _merge_prepare_answers(existing, answers_data, archive_stale=not explicit_answers_path)
 
-    print(f"Interactive contract answers: {answers_path}")
+    answers = answers_data.setdefault("answers", {})
+    print(f"Interactive {label} answers: {answers_path}")
     if not questions:
         print("No follow-up questions found; answers file is unchanged.")
-        return answers_path
+        answers_path.parent.mkdir(parents=True, exist_ok=True)
+        answers_path.write_text(yaml.safe_dump(answers_data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        return {}
 
     for question in questions:
         if not isinstance(question, dict) or not isinstance(question.get("id"), str) or not question["id"]:
-            raise ValueError(f"answers file contains an invalid question entry: {answers_path}")
+            raise ValueError(f"invalid question entry for {label}")
         question_id = question["id"]
         answer_entry = answers.setdefault(question_id, {"answer": "", "notes": ""})
         if not isinstance(answer_entry, dict):
-            raise ValueError(f"answers file contains an invalid answer entry for {question_id}: {answers_path}")
+            raise ValueError(f"invalid answer entry for {question_id}")
         current_answer = str(answer_entry.get("answer") or "").strip()
         print("")
         print(f"[{question_id}] {question.get('question', '')}")
@@ -1085,10 +1405,314 @@ def _write_interactive_contract_answers(
             answer_entry["answer"] = response
         answer_entry.setdefault("notes", "")
 
+    answers_path.parent.mkdir(parents=True, exist_ok=True)
     answers_path.write_text(yaml.safe_dump(answers_data, sort_keys=False, allow_unicode=True), encoding="utf-8")
     print("")
-    print(f"Contract answers written: {answers_path}")
+    print(f"{label.capitalize()} answers written: {answers_path}")
+    return {key: value for key, value in answers.items() if isinstance(key, str) and isinstance(value, dict)}
+
+
+def _write_prepare_answers_template(
+    *,
+    generated_by: str,
+    source_path: Path,
+    source_text: str,
+    project_root: Path,
+    questions: list[dict],
+    cfg: dict,
+) -> Path:
+    answers_path = _prepare_answers_path(source_path, cfg, generated_by=generated_by)
+    artifact_base = _prepare_answers_artifact_base(answers_path.parent, cfg)
+    answers_data = _prepare_answers_template(
+        generated_by=generated_by,
+        source_path=source_path,
+        source_text=source_text,
+        project_root=artifact_base,
+        questions=questions,
+    )
+    if answers_path.exists():
+        existing = _load_prepare_answers_data(answers_path)
+        answers_data = _merge_prepare_answers(existing, answers_data, archive_stale=True)
+    answers_path.parent.mkdir(parents=True, exist_ok=True)
+    answers_path.write_text(yaml.safe_dump(answers_data, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return answers_path
+
+
+def _prepare_answers_path(source_path: Path, cfg: dict, *, generated_by: str) -> Path:
+    phase = generated_by.removeprefix("sikula.").replace("_", "-")
+    stem = _strip_known_task_suffixes(source_path.stem)
+    report_dir = _prepare_answers_report_dir(source_path, cfg)
+    artifact_base = _prepare_answers_artifact_base(report_dir, cfg)
+    base = report_dir / f"{stem}.{phase}.answers.yaml"
+    if _prepare_answers_path_available_for_task(base, source_path, artifact_base, generated_by):
+        return base
+
+    hashed_stem = f"{stem}-{sha256(str(source_path.resolve()).encode('utf-8')).hexdigest()[:8]}"
+    hashed = report_dir / f"{hashed_stem}.{phase}.answers.yaml"
+    if not _prepare_answers_path_available_for_task(hashed, source_path, artifact_base, generated_by):
+        raise FileExistsError(f"answers path already exists for a different task: {hashed}")
+    return hashed
+
+
+def _prepare_answers_report_dir(source_path: Path, cfg: dict) -> Path:
+    if cfg.get("_config_path"):
+        return _resolve_contract_report_dir(cfg)
+    return _infer_task_local_contract_report_dir(source_path)
+
+
+def _prepare_answers_artifact_base(report_dir: Path, cfg: dict) -> Path:
+    project_root = cfg.get("project", {}).get("root_path")
+    if project_root:
+        return Path(project_root).resolve()
+    if report_dir.name == "contract-reports" and report_dir.parent.name == ".sikula":
+        return report_dir.parent.parent.resolve()
+    return Path.cwd().resolve()
+
+
+def _prepare_answers_path_available_for_task(
+    path: Path,
+    source_path: Path,
+    artifact_base: Path,
+    generated_by: str,
+) -> bool:
+    if not path.exists():
+        return True
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if data.get("schema_version") != 1 or data.get("generated_by") != generated_by:
+        return False
+    return _prepare_answers_task_path_matches(data.get("task"), source_path, artifact_base)
+
+
+def _prepare_answers_task_path_matches(task: object, source_path: Path, artifact_base: Path) -> bool:
+    if not isinstance(task, dict):
+        return False
+    value = task.get("path")
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        path = Path(value)
+        if not path.is_absolute():
+            path = artifact_base / path
+        return path.resolve() == source_path.resolve()
+    except OSError:
+        return False
+
+
+def _infer_task_local_contract_report_dir(source_path: Path) -> Path:
+    resolved = source_path.resolve()
+    for parent in resolved.parents:
+        if parent.name == "tasks" and parent.parent.name == ".sikula":
+            return parent.parent / "contract-reports"
+        if parent.name == ".sikula":
+            return parent / "contract-reports"
+    return Path.cwd().resolve() / ".sikula" / "contract-reports"
+
+
+def _infer_task_local_description_dir(source_path: Path) -> Path:
+    resolved = source_path.resolve()
+    for parent in resolved.parents:
+        if parent.name == "tasks" and parent.parent.name == ".sikula":
+            return parent
+        if parent.name == ".sikula":
+            return parent / "tasks"
+    return Path.cwd().resolve() / ".sikula" / "tasks"
+
+
+def _prepare_answers_template(
+    *,
+    generated_by: str,
+    source_path: Path,
+    source_text: str,
+    project_root: Path,
+    questions: list[dict],
+) -> dict:
+    return {
+        "schema_version": 1,
+        "generated_by": generated_by,
+        "task": {
+            "path": _contract_preflight_path(source_path, project_root),
+            "sha256": _text_sha256(source_text),
+        },
+        "questions": questions,
+        "answers": {
+            question["id"]: {
+                "answer": "",
+                "notes": "",
+            }
+            for question in questions
+            if isinstance(question, dict) and isinstance(question.get("id"), str)
+        },
+    }
+
+
+def _merge_prepare_answers(existing: dict, next_data: dict, *, archive_stale: bool = False) -> dict:
+    previous_answers = _prepare_previous_answers(existing)
+    if previous_answers:
+        next_data["previous_answers"] = previous_answers
+
+    existing_answers = existing.get("answers")
+    next_answers = next_data.get("answers")
+    if not isinstance(existing_answers, dict) or not isinstance(next_answers, dict):
+        return next_data
+    existing_sha = _prepare_answers_task_sha(existing)
+    next_sha = _prepare_answers_task_sha(next_data)
+    if existing_sha != next_sha:
+        if archive_stale:
+            archived = _archive_prepare_answers(existing)
+            if archived:
+                next_data.setdefault("previous_answers", []).append(archived)
+        return next_data
+    for question_id, template in list(next_answers.items()):
+        answer = existing_answers.get(question_id)
+        if isinstance(answer, dict):
+            next_answers[question_id] = {
+                "answer": answer.get("answer", ""),
+                "notes": answer.get("notes", ""),
+            }
+        else:
+            next_answers[question_id] = template
+    return next_data
+
+
+def _prepare_answers_task_sha(data: dict) -> str | None:
+    task = data.get("task")
+    if not isinstance(task, dict):
+        return None
+    value = task.get("sha256")
+    return value if isinstance(value, str) and value else None
+
+
+def _prepare_previous_answers(data: dict) -> list[dict]:
+    previous = data.get("previous_answers")
+    if not isinstance(previous, list):
+        return []
+    return [entry for entry in previous if isinstance(entry, dict)]
+
+
+def _archive_prepare_answers(data: dict) -> dict | None:
+    filled = _filled_prepare_answers(data.get("answers"))
+    if not filled:
+        return None
+    task = data.get("task") if isinstance(data.get("task"), dict) else {}
+    return {
+        "archived_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "task": {
+            "path": task.get("path"),
+            "sha256": task.get("sha256"),
+        },
+        "questions": data.get("questions") if isinstance(data.get("questions"), list) else [],
+        "answers": filled,
+    }
+
+
+def _filled_prepare_answers(value) -> dict[str, dict]:
+    if not isinstance(value, dict):
+        return {}
+    filled: dict[str, dict] = {}
+    for question_id, answer in value.items():
+        if not isinstance(question_id, str) or not isinstance(answer, dict):
+            continue
+        answer_text = answer.get("answer", "")
+        notes = answer.get("notes", "")
+        if answer_text or notes:
+            filled[question_id] = {
+                "answer": answer_text,
+                "notes": notes,
+            }
+    return filled
+
+
+def _load_prepare_answers(path: Path, *, source_path: Path, source_text: str) -> dict[str, dict]:
+    data = _load_prepare_answers_data(path)
+    _validate_prepare_answers_for_source(data, source_path=source_path, source_text=source_text)
+    answers = data.get("answers")
+    if not isinstance(answers, dict):
+        raise ValueError(f"answers file is missing the answers mapping: {path}")
+    return {key: value for key, value in answers.items() if isinstance(key, str) and isinstance(value, dict)}
+
+
+def _load_prepare_answers_data(path: Path) -> dict:
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid answers YAML: {path}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"answers file must contain a mapping: {path}")
+    generated_by = data.get("generated_by")
+    if generated_by not in {"sikula.task_refine", "sikula.contract_prepare", "sikula.contract_check"}:
+        raise ValueError(f"answers file was not generated by Sikula prepare/check tooling: {path}")
+    if data.get("schema_version") != 1:
+        raise ValueError(f"Unsupported answers schema version: {data.get('schema_version')!r}")
+    return data
+
+
+def _validate_prepare_answers_for_source(data: dict, *, source_path: Path, source_text: str) -> None:
+    task = data.get("task")
+    if not isinstance(task, dict):
+        raise ValueError("answers file is missing task metadata")
+    expected_sha = _text_sha256(source_text)
+    actual_sha = task.get("sha256")
+    if actual_sha != expected_sha:
+        raise ValueError(
+            f"answers were generated for a different task revision ({actual_sha or 'missing hash'} != {expected_sha})"
+        )
+
+
+def _text_sha256(text: str) -> str:
+    return "sha256:" + sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def _is_placeholder_validation_command(command: str) -> bool:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    return any(token.strip().strip("\"'`<>[]{}():,;").upper() == "TODO" for token in tokens)
+
+
+def _contract_prepare_validation_commands(configured: list[dict[str, str]]) -> list[str]:
+    commands: list[str] = []
+    for entry in configured:
+        command = str(entry.get("command") or "").strip()
+        if not command or entry.get("phase") == "check_autofix":
+            continue
+        if _is_placeholder_validation_command(command):
+            continue
+        commands.append(command)
+    return commands
+
+
+def _prepare_project_context_from_config(cfg: dict) -> dict | None:
+    from core.state import TaskState
+    from core.validation_coverage import configured_validation_commands
+
+    effective = _contract_cli_project_config(cfg)
+    if effective is None:
+        return None
+    project = effective.get("project", {}) if isinstance(effective.get("project"), dict) else {}
+    build = effective.get("build", {}) if isinstance(effective.get("build"), dict) else {}
+    build_tool = str(project.get("build_tool") or "").strip()
+    configured: list[dict[str, str]] = []
+    if build_tool in _SUPPORTED_BUILD_TOOLS:
+        state = TaskState(task_id="contract_prepare", task_description="")
+        configured = configured_validation_commands(effective, state)
+    stack_parts = [
+        str(project.get("language") or "").strip(),
+        str(project.get("platform") or "").strip(),
+        build_tool,
+        str(project.get("ui") or "").strip(),
+    ]
+    stack = " / ".join(part for part in stack_parts if part and part != "TODO")
+    return {
+        "stack": stack or None,
+        "package_manager": build.get("package_manager"),
+        "validation_commands": _contract_prepare_validation_commands(configured),
+    }
 
 
 def _contract_preflight_path(path: Path, project_root: Path) -> str:
@@ -1275,16 +1899,16 @@ def _print_contract_readiness_gate_failure(snapshot: dict, failures: list[str], 
     path = source.get("path")
     print("Next steps:")
     if path:
-        print(f"- Improve the task directly, then rerun: sikula run {path}")
+        print(f"- Refine the task directly, then rerun: sikula run {path}")
         print(f"- Or generate answers: sikula contract check {path} --write-report")
         print(
-            f"- Then apply answers: sikula contract improve {path} "
-            "--answers .sikula/contracts/<task>.answers.yaml --output <task>.v2.md"
+            f"- Then prepare a contract: sikula contract prepare {path} "
+            "--answers .sikula/contract-reports/<task>.answers.yaml --output .sikula/contracts/<task>.contract.md"
         )
     else:
-        print("- Improve the task directly, then rerun sikula run.")
+        print("- Refine the task directly, then rerun sikula run.")
         print(
-            "- Or generate answers with sikula contract check --write-report and apply them with sikula contract improve."
+            "- Or generate answers with sikula contract check --write-report and apply them with sikula contract prepare."
         )
     print(f"Task state saved: sikula show {task_id}")
 
@@ -2756,6 +3380,11 @@ sandbox:
   max_security_review_iterations: 3
 
 tasks:
+  task_description_dir: .sikula/tasks/
+  contract_dir: .sikula/contracts/
+  contract_report_dir: .sikula/contract-reports/
+  refined_suffix: .refined.md
+  contract_suffix: .contract.md
   state_dir: .sikula/state/
 
 progress:
@@ -3037,6 +3666,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     sikula_dir.mkdir(exist_ok=True)
     (sikula_dir / "tasks").mkdir(exist_ok=True)
+    (sikula_dir / "contracts").mkdir(exist_ok=True)
     _ensure_sikula_gitignore(sikula_dir)
 
     guidelines_files = list(result.guidelines_files)
@@ -3167,7 +3797,23 @@ def main() -> None:
 
     sub = parser.add_subparsers(dest="command")
 
-    contract_p = sub.add_parser("contract", help="Inspect or improve implementation contracts")
+    task_p = sub.add_parser("task", help="Prepare product task descriptions")
+    task_sub = task_p.add_subparsers(dest="task_command")
+    task_refine_p = task_sub.add_parser("refine", help="Refine a product task description")
+    task_refine_p.add_argument("task_file", metavar="TASK_FILE", help="Path to task .txt/.md file")
+    task_refine_p.add_argument("--answers", help="Path to a Sikula answers YAML file")
+    task_refine_p.add_argument(
+        "--interactive",
+        action="store_true",
+        default=False,
+        help="Prompt for product task answers before writing the refined task description",
+    )
+    task_refine_p.add_argument(
+        "--output",
+        help="Write the refined Markdown task description to this file; defaults to tasks.<stem>.refined.md",
+    )
+
+    contract_p = sub.add_parser("contract", help="Inspect or prepare implementation contracts")
     contract_sub = contract_p.add_subparsers(dest="contract_command")
     contract_check_p = contract_sub.add_parser("check", help="Check a task file as an implementation contract")
     contract_check_p.add_argument("task_file", metavar="TASK_FILE", help="Path to task .txt/.md file")
@@ -3176,30 +3822,26 @@ def main() -> None:
         "--write-report",
         action="store_true",
         default=False,
-        help="Write .sikula/contracts check report and answers template artifacts",
+        help="Write .sikula/contract-reports check report and answers template artifacts",
     )
-    contract_improve_p = contract_sub.add_parser(
-        "improve",
-        help="Create an improved Markdown implementation contract from an answers file",
+    contract_prepare_p = contract_sub.add_parser(
+        "prepare",
+        help="Create a project-aware Markdown implementation contract",
     )
-    contract_improve_p.add_argument("task_file", metavar="TASK_FILE", help="Path to task .txt/.md file")
-    contract_improve_p.add_argument(
+    contract_prepare_p.add_argument("task_file", metavar="TASK_FILE", help="Path to refined task .txt/.md file")
+    contract_prepare_p.add_argument(
         "--answers",
-        help="Path to .sikula/contracts/*.answers.yaml created by `sikula contract check --write-report`",
+        help="Path to .sikula/contract-reports/*.answers.yaml created by Sikula prepare/check tooling",
     )
-    contract_improve_p.add_argument(
+    contract_prepare_p.add_argument(
         "--interactive",
         action="store_true",
         default=False,
-        help="Prompt for missing contract answers before writing the improved contract",
+        help="Prompt for missing contract answers before writing the implementation contract",
     )
-    improve_target = contract_improve_p.add_mutually_exclusive_group(required=True)
-    improve_target.add_argument("--output", help="Write the improved Markdown contract to this new file")
-    improve_target.add_argument(
-        "--write",
-        action="store_true",
-        default=False,
-        help="Overwrite the original Markdown task file after verifying the answers hash",
+    contract_prepare_p.add_argument(
+        "--output",
+        help="Write the implementation contract to this file; defaults to contracts.<stem>.contract.md",
     )
 
     run_p = sub.add_parser("run", help="Run a task")
@@ -3426,7 +4068,7 @@ def main() -> None:
 
     cfg = _load_runtime_config(
         args.config,
-        required=args.command != "contract",
+        required=args.command not in {"contract", "task"},
     )
 
     if args.command == "run":
@@ -3434,11 +4076,17 @@ def main() -> None:
         if not task_file and not args.task_id:
             run_p.error("provide TASK_FILE or --task-id")
         cmd_run(args, cfg)
+    elif args.command == "task":
+        if args.task_command == "refine":
+            cmd_task_refine(args, cfg)
+        else:
+            task_p.print_help()
+            sys.exit(1)
     elif args.command == "contract":
         if args.contract_command == "check":
             cmd_contract_check(args, cfg)
-        elif args.contract_command == "improve":
-            cmd_contract_improve(args, cfg)
+        elif args.contract_command == "prepare":
+            cmd_contract_prepare(args, cfg)
         else:
             contract_p.print_help()
             sys.exit(1)
