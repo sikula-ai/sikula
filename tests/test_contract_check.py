@@ -2670,6 +2670,45 @@ def test_task_refine_cli_auto_writes_answers_template_for_remaining_questions(
     assert "## Open questions" in output
 
 
+def test_task_refine_cli_auto_records_parse_failure_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    class FakeLLM:
+        def run_readonly_agent(self, _prompt: str, cwd: Path) -> str:
+            assert cwd == tmp_path
+            return "{not json"
+
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.refined.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("core.llm_client.create_llm_client", return_value=FakeLLM()),
+        patch("sys.argv", ["sikula", "task", "refine", str(task_path), "--auto", "--output", str(output_path)]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    err = capsys.readouterr().err
+    audit_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.task-refine.auto-llm.jsonl"
+    audit_record = json.loads(audit_path.read_text(encoding="utf-8").splitlines()[0])
+
+    assert exc.value.code == 1
+    assert not output_path.exists()
+    assert "Failed to auto-refine task" in err
+    assert audit_record["generated_by"] == "sikula.task_refine"
+    assert audit_record["task"]["path"] == ".sikula/tasks/team-invites.md"
+    assert audit_record["output"]["path"] == ".sikula/tasks/team-invites.refined.md"
+    assert audit_record["record"]["phase"] == "task_refine_auto"
+    assert audit_record["record"]["raw_output"] == "{not json"
+    assert audit_record["record"]["parsed"]["status"] == "failed"
+    assert "not valid JSON" in audit_record["record"]["parsed"]["error"]
+
+
 def test_task_refine_cli_auto_rejects_interactive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
     task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
     task_path.parent.mkdir(parents=True)
@@ -2982,6 +3021,46 @@ def test_contract_prepare_cli_auto_preserves_partial_answers_template(
         "notes": "Product intent names teammate invites.",
     }
     assert answers["answers"]["acceptance.criteria"]["answer"] == ""
+
+
+def test_contract_prepare_cli_auto_records_parse_failure_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    class FakeLLM:
+        def run_readonly_agent(self, _prompt: str, cwd: Path) -> str:
+            assert cwd == tmp_path
+            return "{not json"
+
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "contracts" / "team-invites.contract.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["pytest"]}),
+        patch("core.llm_client.create_llm_client", return_value=FakeLLM()),
+        patch("sys.argv", ["sikula", "contract", "prepare", str(task_path), "--auto", "--output", str(output_path)]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    err = capsys.readouterr().err
+    audit_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.contract-prepare.auto-llm.jsonl"
+    audit_record = json.loads(audit_path.read_text(encoding="utf-8").splitlines()[0])
+
+    assert exc.value.code == 1
+    assert not output_path.exists()
+    assert "Failed to auto-prepare contract" in err
+    assert audit_record["generated_by"] == "sikula.contract_prepare"
+    assert audit_record["task"]["path"] == ".sikula/tasks/team-invites.md"
+    assert audit_record["output"]["path"] == ".sikula/contracts/team-invites.contract.md"
+    assert audit_record["record"]["phase"] == "contract_prepare_auto"
+    assert audit_record["record"]["raw_output"] == "{not json"
+    assert audit_record["record"]["parsed"]["status"] == "failed"
+    assert "not valid JSON" in audit_record["record"]["parsed"]["error"]
 
 
 def test_contract_prepare_cli_auto_rejects_interactive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from agents.base_agent import AGENT_SECURITY_PREFIX, guidelines_files, tech_stack
 from core.contract_auto_prepare import (
+    AutoPreparationAuditRecorder,
     ContractAutoAnswerBatch,
     ContractAutoPrepareRequest,
     parse_contract_auto_answer_output,
@@ -161,6 +162,7 @@ class TaskPreparationAgent:
         request: ContractAutoPrepareRequest,
         *,
         project_root: Path,
+        audit_recorder: AutoPreparationAuditRecorder | None = None,
     ) -> ContractAutoAnswerBatch:
         active_ids = {
             str(question.get("id") or "").strip()
@@ -169,7 +171,18 @@ class TaskPreparationAgent:
         }
         prompt = self._build_prompt(request)
         output = self.llm.run_readonly_agent(prompt, cwd=project_root)
-        batch = parse_contract_auto_answer_output(output, active_ids)
+        try:
+            batch = parse_contract_auto_answer_output(output, active_ids)
+        except ValueError as exc:
+            self._record_parse_failure(
+                audit_recorder,
+                phase="contract_prepare_auto",
+                round_index=request.round_index,
+                prompt=prompt,
+                output=output,
+                error=exc,
+            )
+            raise
         return replace(
             batch,
             audit_records=[
@@ -192,10 +205,22 @@ class TaskPreparationAgent:
         request: TaskAutoRefineRequest,
         *,
         project_root: Path,
+        audit_recorder: AutoPreparationAuditRecorder | None = None,
     ) -> TaskAutoRefineDraft:
         prompt = self._build_task_normalization_prompt(request)
         output = self.llm.run_readonly_agent(prompt, cwd=project_root)
-        draft = parse_task_auto_refine_output(output)
+        try:
+            draft = parse_task_auto_refine_output(output)
+        except ValueError as exc:
+            self._record_parse_failure(
+                audit_recorder,
+                phase="task_refine_auto",
+                round_index=1,
+                prompt=prompt,
+                output=output,
+                error=exc,
+            )
+            raise
         return replace(
             draft,
             audit_records=[
@@ -235,6 +260,31 @@ class TaskPreparationAgent:
             product_context_json=product_context_json,
             task_name=task_name,
             brief=request.brief,
+        )
+
+    def _record_parse_failure(
+        self,
+        audit_recorder: AutoPreparationAuditRecorder | None,
+        *,
+        phase: str,
+        round_index: int,
+        prompt: str,
+        output: str,
+        error: ValueError,
+    ) -> None:
+        if audit_recorder is None:
+            return
+        audit_recorder(
+            {
+                "phase": phase,
+                "round_index": round_index,
+                "prompt": prompt,
+                "raw_output": output,
+                "parsed": {
+                    "status": "failed",
+                    "error": str(error),
+                },
+            }
         )
 
     def _workflow_artifact_dirs(self) -> str:

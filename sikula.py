@@ -970,7 +970,11 @@ def _run_task_refine_auto(
         task_text,
         task_name=task_name,
         answers=answers,
-        normalize_provider=lambda request: agent.normalize_task_description(request, project_root=project_root),
+        normalize_provider=lambda request: agent.normalize_task_description(
+            request,
+            project_root=project_root,
+            audit_recorder=audit_recorder,
+        ),
         audit_recorder=audit_recorder,
     )
 
@@ -1250,7 +1254,11 @@ def _run_contract_prepare_auto(
         project_context=project_context,
         generated_answer_entries=generated_answer_entries,
         initial_answers=answers,
-        answer_provider=lambda request: agent.propose_contract_answers(request, project_root=project_root),
+        answer_provider=lambda request: agent.propose_contract_answers(
+            request,
+            project_root=project_root,
+            audit_recorder=audit_recorder,
+        ),
         audit_recorder=audit_recorder,
     )
 

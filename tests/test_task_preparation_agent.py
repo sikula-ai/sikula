@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agents.task_preparation_agent import TaskPreparationAgent
 from core.contract_auto_prepare import ContractAutoPrepareRequest
 from core.task_auto_refine import TaskAutoRefineRequest
@@ -76,6 +78,34 @@ def test_task_preparer_contract_answer_result_includes_audit_record(tmp_path: Pa
     assert record["parsed"]["answered_question_ids"] == ["scope.boundaries"]
 
 
+def test_task_preparer_contract_answer_records_parse_failure(tmp_path: Path):
+    llm = CapturingLLM("{not json")
+    agent = TaskPreparationAgent(llm=llm)
+    audit_records: list[dict] = []
+
+    with pytest.raises(ValueError, match="not valid JSON"):
+        agent.propose_contract_answers(
+            ContractAutoPrepareRequest(
+                contract_markdown="# Add team invites\n",
+                contract_name="team-invites.contract.md",
+                project_context={"validation_commands": ["pytest"]},
+                user_questions=[{"id": "scope.boundaries", "question": "What is in scope?"}],
+                round_index=2,
+            ),
+            project_root=tmp_path,
+            audit_recorder=audit_records.append,
+        )
+
+    assert len(audit_records) == 1
+    record = audit_records[0]
+    assert record["phase"] == "contract_prepare_auto"
+    assert record["round_index"] == 2
+    assert "Active questions:" in record["prompt"]
+    assert record["raw_output"] == llm.output
+    assert record["parsed"]["status"] == "failed"
+    assert "not valid JSON" in record["parsed"]["error"]
+
+
 def test_task_preparer_refine_prompt_disallows_unreferenced_sikula_artifacts(tmp_path: Path):
     llm = CapturingLLM('{"task_markdown": "# Add team invites\\n\\nUsers can invite teammates by email."}')
     agent = TaskPreparationAgent(
@@ -128,3 +158,28 @@ def test_task_preparer_refine_result_includes_audit_record(tmp_path: Path):
     assert record["raw_output"] == llm.output
     assert record["parsed"]["input_language"] == "cs"
     assert record["parsed"]["normalized_to_english"] is True
+
+
+def test_task_preparer_refine_records_parse_failure(tmp_path: Path):
+    llm = CapturingLLM("{not json")
+    agent = TaskPreparationAgent(llm=llm)
+    audit_records: list[dict] = []
+
+    with pytest.raises(ValueError, match="not valid JSON"):
+        agent.normalize_task_description(
+            TaskAutoRefineRequest(
+                brief="Uzivatel muze pozvat kolegu emailem.",
+                task_name="team-invites.txt",
+            ),
+            project_root=tmp_path,
+            audit_recorder=audit_records.append,
+        )
+
+    assert len(audit_records) == 1
+    record = audit_records[0]
+    assert record["phase"] == "task_refine_auto"
+    assert record["round_index"] == 1
+    assert "Raw task description:" in record["prompt"]
+    assert record["raw_output"] == llm.output
+    assert record["parsed"]["status"] == "failed"
+    assert "not valid JSON" in record["parsed"]["error"]
