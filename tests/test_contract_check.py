@@ -2288,6 +2288,44 @@ def test_task_refine_cli_without_config_uses_task_local_answers_template(
     assert not output_path.exists()
 
 
+def test_task_refine_cli_without_config_reuses_nested_task_local_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    caller_dir = tmp_path / "caller"
+    caller_dir.mkdir()
+    task_dir = tmp_path / "repo" / ".sikula" / "tasks"
+    task_dir.mkdir(parents=True)
+    task_path = task_dir / "team-invites.md"
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = task_dir / "team-invites.refined.md"
+    monkeypatch.chdir(caller_dir)
+
+    with (
+        patch("sys.argv", ["sikula", "task", "refine", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit),
+    ):
+        main()
+
+    capsys.readouterr()
+    answers_path = tmp_path / "repo" / ".sikula" / "contract-reports" / "team-invites.task-refine.answers.yaml"
+    answers = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+    assert answers["task"]["path"] == ".sikula/tasks/team-invites.md"
+    answers["answers"]["scope.boundaries"]["answer"] = "Add invite creation from team settings."
+    answers_path.write_text(yaml.safe_dump(answers, sort_keys=False), encoding="utf-8")
+
+    with (
+        patch("sys.argv", ["sikula", "task", "refine", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit),
+    ):
+        main()
+
+    capsys.readouterr()
+    reused = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+    hashed_answers = sorted((tmp_path / "repo" / ".sikula" / "contract-reports").glob("team-invites-*.answers.yaml"))
+    assert reused["answers"]["scope.boundaries"]["answer"] == "Add invite creation from team settings."
+    assert hashed_answers == []
+
+
 def test_task_refine_cli_without_config_uses_task_local_default_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ):

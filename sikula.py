@@ -1364,11 +1364,12 @@ def _collect_prepare_answers_interactive(
 
     explicit_answers_path = answers_path is not None
     answers_path = answers_path or _prepare_answers_path(source_path, cfg, generated_by=generated_by)
+    artifact_base = _prepare_answers_artifact_base(answers_path.parent, cfg)
     answers_data = _prepare_answers_template(
         generated_by=generated_by,
         source_path=source_path,
         source_text=source_text,
-        project_root=project_root,
+        project_root=artifact_base,
         questions=questions,
     )
     if answers_path.exists():
@@ -1421,11 +1422,12 @@ def _write_prepare_answers_template(
     cfg: dict,
 ) -> Path:
     answers_path = _prepare_answers_path(source_path, cfg, generated_by=generated_by)
+    artifact_base = _prepare_answers_artifact_base(answers_path.parent, cfg)
     answers_data = _prepare_answers_template(
         generated_by=generated_by,
         source_path=source_path,
         source_text=source_text,
-        project_root=project_root,
+        project_root=artifact_base,
         questions=questions,
     )
     if answers_path.exists():
