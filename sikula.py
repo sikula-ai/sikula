@@ -1310,6 +1310,7 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
 
     answers: dict[str, dict] = {}
     answers_supplied = bool(args.interactive or args.answers)
+    existing_default_answers_path = None
     if args.interactive:
         try:
             first = prepare_implementation_contract(
@@ -1339,6 +1340,25 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         except (OSError, ValueError) as exc:
             print(f"Failed to load contract answers: {exc}", file=sys.stderr)
             sys.exit(1)
+    elif args.auto:
+        existing_default_answers_path = _existing_prepare_answers_path(
+            task_path,
+            cfg,
+            generated_by="sikula.contract_prepare",
+        )
+        if existing_default_answers_path:
+            try:
+                existing_answers_data = _load_prepare_answers_data(existing_default_answers_path)
+            except (OSError, ValueError) as exc:
+                print(f"Failed to inspect existing contract answers: {exc}", file=sys.stderr)
+                sys.exit(1)
+            if _filled_prepare_answers(existing_answers_data.get("answers")):
+                print(
+                    "Failed to auto-prepare contract: existing contract answers contain filled values; "
+                    f"rerun with --answers {existing_default_answers_path}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
     result = prepare_implementation_contract(
         task_text,
@@ -1389,6 +1409,20 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
                     cfg=cfg,
                     answers=answers,
                     answers_path=_resolve_answers_path(args.answers),
+                )
+            except (OSError, ValueError) as exc:
+                print(f"Failed to update contract answers: {exc}", file=sys.stderr)
+                sys.exit(1)
+        elif existing_default_answers_path and auto_answer_count and not result.needs_user_input:
+            try:
+                _write_prepare_answers_template(
+                    generated_by="sikula.contract_prepare",
+                    source_path=task_path,
+                    source_text=task_text,
+                    project_root=project_root,
+                    questions=result.user_questions,
+                    cfg=cfg,
+                    answers=answers,
                 )
             except (OSError, ValueError) as exc:
                 print(f"Failed to update contract answers: {exc}", file=sys.stderr)
@@ -1720,6 +1754,14 @@ def _prepare_answers_path(source_path: Path, cfg: dict, *, generated_by: str) ->
     if not _prepare_answers_path_available_for_task(hashed, source_path, artifact_base, generated_by):
         raise FileExistsError(f"answers path already exists for a different task: {hashed}")
     return hashed
+
+
+def _existing_prepare_answers_path(source_path: Path, cfg: dict, *, generated_by: str) -> Path | None:
+    try:
+        answers_path = _prepare_answers_path(source_path, cfg, generated_by=generated_by)
+    except FileExistsError:
+        return None
+    return answers_path if answers_path.exists() else None
 
 
 def _prepare_answers_report_dir(source_path: Path, cfg: dict) -> Path:
