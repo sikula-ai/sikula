@@ -2626,6 +2626,79 @@ Users can invite teammates by email.
     assert "Users can invite teammates by email." in output
 
 
+def test_task_refine_cli_auto_applies_product_answers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
+    class FakeLLM:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+            self.prompts.append(prompt)
+            assert cwd == tmp_path
+            if "Raw task description:" in prompt:
+                return json.dumps(
+                    {
+                        "task_markdown": "# Add team invites\n\nUsers can invite teammates by email.",
+                        "input_language": "en",
+                        "normalized_to_english": False,
+                    }
+                )
+            if "Active product task questions:" in prompt:
+                return json.dumps(
+                    {
+                        "answers": {
+                            "scope.boundaries": {
+                                "answer": "Add invite creation from team settings.",
+                                "notes": "Product scope.",
+                            },
+                            "acceptance.criteria": {
+                                "answer": (
+                                    "A valid email can be invited from team settings. "
+                                    "Invalid emails are rejected. Duplicate pending invites show an error."
+                                ),
+                                "notes": "",
+                            },
+                            "scope.out_of_scope": {
+                                "answer": "Do not add billing seat enforcement or bulk invites.",
+                                "notes": "",
+                            },
+                        }
+                    }
+                )
+            raise AssertionError(f"unexpected prompt:\n{prompt}")
+
+    fake_llm = FakeLLM()
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "tasks" / "team-invites.refined.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("core.llm_client.create_llm_client", return_value=fake_llm),
+        patch("sys.argv", ["sikula", "task", "refine", str(task_path), "--auto", "--output", str(output_path)]),
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    output = output_path.read_text(encoding="utf-8")
+    audit_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.task-refine.auto-llm.jsonl"
+    audit_records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+
+    assert len(fake_llm.prompts) == 2
+    assert [record["record"]["phase"] for record in audit_records] == [
+        "task_refine_auto",
+        "task_refine_auto_answers",
+    ]
+    assert "Auto-applied answers: 3" in out
+    assert "Applied answers: 3" in out
+    assert "Open questions: 0" in out
+    assert f"Next step: sikula contract prepare {output_path}" in out
+    assert "Add invite creation from team settings." in output
+    assert "A valid email can be invited from team settings." in output
+    assert "Do not add billing seat enforcement" in output
+    assert "## Open questions" not in output
+
+
 def test_task_refine_cli_auto_writes_answers_template_for_remaining_questions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

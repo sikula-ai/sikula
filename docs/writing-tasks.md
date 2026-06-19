@@ -66,13 +66,15 @@ hash in the template.
 the product intent and avoid project-specific implementation details so the
 refined task can still be reused across platforms. `sikula task refine --auto`
 uses the read-only `task_preparer` LLM agent to normalize a rough or non-English
-request into clean English product-task Markdown, then runs the same
-deterministic product-question pass. The LLM does not answer delivery questions
-and does not write files directly. Its prompt and raw response are recorded in
+request into clean English product-task Markdown. When deterministic
+product-question handling still finds open product questions, `--auto` may
+also propose answers that are directly supported by the task or project
+guidelines, then reruns the same deterministic product-question pass. The LLM
+does not answer delivery questions and does not write files directly. Its
+prompts and raw responses are recorded in
 `.sikula/contract-reports/*.auto-llm.jsonl` for local audit before the
 normalized task is applied, including provider failures or malformed responses
-that cannot be parsed.
-Task refine only resolves product
+that cannot be parsed. Task refine only resolves product
 task-description questions; `sikula contract prepare` may still ask delivery
 questions about privacy, tests, validation, reviewer focus, or other
 implementation-contract readiness gaps. If a non-interactive refine run finds
