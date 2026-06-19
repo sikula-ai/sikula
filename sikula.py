@@ -1378,6 +1378,21 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         result = auto_result.result
         answers = auto_result.answers
         auto_answer_count = len(auto_result.auto_answers)
+        if args.answers and auto_answer_count:
+            try:
+                _write_prepare_answers_template(
+                    generated_by="sikula.contract_prepare",
+                    source_path=task_path,
+                    source_text=task_text,
+                    project_root=project_root,
+                    questions=result.user_questions,
+                    cfg=cfg,
+                    answers=answers,
+                    answers_path=_resolve_answers_path(args.answers),
+                )
+            except (OSError, ValueError) as exc:
+                print(f"Failed to update contract answers: {exc}", file=sys.stderr)
+                sys.exit(1)
 
     if result.needs_user_input and not answers_supplied:
         answers_path = _write_prepare_answers_template(
@@ -1430,27 +1445,15 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         print("")
         print(f"Next step: sikula run {output_path}")
     elif result.needs_user_input:
-        if args.auto and args.answers and auto_answer_count:
-            answers_path = _write_prepare_answers_template(
+        answers_path = (
+            _resolve_answers_path(args.answers)
+            if args.answers
+            else _prepare_answers_path(
+                task_path,
+                cfg,
                 generated_by="sikula.contract_prepare",
-                source_path=task_path,
-                source_text=task_text,
-                project_root=project_root,
-                questions=result.user_questions,
-                cfg=cfg,
-                answers=answers,
-                answers_path=_resolve_answers_path(args.answers),
             )
-        else:
-            answers_path = (
-                _resolve_answers_path(args.answers)
-                if args.answers
-                else _prepare_answers_path(
-                    task_path,
-                    cfg,
-                    generated_by="sikula.contract_prepare",
-                )
-            )
+        )
         print("")
         print("Next step:")
         print(f"- Fill/update the answers file: {answers_path}")

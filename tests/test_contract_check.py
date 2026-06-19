@@ -2979,6 +2979,108 @@ def test_contract_prepare_cli_auto_writes_output_from_supported_answers(
     assert "Owners/admins can invite a teammate" in output_path.read_text(encoding="utf-8")
 
 
+def test_contract_prepare_cli_auto_persists_supplied_answers_when_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    class FakeLLM:
+        def run_readonly_agent(self, _prompt: str, cwd: Path) -> str:
+            assert cwd == tmp_path
+            return json.dumps(
+                {
+                    "answers": {
+                        "scope.boundaries": {
+                            "answer": (
+                                "Add single-teammate email invitations for existing team owners and admins only. "
+                                "Keep existing authentication and team management behaviour unchanged."
+                            )
+                        },
+                        "acceptance.criteria": {
+                            "answer": (
+                                "Owners/admins can invite a teammate by valid email. Duplicate pending invites show "
+                                "a deterministic error. Invalid email input is rejected."
+                            )
+                        },
+                        "acceptance.negative_cases": {
+                            "answer": (
+                                "Reject empty, malformed, unauthorized, duplicate, expired, and reused invitation "
+                                "flows with stable user-visible errors."
+                            )
+                        },
+                        "scope.out_of_scope": {
+                            "answer": (
+                                "Do not add bulk invites, billing seat management, role redesign, or account signup "
+                                "changes."
+                            )
+                        },
+                        "token.lifecycle": {
+                            "answer": "Invitation tokens expire, cannot be reused after acceptance, and are not logged."
+                        },
+                        "privacy.data_handling": {
+                            "answer": "Do not log invite tokens or reveal whether an email already belongs to an account."
+                        },
+                        "reviewer.focus": {
+                            "answer": (
+                                "Review authorization checks, duplicate handling, token lifecycle, and email "
+                                "enumeration behaviour."
+                            )
+                        },
+                        "context.domain_rules": {
+                            "answer": (
+                                "Follow existing team membership, authorization, mailer, and persistence conventions."
+                            )
+                        },
+                    }
+                }
+            )
+
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "contracts" / "team-invites.contract.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["pytest"]}),
+        patch("sys.argv", ["sikula", "contract", "prepare", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit),
+    ):
+        main()
+    capsys.readouterr()
+
+    answers_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.contract-prepare.answers.yaml"
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["pytest"]}),
+        patch("core.llm_client.create_llm_client", return_value=FakeLLM()),
+        patch(
+            "sys.argv",
+            [
+                "sikula",
+                "contract",
+                "prepare",
+                str(task_path),
+                "--auto",
+                "--answers",
+                str(answers_path),
+                "--output",
+                str(output_path),
+            ],
+        ),
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    answers = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+    output = output_path.read_text(encoding="utf-8")
+
+    assert "Implementation contract written:" in out
+    assert "Auto-applied answers: 8" in out
+    assert "Open questions: 0" in out
+    assert answers["answers"]["scope.boundaries"]["answer"].startswith("Add single-teammate email invitations")
+    assert answers["answers"]["acceptance.criteria"]["answer"].startswith("Owners/admins can invite")
+    assert "Owners/admins can invite a teammate" in output
+
+
 def test_contract_prepare_cli_auto_preserves_partial_answers_template(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ):
