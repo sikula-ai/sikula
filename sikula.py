@@ -1346,19 +1346,6 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
             cfg,
             generated_by="sikula.contract_prepare",
         )
-        if existing_default_answers_path:
-            try:
-                existing_answers_data = _load_prepare_answers_data(existing_default_answers_path)
-            except (OSError, ValueError) as exc:
-                print(f"Failed to inspect existing contract answers: {exc}", file=sys.stderr)
-                sys.exit(1)
-            if _filled_prepare_answers(existing_answers_data.get("answers")):
-                print(
-                    "Failed to auto-prepare contract: existing contract answers contain filled values; "
-                    f"rerun with --answers {existing_default_answers_path}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
 
     result = prepare_implementation_contract(
         task_text,
@@ -1378,6 +1365,28 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         print(f"Failed to prepare contract: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
         _print_existing_output_hint(output_path)
         sys.exit(1)
+
+    if args.auto and existing_default_answers_path:
+        try:
+            has_current_filled_default_answers = _prepare_default_answers_has_current_filled_values(
+                answers_path=existing_default_answers_path,
+                generated_by="sikula.contract_prepare",
+                source_path=task_path,
+                source_text=task_text,
+                project_root=project_root,
+                questions=result.user_questions,
+                cfg=cfg,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"Failed to inspect existing contract answers: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if has_current_filled_default_answers:
+            print(
+                "Failed to auto-prepare contract: existing contract answers contain filled values; "
+                f"rerun with --answers {existing_default_answers_path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     if args.auto and result.user_questions:
         try:
@@ -1762,6 +1771,31 @@ def _existing_prepare_answers_path(source_path: Path, cfg: dict, *, generated_by
     except FileExistsError:
         return None
     return answers_path if answers_path.exists() else None
+
+
+def _prepare_default_answers_has_current_filled_values(
+    *,
+    answers_path: Path,
+    generated_by: str,
+    source_path: Path,
+    source_text: str,
+    project_root: Path,
+    questions: list[dict],
+    cfg: dict,
+) -> bool:
+    existing = _load_prepare_answers_data(answers_path)
+    if _prepare_answers_task_sha(existing) != _text_sha256(source_text):
+        _write_prepare_answers_template(
+            generated_by=generated_by,
+            source_path=source_path,
+            source_text=source_text,
+            project_root=project_root,
+            questions=questions,
+            cfg=cfg,
+        )
+        return False
+    _validate_prepare_answers_for_source(existing, source_path=source_path, source_text=source_text)
+    return bool(_filled_prepare_answers(existing.get("answers")))
 
 
 def _prepare_answers_report_dir(source_path: Path, cfg: dict) -> Path:

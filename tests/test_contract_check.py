@@ -3115,6 +3115,64 @@ def test_contract_prepare_cli_auto_rejects_filled_default_answers_without_answer
     assert f"--answers {answers_path}" in err
 
 
+def test_contract_prepare_cli_auto_archives_stale_filled_default_answers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    class FakeLLM:
+        def run_readonly_agent(self, _prompt: str, cwd: Path) -> str:
+            assert cwd == tmp_path
+            return json.dumps(_team_invites_full_auto_answers_payload())
+
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "contracts" / "team-invites.contract.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["pytest"]}),
+        patch("sys.argv", ["sikula", "contract", "prepare", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit),
+    ):
+        main()
+    capsys.readouterr()
+
+    answers_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.contract-prepare.answers.yaml"
+    stale_answers = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+    first_sha = stale_answers["task"]["sha256"]
+    stale_answers["answers"]["scope.boundaries"] = {
+        "answer": "Human-filled stale scope.",
+        "notes": "Human-filled stale notes.",
+    }
+    answers_path.write_text(yaml.safe_dump(stale_answers, sort_keys=False), encoding="utf-8")
+    task_path.write_text(
+        "# Add team invites\n\nUsers should be able to invite teammates by email and role.",
+        encoding="utf-8",
+    )
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["pytest"]}),
+        patch("core.llm_client.create_llm_client", return_value=FakeLLM()),
+        patch("sys.argv", ["sikula", "contract", "prepare", str(task_path), "--auto", "--output", str(output_path)]),
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    regenerated = yaml.safe_load(answers_path.read_text(encoding="utf-8"))
+
+    assert output_path.exists()
+    assert "Auto-applied answers: 8" in out
+    assert regenerated["task"]["sha256"] != first_sha
+    assert regenerated["answers"]["scope.boundaries"]["answer"].startswith("Add single-teammate email invitations")
+    assert regenerated["previous_answers"][0]["task"]["sha256"] == first_sha
+    assert regenerated["previous_answers"][0]["answers"]["scope.boundaries"] == {
+        "answer": "Human-filled stale scope.",
+        "notes": "Human-filled stale notes.",
+    }
+
+
 def test_contract_prepare_cli_auto_preserves_partial_answers_template(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ):
