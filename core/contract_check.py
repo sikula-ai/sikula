@@ -6,9 +6,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
+import mimetypes
 from pathlib import Path
 import re
+import subprocess
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import yaml
 
@@ -153,6 +156,53 @@ _CONTEXT_RE = re.compile(
 _HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 _TEXT_HEADING_RE = re.compile(r"^\s{0,3}([A-Za-z][A-Za-z0-9 /&_-]{1,60}):\s*$")
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$")
+_ASSET_EXTENSIONS = {
+    ".avif",
+    ".csv",
+    ".gif",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".json",
+    ".md",
+    ".otf",
+    ".pdf",
+    ".png",
+    ".svg",
+    ".ttf",
+    ".txt",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".zip",
+}
+_MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*]\(([^)\s]+)(?:\s+['\"][^'\"]*['\"])?\)")
+_CODE_SPAN_RE = re.compile(r"`([^`]+)`")
+_PLAIN_ASSET_PATH_RE = re.compile(
+    r"(?<![\w/.-])"
+    r"((?:\.{1,2}/|\.sikula/|[A-Za-z0-9_.-]+/)"
+    r"[A-Za-z0-9_./@%+=:, -]*?"
+    r"\.(?:avif|csv|gif|ico|jpe?g|json|md|otf|pdf|png|svg|ttf|txt|webp|woff2?|xml|ya?ml|zip))"
+    r"(?![\w/.-])",
+    re.IGNORECASE,
+)
+_ASSET_REFERENCE_HINT_RE = re.compile(
+    r"\b(reference only|do not copy|screenshot|mockup|design reference|layout reference|spec excerpt)\b",
+    re.IGNORECASE,
+)
+_ASSET_DELIVERY_HINT_RE = re.compile(
+    r"\b(delivery asset|use as|use this file|copy|include|ship|production asset|target:|source/license:|"
+    r"provided by|icon|font|fixture)\b",
+    re.IGNORECASE,
+)
+_ASSET_TARGET_HINT_RE = re.compile(r"\b(target|target:|copy to|into|destination|path)\b", re.IGNORECASE)
+_ASSET_PROVENANCE_HINT_RE = re.compile(
+    r"\b(source/license|source:|license:|licence:|provenance|provided by|owned by)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -206,6 +256,7 @@ class ContractCheckResult:
     suggested_sections: list[str]
     validation: dict[str, Any]
     strong_signals: list[str] = field(default_factory=list)
+    asset_references: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -220,6 +271,7 @@ class ContractCheckResult:
             "clarifying_questions": [question.to_dict() for question in self.clarifying_questions],
             "suggested_sections": list(self.suggested_sections),
             "validation": dict(self.validation),
+            "asset_references": [dict(reference) for reference in self.asset_references],
         }
 
 
@@ -493,6 +545,7 @@ def check_contract(
     parsed = _parse_markdown_task(evaluation_text)
     sections_detected = _sections_detected(parsed)
     validation = _validation_details(evaluation_text, project_config, configured_validation_commands)
+    asset_references = _detect_asset_references(evaluation_text, source_path=source_path, project_config=project_config)
     security_sensitive = bool(_SECURITY_RISK_RE.search(evaluation_text))
 
     scores = {
@@ -510,7 +563,7 @@ def check_contract(
     scores["task_size"] = _score_task_size(parsed, scores)
     weighted_score = _weighted_score(scores)
 
-    gaps = _build_gaps(parsed, sections_detected, scores, validation, security_sensitive)
+    gaps = _build_gaps(parsed, sections_detected, scores, validation, security_sensitive, asset_references)
     if any(gap.severity == "blocking" for gap in gaps):
         weighted_score = min(weighted_score, 69)
     elif gaps:
@@ -518,7 +571,7 @@ def check_contract(
     status = _status_for_score(weighted_score)
     questions = _build_questions(gaps, security_sensitive, evaluation_text)
     suggested_sections = _suggested_sections(gaps)
-    strong_signals = _strong_signals(scores, sections_detected, validation)
+    strong_signals = _strong_signals(scores, sections_detected, validation, asset_references)
 
     return ContractCheckResult(
         source={
@@ -536,6 +589,7 @@ def check_contract(
         suggested_sections=suggested_sections,
         validation=validation,
         strong_signals=strong_signals,
+        asset_references=asset_references,
     )
 
 
@@ -578,6 +632,19 @@ def render_contract_check(result: ContractCheckResult) -> str:
     if task_commands:
         lines.append("Validation commands found:")
         lines.extend(f"- {command}" for command in task_commands)
+        lines.append("")
+
+    if result.asset_references:
+        lines.append("Asset references:")
+        for reference in result.asset_references:
+            path = reference.get("project_path") or reference.get("path")
+            status = reference.get("status") or "unknown"
+            kind = reference.get("kind") or "ambiguous"
+            git_status = reference.get("git_status")
+            details = [f"kind={kind}", f"status={status}"]
+            if git_status:
+                details.append(f"git={git_status}")
+            lines.append(f"- `{path}` ({', '.join(details)})")
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
@@ -3110,12 +3177,203 @@ def _validation_details(
     }
 
 
+def _detect_asset_references(
+    text: str,
+    *,
+    source_path: Path | str | None,
+    project_config: dict | None,
+) -> list[dict[str, Any]]:
+    project_root = _asset_project_root(source_path, project_config)
+    seen: set[str] = set()
+    references: list[dict[str, Any]] = []
+    current_heading = ""
+    lines = text.splitlines()
+
+    for line_index, line in enumerate(lines):
+        line_number = line_index + 1
+        markdown_heading = _HEADING_RE.match(line)
+        text_heading = _TEXT_HEADING_RE.match(line)
+        if markdown_heading:
+            current_heading = markdown_heading.group(2).strip()
+        elif text_heading:
+            current_heading = text_heading.group(1).strip()
+
+        for raw_path in _asset_path_candidates(line):
+            normalized_path = _normalize_asset_path_candidate(raw_path)
+            if not normalized_path or normalized_path in seen:
+                continue
+            seen.add(normalized_path)
+            reference = _asset_reference_metadata(
+                normalized_path,
+                project_root=project_root,
+                line_number=line_number,
+                context=_asset_reference_context(current_heading, lines, line_index),
+            )
+            if reference is not None:
+                references.append(reference)
+    return references
+
+
+def _asset_reference_context(current_heading: str, lines: list[str], line_index: int) -> str:
+    local_lines = lines[line_index : min(len(lines), line_index + 4)]
+    return "\n".join([current_heading, *local_lines])
+
+
+def _asset_path_candidates(line: str) -> list[str]:
+    candidates: list[str] = []
+    for pattern in (_MARKDOWN_LINK_RE, _CODE_SPAN_RE, _PLAIN_ASSET_PATH_RE):
+        for match in pattern.finditer(line):
+            if _asset_candidate_is_target_path(line, match.start(1)):
+                continue
+            candidates.append(match.group(1))
+    return candidates
+
+
+def _asset_candidate_is_target_path(line: str, start_index: int) -> bool:
+    prefix = line[:start_index].lower().rstrip("`'\" ")
+    return bool(re.search(r"\b(target|destination|copy to)\s*:\s*$", prefix))
+
+
+def _normalize_asset_path_candidate(raw_path: str) -> str | None:
+    candidate = unquote(raw_path.strip().strip("\"'<>"))
+    candidate = candidate.rstrip(".,;:")
+    if not candidate or candidate.startswith("#"):
+        return None
+    parsed = urlsplit(candidate)
+    if parsed.scheme and parsed.scheme.lower() not in {"file"}:
+        return None
+    if parsed.scheme.lower() == "file":
+        candidate = parsed.path
+    if not _asset_candidate_has_supported_extension(candidate):
+        return None
+    if not _asset_candidate_has_directory(candidate):
+        return None
+    return candidate
+
+
+def _asset_candidate_has_supported_extension(path: str) -> bool:
+    return Path(path).suffix.lower() in _ASSET_EXTENSIONS
+
+
+def _asset_candidate_has_directory(path: str) -> bool:
+    candidate = Path(path)
+    return candidate.is_absolute() or "/" in path or "\\" in path
+
+
+def _asset_project_root(source_path: Path | str | None, project_config: dict | None) -> Path:
+    if project_config:
+        project = project_config.get("project") if isinstance(project_config.get("project"), dict) else {}
+        root = project.get("root_path") if isinstance(project, dict) else None
+        if isinstance(root, str) and root.strip():
+            return Path(root).resolve()
+    if source_path is not None:
+        try:
+            path = Path(str(source_path)).resolve()
+            for parent in path.parents:
+                if parent.name == "tasks" and parent.parent.name == ".sikula":
+                    return parent.parent.parent.resolve()
+                if parent.name == "contracts" and parent.parent.name == ".sikula":
+                    return parent.parent.parent.resolve()
+                if parent.name == ".sikula":
+                    return parent.parent.resolve()
+            if path.exists():
+                return path.parent.resolve()
+        except OSError:
+            pass
+    return Path.cwd().resolve()
+
+
+def _asset_reference_metadata(
+    path_text: str,
+    *,
+    project_root: Path,
+    line_number: int,
+    context: str,
+) -> dict[str, Any] | None:
+    requested_path = Path(path_text)
+    candidate_path = requested_path if requested_path.is_absolute() else project_root / requested_path
+    resolved_path = candidate_path.resolve(strict=False)
+    reference: dict[str, Any] = {
+        "path": path_text,
+        "line": line_number,
+        "kind": _asset_reference_kind(context),
+    }
+    if _ASSET_TARGET_HINT_RE.search(context):
+        reference["target_specified"] = True
+    if _ASSET_PROVENANCE_HINT_RE.search(context):
+        reference["provenance_specified"] = True
+
+    try:
+        project_path = resolved_path.relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        reference["status"] = "outside_project"
+        return reference
+
+    reference["project_path"] = project_path
+    if not resolved_path.exists():
+        reference["status"] = "missing"
+        return reference
+    if not resolved_path.is_file():
+        reference["status"] = "not_file"
+        return reference
+
+    reference["status"] = "available"
+    reference["sha256"] = _file_sha256(resolved_path)
+    reference["size_bytes"] = resolved_path.stat().st_size
+    mime_type, _encoding = mimetypes.guess_type(resolved_path.name)
+    if mime_type:
+        reference["mime_type"] = mime_type
+    reference["git_status"] = _asset_git_status(project_root, project_path)
+    return reference
+
+
+def _asset_reference_kind(context: str) -> str:
+    if _ASSET_DELIVERY_HINT_RE.search(context):
+        return "delivery"
+    if _ASSET_REFERENCE_HINT_RE.search(context):
+        return "reference"
+    return "ambiguous"
+
+
+def _file_sha256(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def _asset_git_status(project_root: Path, project_path: str) -> str:
+    if not (project_root / ".git").exists():
+        return "unknown"
+    if _git_command(project_root, "ls-files", "--error-unmatch", "--", project_path).returncode == 0:
+        return "tracked"
+    if _git_command(project_root, "check-ignore", "-q", "--", project_path).returncode == 0:
+        return "ignored"
+    return "untracked"
+
+
+def _git_command(project_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(project_root), *args],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return subprocess.CompletedProcess(args=["git", *args], returncode=1)
+
+
 def _build_gaps(
     parsed: _ParsedTask,
     sections_detected: dict[str, bool],
     scores: dict[str, int],
     validation: dict[str, Any],
     security_sensitive: bool,
+    asset_references: list[dict[str, Any]],
 ) -> list[ContractGap]:
     gaps: list[ContractGap] = []
     if scores["scope_clarity"] < 50:
@@ -3235,6 +3493,69 @@ def _build_gaps(
                 "Repository context, affected surface, or domain rules are underspecified.",
             )
         )
+    gaps.extend(_asset_reference_gaps(asset_references))
+    return gaps
+
+
+def _asset_reference_gaps(asset_references: list[dict[str, Any]]) -> list[ContractGap]:
+    gaps: list[ContractGap] = []
+    if not asset_references:
+        return gaps
+    if any(reference.get("status") == "missing" for reference in asset_references):
+        gaps.append(
+            ContractGap(
+                "gap.assets.missing",
+                "blocking",
+                "assets",
+                "Referenced local asset files are missing.",
+            )
+        )
+    if any(reference.get("status") == "outside_project" for reference in asset_references):
+        gaps.append(
+            ContractGap(
+                "gap.assets.outside_project",
+                "blocking",
+                "assets",
+                "Referenced asset paths must resolve inside the project boundary.",
+            )
+        )
+    if any(reference.get("status") == "not_file" for reference in asset_references):
+        gaps.append(
+            ContractGap(
+                "gap.assets.not_file",
+                "blocking",
+                "assets",
+                "Referenced asset paths must point to files, not directories.",
+            )
+        )
+    if any(reference.get("git_status") in {"ignored", "untracked"} for reference in asset_references):
+        gaps.append(
+            ContractGap(
+                "gap.assets.worktree_availability",
+                "warning",
+                "assets",
+                "Referenced assets are not tracked by git and may be unavailable in isolated Sikula runs.",
+            )
+        )
+    if any(reference.get("kind") == "ambiguous" for reference in asset_references):
+        gaps.append(
+            ContractGap(
+                "gap.assets.intent",
+                "warning",
+                "assets",
+                "Referenced asset purpose is ambiguous; mark assets as reference-only or delivery assets.",
+            )
+        )
+    delivery_assets = [reference for reference in asset_references if reference.get("kind") == "delivery"]
+    if any(not reference.get("provenance_specified") for reference in delivery_assets):
+        gaps.append(
+            ContractGap(
+                "gap.assets.provenance",
+                "blocking",
+                "assets",
+                "Delivery assets need explicit source, license, or provenance before autonomous delivery.",
+            )
+        )
     return gaps
 
 
@@ -3350,6 +3671,33 @@ def _build_questions(gaps: list[ContractGap], security_sensitive: bool, text: st
                 False,
             )
         )
+    if {"gap.assets.missing", "gap.assets.outside_project", "gap.assets.not_file"} & gap_ids:
+        add(
+            ClarifyingQuestion(
+                "assets.local_files",
+                "Which local project files should Sikula use for the referenced assets?",
+                "Sikula needs local, project-bound asset files so isolated runs and review see the same inputs.",
+                True,
+            )
+        )
+    if "gap.assets.intent" in gap_ids:
+        add(
+            ClarifyingQuestion(
+                "assets.intent",
+                "Which referenced assets are reference-only, and which should be used as delivery assets?",
+                "Reference assets guide the implementation; delivery assets may be copied into production code.",
+                False,
+            )
+        )
+    if "gap.assets.provenance" in gap_ids:
+        add(
+            ClarifyingQuestion(
+                "assets.provenance",
+                "What source, license, or provenance applies to each delivery asset?",
+                "The pipeline should not infer whether a production asset is legally safe to ship.",
+                True,
+            )
+        )
     return questions
 
 
@@ -3367,6 +3715,12 @@ def _suggested_sections(gaps: list[ContractGap]) -> list[str]:
         "gap.review.reviewer_focus": "Reviewer focus: call out risky areas for human review",
         "gap.task_size.too_large": "Scope: split the task or narrow the autonomous delivery boundary",
         "gap.context.repo_context": "Context: name affected files, APIs, domain rules, or project conventions",
+        "gap.assets.missing": "Assets: provide local project files for referenced assets",
+        "gap.assets.outside_project": "Assets: move referenced files inside the project boundary",
+        "gap.assets.not_file": "Assets: reference concrete files rather than directories",
+        "gap.assets.worktree_availability": "Assets: track referenced files or document no-isolate availability",
+        "gap.assets.intent": "Assets: label each asset as reference-only or delivery",
+        "gap.assets.provenance": "Assets: record source, license, or provenance for delivery assets",
     }
     labels_by_category = {
         "scope": "Scope",
@@ -3377,6 +3731,7 @@ def _suggested_sections(gaps: list[ContractGap]) -> list[str]:
         "validation": "Validation",
         "reviewer_focus": "Reviewer focus",
         "repo_context": "Context",
+        "assets": "Assets",
     }
     sections: list[str] = []
     for gap in gaps:
@@ -3387,7 +3742,10 @@ def _suggested_sections(gaps: list[ContractGap]) -> list[str]:
 
 
 def _strong_signals(
-    scores: dict[str, int], sections_detected: dict[str, bool], validation: dict[str, Any]
+    scores: dict[str, int],
+    sections_detected: dict[str, bool],
+    validation: dict[str, Any],
+    asset_references: list[dict[str, Any]],
 ) -> list[str]:
     signals: list[str] = []
     if scores["intent_clarity"] >= 75:
@@ -3404,4 +3762,6 @@ def _strong_signals(
         signals.append("Validation commands are explicit and covered by the configured pipeline.")
     elif validation.get("configured_commands"):
         signals.append("Configured Sikula validation pipeline is available.")
+    if asset_references and all(reference.get("status") == "available" for reference in asset_references):
+        signals.append("Referenced local assets are available and hashed.")
     return signals

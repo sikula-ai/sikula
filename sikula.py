@@ -3741,6 +3741,7 @@ sandbox:
 tasks:
   task_description_dir: .sikula/tasks/
   contract_dir: .sikula/contracts/
+  task_asset_dir: .sikula/task-assets/
   contract_report_dir: .sikula/contract-reports/
   refined_suffix: .refined.md
   contract_suffix: .contract.md
