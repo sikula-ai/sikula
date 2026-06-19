@@ -950,18 +950,28 @@ def _run_task_refine_auto(
     args: argparse.Namespace,
     cfg: dict,
     project_root: Path,
+    source_path: Path,
     task_text: str,
     task_name: str,
+    output_path: Path,
     answers: dict[str, dict],
 ):
     from core.task_auto_refine import auto_refine_task_description
 
+    audit_recorder, _audit_path = _make_auto_preparation_audit_recorder(
+        generated_by="sikula.task_refine",
+        source_path=source_path,
+        source_text=task_text,
+        output_path=output_path,
+        cfg=cfg,
+    )
     agent = _create_task_preparation_agent(args, cfg)
     return auto_refine_task_description(
         task_text,
         task_name=task_name,
         answers=answers,
         normalize_provider=lambda request: agent.normalize_task_description(request, project_root=project_root),
+        audit_recorder=audit_recorder,
     )
 
 
@@ -1020,8 +1030,10 @@ def cmd_task_refine(args: argparse.Namespace, cfg: dict) -> None:
                 args=args,
                 cfg=cfg,
                 project_root=project_root,
+                source_path=task_path,
                 task_text=task_text,
                 task_name=task_path.name,
+                output_path=output_path,
                 answers=answers,
             )
         except (OSError, RuntimeError, ValueError) as exc:
@@ -1215,6 +1227,7 @@ def _run_contract_prepare_auto(
     args: argparse.Namespace,
     cfg: dict,
     project_root: Path,
+    source_path: Path,
     task_text: str,
     output_path: Path,
     project_context: dict | None,
@@ -1224,6 +1237,13 @@ def _run_contract_prepare_auto(
     from core.contract_auto_prepare import auto_prepare_implementation_contract
 
     agent = _create_task_preparation_agent(args, cfg)
+    audit_recorder, _audit_path = _make_auto_preparation_audit_recorder(
+        generated_by="sikula.contract_prepare",
+        source_path=source_path,
+        source_text=task_text,
+        output_path=output_path,
+        cfg=cfg,
+    )
     return auto_prepare_implementation_contract(
         task_text,
         contract_name=output_path.name,
@@ -1231,6 +1251,7 @@ def _run_contract_prepare_auto(
         generated_answer_entries=generated_answer_entries,
         initial_answers=answers,
         answer_provider=lambda request: agent.propose_contract_answers(request, project_root=project_root),
+        audit_recorder=audit_recorder,
     )
 
 
@@ -1325,12 +1346,18 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         sys.exit(1)
 
     auto_answer_count = 0
+    if args.auto and output_path.exists():
+        print(f"Failed to prepare contract: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
+        _print_existing_output_hint(output_path)
+        sys.exit(1)
+
     if args.auto and result.user_questions:
         try:
             auto_result = _run_contract_prepare_auto(
                 args=args,
                 cfg=cfg,
                 project_root=project_root,
+                source_path=task_path,
                 task_text=task_text,
                 output_path=output_path,
                 project_context=project_context,
@@ -1588,6 +1615,49 @@ def _write_prepare_answers_template(
     answers_path.parent.mkdir(parents=True, exist_ok=True)
     answers_path.write_text(yaml.safe_dump(answers_data, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return answers_path
+
+
+def _make_auto_preparation_audit_recorder(
+    *,
+    generated_by: str,
+    source_path: Path,
+    source_text: str,
+    output_path: Path,
+    cfg: dict,
+):
+    audit_path = _prepare_auto_preparation_audit_path(source_path, cfg, generated_by=generated_by)
+    artifact_base = _prepare_answers_artifact_base(audit_path.parent, cfg)
+    task_metadata = {
+        "path": _contract_preflight_path(source_path, artifact_base),
+        "sha256": _text_sha256(source_text),
+    }
+    output_metadata = {
+        "path": _contract_preflight_path(output_path, artifact_base),
+    }
+
+    def record_auto_preparation_audit(record: dict) -> None:
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "generated_by": generated_by,
+            "recorded_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "task": task_metadata,
+            "output": output_metadata,
+            "record": record,
+        }
+        with audit_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+            handle.write("\n")
+
+    return record_auto_preparation_audit, audit_path
+
+
+def _prepare_auto_preparation_audit_path(source_path: Path, cfg: dict, *, generated_by: str) -> Path:
+    answers_path = _prepare_answers_path(source_path, cfg, generated_by=generated_by)
+    suffix = ".answers.yaml"
+    if answers_path.name.endswith(suffix):
+        return answers_path.with_name(f"{answers_path.name[: -len(suffix)]}.auto-llm.jsonl")
+    return answers_path.with_suffix(".auto-llm.jsonl")
 
 
 def _prefill_prepare_answers(answers_data: dict, answers: dict[str, dict]) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -168,7 +169,23 @@ class TaskPreparationAgent:
         }
         prompt = self._build_prompt(request)
         output = self.llm.run_readonly_agent(prompt, cwd=project_root)
-        return parse_contract_auto_answer_output(output, active_ids)
+        batch = parse_contract_auto_answer_output(output, active_ids)
+        return replace(
+            batch,
+            audit_records=[
+                {
+                    "phase": "contract_prepare_auto",
+                    "round_index": request.round_index,
+                    "prompt": prompt,
+                    "raw_output": output,
+                    "parsed": {
+                        "answered_question_ids": sorted(batch.answers),
+                        "unanswered": batch.unanswered,
+                        "warnings": batch.warnings,
+                    },
+                }
+            ],
+        )
 
     def normalize_task_description(
         self,
@@ -178,7 +195,23 @@ class TaskPreparationAgent:
     ) -> TaskAutoRefineDraft:
         prompt = self._build_task_normalization_prompt(request)
         output = self.llm.run_readonly_agent(prompt, cwd=project_root)
-        return parse_task_auto_refine_output(output)
+        draft = parse_task_auto_refine_output(output)
+        return replace(
+            draft,
+            audit_records=[
+                {
+                    "phase": "task_refine_auto",
+                    "round_index": 1,
+                    "prompt": prompt,
+                    "raw_output": output,
+                    "parsed": {
+                        "input_language": draft.input_language,
+                        "normalized_to_english": draft.normalized_to_english,
+                        "warnings": draft.warnings,
+                    },
+                }
+            ],
+        )
 
     def _build_prompt(self, request: ContractAutoPrepareRequest) -> str:
         project_context_json = json.dumps(request.project_context or {}, indent=2, sort_keys=True)

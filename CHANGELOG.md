@@ -31,7 +31,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   requests before the deterministic product-question pass, while
   `contract prepare --auto` uses the same agent to propose answers supported by
   the task, repository, guidelines, and Sikula config before the same
-  deterministic prepare/recheck logic writes or defers the contract.
+  deterministic prepare/recheck logic writes or defers the contract. Both auto
+  modes now record prompt/raw-response audit artifacts under
+  `.sikula/contract-reports/*.auto-llm.jsonl`, and `contract prepare --auto`
+  refuses existing output paths before creating an LLM client.
 - Contract preparation now has side-effect-free in-memory core helpers for future
   chat/MCP adapters, reusing the same contract scoring, answer application, and recheck
   logic as the file-based CLI flow instead of duplicating business rules. The

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from core.contract_auto_prepare import load_auto_json_object
+from core.contract_auto_prepare import AutoPreparationAuditRecorder, load_auto_json_object
 from core.contract_check import TaskDescriptionPrepareResult, prepare_task_description
 
 
@@ -22,6 +22,7 @@ class TaskAutoRefineDraft:
     input_language: str | None = None
     normalized_to_english: bool = False
     warnings: list[str] = field(default_factory=list)
+    audit_records: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class TaskAutoRefineResult:
     input_language: str | None = None
     normalized_to_english: bool = False
     warnings: list[str] = field(default_factory=list)
+    audit_records: list[dict[str, Any]] = field(default_factory=list)
 
 
 TaskAutoRefineProvider = Callable[[TaskAutoRefineRequest], TaskAutoRefineDraft]
@@ -67,6 +69,7 @@ def auto_refine_task_description(
     product_context: dict[str, Any] | None = None,
     answers: dict[str, dict[str, Any]] | None = None,
     normalize_provider: TaskAutoRefineProvider,
+    audit_recorder: AutoPreparationAuditRecorder | None = None,
 ) -> TaskAutoRefineResult:
     """Normalize a raw task description, then run deterministic task preparation."""
 
@@ -77,6 +80,9 @@ def auto_refine_task_description(
             product_context=product_context,
         )
     )
+    if audit_recorder:
+        for record in draft.audit_records:
+            audit_recorder(record)
     result = prepare_task_description(
         draft.task_markdown,
         task_name=task_name,
@@ -89,6 +95,7 @@ def auto_refine_task_description(
         input_language=draft.input_language,
         normalized_to_english=draft.normalized_to_english,
         warnings=draft.warnings,
+        audit_records=draft.audit_records,
     )
 
 

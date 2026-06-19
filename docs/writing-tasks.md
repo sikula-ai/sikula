@@ -68,7 +68,9 @@ refined task can still be reused across platforms. `sikula task refine --auto`
 uses the read-only `task_preparer` LLM agent to normalize a rough or non-English
 request into clean English product-task Markdown, then runs the same
 deterministic product-question pass. The LLM does not answer delivery questions
-and does not write files directly. Task refine only resolves product
+and does not write files directly. Its prompt and raw response are recorded in
+`.sikula/contract-reports/*.auto-llm.jsonl` for local audit before the
+normalized task is applied. Task refine only resolves product
 task-description questions; `sikula contract prepare` may still ask delivery
 questions about privacy, tests, validation, reviewer focus, or other
 implementation-contract readiness gaps. If a non-interactive refine run finds
@@ -114,9 +116,12 @@ to propose answers for currently open preparation questions when the answer is
 supported by the task description, repository, project guidelines, or Sikula
 config. Sikula still applies those answers through the deterministic contract
 prepare core and re-runs the readiness check; the LLM does not write the
-contract Markdown directly. If product, security, privacy, or validation policy
-still needs a human answer, Sikula writes the normal answers YAML with any
-auto-applied answers prefilled and does not write the contract yet.
+contract Markdown directly. Its prompt and raw response are recorded in
+`.sikula/contract-reports/*.auto-llm.jsonl` before auto answers are applied, and
+the command refuses an existing output path before creating the LLM client. If
+product, security, privacy, or validation policy still needs a human answer,
+Sikula writes the normal answers YAML with any auto-applied answers prefilled
+and does not write the contract yet.
 
 `--interactive` is a convenience mode for terminal use: it creates or reuses the
 answers template, prompts for follow-up answers, saves the answers YAML, and

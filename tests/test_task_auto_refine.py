@@ -97,3 +97,32 @@ Users should be able to invite teammates by email.
     assert result.result.needs_user_input is True
     assert {"scope.boundaries", "acceptance.criteria"} <= set(result.result.open_question_ids)
     assert "## Open questions" in result.result.prepared_task_markdown
+
+
+def test_auto_refine_task_description_records_audit_records():
+    events = []
+
+    def provider(_request):
+        events.append("provider")
+        return TaskAutoRefineDraft(
+            task_markdown="""# Add team invites
+
+## Goal
+
+Users should be able to invite teammates by email.
+""",
+            audit_records=[{"phase": "task_refine_auto", "round_index": 1}],
+        )
+
+    def audit_recorder(record):
+        events.append(("audit", record["round_index"]))
+
+    result = auto_refine_task_description(
+        "invite teammates",
+        task_name="team-invites.md",
+        normalize_provider=provider,
+        audit_recorder=audit_recorder,
+    )
+
+    assert events == ["provider", ("audit", 1)]
+    assert result.audit_records == [{"phase": "task_refine_auto", "round_index": 1}]

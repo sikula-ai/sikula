@@ -97,3 +97,30 @@ def test_auto_prepare_implementation_contract_applies_answer_rounds():
     assert set(result.auto_answers) == {"scope.boundaries", "acceptance.criteria"}
     assert "Add email invites only." in result.result.prepared_contract_markdown
     assert result.answers["acceptance.criteria"]["answer"].startswith("Admins can invite valid emails")
+
+
+def test_auto_prepare_implementation_contract_records_audit_records():
+    events = []
+
+    def provider(request):
+        events.append(("provider", request.round_index))
+        return ContractAutoAnswerBatch(
+            answers={"scope.boundaries": {"answer": "Add email invites only.", "notes": ""}},
+            audit_records=[{"phase": "contract_prepare_auto", "round_index": request.round_index}],
+        )
+
+    def audit_recorder(record):
+        events.append(("audit", record["round_index"]))
+
+    result = auto_prepare_implementation_contract(
+        "# Add team invites\n\nUsers should be able to invite teammates by email.",
+        contract_name="team-invites.contract.md",
+        project_context={"validation_commands": ["pytest"]},
+        answer_provider=provider,
+        audit_recorder=audit_recorder,
+        max_rounds=1,
+    )
+
+    assert events == [("provider", 1), ("audit", 1)]
+    assert result.audit_records == [{"phase": "contract_prepare_auto", "round_index": 1}]
+    assert result.rounds == 1

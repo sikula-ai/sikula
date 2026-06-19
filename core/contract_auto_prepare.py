@@ -29,6 +29,7 @@ class ContractAutoAnswerBatch:
     answers: dict[str, dict[str, str]] = field(default_factory=dict)
     unanswered: list[dict[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    audit_records: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -38,9 +39,11 @@ class ContractAutoPrepareResult:
     auto_answers: dict[str, dict[str, str]]
     rounds: int
     warnings: list[str] = field(default_factory=list)
+    audit_records: list[dict[str, Any]] = field(default_factory=list)
 
 
 ContractAutoAnswerProvider = Callable[[ContractAutoPrepareRequest], ContractAutoAnswerBatch]
+AutoPreparationAuditRecorder = Callable[[dict[str, Any]], None]
 
 
 def parse_contract_auto_answer_output(output: str, active_question_ids: set[str]) -> ContractAutoAnswerBatch:
@@ -89,6 +92,7 @@ def auto_prepare_implementation_contract(
     generated_answer_entries: list[dict[str, Any]] | None = None,
     initial_answers: dict[str, dict[str, Any]] | None = None,
     answer_provider: ContractAutoAnswerProvider,
+    audit_recorder: AutoPreparationAuditRecorder | None = None,
     max_rounds: int = 2,
 ) -> ContractAutoPrepareResult:
     """Run bounded auto-answer rounds, then return the deterministic prepare result."""
@@ -96,6 +100,7 @@ def auto_prepare_implementation_contract(
     answers = _normalize_answers(initial_answers or {})
     auto_answers: dict[str, dict[str, str]] = {}
     warnings: list[str] = []
+    audit_records: list[dict[str, Any]] = []
     result = prepare_implementation_contract(
         task_description_markdown,
         contract_name=contract_name,
@@ -104,7 +109,14 @@ def auto_prepare_implementation_contract(
         generated_answer_entries=generated_answer_entries,
     )
     if result.required_next_step == "provide_project_context" or not result.user_questions:
-        return ContractAutoPrepareResult(result=result, answers=answers, auto_answers={}, rounds=0, warnings=warnings)
+        return ContractAutoPrepareResult(
+            result=result,
+            answers=answers,
+            auto_answers={},
+            rounds=0,
+            warnings=warnings,
+            audit_records=audit_records,
+        )
 
     rounds = 0
     for round_index in range(max(0, max_rounds)):
@@ -126,6 +138,10 @@ def auto_prepare_implementation_contract(
             round_index=round_index + 1,
         )
         batch = answer_provider(request)
+        audit_records.extend(batch.audit_records)
+        if audit_recorder:
+            for record in batch.audit_records:
+                audit_recorder(record)
         warnings.extend(batch.warnings)
         new_answers = {
             question_id: answer
@@ -152,6 +168,7 @@ def auto_prepare_implementation_contract(
         auto_answers=auto_answers,
         rounds=rounds,
         warnings=warnings,
+        audit_records=audit_records,
     )
 
 

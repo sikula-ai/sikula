@@ -2606,9 +2606,18 @@ Users can invite teammates by email.
 
     out = capsys.readouterr().out
     output = output_path.read_text(encoding="utf-8")
+    audit_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.task-refine.auto-llm.jsonl"
+    audit_record = json.loads(audit_path.read_text(encoding="utf-8").splitlines()[0])
+
     assert len(fake_llm.prompts) == 1
     assert "Preserve the user's product intent" in fake_llm.prompts[0]
     assert "Uzivatel muze pozvat kolegu emailem." in fake_llm.prompts[0]
+    assert audit_record["generated_by"] == "sikula.task_refine"
+    assert audit_record["task"]["path"] == ".sikula/tasks/team-invites.md"
+    assert audit_record["output"]["path"] == ".sikula/tasks/team-invites.refined.md"
+    assert audit_record["record"]["phase"] == "task_refine_auto"
+    assert audit_record["record"]["prompt"] == fake_llm.prompts[0]
+    assert "task_markdown" in audit_record["record"]["raw_output"]
     assert "Auto-normalized task description: yes" in out
     assert "Input language: cs" in out
     assert "Normalized to English: yes" in out
@@ -2913,9 +2922,18 @@ def test_contract_prepare_cli_auto_writes_output_from_supported_answers(
         main()
 
     out = capsys.readouterr().out
+    audit_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.contract-prepare.auto-llm.jsonl"
+    audit_record = json.loads(audit_path.read_text(encoding="utf-8").splitlines()[0])
+
     assert output_path.exists()
     assert len(fake_llm.prompts) == 1
     assert "Do not invent product requirements" in fake_llm.prompts[0]
+    assert audit_record["generated_by"] == "sikula.contract_prepare"
+    assert audit_record["task"]["path"] == ".sikula/tasks/team-invites.md"
+    assert audit_record["output"]["path"] == ".sikula/contracts/team-invites.contract.md"
+    assert audit_record["record"]["phase"] == "contract_prepare_auto"
+    assert audit_record["record"]["prompt"] == fake_llm.prompts[0]
+    assert "scope.boundaries" in audit_record["record"]["raw_output"]
     assert "Implementation contract written:" in out
     assert "Auto-applied answers: 8" in out
     assert "Open questions: 0" in out
@@ -3019,6 +3037,33 @@ def test_contract_prepare_cli_auto_project_context_blocker_does_not_call_llm(
     assert not output_path.exists()
     assert "Contract preparation needs project context before writing an implementation contract." in out
     assert "Contract preparation answers template written:" not in out
+
+
+def test_contract_prepare_cli_auto_existing_output_does_not_call_llm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = tmp_path / ".sikula" / "contracts" / "team-invites.contract.md"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("# Existing contract\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["pytest"]}),
+        patch("core.llm_client.create_llm_client", side_effect=AssertionError("LLM must not be created")),
+        patch("sys.argv", ["sikula", "contract", "prepare", str(task_path), "--auto", "--output", str(output_path)]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    err = capsys.readouterr().err
+    assert exc.value.code == 1
+    assert "refusing to overwrite existing output file" in err
+    assert "Choose a new --output path" in err
 
 
 def test_contract_prepare_cli_same_stem_answers_templates_use_task_specific_paths(
