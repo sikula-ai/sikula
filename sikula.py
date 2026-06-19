@@ -456,8 +456,7 @@ def _enrich_prompt_with_referenced_files(task_description: str, llm_client, proj
 def _branch_stem(task_file: str) -> str:
     stem = Path(task_file).stem
     stem = stem.lower()
-    stem = re.sub(r"[\s_]+", "-", stem)
-    stem = re.sub(r"[^a-z0-9-]", "", stem)
+    stem = re.sub(r"[^a-z0-9]+", "-", stem)
     return stem.strip("-") or "task"
 
 
