@@ -34,23 +34,55 @@ Before running a task, you can ask Sikula to inspect whether the task or
 contract file is specific enough to act as an implementation contract:
 
 ```bash
+# Inspect the original product task.
 sikula contract check .sikula/tasks/my-task.md
 sikula contract check .sikula/tasks/my-task.md --json
+
+# Option A: let a read-only LLM normalize the product task and answer supported
+# product-level questions.
 sikula task refine .sikula/tasks/my-task.md \
   --auto \
   --output .sikula/tasks/my-task.refined.md
+
+# Option B: answer product-level refinement questions in the terminal.
 sikula task refine .sikula/tasks/my-task.md \
   --interactive \
   --output .sikula/tasks/my-task.refined.md
+
+# Option C: generate a product-refinement answers template, edit it, then apply it.
+sikula task refine .sikula/tasks/my-task.md
+# edit .sikula/contract-reports/my-task.task-refine.answers.yaml
+sikula task refine .sikula/tasks/my-task.md \
+  --answers .sikula/contract-reports/my-task.task-refine.answers.yaml \
+  --output .sikula/tasks/my-task.refined.md
+
+# Optional: inspect the refined task as an implementation-contract candidate
+# and write reusable report/answers artifacts.
 sikula contract check .sikula/tasks/my-task.refined.md --write-report
+
+# Option A: let a read-only LLM answer only delivery questions supported by the
+# task, repository, guidelines, or Sikula config.
+sikula contract prepare .sikula/tasks/my-task.refined.md \
+  --auto \
+  --output .sikula/contracts/my-task.contract.md
+
+# Option B: answer contract-preparation questions in the terminal.
+sikula contract prepare .sikula/tasks/my-task.refined.md \
+  --interactive \
+  --output .sikula/contracts/my-task.contract.md
+
+# Option C: generate a contract-preparation answers template, edit it, then
+# apply it.
+sikula contract prepare .sikula/tasks/my-task.refined.md
+# edit .sikula/contract-reports/my-task.contract-prepare.answers.yaml
+sikula contract prepare .sikula/tasks/my-task.refined.md \
+  --answers .sikula/contract-reports/my-task.contract-prepare.answers.yaml \
+  --output .sikula/contracts/my-task.contract.md
+
+# Or use the answers template produced by contract check --write-report.
+# edit .sikula/contract-reports/my-task.refined.answers.yaml
 sikula contract prepare .sikula/tasks/my-task.refined.md \
   --answers .sikula/contract-reports/my-task.refined.answers.yaml \
-  --output .sikula/contracts/my-task.contract.md
-sikula contract prepare .sikula/tasks/my-task.refined.md \
-  --interactive \
-  --output .sikula/contracts/my-task.contract.md
-sikula contract prepare .sikula/tasks/my-task.refined.md \
-  --auto \
   --output .sikula/contracts/my-task.contract.md
 ```
 
@@ -66,13 +98,15 @@ hash in the template.
 the product intent and avoid project-specific implementation details so the
 refined task can still be reused across platforms. `sikula task refine --auto`
 uses the read-only `task_preparer` LLM agent to normalize a rough or non-English
-request into clean English product-task Markdown, then runs the same
-deterministic product-question pass. The LLM does not answer delivery questions
-and does not write files directly. Its prompt and raw response are recorded in
+request into clean English product-task Markdown. When deterministic
+product-question handling still finds open product questions, `--auto` may
+also propose answers that are directly supported by the task or project
+guidelines, then reruns the same deterministic product-question pass. The LLM
+does not answer delivery questions and does not write files directly. Its
+prompts and raw responses are recorded in
 `.sikula/contract-reports/*.auto-llm.jsonl` for local audit before the
 normalized task is applied, including provider failures or malformed responses
-that cannot be parsed.
-Task refine only resolves product
+that cannot be parsed. Task refine only resolves product
 task-description questions; `sikula contract prepare` may still ask delivery
 questions about privacy, tests, validation, reviewer focus, or other
 implementation-contract readiness gaps. If a non-interactive refine run finds

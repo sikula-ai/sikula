@@ -6,7 +6,7 @@ import pytest
 
 from agents.task_preparation_agent import TaskPreparationAgent
 from core.contract_auto_prepare import ContractAutoPrepareRequest
-from core.task_auto_refine import TaskAutoRefineRequest
+from core.task_auto_refine import TaskAutoAnswerRequest, TaskAutoRefineRequest
 
 
 class CapturingLLM:
@@ -199,6 +199,129 @@ def test_task_preparer_refine_result_includes_audit_record(tmp_path: Path):
     assert record["raw_output"] == llm.output
     assert record["parsed"]["input_language"] == "cs"
     assert record["parsed"]["normalized_to_english"] is True
+
+
+def test_task_preparer_refine_answer_prompt_stays_product_level(tmp_path: Path):
+    llm = CapturingLLM(
+        '{"answers": {"scope.boundaries": {"answer": "Add invite creation only.", "notes": "Task scope."}}}'
+    )
+    agent = TaskPreparationAgent(
+        llm=llm,
+        project_config={
+            "tasks": {
+                "task_description_dir": "docs/product-tasks",
+                "contract_dir": "docs/contracts",
+                "contract_report_dir": ".generated/sikula-contract-reports",
+            }
+        },
+    )
+
+    batch = agent.propose_task_refinement_answers(
+        TaskAutoAnswerRequest(
+            original_brief="Uzivatel muze pozvat kolegu emailem.",
+            task_markdown="# Add team invites\n\nUsers can invite teammates by email.",
+            task_name="team-invites.txt",
+            product_context=None,
+            user_questions=[{"id": "scope.boundaries", "question": "What is in scope?"}],
+            round_index=1,
+        ),
+        project_root=tmp_path,
+    )
+
+    prompt = llm.prompts[0]
+    assert batch.answers == {"scope.boundaries": {"answer": "Add invite creation only.", "notes": "Task scope."}}
+    assert "Active product task questions:" in prompt
+    assert "Original raw task description:" in prompt
+    assert "Current normalized task draft:" in prompt
+    assert "Do not inspect arbitrary source files for implementation details" in prompt
+    assert "Do not invent product requirements" in prompt
+    assert "- task descriptions: docs/product-tasks" in prompt
+
+
+def test_task_preparer_refine_answer_result_includes_audit_record(tmp_path: Path):
+    llm = CapturingLLM('{"answers": {"acceptance.criteria": {"answer": "Valid emails can be invited.", "notes": ""}}}')
+    agent = TaskPreparationAgent(llm=llm)
+
+    batch = agent.propose_task_refinement_answers(
+        TaskAutoAnswerRequest(
+            original_brief="invite teammates",
+            task_markdown="# Add team invites\n\nUsers can invite teammates by email.",
+            task_name="team-invites.txt",
+            product_context=None,
+            user_questions=[{"id": "acceptance.criteria", "question": "What proves completion?"}],
+            round_index=2,
+        ),
+        project_root=tmp_path,
+    )
+
+    assert len(batch.audit_records) == 1
+    record = batch.audit_records[0]
+    assert record["phase"] == "task_refine_auto_answers"
+    assert record["round_index"] == 2
+    assert "Active product task questions:" in record["prompt"]
+    assert record["raw_output"] == llm.output
+    assert record["parsed"]["answered_question_ids"] == ["acceptance.criteria"]
+
+
+def test_task_preparer_refine_answer_records_parse_failure(tmp_path: Path):
+    llm = CapturingLLM("{not json")
+    agent = TaskPreparationAgent(llm=llm)
+    audit_records: list[dict] = []
+
+    with pytest.raises(ValueError, match="not valid JSON"):
+        agent.propose_task_refinement_answers(
+            TaskAutoAnswerRequest(
+                original_brief="invite teammates",
+                task_markdown="# Add team invites\n\nUsers can invite teammates by email.",
+                task_name="team-invites.txt",
+                product_context=None,
+                user_questions=[{"id": "scope.boundaries", "question": "What is in scope?"}],
+                round_index=1,
+            ),
+            project_root=tmp_path,
+            audit_recorder=audit_records.append,
+        )
+
+    assert len(audit_records) == 1
+    record = audit_records[0]
+    assert record["phase"] == "task_refine_auto_answers"
+    assert record["round_index"] == 1
+    assert "Active product task questions:" in record["prompt"]
+    assert record["raw_output"] == llm.output
+    assert record["parsed"]["status"] == "failed"
+    assert "not valid JSON" in record["parsed"]["error"]
+
+
+def test_task_preparer_refine_answer_records_provider_failure(tmp_path: Path):
+    llm = FailingLLM(RuntimeError("provider timeout"))
+    agent = TaskPreparationAgent(llm=llm)
+    audit_records: list[dict] = []
+
+    with pytest.raises(RuntimeError, match="provider timeout"):
+        agent.propose_task_refinement_answers(
+            TaskAutoAnswerRequest(
+                original_brief="invite teammates",
+                task_markdown="# Add team invites\n\nUsers can invite teammates by email.",
+                task_name="team-invites.txt",
+                product_context=None,
+                user_questions=[{"id": "scope.boundaries", "question": "What is in scope?"}],
+                round_index=1,
+            ),
+            project_root=tmp_path,
+            audit_recorder=audit_records.append,
+        )
+
+    assert len(audit_records) == 1
+    record = audit_records[0]
+    assert record["phase"] == "task_refine_auto_answers"
+    assert record["round_index"] == 1
+    assert "Active product task questions:" in record["prompt"]
+    assert record["raw_output"] is None
+    assert record["parsed"] == {
+        "status": "failed",
+        "error_type": "RuntimeError",
+        "error": "provider timeout",
+    }
 
 
 def test_task_preparer_refine_records_parse_failure(tmp_path: Path):

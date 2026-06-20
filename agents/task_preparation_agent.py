@@ -15,8 +15,11 @@ from core.contract_auto_prepare import (
 )
 from core.llm_client import LLMClient
 from core.task_auto_refine import (
+    TaskAutoAnswerBatch,
+    TaskAutoAnswerRequest,
     TaskAutoRefineDraft,
     TaskAutoRefineRequest,
+    parse_task_auto_answer_output,
     parse_task_auto_refine_output,
 )
 
@@ -147,6 +150,68 @@ Return this JSON shape:
 }}
 """
 
+_TASK_ANSWER_PROMPT = """\
+You are Sikula's read-only product task-description refinement assistant.
+
+Your job is to propose answers only for active product task-refinement questions that can be
+answered from the original task description, the normalized task draft, product context, or project guidelines.
+
+Hard rules:
+- Do not write, edit, delete, or create files.
+- Do not run network commands or inspect external services.
+- Do not invent product requirements, business policy, security policy, privacy policy, validation commands, files, APIs, or implementation details.
+- Do not inspect arbitrary source files for implementation details; use project guidelines only for terminology and product context when useful.
+- If the answer is not directly supported by the task, product context, or guidelines, leave that question unanswered.
+- Do not use other Sikula workflow artifacts from the configured workflow artifact directories as product evidence
+  unless the raw task explicitly references them.
+- Answer only active question IDs from the JSON below.
+- Return exactly one JSON object and no Markdown.
+
+Project stack: {project_stack}
+
+Project guidelines files to inspect when useful:
+{guidelines_files}
+
+Configured Sikula workflow artifact directories:
+{workflow_artifact_dirs}
+
+Provided product context:
+```json
+{product_context_json}
+```
+
+Active product task questions:
+```json
+{questions_json}
+```
+
+Task name: {task_name}
+
+Original raw task description:
+```text
+{original_brief}
+```
+
+Current normalized task draft:
+```markdown
+{task_markdown}
+```
+
+Return this JSON shape:
+{{
+  "answers": {{
+    "question.id": {{
+      "answer": "Concise product-level answer supported by the task or guidelines.",
+      "notes": "Optional short rationale without quoting source."
+    }}
+  }},
+  "unanswered": [
+    {{"id": "question.id", "reason": "Why this requires a human answer."}}
+  ],
+  "warnings": []
+}}
+"""
+
 
 class TaskPreparationAgent:
     """Ask a read-only LLM for safe answers to active preparation questions."""
@@ -260,6 +325,60 @@ class TaskPreparationAgent:
             ],
         )
 
+    def propose_task_refinement_answers(
+        self,
+        request: TaskAutoAnswerRequest,
+        *,
+        project_root: Path,
+        audit_recorder: AutoPreparationAuditRecorder | None = None,
+    ) -> TaskAutoAnswerBatch:
+        active_ids = {
+            str(question.get("id") or "").strip()
+            for question in request.user_questions
+            if isinstance(question, dict) and str(question.get("id") or "").strip()
+        }
+        prompt = self._build_task_answer_prompt(request)
+        try:
+            output = self.llm.run_readonly_agent(prompt, cwd=project_root)
+        except Exception as exc:
+            self._record_failure(
+                audit_recorder,
+                phase="task_refine_auto_answers",
+                round_index=request.round_index,
+                prompt=prompt,
+                output=None,
+                error=exc,
+            )
+            raise
+        try:
+            batch = parse_task_auto_answer_output(output, active_ids)
+        except ValueError as exc:
+            self._record_failure(
+                audit_recorder,
+                phase="task_refine_auto_answers",
+                round_index=request.round_index,
+                prompt=prompt,
+                output=output,
+                error=exc,
+            )
+            raise
+        return replace(
+            batch,
+            audit_records=[
+                {
+                    "phase": "task_refine_auto_answers",
+                    "round_index": request.round_index,
+                    "prompt": prompt,
+                    "raw_output": output,
+                    "parsed": {
+                        "answered_question_ids": sorted(batch.answers),
+                        "unanswered": batch.unanswered,
+                        "warnings": batch.warnings,
+                    },
+                }
+            ],
+        )
+
     def _build_prompt(self, request: ContractAutoPrepareRequest) -> str:
         project_context_json = json.dumps(request.project_context or {}, indent=2, sort_keys=True)
         questions_json = json.dumps(request.user_questions, indent=2, sort_keys=True)
@@ -282,6 +401,21 @@ class TaskPreparationAgent:
             product_context_json=product_context_json,
             task_name=task_name,
             brief=request.brief,
+        )
+
+    def _build_task_answer_prompt(self, request: TaskAutoAnswerRequest) -> str:
+        task_name = request.task_name or "task"
+        product_context_json = json.dumps(request.product_context or {}, indent=2, sort_keys=True)
+        questions_json = json.dumps(request.user_questions, indent=2, sort_keys=True)
+        return AGENT_SECURITY_PREFIX + _TASK_ANSWER_PROMPT.format(
+            project_stack=tech_stack(self.project_config),
+            guidelines_files=guidelines_files(self.project_config),
+            workflow_artifact_dirs=self._workflow_artifact_dirs(),
+            product_context_json=product_context_json,
+            questions_json=questions_json,
+            task_name=task_name,
+            original_brief=request.original_brief,
+            task_markdown=request.task_markdown,
         )
 
     def _record_failure(

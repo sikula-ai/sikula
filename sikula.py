@@ -975,6 +975,11 @@ def _run_task_refine_auto(
             project_root=project_root,
             audit_recorder=audit_recorder,
         ),
+        answer_provider=lambda request: agent.propose_task_refinement_answers(
+            request,
+            project_root=project_root,
+            audit_recorder=audit_recorder,
+        ),
         audit_recorder=audit_recorder,
     )
 
@@ -1057,6 +1062,7 @@ def cmd_task_refine(args: argparse.Namespace, cfg: dict) -> None:
             print("Auto-refine warnings:")
             for warning in auto_result.warnings:
                 print(f"- {warning}")
+        print(f"Auto-applied answers: {len(auto_result.auto_answers)}")
         print(f"Applied answers: {len(result.answered_question_ids)}")
         print(f"Open questions: {len(result.open_question_ids)}")
         _print_open_question_details(result.user_questions)
