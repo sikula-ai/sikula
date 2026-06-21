@@ -262,13 +262,16 @@ bullets are treated as separate task requirements, not as metadata for the
 previous asset.
 
 Sikula treats asset paths deterministically during contract readiness checks:
-referenced local files are resolved inside the project boundary, hashed, and
-reported with lightweight metadata. Missing files, paths outside the project,
-or delivery assets without provenance are readiness blockers. Untracked,
-ignored, or dirty/staged assets are warnings because isolated runs may not
-receive the same inputs. Sikula does not fetch URLs during delivery runs; put
-the file in the project first and use URLs only as provenance or background
-context.
+paths in the configured task asset directory, paths in explicit asset sections,
+and paths with explicit reference/delivery asset wording are resolved inside the
+project boundary, hashed, and reported with lightweight metadata. Ordinary
+implementation target paths such as `app/assets/icon.svg` or `docs/new-guide.md`
+are not treated as asset inputs just because they appear in a task. Missing
+files, paths outside the project, or delivery assets without provenance are
+readiness blockers. Untracked, ignored, or dirty/staged assets are warnings
+because isolated runs may not receive the same inputs. Sikula does not fetch
+URLs during delivery runs; put the file in the project first and use URLs only
+as provenance or background context.
 
 When `sikula contract prepare` sees verified reference or delivery assets, it
 adds an `Asset manifest` section to the implementation contract with the

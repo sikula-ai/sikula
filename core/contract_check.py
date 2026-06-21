@@ -3919,7 +3919,7 @@ def _asset_candidate_is_destination_path(
     if not re.search(r"\b(copy|move|place|install|save|write|add|include|use)\b", transfer_prefix):
         return False
     between_paths = line[previous_asset_end:start_index].casefold().strip(" `\"'")
-    return bool(re.fullmatch(r"(?:to|into|under|at|as)\s*", between_paths))
+    return bool(re.fullmatch(r"(?:to|into|under|at|as|for)\s*", between_paths))
 
 
 def _merge_asset_reference(existing: dict[str, Any], update: dict[str, Any]) -> None:
@@ -3984,11 +3984,7 @@ def _asset_reference_input_context(path_text: str, context: str, project_config:
         return False
     if "asset" in normalized_heading or "attachment" in normalized_heading:
         return True
-    return bool(
-        _ASSET_REFERENCE_HINT_RE.search(context)
-        or _ASSET_STRONG_DELIVERY_HINT_RE.search(context)
-        or _ASSET_PROVENANCE_HINT_RE.search(context)
-    )
+    return _asset_context_has_explicit_input_hint(context)
 
 
 def _asset_reference_is_output_destination(path_text: str, context: str) -> bool:
@@ -4007,10 +4003,13 @@ def _asset_reference_is_output_destination(path_text: str, context: str) -> bool
 
 
 def _asset_line_has_explicit_input_hint(heading: str, line: str) -> bool:
-    context = "\n".join([heading, line])
+    return _asset_context_has_explicit_input_hint("\n".join([heading, line]))
+
+
+def _asset_context_has_explicit_input_hint(context: str) -> bool:
     return bool(
         _ASSET_STRONG_DELIVERY_HINT_RE.search(context)
-        or _ASSET_PROVENANCE_HINT_RE.search(context)
+        or _asset_reference_detail(context, _ASSET_PROVENANCE_DETAIL_RE)
         or _ASSET_EXPLICIT_REFERENCE_HINT_RE.search(context)
     )
 
@@ -4095,9 +4094,9 @@ def _asset_reference_metadata(
         if requested_target:
             reference["requested_target"] = requested_target
     if _ASSET_PROVENANCE_HINT_RE.search(context):
-        reference["provenance_specified"] = True
         source_license = _asset_reference_detail(context, _ASSET_PROVENANCE_DETAIL_RE)
         if source_license:
+            reference["provenance_specified"] = True
             reference["source_license"] = source_license
 
     try:
