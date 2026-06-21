@@ -3865,14 +3865,7 @@ def _asset_text_heading_level(heading_stack: list[tuple[int, str]]) -> int:
 def _asset_context_headings(heading_stack: list[tuple[int, str]]) -> list[str]:
     if not heading_stack:
         return []
-    section_headings = [heading for level, heading in heading_stack if level > 1]
-    asset_title_headings = [
-        heading
-        for level, heading in heading_stack
-        if level == 1 and ("asset" in _normalize_heading(heading) or "attachment" in _normalize_heading(heading))
-    ]
-    headings = [*asset_title_headings, *section_headings]
-    return headings or [heading_stack[-1][1]]
+    return [heading for level, heading in heading_stack if level > 1]
 
 
 def _asset_reference_context(heading_stack: list[tuple[int, str]], lines: list[str], line_index: int) -> str:

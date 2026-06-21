@@ -840,6 +840,30 @@ def test_contract_check_does_not_treat_output_file_paths_as_assets(tmp_path: Pat
     assert all(not gap.id.startswith("gap.assets.") for gap in result.gaps)
 
 
+def test_contract_check_does_not_let_asset_title_govern_scope_paths(tmp_path: Path):
+    task = """# Update asset docs
+
+## Scope
+- Update `docs/assets.md` with the new naming guidance.
+
+## Acceptance criteria
+- The documentation includes the new naming guidance.
+
+## Out of scope
+- Do not change runtime assets.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert result.asset_references == []
+    assert all(not gap.id.startswith("gap.assets.") for gap in result.gaps)
+
+
 def test_contract_check_does_not_treat_assets_heading_output_paths_as_inputs(tmp_path: Path):
     task = """# Add success icon
 
