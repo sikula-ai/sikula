@@ -2348,12 +2348,46 @@ def _asset_intent_answer_entries(
     answer_lines = _answer_lines(intent_answer)
     ambiguous_refs = [reference for reference in asset_references if reference.get("kind") == "ambiguous"]
     if len(ambiguous_refs) == 1 and len(answer_lines) == 1:
-        answer_line = _clean_answer_bullet(answer_lines[0])
-        if not _asset_path_from_answer_line(answer_line, project_root=project_root):
+        source_text, intent_text = _asset_intent_answer_parts(answer_lines[0], project_root=project_root)
+        answer_line = _clean_answer_bullet(intent_text)
+        if not source_text and answer_line and not _asset_path_from_answer_line(answer_line, project_root=project_root):
             project_path = str(ambiguous_refs[0].get("project_path") or ambiguous_refs[0].get("path") or "").strip()
             if project_path:
                 return [f"- `{project_path}`", f"  - {answer_line}"]
-    return [f"- {_clean_answer_bullet(answer_line)}" for answer_line in answer_lines]
+
+    reference_lookup = _asset_reference_lookup(ambiguous_refs)
+    used_reference_ids: set[int] = set()
+    entries: list[str] = []
+    for answer_line in answer_lines:
+        source_text, intent_text = _asset_intent_answer_parts(answer_line, project_root=project_root)
+        intent = _clean_answer_bullet(intent_text)
+        if not intent:
+            continue
+        source_key = _asset_answer_source_key(source_text, project_root=project_root)
+        if source_key:
+            reference = reference_lookup.get(source_key)
+            if reference is None or id(reference) in used_reference_ids:
+                continue
+            project_path = str(reference.get("project_path") or reference.get("path") or "").strip()
+            if not project_path:
+                continue
+            entries.append(f"- `{project_path}`")
+            entries.append(f"  - {intent}")
+            used_reference_ids.add(id(reference))
+            continue
+        entries.append(f"- {intent}")
+    return entries
+
+
+def _asset_intent_answer_parts(answer_line: str, *, project_root: Path) -> tuple[str, str]:
+    cleaned = _clean_answer_bullet(answer_line)
+    for separator in ("->", "=>", ":"):
+        if separator in cleaned:
+            left, right = cleaned.split(separator, 1)
+            if separator == ":" and not _asset_answer_source_key(left, project_root=project_root):
+                continue
+            return left.strip(), right.strip()
+    return "", cleaned
 
 
 def _asset_provenance_answer_entries(
@@ -2515,6 +2549,7 @@ def _asset_reference_for_answer_spec(
         reference = reference_lookup.get(source_key)
         if reference is not None and id(reference) not in used_reference_ids:
             return reference
+        return None
     for reference in unresolved_references:
         if id(reference) not in used_reference_ids:
             return reference
@@ -2605,6 +2640,8 @@ def _asset_local_file_answer_entries(
             reference_lookup,
             used_reference_ids,
         )
+        if reference is None and spec.get("source_key"):
+            continue
         replacement_kind = str(reference.get("kind") or fallback_kind) if reference else fallback_kind
         entries.append(_asset_local_file_answer_line(answer_path, replacement_kind))
         if reference:

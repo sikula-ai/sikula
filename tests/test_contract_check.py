@@ -1320,6 +1320,98 @@ def test_prepare_implementation_contract_applies_single_asset_intent_answer(
     assert "  - reference only" in result.prepared_contract_markdown
 
 
+def test_prepare_implementation_contract_keeps_colon_text_in_single_asset_intent_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-reference.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Fix login spacing
+
+## Assets
+
+- `.sikula/task-assets/login-reference.png`
+
+## Scope
+- Fix the login form spacing shown in the asset.
+
+## Acceptance criteria
+- The login form spacing matches the reference.
+
+## Out of scope
+- Do not redesign the login screen.
+
+## Tests
+- Cover the login form spacing state.
+
+## Validation
+- `pytest`
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/login-spacing.md",
+        answers={"assets.intent": "Reference only: do not copy to production assets."},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.recheck_result is not None
+    assert all(gap.id != "gap.assets.intent" for gap in result.recheck_result.gaps)
+    assert "  - Reference only: do not copy to production assets." in result.prepared_contract_markdown
+    assert "assets.intent" not in result.open_question_ids
+
+
+def test_prepare_implementation_contract_resolves_mapped_asset_intent_answers_by_basename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    spacing_path = tmp_path / ".sikula" / "task-assets" / "spacing.png"
+    button_path = tmp_path / ".sikula" / "task-assets" / "button.png"
+    spacing_path.parent.mkdir(parents=True)
+    spacing_path.write_bytes(b"spacing-png")
+    button_path.write_bytes(b"button-png")
+    task = """# Fix login visuals
+
+## Assets
+
+- `.sikula/task-assets/spacing.png`
+- `.sikula/task-assets/button.png`
+
+## Scope
+- Fix the login form spacing and button state using the provided assets.
+
+## Acceptance criteria
+- The login form spacing matches the spacing asset.
+- The button state matches the button asset.
+
+## Out of scope
+- Do not redesign the login screen.
+
+## Tests
+- Cover the login form spacing and button states.
+
+## Validation
+- `pytest`
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/login-visuals.md",
+        answers={"assets.intent": "spacing.png: reference only\nbutton.png: reference only"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.recheck_result is not None
+    assert all(gap.id != "gap.assets.intent" for gap in result.recheck_result.gaps)
+    assert "assets.intent" not in result.open_question_ids
+    assert "- `.sikula/task-assets/spacing.png`" in result.prepared_contract_markdown
+    assert "- `.sikula/task-assets/button.png`" in result.prepared_contract_markdown
+    assert result.prepared_contract_markdown.count("  - reference only") >= 2
+
+
 def test_prepare_implementation_contract_applies_per_asset_provenance_answers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1574,6 +1666,62 @@ def test_prepare_implementation_contract_matches_mapped_asset_answers_by_source_
     assert result.recheck_result is not None
     assert all(gap.id != "gap.assets.missing" for gap in result.recheck_result.gaps)
     assert "assets.local_files" not in result.open_question_ids
+
+
+def test_prepare_implementation_contract_keeps_unmatched_mapped_asset_answer_unresolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    spacing_path = tmp_path / ".sikula" / "task-assets" / "spacing.png"
+    button_path = tmp_path / ".sikula" / "task-assets" / "button.png"
+    spacing_path.parent.mkdir(parents=True)
+    spacing_path.write_bytes(b"spacing-png")
+    button_path.write_bytes(b"button-png")
+    task = """# Fix login visuals
+
+## Scope
+- Fix the login form spacing shown in `.sikula/task-assets/missing-spacing.png` as a reference screenshot.
+- Match the button state shown in `.sikula/task-assets/missing-button.png` as a reference screenshot.
+
+## Acceptance criteria
+- The login form spacing matches the spacing reference.
+- The button state matches the button reference.
+
+## Out of scope
+- Do not redesign the login screen.
+
+## Tests
+- Cover the login form spacing and button states.
+
+## Validation
+- `pytest`
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/login-visuals.md",
+        answers={
+            "assets.local_files": "\n".join(
+                [
+                    "typo-button.png -> .sikula/task-assets/button.png",
+                    "missing-spacing.png -> .sikula/task-assets/spacing.png",
+                ]
+            )
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert (
+        "Fix the login form spacing shown in `.sikula/task-assets/spacing.png` as a reference screenshot."
+        in result.prepared_contract_markdown
+    )
+    assert ".sikula/task-assets/missing-spacing.png" not in result.prepared_contract_markdown
+    assert ".sikula/task-assets/missing-button.png" in result.prepared_contract_markdown
+    assert ".sikula/task-assets/button.png" not in result.prepared_contract_markdown
+    assert result.recheck_result is not None
+    assert any(gap.id == "gap.assets.missing" for gap in result.recheck_result.gaps)
+    assert "assets.local_files" in result.open_question_ids
 
 
 def test_prepare_implementation_contract_replaces_repeated_missing_asset_path(
