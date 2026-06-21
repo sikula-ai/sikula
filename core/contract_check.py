@@ -2319,7 +2319,13 @@ def _asset_answer_entry_lines(
     lines: list[str] = []
 
     local_files_answer = _answer_text(answers.get("assets.local_files", {}))
+    metadata_references = asset_references
     if local_files_answer:
+        metadata_references = _asset_references_with_local_file_replacements(
+            asset_references,
+            local_files_answer,
+            project_root=project_root,
+        )
         lines.append(_generated_answer_entry_marker("assets.local_files"))
         lines.extend(_asset_local_file_answer_entries(local_files_answer, asset_references, project_root=project_root))
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
@@ -2328,14 +2334,14 @@ def _asset_answer_entry_lines(
     if intent_answer:
         question_id = "assets.intent"
         lines.append(_generated_answer_entry_marker(question_id))
-        lines.extend(_asset_intent_answer_entries(intent_answer, asset_references, project_root=project_root))
+        lines.extend(_asset_intent_answer_entries(intent_answer, metadata_references, project_root=project_root))
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
 
     provenance = _answer_text(answers.get("assets.provenance", {}))
     if provenance:
         delivery_refs = [
             reference
-            for reference in asset_references
+            for reference in metadata_references
             if reference.get("kind") == "delivery" and not reference.get("source_license")
         ]
         lines.append(_generated_answer_entry_marker("assets.provenance"))
@@ -2347,6 +2353,63 @@ def _asset_answer_entry_lines(
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
 
     return lines
+
+
+def _asset_references_with_local_file_replacements(
+    asset_references: list[dict[str, Any]],
+    answer_text: str,
+    *,
+    project_root: Path,
+) -> list[dict[str, Any]]:
+    replacements = _asset_path_replacements(asset_references, answer_text, project_root=project_root)
+    if not replacements:
+        return asset_references
+
+    replacement_by_reference_id = {id(reference): replacement_path for reference, replacement_path in replacements}
+    updated_references: list[dict[str, Any]] = []
+    for reference in asset_references:
+        replacement_path = replacement_by_reference_id.get(id(reference))
+        if replacement_path is None:
+            updated_references.append(reference)
+            continue
+        updated_references.append(
+            _asset_reference_with_replacement_path(
+                reference,
+                replacement_path,
+                project_root=project_root,
+            )
+        )
+    return updated_references
+
+
+def _asset_reference_with_replacement_path(
+    reference: dict[str, Any],
+    replacement_path: str,
+    *,
+    project_root: Path,
+) -> dict[str, Any]:
+    updated = {key: value for key, value in reference.items() if not str(key).startswith("_")}
+    updated["path"] = replacement_path
+    updated["project_path"] = replacement_path
+
+    resolved_path = project_root / replacement_path
+    if not resolved_path.exists():
+        updated["status"] = "missing"
+        return updated
+    if not resolved_path.is_file():
+        updated["status"] = "not_file"
+        return updated
+
+    updated["status"] = "available"
+    updated["sha256"] = _file_sha256(resolved_path)
+    updated["size_bytes"] = resolved_path.stat().st_size
+    mime_type, _encoding = mimetypes.guess_type(resolved_path.name)
+    if mime_type:
+        updated["mime_type"] = mime_type
+    else:
+        updated.pop("mime_type", None)
+    updated["git_status"] = _asset_git_status(project_root, replacement_path)
+    return updated
 
 
 def _asset_intent_answer_entries(

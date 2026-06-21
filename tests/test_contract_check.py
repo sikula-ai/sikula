@@ -2197,6 +2197,65 @@ def test_prepare_implementation_contract_preserves_asset_metadata_when_replacing
     )
 
 
+def test_prepare_implementation_contract_applies_asset_metadata_to_replacement_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Scope
+- Add the success state icon from the provided delivery asset.
+
+## Assets
+
+### Delivery assets
+- Use `.sikula/task-assets/missing.svg` as the success state icon.
+  - Target path: `app/src/main/res/drawable/success_check.svg`
+
+## Acceptance criteria
+- The success state shows the provided icon.
+- Existing success state behavior remains unchanged.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Tests
+- Cover the success state icon.
+
+## Validation
+- `pytest`
+
+## Reviewer focus
+- Verify the provided asset is used only for the success state.
+
+## Context
+- Follow the existing asset conventions.
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/success-icon.md",
+        answers={
+            "assets.local_files": ".sikula/task-assets/success-check.svg",
+            "assets.provenance": ".sikula/task-assets/success-check.svg: provided by product team; MIT.",
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert ".sikula/task-assets/missing.svg" not in result.prepared_contract_markdown
+    assert "Delivery asset: `.sikula/task-assets/success-check.svg`" in result.prepared_contract_markdown
+    assert "Source/license: provided by product team; MIT." in result.prepared_contract_markdown
+    assert result.recheck_result is not None
+    assert all(gap.id != "gap.assets.missing" for gap in result.recheck_result.gaps)
+    assert all(gap.id != "gap.assets.provenance" for gap in result.recheck_result.gaps)
+    assert "assets.local_files" not in result.open_question_ids
+    assert "assets.provenance" not in result.open_question_ids
+
+
 def test_prepare_implementation_contract_does_not_manifest_unresolved_assets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
