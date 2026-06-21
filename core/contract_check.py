@@ -3795,6 +3795,8 @@ def _asset_path_candidates(line: str) -> list[str]:
     previous_asset_start: int | None = None
     previous_asset_end: int | None = None
     for start_index, end_index, value in matches:
+        if _asset_candidate_starts_with_metadata_label(value):
+            continue
         if _asset_candidate_is_target_path(line, start_index):
             continue
         if _asset_candidate_is_provenance_detail_path(line, start_index):
@@ -3810,6 +3812,10 @@ def _asset_path_candidates(line: str) -> list[str]:
         previous_asset_start = start_index
         previous_asset_end = end_index
     return candidates
+
+
+def _asset_candidate_starts_with_metadata_label(value: str) -> bool:
+    return bool(re.match(r"\s*(?:source/license|source|license|licence|provenance)\s*:", value, re.IGNORECASE))
 
 
 def _asset_candidate_is_target_path(line: str, start_index: int) -> bool:

@@ -295,6 +295,44 @@ def test_contract_check_captures_delivery_asset_target_and_source_license(tmp_pa
     assert all(gap.id != "gap.assets.provenance" for gap in result.gaps)
 
 
+def test_contract_check_does_not_parse_source_license_label_as_missing_asset(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Assets
+
+### Delivery assets
+
+- Use `.sikula/task-assets/success-check.svg` as the success state icon.
+  - Source/license: success-check.svg: MIT
+
+## Scope
+- Add the success state icon to the confirmation screen.
+
+## Acceptance criteria
+- The success screen shows the provided success icon.
+- Existing success message text remains unchanged.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert len(result.asset_references) == 1
+    assert result.asset_references[0]["project_path"] == ".sikula/task-assets/success-check.svg"
+    assert result.asset_references[0]["source_license"] == "success-check.svg: MIT"
+    assert all(gap.id != "gap.assets.missing" for gap in result.gaps)
+    assert all(gap.id != "gap.assets.provenance" for gap in result.gaps)
+
+
 def test_contract_check_treats_target_path_label_as_destination(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
     asset_path.parent.mkdir(parents=True)
