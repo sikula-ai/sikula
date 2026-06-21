@@ -1250,6 +1250,68 @@ def test_prepare_implementation_contract_applies_asset_provenance_answer(
     assert "<!-- sikula:generated-answer: assets.provenance -->" in result.resume_arguments["contract_markdown"]
 
 
+def test_prepare_implementation_contract_applies_per_asset_provenance_answers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    success_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    error_path = tmp_path / ".sikula" / "task-assets" / "error-check.svg"
+    success_path.parent.mkdir(parents=True)
+    success_path.write_text("<svg />", encoding="utf-8")
+    error_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add status icons
+
+## Assets
+
+### Delivery assets
+
+- Use `.sikula/task-assets/success-check.svg` as the success state icon.
+- Use `.sikula/task-assets/error-check.svg` as the error state icon.
+
+## Scope
+- Add success and error state icons to the confirmation screen.
+
+## Acceptance criteria
+- The success state shows the success icon.
+- The error state shows the error icon.
+
+## Out of scope
+- Do not redesign the confirmation screen.
+
+## Tests
+- Cover the success and error icon states.
+
+## Validation
+- `pytest`
+
+## Reviewer focus
+- Verify each provided asset is used only for its matching status.
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/status-icons.md",
+        answers={
+            "assets.provenance": "\n".join(
+                [
+                    "` .sikula/task-assets/success-check.svg `: provided by product team; MIT.",
+                    ".sikula/task-assets/error-check.svg: owned by product team; Apache-2.0.",
+                ]
+            )
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "assets.provenance" in result.answered_question_ids
+    assert "assets.provenance" not in result.open_question_ids
+    assert result.recheck_result is not None
+    assert all(not gap.id.startswith("gap.assets.") for gap in result.recheck_result.gaps)
+    assert "Source/license: provided by product team; MIT." in result.prepared_contract_markdown
+    assert "Source/license: owned by product team; Apache-2.0." in result.prepared_contract_markdown
+    assert "Source/license: ` .sikula/task-assets/success-check.svg `" not in result.prepared_contract_markdown
+
+
 def test_prepare_implementation_contract_replaces_missing_asset_from_answers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

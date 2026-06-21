@@ -2316,19 +2316,82 @@ def _asset_answer_entry_lines(asset_references: list[dict[str, Any]], answers: d
         ]
         lines.append(_generated_answer_entry_marker("assets.provenance"))
         if delivery_refs:
-            provenance_text = _single_line(provenance)
-            for reference in delivery_refs:
-                project_path = str(reference.get("project_path") or reference.get("path") or "").strip()
-                if not project_path:
-                    continue
-                lines.append(f"- `{project_path}`")
-                lines.append(f"  - Source/license: {provenance_text}")
+            lines.extend(_asset_provenance_answer_entries(provenance, delivery_refs))
         else:
             for answer_line in _answer_lines(provenance):
                 lines.append(f"- {_clean_answer_bullet(answer_line)}")
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
 
     return lines
+
+
+def _asset_provenance_answer_entries(provenance: str, delivery_refs: list[dict[str, Any]]) -> list[str]:
+    entries: list[str] = []
+    path_specific_provenance = _asset_provenance_by_path(provenance)
+    common_provenance = _single_line(provenance) if not path_specific_provenance else ""
+
+    for reference in delivery_refs:
+        project_path = str(reference.get("project_path") or reference.get("path") or "").strip()
+        if not project_path:
+            continue
+        provenance_text = _asset_provenance_for_reference(reference, path_specific_provenance) or common_provenance
+        if not provenance_text:
+            continue
+        entries.append(f"- `{project_path}`")
+        entries.append(f"  - Source/license: {provenance_text}")
+    return entries
+
+
+def _asset_provenance_by_path(provenance: str) -> dict[str, str]:
+    provenance_by_path: dict[str, str] = {}
+    for answer_line in _answer_lines(provenance):
+        cleaned = _clean_answer_bullet(answer_line)
+        for candidate in _asset_path_candidates(cleaned):
+            normalized = _normalize_asset_path_candidate(candidate)
+            if not normalized:
+                continue
+            provenance_text = _asset_provenance_text_without_path(cleaned, candidate)
+            if not provenance_text:
+                continue
+            for key in _asset_path_match_keys(normalized):
+                provenance_by_path[key] = provenance_text
+            break
+    return provenance_by_path
+
+
+def _asset_provenance_for_reference(reference: dict[str, Any], provenance_by_path: dict[str, str]) -> str:
+    for value in (reference.get("project_path"), reference.get("path")):
+        for key in _asset_path_match_keys(str(value or "")):
+            provenance = provenance_by_path.get(key)
+            if provenance:
+                return provenance
+    return ""
+
+
+def _asset_path_match_keys(path_text: str) -> set[str]:
+    normalized = Path(path_text).as_posix().strip()
+    if not normalized:
+        return set()
+    return {normalized, normalized.lstrip("./")}
+
+
+def _asset_provenance_text_without_path(answer_line: str, path_text: str) -> str:
+    path_index = answer_line.find(path_text)
+    if path_index < 0:
+        return _single_line(answer_line)
+    before = answer_line[:path_index]
+    after = answer_line[path_index + len(path_text) :]
+    candidate = after if after.strip(" `\"'.,;:-") else before
+    candidate = candidate.strip(" `\"'")
+    candidate = re.sub(r"^\s*[.,;:-]+\s*", "", candidate)
+    candidate = re.sub(
+        r"^\s*(?:source/license|source|license|licence|provenance)\s*:\s*",
+        "",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = candidate.strip(" `\"'")
+    return _single_line(candidate)
 
 
 def _replace_unresolved_asset_reference_paths(
@@ -3544,6 +3607,8 @@ def _asset_path_candidates(line: str) -> list[str]:
     for start_index, end_index, value in matches:
         if _asset_candidate_is_target_path(line, start_index):
             continue
+        if _asset_candidate_is_provenance_detail_path(line, start_index):
+            continue
         if _asset_candidate_is_destination_path(
             line,
             start_index,
@@ -3560,6 +3625,11 @@ def _asset_path_candidates(line: str) -> list[str]:
 def _asset_candidate_is_target_path(line: str, start_index: int) -> bool:
     prefix = line[:start_index].lower().rstrip("`'\" ")
     return bool(re.search(r"\b(?:target|destination)(?:\s+path)?\s*:\s*$|\bcopy\s+to\s*:\s*$", prefix))
+
+
+def _asset_candidate_is_provenance_detail_path(line: str, start_index: int) -> bool:
+    prefix = line[:start_index].lower()
+    return bool(re.search(r"\b(?:source/license|source|license|licence|provenance)\s*:\s*", prefix))
 
 
 def _asset_candidate_is_destination_path(
