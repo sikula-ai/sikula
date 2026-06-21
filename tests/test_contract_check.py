@@ -257,6 +257,75 @@ def test_contract_check_treats_target_path_label_as_destination(tmp_path: Path):
     assert all(gap.id != "gap.assets.missing" for gap in result.gaps)
 
 
+def test_contract_check_treats_use_as_second_path_as_destination(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Assets
+
+### Delivery assets
+
+- Use `.sikula/task-assets/success-check.svg` as `app/assets/success-check.svg`.
+  - Source/license: provided by product team for this project.
+
+## Scope
+- Add the success state icon.
+
+## Acceptance criteria
+- The success state shows the new icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert len(result.asset_references) == 1
+    assert result.asset_references[0]["project_path"] == ".sikula/task-assets/success-check.svg"
+    assert all(gap.id != "gap.assets.missing" for gap in result.gaps)
+
+
+def test_contract_check_classifies_delivery_asset_heading_as_delivery(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Assets
+
+### Delivery assets
+
+- `.sikula/task-assets/success-check.svg`
+
+## Scope
+- Add the success state icon.
+
+## Acceptance criteria
+- The success state shows the new icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert result.asset_references[0]["kind"] == "delivery"
+    assert any(gap.id == "gap.assets.provenance" and gap.severity == "blocking" for gap in result.gaps)
+    assert all(gap.id != "gap.assets.intent" for gap in result.gaps)
+
+
 def test_contract_check_allows_delivery_asset_target_to_be_inferred(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
     asset_path.parent.mkdir(parents=True)
@@ -1154,6 +1223,10 @@ def test_prepare_implementation_contract_replaces_missing_asset_from_answers(
     assert "assets.local_files" in result.answered_question_ids
     assert "assets.local_files" not in result.open_question_ids
     assert ".sikula/task-assets/missing.png" not in result.prepared_contract_markdown
+    assert (
+        "Fix the login form spacing shown in `.sikula/task-assets/login-reference.png` as a reference screenshot."
+        in result.prepared_contract_markdown
+    )
     assert "Reference asset: `.sikula/task-assets/login-reference.png`" in result.prepared_contract_markdown
     assert result.recheck_result is not None
     assert all(gap.id != "gap.assets.missing" for gap in result.recheck_result.gaps)

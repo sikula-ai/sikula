@@ -2235,8 +2235,13 @@ def _render_improved_contract(
         answered_question_ids,
         generated_answer_entries or [],
     )
-    if _answer_text(answers.get("assets.local_files", {})):
-        task_text = _strip_unresolved_asset_reference_lines(task_text, asset_references or [])
+    local_files_answer = _answer_text(answers.get("assets.local_files", {}))
+    if local_files_answer:
+        task_text = _replace_unresolved_asset_reference_paths(
+            task_text,
+            asset_references or [],
+            local_files_answer,
+        )
     task_text = _strip_generated_open_questions_section(task_text)
     lines = _improved_contract_base_lines(task_text, task_path)
     section_entries: dict[str, list[tuple[dict[str, Any], str, str]]] = {}
@@ -2325,58 +2330,48 @@ def _asset_answer_entry_lines(asset_references: list[dict[str, Any]], answers: d
     return lines
 
 
-def _strip_unresolved_asset_reference_lines(task_text: str, asset_references: list[dict[str, Any]]) -> str:
+def _replace_unresolved_asset_reference_paths(
+    task_text: str,
+    asset_references: list[dict[str, Any]],
+    answer_text: str,
+) -> str:
     source_lines = task_text.splitlines()
-    unresolved_line_numbers = [
-        int(reference["line"])
-        for reference in asset_references
-        if reference.get("status") in {"missing", "outside_project", "not_file"}
-        and isinstance(reference.get("line"), int)
-        and 1 <= int(reference["line"]) <= len(source_lines)
-    ]
-    if not unresolved_line_numbers:
+    replacements = _asset_path_replacements(asset_references, answer_text)
+    if not replacements:
         return task_text
 
-    ranges = [_asset_reference_line_range(source_lines, line_number - 1) for line_number in unresolved_line_numbers]
-    ranges = _merge_line_ranges(ranges)
-    stripped = _remove_line_ranges(source_lines, ranges)
-    return "\n".join(stripped).strip()
+    for reference, replacement_path in replacements:
+        line_number = reference.get("line")
+        old_path = str(reference.get("path") or "").strip()
+        if not isinstance(line_number, int) or line_number < 1 or line_number > len(source_lines) or not old_path:
+            continue
+        line_index = line_number - 1
+        source_lines[line_index] = source_lines[line_index].replace(old_path, replacement_path, 1)
+    return "\n".join(source_lines).strip()
 
 
-def _asset_reference_line_range(source_lines: list[str], line_index: int) -> tuple[int, int]:
-    line = source_lines[line_index]
-    bullet_match = _BULLET_RE.match(line)
-    if not bullet_match:
-        return line_index, line_index + 1
-
-    base_indent = _line_indent(line)
-    end_index = line_index + 1
-    while end_index < len(source_lines):
-        candidate = source_lines[end_index]
-        if _HEADING_RE.match(candidate):
-            break
-        if candidate.strip() and _BULLET_RE.match(candidate) and _line_indent(candidate) <= base_indent:
-            break
-        end_index += 1
-    return line_index, end_index
+def _asset_path_replacements(
+    asset_references: list[dict[str, Any]],
+    answer_text: str,
+) -> list[tuple[dict[str, Any], str]]:
+    unresolved_references = _unresolved_asset_references(asset_references)
+    answer_paths = [_asset_path_from_answer_line(line) for line in _answer_lines(answer_text)]
+    answer_paths = [path for path in answer_paths if path]
+    replacements: list[tuple[dict[str, Any], str]] = []
+    for index, reference in enumerate(unresolved_references):
+        replacement_path = answer_paths[index] if index < len(answer_paths) else answer_paths[0] if answer_paths else ""
+        if replacement_path:
+            replacements.append((reference, replacement_path))
+    return replacements
 
 
-def _merge_line_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    merged: list[tuple[int, int]] = []
-    for start, end in sorted(ranges):
-        if not merged or start > merged[-1][1]:
-            merged.append((start, end))
-        else:
-            previous_start, previous_end = merged[-1]
-            merged[-1] = (previous_start, max(previous_end, end))
-    return merged
-
-
-def _remove_line_ranges(source_lines: list[str], ranges: list[tuple[int, int]]) -> list[str]:
-    def removed(line_index: int) -> bool:
-        return any(start <= line_index < end for start, end in ranges)
-
-    return [line for index, line in enumerate(source_lines) if not removed(index)]
+def _asset_path_from_answer_line(answer_line: str) -> str:
+    cleaned = _clean_answer_bullet(answer_line)
+    for candidate in _asset_path_candidates(cleaned):
+        normalized = _normalize_asset_path_candidate(candidate)
+        if normalized:
+            return normalized
+    return cleaned
 
 
 def _asset_local_file_answer_entries(answer_text: str, asset_references: list[dict[str, Any]]) -> list[str]:
@@ -3583,7 +3578,7 @@ def _asset_candidate_is_destination_path(
     if previous_asset_start is None or previous_asset_end is None:
         return False
     transfer_prefix = line[:previous_asset_start].casefold()
-    if not re.search(r"\b(copy|move|place|install|save|write|add|include)\b", transfer_prefix):
+    if not re.search(r"\b(copy|move|place|install|save|write|add|include|use)\b", transfer_prefix):
         return False
     between_paths = line[previous_asset_end:start_index].casefold().strip(" `\"'")
     return bool(re.fullmatch(r"(?:to|into|under|at|as)\s*", between_paths))
@@ -3736,6 +3731,8 @@ def _asset_reference_metadata(
 def _asset_reference_kind(context: str) -> str:
     if _ASSET_REFERENCE_HINT_RE.search(context) and not _ASSET_STRONG_DELIVERY_HINT_RE.search(context):
         return "reference"
+    if _ASSET_STRONG_DELIVERY_HINT_RE.search(context):
+        return "delivery"
     if _ASSET_DELIVERY_HINT_RE.search(context):
         return "delivery"
     if _ASSET_REFERENCE_HINT_RE.search(context):
