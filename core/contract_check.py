@@ -300,8 +300,12 @@ class ContractCheckResult:
             "clarifying_questions": [question.to_dict() for question in self.clarifying_questions],
             "suggested_sections": list(self.suggested_sections),
             "validation": dict(self.validation),
-            "asset_references": [dict(reference) for reference in self.asset_references],
+            "asset_references": [_public_asset_reference(reference) for reference in self.asset_references],
         }
+
+
+def _public_asset_reference(reference: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in reference.items() if not str(key).startswith("_")}
 
 
 @dataclass(frozen=True)
@@ -2486,11 +2490,20 @@ def _replace_unresolved_asset_reference_paths(
 
     updated = task_text
     for reference, replacement_path in replacements:
-        old_path = str(reference.get("path") or "").strip()
-        if not old_path:
-            continue
-        updated = updated.replace(old_path, replacement_path)
+        for old_path in _asset_reference_replacement_tokens(reference):
+            updated = updated.replace(old_path, replacement_path)
     return updated.strip()
+
+
+def _asset_reference_replacement_tokens(reference: dict[str, Any]) -> list[str]:
+    tokens: list[str] = []
+    for raw_path in reference.get("_raw_paths") or []:
+        if isinstance(raw_path, str) and raw_path.strip():
+            tokens.append(raw_path.strip())
+    normalized_path = str(reference.get("path") or "").strip()
+    if normalized_path:
+        tokens.append(normalized_path)
+    return list(dict.fromkeys(tokens))
 
 
 def _asset_path_replacements(
@@ -3745,6 +3758,7 @@ def _detect_asset_references(
                 project_root=project_root,
                 line_number=line_number,
                 context=context,
+                raw_path=raw_path,
             )
             if reference is None:
                 continue
@@ -3848,6 +3862,12 @@ def _asset_candidate_is_destination_path(
 def _merge_asset_reference(existing: dict[str, Any], update: dict[str, Any]) -> None:
     if _asset_reference_kind_rank(update.get("kind")) > _asset_reference_kind_rank(existing.get("kind")):
         existing["kind"] = update["kind"]
+    for raw_path in update.get("_raw_paths") or []:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        existing.setdefault("_raw_paths", [])
+        if raw_path not in existing["_raw_paths"]:
+            existing["_raw_paths"].append(raw_path)
     for key in (
         "target_specified",
         "requested_target",
@@ -3909,15 +3929,27 @@ def _asset_reference_input_context(path_text: str, context: str, project_config:
 
 
 def _asset_reference_is_output_destination(path_text: str, context: str) -> bool:
+    heading = context.splitlines()[0] if context else ""
     for line in context.splitlines()[1:]:
         if path_text not in line:
             continue
         prefix = line.split(path_text, 1)[0]
         if _asset_source_prefix_before_path(prefix):
             continue
+        if _asset_line_has_explicit_input_hint(heading, line):
+            continue
         if _asset_output_prefix_before_path(prefix):
             return True
     return False
+
+
+def _asset_line_has_explicit_input_hint(heading: str, line: str) -> bool:
+    context = "\n".join([heading, line])
+    return bool(
+        _ASSET_STRONG_DELIVERY_HINT_RE.search(context)
+        or _ASSET_PROVENANCE_HINT_RE.search(context)
+        or _ASSET_EXPLICIT_REFERENCE_HINT_RE.search(context)
+    )
 
 
 def _asset_source_prefix_before_path(prefix: str) -> bool:
@@ -3982,6 +4014,7 @@ def _asset_reference_metadata(
     project_root: Path,
     line_number: int,
     context: str,
+    raw_path: str | None = None,
 ) -> dict[str, Any] | None:
     requested_path = Path(path_text)
     candidate_path = requested_path if requested_path.is_absolute() else project_root / requested_path
@@ -3991,6 +4024,8 @@ def _asset_reference_metadata(
         "line": line_number,
         "kind": _asset_reference_kind(context),
     }
+    if raw_path and raw_path != path_text:
+        reference["_raw_paths"] = [raw_path]
     if _ASSET_TARGET_HINT_RE.search(context):
         reference["target_specified"] = True
         requested_target = _asset_reference_detail(context, _ASSET_TARGET_DETAIL_RE)

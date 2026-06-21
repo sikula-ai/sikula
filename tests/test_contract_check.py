@@ -718,6 +718,35 @@ def test_contract_check_keeps_source_asset_after_output_verb_when_using_clause(t
     assert any(gap.id == "gap.assets.provenance" and gap.severity == "blocking" for gap in result.gaps)
 
 
+def test_contract_check_keeps_provided_delivery_asset_after_output_verb(tmp_path: Path):
+    asset_path = tmp_path / "designs" / "success.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Scope
+- Add the provided icon `designs/success.svg` as the delivery asset.
+
+## Acceptance criteria
+- The success state shows the provided icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert len(result.asset_references) == 1
+    assert result.asset_references[0]["project_path"] == "designs/success.svg"
+    assert result.asset_references[0]["kind"] == "delivery"
+    assert any(gap.id == "gap.assets.provenance" and gap.severity == "blocking" for gap in result.gaps)
+
+
 def test_contract_check_warns_for_untracked_asset_in_git_repo(tmp_path: Path):
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing-bug.png"
@@ -1711,6 +1740,57 @@ def test_prepare_implementation_contract_replaces_missing_asset_from_answers(
     assert result.recheck_result is not None
     assert all(gap.id != "gap.assets.missing" for gap in result.recheck_result.gaps)
     assert all(gap.id != "gap.assets.intent" for gap in result.recheck_result.gaps)
+
+
+def test_prepare_implementation_contract_replaces_encoded_missing_asset_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-reference.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Fix login spacing
+
+## Scope
+- Fix the login form spacing shown in `.sikula/task-assets/missing%20icon.png` as a reference screenshot.
+
+## Acceptance criteria
+- The login form spacing matches the reference.
+- Existing validation messages remain unchanged.
+
+## Out of scope
+- Do not redesign the login screen.
+
+## Tests
+- Cover the login form spacing state.
+
+## Validation
+- `pytest`
+
+## Reviewer focus
+- Verify only the login spacing changes.
+
+## Context
+- Follow the existing login screen layout conventions.
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/login-spacing.md",
+        answers={"assets.local_files": ".sikula/task-assets/login-reference.png"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert ".sikula/task-assets/missing%20icon.png" not in result.prepared_contract_markdown
+    assert ".sikula/task-assets/missing icon.png" not in result.prepared_contract_markdown
+    assert (
+        "Fix the login form spacing shown in `.sikula/task-assets/login-reference.png` as a reference screenshot."
+        in result.prepared_contract_markdown
+    )
+    assert result.recheck_result is not None
+    assert all(gap.id != "gap.assets.missing" for gap in result.recheck_result.gaps)
+    assert all("_raw_paths" not in reference for reference in result.check_result.to_dict()["asset_references"])
 
 
 def test_prepare_implementation_contract_normalizes_absolute_asset_answer(
