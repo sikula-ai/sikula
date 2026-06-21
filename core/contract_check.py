@@ -203,6 +203,11 @@ _ASSET_REFERENCE_HINT_RE = re.compile(
     r"\b(reference assets?|reference only|do not copy|screenshot|mockup|design reference|layout reference|spec excerpt)\b",
     re.IGNORECASE,
 )
+_ASSET_EXPLICIT_REFERENCE_HINT_RE = re.compile(
+    r"\b(reference assets?|reference only|do not copy|design reference|layout reference|"
+    r"visual reference|reference (?:asset|image|screenshot|mockup)|spec excerpt)\b",
+    re.IGNORECASE,
+)
 _ASSET_DELIVERY_HINT_RE = re.compile(
     r"\bdelivery asset\b|\buse\b.+\b(?:as|for)\b|\buse this file\b|\bcopy\b|\binclude\b|\bship\b|"
     r"\bproduction asset\b|\btarget\s*:|\bsource/license\s*:|\bprovided by\b",
@@ -3994,12 +3999,14 @@ def _asset_reference_metadata(
 
 
 def _asset_reference_kind(context: str) -> str:
-    if _ASSET_REFERENCE_HINT_RE.search(context):
+    if _ASSET_EXPLICIT_REFERENCE_HINT_RE.search(context):
         return "reference"
     if _ASSET_STRONG_DELIVERY_HINT_RE.search(context):
         return "delivery"
     if _ASSET_DELIVERY_HINT_RE.search(context):
         return "delivery"
+    if _ASSET_REFERENCE_HINT_RE.search(context):
+        return "reference"
     return "ambiguous"
 
 

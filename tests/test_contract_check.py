@@ -179,6 +179,43 @@ def test_contract_check_blocks_delivery_asset_without_provenance(tmp_path: Path)
     )
 
 
+def test_contract_check_delivery_heading_overrides_screenshot_filename_hint(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "hero-screenshot.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Add hero image
+
+## Assets
+
+### Delivery assets
+
+- `.sikula/task-assets/hero-screenshot.png`
+
+## Scope
+- Add the provided hero image to the landing page.
+
+## Acceptance criteria
+- The landing page shows the provided hero image.
+
+## Out of scope
+- Do not redesign the landing page.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert len(result.asset_references) == 1
+    assert result.asset_references[0]["kind"] == "delivery"
+    assert any(gap.id == "gap.assets.provenance" and gap.severity == "blocking" for gap in result.gaps)
+    assert any(
+        question.id == "assets.provenance" and question.blocks_delivery for question in result.clarifying_questions
+    )
+
+
 def test_contract_check_delivery_dominates_duplicate_reference_asset_mentions(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
     asset_path.parent.mkdir(parents=True)
