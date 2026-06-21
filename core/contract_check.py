@@ -200,11 +200,12 @@ _ASSET_FILENAME_RE = re.compile(
     re.IGNORECASE,
 )
 _ASSET_REFERENCE_HINT_RE = re.compile(
-    r"\b(reference assets?|reference only|do not copy|screenshot|mockup|design reference|layout reference|spec excerpt)\b",
+    r"\b(reference assets?|reference[-\s]+only|do[-\s]+not[-\s]+copy|screenshot|mockup|design reference|"
+    r"layout reference|spec excerpt)\b",
     re.IGNORECASE,
 )
 _ASSET_EXPLICIT_REFERENCE_HINT_RE = re.compile(
-    r"\b(reference assets?|reference only|do not copy|design reference|layout reference|"
+    r"\b(reference assets?|reference[-\s]+only|do[-\s]+not[-\s]+copy|design reference|layout reference|"
     r"visual reference|reference (?:asset|image|screenshot|mockup)|spec excerpt)\b",
     re.IGNORECASE,
 )
@@ -3912,9 +3913,30 @@ def _asset_reference_is_output_destination(path_text: str, context: str) -> bool
         if path_text not in line:
             continue
         prefix = line.split(path_text, 1)[0]
-        if re.search(r"\b(?:add|build|create|draw|generate|implement|write)\b", prefix, re.IGNORECASE):
+        if _asset_source_prefix_before_path(prefix):
+            continue
+        if _asset_output_prefix_before_path(prefix):
             return True
     return False
+
+
+def _asset_source_prefix_before_path(prefix: str) -> bool:
+    normalized = prefix.casefold().rstrip("`'\" ")
+    return bool(re.search(r"\b(?:using|with|from|via|based on|according to)\s*$", normalized))
+
+
+def _asset_output_prefix_before_path(prefix: str) -> bool:
+    normalized = prefix.casefold().rstrip("`'\" ")
+    output_match = None
+    for match in re.finditer(r"\b(?:add|build|create|draw|generate|implement|write)\b", normalized):
+        output_match = match
+    if output_match is None:
+        return False
+    if re.search(r"\b(?:using|with|from|via|based on|according to)\b", normalized[output_match.end() :]):
+        return False
+    if re.search(r"\b(?:to|into|under|at|as)\s*$", normalized):
+        return True
+    return len(re.findall(r"\b[\w-]+\b", normalized[output_match.end() :])) <= 4
 
 
 def _asset_path_in_task_asset_dir(path_text: str, project_config: dict | None) -> bool:

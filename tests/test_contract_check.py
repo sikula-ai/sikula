@@ -689,6 +689,35 @@ def test_contract_check_does_not_treat_assets_heading_output_paths_as_inputs(tmp
     assert all(not gap.id.startswith("gap.assets.") for gap in result.gaps)
 
 
+def test_contract_check_keeps_source_asset_after_output_verb_when_using_clause(tmp_path: Path):
+    asset_path = tmp_path / "designs" / "success.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Scope
+- Add the success icon using `designs/success.svg` as the delivery asset.
+
+## Acceptance criteria
+- The success state shows the provided icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert len(result.asset_references) == 1
+    assert result.asset_references[0]["project_path"] == "designs/success.svg"
+    assert result.asset_references[0]["kind"] == "delivery"
+    assert any(gap.id == "gap.assets.provenance" and gap.severity == "blocking" for gap in result.gaps)
+
+
 def test_contract_check_warns_for_untracked_asset_in_git_repo(tmp_path: Path):
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing-bug.png"
@@ -1474,6 +1503,49 @@ def test_prepare_implementation_contract_keeps_colon_text_in_single_asset_intent
     assert result.recheck_result is not None
     assert all(gap.id != "gap.assets.intent" for gap in result.recheck_result.gaps)
     assert "  - Reference only: do not copy to production assets." in result.prepared_contract_markdown
+    assert "assets.intent" not in result.open_question_ids
+
+
+def test_prepare_implementation_contract_accepts_hyphenated_single_asset_intent_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-reference.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Fix login spacing
+
+## Assets
+
+- `.sikula/task-assets/login-reference.png`
+
+## Scope
+- Fix the login form spacing shown in the asset.
+
+## Acceptance criteria
+- The login form spacing matches the reference.
+
+## Out of scope
+- Do not redesign the login screen.
+
+## Tests
+- Cover the login form spacing state.
+
+## Validation
+- `pytest`
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/login-spacing.md",
+        answers={"assets.intent": "reference-only"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.recheck_result is not None
+    assert all(gap.id != "gap.assets.intent" for gap in result.recheck_result.gaps)
+    assert "  - reference-only" in result.prepared_contract_markdown
     assert "assets.intent" not in result.open_question_ids
 
 
