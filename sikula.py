@@ -1258,6 +1258,7 @@ def _run_contract_prepare_auto(
         task_text,
         contract_name=str(source_path),
         project_context=project_context,
+        project_config=_contract_cli_project_config(cfg),
         generated_answer_entries=generated_answer_entries,
         initial_answers=answers,
         answer_provider=lambda request: agent.propose_contract_answers(
@@ -1292,6 +1293,7 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
 
     task_text = task_path.read_text(encoding="utf-8")
     project_context = _prepare_project_context_from_config(cfg)
+    prepare_project_config = _contract_cli_project_config(cfg)
     output_path = _resolve_output_path(args.output) if args.output else _default_contract_path(task_path, cfg)
     report_root = project_root if cfg.get("project", {}).get("root_path") else None
     report_dir = _resolve_contract_report_dir(cfg) if cfg.get("_config_path") else None
@@ -1306,6 +1308,7 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
             task_text,
             contract_name=str(task_path),
             project_context=project_context,
+            project_config=prepare_project_config,
             generated_answer_entries=generated_answer_entries,
         )
         if result.required_next_step == "provide_project_context":
@@ -1323,6 +1326,7 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
                 task_text,
                 contract_name=str(task_path),
                 project_context=project_context,
+                project_config=prepare_project_config,
                 generated_answer_entries=generated_answer_entries,
             )
             answers = _collect_prepare_answers_interactive(
@@ -1358,6 +1362,7 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         contract_name=str(task_path),
         answers=answers,
         project_context=project_context,
+        project_config=prepare_project_config,
         generated_answer_entries=generated_answer_entries,
     )
     if result.required_next_step == "provide_project_context":

@@ -279,6 +279,51 @@ def test_contract_check_does_not_scan_copy_destination_as_input_asset(tmp_path: 
     assert all(gap.id != "gap.assets.missing" for gap in result.gaps)
 
 
+def test_contract_check_limits_asset_context_to_current_list_item(tmp_path: Path):
+    reference_path = tmp_path / ".sikula" / "task-assets" / "reference.png"
+    delivery_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    reference_path.parent.mkdir(parents=True)
+    reference_path.write_bytes(b"fake-png")
+    delivery_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Assets
+
+### Reference assets
+
+- `.sikula/task-assets/reference.png`
+
+### Delivery assets
+
+- `.sikula/task-assets/success-check.svg`
+  - Source/license: provided by product team for this project.
+
+## Scope
+- Add a success icon based on the delivery asset.
+
+## Acceptance criteria
+- The success state shows the icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    references = {reference["project_path"]: reference for reference in result.asset_references}
+    assert references[".sikula/task-assets/reference.png"]["kind"] == "reference"
+    assert "source_license" not in references[".sikula/task-assets/reference.png"]
+    assert references[".sikula/task-assets/success-check.svg"]["kind"] == "delivery"
+    assert references[".sikula/task-assets/success-check.svg"]["source_license"] == (
+        "provided by product team for this project."
+    )
+
+
 def test_contract_check_does_not_treat_basename_docs_as_assets(tmp_path: Path):
     (tmp_path / "README.md").write_text("# Repo docs\n", encoding="utf-8")
     task = """# Update docs
@@ -989,6 +1034,55 @@ def test_prepare_implementation_contract_applies_asset_provenance_answer(
     assert all(gap.id != "gap.assets.provenance" for gap in result.recheck_result.gaps)
     assert "Source/license: provided by product team for this project." in result.prepared_contract_markdown
     assert "<!-- sikula:generated-answer: assets.provenance -->" in result.resume_arguments["contract_markdown"]
+
+
+def test_prepare_implementation_contract_replaces_missing_asset_from_answers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-reference.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Fix login spacing
+
+## Scope
+- Fix the login form spacing shown in `.sikula/task-assets/missing.png` as a reference screenshot.
+
+## Acceptance criteria
+- The login form spacing matches the reference.
+- Existing validation messages remain unchanged.
+
+## Out of scope
+- Do not redesign the login screen.
+
+## Tests
+- Cover the login form spacing state.
+
+## Validation
+- `pytest`
+
+## Reviewer focus
+- Verify only the login spacing changes.
+
+## Context
+- Follow the existing login screen layout conventions.
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/login-spacing.md",
+        answers={"assets.local_files": ".sikula/task-assets/login-reference.png"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "assets.local_files" in result.answered_question_ids
+    assert "assets.local_files" not in result.open_question_ids
+    assert ".sikula/task-assets/missing.png" not in result.prepared_contract_markdown
+    assert "Reference asset: `.sikula/task-assets/login-reference.png`" in result.prepared_contract_markdown
+    assert result.recheck_result is not None
+    assert all(gap.id != "gap.assets.missing" for gap in result.recheck_result.gaps)
+    assert all(gap.id != "gap.assets.intent" for gap in result.recheck_result.gaps)
 
 
 def test_prepare_implementation_contract_does_not_manifest_unresolved_assets(
@@ -4432,7 +4526,7 @@ run_checks: true
     asset_path = repo / ".sikula" / "task-assets" / "success-check.svg"
     asset_path.parent.mkdir(parents=True)
     asset_path.write_text("<svg />", encoding="utf-8")
-    task_path = repo / ".sikula" / "tasks" / "success-icon.md"
+    task_path = repo / "docs" / "tasks" / "success-icon.md"
     task_path.parent.mkdir(parents=True)
     task_path.write_text(
         """# Add success icon

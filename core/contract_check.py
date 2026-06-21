@@ -194,7 +194,7 @@ _PLAIN_ASSET_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 _ASSET_REFERENCE_HINT_RE = re.compile(
-    r"\b(reference only|do not copy|screenshot|mockup|design reference|layout reference|spec excerpt)\b",
+    r"\b(reference assets?|reference only|do not copy|screenshot|mockup|design reference|layout reference|spec excerpt)\b",
     re.IGNORECASE,
 )
 _ASSET_DELIVERY_HINT_RE = re.compile(
@@ -969,12 +969,13 @@ def prepare_implementation_contract(
     contract_name: str | None = None,
     answers: dict[str, str | dict[str, Any]] | None = None,
     project_context: PrepareProjectContext | dict[str, Any] | None = None,
+    project_config: dict | None = None,
     generated_answer_entries: list[dict[str, Any]] | None = None,
 ) -> ContractPrepareResult:
     """Prepare an implementation contract through an in-memory check/improve loop."""
 
     source_format = "text" if contract_name and Path(contract_name).suffix.lower() == ".txt" else "markdown"
-    project_config = _prepare_project_config_from_contract_name(contract_name)
+    project_config = project_config or _prepare_project_config_from_contract_name(contract_name)
     normalized_project_context = _normalize_prepare_project_context(project_context)
     project_context_blockers = _prepare_project_context_blockers(normalized_project_context)
     validation_commands = _validation_commands_from_prepare_context(normalized_project_context)
@@ -2231,6 +2232,8 @@ def _render_improved_contract(
         answered_question_ids,
         generated_answer_entries or [],
     )
+    if _answer_text(answers.get("assets.local_files", {})):
+        task_text = _strip_unresolved_asset_reference_lines(task_text, asset_references or [])
     task_text = _strip_generated_open_questions_section(task_text)
     lines = _improved_contract_base_lines(task_text, task_path)
     section_entries: dict[str, list[tuple[dict[str, Any], str, str]]] = {}
@@ -2281,12 +2284,21 @@ def _render_improved_contract(
 def _asset_answer_entry_lines(asset_references: list[dict[str, Any]], answers: dict[str, dict[str, Any]]) -> list[str]:
     lines: list[str] = []
 
-    for question_id in ("assets.local_files", "assets.intent"):
-        answer_text = _answer_text(answers.get(question_id, {}))
-        if not answer_text:
-            continue
+    local_files_answer = _answer_text(answers.get("assets.local_files", {}))
+    if local_files_answer:
+        replacement_kind = _asset_replacement_kind(asset_references)
+        lines.append(_generated_answer_entry_marker("assets.local_files"))
+        for answer_line in _answer_lines(local_files_answer):
+            cleaned = _clean_answer_bullet(answer_line)
+            if cleaned:
+                lines.append(_asset_local_file_answer_line(cleaned, replacement_kind))
+        lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
+
+    intent_answer = _answer_text(answers.get("assets.intent", {}))
+    if intent_answer:
+        question_id = "assets.intent"
         lines.append(_generated_answer_entry_marker(question_id))
-        for answer_line in _answer_lines(answer_text):
+        for answer_line in _answer_lines(intent_answer):
             lines.append(f"- {_clean_answer_bullet(answer_line)}")
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
 
@@ -2312,6 +2324,87 @@ def _asset_answer_entry_lines(asset_references: list[dict[str, Any]], answers: d
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
 
     return lines
+
+
+def _strip_unresolved_asset_reference_lines(task_text: str, asset_references: list[dict[str, Any]]) -> str:
+    source_lines = task_text.splitlines()
+    unresolved_line_numbers = [
+        int(reference["line"])
+        for reference in asset_references
+        if reference.get("status") in {"missing", "outside_project", "not_file"}
+        and isinstance(reference.get("line"), int)
+        and 1 <= int(reference["line"]) <= len(source_lines)
+    ]
+    if not unresolved_line_numbers:
+        return task_text
+
+    ranges = [_asset_reference_line_range(source_lines, line_number - 1) for line_number in unresolved_line_numbers]
+    ranges = _merge_line_ranges(ranges)
+    stripped = _remove_line_ranges(source_lines, ranges)
+    return "\n".join(stripped).strip()
+
+
+def _asset_reference_line_range(source_lines: list[str], line_index: int) -> tuple[int, int]:
+    line = source_lines[line_index]
+    bullet_match = _BULLET_RE.match(line)
+    if not bullet_match:
+        return line_index, line_index + 1
+
+    base_indent = _line_indent(line)
+    end_index = line_index + 1
+    while end_index < len(source_lines):
+        candidate = source_lines[end_index]
+        if _HEADING_RE.match(candidate):
+            break
+        if candidate.strip() and _BULLET_RE.match(candidate) and _line_indent(candidate) <= base_indent:
+            break
+        end_index += 1
+    return line_index, end_index
+
+
+def _merge_line_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end))
+    return merged
+
+
+def _remove_line_ranges(source_lines: list[str], ranges: list[tuple[int, int]]) -> list[str]:
+    def removed(line_index: int) -> bool:
+        return any(start <= line_index < end for start, end in ranges)
+
+    return [line for index, line in enumerate(source_lines) if not removed(index)]
+
+
+def _asset_replacement_kind(asset_references: list[dict[str, Any]]) -> str:
+    unresolved_kinds = [
+        str(reference.get("kind") or "").strip()
+        for reference in asset_references
+        if reference.get("status") in {"missing", "outside_project", "not_file"}
+    ]
+    if unresolved_kinds and all(kind == "delivery" for kind in unresolved_kinds):
+        return "delivery"
+    if unresolved_kinds and all(kind == "reference" for kind in unresolved_kinds):
+        return "reference"
+    return "asset"
+
+
+def _asset_local_file_answer_line(answer_line: str, replacement_kind: str) -> str:
+    if _ASSET_REFERENCE_HINT_RE.search(answer_line) or _ASSET_DELIVERY_HINT_RE.search(answer_line):
+        return f"- {answer_line}"
+
+    label = {
+        "delivery": "Delivery asset",
+        "reference": "Reference asset",
+    }.get(replacement_kind, "Asset")
+    value = answer_line
+    if _normalize_asset_path_candidate(answer_line):
+        value = f"`{answer_line}`"
+    return f"- {label}: {value}"
 
 
 def _reconcile_rendered_open_questions(
@@ -3374,8 +3467,37 @@ def _detect_asset_references(
 
 
 def _asset_reference_context(current_heading: str, lines: list[str], line_index: int) -> str:
-    local_lines = lines[line_index : min(len(lines), line_index + 4)]
+    local_lines = _asset_reference_context_lines(lines, line_index)
     return "\n".join([current_heading, *local_lines])
+
+
+def _asset_reference_context_lines(lines: list[str], line_index: int) -> list[str]:
+    line = lines[line_index]
+    bullet_match = _BULLET_RE.match(line)
+    if not bullet_match:
+        return [line]
+
+    base_indent = _line_indent(line)
+    context_lines = [line]
+    next_index = line_index + 1
+    while next_index < len(lines):
+        candidate = lines[next_index]
+        if _HEADING_RE.match(candidate):
+            break
+        if (
+            candidate.strip()
+            and _BULLET_RE.match(candidate)
+            and _line_indent(candidate) <= base_indent
+            and _asset_path_candidates(candidate)
+        ):
+            break
+        context_lines.append(candidate)
+        next_index += 1
+    return context_lines
+
+
+def _line_indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
 
 
 def _asset_path_candidates(line: str) -> list[str]:
