@@ -203,7 +203,7 @@ _ASSET_DELIVERY_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 _ASSET_STRONG_DELIVERY_HINT_RE = re.compile(
-    r"\b(delivery assets?|target:|copy to|destination:|production asset|source/license:)\b",
+    r"\b(delivery assets?|target(?:\s+path)?:|copy to|destination(?:\s+path)?:|production asset|source/license:)\b",
     re.IGNORECASE,
 )
 _ASSET_TARGET_HINT_RE = re.compile(r"\b(target|target:|copy to|into|destination|path)\b", re.IGNORECASE)
@@ -211,7 +211,10 @@ _ASSET_PROVENANCE_HINT_RE = re.compile(
     r"\b(source/license|source:|license:|licence:|provenance|provided by|owned by)\b",
     re.IGNORECASE,
 )
-_ASSET_TARGET_DETAIL_RE = re.compile(r"\b(?:target|destination|copy to)\s*:\s*(.+)", re.IGNORECASE)
+_ASSET_TARGET_DETAIL_RE = re.compile(
+    r"\b(?:target(?:\s+path)?|destination(?:\s+path)?|copy\s+to)\s*:\s*(.+)",
+    re.IGNORECASE,
+)
 _ASSET_PROVENANCE_DETAIL_RE = re.compile(
     r"\b(?:source/license|source|license|licence|provenance)\s*:\s*(.+)",
     re.IGNORECASE,
@@ -2286,12 +2289,8 @@ def _asset_answer_entry_lines(asset_references: list[dict[str, Any]], answers: d
 
     local_files_answer = _answer_text(answers.get("assets.local_files", {}))
     if local_files_answer:
-        replacement_kind = _asset_replacement_kind(asset_references)
         lines.append(_generated_answer_entry_marker("assets.local_files"))
-        for answer_line in _answer_lines(local_files_answer):
-            cleaned = _clean_answer_bullet(answer_line)
-            if cleaned:
-                lines.append(_asset_local_file_answer_line(cleaned, replacement_kind))
+        lines.extend(_asset_local_file_answer_entries(local_files_answer, asset_references))
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
 
     intent_answer = _answer_text(answers.get("assets.intent", {}))
@@ -2380,12 +2379,45 @@ def _remove_line_ranges(source_lines: list[str], ranges: list[tuple[int, int]]) 
     return [line for index, line in enumerate(source_lines) if not removed(index)]
 
 
-def _asset_replacement_kind(asset_references: list[dict[str, Any]]) -> str:
-    unresolved_kinds = [
-        str(reference.get("kind") or "").strip()
+def _asset_local_file_answer_entries(answer_text: str, asset_references: list[dict[str, Any]]) -> list[str]:
+    unresolved_references = _unresolved_asset_references(asset_references)
+    fallback_kind = _asset_replacement_kind(unresolved_references)
+    entries: list[str] = []
+    for index, answer_line in enumerate(_answer_lines(answer_text)):
+        cleaned = _clean_answer_bullet(answer_line)
+        if not cleaned:
+            continue
+        reference = _matching_unresolved_asset_reference(unresolved_references, index)
+        replacement_kind = str(reference.get("kind") or fallback_kind) if reference else fallback_kind
+        entries.append(_asset_local_file_answer_line(cleaned, replacement_kind))
+        if reference:
+            entries.extend(_asset_preserved_metadata_lines(reference))
+    return entries
+
+
+def _unresolved_asset_references(asset_references: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        reference
         for reference in asset_references
         if reference.get("status") in {"missing", "outside_project", "not_file"}
     ]
+
+
+def _matching_unresolved_asset_reference(
+    unresolved_references: list[dict[str, Any]],
+    index: int,
+) -> dict[str, Any] | None:
+    if not unresolved_references:
+        return None
+    if index < len(unresolved_references):
+        return unresolved_references[index]
+    if len(unresolved_references) == 1:
+        return unresolved_references[0]
+    return None
+
+
+def _asset_replacement_kind(asset_references: list[dict[str, Any]]) -> str:
+    unresolved_kinds = [str(reference.get("kind") or "").strip() for reference in asset_references]
     if unresolved_kinds and all(kind == "delivery" for kind in unresolved_kinds):
         return "delivery"
     if unresolved_kinds and all(kind == "reference" for kind in unresolved_kinds):
@@ -2405,6 +2437,17 @@ def _asset_local_file_answer_line(answer_line: str, replacement_kind: str) -> st
     if _normalize_asset_path_candidate(answer_line):
         value = f"`{answer_line}`"
     return f"- {label}: {value}"
+
+
+def _asset_preserved_metadata_lines(reference: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    requested_target = str(reference.get("requested_target") or "").strip()
+    if requested_target:
+        lines.append(f"  - Target path: `{requested_target}`")
+    source_license = str(reference.get("source_license") or "").strip()
+    if source_license:
+        lines.append(f"  - Source/license: {source_license}")
+    return lines
 
 
 def _reconcile_rendered_open_questions(
@@ -3527,7 +3570,7 @@ def _asset_path_candidates(line: str) -> list[str]:
 
 def _asset_candidate_is_target_path(line: str, start_index: int) -> bool:
     prefix = line[:start_index].lower().rstrip("`'\" ")
-    return bool(re.search(r"\b(target|destination|copy to)\s*:\s*$", prefix))
+    return bool(re.search(r"\b(?:target|destination)(?:\s+path)?\s*:\s*$|\bcopy\s+to\s*:\s*$", prefix))
 
 
 def _asset_candidate_is_destination_path(
@@ -3719,7 +3762,7 @@ def _file_sha256(path: Path) -> str:
 
 
 def _asset_git_status(project_root: Path, project_path: str) -> str:
-    if not (project_root / ".git").exists():
+    if _git_command(project_root, "rev-parse", "--is-inside-work-tree").returncode != 0:
         return "unknown"
     status = _git_command_stdout(project_root, "status", "--porcelain", "--ignored", "--", project_path)
     status_line = status.stdout.strip().splitlines()[0] if status.returncode == 0 and status.stdout.strip() else ""

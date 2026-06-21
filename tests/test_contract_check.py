@@ -220,6 +220,43 @@ def test_contract_check_captures_delivery_asset_target_and_source_license(tmp_pa
     assert all(gap.id != "gap.assets.provenance" for gap in result.gaps)
 
 
+def test_contract_check_treats_target_path_label_as_destination(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Assets
+
+### Delivery assets
+
+- Use `.sikula/task-assets/success-check.svg` as the success state icon.
+  - Target path: `app/src/main/res/drawable/success_check.svg`
+  - Source/license: provided by product team for this project.
+
+## Scope
+- Add the success state icon.
+
+## Acceptance criteria
+- The success state shows the new icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert len(result.asset_references) == 1
+    assert result.asset_references[0]["project_path"] == ".sikula/task-assets/success-check.svg"
+    assert result.asset_references[0]["requested_target"] == "app/src/main/res/drawable/success_check.svg"
+    assert all(gap.id != "gap.assets.missing" for gap in result.gaps)
+
+
 def test_contract_check_allows_delivery_asset_target_to_be_inferred(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
     asset_path.parent.mkdir(parents=True)
@@ -396,6 +433,44 @@ def test_contract_check_warns_for_untracked_asset_in_git_repo(tmp_path: Path):
 
     result = check_contract(
         task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert result.asset_references[0]["git_status"] == "untracked"
+    assert any(gap.id == "gap.assets.worktree_availability" and gap.severity == "warning" for gap in result.gaps)
+
+
+def test_contract_check_warns_for_untracked_asset_in_nested_git_project_root(tmp_path: Path):
+    repo = tmp_path / "repo"
+    app = repo / "apps" / "mobile"
+    app.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    asset_path = app / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Assets
+
+### Delivery assets
+
+- Use `.sikula/task-assets/success-check.svg` as the success state icon.
+  - Source/license: provided by product team for this project.
+
+## Scope
+- Add the success state icon.
+
+## Acceptance criteria
+- The success state shows the new icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=app / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(app)
     )
 
     assert result.asset_references[0]["git_status"] == "untracked"
@@ -1083,6 +1158,66 @@ def test_prepare_implementation_contract_replaces_missing_asset_from_answers(
     assert result.recheck_result is not None
     assert all(gap.id != "gap.assets.missing" for gap in result.recheck_result.gaps)
     assert all(gap.id != "gap.assets.intent" for gap in result.recheck_result.gaps)
+
+
+def test_prepare_implementation_contract_preserves_asset_metadata_when_replacing_missing_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Assets
+
+### Delivery assets
+
+- Use `.sikula/task-assets/missing.svg` as the success state icon.
+  - Target path: `app/src/main/res/drawable/success_check.svg`
+  - Source/license: provided by product team for this project.
+
+## Scope
+- Add the success state icon.
+
+## Acceptance criteria
+- The success state shows the new icon.
+- Existing success message text remains unchanged.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Tests
+- Cover the success icon state.
+
+## Validation
+- `pytest`
+
+## Reviewer focus
+- Verify the provided asset is used only for the success state.
+
+## Context
+- Follow the existing confirmation screen resource conventions.
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/success-icon.md",
+        answers={"assets.local_files": ".sikula/task-assets/success-check.svg"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert ".sikula/task-assets/missing.svg" not in result.prepared_contract_markdown
+    assert "Delivery asset: `.sikula/task-assets/success-check.svg`" in result.prepared_contract_markdown
+    assert "Target path: `app/src/main/res/drawable/success_check.svg`" in result.prepared_contract_markdown
+    assert "Source/license: provided by product team for this project." in result.prepared_contract_markdown
+    assert result.recheck_result is not None
+    assert all(gap.id != "gap.assets.missing" for gap in result.recheck_result.gaps)
+    assert all(gap.id != "gap.assets.provenance" for gap in result.recheck_result.gaps)
+    assert result.recheck_result.asset_references[0]["requested_target"] == (
+        "app/src/main/res/drawable/success_check.svg"
+    )
 
 
 def test_prepare_implementation_contract_does_not_manifest_unresolved_assets(
