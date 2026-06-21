@@ -2335,19 +2335,17 @@ def _replace_unresolved_asset_reference_paths(
     asset_references: list[dict[str, Any]],
     answer_text: str,
 ) -> str:
-    source_lines = task_text.splitlines()
     replacements = _asset_path_replacements(asset_references, answer_text)
     if not replacements:
         return task_text
 
+    updated = task_text
     for reference, replacement_path in replacements:
-        line_number = reference.get("line")
         old_path = str(reference.get("path") or "").strip()
-        if not isinstance(line_number, int) or line_number < 1 or line_number > len(source_lines) or not old_path:
+        if not old_path:
             continue
-        line_index = line_number - 1
-        source_lines[line_index] = source_lines[line_index].replace(old_path, replacement_path, 1)
-    return "\n".join(source_lines).strip()
+        updated = updated.replace(old_path, replacement_path)
+    return updated.strip()
 
 
 def _asset_path_replacements(
@@ -3522,12 +3520,7 @@ def _asset_reference_context_lines(lines: list[str], line_index: int) -> list[st
         candidate = lines[next_index]
         if _HEADING_RE.match(candidate):
             break
-        if (
-            candidate.strip()
-            and _BULLET_RE.match(candidate)
-            and _line_indent(candidate) <= base_indent
-            and _asset_path_candidates(candidate)
-        ):
+        if candidate.strip() and _BULLET_RE.match(candidate) and _line_indent(candidate) <= base_indent:
             break
         context_lines.append(candidate)
         next_index += 1

@@ -52,8 +52,7 @@ def test_contract_check_reports_available_reference_asset(tmp_path: Path):
         """# Fix login spacing
 
 ## Scope
-- Fix the login form spacing shown in `.sikula/task-assets/login-spacing-bug.png`.
-- Use the screenshot as reference only.
+- Fix the login form spacing shown in `.sikula/task-assets/login-spacing-bug.png` as a reference screenshot.
 
 ## Acceptance criteria
 - The email field and submit button match the referenced spacing.
@@ -155,7 +154,7 @@ def test_contract_check_blocks_delivery_asset_without_provenance(tmp_path: Path)
 
 ## Scope
 - Use `.sikula/task-assets/success-check.svg` as the success state icon.
-- Target: `app/src/main/res/drawable/success_check.svg`
+  - Target: `app/src/main/res/drawable/success_check.svg`
 
 ## Acceptance criteria
 - The success state shows the new icon.
@@ -324,6 +323,40 @@ def test_contract_check_classifies_delivery_asset_heading_as_delivery(tmp_path: 
     assert result.asset_references[0]["kind"] == "delivery"
     assert any(gap.id == "gap.assets.provenance" and gap.severity == "blocking" for gap in result.gaps)
     assert all(gap.id != "gap.assets.intent" for gap in result.gaps)
+
+
+def test_contract_check_does_not_let_sibling_bullet_change_asset_intent(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Assets
+
+### Delivery assets
+
+- `.sikula/task-assets/success-check.svg`
+- Do not copy the reference screenshot into production assets.
+
+## Scope
+- Add the success state icon.
+
+## Acceptance criteria
+- The success state shows the new icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert result.asset_references[0]["kind"] == "delivery"
+    assert any(gap.id == "gap.assets.provenance" for gap in result.gaps)
 
 
 def test_contract_check_prioritizes_reference_only_over_delivery_keywords(tmp_path: Path):
@@ -1266,6 +1299,59 @@ def test_prepare_implementation_contract_replaces_missing_asset_from_answers(
     assert result.recheck_result is not None
     assert all(gap.id != "gap.assets.missing" for gap in result.recheck_result.gaps)
     assert all(gap.id != "gap.assets.intent" for gap in result.recheck_result.gaps)
+
+
+def test_prepare_implementation_contract_replaces_repeated_missing_asset_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-reference.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Fix login spacing
+
+## Assets
+
+### Reference assets
+
+- `.sikula/task-assets/missing.png`
+
+## Scope
+- Fix the login form spacing shown in `.sikula/task-assets/missing.png` as a reference screenshot.
+
+## Acceptance criteria
+- The login form spacing matches the reference.
+- Existing validation messages remain unchanged.
+
+## Out of scope
+- Do not redesign the login screen.
+
+## Tests
+- Cover the login form spacing state.
+
+## Validation
+- `pytest`
+
+## Reviewer focus
+- Verify only the login spacing changes.
+
+## Context
+- Follow the existing login screen layout conventions.
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/login-spacing.md",
+        answers={"assets.local_files": ".sikula/task-assets/login-reference.png"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert ".sikula/task-assets/missing.png" not in result.prepared_contract_markdown
+    assert result.prepared_contract_markdown.count(".sikula/task-assets/login-reference.png") >= 2
+    assert result.recheck_result is not None
+    assert all(gap.id != "gap.assets.missing" for gap in result.recheck_result.gaps)
+    assert "assets.local_files" not in result.open_question_ids
 
 
 def test_prepare_implementation_contract_keeps_missing_asset_for_non_path_answer(
