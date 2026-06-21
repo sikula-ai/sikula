@@ -274,6 +274,32 @@ def test_contract_check_does_not_treat_basename_docs_as_assets(tmp_path: Path):
     assert result.asset_references == []
 
 
+def test_contract_check_does_not_treat_output_file_paths_as_assets(tmp_path: Path):
+    task = """# Add guide
+
+## Scope
+- Create `docs/new-guide.md`.
+- Add `config/example.json` with sample settings.
+
+## Acceptance criteria
+- The new guide explains the setup flow.
+- The sample settings are committed with the guide.
+
+## Out of scope
+- Do not change runtime behaviour.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert result.asset_references == []
+    assert all(not gap.id.startswith("gap.assets.") for gap in result.gaps)
+
+
 def test_contract_check_warns_for_untracked_asset_in_git_repo(tmp_path: Path):
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing-bug.png"
@@ -299,6 +325,80 @@ def test_contract_check_warns_for_untracked_asset_in_git_repo(tmp_path: Path):
     )
 
     assert result.asset_references[0]["git_status"] == "untracked"
+    assert any(gap.id == "gap.assets.worktree_availability" and gap.severity == "warning" for gap in result.gaps)
+
+
+def test_contract_check_warns_for_dirty_tracked_asset_in_git_repo(tmp_path: Path):
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing-bug.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"old-png")
+    subprocess.run(["git", "add", str(asset_path.relative_to(tmp_path))], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Sikula Test", "-c", "user.email=sikula@example.test", "commit", "-m", "add asset"],
+        cwd=tmp_path,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    asset_path.write_bytes(b"new-png")
+    task = """# Fix login spacing
+
+## Scope
+- Use `.sikula/task-assets/login-spacing-bug.png` as a reference screenshot.
+
+## Acceptance criteria
+- The login form spacing matches the reference.
+
+## Out of scope
+- Do not redesign the screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert result.asset_references[0]["git_status"] == "dirty"
+    assert result.asset_references[0]["sha256"] == "sha256:" + sha256(b"new-png").hexdigest()
+    assert any(gap.id == "gap.assets.worktree_availability" and gap.severity == "warning" for gap in result.gaps)
+
+
+def test_contract_check_warns_for_staged_new_asset_in_git_repo(tmp_path: Path):
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    subprocess.run(["git", "add", str(asset_path.relative_to(tmp_path))], cwd=tmp_path, check=True)
+    task = """# Add success icon
+
+## Assets
+
+### Delivery assets
+
+- Use `.sikula/task-assets/success-check.svg` as the success state icon.
+  - Source/license: provided by product team for this project.
+
+## Scope
+- Add the success state icon.
+
+## Acceptance criteria
+- The success state shows the new icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert result.asset_references[0]["git_status"] == "dirty"
     assert any(gap.id == "gap.assets.worktree_availability" and gap.severity == "warning" for gap in result.gaps)
 
 

@@ -3294,12 +3294,15 @@ def _detect_asset_references(
             normalized_path = _normalize_asset_path_candidate(raw_path)
             if not normalized_path or normalized_path in seen:
                 continue
+            context = _asset_reference_context(current_heading, lines, line_index)
+            if not _asset_reference_input_context(normalized_path, context, project_config):
+                continue
             seen.add(normalized_path)
             reference = _asset_reference_metadata(
                 normalized_path,
                 project_root=project_root,
                 line_number=line_number,
-                context=_asset_reference_context(current_heading, lines, line_index),
+                context=context,
             )
             if reference is not None:
                 references.append(reference)
@@ -3350,6 +3353,34 @@ def _asset_candidate_has_supported_extension(path: str) -> bool:
 def _asset_candidate_has_directory(path: str) -> bool:
     candidate = Path(path)
     return candidate.is_absolute() or "/" in path or "\\" in path
+
+
+def _asset_reference_input_context(path_text: str, context: str, project_config: dict | None) -> bool:
+    heading = context.splitlines()[0] if context else ""
+    normalized_heading = _normalize_heading(heading)
+    if "asset" in normalized_heading or "attachment" in normalized_heading:
+        return True
+    if _asset_path_in_task_asset_dir(path_text, project_config):
+        return True
+    return bool(
+        _ASSET_REFERENCE_HINT_RE.search(context)
+        or _ASSET_STRONG_DELIVERY_HINT_RE.search(context)
+        or _ASSET_PROVENANCE_HINT_RE.search(context)
+    )
+
+
+def _asset_path_in_task_asset_dir(path_text: str, project_config: dict | None) -> bool:
+    normalized_path = Path(path_text).as_posix().lstrip("./")
+    configured_dirs = [".sikula/task-assets"]
+    tasks = project_config.get("tasks") if isinstance(project_config, dict) else None
+    task_asset_dir = tasks.get("task_asset_dir") if isinstance(tasks, dict) else None
+    if isinstance(task_asset_dir, str) and task_asset_dir.strip():
+        configured_dirs.append(task_asset_dir.strip())
+    for configured_dir in configured_dirs:
+        normalized_dir = Path(configured_dir).as_posix().strip("/").lstrip("./")
+        if normalized_dir and (normalized_path == normalized_dir or normalized_path.startswith(normalized_dir + "/")):
+            return True
+    return False
 
 
 def _asset_project_root(source_path: Path | str | None, project_config: dict | None) -> Path:
@@ -3456,11 +3487,33 @@ def _file_sha256(path: Path) -> str:
 def _asset_git_status(project_root: Path, project_path: str) -> str:
     if not (project_root / ".git").exists():
         return "unknown"
+    status = _git_command_stdout(project_root, "status", "--porcelain", "--ignored", "--", project_path)
+    status_line = status.stdout.strip().splitlines()[0] if status.returncode == 0 and status.stdout.strip() else ""
+    if status_line.startswith("!!"):
+        return "ignored"
+    if status_line.startswith("??"):
+        return "untracked"
+    if status_line:
+        return "dirty"
     if _git_command(project_root, "ls-files", "--error-unmatch", "--", project_path).returncode == 0:
         return "tracked"
     if _git_command(project_root, "check-ignore", "-q", "--", project_path).returncode == 0:
         return "ignored"
     return "untracked"
+
+
+def _git_command_stdout(project_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(project_root), *args],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return subprocess.CompletedProcess(args, returncode=1, stdout="", stderr="")
 
 
 def _git_command(project_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -3638,13 +3691,13 @@ def _asset_reference_gaps(asset_references: list[dict[str, Any]]) -> list[Contra
                 "Referenced asset paths must point to files, not directories.",
             )
         )
-    if any(reference.get("git_status") in {"ignored", "untracked"} for reference in asset_references):
+    if any(reference.get("git_status") in {"dirty", "ignored", "untracked"} for reference in asset_references):
         gaps.append(
             ContractGap(
                 "gap.assets.worktree_availability",
                 "warning",
                 "assets",
-                "Referenced assets are not tracked by git and may be unavailable in isolated Sikula runs.",
+                "Referenced assets are not cleanly tracked by git and may be unavailable in isolated Sikula runs.",
             )
         )
     if any(reference.get("kind") == "ambiguous" for reference in asset_references):
