@@ -413,6 +413,46 @@ def test_contract_check_applies_path_specific_provenance_only_to_matching_asset(
     assert any(gap.id == "gap.assets.provenance" and gap.severity == "blocking" for gap in result.gaps)
 
 
+def test_contract_check_rejects_ambiguous_basename_provenance(tmp_path: Path):
+    light_path = tmp_path / ".sikula" / "task-assets" / "light" / "icon.svg"
+    dark_path = tmp_path / ".sikula" / "task-assets" / "dark" / "icon.svg"
+    light_path.parent.mkdir(parents=True)
+    dark_path.parent.mkdir(parents=True)
+    light_path.write_text("<svg />", encoding="utf-8")
+    dark_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add theme icons
+
+## Assets
+
+### Delivery assets
+
+- Use `.sikula/task-assets/light/icon.svg` and `.sikula/task-assets/dark/icon.svg` as theme icons.
+  - Source/license: icon.svg: MIT
+
+## Scope
+- Add light and dark theme icons.
+
+## Acceptance criteria
+- The light theme shows the light icon.
+- The dark theme shows the dark icon.
+
+## Out of scope
+- Do not redesign the theme picker.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    references = {reference["project_path"]: reference for reference in result.asset_references}
+    assert "source_license" not in references[".sikula/task-assets/light/icon.svg"]
+    assert "source_license" not in references[".sikula/task-assets/dark/icon.svg"]
+    assert any(gap.id == "gap.assets.provenance" and gap.severity == "blocking" for gap in result.gaps)
+
+
 def test_contract_check_requires_source_license_detail_for_delivery_asset(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
     asset_path.parent.mkdir(parents=True)

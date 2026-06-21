@@ -4263,7 +4263,12 @@ def _asset_reference_detail_for_reference(
         detail = _single_line(value)
         if not detail:
             continue
-        specific_detail = _path_specific_asset_detail(detail, reference, project_root=project_root)
+        specific_detail = _path_specific_asset_detail(
+            detail,
+            reference,
+            context=context,
+            project_root=project_root,
+        )
         if specific_detail is not None:
             if specific_detail:
                 return specific_detail
@@ -4273,19 +4278,44 @@ def _asset_reference_detail_for_reference(
     return common_detail
 
 
-def _path_specific_asset_detail(detail: str, reference: dict[str, Any], *, project_root: Path) -> str | None:
+def _path_specific_asset_detail(
+    detail: str,
+    reference: dict[str, Any],
+    *,
+    context: str,
+    project_root: Path,
+) -> str | None:
     reference_keys = _asset_reference_match_keys(reference)
+    context_basenames = _asset_context_project_paths_by_basename(context, project_root=project_root)
     saw_path_specific_detail = False
     for candidate in _asset_detail_path_candidates(detail):
         candidate_key = _asset_detail_path_key(candidate, project_root=project_root)
         if not candidate_key:
             continue
         saw_path_specific_detail = True
+        if _asset_detail_path_is_basename(candidate):
+            matching_paths = context_basenames.get(candidate_key, set())
+            if len(matching_paths) != 1:
+                continue
         if candidate_key in reference_keys:
             return _asset_provenance_text_without_path(detail, candidate)
     if saw_path_specific_detail:
         return ""
     return None
+
+
+def _asset_context_project_paths_by_basename(context: str, *, project_root: Path) -> dict[str, set[str]]:
+    paths_by_basename: dict[str, set[str]] = {}
+    for line in context.splitlines():
+        for candidate in _asset_path_candidates(line):
+            normalized = _normalize_asset_path_candidate(candidate)
+            if not normalized:
+                continue
+            project_path = _asset_answer_path_for_project(normalized, project_root=project_root) or normalized
+            basename = Path(project_path).name
+            if basename:
+                paths_by_basename.setdefault(basename, set()).add(project_path)
+    return paths_by_basename
 
 
 def _asset_detail_path_candidates(detail: str) -> list[str]:
@@ -4308,6 +4338,11 @@ def _asset_detail_path_key(path_text: str, *, project_root: Path) -> str:
         return normalized
     filename_match = _ASSET_FILENAME_RE.fullmatch(path_text.strip())
     return filename_match.group(1) if filename_match else ""
+
+
+def _asset_detail_path_is_basename(path_text: str) -> bool:
+    stripped = path_text.strip()
+    return bool(_ASSET_FILENAME_RE.fullmatch(stripped)) and "/" not in stripped and "\\" not in stripped
 
 
 def _asset_reference_detail(context: str, pattern: re.Pattern[str]) -> str | None:
