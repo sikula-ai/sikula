@@ -2359,7 +2359,7 @@ def _asset_path_replacements(
     answer_paths = [path for path in answer_paths if path]
     replacements: list[tuple[dict[str, Any], str]] = []
     for index, reference in enumerate(unresolved_references):
-        replacement_path = answer_paths[index] if index < len(answer_paths) else answer_paths[0] if answer_paths else ""
+        replacement_path = answer_paths[index] if index < len(answer_paths) else ""
         if replacement_path:
             replacements.append((reference, replacement_path))
     return replacements
@@ -2371,7 +2371,7 @@ def _asset_path_from_answer_line(answer_line: str) -> str:
         normalized = _normalize_asset_path_candidate(candidate)
         if normalized:
             return normalized
-    return cleaned
+    return ""
 
 
 def _asset_local_file_answer_entries(answer_text: str, asset_references: list[dict[str, Any]]) -> list[str]:
@@ -2379,12 +2379,12 @@ def _asset_local_file_answer_entries(answer_text: str, asset_references: list[di
     fallback_kind = _asset_replacement_kind(unresolved_references)
     entries: list[str] = []
     for index, answer_line in enumerate(_answer_lines(answer_text)):
-        cleaned = _clean_answer_bullet(answer_line)
-        if not cleaned:
+        answer_path = _asset_path_from_answer_line(answer_line)
+        if not answer_path:
             continue
         reference = _matching_unresolved_asset_reference(unresolved_references, index)
         replacement_kind = str(reference.get("kind") or fallback_kind) if reference else fallback_kind
-        entries.append(_asset_local_file_answer_line(cleaned, replacement_kind))
+        entries.append(_asset_local_file_answer_line(answer_path, replacement_kind))
         if reference:
             entries.extend(_asset_preserved_metadata_lines(reference))
     return entries
@@ -3729,14 +3729,12 @@ def _asset_reference_metadata(
 
 
 def _asset_reference_kind(context: str) -> str:
-    if _ASSET_REFERENCE_HINT_RE.search(context) and not _ASSET_STRONG_DELIVERY_HINT_RE.search(context):
+    if _ASSET_REFERENCE_HINT_RE.search(context):
         return "reference"
     if _ASSET_STRONG_DELIVERY_HINT_RE.search(context):
         return "delivery"
     if _ASSET_DELIVERY_HINT_RE.search(context):
         return "delivery"
-    if _ASSET_REFERENCE_HINT_RE.search(context):
-        return "reference"
     return "ambiguous"
 
 

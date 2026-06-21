@@ -326,6 +326,41 @@ def test_contract_check_classifies_delivery_asset_heading_as_delivery(tmp_path: 
     assert all(gap.id != "gap.assets.intent" for gap in result.gaps)
 
 
+def test_contract_check_prioritizes_reference_only_over_delivery_keywords(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "reference.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Update visual spacing
+
+## Assets
+
+### Reference assets
+
+- Use `.sikula/task-assets/reference.png` as reference only; do not copy to production assets.
+  - Source/license: provided by product team for this project.
+
+## Scope
+- Match the spacing shown in the reference image.
+
+## Acceptance criteria
+- The login screen spacing matches the reference.
+
+## Out of scope
+- Do not copy the reference image into production resources.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert result.asset_references[0]["kind"] == "reference"
+    assert all(gap.id != "gap.assets.provenance" for gap in result.gaps)
+    assert all(gap.id != "gap.assets.intent" for gap in result.gaps)
+
+
 def test_contract_check_allows_delivery_asset_target_to_be_inferred(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
     asset_path.parent.mkdir(parents=True)
@@ -1231,6 +1266,100 @@ def test_prepare_implementation_contract_replaces_missing_asset_from_answers(
     assert result.recheck_result is not None
     assert all(gap.id != "gap.assets.missing" for gap in result.recheck_result.gaps)
     assert all(gap.id != "gap.assets.intent" for gap in result.recheck_result.gaps)
+
+
+def test_prepare_implementation_contract_keeps_missing_asset_for_non_path_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    task = """# Fix login spacing
+
+## Scope
+- Fix the login form spacing shown in `.sikula/task-assets/missing.png` as a reference screenshot.
+
+## Acceptance criteria
+- The login form spacing matches the reference.
+- Existing validation messages remain unchanged.
+
+## Out of scope
+- Do not redesign the login screen.
+
+## Tests
+- Cover the login form spacing state.
+
+## Validation
+- `pytest`
+
+## Reviewer focus
+- Verify only the login spacing changes.
+
+## Context
+- Follow the existing login screen layout conventions.
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/login-spacing.md",
+        answers={"assets.local_files": "n/a"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert ".sikula/task-assets/missing.png" in result.prepared_contract_markdown
+    assert "Asset: n/a" not in result.prepared_contract_markdown
+    assert result.recheck_result is not None
+    assert any(gap.id == "gap.assets.missing" for gap in result.recheck_result.gaps)
+    assert "assets.local_files" in result.open_question_ids
+
+
+def test_prepare_implementation_contract_does_not_reuse_one_answer_for_multiple_missing_assets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-reference.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Fix login spacing
+
+## Scope
+- Fix the login form spacing shown in `.sikula/task-assets/missing-spacing.png` as a reference screenshot.
+- Match the button state shown in `.sikula/task-assets/missing-button.png` as a reference screenshot.
+
+## Acceptance criteria
+- The login form spacing matches the reference.
+- The button state matches the reference.
+- Existing validation messages remain unchanged.
+
+## Out of scope
+- Do not redesign the login screen.
+
+## Tests
+- Cover the login form spacing and button state.
+
+## Validation
+- `pytest`
+
+## Reviewer focus
+- Verify only the login visual states change.
+
+## Context
+- Follow the existing login screen layout conventions.
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/login-spacing.md",
+        answers={"assets.local_files": ".sikula/task-assets/login-reference.png"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert ".sikula/task-assets/missing-spacing.png" not in result.prepared_contract_markdown
+    assert ".sikula/task-assets/login-reference.png" in result.prepared_contract_markdown
+    assert ".sikula/task-assets/missing-button.png" in result.prepared_contract_markdown
+    assert result.recheck_result is not None
+    assert any(gap.id == "gap.assets.missing" for gap in result.recheck_result.gaps)
+    assert "assets.local_files" in result.open_question_ids
 
 
 def test_prepare_implementation_contract_preserves_asset_metadata_when_replacing_missing_path(
