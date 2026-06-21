@@ -3834,7 +3834,7 @@ def _asset_candidate_is_destination_path(
 
 
 def _merge_asset_reference(existing: dict[str, Any], update: dict[str, Any]) -> None:
-    if existing.get("kind") == "ambiguous" and update.get("kind") in {"delivery", "reference"}:
+    if _asset_reference_kind_rank(update.get("kind")) > _asset_reference_kind_rank(existing.get("kind")):
         existing["kind"] = update["kind"]
     for key in (
         "target_specified",
@@ -3848,6 +3848,10 @@ def _merge_asset_reference(existing: dict[str, Any], update: dict[str, Any]) -> 
     ):
         if update.get(key) and not existing.get(key):
             existing[key] = update[key]
+
+
+def _asset_reference_kind_rank(kind: Any) -> int:
+    return {"delivery": 3, "reference": 2, "ambiguous": 1}.get(str(kind or ""), 0)
 
 
 def _normalize_asset_path_candidate(raw_path: str) -> str | None:

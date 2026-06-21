@@ -179,6 +179,45 @@ def test_contract_check_blocks_delivery_asset_without_provenance(tmp_path: Path)
     )
 
 
+def test_contract_check_delivery_dominates_duplicate_reference_asset_mentions(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Assets
+
+### Reference assets
+
+- `.sikula/task-assets/success-check.svg` as a visual reference screenshot.
+
+## Scope
+- Use `.sikula/task-assets/success-check.svg` as the success state icon.
+  - Target: `app/src/main/res/drawable/success_check.svg`
+
+## Acceptance criteria
+- The success state shows the new icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert len(result.asset_references) == 1
+    assert result.asset_references[0]["kind"] == "delivery"
+    assert result.asset_references[0]["target_specified"] is True
+    assert any(gap.id == "gap.assets.provenance" and gap.severity == "blocking" for gap in result.gaps)
+    assert any(
+        question.id == "assets.provenance" and question.blocks_delivery for question in result.clarifying_questions
+    )
+
+
 def test_contract_check_captures_delivery_asset_target_and_source_license(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
     asset_path.parent.mkdir(parents=True)
