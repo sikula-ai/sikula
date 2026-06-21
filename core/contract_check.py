@@ -3893,7 +3893,7 @@ def _asset_path_candidates(line: str) -> list[str]:
 
 
 def _asset_candidate_starts_with_metadata_label(value: str) -> bool:
-    return bool(re.match(r"\s*(?:source/license|source|license|licence|provenance)\s*:", value, re.IGNORECASE))
+    return bool(re.match(r"\s*(?:source/license|license|licence|provenance)\s*:", value, re.IGNORECASE))
 
 
 def _asset_candidate_is_target_path(line: str, start_index: int) -> bool:
@@ -3903,7 +3903,7 @@ def _asset_candidate_is_target_path(line: str, start_index: int) -> bool:
 
 def _asset_candidate_is_provenance_detail_path(line: str, start_index: int) -> bool:
     prefix = line[:start_index].lower()
-    return bool(re.search(r"\b(?:source/license|source|license|licence|provenance)\s*:\s*", prefix))
+    return bool(re.search(r"\b(?:source/license|license|licence|provenance)\s*:\s*", prefix))
 
 
 def _asset_candidate_is_destination_path(
