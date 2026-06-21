@@ -864,6 +864,7 @@ def improve_contract_text(
         source_path,
         question_dicts,
         normalized_answers,
+        asset_references=source_result.asset_references,
         generated_answer_entries=generated_answer_entries,
     )
     check_result = check_contract(
@@ -973,7 +974,7 @@ def prepare_implementation_contract(
     """Prepare an implementation contract through an in-memory check/improve loop."""
 
     source_format = "text" if contract_name and Path(contract_name).suffix.lower() == ".txt" else "markdown"
-    project_config = None
+    project_config = _prepare_project_config_from_contract_name(contract_name)
     normalized_project_context = _normalize_prepare_project_context(project_context)
     project_context_blockers = _prepare_project_context_blockers(normalized_project_context)
     validation_commands = _validation_commands_from_prepare_context(normalized_project_context)
@@ -1818,6 +1819,16 @@ def _normalize_prepare_project_context(
     )
 
 
+def _prepare_project_config_from_contract_name(contract_name: str | None) -> dict[str, Any] | None:
+    if not contract_name:
+        return None
+    path = Path(str(contract_name))
+    if not path.is_absolute() and ".sikula" not in path.parts:
+        return None
+    project_root = _asset_project_root(contract_name, None)
+    return {"project": {"root_path": str(project_root)}}
+
+
 def _normalize_prepare_delivery_environment(project_context: dict[str, Any]) -> PrepareDeliveryEnvironment | None:
     value = project_context.get("delivery_environment")
     if isinstance(value, PrepareDeliveryEnvironment):
@@ -2210,6 +2221,7 @@ def _render_improved_contract(
     questions: list[dict[str, Any]],
     answers: dict[str, dict[str, Any]],
     *,
+    asset_references: list[dict[str, Any]] | None = None,
     generated_answer_entries: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[str], list[str]]:
     answered_question_ids = [question["id"] for question in questions if _answer_text(answers.get(question["id"], {}))]
@@ -2233,6 +2245,10 @@ def _render_improved_contract(
         notes = _answer_notes(answer)
         if answer_text:
             answered_ids.append(question_id)
+            if question_id.startswith("assets."):
+                if notes:
+                    answered_notes.append((_contract_note_label_for_question(question_id, "Assets"), notes))
+                continue
             section = _contract_section_for_question(question_id)
             section_entries.setdefault(section, []).append((question, answer_text, notes))
             if notes:
@@ -2248,6 +2264,10 @@ def _render_improved_contract(
         for question, answer_text, _notes in entries:
             _append_answer_entry(lines, question["id"], section, answer_text)
 
+    asset_answer_entries = _asset_answer_entry_lines(asset_references or [], answers)
+    if asset_answer_entries:
+        _insert_or_append_section_entries(lines, "Assets", asset_answer_entries)
+
     _append_open_questions(lines, [question for question in questions if question["id"] in open_ids], answers)
 
     if answered_notes:
@@ -2256,6 +2276,42 @@ def _render_improved_contract(
             lines.append(f"- {label}: {_single_line(notes)}")
 
     return "\n".join(lines).rstrip() + "\n", answered_ids, open_ids
+
+
+def _asset_answer_entry_lines(asset_references: list[dict[str, Any]], answers: dict[str, dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+
+    for question_id in ("assets.local_files", "assets.intent"):
+        answer_text = _answer_text(answers.get(question_id, {}))
+        if not answer_text:
+            continue
+        lines.append(_generated_answer_entry_marker(question_id))
+        for answer_line in _answer_lines(answer_text):
+            lines.append(f"- {_clean_answer_bullet(answer_line)}")
+        lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
+
+    provenance = _answer_text(answers.get("assets.provenance", {}))
+    if provenance:
+        delivery_refs = [
+            reference
+            for reference in asset_references
+            if reference.get("kind") == "delivery" and not reference.get("source_license")
+        ]
+        lines.append(_generated_answer_entry_marker("assets.provenance"))
+        if delivery_refs:
+            provenance_text = _single_line(provenance)
+            for reference in delivery_refs:
+                project_path = str(reference.get("project_path") or reference.get("path") or "").strip()
+                if not project_path:
+                    continue
+                lines.append(f"- `{project_path}`")
+                lines.append(f"  - Source/license: {provenance_text}")
+        else:
+            for answer_line in _answer_lines(provenance):
+                lines.append(f"- {_clean_answer_bullet(answer_line)}")
+        lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
+
+    return lines
 
 
 def _reconcile_rendered_open_questions(
@@ -2583,6 +2639,9 @@ def _contract_note_label_for_question(question_id: str, section: str) -> str:
         "validation.commands": "Validation",
         "reviewer.focus": "Reviewer focus",
         "context.domain_rules": "Context",
+        "assets.local_files": "Assets",
+        "assets.intent": "Asset intent",
+        "assets.provenance": "Asset provenance",
     }
     return labels.get(question_id, section)
 
@@ -3276,8 +3335,8 @@ def _detect_asset_references(
     project_config: dict | None,
 ) -> list[dict[str, Any]]:
     project_root = _asset_project_root(source_path, project_config)
-    seen: set[str] = set()
-    references: list[dict[str, Any]] = []
+    references_by_path: dict[str, dict[str, Any]] = {}
+    reference_order: list[str] = []
     current_heading = ""
     lines = text.splitlines()
 
@@ -3292,21 +3351,26 @@ def _detect_asset_references(
 
         for raw_path in _asset_path_candidates(line):
             normalized_path = _normalize_asset_path_candidate(raw_path)
-            if not normalized_path or normalized_path in seen:
+            if not normalized_path:
                 continue
             context = _asset_reference_context(current_heading, lines, line_index)
             if not _asset_reference_input_context(normalized_path, context, project_config):
                 continue
-            seen.add(normalized_path)
             reference = _asset_reference_metadata(
                 normalized_path,
                 project_root=project_root,
                 line_number=line_number,
                 context=context,
             )
-            if reference is not None:
-                references.append(reference)
-    return references
+            if reference is None:
+                continue
+            existing = references_by_path.get(normalized_path)
+            if existing is None:
+                references_by_path[normalized_path] = reference
+                reference_order.append(normalized_path)
+            else:
+                _merge_asset_reference(existing, reference)
+    return [references_by_path[path] for path in reference_order]
 
 
 def _asset_reference_context(current_heading: str, lines: list[str], line_index: int) -> str:
@@ -3315,18 +3379,66 @@ def _asset_reference_context(current_heading: str, lines: list[str], line_index:
 
 
 def _asset_path_candidates(line: str) -> list[str]:
-    candidates: list[str] = []
+    matches: list[tuple[int, int, str]] = []
     for pattern in (_MARKDOWN_LINK_RE, _CODE_SPAN_RE, _PLAIN_ASSET_PATH_RE):
-        for match in pattern.finditer(line):
-            if _asset_candidate_is_target_path(line, match.start(1)):
-                continue
-            candidates.append(match.group(1))
+        matches.extend((match.start(1), match.end(1), match.group(1)) for match in pattern.finditer(line))
+    matches.sort(key=lambda item: item[0])
+
+    candidates: list[str] = []
+    previous_asset_start: int | None = None
+    previous_asset_end: int | None = None
+    for start_index, end_index, value in matches:
+        if _asset_candidate_is_target_path(line, start_index):
+            continue
+        if _asset_candidate_is_destination_path(
+            line,
+            start_index,
+            previous_asset_start=previous_asset_start,
+            previous_asset_end=previous_asset_end,
+        ):
+            continue
+        candidates.append(value)
+        previous_asset_start = start_index
+        previous_asset_end = end_index
     return candidates
 
 
 def _asset_candidate_is_target_path(line: str, start_index: int) -> bool:
     prefix = line[:start_index].lower().rstrip("`'\" ")
     return bool(re.search(r"\b(target|destination|copy to)\s*:\s*$", prefix))
+
+
+def _asset_candidate_is_destination_path(
+    line: str,
+    start_index: int,
+    *,
+    previous_asset_start: int | None,
+    previous_asset_end: int | None,
+) -> bool:
+    if previous_asset_start is None or previous_asset_end is None:
+        return False
+    transfer_prefix = line[:previous_asset_start].casefold()
+    if not re.search(r"\b(copy|move|place|install|save|write|add|include)\b", transfer_prefix):
+        return False
+    between_paths = line[previous_asset_end:start_index].casefold().strip(" `\"'")
+    return bool(re.fullmatch(r"(?:to|into|under|at|as)\s*", between_paths))
+
+
+def _merge_asset_reference(existing: dict[str, Any], update: dict[str, Any]) -> None:
+    if existing.get("kind") == "ambiguous" and update.get("kind") in {"delivery", "reference"}:
+        existing["kind"] = update["kind"]
+    for key in (
+        "target_specified",
+        "requested_target",
+        "provenance_specified",
+        "source_license",
+        "mime_type",
+        "sha256",
+        "size_bytes",
+        "git_status",
+    ):
+        if update.get(key) and not existing.get(key):
+            existing[key] = update[key]
 
 
 def _normalize_asset_path_candidate(raw_path: str) -> str | None:

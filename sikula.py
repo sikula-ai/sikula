@@ -1256,7 +1256,7 @@ def _run_contract_prepare_auto(
     )
     return auto_prepare_implementation_contract(
         task_text,
-        contract_name=output_path.name,
+        contract_name=str(source_path),
         project_context=project_context,
         generated_answer_entries=generated_answer_entries,
         initial_answers=answers,
@@ -1304,7 +1304,7 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
     if project_context is None or not project_context.get("validation_commands"):
         result = prepare_implementation_contract(
             task_text,
-            contract_name=output_path.name,
+            contract_name=str(task_path),
             project_context=project_context,
             generated_answer_entries=generated_answer_entries,
         )
@@ -1321,7 +1321,7 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         try:
             first = prepare_implementation_contract(
                 task_text,
-                contract_name=task_path.name,
+                contract_name=str(task_path),
                 project_context=project_context,
                 generated_answer_entries=generated_answer_entries,
             )
@@ -1355,7 +1355,7 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
 
     result = prepare_implementation_contract(
         task_text,
-        contract_name=output_path.name,
+        contract_name=str(task_path),
         answers=answers,
         project_context=project_context,
         generated_answer_entries=generated_answer_entries,

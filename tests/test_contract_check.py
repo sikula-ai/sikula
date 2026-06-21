@@ -250,6 +250,35 @@ def test_contract_check_allows_delivery_asset_target_to_be_inferred(tmp_path: Pa
     assert all(question.id != "assets.target" for question in result.clarifying_questions)
 
 
+def test_contract_check_does_not_scan_copy_destination_as_input_asset(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Scope
+- Copy `.sikula/task-assets/success-check.svg` to `app/assets/success-check.svg`.
+- Source/license: provided by product team for this project.
+
+## Acceptance criteria
+- The success state shows the new icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert len(result.asset_references) == 1
+    assert result.asset_references[0]["project_path"] == ".sikula/task-assets/success-check.svg"
+    assert all(gap.id != "gap.assets.missing" for gap in result.gaps)
+
+
 def test_contract_check_does_not_treat_basename_docs_as_assets(tmp_path: Path):
     (tmp_path / "README.md").write_text("# Repo docs\n", encoding="utf-8")
     task = """# Update docs
@@ -903,6 +932,63 @@ def test_prepare_implementation_contract_adds_delivery_asset_manifest_with_targe
     assert "Source/license: provided by product team for this project." in result.prepared_contract_markdown
     assert "Target resolution: analyst should choose" not in result.prepared_contract_markdown
     assert all(gap.id != "gap.assets.provenance" for gap in result.recheck_result.gaps)
+
+
+def test_prepare_implementation_contract_applies_asset_provenance_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Assets
+
+### Delivery assets
+
+- Use `.sikula/task-assets/success-check.svg` as the success state icon.
+
+## Scope
+- Add the success state icon to the confirmation screen.
+- Preserve the existing confirmation text and layout.
+
+## Acceptance criteria
+- The success screen shows the provided success icon.
+- Existing success message text remains unchanged.
+- Missing or invalid confirmation state still shows the existing error state.
+
+## Out of scope
+- Do not redesign the success screen.
+- Do not change confirmation copy.
+
+## Tests
+- Cover the success icon state and the existing error state.
+
+## Validation
+- `pytest`
+
+## Reviewer focus
+- Verify the provided asset is used only for the success state.
+
+## Context
+- Follow the existing confirmation screen resource conventions.
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/success-icon.md",
+        answers={"assets.provenance": "provided by product team for this project."},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "assets.provenance" in result.answered_question_ids
+    assert "assets.provenance" not in result.open_question_ids
+    assert result.recheck_result is not None
+    assert all(gap.id != "gap.assets.provenance" for gap in result.recheck_result.gaps)
+    assert "Source/license: provided by product team for this project." in result.prepared_contract_markdown
+    assert "<!-- sikula:generated-answer: assets.provenance -->" in result.resume_arguments["contract_markdown"]
 
 
 def test_prepare_implementation_contract_does_not_manifest_unresolved_assets(
@@ -4322,6 +4408,98 @@ def test_contract_prepare_cli_writes_ready_contract_without_answers(
     assert "Implementation contract written:" in out
     assert "Open questions:" in out
     assert f"Next step: sikula run {output_path}" in out
+
+
+def test_contract_prepare_cli_resolves_assets_from_config_project_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    repo = tmp_path / "repo"
+    config_path = repo / ".sikula" / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        """project:
+  root_path: .
+  build_tool: python
+  language: Python
+build:
+  test_command: pytest
+run_build: true
+run_tests: true
+run_checks: true
+""",
+        encoding="utf-8",
+    )
+    asset_path = repo / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task_path = repo / ".sikula" / "tasks" / "success-icon.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text(
+        """# Add success icon
+
+## Assets
+
+### Delivery assets
+
+- Use `.sikula/task-assets/success-check.svg` as the success state icon.
+  - Source/license: provided by product team for this project.
+
+## Scope
+- Add the success state icon to the confirmation screen.
+- Preserve the existing confirmation text and layout.
+
+## Acceptance criteria
+- The success screen shows the provided success icon.
+- Existing success message text remains unchanged.
+- Missing or invalid confirmation state still shows the existing error state.
+
+## Out of scope
+- Do not redesign the success screen.
+- Do not change confirmation copy.
+
+## Security and privacy
+- Do not log or expose any additional user data.
+
+## Tests
+- Cover the success icon state and the existing error state.
+
+## Validation
+- `pytest`
+
+## Reviewer focus
+- Verify the provided asset is used only for the success state.
+
+## Context
+- Follow the existing confirmation screen resource conventions.
+""",
+        encoding="utf-8",
+    )
+    output_path = repo / ".sikula" / "contracts" / "success-icon.contract.md"
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    monkeypatch.chdir(caller)
+
+    with patch(
+        "sys.argv",
+        [
+            "sikula",
+            "--config",
+            str(config_path),
+            "contract",
+            "prepare",
+            str(task_path),
+            "--output",
+            str(output_path),
+        ],
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    output = output_path.read_text(encoding="utf-8")
+    assert "Implementation contract written:" in out
+    assert "Referenced local asset files are missing." not in out
+    assert "## Asset manifest" in output
+    assert "- Path: `.sikula/task-assets/success-check.svg`" in output
 
 
 def test_contract_prepare_cli_project_context_blocker_does_not_write_answers_template(
