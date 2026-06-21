@@ -10,7 +10,7 @@ import mimetypes
 from pathlib import Path
 import re
 import subprocess
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import unquote, urlsplit
 
 import yaml
@@ -2389,6 +2389,13 @@ def _asset_reference_with_replacement_path(
     project_root: Path,
 ) -> dict[str, Any]:
     updated = {key: value for key, value in reference.items() if not str(key).startswith("_")}
+    match_aliases = [
+        value
+        for value in _asset_reference_match_values(reference)
+        if value != replacement_path and value != replacement_path.lstrip("./")
+    ]
+    if match_aliases:
+        updated["_match_aliases"] = list(dict.fromkeys(match_aliases))
     updated["path"] = replacement_path
     updated["project_path"] = replacement_path
 
@@ -2506,7 +2513,7 @@ def _asset_provenance_by_path(provenance: str, *, project_root: Path) -> dict[st
 
 
 def _asset_provenance_for_reference(reference: dict[str, Any], provenance_by_path: dict[str, str]) -> str:
-    for value in (reference.get("project_path"), reference.get("path")):
+    for value in _asset_reference_match_values(reference):
         for key in _asset_path_match_keys(str(value or "")):
             provenance = provenance_by_path.get(key)
             if provenance:
@@ -2657,7 +2664,7 @@ def _asset_reference_lookup(asset_references: list[dict[str, Any]]) -> dict[str,
 
 def _asset_reference_match_keys(reference: dict[str, Any]) -> set[str]:
     keys: set[str] = set()
-    for value in (reference.get("path"), reference.get("project_path")):
+    for value in _asset_reference_match_values(reference):
         normalized = Path(str(value or "")).as_posix().strip()
         if not normalized:
             continue
@@ -2665,6 +2672,23 @@ def _asset_reference_match_keys(reference: dict[str, Any]) -> set[str]:
         keys.add(normalized.lstrip("./"))
         keys.add(Path(normalized).name)
     return {key for key in keys if key}
+
+
+def _asset_reference_match_values(reference: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for value in (reference.get("path"), reference.get("project_path")):
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+    for field_name in ("_raw_paths", "_match_aliases"):
+        field_value = reference.get(field_name)
+        if isinstance(field_value, str):
+            candidates: Iterable[Any] = (field_value,)
+        else:
+            candidates = field_value or []
+        for value in candidates:
+            if isinstance(value, str) and value.strip():
+                values.append(value.strip())
+    return list(dict.fromkeys(values))
 
 
 def _asset_answer_source_key(answer_line: str, *, project_root: Path) -> str:

@@ -2444,6 +2444,70 @@ def test_prepare_implementation_contract_matches_colon_mapped_asset_answers_by_s
     assert "assets.local_files" not in result.open_question_ids
 
 
+def test_prepare_implementation_contract_preserves_original_asset_keys_after_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    spacing_path = tmp_path / ".sikula" / "task-assets" / "spacing.png"
+    button_path = tmp_path / ".sikula" / "task-assets" / "button.png"
+    spacing_path.parent.mkdir(parents=True)
+    spacing_path.write_bytes(b"spacing-png")
+    button_path.write_bytes(b"button-png")
+    task = """# Fix login visuals
+
+## Scope
+- Fix the login form spacing shown in `.sikula/task-assets/missing-spacing.png`.
+- Match the button state shown in `.sikula/task-assets/missing-button.png`.
+
+## Acceptance criteria
+- The login form spacing matches the spacing reference.
+- The button state matches the button reference.
+
+## Out of scope
+- Do not redesign the login screen.
+
+## Tests
+- Cover the login form spacing and button states.
+
+## Validation
+- `pytest`
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/login-visuals.md",
+        answers={
+            "assets.local_files": "\n".join(
+                [
+                    "missing-button.png: .sikula/task-assets/button.png",
+                    "missing-spacing.png: .sikula/task-assets/spacing.png",
+                ]
+            ),
+            "assets.intent": "\n".join(
+                [
+                    "missing-spacing.png: reference only",
+                    "missing-button.png: reference only",
+                ]
+            ),
+        },
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert ".sikula/task-assets/missing-spacing.png" not in result.prepared_contract_markdown
+    assert ".sikula/task-assets/missing-button.png" not in result.prepared_contract_markdown
+    assert "- `.sikula/task-assets/spacing.png`" in result.prepared_contract_markdown
+    assert "- `.sikula/task-assets/button.png`" in result.prepared_contract_markdown
+    assert result.prepared_contract_markdown.count("  - reference only") >= 2
+    assert result.recheck_result is not None
+    assert all(gap.id != "gap.assets.missing" for gap in result.recheck_result.gaps)
+    assert all(gap.id != "gap.assets.intent" for gap in result.recheck_result.gaps)
+    assert "assets.local_files" not in result.open_question_ids
+    assert "assets.intent" not in result.open_question_ids
+    assert "assets.local_files" in result.answered_question_ids
+    assert "assets.intent" in result.answered_question_ids
+
+
 def test_prepare_implementation_contract_keeps_unmatched_mapped_asset_answer_unresolved(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
