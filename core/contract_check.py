@@ -2468,14 +2468,20 @@ def _asset_path_replacements(
 
 def _asset_path_from_answer_line(answer_line: str, *, project_root: Path) -> str:
     cleaned = _clean_answer_bullet(answer_line)
+    normalized_paths: list[str] = []
     for candidate in _asset_path_candidates(cleaned):
         normalized = _normalize_asset_path_candidate(candidate)
         if not normalized:
             continue
         normalized = _asset_answer_path_for_project(normalized, project_root=project_root)
         if normalized:
+            normalized_paths.append(normalized)
+    if not normalized_paths:
+        return ""
+    for normalized in reversed(normalized_paths):
+        if (project_root / normalized).is_file():
             return normalized
-    return ""
+    return normalized_paths[-1]
 
 
 def _asset_answer_path_for_project(path_text: str, *, project_root: Path) -> str:
@@ -3751,15 +3757,27 @@ def _asset_candidate_has_directory(path: str) -> bool:
 def _asset_reference_input_context(path_text: str, context: str, project_config: dict | None) -> bool:
     heading = context.splitlines()[0] if context else ""
     normalized_heading = _normalize_heading(heading)
-    if "asset" in normalized_heading or "attachment" in normalized_heading:
-        return True
     if _asset_path_in_task_asset_dir(path_text, project_config):
+        return True
+    if _asset_reference_is_output_destination(path_text, context):
+        return False
+    if "asset" in normalized_heading or "attachment" in normalized_heading:
         return True
     return bool(
         _ASSET_REFERENCE_HINT_RE.search(context)
         or _ASSET_STRONG_DELIVERY_HINT_RE.search(context)
         or _ASSET_PROVENANCE_HINT_RE.search(context)
     )
+
+
+def _asset_reference_is_output_destination(path_text: str, context: str) -> bool:
+    for line in context.splitlines()[1:]:
+        if path_text not in line:
+            continue
+        prefix = line.split(path_text, 1)[0]
+        if re.search(r"\b(?:add|build|create|draw|generate|implement|write)\b", prefix, re.IGNORECASE):
+            return True
+    return False
 
 
 def _asset_path_in_task_asset_dir(path_text: str, project_config: dict | None) -> bool:
