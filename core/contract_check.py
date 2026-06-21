@@ -2598,7 +2598,7 @@ def _asset_path_replacements(
 def _asset_local_file_answer_specs(answer_text: str, *, project_root: Path) -> list[dict[str, str]]:
     specs: list[dict[str, str]] = []
     for answer_line in _answer_lines(answer_text):
-        source_text, replacement_text = _asset_answer_mapping_parts(answer_line)
+        source_text, replacement_text = _asset_answer_mapping_parts(answer_line, project_root=project_root)
         replacement_path = _asset_path_from_answer_line(replacement_text, project_root=project_root)
         if not replacement_path:
             continue
@@ -2611,11 +2611,18 @@ def _asset_local_file_answer_specs(answer_text: str, *, project_root: Path) -> l
     return specs
 
 
-def _asset_answer_mapping_parts(answer_line: str) -> tuple[str, str]:
+def _asset_answer_mapping_parts(answer_line: str, *, project_root: Path) -> tuple[str, str]:
     cleaned = _clean_answer_bullet(answer_line)
     for separator in ("->", "=>"):
         if separator in cleaned:
             left, right = cleaned.split(separator, 1)
+            return left.strip(), right.strip()
+    if ":" in cleaned:
+        left, right = cleaned.split(":", 1)
+        if _asset_answer_source_key(left, project_root=project_root) and _asset_path_from_answer_line(
+            right,
+            project_root=project_root,
+        ):
             return left.strip(), right.strip()
     return "", cleaned
 
