@@ -221,7 +221,7 @@ _ASSET_STRONG_DELIVERY_HINT_RE = re.compile(
 )
 _ASSET_TARGET_HINT_RE = re.compile(r"\b(target|target:|copy to|into|destination|path)\b", re.IGNORECASE)
 _ASSET_PROVENANCE_HINT_RE = re.compile(
-    r"\b(source/license|source:|license:|licence:|provenance|provided by|owned by)\b",
+    r"\b(source/license|license:|licence:|provenance|provided by|owned by)\b",
     re.IGNORECASE,
 )
 _ASSET_TARGET_DETAIL_RE = re.compile(
@@ -229,7 +229,7 @@ _ASSET_TARGET_DETAIL_RE = re.compile(
     re.IGNORECASE,
 )
 _ASSET_PROVENANCE_DETAIL_RE = re.compile(
-    r"\b(?:source/license|source|license|licence|provenance)\s*:\s*(.+)",
+    r"\b(?:source/license|license|licence|provenance)\s*:\s*(.+)",
     re.IGNORECASE,
 )
 
