@@ -198,12 +198,13 @@ _ASSET_REFERENCE_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 _ASSET_DELIVERY_HINT_RE = re.compile(
-    r"\b(delivery asset|use as|use this file|copy|include|ship|production asset|target:|source/license:|"
-    r"provided by|icon|font|fixture)\b",
+    r"\bdelivery asset\b|\buse\b.+\b(?:as|for)\b|\buse this file\b|\bcopy\b|\binclude\b|\bship\b|"
+    r"\bproduction asset\b|\btarget\s*:|\bsource/license\s*:|\bprovided by\b",
     re.IGNORECASE,
 )
 _ASSET_STRONG_DELIVERY_HINT_RE = re.compile(
-    r"\b(delivery assets?|target(?:\s+path)?:|copy to|destination(?:\s+path)?:|production asset|source/license:)\b",
+    r"\bdelivery assets?\b|\btarget(?:\s+path)?\s*:|\bcopy\s+to\b|"
+    r"\bdestination(?:\s+path)?\s*:|\bproduction asset\b|\bsource/license\s*:",
     re.IGNORECASE,
 )
 _ASSET_TARGET_HINT_RE = re.compile(r"\b(target|target:|copy to|into|destination|path)\b", re.IGNORECASE)

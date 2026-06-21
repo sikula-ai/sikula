@@ -528,10 +528,12 @@ def test_contract_check_does_not_treat_output_file_paths_as_assets(tmp_path: Pat
 ## Scope
 - Create `docs/new-guide.md`.
 - Add `config/example.json` with sample settings.
+- Add `app/assets/success.svg` as the success icon.
 
 ## Acceptance criteria
 - The new guide explains the setup flow.
 - The sample settings are committed with the guide.
+- The success state shows the new icon.
 
 ## Out of scope
 - Do not change runtime behaviour.
