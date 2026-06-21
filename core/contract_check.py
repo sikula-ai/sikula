@@ -869,6 +869,7 @@ def improve_contract_text(
         question_dicts,
         normalized_answers,
         asset_references=source_result.asset_references,
+        project_config=project_config,
         generated_answer_entries=generated_answer_entries,
     )
     check_result = check_contract(
@@ -2227,6 +2228,7 @@ def _render_improved_contract(
     answers: dict[str, dict[str, Any]],
     *,
     asset_references: list[dict[str, Any]] | None = None,
+    project_config: dict | None = None,
     generated_answer_entries: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[str], list[str]]:
     answered_question_ids = [question["id"] for question in questions if _answer_text(answers.get(question["id"], {}))]
@@ -2236,12 +2238,14 @@ def _render_improved_contract(
         answered_question_ids,
         generated_answer_entries or [],
     )
+    project_root = _asset_project_root(task_path, project_config)
     local_files_answer = _answer_text(answers.get("assets.local_files", {}))
     if local_files_answer:
         task_text = _replace_unresolved_asset_reference_paths(
             task_text,
             asset_references or [],
             local_files_answer,
+            project_root=project_root,
         )
     task_text = _strip_generated_open_questions_section(task_text)
     lines = _improved_contract_base_lines(task_text, task_path)
@@ -2276,7 +2280,7 @@ def _render_improved_contract(
         for question, answer_text, _notes in entries:
             _append_answer_entry(lines, question["id"], section, answer_text)
 
-    asset_answer_entries = _asset_answer_entry_lines(asset_references or [], answers)
+    asset_answer_entries = _asset_answer_entry_lines(asset_references or [], answers, project_root=project_root)
     if asset_answer_entries:
         _insert_or_append_section_entries(lines, "Assets", asset_answer_entries)
 
@@ -2290,21 +2294,25 @@ def _render_improved_contract(
     return "\n".join(lines).rstrip() + "\n", answered_ids, open_ids
 
 
-def _asset_answer_entry_lines(asset_references: list[dict[str, Any]], answers: dict[str, dict[str, Any]]) -> list[str]:
+def _asset_answer_entry_lines(
+    asset_references: list[dict[str, Any]],
+    answers: dict[str, dict[str, Any]],
+    *,
+    project_root: Path,
+) -> list[str]:
     lines: list[str] = []
 
     local_files_answer = _answer_text(answers.get("assets.local_files", {}))
     if local_files_answer:
         lines.append(_generated_answer_entry_marker("assets.local_files"))
-        lines.extend(_asset_local_file_answer_entries(local_files_answer, asset_references))
+        lines.extend(_asset_local_file_answer_entries(local_files_answer, asset_references, project_root=project_root))
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
 
     intent_answer = _answer_text(answers.get("assets.intent", {}))
     if intent_answer:
         question_id = "assets.intent"
         lines.append(_generated_answer_entry_marker(question_id))
-        for answer_line in _answer_lines(intent_answer):
-            lines.append(f"- {_clean_answer_bullet(answer_line)}")
+        lines.extend(_asset_intent_answer_entries(intent_answer, asset_references, project_root=project_root))
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
 
     provenance = _answer_text(answers.get("assets.provenance", {}))
@@ -2316,7 +2324,7 @@ def _asset_answer_entry_lines(asset_references: list[dict[str, Any]], answers: d
         ]
         lines.append(_generated_answer_entry_marker("assets.provenance"))
         if delivery_refs:
-            lines.extend(_asset_provenance_answer_entries(provenance, delivery_refs))
+            lines.extend(_asset_provenance_answer_entries(provenance, delivery_refs, project_root=project_root))
         else:
             for answer_line in _answer_lines(provenance):
                 lines.append(f"- {_clean_answer_bullet(answer_line)}")
@@ -2325,9 +2333,31 @@ def _asset_answer_entry_lines(asset_references: list[dict[str, Any]], answers: d
     return lines
 
 
-def _asset_provenance_answer_entries(provenance: str, delivery_refs: list[dict[str, Any]]) -> list[str]:
+def _asset_intent_answer_entries(
+    intent_answer: str,
+    asset_references: list[dict[str, Any]],
+    *,
+    project_root: Path,
+) -> list[str]:
+    answer_lines = _answer_lines(intent_answer)
+    ambiguous_refs = [reference for reference in asset_references if reference.get("kind") == "ambiguous"]
+    if len(ambiguous_refs) == 1 and len(answer_lines) == 1:
+        answer_line = _clean_answer_bullet(answer_lines[0])
+        if not _asset_path_from_answer_line(answer_line, project_root=project_root):
+            project_path = str(ambiguous_refs[0].get("project_path") or ambiguous_refs[0].get("path") or "").strip()
+            if project_path:
+                return [f"- `{project_path}`", f"  - {answer_line}"]
+    return [f"- {_clean_answer_bullet(answer_line)}" for answer_line in answer_lines]
+
+
+def _asset_provenance_answer_entries(
+    provenance: str,
+    delivery_refs: list[dict[str, Any]],
+    *,
+    project_root: Path,
+) -> list[str]:
     entries: list[str] = []
-    path_specific_provenance = _asset_provenance_by_path(provenance)
+    path_specific_provenance = _asset_provenance_by_path(provenance, project_root=project_root)
     common_provenance = _single_line(provenance) if not path_specific_provenance else ""
 
     for reference in delivery_refs:
@@ -2342,12 +2372,15 @@ def _asset_provenance_answer_entries(provenance: str, delivery_refs: list[dict[s
     return entries
 
 
-def _asset_provenance_by_path(provenance: str) -> dict[str, str]:
+def _asset_provenance_by_path(provenance: str, *, project_root: Path) -> dict[str, str]:
     provenance_by_path: dict[str, str] = {}
     for answer_line in _answer_lines(provenance):
         cleaned = _clean_answer_bullet(answer_line)
         for candidate in _asset_path_candidates(cleaned):
             normalized = _normalize_asset_path_candidate(candidate)
+            if not normalized:
+                continue
+            normalized = _asset_answer_path_for_project(normalized, project_root=project_root)
             if not normalized:
                 continue
             provenance_text = _asset_provenance_text_without_path(cleaned, candidate)
@@ -2398,8 +2431,10 @@ def _replace_unresolved_asset_reference_paths(
     task_text: str,
     asset_references: list[dict[str, Any]],
     answer_text: str,
+    *,
+    project_root: Path,
 ) -> str:
-    replacements = _asset_path_replacements(asset_references, answer_text)
+    replacements = _asset_path_replacements(asset_references, answer_text, project_root=project_root)
     if not replacements:
         return task_text
 
@@ -2415,9 +2450,13 @@ def _replace_unresolved_asset_reference_paths(
 def _asset_path_replacements(
     asset_references: list[dict[str, Any]],
     answer_text: str,
+    *,
+    project_root: Path,
 ) -> list[tuple[dict[str, Any], str]]:
     unresolved_references = _unresolved_asset_references(asset_references)
-    answer_paths = [_asset_path_from_answer_line(line) for line in _answer_lines(answer_text)]
+    answer_paths = [
+        _asset_path_from_answer_line(line, project_root=project_root) for line in _answer_lines(answer_text)
+    ]
     answer_paths = [path for path in answer_paths if path]
     replacements: list[tuple[dict[str, Any], str]] = []
     for index, reference in enumerate(unresolved_references):
@@ -2427,21 +2466,39 @@ def _asset_path_replacements(
     return replacements
 
 
-def _asset_path_from_answer_line(answer_line: str) -> str:
+def _asset_path_from_answer_line(answer_line: str, *, project_root: Path) -> str:
     cleaned = _clean_answer_bullet(answer_line)
     for candidate in _asset_path_candidates(cleaned):
         normalized = _normalize_asset_path_candidate(candidate)
+        if not normalized:
+            continue
+        normalized = _asset_answer_path_for_project(normalized, project_root=project_root)
         if normalized:
             return normalized
     return ""
 
 
-def _asset_local_file_answer_entries(answer_text: str, asset_references: list[dict[str, Any]]) -> list[str]:
+def _asset_answer_path_for_project(path_text: str, *, project_root: Path) -> str:
+    path = Path(path_text)
+    candidate = path if path.is_absolute() else project_root / path
+    try:
+        relative = candidate.resolve(strict=False).relative_to(project_root.resolve(strict=False))
+    except (OSError, ValueError):
+        return ""
+    return relative.as_posix()
+
+
+def _asset_local_file_answer_entries(
+    answer_text: str,
+    asset_references: list[dict[str, Any]],
+    *,
+    project_root: Path,
+) -> list[str]:
     unresolved_references = _unresolved_asset_references(asset_references)
     fallback_kind = _asset_replacement_kind(unresolved_references)
     entries: list[str] = []
     for index, answer_line in enumerate(_answer_lines(answer_text)):
-        answer_path = _asset_path_from_answer_line(answer_line)
+        answer_path = _asset_path_from_answer_line(answer_line, project_root=project_root)
         if not answer_path:
             continue
         reference = _matching_unresolved_asset_reference(unresolved_references, index)
