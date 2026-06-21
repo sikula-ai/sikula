@@ -3840,10 +3840,11 @@ def _detect_asset_references(
             )
             if reference is None:
                 continue
-            existing = references_by_path.get(normalized_path)
+            reference_key = _asset_reference_identity_key(reference, normalized_path)
+            existing = references_by_path.get(reference_key)
             if existing is None:
-                references_by_path[normalized_path] = reference
-                reference_order.append(normalized_path)
+                references_by_path[reference_key] = reference
+                reference_order.append(reference_key)
             else:
                 _merge_asset_reference(existing, reference)
     return [references_by_path[path] for path in reference_order]
@@ -4013,9 +4014,22 @@ def _asset_destination_separator_between_paths(text: str) -> bool:
     return len(words) <= 5
 
 
+def _asset_reference_identity_key(reference: dict[str, Any], fallback_path: str) -> str:
+    project_path = str(reference.get("project_path") or "").strip()
+    if project_path:
+        return project_path
+    normalized_fallback = Path(fallback_path).as_posix().strip()
+    return normalized_fallback or str(fallback_path).strip()
+
+
 def _merge_asset_reference(existing: dict[str, Any], update: dict[str, Any]) -> None:
     if _asset_reference_kind_rank(update.get("kind")) > _asset_reference_kind_rank(existing.get("kind")):
         existing["kind"] = update["kind"]
+    update_path = str(update.get("path") or "").strip()
+    if update_path and update_path != str(existing.get("path") or "").strip():
+        existing.setdefault("_raw_paths", [])
+        if update_path not in existing["_raw_paths"]:
+            existing["_raw_paths"].append(update_path)
     for raw_path in update.get("_raw_paths") or []:
         if not isinstance(raw_path, str) or not raw_path.strip():
             continue
@@ -4172,6 +4186,10 @@ def _asset_reference_metadata(
     requested_path = Path(path_text)
     candidate_path = requested_path if requested_path.is_absolute() else project_root / requested_path
     resolved_path = candidate_path.resolve(strict=False)
+    try:
+        project_path = resolved_path.relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        project_path = ""
     reference: dict[str, Any] = {
         "path": path_text,
         "line": line_number,
@@ -4185,14 +4203,17 @@ def _asset_reference_metadata(
         if requested_target:
             reference["requested_target"] = requested_target
     if _ASSET_PROVENANCE_HINT_RE.search(context):
-        source_license = _asset_reference_detail(context, _ASSET_PROVENANCE_DETAIL_RE)
+        source_license = _asset_reference_detail_for_reference(
+            context,
+            _ASSET_PROVENANCE_DETAIL_RE,
+            {"path": path_text, "project_path": project_path},
+            project_root=project_root,
+        )
         if source_license:
             reference["provenance_specified"] = True
             reference["source_license"] = source_license
 
-    try:
-        project_path = resolved_path.relative_to(project_root.resolve()).as_posix()
-    except ValueError:
+    if not project_path:
         reference["status"] = "outside_project"
         return reference
 
@@ -4224,6 +4245,69 @@ def _asset_reference_kind(context: str) -> str:
     if _ASSET_REFERENCE_HINT_RE.search(context):
         return "reference"
     return "ambiguous"
+
+
+def _asset_reference_detail_for_reference(
+    context: str,
+    pattern: re.Pattern[str],
+    reference: dict[str, Any],
+    *,
+    project_root: Path,
+) -> str | None:
+    common_detail: str | None = None
+    for line in context.splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        value = _clean_answer_bullet(match.group(1)).strip("` ")
+        detail = _single_line(value)
+        if not detail:
+            continue
+        specific_detail = _path_specific_asset_detail(detail, reference, project_root=project_root)
+        if specific_detail is not None:
+            if specific_detail:
+                return specific_detail
+            continue
+        if common_detail is None:
+            common_detail = detail
+    return common_detail
+
+
+def _path_specific_asset_detail(detail: str, reference: dict[str, Any], *, project_root: Path) -> str | None:
+    reference_keys = _asset_reference_match_keys(reference)
+    saw_path_specific_detail = False
+    for candidate in _asset_detail_path_candidates(detail):
+        candidate_key = _asset_detail_path_key(candidate, project_root=project_root)
+        if not candidate_key:
+            continue
+        saw_path_specific_detail = True
+        if candidate_key in reference_keys:
+            return _asset_provenance_text_without_path(detail, candidate)
+    if saw_path_specific_detail:
+        return ""
+    return None
+
+
+def _asset_detail_path_candidates(detail: str) -> list[str]:
+    candidates = list(_asset_path_candidates(detail))
+    seen = set(candidates)
+    for match in _ASSET_FILENAME_RE.finditer(detail):
+        candidate = match.group(1)
+        if candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+    return candidates
+
+
+def _asset_detail_path_key(path_text: str, *, project_root: Path) -> str:
+    normalized = _normalize_asset_path_candidate(path_text)
+    if normalized:
+        project_path = _asset_answer_path_for_project(normalized, project_root=project_root)
+        if project_path:
+            return project_path
+        return normalized
+    filename_match = _ASSET_FILENAME_RE.fullmatch(path_text.strip())
+    return filename_match.group(1) if filename_match else ""
 
 
 def _asset_reference_detail(context: str, pattern: re.Pattern[str]) -> str | None:
