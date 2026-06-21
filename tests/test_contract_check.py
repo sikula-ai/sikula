@@ -788,6 +788,47 @@ def test_contract_check_limits_asset_context_to_current_list_item(tmp_path: Path
     )
 
 
+def test_contract_check_keeps_plain_text_asset_subsections_as_siblings(tmp_path: Path):
+    reference_path = tmp_path / ".sikula" / "task-assets" / "reference.png"
+    delivery_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    reference_path.parent.mkdir(parents=True)
+    reference_path.write_bytes(b"fake-png")
+    delivery_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Assets
+
+Reference assets:
+
+- `.sikula/task-assets/reference.png`
+
+Delivery assets:
+
+- `.sikula/task-assets/success-check.svg`
+
+## Scope
+- Add a success icon based on the delivery asset.
+
+## Acceptance criteria
+- The success state shows the icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    references = {reference["project_path"]: reference for reference in result.asset_references}
+    assert references[".sikula/task-assets/reference.png"]["kind"] == "reference"
+    assert references[".sikula/task-assets/success-check.svg"]["kind"] == "delivery"
+    assert any(gap.id == "gap.assets.provenance" and gap.severity == "blocking" for gap in result.gaps)
+
+
 def test_contract_check_does_not_treat_basename_docs_as_assets(tmp_path: Path):
     (tmp_path / "README.md").write_text("# Repo docs\n", encoding="utf-8")
     task = """# Update docs

@@ -3852,14 +3852,39 @@ def _asset_update_heading_stack(
 
 
 def _asset_text_heading_level(heading_stack: list[tuple[int, str]]) -> int:
-    asset_levels = [
-        level
-        for level, heading in heading_stack
-        if "asset" in _normalize_heading(heading) or "attachment" in _normalize_heading(heading)
-    ]
-    if asset_levels:
-        return max(asset_levels) + 1
+    if heading_stack and _asset_subsection_heading(heading_stack[-1][1]):
+        return heading_stack[-1][0]
+    for level, heading in reversed(heading_stack):
+        if _asset_root_section_heading(heading):
+            return level + 1
     return 2
+
+
+def _asset_root_section_heading(heading: str) -> bool:
+    return _normalize_heading(heading) in {
+        "asset",
+        "assets",
+        "attachment",
+        "attachments",
+        "task asset",
+        "task assets",
+        "task attachment",
+        "task attachments",
+    }
+
+
+def _asset_subsection_heading(heading: str) -> bool:
+    normalized = _normalize_heading(heading)
+    return normalized in {
+        "reference asset",
+        "reference assets",
+        "delivery asset",
+        "delivery assets",
+        "mockup",
+        "mockups",
+        "screenshot",
+        "screenshots",
+    }
 
 
 def _asset_context_headings(heading_stack: list[tuple[int, str]]) -> list[str]:
