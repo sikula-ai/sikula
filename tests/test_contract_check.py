@@ -510,6 +510,41 @@ def test_contract_check_treats_use_for_second_path_as_destination(tmp_path: Path
     assert all(gap.id != "gap.assets.missing" for gap in result.gaps)
 
 
+def test_contract_check_treats_decorated_second_path_as_destination(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Assets
+
+### Delivery assets
+
+- Use `.sikula/task-assets/success-check.svg` as the new `app/assets/success-check.svg` icon.
+  - Source/license: provided by product team for this project.
+
+## Scope
+- Add the success state icon.
+
+## Acceptance criteria
+- The success state shows the new icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert len(result.asset_references) == 1
+    assert result.asset_references[0]["project_path"] == ".sikula/task-assets/success-check.svg"
+    assert all(gap.id != "gap.assets.missing" for gap in result.gaps)
+
+
 def test_contract_check_classifies_delivery_asset_heading_as_delivery(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
     asset_path.parent.mkdir(parents=True)

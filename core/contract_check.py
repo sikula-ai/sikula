@@ -3919,7 +3919,32 @@ def _asset_candidate_is_destination_path(
     if not re.search(r"\b(copy|move|place|install|save|write|add|include|use)\b", transfer_prefix):
         return False
     between_paths = line[previous_asset_end:start_index].casefold().strip(" `\"'")
-    return bool(re.fullmatch(r"(?:to|into|under|at|as|for)\s*", between_paths))
+    return _asset_destination_separator_between_paths(between_paths)
+
+
+def _asset_destination_separator_between_paths(text: str) -> bool:
+    words = re.findall(r"[a-z][a-z-]*", text.casefold())
+    if not words or words[0] not in {"to", "into", "under", "at", "as", "for"}:
+        return False
+    if any(
+        word
+        in {
+            "reference",
+            "compare",
+            "compared",
+            "according",
+            "based",
+            "basis",
+            "from",
+            "with",
+            "using",
+            "via",
+            "against",
+        }
+        for word in words[1:]
+    ):
+        return False
+    return len(words) <= 5
 
 
 def _merge_asset_reference(existing: dict[str, Any], update: dict[str, Any]) -> None:
