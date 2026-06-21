@@ -215,7 +215,7 @@ _ASSET_DELIVERY_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 _ASSET_STRONG_DELIVERY_HINT_RE = re.compile(
-    r"\bdelivery assets?\b|\btarget(?:\s+path)?\s*:|\bcopy\s+to\b|"
+    r"\bdelivery assets?\b|\btarget(?:\s+path)?\s*:|\bcopy\b.+\b(?:to|into|under|at)\b|"
     r"\bdestination(?:\s+path)?\s*:|\bproduction asset\b|\bsource/license\s*:",
     re.IGNORECASE,
 )

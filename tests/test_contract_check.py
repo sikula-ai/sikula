@@ -900,6 +900,35 @@ def test_contract_check_does_not_scan_copy_destination_as_input_asset(tmp_path: 
     assert all(gap.id != "gap.assets.missing" for gap in result.gaps)
 
 
+def test_contract_check_recognizes_copy_into_source_as_delivery_asset(tmp_path: Path):
+    asset_path = tmp_path / "designs" / "success.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Scope
+- Copy `designs/success.svg` into `app/assets/success.svg`.
+
+## Acceptance criteria
+- The success state shows the new icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert len(result.asset_references) == 1
+    assert result.asset_references[0]["project_path"] == "designs/success.svg"
+    assert result.asset_references[0]["kind"] == "delivery"
+    assert any(gap.id == "gap.assets.provenance" and gap.severity == "blocking" for gap in result.gaps)
+
+
 def test_contract_check_limits_asset_context_to_current_list_item(tmp_path: Path):
     reference_path = tmp_path / ".sikula" / "task-assets" / "reference.png"
     delivery_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
