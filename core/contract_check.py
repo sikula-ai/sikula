@@ -193,6 +193,12 @@ _PLAIN_ASSET_PATH_RE = re.compile(
     r"(?![\w/.-])",
     re.IGNORECASE,
 )
+_ASSET_FILENAME_RE = re.compile(
+    r"(?<![\w/.-])"
+    r"([A-Za-z0-9_.@%+=-]+\.(?:avif|csv|gif|ico|jpe?g|json|md|otf|pdf|png|svg|ttf|txt|webp|woff2?|xml|ya?ml|zip))"
+    r"(?![\w/.-])",
+    re.IGNORECASE,
+)
 _ASSET_REFERENCE_HINT_RE = re.compile(
     r"\b(reference assets?|reference only|do not copy|screenshot|mockup|design reference|layout reference|spec excerpt)\b",
     re.IGNORECASE,
@@ -2454,16 +2460,101 @@ def _asset_path_replacements(
     project_root: Path,
 ) -> list[tuple[dict[str, Any], str]]:
     unresolved_references = _unresolved_asset_references(asset_references)
-    answer_paths = [
-        _asset_path_from_answer_line(line, project_root=project_root) for line in _answer_lines(answer_text)
-    ]
-    answer_paths = [path for path in answer_paths if path]
+    answer_specs = _asset_local_file_answer_specs(answer_text, project_root=project_root)
+    reference_lookup = _asset_reference_lookup(unresolved_references)
+    used_reference_ids: set[int] = set()
     replacements: list[tuple[dict[str, Any], str]] = []
-    for index, reference in enumerate(unresolved_references):
-        replacement_path = answer_paths[index] if index < len(answer_paths) else ""
-        if replacement_path:
-            replacements.append((reference, replacement_path))
+    for spec in answer_specs:
+        replacement_path = spec["replacement_path"]
+        reference = _asset_reference_for_answer_spec(
+            spec,
+            unresolved_references,
+            reference_lookup,
+            used_reference_ids,
+        )
+        if reference is None:
+            continue
+        replacements.append((reference, replacement_path))
+        used_reference_ids.add(id(reference))
     return replacements
+
+
+def _asset_local_file_answer_specs(answer_text: str, *, project_root: Path) -> list[dict[str, str]]:
+    specs: list[dict[str, str]] = []
+    for answer_line in _answer_lines(answer_text):
+        source_text, replacement_text = _asset_answer_mapping_parts(answer_line)
+        replacement_path = _asset_path_from_answer_line(replacement_text, project_root=project_root)
+        if not replacement_path:
+            continue
+        specs.append(
+            {
+                "source_key": _asset_answer_source_key(source_text, project_root=project_root),
+                "replacement_path": replacement_path,
+            }
+        )
+    return specs
+
+
+def _asset_answer_mapping_parts(answer_line: str) -> tuple[str, str]:
+    cleaned = _clean_answer_bullet(answer_line)
+    for separator in ("->", "=>"):
+        if separator in cleaned:
+            left, right = cleaned.split(separator, 1)
+            return left.strip(), right.strip()
+    return "", cleaned
+
+
+def _asset_reference_for_answer_spec(
+    spec: dict[str, str],
+    unresolved_references: list[dict[str, Any]],
+    reference_lookup: dict[str, dict[str, Any]],
+    used_reference_ids: set[int],
+) -> dict[str, Any] | None:
+    source_key = spec.get("source_key")
+    if source_key:
+        reference = reference_lookup.get(source_key)
+        if reference is not None and id(reference) not in used_reference_ids:
+            return reference
+    for reference in unresolved_references:
+        if id(reference) not in used_reference_ids:
+            return reference
+    return None
+
+
+def _asset_reference_lookup(asset_references: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    references_by_key: dict[str, dict[str, Any]] = {}
+    key_counts: dict[str, int] = {}
+    for reference in asset_references:
+        for key in _asset_reference_match_keys(reference):
+            key_counts[key] = key_counts.get(key, 0) + 1
+            references_by_key[key] = reference
+    return {key: reference for key, reference in references_by_key.items() if key_counts.get(key) == 1}
+
+
+def _asset_reference_match_keys(reference: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for value in (reference.get("path"), reference.get("project_path")):
+        normalized = Path(str(value or "")).as_posix().strip()
+        if not normalized:
+            continue
+        keys.add(normalized)
+        keys.add(normalized.lstrip("./"))
+        keys.add(Path(normalized).name)
+    return {key for key in keys if key}
+
+
+def _asset_answer_source_key(answer_line: str, *, project_root: Path) -> str:
+    cleaned = _clean_answer_bullet(answer_line)
+    for candidate in _asset_path_candidates(cleaned):
+        normalized = _normalize_asset_path_candidate(candidate)
+        if not normalized:
+            continue
+        normalized = _asset_answer_path_for_project(normalized, project_root=project_root)
+        if normalized:
+            return normalized
+    for match in _ASSET_FILENAME_RE.finditer(cleaned):
+        return match.group(1)
+    return ""
 
 
 def _asset_path_from_answer_line(answer_line: str, *, project_root: Path) -> str:
@@ -2502,16 +2593,23 @@ def _asset_local_file_answer_entries(
 ) -> list[str]:
     unresolved_references = _unresolved_asset_references(asset_references)
     fallback_kind = _asset_replacement_kind(unresolved_references)
+    answer_specs = _asset_local_file_answer_specs(answer_text, project_root=project_root)
+    reference_lookup = _asset_reference_lookup(unresolved_references)
+    used_reference_ids: set[int] = set()
     entries: list[str] = []
-    for index, answer_line in enumerate(_answer_lines(answer_text)):
-        answer_path = _asset_path_from_answer_line(answer_line, project_root=project_root)
-        if not answer_path:
-            continue
-        reference = _matching_unresolved_asset_reference(unresolved_references, index)
+    for spec in answer_specs:
+        answer_path = spec["replacement_path"]
+        reference = _asset_reference_for_answer_spec(
+            spec,
+            unresolved_references,
+            reference_lookup,
+            used_reference_ids,
+        )
         replacement_kind = str(reference.get("kind") or fallback_kind) if reference else fallback_kind
         entries.append(_asset_local_file_answer_line(answer_path, replacement_kind))
         if reference:
             entries.extend(_asset_preserved_metadata_lines(reference))
+            used_reference_ids.add(id(reference))
     return entries
 
 
@@ -2521,19 +2619,6 @@ def _unresolved_asset_references(asset_references: list[dict[str, Any]]) -> list
         for reference in asset_references
         if reference.get("status") in {"missing", "outside_project", "not_file"}
     ]
-
-
-def _matching_unresolved_asset_reference(
-    unresolved_references: list[dict[str, Any]],
-    index: int,
-) -> dict[str, Any] | None:
-    if not unresolved_references:
-        return None
-    if index < len(unresolved_references):
-        return unresolved_references[index]
-    if len(unresolved_references) == 1:
-        return unresolved_references[0]
-    return None
 
 
 def _asset_replacement_kind(asset_references: list[dict[str, Any]]) -> str:
