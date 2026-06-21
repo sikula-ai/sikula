@@ -257,6 +257,10 @@ Prefer an explicit section:
   - Source/license: provided by product team for this project.
 ```
 
+Put per-asset metadata as nested bullets under that asset item. Same-level
+bullets are treated as separate task requirements, not as metadata for the
+previous asset.
+
 Sikula treats asset paths deterministically during contract readiness checks:
 referenced local files are resolved inside the project boundary, hashed, and
 reported with lightweight metadata. Missing files, paths outside the project,
@@ -271,7 +275,9 @@ adds an `Asset manifest` section to the implementation contract with the
 resolved project path, hash, asset intent, and any explicit target or
 source/license details from the task. Missing, ambiguous, or out-of-project
 assets remain follow-up questions instead of being silently added to the
-contract.
+contract. If you answer an `assets.local_files` question, provide supported
+local project paths, one per unresolved asset. Free text such as `n/a` does
+not resolve a missing asset reference.
 
 ## Feature Example
 
