@@ -174,6 +174,8 @@ def test_task_preparer_refine_prompt_disallows_unreferenced_sikula_artifacts(tmp
     assert "- implementation contracts: docs/contracts" in prompt
     assert "- reports and answers: .generated/sikula-contract-reports" in prompt
     assert "unless the raw task explicitly references them" in prompt
+    assert "Preserve local asset paths exactly" in prompt
+    assert "Do not invent asset target paths" in prompt
 
 
 def test_task_preparer_refine_result_includes_audit_record(tmp_path: Path):
@@ -235,6 +237,7 @@ def test_task_preparer_refine_answer_prompt_stays_product_level(tmp_path: Path):
     assert "Current normalized task draft:" in prompt
     assert "Do not inspect arbitrary source files for implementation details" in prompt
     assert "Do not invent product requirements" in prompt
+    assert "If an asset's reference-vs-delivery intent or provenance is unclear" in prompt
     assert "- task descriptions: docs/product-tasks" in prompt
 
 

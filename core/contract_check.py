@@ -31,6 +31,7 @@ _GENERATED_OPEN_QUESTIONS_MARKER = "<!-- sikula:generated-open-questions -->"
 _IMPLEMENTATION_CONTEXT_ENTRY_IDS = [
     "project_context.details",
     "project_context.validation_commands",
+    "asset_manifest.references",
 ]
 
 _STATUS_THRESHOLDS = (
@@ -131,6 +132,9 @@ _SECTION_ALIASES = {
         "files",
         "references",
     },
+    "asset_manifest": {
+        "asset manifest",
+    },
 }
 
 _SECURITY_RISK_RE = re.compile(
@@ -198,9 +202,18 @@ _ASSET_DELIVERY_HINT_RE = re.compile(
     r"provided by|icon|font|fixture)\b",
     re.IGNORECASE,
 )
+_ASSET_STRONG_DELIVERY_HINT_RE = re.compile(
+    r"\b(delivery assets?|target:|copy to|destination:|production asset|source/license:)\b",
+    re.IGNORECASE,
+)
 _ASSET_TARGET_HINT_RE = re.compile(r"\b(target|target:|copy to|into|destination|path)\b", re.IGNORECASE)
 _ASSET_PROVENANCE_HINT_RE = re.compile(
     r"\b(source/license|source:|license:|licence:|provenance|provided by|owned by)\b",
+    re.IGNORECASE,
+)
+_ASSET_TARGET_DETAIL_RE = re.compile(r"\b(?:target|destination|copy to)\s*:\s*(.+)", re.IGNORECASE)
+_ASSET_PROVENANCE_DETAIL_RE = re.compile(
+    r"\b(?:source/license|source|license|licence|provenance)\s*:\s*(.+)",
     re.IGNORECASE,
 )
 
@@ -1009,6 +1022,7 @@ def prepare_implementation_contract(
             improved.resume_markdown,
             normalized_project_context,
             generated_answer_entries=generated_answer_entries,
+            asset_references=improved.check_result.asset_references,
         )
         enriched_check_result = check_contract(
             prepared_contract_markdown,
@@ -1034,6 +1048,7 @@ def prepare_implementation_contract(
         source_contract_markdown,
         normalized_project_context,
         generated_answer_entries=generated_answer_entries,
+        asset_references=check_result.asset_references,
     )
     recheck_result = None
     if prepared_contract_markdown != evaluation_contract_markdown.strip() + "\n":
@@ -1080,6 +1095,7 @@ def _prepare_active_questions_for_answers(
         contract_markdown,
         project_context,
         generated_answer_entries=generated_answer_entries,
+        asset_references=check_result.asset_references,
     )
     if enriched_markdown == _strip_generated_markers(contract_markdown).strip() + "\n":
         return questions
@@ -1636,6 +1652,7 @@ def _enrich_implementation_contract_markdown(
     project_context: PrepareProjectContext | None,
     *,
     generated_answer_entries: list[dict[str, Any]] | None = None,
+    asset_references: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
     source = contract_markdown.strip()
     source = _strip_generated_answer_entries(source, _IMPLEMENTATION_CONTEXT_ENTRY_IDS)
@@ -1656,6 +1673,11 @@ def _enrich_implementation_contract_markdown(
         validation_entries = _implementation_validation_entry_lines(project_context, current_markdown)
         if validation_entries:
             _insert_or_append_section_entries(lines, "Validation", validation_entries)
+
+    current_markdown = "\n".join(lines)
+    asset_manifest_entries = _implementation_asset_manifest_entry_lines(asset_references or [], current_markdown)
+    if asset_manifest_entries:
+        _insert_or_append_section_entries(lines, "Asset manifest", asset_manifest_entries)
 
     resume_markdown = "\n".join(lines).rstrip() + "\n"
     return _strip_generated_markers(resume_markdown), resume_markdown
@@ -1701,6 +1723,74 @@ def _implementation_validation_entry_lines(
         *[f"- `{_clean_validation_command(command)}`" for command in commands],
         _GENERATED_ANSWER_ENTRY_END_MARKER,
     ]
+
+
+def _implementation_asset_manifest_entry_lines(
+    asset_references: list[dict[str, Any]],
+    current_markdown: str,
+) -> list[str]:
+    existing_manifest = _section_content(_parse_markdown_task(current_markdown), "asset_manifest")
+    entries: list[str] = []
+    for reference in asset_references:
+        if not _asset_reference_ready_for_manifest(reference):
+            continue
+        project_path = str(reference.get("project_path") or reference.get("path") or "").strip()
+        if not project_path or project_path in existing_manifest:
+            continue
+        entries.extend(_asset_manifest_reference_lines(reference))
+
+    if not entries:
+        return []
+    return [
+        _generated_answer_entry_marker("asset_manifest.references"),
+        *entries,
+        _GENERATED_ANSWER_ENTRY_END_MARKER,
+    ]
+
+
+def _asset_reference_ready_for_manifest(reference: dict[str, Any]) -> bool:
+    return reference.get("status") == "available" and reference.get("kind") in {"reference", "delivery"}
+
+
+def _asset_manifest_reference_lines(reference: dict[str, Any]) -> list[str]:
+    project_path = str(reference.get("project_path") or reference.get("path") or "").strip()
+    kind = str(reference.get("kind") or "reference").strip()
+    lines = [f"- Path: `{project_path}`"]
+    if kind == "delivery":
+        lines.append("  - Usage: delivery asset; use this file only for the requested implementation.")
+    else:
+        lines.append("  - Usage: reference only; do not copy this asset into production files.")
+
+    sha256_value = str(reference.get("sha256") or "").strip()
+    if sha256_value:
+        lines.append(f"  - SHA-256: `{sha256_value}`")
+
+    lines.append(_asset_manifest_purpose_line(kind))
+
+    mime_type = str(reference.get("mime_type") or "").strip()
+    if mime_type:
+        lines.append(f"  - MIME type: `{mime_type}`")
+    size_bytes = reference.get("size_bytes")
+    if isinstance(size_bytes, int):
+        lines.append(f"  - Size: {size_bytes} bytes")
+    git_status = str(reference.get("git_status") or "").strip()
+    if git_status:
+        lines.append(f"  - Git status: `{git_status}`")
+    requested_target = str(reference.get("requested_target") or "").strip()
+    if requested_target:
+        lines.append(f"  - Requested target: `{requested_target}`")
+    elif kind == "delivery":
+        lines.append("  - Target resolution: analyst should choose the project-conventional location.")
+    source_license = str(reference.get("source_license") or "").strip()
+    if kind == "delivery" and source_license:
+        lines.append(f"  - Source/license: {source_license}")
+    return lines
+
+
+def _asset_manifest_purpose_line(kind: str) -> str:
+    if kind == "delivery":
+        return "  - Purpose: delivery asset referenced by the implementation contract."
+    return "  - Purpose: reference context for the implementation contract."
 
 
 def _clean_validation_command(command: str) -> str:
@@ -2461,6 +2551,8 @@ def _contract_section_for_question(question_id: str) -> str:
         return "Project context"
     if question_id == "project_context.validation_commands":
         return "Validation"
+    if question_id == "asset_manifest.references":
+        return "Asset manifest"
     if question_id in {"scope.boundaries"}:
         return "Scope"
     if question_id in {"acceptance.criteria", "acceptance.negative_cases"}:
@@ -3300,8 +3392,14 @@ def _asset_reference_metadata(
     }
     if _ASSET_TARGET_HINT_RE.search(context):
         reference["target_specified"] = True
+        requested_target = _asset_reference_detail(context, _ASSET_TARGET_DETAIL_RE)
+        if requested_target:
+            reference["requested_target"] = requested_target
     if _ASSET_PROVENANCE_HINT_RE.search(context):
         reference["provenance_specified"] = True
+        source_license = _asset_reference_detail(context, _ASSET_PROVENANCE_DETAIL_RE)
+        if source_license:
+            reference["source_license"] = source_license
 
     try:
         project_path = resolved_path.relative_to(project_root.resolve()).as_posix()
@@ -3328,11 +3426,23 @@ def _asset_reference_metadata(
 
 
 def _asset_reference_kind(context: str) -> str:
+    if _ASSET_REFERENCE_HINT_RE.search(context) and not _ASSET_STRONG_DELIVERY_HINT_RE.search(context):
+        return "reference"
     if _ASSET_DELIVERY_HINT_RE.search(context):
         return "delivery"
     if _ASSET_REFERENCE_HINT_RE.search(context):
         return "reference"
     return "ambiguous"
+
+
+def _asset_reference_detail(context: str, pattern: re.Pattern[str]) -> str | None:
+    for line in context.splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        value = _clean_answer_bullet(match.group(1)).strip("` ")
+        return _single_line(value) or None
+    return None
 
 
 def _file_sha256(path: Path) -> str:

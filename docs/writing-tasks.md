@@ -265,6 +265,13 @@ ignored assets are warnings because isolated runs may not receive the same
 inputs. Sikula does not fetch URLs during delivery runs; put the file in the
 project first and use URLs only as provenance or background context.
 
+When `sikula contract prepare` sees verified reference or delivery assets, it
+adds an `Asset manifest` section to the implementation contract with the
+resolved project path, hash, asset intent, and any explicit target or
+source/license details from the task. Missing, ambiguous, or out-of-project
+assets remain follow-up questions instead of being silently added to the
+contract.
+
 ## Feature Example
 
 ```md
