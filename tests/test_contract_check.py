@@ -579,6 +579,42 @@ def test_contract_check_classifies_delivery_asset_heading_as_delivery(tmp_path: 
     assert all(gap.id != "gap.assets.intent" for gap in result.gaps)
 
 
+def test_contract_check_preserves_parent_assets_heading_for_child_sections(tmp_path: Path):
+    asset_path = tmp_path / "designs" / "login.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Fix login layout
+
+## Assets
+
+### Mockups
+
+- `designs/login.png`
+
+## Scope
+- Match the login form spacing to the provided mockup.
+
+## Acceptance criteria
+- The login form spacing matches the mockup.
+
+## Out of scope
+- Do not redesign the login flow.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert len(result.asset_references) == 1
+    assert result.asset_references[0]["project_path"] == "designs/login.png"
+    assert result.asset_references[0]["kind"] == "reference"
+    assert result.asset_references[0]["status"] == "available"
+    assert all(gap.id != "gap.assets.missing" for gap in result.gaps)
+
+
 def test_contract_check_does_not_let_sibling_bullet_change_asset_intent(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
     asset_path.parent.mkdir(parents=True)

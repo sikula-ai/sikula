@@ -200,7 +200,7 @@ _ASSET_FILENAME_RE = re.compile(
     re.IGNORECASE,
 )
 _ASSET_REFERENCE_HINT_RE = re.compile(
-    r"\b(reference assets?|reference[-\s]+only|do[-\s]+not[-\s]+copy|screenshot|mockup|design reference|"
+    r"\b(reference assets?|reference[-\s]+only|do[-\s]+not[-\s]+copy|screenshots?|mockups?|design reference|"
     r"layout reference|spec excerpt)\b",
     re.IGNORECASE,
 )
@@ -3797,7 +3797,7 @@ def _detect_asset_references(
     project_root = _asset_project_root(source_path, project_config)
     references_by_path: dict[str, dict[str, Any]] = {}
     reference_order: list[str] = []
-    current_heading = ""
+    heading_stack: list[tuple[int, str]] = []
     lines = text.splitlines()
 
     for line_index, line in enumerate(lines):
@@ -3805,15 +3805,23 @@ def _detect_asset_references(
         markdown_heading = _HEADING_RE.match(line)
         text_heading = _TEXT_HEADING_RE.match(line)
         if markdown_heading:
-            current_heading = markdown_heading.group(2).strip()
+            heading_stack = _asset_update_heading_stack(
+                heading_stack,
+                level=len(markdown_heading.group(1)),
+                heading=markdown_heading.group(2).strip(),
+            )
         elif text_heading:
-            current_heading = text_heading.group(1).strip()
+            heading_stack = _asset_update_heading_stack(
+                heading_stack,
+                level=_asset_text_heading_level(heading_stack),
+                heading=text_heading.group(1).strip(),
+            )
 
         for raw_path in _asset_path_candidates(line):
             normalized_path = _normalize_asset_path_candidate(raw_path)
             if not normalized_path:
                 continue
-            context = _asset_reference_context(current_heading, lines, line_index)
+            context = _asset_reference_context(heading_stack, lines, line_index)
             if not _asset_reference_input_context(normalized_path, context, project_config):
                 continue
             reference = _asset_reference_metadata(
@@ -3834,9 +3842,42 @@ def _detect_asset_references(
     return [references_by_path[path] for path in reference_order]
 
 
-def _asset_reference_context(current_heading: str, lines: list[str], line_index: int) -> str:
+def _asset_update_heading_stack(
+    heading_stack: list[tuple[int, str]],
+    *,
+    level: int,
+    heading: str,
+) -> list[tuple[int, str]]:
+    return [item for item in heading_stack if item[0] < level] + [(level, heading)]
+
+
+def _asset_text_heading_level(heading_stack: list[tuple[int, str]]) -> int:
+    asset_levels = [
+        level
+        for level, heading in heading_stack
+        if "asset" in _normalize_heading(heading) or "attachment" in _normalize_heading(heading)
+    ]
+    if asset_levels:
+        return max(asset_levels) + 1
+    return 2
+
+
+def _asset_context_headings(heading_stack: list[tuple[int, str]]) -> list[str]:
+    if not heading_stack:
+        return []
+    section_headings = [heading for level, heading in heading_stack if level > 1]
+    asset_title_headings = [
+        heading
+        for level, heading in heading_stack
+        if level == 1 and ("asset" in _normalize_heading(heading) or "attachment" in _normalize_heading(heading))
+    ]
+    headings = [*asset_title_headings, *section_headings]
+    return headings or [heading_stack[-1][1]]
+
+
+def _asset_reference_context(heading_stack: list[tuple[int, str]], lines: list[str], line_index: int) -> str:
     local_lines = _asset_reference_context_lines(lines, line_index)
-    return "\n".join([current_heading, *local_lines])
+    return "\n".join([*_asset_context_headings(heading_stack), *local_lines])
 
 
 def _asset_reference_context_lines(lines: list[str], line_index: int) -> list[str]:
