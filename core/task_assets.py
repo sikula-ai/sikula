@@ -232,7 +232,7 @@ def asset_answer_entry_lines(
         declaration_entries = _asset_declaration_answer_entries(declarations_answer, project_root=project_root)
         if declaration_entries:
             lines.append(_generated_answer_entry_marker("assets.declarations"))
-            lines.extend(declaration_entries)
+            lines.extend(_asset_answer_entries_with_subsections(declaration_entries))
             lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
 
     local_files_answer = _answer_text(answers.get("assets.local_files", {}))
@@ -244,14 +244,22 @@ def asset_answer_entry_lines(
             project_root=project_root,
         )
         lines.append(_generated_answer_entry_marker("assets.local_files"))
-        lines.extend(_asset_local_file_answer_entries(local_files_answer, asset_references, project_root=project_root))
+        lines.extend(
+            _asset_answer_entries_with_subsections(
+                _asset_local_file_answer_entries(local_files_answer, asset_references, project_root=project_root)
+            )
+        )
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
 
     intent_answer = _answer_text(answers.get("assets.intent", {}))
     if intent_answer:
         question_id = "assets.intent"
         lines.append(_generated_answer_entry_marker(question_id))
-        lines.extend(_asset_intent_answer_entries(intent_answer, metadata_references, project_root=project_root))
+        lines.extend(
+            _asset_answer_entries_with_subsections(
+                _asset_intent_answer_entries(intent_answer, metadata_references, project_root=project_root)
+            )
+        )
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
 
     provenance = _answer_text(answers.get("assets.provenance", {}))
@@ -263,13 +271,80 @@ def asset_answer_entry_lines(
         ]
         lines.append(_generated_answer_entry_marker("assets.provenance"))
         if delivery_refs:
-            lines.extend(_asset_provenance_answer_entries(provenance, delivery_refs, project_root=project_root))
+            lines.extend(
+                _asset_answer_entries_with_subsections(
+                    _asset_provenance_answer_entries(provenance, delivery_refs, project_root=project_root)
+                )
+            )
         else:
             for answer_line in _answer_lines(provenance):
                 lines.append(f"- {_clean_answer_bullet(answer_line)}")
         lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
 
     return lines
+
+
+def _asset_answer_entries_with_subsections(entries: list[str]) -> list[str]:
+    blocks = _asset_answer_entry_blocks(entries)
+    grouped: dict[str, list[list[str]]] = {"reference": [], "delivery": [], "ambiguous": []}
+    for block in blocks:
+        grouped.setdefault(_asset_answer_entry_block_kind(block), []).append(block)
+
+    lines: list[str] = []
+    for kind, heading in (
+        ("reference", "### Reference assets"),
+        ("delivery", "### Delivery assets"),
+        ("ambiguous", "### Assets to classify"),
+    ):
+        kind_blocks = grouped.get(kind, [])
+        if not kind_blocks:
+            continue
+        if lines:
+            lines.append("")
+        lines.extend([heading, ""])
+        for block_index, block in enumerate(kind_blocks):
+            if block_index:
+                lines.append("")
+            lines.extend(block)
+    return lines
+
+
+def _asset_answer_entry_blocks(entries: list[str]) -> list[list[str]]:
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in entries:
+        if line.startswith("- ") and current:
+            blocks.append(current)
+            current = [line]
+            continue
+        if current:
+            current.append(line)
+        else:
+            current = [line]
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _asset_answer_entry_block_kind(block: list[str]) -> str:
+    if not block:
+        return "ambiguous"
+    field = _structured_asset_field(_clean_answer_bullet(block[0]))
+    if field is not None:
+        label, _value = field
+        label_kind = _structured_asset_path_label_kind(label)
+        if label_kind:
+            return label_kind
+    for line in block[1:]:
+        field = _structured_asset_field(_clean_answer_bullet(line))
+        if field is None:
+            continue
+        label, value = field
+        if label in {"usage", "use"}:
+            usage_kind = _structured_asset_usage_kind(value)
+            if usage_kind:
+                return usage_kind
+    return AssetKind.AMBIGUOUS.value
 
 
 def _asset_declaration_answer_entries(answer_text: str, *, project_root: Path) -> list[str]:
@@ -556,9 +631,43 @@ def _replace_unresolved_asset_reference_paths(
 
     updated = task_text
     for reference, replacement_path in replacements:
-        for old_path in _asset_reference_replacement_tokens(reference):
-            updated = updated.replace(old_path, replacement_path)
+        updated = _replace_asset_declaration_token(updated, reference, replacement_path)
     return updated.strip()
+
+
+def _replace_asset_declaration_token(task_text: str, reference: dict[str, Any], replacement_path: str) -> str:
+    lines = task_text.splitlines()
+    for line_index, line in enumerate(lines):
+        if _asset_line_is_target_metadata(line):
+            continue
+        lines[line_index] = _replace_asset_token_in_line(line, reference, replacement_path)
+    return "\n".join(lines)
+
+
+def _asset_line_is_target_metadata(line: str) -> bool:
+    field = _structured_asset_field(_clean_answer_bullet(line))
+    if field is None:
+        return False
+    label, value = field
+    return label in {"target", "target path", "destination", "destination path", "requested target"} and bool(value)
+
+
+def _replace_asset_token_in_line(line: str, reference: dict[str, Any], replacement_path: str) -> str:
+    updated = line
+    for token in sorted(_asset_reference_replacement_tokens(reference), key=len, reverse=True):
+        updated = _replace_standalone_asset_token(updated, token, replacement_path)
+    for candidate in _asset_path_candidates(updated):
+        normalized = _normalize_asset_path_candidate(candidate)
+        if normalized and _asset_path_match_keys(normalized) & _asset_reference_match_keys(reference):
+            updated = updated.replace(candidate, replacement_path, 1)
+    return updated
+
+
+def _replace_standalone_asset_token(line: str, token: str, replacement_path: str) -> str:
+    if not token:
+        return line
+    pattern = re.compile(rf"(?<![\w./@%+=:-]){re.escape(token)}(?![\w/@%+=:-])")
+    return pattern.sub(replacement_path, line)
 
 
 def _asset_reference_replacement_tokens(reference: dict[str, Any]) -> list[str]:
