@@ -2232,6 +2232,46 @@ def test_prepare_implementation_contract_adds_delivery_asset_manifest_with_targe
     assert all(gap.id != "gap.assets.provenance" for gap in result.recheck_result.gaps)
 
 
+def test_prepare_implementation_contract_does_not_manifest_delivery_asset_without_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Assets
+
+### Delivery assets
+
+- Path: `.sikula/task-assets/success-check.svg`
+
+## Scope
+- Add the success state icon to the confirmation screen.
+
+## Acceptance criteria
+- The success screen shows the provided success icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/success-icon.md",
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "## Asset manifest" not in result.prepared_contract_markdown
+    assert any(gap.id == "gap.assets.provenance" and gap.severity == "blocking" for gap in result.unresolved_gaps)
+    assert "assets.provenance" in result.open_question_ids
+
+
 def test_prepare_implementation_contract_preserves_existing_asset_manifest_hash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

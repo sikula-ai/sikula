@@ -176,7 +176,14 @@ def _generated_answer_entry_marker(question_id: str) -> str:
 
 
 def asset_reference_ready_for_manifest(reference: dict[str, Any]) -> bool:
-    return reference.get("status") == "available" and reference.get("kind") in {"reference", "delivery"}
+    if reference.get("status") != "available":
+        return False
+    kind = reference.get("kind")
+    if kind == "reference":
+        return True
+    if kind == "delivery":
+        return bool(str(reference.get("source_license") or "").strip())
+    return False
 
 
 def asset_manifest_reference_lines(reference: dict[str, Any]) -> list[str]:
@@ -859,17 +866,21 @@ def detect_undeclared_asset_paths(
                 heading=text_heading.group(1).strip(),
             )
             continue
-        if _asset_heading_stack_has_structured_asset_root(heading_stack):
-            continue
-
         context = _asset_reference_context(heading_stack, lines, line_index)
+        in_structured_asset_root = _asset_heading_stack_has_structured_asset_root(heading_stack)
         for raw_path in _asset_path_candidates(line):
             normalized_path = _normalize_asset_path_candidate(raw_path)
             if not normalized_path:
                 continue
             if _asset_path_match_keys(normalized_path) & declared_keys:
                 continue
-            if not _undeclared_asset_path_should_warn(normalized_path, context, project_config):
+            if in_structured_asset_root and not _asset_line_is_bare_asset_path(line, normalized_path):
+                continue
+            if not in_structured_asset_root and not _undeclared_asset_path_should_warn(
+                normalized_path,
+                context,
+                project_config,
+            ):
                 continue
             key = (line_index + 1, normalized_path)
             if key in seen:
@@ -877,6 +888,19 @@ def detect_undeclared_asset_paths(
             seen.add(key)
             paths.append({"path": normalized_path, "line": line_index + 1})
     return paths
+
+
+def _asset_line_is_bare_asset_path(line: str, normalized_path: str) -> bool:
+    cleaned = _clean_answer_bullet(line).strip()
+    markdown_link = _MARKDOWN_LINK_RE.fullmatch(cleaned)
+    if markdown_link:
+        return _normalize_asset_path_candidate(markdown_link.group(1)) == normalized_path
+    code_span = _CODE_SPAN_RE.fullmatch(cleaned)
+    if code_span:
+        return _normalize_asset_path_candidate(code_span.group(1)) == normalized_path
+    cleaned = cleaned.strip("<>`\"'")
+    cleaned = cleaned.rstrip(".,;:")
+    return _normalize_asset_path_candidate(cleaned) == normalized_path
 
 
 def _parse_structured_asset_declarations(text: str) -> list[_StructuredAssetDeclaration]:

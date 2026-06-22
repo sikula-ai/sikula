@@ -178,6 +178,17 @@ def test_detect_undeclared_asset_paths_reports_prose_task_asset_paths(tmp_path: 
     assert _undeclared_paths(markdown, tmp_path) == [{"path": ".sikula/task-assets/login-reference.png", "line": 5}]
 
 
+def test_detect_undeclared_asset_paths_reports_bare_paths_inside_assets_section(tmp_path: Path):
+    markdown = """# Fix login spacing
+
+## Assets
+
+- `.sikula/task-assets/login-reference.png`
+"""
+
+    assert _undeclared_paths(markdown, tmp_path) == [{"path": ".sikula/task-assets/login-reference.png", "line": 5}]
+
+
 def test_detect_undeclared_asset_paths_ignores_declared_asset_paths_reused_in_text(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "login-reference.png"
     asset_path.parent.mkdir(parents=True)
