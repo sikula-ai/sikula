@@ -6,15 +6,21 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
-import mimetypes
 from pathlib import Path
 import re
-import subprocess
-from typing import Any, Iterable
-from urllib.parse import unquote, urlsplit
-
+from typing import Any
 import yaml
 
+from core.task_assets import (
+    asset_answer_entry_lines as _asset_answer_entry_lines,
+    asset_manifest_reference_lines as _asset_manifest_reference_lines,
+    asset_project_root as _asset_project_root,
+    asset_reference_ready_for_manifest as _asset_reference_ready_for_manifest,
+    detect_asset_references as _detect_asset_references,
+    detect_undeclared_asset_paths as _detect_undeclared_asset_paths,
+    public_asset_reference as _public_asset_reference,
+    replace_unresolved_asset_reference_paths as _replace_unresolved_asset_reference_paths,
+)
 from core.state import TaskState
 from core.validation_coverage import (
     configured_validation_commands,
@@ -160,78 +166,6 @@ _CONTEXT_RE = re.compile(
 _HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 _TEXT_HEADING_RE = re.compile(r"^\s{0,3}([A-Za-z][A-Za-z0-9 /&_-]{1,60}):\s*$")
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$")
-_ASSET_EXTENSIONS = {
-    ".avif",
-    ".csv",
-    ".gif",
-    ".ico",
-    ".jpeg",
-    ".jpg",
-    ".json",
-    ".md",
-    ".otf",
-    ".pdf",
-    ".png",
-    ".svg",
-    ".ttf",
-    ".txt",
-    ".webp",
-    ".woff",
-    ".woff2",
-    ".xml",
-    ".yaml",
-    ".yml",
-    ".zip",
-}
-_MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*]\(([^)\s]+)(?:\s+['\"][^'\"]*['\"])?\)")
-_CODE_SPAN_RE = re.compile(r"`([^`]+)`")
-_PLAIN_ASSET_PATH_RE = re.compile(
-    r"(?<![\w/.-])"
-    r"((?:\.{1,2}/|\.sikula/|[A-Za-z0-9_.-]+/)"
-    r"[A-Za-z0-9_./@%+=:, -]*?"
-    r"\.(?:avif|csv|gif|ico|jpe?g|json|md|otf|pdf|png|svg|ttf|txt|webp|woff2?|xml|ya?ml|zip))"
-    r"(?![\w/.-])",
-    re.IGNORECASE,
-)
-_ASSET_FILENAME_RE = re.compile(
-    r"(?<![\w/.-])"
-    r"([A-Za-z0-9_.@%+=-]+\.(?:avif|csv|gif|ico|jpe?g|json|md|otf|pdf|png|svg|ttf|txt|webp|woff2?|xml|ya?ml|zip))"
-    r"(?![\w/.-])",
-    re.IGNORECASE,
-)
-_ASSET_REFERENCE_HINT_RE = re.compile(
-    r"\b(reference assets?|reference[-\s]+only|do[-\s]+not[-\s]+copy|screenshots?|mockups?|design reference|"
-    r"layout reference|spec excerpt)\b",
-    re.IGNORECASE,
-)
-_ASSET_EXPLICIT_REFERENCE_HINT_RE = re.compile(
-    r"\b(reference assets?|reference[-\s]+only|do[-\s]+not[-\s]+copy|design reference|layout reference|"
-    r"visual reference|reference (?:asset|image|screenshot|mockup)|spec excerpt)\b",
-    re.IGNORECASE,
-)
-_ASSET_DELIVERY_HINT_RE = re.compile(
-    r"\bdelivery asset\b|\buse\b.+\b(?:as|for)\b|\buse this file\b|\bcopy\b|\binclude\b|\bship\b|"
-    r"\bproduction asset\b|\btarget\s*:|\bsource/license\s*:|\bprovided by\b",
-    re.IGNORECASE,
-)
-_ASSET_STRONG_DELIVERY_HINT_RE = re.compile(
-    r"\bdelivery assets?\b|\btarget(?:\s+path)?\s*:|\bcopy\b.+\b(?:to|into|under|at)\b|"
-    r"\bdestination(?:\s+path)?\s*:|\bproduction asset\b|\bsource/license\s*:",
-    re.IGNORECASE,
-)
-_ASSET_TARGET_HINT_RE = re.compile(r"\b(target|target:|copy to|into|destination|path)\b", re.IGNORECASE)
-_ASSET_PROVENANCE_HINT_RE = re.compile(
-    r"\b(source/license|license:|licence:|provenance|provided by|owned by)\b",
-    re.IGNORECASE,
-)
-_ASSET_TARGET_DETAIL_RE = re.compile(
-    r"\b(?:target(?:\s+path)?|destination(?:\s+path)?|copy\s+to)\s*:\s*(.+)",
-    re.IGNORECASE,
-)
-_ASSET_PROVENANCE_DETAIL_RE = re.compile(
-    r"\b(?:source/license|license|licence|provenance)\s*:\s*(.+)|\b(provided\s+by\b.+)",
-    re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True)
@@ -302,10 +236,6 @@ class ContractCheckResult:
             "validation": dict(self.validation),
             "asset_references": [_public_asset_reference(reference) for reference in self.asset_references],
         }
-
-
-def _public_asset_reference(reference: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in reference.items() if not str(key).startswith("_")}
 
 
 @dataclass(frozen=True)
@@ -579,6 +509,13 @@ def check_contract(
     sections_detected = _sections_detected(parsed)
     validation = _validation_details(evaluation_text, project_config, configured_validation_commands)
     asset_references = _detect_asset_references(evaluation_text, source_path=source_path, project_config=project_config)
+    undeclared_asset_paths = _detect_undeclared_asset_paths(
+        evaluation_text,
+        project_config=project_config,
+        asset_references=asset_references,
+    )
+    if undeclared_asset_paths:
+        validation = {**validation, "undeclared_asset_paths": undeclared_asset_paths}
     security_sensitive = bool(_SECURITY_RISK_RE.search(evaluation_text))
 
     scores = {
@@ -596,7 +533,15 @@ def check_contract(
     scores["task_size"] = _score_task_size(parsed, scores)
     weighted_score = _weighted_score(scores)
 
-    gaps = _build_gaps(parsed, sections_detected, scores, validation, security_sensitive, asset_references)
+    gaps = _build_gaps(
+        parsed,
+        sections_detected,
+        scores,
+        validation,
+        security_sensitive,
+        asset_references,
+        undeclared_asset_paths,
+    )
     if any(gap.severity == "blocking" for gap in gaps):
         weighted_score = min(weighted_score, 69)
     elif gaps:
@@ -667,8 +612,18 @@ def render_contract_check(result: ContractCheckResult) -> str:
         lines.extend(f"- {command}" for command in task_commands)
         lines.append("")
 
+    undeclared_asset_paths = result.validation.get("undeclared_asset_paths") or []
+    if undeclared_asset_paths:
+        lines.append("Undeclared asset-like paths:")
+        for reference in undeclared_asset_paths:
+            path = reference.get("path")
+            line = reference.get("line")
+            location = f"line {line}" if line else "unknown line"
+            lines.append(f"- `{path}` ({location})")
+        lines.append("")
+
     if result.asset_references:
-        lines.append("Asset references:")
+        lines.append("Declared asset references:")
         for reference in result.asset_references:
             path = reference.get("project_path") or reference.get("path")
             status = reference.get("status") or "unknown"
@@ -990,8 +945,9 @@ def prepare_implementation_contract(
     contract_name: str | None = None,
     answers: dict[str, str | dict[str, Any]] | None = None,
     project_context: PrepareProjectContext | dict[str, Any] | None = None,
-    project_config: dict | None = None,
     generated_answer_entries: list[dict[str, Any]] | None = None,
+    *,
+    project_config: dict | None = None,
 ) -> ContractPrepareResult:
     """Prepare an implementation contract through an in-memory check/improve loop."""
 
@@ -1139,12 +1095,32 @@ def _strip_revisable_generated_entries(
     answers: dict[str, str | dict[str, Any]] | None,
     generated_answer_entries: list[dict[str, Any]],
 ) -> str:
-    if not generated_answer_entries:
-        return contract_markdown
     question_ids = [*_IMPLEMENTATION_CONTEXT_ENTRY_IDS]
     if answers:
+        question_ids.extend(_answered_marker_entry_ids(answers, contract_markdown))
         question_ids.extend(_answered_generated_entry_ids(answers, generated_answer_entries))
-    return _strip_tracked_generated_answer_entries(contract_markdown, question_ids, generated_answer_entries)
+    question_ids = list(dict.fromkeys(question_ids))
+    stripped = _strip_generated_answer_entries(contract_markdown, question_ids)
+    return _strip_tracked_generated_answer_entries(stripped, question_ids, generated_answer_entries)
+
+
+def _answered_marker_entry_ids(answers: dict[str, str | dict[str, Any]], contract_markdown: str) -> list[str]:
+    normalized_answers = _normalize_contract_answers(answers)
+    marker_ids = set(_generated_answer_entry_ids_from_markers(contract_markdown))
+    return [question_id for question_id in normalized_answers if question_id in marker_ids]
+
+
+def _generated_answer_entry_ids_from_markers(markdown: str) -> list[str]:
+    ids: list[str] = []
+    for line in markdown.splitlines():
+        marker_match = _GENERATED_ANSWER_ENTRY_RE.match(line)
+        if not marker_match:
+            continue
+        for value in marker_match.group(1).split(","):
+            question_id = value.strip()
+            if question_id:
+                ids.append(question_id)
+    return list(dict.fromkeys(ids))
 
 
 def _answered_generated_entry_ids(
@@ -1651,8 +1627,12 @@ def _insert_or_append_section_entries(lines: list[str], section: str, entries: l
             continue
         if _normalize_heading(heading_match.group(2)) == normalized_section:
             section_start = index
+            section_level = len(heading_match.group(1))
             section_end = index + 1
-            while section_end < len(lines) and not _HEADING_RE.match(lines[section_end]):
+            while section_end < len(lines):
+                next_heading = _HEADING_RE.match(lines[section_end])
+                if next_heading and len(next_heading.group(1)) <= section_level:
+                    break
                 section_end += 1
             break
 
@@ -1752,16 +1732,25 @@ def _implementation_asset_manifest_entry_lines(
     asset_references: list[dict[str, Any]],
     current_markdown: str,
 ) -> list[str]:
-    existing_manifest = _section_content(_parse_markdown_task(current_markdown), "asset_manifest")
-    entries: list[str] = []
+    existing_manifest = _markdown_section_content(current_markdown, "Asset manifest")
+    entries_by_kind: dict[str, list[str]] = {"reference": [], "delivery": []}
     for reference in asset_references:
         if not _asset_reference_ready_for_manifest(reference):
             continue
         project_path = str(reference.get("project_path") or reference.get("path") or "").strip()
         if not project_path or project_path in existing_manifest:
             continue
-        entries.extend(_asset_manifest_reference_lines(reference))
+        kind = str(reference.get("kind") or "reference").strip()
+        entries_by_kind.setdefault(kind, []).extend(_asset_manifest_reference_lines(reference))
 
+    entries: list[str] = []
+    for kind, heading in (("reference", "### Reference assets"), ("delivery", "### Delivery assets")):
+        kind_entries = entries_by_kind.get(kind) or []
+        if not kind_entries:
+            continue
+        if entries:
+            entries.append("")
+        entries.extend([heading, "", *kind_entries])
     if not entries:
         return []
     return [
@@ -1771,49 +1760,30 @@ def _implementation_asset_manifest_entry_lines(
     ]
 
 
-def _asset_reference_ready_for_manifest(reference: dict[str, Any]) -> bool:
-    return reference.get("status") == "available" and reference.get("kind") in {"reference", "delivery"}
+def _markdown_section_content(markdown: str, section: str) -> str:
+    normalized_section = _normalize_heading(section)
+    lines = markdown.splitlines()
+    for index, line in enumerate(lines):
+        heading_match = _HEADING_RE.match(line)
+        if not heading_match or _normalize_heading(heading_match.group(2)) != normalized_section:
+            continue
+        section_end = _markdown_section_end(lines, index)
+        return "\n".join(lines[index + 1 : section_end]).strip()
+    return ""
 
 
-def _asset_manifest_reference_lines(reference: dict[str, Any]) -> list[str]:
-    project_path = str(reference.get("project_path") or reference.get("path") or "").strip()
-    kind = str(reference.get("kind") or "reference").strip()
-    lines = [f"- Path: `{project_path}`"]
-    if kind == "delivery":
-        lines.append("  - Usage: delivery asset; use this file only for the requested implementation.")
-    else:
-        lines.append("  - Usage: reference only; do not copy this asset into production files.")
-
-    sha256_value = str(reference.get("sha256") or "").strip()
-    if sha256_value:
-        lines.append(f"  - SHA-256: `{sha256_value}`")
-
-    lines.append(_asset_manifest_purpose_line(kind))
-
-    mime_type = str(reference.get("mime_type") or "").strip()
-    if mime_type:
-        lines.append(f"  - MIME type: `{mime_type}`")
-    size_bytes = reference.get("size_bytes")
-    if isinstance(size_bytes, int):
-        lines.append(f"  - Size: {size_bytes} bytes")
-    git_status = str(reference.get("git_status") or "").strip()
-    if git_status:
-        lines.append(f"  - Git status: `{git_status}`")
-    requested_target = str(reference.get("requested_target") or "").strip()
-    if requested_target:
-        lines.append(f"  - Requested target: `{requested_target}`")
-    elif kind == "delivery":
-        lines.append("  - Target resolution: analyst should choose the project-conventional location.")
-    source_license = str(reference.get("source_license") or "").strip()
-    if kind == "delivery" and source_license:
-        lines.append(f"  - Source/license: {source_license}")
-    return lines
-
-
-def _asset_manifest_purpose_line(kind: str) -> str:
-    if kind == "delivery":
-        return "  - Purpose: delivery asset referenced by the implementation contract."
-    return "  - Purpose: reference context for the implementation contract."
+def _markdown_section_end(lines: list[str], heading_index: int) -> int:
+    heading_match = _HEADING_RE.match(lines[heading_index])
+    if not heading_match:
+        return heading_index + 1
+    section_level = len(heading_match.group(1))
+    section_end = heading_index + 1
+    while section_end < len(lines):
+        next_heading = _HEADING_RE.match(lines[section_end])
+        if next_heading and len(next_heading.group(1)) <= section_level:
+            break
+        section_end += 1
+    return section_end
 
 
 def _clean_validation_command(command: str) -> str:
@@ -2310,501 +2280,6 @@ def _render_improved_contract(
     return "\n".join(lines).rstrip() + "\n", answered_ids, open_ids
 
 
-def _asset_answer_entry_lines(
-    asset_references: list[dict[str, Any]],
-    answers: dict[str, dict[str, Any]],
-    *,
-    project_root: Path,
-) -> list[str]:
-    lines: list[str] = []
-
-    local_files_answer = _answer_text(answers.get("assets.local_files", {}))
-    metadata_references = asset_references
-    if local_files_answer:
-        metadata_references = _asset_references_with_local_file_replacements(
-            asset_references,
-            local_files_answer,
-            project_root=project_root,
-        )
-        lines.append(_generated_answer_entry_marker("assets.local_files"))
-        lines.extend(_asset_local_file_answer_entries(local_files_answer, asset_references, project_root=project_root))
-        lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
-
-    intent_answer = _answer_text(answers.get("assets.intent", {}))
-    if intent_answer:
-        question_id = "assets.intent"
-        lines.append(_generated_answer_entry_marker(question_id))
-        lines.extend(_asset_intent_answer_entries(intent_answer, metadata_references, project_root=project_root))
-        lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
-
-    provenance = _answer_text(answers.get("assets.provenance", {}))
-    if provenance:
-        delivery_refs = [
-            reference
-            for reference in metadata_references
-            if reference.get("kind") == "delivery" and not reference.get("source_license")
-        ]
-        lines.append(_generated_answer_entry_marker("assets.provenance"))
-        if delivery_refs:
-            lines.extend(_asset_provenance_answer_entries(provenance, delivery_refs, project_root=project_root))
-        else:
-            for answer_line in _answer_lines(provenance):
-                lines.append(f"- {_clean_answer_bullet(answer_line)}")
-        lines.append(_GENERATED_ANSWER_ENTRY_END_MARKER)
-
-    return lines
-
-
-def _asset_references_with_local_file_replacements(
-    asset_references: list[dict[str, Any]],
-    answer_text: str,
-    *,
-    project_root: Path,
-) -> list[dict[str, Any]]:
-    replacements = _asset_path_replacements(asset_references, answer_text, project_root=project_root)
-    if not replacements:
-        return asset_references
-
-    replacement_by_reference_id = {id(reference): replacement_path for reference, replacement_path in replacements}
-    updated_references: list[dict[str, Any]] = []
-    for reference in asset_references:
-        replacement_path = replacement_by_reference_id.get(id(reference))
-        if replacement_path is None:
-            updated_references.append(reference)
-            continue
-        updated_references.append(
-            _asset_reference_with_replacement_path(
-                reference,
-                replacement_path,
-                project_root=project_root,
-            )
-        )
-    return updated_references
-
-
-def _asset_reference_with_replacement_path(
-    reference: dict[str, Any],
-    replacement_path: str,
-    *,
-    project_root: Path,
-) -> dict[str, Any]:
-    updated = {key: value for key, value in reference.items() if not str(key).startswith("_")}
-    match_aliases = [
-        value
-        for value in _asset_reference_match_values(reference)
-        if value != replacement_path and value != replacement_path.lstrip("./")
-    ]
-    if match_aliases:
-        updated["_match_aliases"] = list(dict.fromkeys(match_aliases))
-    updated["path"] = replacement_path
-    updated["project_path"] = replacement_path
-
-    resolved_path = project_root / replacement_path
-    if not resolved_path.exists():
-        updated["status"] = "missing"
-        return updated
-    if not resolved_path.is_file():
-        updated["status"] = "not_file"
-        return updated
-
-    updated["status"] = "available"
-    updated["sha256"] = _file_sha256(resolved_path)
-    updated["size_bytes"] = resolved_path.stat().st_size
-    mime_type, _encoding = mimetypes.guess_type(resolved_path.name)
-    if mime_type:
-        updated["mime_type"] = mime_type
-    else:
-        updated.pop("mime_type", None)
-    updated["git_status"] = _asset_git_status(project_root, replacement_path)
-    return updated
-
-
-def _asset_intent_answer_entries(
-    intent_answer: str,
-    asset_references: list[dict[str, Any]],
-    *,
-    project_root: Path,
-) -> list[str]:
-    answer_lines = _answer_lines(intent_answer)
-    ambiguous_refs = [reference for reference in asset_references if reference.get("kind") == "ambiguous"]
-    if len(ambiguous_refs) == 1 and len(answer_lines) == 1:
-        source_text, intent_text = _asset_intent_answer_parts(answer_lines[0], project_root=project_root)
-        answer_line = _clean_answer_bullet(intent_text)
-        if not source_text and answer_line and not _asset_path_from_answer_line(answer_line, project_root=project_root):
-            project_path = str(ambiguous_refs[0].get("project_path") or ambiguous_refs[0].get("path") or "").strip()
-            if project_path:
-                return [f"- `{project_path}`", f"  - {answer_line}"]
-
-    reference_lookup = _asset_reference_lookup(ambiguous_refs)
-    used_reference_ids: set[int] = set()
-    entries: list[str] = []
-    for answer_line in answer_lines:
-        source_text, intent_text = _asset_intent_answer_parts(answer_line, project_root=project_root)
-        intent = _clean_answer_bullet(intent_text)
-        if not intent:
-            continue
-        source_key = _asset_answer_source_key(source_text, project_root=project_root)
-        if source_key:
-            reference = reference_lookup.get(source_key)
-            if reference is None or id(reference) in used_reference_ids:
-                continue
-            project_path = str(reference.get("project_path") or reference.get("path") or "").strip()
-            if not project_path:
-                continue
-            entries.append(f"- `{project_path}`")
-            entries.append(f"  - {intent}")
-            used_reference_ids.add(id(reference))
-            continue
-        entries.append(f"- {intent}")
-    return entries
-
-
-def _asset_intent_answer_parts(answer_line: str, *, project_root: Path) -> tuple[str, str]:
-    cleaned = _clean_answer_bullet(answer_line)
-    for separator in ("->", "=>", ":"):
-        if separator in cleaned:
-            left, right = cleaned.split(separator, 1)
-            if separator == ":" and not _asset_answer_source_key(left, project_root=project_root):
-                continue
-            return left.strip(), right.strip()
-    return "", cleaned
-
-
-def _asset_provenance_answer_entries(
-    provenance: str,
-    delivery_refs: list[dict[str, Any]],
-    *,
-    project_root: Path,
-) -> list[str]:
-    entries: list[str] = []
-    path_specific_provenance = _asset_provenance_by_path(provenance, project_root=project_root)
-    common_provenance = _single_line(provenance) if not path_specific_provenance else ""
-
-    for reference in delivery_refs:
-        project_path = str(reference.get("project_path") or reference.get("path") or "").strip()
-        if not project_path:
-            continue
-        provenance_text = _asset_provenance_for_reference(reference, path_specific_provenance) or common_provenance
-        if not provenance_text:
-            continue
-        entries.append(f"- `{project_path}`")
-        entries.append(f"  - Source/license: {provenance_text}")
-    return entries
-
-
-def _asset_provenance_by_path(provenance: str, *, project_root: Path) -> dict[str, str]:
-    provenance_by_path: dict[str, str] = {}
-    for answer_line in _answer_lines(provenance):
-        cleaned = _clean_answer_bullet(answer_line)
-        for candidate in _asset_path_candidates(cleaned):
-            normalized = _normalize_asset_path_candidate(candidate)
-            if not normalized:
-                continue
-            normalized = _asset_answer_path_for_project(normalized, project_root=project_root)
-            if not normalized:
-                continue
-            provenance_text = _asset_provenance_text_without_path(cleaned, candidate)
-            if not provenance_text:
-                continue
-            for key in _asset_path_match_keys(normalized):
-                provenance_by_path[key] = provenance_text
-            break
-    return provenance_by_path
-
-
-def _asset_provenance_for_reference(reference: dict[str, Any], provenance_by_path: dict[str, str]) -> str:
-    for value in _asset_reference_match_values(reference):
-        for key in _asset_path_match_keys(str(value or "")):
-            provenance = provenance_by_path.get(key)
-            if provenance:
-                return provenance
-    return ""
-
-
-def _asset_path_match_keys(path_text: str) -> set[str]:
-    normalized = Path(path_text).as_posix().strip()
-    if not normalized:
-        return set()
-    return {normalized, normalized.lstrip("./")}
-
-
-def _asset_provenance_text_without_path(answer_line: str, path_text: str) -> str:
-    path_index = answer_line.find(path_text)
-    if path_index < 0:
-        return _single_line(answer_line)
-    before = answer_line[:path_index]
-    after = answer_line[path_index + len(path_text) :]
-    candidate = after if after.strip(" `\"'.,;:-") else before
-    candidate = candidate.strip(" `\"'")
-    candidate = re.sub(r"^\s*[.,;:-]+\s*", "", candidate)
-    candidate = re.sub(
-        r"^\s*(?:source/license|source|license|licence|provenance)\s*:\s*",
-        "",
-        candidate,
-        flags=re.IGNORECASE,
-    )
-    candidate = candidate.strip(" `\"'")
-    return _single_line(candidate)
-
-
-def _replace_unresolved_asset_reference_paths(
-    task_text: str,
-    asset_references: list[dict[str, Any]],
-    answer_text: str,
-    *,
-    project_root: Path,
-) -> str:
-    replacements = _asset_path_replacements(asset_references, answer_text, project_root=project_root)
-    if not replacements:
-        return task_text
-
-    updated = task_text
-    for reference, replacement_path in replacements:
-        for old_path in _asset_reference_replacement_tokens(reference):
-            updated = updated.replace(old_path, replacement_path)
-    return updated.strip()
-
-
-def _asset_reference_replacement_tokens(reference: dict[str, Any]) -> list[str]:
-    tokens: list[str] = []
-    for raw_path in reference.get("_raw_paths") or []:
-        if isinstance(raw_path, str) and raw_path.strip():
-            tokens.append(raw_path.strip())
-    normalized_path = str(reference.get("path") or "").strip()
-    if normalized_path:
-        tokens.append(normalized_path)
-    return list(dict.fromkeys(tokens))
-
-
-def _asset_path_replacements(
-    asset_references: list[dict[str, Any]],
-    answer_text: str,
-    *,
-    project_root: Path,
-) -> list[tuple[dict[str, Any], str]]:
-    unresolved_references = _unresolved_asset_references(asset_references)
-    answer_specs = _asset_local_file_answer_specs(answer_text, project_root=project_root)
-    reference_lookup = _asset_reference_lookup(unresolved_references)
-    used_reference_ids: set[int] = set()
-    replacements: list[tuple[dict[str, Any], str]] = []
-    for spec in answer_specs:
-        replacement_path = spec["replacement_path"]
-        reference = _asset_reference_for_answer_spec(
-            spec,
-            unresolved_references,
-            reference_lookup,
-            used_reference_ids,
-        )
-        if reference is None:
-            continue
-        replacements.append((reference, replacement_path))
-        used_reference_ids.add(id(reference))
-    return replacements
-
-
-def _asset_local_file_answer_specs(answer_text: str, *, project_root: Path) -> list[dict[str, str]]:
-    specs: list[dict[str, str]] = []
-    for answer_line in _answer_lines(answer_text):
-        source_text, replacement_text = _asset_answer_mapping_parts(answer_line, project_root=project_root)
-        replacement_path = _asset_path_from_answer_line(replacement_text, project_root=project_root)
-        if not replacement_path:
-            continue
-        specs.append(
-            {
-                "source_key": _asset_answer_source_key(source_text, project_root=project_root),
-                "replacement_path": replacement_path,
-            }
-        )
-    return specs
-
-
-def _asset_answer_mapping_parts(answer_line: str, *, project_root: Path) -> tuple[str, str]:
-    cleaned = _clean_answer_bullet(answer_line)
-    for separator in ("->", "=>"):
-        if separator in cleaned:
-            left, right = cleaned.split(separator, 1)
-            return left.strip(), right.strip()
-    if ":" in cleaned:
-        left, right = cleaned.split(":", 1)
-        if _asset_answer_source_key(left, project_root=project_root) and _asset_path_from_answer_line(
-            right,
-            project_root=project_root,
-        ):
-            return left.strip(), right.strip()
-    return "", cleaned
-
-
-def _asset_reference_for_answer_spec(
-    spec: dict[str, str],
-    unresolved_references: list[dict[str, Any]],
-    reference_lookup: dict[str, dict[str, Any]],
-    used_reference_ids: set[int],
-) -> dict[str, Any] | None:
-    source_key = spec.get("source_key")
-    if source_key:
-        reference = reference_lookup.get(source_key)
-        if reference is not None and id(reference) not in used_reference_ids:
-            return reference
-        return None
-    for reference in unresolved_references:
-        if id(reference) not in used_reference_ids:
-            return reference
-    return None
-
-
-def _asset_reference_lookup(asset_references: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    references_by_key: dict[str, dict[str, Any]] = {}
-    key_counts: dict[str, int] = {}
-    for reference in asset_references:
-        for key in _asset_reference_match_keys(reference):
-            key_counts[key] = key_counts.get(key, 0) + 1
-            references_by_key[key] = reference
-    return {key: reference for key, reference in references_by_key.items() if key_counts.get(key) == 1}
-
-
-def _asset_reference_match_keys(reference: dict[str, Any]) -> set[str]:
-    keys: set[str] = set()
-    for value in _asset_reference_match_values(reference):
-        normalized = Path(str(value or "")).as_posix().strip()
-        if not normalized:
-            continue
-        keys.add(normalized)
-        keys.add(normalized.lstrip("./"))
-        keys.add(Path(normalized).name)
-    return {key for key in keys if key}
-
-
-def _asset_reference_match_values(reference: dict[str, Any]) -> list[str]:
-    values: list[str] = []
-    for value in (reference.get("path"), reference.get("project_path")):
-        if isinstance(value, str) and value.strip():
-            values.append(value.strip())
-    for field_name in ("_raw_paths", "_match_aliases"):
-        field_value = reference.get(field_name)
-        if isinstance(field_value, str):
-            candidates: Iterable[Any] = (field_value,)
-        else:
-            candidates = field_value or []
-        for value in candidates:
-            if isinstance(value, str) and value.strip():
-                values.append(value.strip())
-    return list(dict.fromkeys(values))
-
-
-def _asset_answer_source_key(answer_line: str, *, project_root: Path) -> str:
-    cleaned = _clean_answer_bullet(answer_line)
-    for candidate in _asset_path_candidates(cleaned):
-        normalized = _normalize_asset_path_candidate(candidate)
-        if not normalized:
-            continue
-        normalized = _asset_answer_path_for_project(normalized, project_root=project_root)
-        if normalized:
-            return normalized
-    for match in _ASSET_FILENAME_RE.finditer(cleaned):
-        return match.group(1)
-    return ""
-
-
-def _asset_path_from_answer_line(answer_line: str, *, project_root: Path) -> str:
-    cleaned = _clean_answer_bullet(answer_line)
-    normalized_paths: list[str] = []
-    for candidate in _asset_path_candidates(cleaned):
-        normalized = _normalize_asset_path_candidate(candidate)
-        if not normalized:
-            continue
-        normalized = _asset_answer_path_for_project(normalized, project_root=project_root)
-        if normalized:
-            normalized_paths.append(normalized)
-    if not normalized_paths:
-        return ""
-    for normalized in reversed(normalized_paths):
-        if (project_root / normalized).is_file():
-            return normalized
-    return normalized_paths[-1]
-
-
-def _asset_answer_path_for_project(path_text: str, *, project_root: Path) -> str:
-    path = Path(path_text)
-    candidate = path if path.is_absolute() else project_root / path
-    try:
-        relative = candidate.resolve(strict=False).relative_to(project_root.resolve(strict=False))
-    except (OSError, ValueError):
-        return ""
-    return relative.as_posix()
-
-
-def _asset_local_file_answer_entries(
-    answer_text: str,
-    asset_references: list[dict[str, Any]],
-    *,
-    project_root: Path,
-) -> list[str]:
-    unresolved_references = _unresolved_asset_references(asset_references)
-    fallback_kind = _asset_replacement_kind(unresolved_references)
-    answer_specs = _asset_local_file_answer_specs(answer_text, project_root=project_root)
-    reference_lookup = _asset_reference_lookup(unresolved_references)
-    used_reference_ids: set[int] = set()
-    entries: list[str] = []
-    for spec in answer_specs:
-        answer_path = spec["replacement_path"]
-        reference = _asset_reference_for_answer_spec(
-            spec,
-            unresolved_references,
-            reference_lookup,
-            used_reference_ids,
-        )
-        if reference is None and spec.get("source_key"):
-            continue
-        replacement_kind = str(reference.get("kind") or fallback_kind) if reference else fallback_kind
-        entries.append(_asset_local_file_answer_line(answer_path, replacement_kind))
-        if reference:
-            entries.extend(_asset_preserved_metadata_lines(reference))
-            used_reference_ids.add(id(reference))
-    return entries
-
-
-def _unresolved_asset_references(asset_references: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        reference
-        for reference in asset_references
-        if reference.get("status") in {"missing", "outside_project", "not_file"}
-    ]
-
-
-def _asset_replacement_kind(asset_references: list[dict[str, Any]]) -> str:
-    unresolved_kinds = [str(reference.get("kind") or "").strip() for reference in asset_references]
-    if unresolved_kinds and all(kind == "delivery" for kind in unresolved_kinds):
-        return "delivery"
-    if unresolved_kinds and all(kind == "reference" for kind in unresolved_kinds):
-        return "reference"
-    return "asset"
-
-
-def _asset_local_file_answer_line(answer_line: str, replacement_kind: str) -> str:
-    if _ASSET_REFERENCE_HINT_RE.search(answer_line) or _ASSET_DELIVERY_HINT_RE.search(answer_line):
-        return f"- {answer_line}"
-
-    label = {
-        "delivery": "Delivery asset",
-        "reference": "Reference asset",
-    }.get(replacement_kind, "Asset")
-    value = answer_line
-    if _normalize_asset_path_candidate(answer_line):
-        value = f"`{answer_line}`"
-    return f"- {label}: {value}"
-
-
-def _asset_preserved_metadata_lines(reference: dict[str, Any]) -> list[str]:
-    lines: list[str] = []
-    requested_target = str(reference.get("requested_target") or "").strip()
-    if requested_target:
-        lines.append(f"  - Target path: `{requested_target}`")
-    source_license = str(reference.get("source_license") or "").strip()
-    if source_license:
-        lines.append(f"  - Source/license: {source_license}")
-    return lines
-
-
 def _reconcile_rendered_open_questions(
     rendered: str,
     active_questions: list[ClarifyingQuestion],
@@ -2877,12 +2352,10 @@ def _strip_generated_answer_entries(task_text: str, question_ids: list[str]) -> 
         line = source_lines[index]
         heading_match = _HEADING_RE.match(line)
         if heading_match:
-            section_end = index + 1
-            while section_end < len(source_lines) and not _HEADING_RE.match(source_lines[section_end]):
-                section_end += 1
-            section_body = source_lines[index + 1 : section_end]
             normalized_heading = _normalize_heading(heading_match.group(2))
             if normalized_heading in target_sections:
+                section_end = _markdown_section_end(source_lines, index)
+                section_body = source_lines[index + 1 : section_end]
                 stripped_body, removed_marked_entry = _strip_marked_answer_entries(section_body, target_ids)
                 if removed_marked_entry:
                     stripped_body = _trim_blank_lines(stripped_body)
@@ -2895,9 +2368,6 @@ def _strip_generated_answer_entries(task_text: str, question_ids: list[str]) -> 
                             lines.append("")
                     index = section_end
                     continue
-            lines.extend(source_lines[index:section_end])
-            index = section_end
-            continue
 
         lines.append(line)
         index += 1
@@ -3100,6 +2570,8 @@ def _contract_section_for_question(question_id: str) -> str:
         return "Validation"
     if question_id == "asset_manifest.references":
         return "Asset manifest"
+    if question_id.startswith("assets."):
+        return "Assets"
     if question_id in {"scope.boundaries"}:
         return "Scope"
     if question_id in {"acceptance.criteria", "acceptance.negative_cases"}:
@@ -3819,640 +3291,6 @@ def _validation_details(
     }
 
 
-def _detect_asset_references(
-    text: str,
-    *,
-    source_path: Path | str | None,
-    project_config: dict | None,
-) -> list[dict[str, Any]]:
-    project_root = _asset_project_root(source_path, project_config)
-    references_by_path: dict[str, dict[str, Any]] = {}
-    reference_order: list[str] = []
-    heading_stack: list[tuple[int, str]] = []
-    lines = text.splitlines()
-
-    for line_index, line in enumerate(lines):
-        line_number = line_index + 1
-        markdown_heading = _HEADING_RE.match(line)
-        text_heading = _TEXT_HEADING_RE.match(line)
-        if markdown_heading:
-            heading_stack = _asset_update_heading_stack(
-                heading_stack,
-                level=len(markdown_heading.group(1)),
-                heading=markdown_heading.group(2).strip(),
-            )
-        elif text_heading:
-            heading_stack = _asset_update_heading_stack(
-                heading_stack,
-                level=_asset_text_heading_level(heading_stack),
-                heading=text_heading.group(1).strip(),
-            )
-
-        for raw_path in _asset_path_candidates(line):
-            normalized_path = _normalize_asset_path_candidate(raw_path)
-            if not normalized_path:
-                continue
-            context = _asset_reference_context(heading_stack, lines, line_index)
-            if not _asset_reference_input_context(normalized_path, context, project_config, heading_stack):
-                continue
-            reference = _asset_reference_metadata(
-                normalized_path,
-                project_root=project_root,
-                line_number=line_number,
-                context=context,
-                raw_path=raw_path,
-            )
-            if reference is None:
-                continue
-            reference_key = _asset_reference_identity_key(reference, normalized_path)
-            existing = references_by_path.get(reference_key)
-            if existing is None:
-                references_by_path[reference_key] = reference
-                reference_order.append(reference_key)
-            else:
-                _merge_asset_reference(existing, reference)
-    return [references_by_path[path] for path in reference_order]
-
-
-def _asset_update_heading_stack(
-    heading_stack: list[tuple[int, str]],
-    *,
-    level: int,
-    heading: str,
-) -> list[tuple[int, str]]:
-    return [item for item in heading_stack if item[0] < level] + [(level, heading)]
-
-
-def _asset_text_heading_level(heading_stack: list[tuple[int, str]]) -> int:
-    if heading_stack and _asset_subsection_heading(heading_stack[-1][1]):
-        return heading_stack[-1][0]
-    for level, heading in reversed(heading_stack):
-        if _asset_root_section_heading(heading):
-            return level + 1
-    return 2
-
-
-def _asset_root_section_heading(heading: str) -> bool:
-    return _normalize_heading(heading) in {
-        "asset",
-        "assets",
-        "attachment",
-        "attachments",
-        "task asset",
-        "task assets",
-        "task attachment",
-        "task attachments",
-    }
-
-
-def _asset_subsection_heading(heading: str) -> bool:
-    normalized = _normalize_heading(heading)
-    return normalized in {
-        "reference asset",
-        "reference assets",
-        "delivery asset",
-        "delivery assets",
-        "mockup",
-        "mockups",
-        "screenshot",
-        "screenshots",
-    }
-
-
-def _asset_context_headings(heading_stack: list[tuple[int, str]]) -> list[str]:
-    if not heading_stack:
-        return []
-    return [heading for level, heading in heading_stack if level > 1]
-
-
-def _asset_reference_context(heading_stack: list[tuple[int, str]], lines: list[str], line_index: int) -> str:
-    local_lines = _asset_reference_context_lines(lines, line_index)
-    return "\n".join([*_asset_context_headings(heading_stack), *local_lines])
-
-
-def _asset_reference_context_lines(lines: list[str], line_index: int) -> list[str]:
-    line = lines[line_index]
-    bullet_match = _BULLET_RE.match(line)
-    if not bullet_match:
-        return [line]
-
-    base_indent = _line_indent(line)
-    context_lines = [line]
-    next_index = line_index + 1
-    while next_index < len(lines):
-        candidate = lines[next_index]
-        if _HEADING_RE.match(candidate):
-            break
-        if candidate.strip() and _BULLET_RE.match(candidate) and _line_indent(candidate) <= base_indent:
-            break
-        context_lines.append(candidate)
-        next_index += 1
-    return context_lines
-
-
-def _line_indent(line: str) -> int:
-    return len(line) - len(line.lstrip(" "))
-
-
-def _asset_path_candidates(line: str) -> list[str]:
-    matches: list[tuple[int, int, str]] = []
-    for pattern in (_MARKDOWN_LINK_RE, _CODE_SPAN_RE, _PLAIN_ASSET_PATH_RE):
-        matches.extend((match.start(1), match.end(1), match.group(1)) for match in pattern.finditer(line))
-    matches.sort(key=lambda item: item[0])
-
-    candidates: list[str] = []
-    previous_asset_start: int | None = None
-    previous_asset_end: int | None = None
-    for start_index, end_index, value in matches:
-        if _asset_candidate_starts_with_metadata_label(value):
-            continue
-        if _asset_candidate_is_target_path(line, start_index):
-            continue
-        if _asset_candidate_is_provenance_detail_path(line, start_index):
-            continue
-        if _asset_candidate_is_destination_path(
-            line,
-            start_index,
-            previous_asset_start=previous_asset_start,
-            previous_asset_end=previous_asset_end,
-        ):
-            continue
-        candidates.append(value)
-        previous_asset_start = start_index
-        previous_asset_end = end_index
-    return candidates
-
-
-def _asset_candidate_starts_with_metadata_label(value: str) -> bool:
-    return bool(re.match(r"\s*(?:source/license|license|licence|provenance)\s*:", value, re.IGNORECASE))
-
-
-def _asset_candidate_is_target_path(line: str, start_index: int) -> bool:
-    prefix = line[:start_index].lower().rstrip("`'\" ")
-    return bool(re.search(r"\b(?:target|destination)(?:\s+path)?\s*:\s*$|\bcopy\s+to\s*:\s*$", prefix))
-
-
-def _asset_candidate_is_provenance_detail_path(line: str, start_index: int) -> bool:
-    prefix = line[:start_index].lower()
-    return bool(re.search(r"\b(?:source/license|license|licence|provenance)\s*:\s*", prefix))
-
-
-def _asset_candidate_is_destination_path(
-    line: str,
-    start_index: int,
-    *,
-    previous_asset_start: int | None,
-    previous_asset_end: int | None,
-) -> bool:
-    if previous_asset_start is None or previous_asset_end is None:
-        return False
-    transfer_prefix = line[:previous_asset_start].casefold()
-    if not re.search(r"\b(copy|move|place|install|save|write|add|include|use)\b", transfer_prefix):
-        return False
-    between_paths = line[previous_asset_end:start_index].casefold().strip(" `\"'")
-    return _asset_destination_separator_between_paths(between_paths)
-
-
-def _asset_destination_separator_between_paths(text: str) -> bool:
-    words = re.findall(r"[a-z][a-z-]*", text.casefold())
-    if not words or words[0] not in {"to", "into", "under", "at", "as", "for"}:
-        return False
-    if any(
-        word
-        in {
-            "reference",
-            "compare",
-            "compared",
-            "according",
-            "based",
-            "basis",
-            "from",
-            "with",
-            "using",
-            "via",
-            "against",
-        }
-        for word in words[1:]
-    ):
-        return False
-    return len(words) <= 5
-
-
-def _asset_reference_identity_key(reference: dict[str, Any], fallback_path: str) -> str:
-    project_path = str(reference.get("project_path") or "").strip()
-    if project_path:
-        return project_path
-    normalized_fallback = Path(fallback_path).as_posix().strip()
-    return normalized_fallback or str(fallback_path).strip()
-
-
-def _merge_asset_reference(existing: dict[str, Any], update: dict[str, Any]) -> None:
-    if _asset_reference_kind_rank(update.get("kind")) > _asset_reference_kind_rank(existing.get("kind")):
-        existing["kind"] = update["kind"]
-    update_path = str(update.get("path") or "").strip()
-    if update_path and update_path != str(existing.get("path") or "").strip():
-        existing.setdefault("_raw_paths", [])
-        if update_path not in existing["_raw_paths"]:
-            existing["_raw_paths"].append(update_path)
-    for raw_path in update.get("_raw_paths") or []:
-        if not isinstance(raw_path, str) or not raw_path.strip():
-            continue
-        existing.setdefault("_raw_paths", [])
-        if raw_path not in existing["_raw_paths"]:
-            existing["_raw_paths"].append(raw_path)
-    for key in (
-        "target_specified",
-        "requested_target",
-        "provenance_specified",
-        "source_license",
-        "mime_type",
-        "sha256",
-        "size_bytes",
-        "git_status",
-    ):
-        if update.get(key) and not existing.get(key):
-            existing[key] = update[key]
-
-
-def _asset_reference_kind_rank(kind: Any) -> int:
-    return {"delivery": 3, "reference": 2, "ambiguous": 1}.get(str(kind or ""), 0)
-
-
-def _normalize_asset_path_candidate(raw_path: str) -> str | None:
-    candidate = unquote(raw_path.strip().strip("\"'<>"))
-    candidate = candidate.rstrip(".,;:")
-    if not candidate or candidate.startswith("#"):
-        return None
-    parsed = urlsplit(candidate)
-    if parsed.scheme and parsed.scheme.lower() not in {"file"}:
-        return None
-    if parsed.scheme.lower() == "file":
-        candidate = parsed.path
-    if not _asset_candidate_has_supported_extension(candidate):
-        return None
-    if not _asset_candidate_has_directory(candidate):
-        return None
-    return candidate
-
-
-def _asset_candidate_has_supported_extension(path: str) -> bool:
-    return Path(path).suffix.lower() in _ASSET_EXTENSIONS
-
-
-def _asset_candidate_has_directory(path: str) -> bool:
-    candidate = Path(path)
-    return candidate.is_absolute() or "/" in path or "\\" in path
-
-
-def _asset_reference_input_context(
-    path_text: str,
-    context: str,
-    project_config: dict | None,
-    heading_stack: list[tuple[int, str]],
-) -> bool:
-    if _asset_path_in_task_asset_dir(path_text, project_config):
-        return True
-    if _asset_reference_is_output_destination(path_text, context):
-        return False
-    if _asset_heading_stack_has_asset_section(heading_stack):
-        return True
-    return _asset_context_has_explicit_input_hint(context)
-
-
-def _asset_heading_stack_has_asset_section(heading_stack: list[tuple[int, str]]) -> bool:
-    for level, heading in heading_stack:
-        if level <= 1:
-            continue
-        normalized_heading = _normalize_heading(heading)
-        if "asset" in normalized_heading or "attachment" in normalized_heading:
-            return True
-    return False
-
-
-def _asset_reference_is_output_destination(path_text: str, context: str) -> bool:
-    heading = context.splitlines()[0] if context else ""
-    for line in context.splitlines()[1:]:
-        if path_text not in line:
-            continue
-        prefix = line.split(path_text, 1)[0]
-        if _asset_source_prefix_before_path(prefix):
-            continue
-        if _asset_line_has_explicit_input_hint(heading, line):
-            continue
-        if _asset_output_prefix_before_path(prefix):
-            return True
-    return False
-
-
-def _asset_line_has_explicit_input_hint(heading: str, line: str) -> bool:
-    return _asset_context_has_explicit_input_hint("\n".join([heading, line]))
-
-
-def _asset_context_has_explicit_input_hint(context: str) -> bool:
-    return bool(
-        _ASSET_STRONG_DELIVERY_HINT_RE.search(context)
-        or _asset_reference_detail(context, _ASSET_PROVENANCE_DETAIL_RE)
-        or _ASSET_EXPLICIT_REFERENCE_HINT_RE.search(context)
-    )
-
-
-def _asset_source_prefix_before_path(prefix: str) -> bool:
-    normalized = prefix.casefold().rstrip("`'\" ")
-    return bool(re.search(r"\b(?:using|with|from|via|based on|according to)\s*$", normalized))
-
-
-def _asset_output_prefix_before_path(prefix: str) -> bool:
-    normalized = prefix.casefold().rstrip("`'\" ")
-    output_match = None
-    for match in re.finditer(r"\b(?:add|build|create|draw|generate|implement|write)\b", normalized):
-        output_match = match
-    if output_match is None:
-        return False
-    if re.search(r"\b(?:using|with|from|via|based on|according to)\b", normalized[output_match.end() :]):
-        return False
-    if re.search(r"\b(?:to|into|under|at|as)\s*$", normalized):
-        return True
-    return len(re.findall(r"\b[\w-]+\b", normalized[output_match.end() :])) <= 4
-
-
-def _asset_path_in_task_asset_dir(path_text: str, project_config: dict | None) -> bool:
-    normalized_path = Path(path_text).as_posix().lstrip("./")
-    configured_dirs = [".sikula/task-assets"]
-    tasks = project_config.get("tasks") if isinstance(project_config, dict) else None
-    task_asset_dir = tasks.get("task_asset_dir") if isinstance(tasks, dict) else None
-    if isinstance(task_asset_dir, str) and task_asset_dir.strip():
-        configured_dirs.append(task_asset_dir.strip())
-    for configured_dir in configured_dirs:
-        normalized_dir = Path(configured_dir).as_posix().strip("/").lstrip("./")
-        if normalized_dir and (normalized_path == normalized_dir or normalized_path.startswith(normalized_dir + "/")):
-            return True
-    return False
-
-
-def _asset_project_root(source_path: Path | str | None, project_config: dict | None) -> Path:
-    if project_config:
-        project = project_config.get("project") if isinstance(project_config.get("project"), dict) else {}
-        root = project.get("root_path") if isinstance(project, dict) else None
-        if isinstance(root, str) and root.strip():
-            return Path(root).resolve()
-    if source_path is not None:
-        try:
-            path = Path(str(source_path)).resolve()
-            for parent in path.parents:
-                if parent.name == "tasks" and parent.parent.name == ".sikula":
-                    return parent.parent.parent.resolve()
-                if parent.name == "contracts" and parent.parent.name == ".sikula":
-                    return parent.parent.parent.resolve()
-                if parent.name == ".sikula":
-                    return parent.parent.resolve()
-            if path.exists():
-                return path.parent.resolve()
-        except OSError:
-            pass
-    return Path.cwd().resolve()
-
-
-def _asset_reference_metadata(
-    path_text: str,
-    *,
-    project_root: Path,
-    line_number: int,
-    context: str,
-    raw_path: str | None = None,
-) -> dict[str, Any] | None:
-    requested_path = Path(path_text)
-    candidate_path = requested_path if requested_path.is_absolute() else project_root / requested_path
-    resolved_path = candidate_path.resolve(strict=False)
-    try:
-        project_path = resolved_path.relative_to(project_root.resolve()).as_posix()
-    except ValueError:
-        project_path = ""
-    reference: dict[str, Any] = {
-        "path": path_text,
-        "line": line_number,
-        "kind": _asset_reference_kind(context),
-    }
-    if raw_path and raw_path != path_text:
-        reference["_raw_paths"] = [raw_path]
-    if _ASSET_TARGET_HINT_RE.search(context):
-        reference["target_specified"] = True
-        requested_target = _asset_reference_detail(context, _ASSET_TARGET_DETAIL_RE)
-        if requested_target:
-            reference["requested_target"] = requested_target
-    if _ASSET_PROVENANCE_HINT_RE.search(context):
-        source_license = _asset_reference_detail_for_reference(
-            context,
-            _ASSET_PROVENANCE_DETAIL_RE,
-            {"path": path_text, "project_path": project_path},
-            project_root=project_root,
-        )
-        if source_license:
-            reference["provenance_specified"] = True
-            reference["source_license"] = source_license
-
-    if not project_path:
-        reference["status"] = "outside_project"
-        return reference
-
-    reference["project_path"] = project_path
-    if not resolved_path.exists():
-        reference["status"] = "missing"
-        return reference
-    if not resolved_path.is_file():
-        reference["status"] = "not_file"
-        return reference
-
-    reference["status"] = "available"
-    reference["sha256"] = _file_sha256(resolved_path)
-    reference["size_bytes"] = resolved_path.stat().st_size
-    mime_type, _encoding = mimetypes.guess_type(resolved_path.name)
-    if mime_type:
-        reference["mime_type"] = mime_type
-    reference["git_status"] = _asset_git_status(project_root, project_path)
-    return reference
-
-
-def _asset_reference_kind(context: str) -> str:
-    if _ASSET_EXPLICIT_REFERENCE_HINT_RE.search(context):
-        return "reference"
-    if _ASSET_STRONG_DELIVERY_HINT_RE.search(context):
-        return "delivery"
-    if _ASSET_DELIVERY_HINT_RE.search(context):
-        return "delivery"
-    if _ASSET_REFERENCE_HINT_RE.search(context):
-        return "reference"
-    return "ambiguous"
-
-
-def _asset_reference_detail_for_reference(
-    context: str,
-    pattern: re.Pattern[str],
-    reference: dict[str, Any],
-    *,
-    project_root: Path,
-) -> str | None:
-    common_detail: str | None = None
-    for line in context.splitlines():
-        match = pattern.search(line)
-        if not match:
-            continue
-        value = _clean_answer_bullet(_first_match_group(match)).strip("` ")
-        detail = _single_line(value)
-        if not detail:
-            continue
-        specific_detail = _path_specific_asset_detail(
-            detail,
-            reference,
-            context=context,
-            project_root=project_root,
-        )
-        if specific_detail is not None:
-            if specific_detail:
-                return specific_detail
-            continue
-        if common_detail is None:
-            common_detail = detail
-    return common_detail
-
-
-def _path_specific_asset_detail(
-    detail: str,
-    reference: dict[str, Any],
-    *,
-    context: str,
-    project_root: Path,
-) -> str | None:
-    reference_keys = _asset_reference_match_keys(reference)
-    context_basenames = _asset_context_project_paths_by_basename(context, project_root=project_root)
-    saw_path_specific_detail = False
-    for candidate in _asset_detail_path_candidates(detail):
-        candidate_key = _asset_detail_path_key(candidate, project_root=project_root)
-        if not candidate_key:
-            continue
-        saw_path_specific_detail = True
-        if _asset_detail_path_is_basename(candidate):
-            matching_paths = context_basenames.get(candidate_key, set())
-            if len(matching_paths) != 1:
-                continue
-        if candidate_key in reference_keys:
-            return _asset_provenance_text_without_path(detail, candidate)
-    if saw_path_specific_detail:
-        return ""
-    return None
-
-
-def _asset_context_project_paths_by_basename(context: str, *, project_root: Path) -> dict[str, set[str]]:
-    paths_by_basename: dict[str, set[str]] = {}
-    for line in context.splitlines():
-        for candidate in _asset_path_candidates(line):
-            normalized = _normalize_asset_path_candidate(candidate)
-            if not normalized:
-                continue
-            project_path = _asset_answer_path_for_project(normalized, project_root=project_root) or normalized
-            basename = Path(project_path).name
-            if basename:
-                paths_by_basename.setdefault(basename, set()).add(project_path)
-    return paths_by_basename
-
-
-def _asset_detail_path_candidates(detail: str) -> list[str]:
-    candidates = list(_asset_path_candidates(detail))
-    seen = set(candidates)
-    for match in _ASSET_FILENAME_RE.finditer(detail):
-        candidate = match.group(1)
-        if candidate not in seen:
-            candidates.append(candidate)
-            seen.add(candidate)
-    return candidates
-
-
-def _asset_detail_path_key(path_text: str, *, project_root: Path) -> str:
-    normalized = _normalize_asset_path_candidate(path_text)
-    if normalized:
-        project_path = _asset_answer_path_for_project(normalized, project_root=project_root)
-        if project_path:
-            return project_path
-        return normalized
-    filename_match = _ASSET_FILENAME_RE.fullmatch(path_text.strip())
-    return filename_match.group(1) if filename_match else ""
-
-
-def _asset_detail_path_is_basename(path_text: str) -> bool:
-    stripped = path_text.strip()
-    return bool(_ASSET_FILENAME_RE.fullmatch(stripped)) and "/" not in stripped and "\\" not in stripped
-
-
-def _asset_reference_detail(context: str, pattern: re.Pattern[str]) -> str | None:
-    for line in context.splitlines():
-        match = pattern.search(line)
-        if not match:
-            continue
-        value = _clean_answer_bullet(_first_match_group(match)).strip("` ")
-        return _single_line(value) or None
-    return None
-
-
-def _first_match_group(match: re.Match[str]) -> str:
-    for value in match.groups():
-        if value:
-            return value
-    return match.group(0)
-
-
-def _file_sha256(path: Path) -> str:
-    digest = sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return "sha256:" + digest.hexdigest()
-
-
-def _asset_git_status(project_root: Path, project_path: str) -> str:
-    if _git_command(project_root, "rev-parse", "--is-inside-work-tree").returncode != 0:
-        return "unknown"
-    status = _git_command_stdout(project_root, "status", "--porcelain", "--ignored", "--", project_path)
-    status_line = status.stdout.strip().splitlines()[0] if status.returncode == 0 and status.stdout.strip() else ""
-    if status_line.startswith("!!"):
-        return "ignored"
-    if status_line.startswith("??"):
-        return "untracked"
-    if status_line:
-        return "dirty"
-    if _git_command(project_root, "ls-files", "--error-unmatch", "--", project_path).returncode == 0:
-        return "tracked"
-    if _git_command(project_root, "check-ignore", "-q", "--", project_path).returncode == 0:
-        return "ignored"
-    return "untracked"
-
-
-def _git_command_stdout(project_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(
-            ["git", "-C", str(project_root), *args],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return subprocess.CompletedProcess(args, returncode=1, stdout="", stderr="")
-
-
-def _git_command(project_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(
-            ["git", "-C", str(project_root), *args],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return subprocess.CompletedProcess(args=["git", *args], returncode=1)
-
-
 def _build_gaps(
     parsed: _ParsedTask,
     sections_detected: dict[str, bool],
@@ -4460,6 +3298,7 @@ def _build_gaps(
     validation: dict[str, Any],
     security_sensitive: bool,
     asset_references: list[dict[str, Any]],
+    undeclared_asset_paths: list[dict[str, Any]] | None = None,
 ) -> list[ContractGap]:
     gaps: list[ContractGap] = []
     if scores["scope_clarity"] < 50:
@@ -4579,12 +3418,24 @@ def _build_gaps(
                 "Repository context, affected surface, or domain rules are underspecified.",
             )
         )
-    gaps.extend(_asset_reference_gaps(asset_references))
+    gaps.extend(_asset_reference_gaps(asset_references, undeclared_asset_paths or []))
     return gaps
 
 
-def _asset_reference_gaps(asset_references: list[dict[str, Any]]) -> list[ContractGap]:
+def _asset_reference_gaps(
+    asset_references: list[dict[str, Any]],
+    undeclared_asset_paths: list[dict[str, Any]],
+) -> list[ContractGap]:
     gaps: list[ContractGap] = []
+    if undeclared_asset_paths:
+        gaps.append(
+            ContractGap(
+                "gap.assets.declarations",
+                "warning",
+                "assets",
+                "Local asset-like paths must be declared in a structured ## Assets section.",
+            )
+        )
     if not asset_references:
         return gaps
     if any(reference.get("status") == "missing" for reference in asset_references):
@@ -4593,7 +3444,7 @@ def _asset_reference_gaps(asset_references: list[dict[str, Any]]) -> list[Contra
                 "gap.assets.missing",
                 "blocking",
                 "assets",
-                "Referenced local asset files are missing.",
+                "Declared local asset files are missing.",
             )
         )
     if any(reference.get("status") == "outside_project" for reference in asset_references):
@@ -4602,7 +3453,7 @@ def _asset_reference_gaps(asset_references: list[dict[str, Any]]) -> list[Contra
                 "gap.assets.outside_project",
                 "blocking",
                 "assets",
-                "Referenced asset paths must resolve inside the project boundary.",
+                "Declared asset paths must resolve inside the project boundary.",
             )
         )
     if any(reference.get("status") == "not_file" for reference in asset_references):
@@ -4611,7 +3462,7 @@ def _asset_reference_gaps(asset_references: list[dict[str, Any]]) -> list[Contra
                 "gap.assets.not_file",
                 "blocking",
                 "assets",
-                "Referenced asset paths must point to files, not directories.",
+                "Declared asset paths must point to files, not directories.",
             )
         )
     if any(reference.get("git_status") in {"dirty", "ignored", "untracked"} for reference in asset_references):
@@ -4620,7 +3471,7 @@ def _asset_reference_gaps(asset_references: list[dict[str, Any]]) -> list[Contra
                 "gap.assets.worktree_availability",
                 "warning",
                 "assets",
-                "Referenced assets are not cleanly tracked by git and may be unavailable in isolated Sikula runs.",
+                "Declared assets are not cleanly tracked by git and may be unavailable in isolated Sikula runs.",
             )
         )
     if any(reference.get("kind") == "ambiguous" for reference in asset_references):
@@ -4629,7 +3480,7 @@ def _asset_reference_gaps(asset_references: list[dict[str, Any]]) -> list[Contra
                 "gap.assets.intent",
                 "warning",
                 "assets",
-                "Referenced asset purpose is ambiguous; mark assets as reference-only or delivery assets.",
+                "Declared asset purpose is ambiguous; mark assets as reference-only or delivery assets.",
             )
         )
     delivery_assets = [reference for reference in asset_references if reference.get("kind") == "delivery"]
@@ -4757,11 +3608,20 @@ def _build_questions(gaps: list[ContractGap], security_sensitive: bool, text: st
                 False,
             )
         )
+    if "gap.assets.declarations" in gap_ids:
+        add(
+            ClarifyingQuestion(
+                "assets.declarations",
+                "Which local asset paths should be declared in the structured ## Assets section?",
+                "Sikula treats structured asset declarations as the source of truth for usage, target, and provenance.",
+                False,
+            )
+        )
     if {"gap.assets.missing", "gap.assets.outside_project", "gap.assets.not_file"} & gap_ids:
         add(
             ClarifyingQuestion(
                 "assets.local_files",
-                "Which local project files should Sikula use for the referenced assets?",
+                "Which local project files should Sikula use for the declared assets?",
                 "Sikula needs local, project-bound asset files so isolated runs and review see the same inputs.",
                 True,
             )
@@ -4770,7 +3630,7 @@ def _build_questions(gaps: list[ContractGap], security_sensitive: bool, text: st
         add(
             ClarifyingQuestion(
                 "assets.intent",
-                "Which referenced assets are reference-only, and which should be used as delivery assets?",
+                "Which declared assets are reference-only, and which should be used as delivery assets?",
                 "Reference assets guide the implementation; delivery assets may be copied into production code.",
                 False,
             )
@@ -4801,10 +3661,11 @@ def _suggested_sections(gaps: list[ContractGap]) -> list[str]:
         "gap.review.reviewer_focus": "Reviewer focus: call out risky areas for human review",
         "gap.task_size.too_large": "Scope: split the task or narrow the autonomous delivery boundary",
         "gap.context.repo_context": "Context: name affected files, APIs, domain rules, or project conventions",
-        "gap.assets.missing": "Assets: provide local project files for referenced assets",
-        "gap.assets.outside_project": "Assets: move referenced files inside the project boundary",
-        "gap.assets.not_file": "Assets: reference concrete files rather than directories",
-        "gap.assets.worktree_availability": "Assets: track referenced files or document no-isolate availability",
+        "gap.assets.declarations": "Assets: declare local asset paths in structured ## Assets entries",
+        "gap.assets.missing": "Assets: provide local project files for declared assets",
+        "gap.assets.outside_project": "Assets: move declared files inside the project boundary",
+        "gap.assets.not_file": "Assets: declare concrete files rather than directories",
+        "gap.assets.worktree_availability": "Assets: track declared files or document no-isolate availability",
         "gap.assets.intent": "Assets: label each asset as reference-only or delivery",
         "gap.assets.provenance": "Assets: record source, license, or provenance for delivery assets",
     }
@@ -4849,5 +3710,5 @@ def _strong_signals(
     elif validation.get("configured_commands"):
         signals.append("Configured Sikula validation pipeline is available.")
     if asset_references and all(reference.get("status") == "available" for reference in asset_references):
-        signals.append("Referenced local assets are available and hashed.")
+        signals.append("Declared local assets are available and hashed.")
     return signals

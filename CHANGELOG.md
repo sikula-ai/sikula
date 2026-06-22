@@ -48,10 +48,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   MCP-ready adapter response shapes for both stages.
 - Contract readiness and preparation now support local task assets from the
   configured `tasks.task_asset_dir`, including deterministic path validation,
-  hashing, reference-vs-delivery classification, delivery provenance checks,
-  isolated-run availability warnings for untracked/dirty assets, answer-based
-  missing-asset replacement, and generated implementation-contract asset
-  manifests.
+  structured `## Assets` declarations as the source of truth, warnings for
+  undeclared asset-like paths in prose, hashing, reference-vs-delivery
+  classification, delivery provenance checks, isolated-run availability warnings
+  for untracked/dirty assets, answer-based missing-asset replacement, and
+  generated implementation-contract asset manifests.
 - Task terminal summaries now include a platform-neutral audit report with validation status, review status, non-blocking audit warnings, and recovered issues such as validation failures fixed by the build/fix loop.
 - Failed validation records now include high-signal diagnostic summary lines, and task terminal summaries sample and deduplicate those lines across recovered build/test/check failures so successful self-healed runs still reveal the concrete compiler error, failed test, sanitized assertion failure, or linter rule that was repaired without echoing source-code frames or assertion values, with an explicit pointer to `sikula show` for full state details.
 - The test writer now more strongly prefers behavioural seams over broad source-inspection tests, especially for UI implementation details that cannot be meaningfully exercised by existing project test infrastructure.

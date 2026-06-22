@@ -32,6 +32,7 @@
 | `InitAgent` | `agents/init_agent.py` | Generates `.sikula/guidelines.md` from codebase analysis; called by `cmd_init()` only — not part of the orchestrator loop |
 | `LLMClient` | `core/llm_client.py` | Abstract interface: `generate()` for single-shot text; `run_readonly_agent()` for read-only autonomous agents; `run_agent()` for autonomous file-editing agents |
 | `ContractCheck` helpers | `core/contract_check.py` | Deterministic implementation-contract readiness checks for Markdown/plain-text task files; `sikula run` stores a warning-only state snapshot and `sikula contract check --write-report` explicitly writes report artifacts |
+| `TaskAsset` helpers | `core/task_assets.py` | Deterministic local task-asset parsing, path canonicalization, answer mapping, and asset-manifest line rendering used by contract preparation |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
 | `JsonStateStore` | `core/state.py` | Stores each task as `<task_id>.json` in the configured state dir; serializes same-process access and writes via temp-file replacement so heartbeat updates and audit saves cannot interleave partial JSON writes |
 
@@ -143,7 +144,13 @@ client-reported local config presence is guidance only and is not a readiness si
 `core.contract_prepare_adapter` maps those core results into stable
 `prepare_task_description` and `prepare_implementation_contract` response shapes for
 future MCP transport without adding scoring or rewrite logic; task-description responses
-do not expose implementation-contract readiness fields. These commands and helpers
+do not expose implementation-contract readiness fields. Contract preparation helpers
+capture local task assets in the prepared contract manifest as path/hash snapshots.
+Asset detection treats structured `## Assets` declarations as authoritative; paths in
+prose or configured task-asset directories are reported only as undeclared-path
+warnings unless a matching structured declaration exists. Runtime hash mismatch
+enforcement belongs to the run-state asset audit work and is not performed by this
+warning-only preflight path. These commands and helpers
 do not create `TaskState`, start agents, create worktrees, or alter `review` flow. Fresh `sikula run
 TASK_FILE` uses the same deterministic checks to store a compact warning-only snapshot in
 `TaskState.implementation_contract` and print a one-line summary before agents start; it
