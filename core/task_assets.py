@@ -153,35 +153,15 @@ _ASSET_REFERENCE_HINT_RE = re.compile(
     r"layout reference|spec excerpt)\b",
     re.IGNORECASE,
 )
-_ASSET_EXPLICIT_REFERENCE_HINT_RE = re.compile(
-    r"\b(reference assets?|reference[-\s]+only|do[-\s]+not[-\s]+copy|design reference|layout reference|"
-    r"visual reference|reference (?:asset|image|screenshot|mockup)|spec excerpt)\b",
-    re.IGNORECASE,
-)
 _ASSET_DELIVERY_HINT_RE = re.compile(
     r"\bdelivery asset\b|\buse\b.+\b(?:as|for)\b|\buse this file\b|\bcopy\b|\binclude\b|\bship\b|"
     r"\bproduction asset\b|\btarget\s*:|\bsource/license\s*:|\bprovided by\b",
     re.IGNORECASE,
 )
-_ASSET_STRONG_DELIVERY_HINT_RE = re.compile(
-    r"\bdelivery assets?\b|\btarget(?:\s+path)?\s*:|\bcopy\b.+\b(?:to|into|under|at)\b|"
-    r"\bdestination(?:\s+path)?\s*:|\bproduction asset\b|\bsource/license\s*:",
-    re.IGNORECASE,
-)
-_ASSET_TARGET_HINT_RE = re.compile(
-    r"\b(?:target(?:\s+path)?|copy\s+to|into|destination(?:\s+path)?)\b",
-    re.IGNORECASE,
-)
-_ASSET_PROVENANCE_HINT_RE = re.compile(
-    r"\b(source/license|license:|licence:|provenance|provided by|owned by)\b",
-    re.IGNORECASE,
-)
-_ASSET_TARGET_DETAIL_RE = re.compile(
-    r"\b(?:target(?:\s+path)?|destination(?:\s+path)?|copy\s+to)\s*:\s*(.+)",
-    re.IGNORECASE,
-)
-_ASSET_PROVENANCE_DETAIL_RE = re.compile(
-    r"\b(?:source/license|license|licence|provenance)\s*:\s*(.+)|\b(provided\s+by\b.+)",
+_ASSET_UNDECLARED_HINT_RE = re.compile(
+    r"\b(reference assets?|reference[-\s]+only|do[-\s]+not[-\s]+copy|design reference|"
+    r"layout reference|visual reference|reference (?:asset|image|screenshot|mockup)|spec excerpt|"
+    r"delivery assets?|production asset|source/license\s*:)\b",
     re.IGNORECASE,
 )
 _GENERATED_ANSWER_ENTRY_END_MARKER = "<!-- /sikula:generated-answer -->"
@@ -828,7 +808,6 @@ def detect_asset_references(
             declaration.path,
             project_root=project_root,
             line_number=declaration.line,
-            context="",
             raw_path=declaration.raw_path,
             kind=declaration.kind,
             target_specified=declaration.target_specified,
@@ -1071,7 +1050,7 @@ def _asset_structured_root_heading(heading: str) -> bool:
 
 
 def _undeclared_asset_path_should_warn(path_text: str, context: str, project_config: dict | None) -> bool:
-    return _asset_path_in_task_asset_dir(path_text, project_config) or _asset_context_has_explicit_input_hint(context)
+    return _asset_path_in_task_asset_dir(path_text, project_config) or bool(_ASSET_UNDECLARED_HINT_RE.search(context))
 
 
 def _asset_update_heading_stack(
@@ -1304,124 +1283,6 @@ def _asset_candidate_has_directory(path: str) -> bool:
     return candidate.is_absolute() or "/" in path or "\\" in path
 
 
-def _asset_reference_input_context(
-    path_text: str,
-    raw_path: str,
-    context: str,
-    project_config: dict | None,
-    heading_stack: list[tuple[int, str]],
-) -> bool:
-    if _asset_path_in_task_asset_dir(path_text, project_config):
-        return True
-    if _asset_reference_is_output_destination(path_text, context):
-        return False
-    if _asset_context_has_structured_asset_declaration(path_text, raw_path, context, heading_stack):
-        return True
-    return _asset_context_has_explicit_input_hint(context)
-
-
-def _asset_context_has_structured_asset_declaration(
-    path_text: str,
-    raw_path: str,
-    context: str,
-    heading_stack: list[tuple[int, str]],
-) -> bool:
-    if not _asset_heading_stack_has_asset_section(heading_stack):
-        return False
-    return any(_asset_line_declares_asset_path(line, path_text, raw_path) for line in context.splitlines())
-
-
-def _asset_line_declares_asset_path(line: str, path_text: str, raw_path: str) -> bool:
-    cleaned = _clean_answer_bullet(line)
-    label_match = re.match(r"^(?:path|asset|reference asset|delivery asset)\s*:\s*(.+)$", cleaned, re.IGNORECASE)
-    if label_match:
-        return _asset_line_contains_path_candidate(label_match.group(1), path_text)
-    return _asset_line_is_bare_asset_path(cleaned, path_text, raw_path)
-
-
-def _asset_line_contains_path_candidate(value: str, path_text: str) -> bool:
-    for candidate in _asset_path_candidates(value):
-        if _normalize_asset_path_candidate(candidate) == path_text:
-            return True
-    return False
-
-
-def _asset_line_is_bare_asset_path(value: str, path_text: str, raw_path: str) -> bool:
-    normalized_value = _normalize_bare_asset_path_literal(value)
-    if normalized_value is None:
-        return False
-    if normalized_value == path_text:
-        return True
-    normalized_raw_path = _normalize_bare_asset_path_literal(raw_path) if raw_path else None
-    return normalized_raw_path is not None and normalized_value == normalized_raw_path
-
-
-def _normalize_bare_asset_path_literal(value: str) -> str | None:
-    cleaned = _single_line(value).strip()
-    link_match = _MARKDOWN_LINK_RE.fullmatch(cleaned)
-    if link_match:
-        cleaned = link_match.group(1)
-    cleaned = cleaned.strip().strip("`\"'<>")
-    cleaned = cleaned.rstrip(".,;:")
-    return _normalize_asset_path_candidate(cleaned)
-
-
-def _asset_heading_stack_has_asset_section(heading_stack: list[tuple[int, str]]) -> bool:
-    for level, heading in heading_stack:
-        if level <= 1:
-            continue
-        normalized_heading = _normalize_heading(heading)
-        if "asset" in normalized_heading or "attachment" in normalized_heading:
-            return True
-    return False
-
-
-def _asset_reference_is_output_destination(path_text: str, context: str) -> bool:
-    heading = context.splitlines()[0] if context else ""
-    for line in context.splitlines()[1:]:
-        if path_text not in line:
-            continue
-        prefix = line.split(path_text, 1)[0]
-        if _asset_source_prefix_before_path(prefix):
-            continue
-        if _asset_line_has_explicit_input_hint(heading, line):
-            continue
-        if _asset_output_prefix_before_path(prefix):
-            return True
-    return False
-
-
-def _asset_line_has_explicit_input_hint(heading: str, line: str) -> bool:
-    return _asset_context_has_explicit_input_hint("\n".join([heading, line]))
-
-
-def _asset_context_has_explicit_input_hint(context: str) -> bool:
-    return bool(
-        _ASSET_STRONG_DELIVERY_HINT_RE.search(context)
-        or _asset_reference_detail(context, _ASSET_PROVENANCE_DETAIL_RE)
-        or _ASSET_EXPLICIT_REFERENCE_HINT_RE.search(context)
-    )
-
-
-def _asset_source_prefix_before_path(prefix: str) -> bool:
-    normalized = prefix.casefold().rstrip("`'\" ")
-    return bool(re.search(r"\b(?:using|with|from|via|based on|according to)\s*$", normalized))
-
-
-def _asset_output_prefix_before_path(prefix: str) -> bool:
-    normalized = prefix.casefold().rstrip("`'\" ")
-    output_match = None
-    for match in re.finditer(r"\b(?:add|build|create|draw|generate|implement|write)\b", normalized):
-        output_match = match
-    if output_match is None:
-        return False
-    if re.search(r"\b(?:using|with|from|via|based on|according to)\b", normalized[output_match.end() :]):
-        return False
-    if re.search(r"\b(?:to|into|under|at|as)\s*$", normalized):
-        return True
-    return len(re.findall(r"\b[\w-]+\b", normalized[output_match.end() :])) <= 4
-
-
 def _asset_path_in_task_asset_dir(path_text: str, project_config: dict | None) -> bool:
     normalized_path = Path(path_text).as_posix().lstrip("./")
     configured_dirs = [".sikula/task-assets"]
@@ -1464,12 +1325,11 @@ def _asset_reference_metadata(
     *,
     project_root: Path,
     line_number: int,
-    context: str,
     raw_path: str | None = None,
-    kind: str | None = None,
-    target_specified: bool | None = None,
+    kind: str = AssetKind.AMBIGUOUS.value,
+    target_specified: bool = False,
     requested_target: str | None = None,
-    provenance_specified: bool | None = None,
+    provenance_specified: bool = False,
     source_license: str | None = None,
 ) -> dict[str, Any] | None:
     requested_path = Path(path_text)
@@ -1479,28 +1339,9 @@ def _asset_reference_metadata(
         project_path = resolved_path.relative_to(project_root.resolve()).as_posix()
     except ValueError:
         project_path = ""
-    kind = kind or _asset_reference_kind(context)
     raw_paths = [raw_path] if raw_path and raw_path != path_text else []
     requested_target = requested_target or ""
-    if target_specified is None:
-        if _ASSET_TARGET_HINT_RE.search(context):
-            requested_target = _asset_reference_detail(context, _ASSET_TARGET_DETAIL_RE, path_value=True) or ""
-        target_specified = bool(requested_target)
     source_license = source_license or ""
-    if provenance_specified is None:
-        provenance_specified = False
-        if _ASSET_PROVENANCE_HINT_RE.search(context):
-            source_license = (
-                _asset_reference_detail_for_reference(
-                    context,
-                    _ASSET_PROVENANCE_DETAIL_RE,
-                    {"path": path_text, "project_path": project_path},
-                    project_root=project_root,
-                )
-                or ""
-            )
-            if source_license:
-                provenance_specified = True
 
     if not project_path:
         return AssetReference(
@@ -1561,162 +1402,6 @@ def _asset_reference_metadata(
     ).to_dict(include_internal=True)
 
 
-def _asset_reference_kind(context: str) -> str:
-    if _ASSET_EXPLICIT_REFERENCE_HINT_RE.search(context):
-        return AssetKind.REFERENCE.value
-    if _ASSET_STRONG_DELIVERY_HINT_RE.search(context):
-        return AssetKind.DELIVERY.value
-    if _ASSET_REFERENCE_HINT_RE.search(context):
-        return AssetKind.REFERENCE.value
-    if _ASSET_DELIVERY_HINT_RE.search(context):
-        return AssetKind.DELIVERY.value
-    return AssetKind.AMBIGUOUS.value
-
-
-def _asset_reference_detail_for_reference(
-    context: str,
-    pattern: re.Pattern[str],
-    reference: dict[str, Any],
-    *,
-    project_root: Path,
-) -> str | None:
-    common_detail: str | None = None
-    for line in context.splitlines():
-        match = pattern.search(line)
-        if not match:
-            continue
-        value = _clean_answer_bullet(_first_match_group(match)).strip("` ")
-        detail = _single_line(value)
-        if not detail:
-            continue
-        specific_detail = _path_specific_asset_detail(
-            detail,
-            reference,
-            context=context,
-            project_root=project_root,
-        )
-        if specific_detail is not None:
-            if specific_detail:
-                return specific_detail
-            continue
-        if common_detail is None:
-            common_detail = detail
-    return common_detail
-
-
-def _path_specific_asset_detail(
-    detail: str,
-    reference: dict[str, Any],
-    *,
-    context: str,
-    project_root: Path,
-) -> str | None:
-    reference_keys = _asset_reference_match_keys(reference)
-    context_basenames = _asset_context_project_paths_by_basename(context, project_root=project_root)
-    context_reference_keys = _asset_context_reference_path_keys(context, project_root=project_root)
-    saw_path_specific_detail = False
-    for candidate in _asset_detail_path_candidates(detail):
-        candidate_key = _asset_detail_path_key(candidate, project_root=project_root)
-        if not candidate_key:
-            continue
-        provenance_text = _asset_provenance_text_without_path(detail, candidate)
-        if _asset_detail_path_is_basename(candidate):
-            matching_paths = context_basenames.get(candidate_key, set())
-            if matching_paths:
-                saw_path_specific_detail = True
-            if len(matching_paths) != 1:
-                continue
-        if candidate_key in reference_keys:
-            return provenance_text
-        if _asset_path_match_keys(candidate_key) & context_reference_keys:
-            saw_path_specific_detail = True
-    if saw_path_specific_detail:
-        return ""
-    return None
-
-
-def _asset_context_reference_path_keys(context: str, *, project_root: Path) -> set[str]:
-    keys: set[str] = set()
-    for line in context.splitlines():
-        if _asset_line_is_metadata_path_value(line):
-            continue
-        for candidate in _asset_path_candidates(line):
-            normalized = _normalize_asset_path_candidate(candidate)
-            if not normalized:
-                continue
-            project_path = _asset_answer_path_for_project(normalized, project_root=project_root) or normalized
-            keys.update(_asset_path_match_keys(project_path))
-    return keys
-
-
-def _asset_context_project_paths_by_basename(context: str, *, project_root: Path) -> dict[str, set[str]]:
-    paths_by_basename: dict[str, set[str]] = {}
-    for line in context.splitlines():
-        if _asset_line_is_metadata_path_value(line):
-            continue
-        for candidate in _asset_path_candidates(line):
-            normalized = _normalize_asset_path_candidate(candidate)
-            if not normalized:
-                continue
-            project_path = _asset_answer_path_for_project(normalized, project_root=project_root) or normalized
-            basename = Path(project_path).name
-            if basename:
-                paths_by_basename.setdefault(basename, set()).add(project_path)
-    return paths_by_basename
-
-
-def _asset_line_is_metadata_path_value(line: str) -> bool:
-    cleaned = _clean_answer_bullet(line)
-    return bool(
-        re.match(
-            r"^(?:target(?:\s+path)?|requested target|destination(?:\s+path)?|"
-            r"source/license|license|licence|provenance)\s*:",
-            cleaned,
-            re.IGNORECASE,
-        )
-    )
-
-
-def _asset_detail_path_candidates(detail: str) -> list[str]:
-    candidates = list(_asset_path_candidates(detail))
-    seen = set(candidates)
-    for match in _ASSET_FILENAME_RE.finditer(detail):
-        candidate = match.group(1)
-        if candidate not in seen:
-            candidates.append(candidate)
-            seen.add(candidate)
-    return candidates
-
-
-def _asset_detail_path_key(path_text: str, *, project_root: Path) -> str:
-    normalized = _normalize_asset_path_candidate(path_text)
-    if normalized:
-        project_path = _asset_answer_path_for_project(normalized, project_root=project_root)
-        if project_path:
-            return project_path
-        return normalized
-    filename_match = _ASSET_FILENAME_RE.fullmatch(path_text.strip())
-    return filename_match.group(1) if filename_match else ""
-
-
-def _asset_detail_path_is_basename(path_text: str) -> bool:
-    stripped = path_text.strip()
-    return bool(_ASSET_FILENAME_RE.fullmatch(stripped)) and "/" not in stripped and "\\" not in stripped
-
-
-def _asset_reference_detail(context: str, pattern: re.Pattern[str], *, path_value: bool = False) -> str | None:
-    for line in context.splitlines():
-        match = pattern.search(line)
-        if not match:
-            continue
-        value = _clean_answer_bullet(_first_match_group(match))
-        if path_value:
-            return _asset_path_metadata_value(value)
-        value = value.strip("` ")
-        return _single_line(value) or None
-    return None
-
-
 def _asset_path_metadata_value(value: str) -> str | None:
     cleaned = _single_line(value)
     markdown_link = _MARKDOWN_LINK_RE.search(cleaned)
@@ -1736,13 +1421,6 @@ def _clean_asset_path_metadata_token(value: str) -> str | None:
     cleaned = cleaned.rstrip("`\"'")
     cleaned = cleaned.strip()
     return cleaned or None
-
-
-def _first_match_group(match: re.Match[str]) -> str:
-    for value in match.groups():
-        if value:
-            return value
-    return match.group(0)
 
 
 def _file_sha256(path: Path) -> str:

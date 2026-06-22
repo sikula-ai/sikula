@@ -74,7 +74,7 @@ Before opening a PR, read [ARCHITECTURE.md](ARCHITECTURE.md) and [guidelines.md]
 - **TestWriterAgent must only write to test directories** — it must be constrained to `sandbox.allowed_test_write_paths`; production source files are off-limits.
 - **Security reviewer fail-safe must not be weakened** — unexpected or ambiguous output (no `APPROVED` signal, no `## Warnings`, no `## Security Issues`) must always be treated as blocking.
 - **Provider sandbox** — document the workspace boundary enforcement level (OS-level vs prompt-level) in the sandbox notes for the new provider. See `core/llm_client.py` for existing implementations.
-- **Keep documentation in sync** — any PR that changes documented behaviour must update `ARCHITECTURE.md` and the relevant sections of `README.md` in the same PR.
+- **Keep documentation in sync** — any PR that changes documented behaviour must update `ARCHITECTURE.md`, the relevant sections of `README.md`, and topic docs such as `docs/writing-tasks.md` for task or contract syntax changes in the same PR.
 - **English comments only** — all code comments must be in English.
 
 ## Scope
@@ -139,7 +139,7 @@ def test_happy_path(git_project, fake_llm):
 - [ ] `python3 -m pytest tests/` passes
 - [ ] Coverage checked for new or changed code where meaningful
 - [ ] `ruff check .` and `ruff format --check .` pass
-- [ ] `ARCHITECTURE.md` and `README.md` updated if the change affects documented behaviour
+- [ ] `ARCHITECTURE.md`, `README.md`, and relevant topic docs updated if the change affects documented behaviour
 - [ ] CI passes on the PR
 
 CI runs automatically on every PR (Python 3.10–3.13 matrix, compile check, tests, ruff lint/format, and Codecov diff coverage). All checks must pass before merge.
