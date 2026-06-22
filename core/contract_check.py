@@ -229,7 +229,7 @@ _ASSET_TARGET_DETAIL_RE = re.compile(
     re.IGNORECASE,
 )
 _ASSET_PROVENANCE_DETAIL_RE = re.compile(
-    r"\b(?:source/license|license|licence|provenance)\s*:\s*(.+)",
+    r"\b(?:source/license|license|licence|provenance)\s*:\s*(.+)|\b(provided\s+by\b.+)",
     re.IGNORECASE,
 )
 
@@ -3853,7 +3853,7 @@ def _detect_asset_references(
             if not normalized_path:
                 continue
             context = _asset_reference_context(heading_stack, lines, line_index)
-            if not _asset_reference_input_context(normalized_path, context, project_config):
+            if not _asset_reference_input_context(normalized_path, context, project_config, heading_stack):
                 continue
             reference = _asset_reference_metadata(
                 normalized_path,
@@ -4104,16 +4104,29 @@ def _asset_candidate_has_directory(path: str) -> bool:
     return candidate.is_absolute() or "/" in path or "\\" in path
 
 
-def _asset_reference_input_context(path_text: str, context: str, project_config: dict | None) -> bool:
-    heading = context.splitlines()[0] if context else ""
-    normalized_heading = _normalize_heading(heading)
+def _asset_reference_input_context(
+    path_text: str,
+    context: str,
+    project_config: dict | None,
+    heading_stack: list[tuple[int, str]],
+) -> bool:
     if _asset_path_in_task_asset_dir(path_text, project_config):
         return True
     if _asset_reference_is_output_destination(path_text, context):
         return False
-    if "asset" in normalized_heading or "attachment" in normalized_heading:
+    if _asset_heading_stack_has_asset_section(heading_stack):
         return True
     return _asset_context_has_explicit_input_hint(context)
+
+
+def _asset_heading_stack_has_asset_section(heading_stack: list[tuple[int, str]]) -> bool:
+    for level, heading in heading_stack:
+        if level <= 1:
+            continue
+        normalized_heading = _normalize_heading(heading)
+        if "asset" in normalized_heading or "attachment" in normalized_heading:
+            return True
+    return False
 
 
 def _asset_reference_is_output_destination(path_text: str, context: str) -> bool:
@@ -4283,7 +4296,7 @@ def _asset_reference_detail_for_reference(
         match = pattern.search(line)
         if not match:
             continue
-        value = _clean_answer_bullet(match.group(1)).strip("` ")
+        value = _clean_answer_bullet(_first_match_group(match)).strip("` ")
         detail = _single_line(value)
         if not detail:
             continue
@@ -4374,9 +4387,16 @@ def _asset_reference_detail(context: str, pattern: re.Pattern[str]) -> str | Non
         match = pattern.search(line)
         if not match:
             continue
-        value = _clean_answer_bullet(match.group(1)).strip("` ")
+        value = _clean_answer_bullet(_first_match_group(match)).strip("` ")
         return _single_line(value) or None
     return None
+
+
+def _first_match_group(match: re.Match[str]) -> str:
+    for value in match.groups():
+        if value:
+            return value
+    return match.group(0)
 
 
 def _file_sha256(path: Path) -> str:

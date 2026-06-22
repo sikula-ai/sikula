@@ -336,6 +336,40 @@ def test_contract_check_captures_delivery_asset_target_and_source_license(tmp_pa
     assert all(gap.id != "gap.assets.provenance" for gap in result.gaps)
 
 
+def test_contract_check_captures_delivery_asset_provided_by_provenance(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task = """# Add success icon
+
+## Assets
+
+### Delivery assets
+
+- Use `.sikula/task-assets/success-check.svg` as the success state icon, provided by product team for this project.
+
+## Scope
+- Add the success state icon to the confirmation screen.
+
+## Acceptance criteria
+- The success screen shows the provided success icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert len(result.asset_references) == 1
+    assert result.asset_references[0]["source_license"] == "provided by product team for this project."
+    assert all(gap.id != "gap.assets.provenance" for gap in result.gaps)
+
+
 def test_contract_check_does_not_parse_source_license_label_as_missing_asset(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
     asset_path.parent.mkdir(parents=True)
@@ -1085,6 +1119,27 @@ def test_contract_check_does_not_let_asset_title_govern_scope_paths(tmp_path: Pa
 
     result = check_contract(
         task, source_path=tmp_path / ".sikula" / "tasks" / "task.md", project_config=_python_project_config(tmp_path)
+    )
+
+    assert result.asset_references == []
+    assert all(not gap.id.startswith("gap.assets.") for gap in result.gaps)
+
+
+def test_contract_check_does_not_treat_plain_text_asset_path_as_asset_heading(tmp_path: Path):
+    task = """Update docs/assets.md with new asset naming guidance.
+
+Acceptance criteria:
+- The documentation includes the new naming guidance.
+
+Out of scope:
+- Do not change runtime assets.
+
+Validation:
+- `pytest`
+"""
+
+    result = check_contract(
+        task, source_path=tmp_path / ".sikula" / "tasks" / "task.txt", project_config=_python_project_config(tmp_path)
     )
 
     assert result.asset_references == []
