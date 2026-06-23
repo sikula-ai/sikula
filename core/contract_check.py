@@ -503,15 +503,17 @@ def check_contract(
     source_format: str = "markdown",
     project_config: dict | None = None,
     configured_validation_commands: list[str] | None = None,
+    asset_project_config: dict | None = None,
 ) -> ContractCheckResult:
     evaluation_text = _strip_generated_markers(_strip_generated_open_questions_section(text))
     parsed = _parse_markdown_task(evaluation_text)
     sections_detected = _sections_detected(parsed)
     validation = _validation_details(evaluation_text, project_config, configured_validation_commands)
-    asset_references = _detect_asset_references(evaluation_text, source_path=source_path, project_config=project_config)
+    asset_config = asset_project_config if asset_project_config is not None else project_config
+    asset_references = _detect_asset_references(evaluation_text, source_path=source_path, project_config=asset_config)
     undeclared_asset_paths = _detect_undeclared_asset_paths(
         evaluation_text,
-        project_config=project_config,
+        project_config=asset_config,
         asset_references=asset_references,
     )
     if undeclared_asset_paths:
@@ -815,6 +817,7 @@ def improve_contract_text(
     output_name: str | Path | None = None,
     project_config: dict | None = None,
     configured_validation_commands: list[str] | None = None,
+    asset_project_config: dict | None = None,
     generated_answer_entries: list[dict[str, Any]] | None = None,
 ) -> ContractTextImproveResult:
     """Apply contract answers without reading or writing workflow files."""
@@ -829,6 +832,7 @@ def improve_contract_text(
             source_format=source_format,
             project_config=project_config,
             configured_validation_commands=configured_validation_commands,
+            asset_project_config=asset_project_config,
         )
     question_dicts = _question_dicts(questions)
     normalized_answers = _normalize_contract_answers(answers)
@@ -840,7 +844,7 @@ def improve_contract_text(
         question_dicts,
         normalized_answers,
         asset_references=source_result.asset_references,
-        project_config=project_config,
+        project_config=asset_project_config if asset_project_config is not None else project_config,
         generated_answer_entries=generated_answer_entries,
     )
     check_result = check_contract(
@@ -849,6 +853,7 @@ def improve_contract_text(
         source_format="markdown",
         project_config=project_config,
         configured_validation_commands=configured_validation_commands,
+        asset_project_config=asset_project_config,
     )
     rendered, open_ids = _reconcile_rendered_open_questions(
         rendered,
@@ -863,6 +868,7 @@ def improve_contract_text(
         source_format="markdown",
         project_config=project_config,
         configured_validation_commands=configured_validation_commands,
+        asset_project_config=asset_project_config,
     )
     return ContractTextImproveResult(
         markdown=rendered,
@@ -952,7 +958,8 @@ def prepare_implementation_contract(
     """Prepare an implementation contract through an in-memory check/improve loop."""
 
     source_format = "text" if contract_name and Path(contract_name).suffix.lower() == ".txt" else "markdown"
-    project_config = project_config or _prepare_project_config_from_contract_name(contract_name)
+    validation_project_config = project_config
+    asset_project_config = project_config or _prepare_project_config_from_contract_name(contract_name)
     normalized_project_context = _normalize_prepare_project_context(project_context)
     project_context_blockers = _prepare_project_context_blockers(normalized_project_context)
     validation_commands = _validation_commands_from_prepare_context(normalized_project_context)
@@ -967,8 +974,9 @@ def prepare_implementation_contract(
         evaluation_contract_markdown,
         source_path=contract_name,
         source_format=source_format,
-        project_config=project_config,
+        project_config=validation_project_config,
         configured_validation_commands=validation_commands,
+        asset_project_config=asset_project_config,
     )
 
     if answers:
@@ -981,8 +989,9 @@ def prepare_implementation_contract(
             answers=answers,
             check_result=check_result,
             safe_task_path=safe_task_path,
-            project_config=project_config,
+            project_config=validation_project_config,
             configured_validation_commands=validation_commands,
+            asset_project_config=asset_project_config,
             generated_answer_entries=generated_answer_entries,
         )
         active_answers = _answers_for_questions(answers, active_questions)
@@ -993,8 +1002,9 @@ def prepare_implementation_contract(
             answers=active_answers,
             source_result=check_result,
             output_name=safe_task_path,
-            project_config=project_config,
+            project_config=validation_project_config,
             configured_validation_commands=validation_commands,
+            asset_project_config=asset_project_config,
             generated_answer_entries=generated_answer_entries,
         )
         prepared_contract_markdown, resume_contract_markdown = _enrich_implementation_contract_markdown(
@@ -1007,8 +1017,9 @@ def prepare_implementation_contract(
             prepared_contract_markdown,
             source_path=safe_task_path,
             source_format="markdown",
-            project_config=project_config,
+            project_config=validation_project_config,
             configured_validation_commands=validation_commands,
+            asset_project_config=asset_project_config,
         )
         return _build_prepare_result(
             contract_name=contract_name,
@@ -1035,8 +1046,9 @@ def prepare_implementation_contract(
             prepared_contract_markdown,
             source_path=safe_task_path,
             source_format="markdown",
-            project_config=project_config,
+            project_config=validation_project_config,
             configured_validation_commands=validation_commands,
+            asset_project_config=asset_project_config,
         )
 
     return _build_prepare_result(
@@ -1060,6 +1072,7 @@ def _prepare_active_questions_for_answers(
     safe_task_path: str,
     project_config: dict | None,
     configured_validation_commands: list[str] | None,
+    asset_project_config: dict | None,
     generated_answer_entries: list[dict[str, Any]] | None,
 ) -> list[ClarifyingQuestion]:
     questions = list(check_result.clarifying_questions)
@@ -1085,6 +1098,7 @@ def _prepare_active_questions_for_answers(
         source_format="markdown",
         project_config=project_config,
         configured_validation_commands=configured_validation_commands,
+        asset_project_config=asset_project_config,
     )
     return _merge_clarifying_questions(questions, enriched_check_result.clarifying_questions)
 

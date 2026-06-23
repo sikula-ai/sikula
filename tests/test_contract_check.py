@@ -2076,6 +2076,51 @@ def test_prepare_implementation_contract_uses_project_context_validation_command
     assert all(gap.id != "gap.validation.coverage" for gap in result.unresolved_gaps)
 
 
+def test_prepare_implementation_contract_does_not_use_inferred_asset_root_for_validation(tmp_path: Path):
+    task = """# Add Android search
+
+## Scope
+- Add search by country name.
+- Keep existing filtering.
+- Keep sorting unchanged.
+
+## Acceptance criteria
+- Search is case-insensitive.
+- Clearing search shows all countries.
+- No results shows an empty state.
+- Existing filters still apply.
+
+## Out of scope
+- Do not add server-side search.
+- Do not change country details.
+
+## Tests
+- Search matching test.
+- Empty state test.
+
+## Validation
+- `./gradlew testDebugUnitTest`
+
+## Reviewer focus
+- Search/filter interaction.
+"""
+    contract_name = tmp_path / ".sikula" / "contracts" / "android-search.contract.md"
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=str(contract_name),
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.check_result.validation["configured_commands"] == [
+        {"phase": "project_context", "name": "validation-1", "command": "pytest"}
+    ]
+    assert result.check_result.validation["coverage_gaps"] == ["./gradlew testDebugUnitTest"]
+    assert any(gap.id == "gap.validation.coverage" for gap in result.unresolved_gaps)
+    assert not result.ready_to_run
+    assert result.required_next_step == "answer_questions"
+
+
 def test_prepare_implementation_contract_adds_reference_asset_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
