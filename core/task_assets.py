@@ -983,13 +983,11 @@ def detect_undeclared_asset_paths(
                 continue
             if _asset_path_match_keys(normalized_path) & declared_keys:
                 continue
-            if in_structured_asset_root and not _asset_line_is_bare_asset_path(line, normalized_path):
-                continue
-            if not in_structured_asset_root and not _undeclared_asset_path_should_warn(
-                normalized_path,
-                context,
-                project_config,
-            ):
+            if in_structured_asset_root:
+                is_bare_asset_path = _asset_line_is_bare_asset_path(line, normalized_path)
+                if not is_bare_asset_path and not _asset_path_in_task_asset_dir(normalized_path, project_config):
+                    continue
+            elif not _undeclared_asset_path_should_warn(normalized_path, context, project_config):
                 continue
             key = (line_index + 1, normalized_path)
             if key in seen:

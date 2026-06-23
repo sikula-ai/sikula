@@ -2521,6 +2521,58 @@ def test_prepare_implementation_contract_applies_asset_declaration_answer(
     assert "assets.intent" in result.open_question_ids
 
 
+def test_prepare_implementation_contract_requires_prose_task_asset_declaration_inside_assets_section(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-reference.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Fix login spacing
+
+## Assets
+
+- Use `.sikula/task-assets/login-reference.png` as the reference mockup.
+
+## Scope
+- Fix the login form spacing shown in the mockup.
+
+## Acceptance criteria
+- The login form spacing matches the reference.
+
+## Out of scope
+- Do not redesign the login screen.
+
+## Validation
+- `pytest`
+"""
+
+    unanswered = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/login-spacing.md",
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert any(gap.id == "gap.assets.declarations" for gap in unanswered.unresolved_gaps)
+    assert "assets.declarations" in unanswered.open_question_ids
+
+    answered = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/login-spacing.md",
+        answers={"assets.declarations": "Reference asset: .sikula/task-assets/login-reference.png"},
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert "### Reference assets" in answered.prepared_contract_markdown
+    assert "- Reference asset: `.sikula/task-assets/login-reference.png`" in answered.prepared_contract_markdown
+    assert answered.recheck_result is not None
+    assert all(gap.id != "gap.assets.declarations" for gap in answered.recheck_result.gaps)
+    assert all(gap.id != "gap.assets.intent" for gap in answered.recheck_result.gaps)
+    assert "assets.declarations" not in answered.open_question_ids
+    assert "assets.intent" not in answered.open_question_ids
+
+
 def test_prepare_implementation_contract_inserts_reference_answer_under_reference_subsection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
