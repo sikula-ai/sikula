@@ -2310,6 +2310,46 @@ def test_prepare_implementation_contract_ignores_asset_manifest_document_title(
     assert result.recheck_result.asset_references[0]["status"] == "available"
 
 
+def test_prepare_implementation_contract_preserves_product_assets_under_asset_manifest_title(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing-bug.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Asset manifest
+
+## Assets
+
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing-bug.png`
+  - Usage: reference only.
+
+## Scope
+- Show the reference image in the Asset Manifest editor.
+
+## Acceptance criteria
+- The editor shows the selected reference image.
+
+## Validation
+- `pytest`
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/asset-manifest.md",
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.prepared_contract_markdown.startswith("# Asset manifest")
+    assert result.prepared_contract_markdown.count("## Asset manifest") == 1
+    assert "SHA-256: `sha256:" in result.prepared_contract_markdown
+    assert result.recheck_result is not None
+    assert result.recheck_result.asset_references[0]["status"] == "available"
+
+
 def test_prepare_implementation_contract_reads_first_h1_asset_manifest_with_manifest_body(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

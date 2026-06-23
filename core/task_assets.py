@@ -81,6 +81,14 @@ class _StructuredAssetDeclaration:
     source_license: str = ""
 
 
+@dataclass
+class _MarkdownSection:
+    heading: str
+    level: int
+    body_lines: list[str] = field(default_factory=list)
+    children: list["_MarkdownSection"] = field(default_factory=list)
+
+
 def _answer_text(answer: dict[str, Any] | None) -> str:
     if not isinstance(answer, dict):
         return ""
@@ -1244,8 +1252,23 @@ def asset_manifest_h1_has_structured_body(
     *,
     ignore_fenced_blocks: bool = False,
 ) -> bool:
+    root = _asset_manifest_h1_body_section(
+        lines,
+        start_index,
+        ignore_fenced_blocks=ignore_fenced_blocks,
+    )
+    return _asset_manifest_section_has_structured_body(root, allow_body_fields=True)
+
+
+def _asset_manifest_h1_body_section(
+    lines: list[str],
+    start_index: int,
+    *,
+    ignore_fenced_blocks: bool,
+) -> _MarkdownSection:
+    root = _MarkdownSection(heading="Asset manifest", level=1)
+    stack = [root]
     in_fenced_block = False
-    in_manifest_context = True
     for line in lines[start_index:]:
         if ignore_fenced_blocks and _FENCED_BLOCK_RE.match(line):
             in_fenced_block = not in_fenced_block
@@ -1256,24 +1279,52 @@ def asset_manifest_h1_has_structured_body(
             continue
         markdown_heading = _HEADING_RE.match(line)
         if markdown_heading:
-            if len(markdown_heading.group(1)) == 1:
-                return False
-            if _asset_manifest_body_heading(markdown_heading.group(2)):
-                return True
-            in_manifest_context = False
+            heading_level = len(markdown_heading.group(1))
+            if heading_level == 1:
+                break
+            _append_markdown_section(
+                stack,
+                _MarkdownSection(heading=markdown_heading.group(2), level=heading_level),
+            )
             continue
         text_heading = _TEXT_HEADING_RE.match(line)
         if text_heading:
-            if _asset_manifest_body_heading(text_heading.group(1)):
-                return True
-            in_manifest_context = False
+            _append_markdown_section(
+                stack,
+                _MarkdownSection(heading=text_heading.group(1), level=2),
+            )
             continue
-        bullet = _BULLET_RE.match(line)
-        if bullet:
-            field = _structured_asset_field(bullet.group(1))
-            if in_manifest_context and field and _asset_manifest_body_field_label(field[0]):
-                return True
+        stack[-1].body_lines.append(line)
+    return root
+
+
+def _append_markdown_section(stack: list[_MarkdownSection], section: _MarkdownSection) -> None:
+    while stack and stack[-1].level >= section.level:
+        stack.pop()
+    stack[-1].children.append(section)
+    stack.append(section)
+
+
+def _asset_manifest_section_has_structured_body(section: _MarkdownSection, *, allow_body_fields: bool) -> bool:
+    if allow_body_fields and any(_asset_manifest_body_line(line) for line in section.body_lines):
+        return True
+
+    for child in section.children:
+        if _asset_root_section_heading(child.heading):
+            continue
+        if _asset_manifest_body_heading(child.heading):
+            return True
+        if _asset_manifest_section_has_structured_body(child, allow_body_fields=False):
+            return True
     return False
+
+
+def _asset_manifest_body_line(line: str) -> bool:
+    bullet = _BULLET_RE.match(line)
+    if not bullet:
+        return False
+    field = _structured_asset_field(bullet.group(1))
+    return bool(field and _asset_manifest_body_field_label(field[0]))
 
 
 def _asset_manifest_body_heading(heading: str) -> bool:

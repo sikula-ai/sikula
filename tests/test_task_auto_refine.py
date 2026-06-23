@@ -102,6 +102,14 @@ def test_parse_task_auto_refine_output_allows_asset_manifest_title_with_product_
     assert "## Assets" in draft.task_markdown
 
 
+def test_parse_task_auto_refine_output_allows_asset_manifest_title_with_product_asset_declarations():
+    draft = parse_task_auto_refine_output(
+        '{"task_markdown": "# Asset manifest\\n\\n## Assets\\n\\n### Reference assets\\n\\n- Path: `.sikula/task-assets/x.png`\\n  - Usage: reference only."}'
+    )
+
+    assert "### Reference assets" in draft.task_markdown
+
+
 def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_numbered_manifest_field():
     with pytest.raises(ValueError, match="must not contain an Asset manifest"):
         parse_task_auto_refine_output(

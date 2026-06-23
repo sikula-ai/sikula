@@ -3,7 +3,11 @@ from __future__ import annotations
 from hashlib import sha256
 from pathlib import Path
 
-from core.task_assets import detect_asset_references, detect_undeclared_asset_paths
+from core.task_assets import (
+    asset_manifest_h1_has_structured_body,
+    detect_asset_references,
+    detect_undeclared_asset_paths,
+)
 
 
 def _project_config(project_root: Path, *, task_asset_dir: str = ".sikula/task-assets") -> dict:
@@ -33,6 +37,100 @@ def _undeclared_paths(markdown: str, tmp_path: Path, *, task_asset_dir: str = ".
         project_config=_project_config(tmp_path, task_asset_dir=task_asset_dir),
         asset_references=references,
     )
+
+
+def _asset_manifest_title_has_structured_body(markdown: str, *, ignore_fenced_blocks: bool = False) -> bool:
+    lines = markdown.splitlines()
+    return asset_manifest_h1_has_structured_body(lines, 1, ignore_fenced_blocks=ignore_fenced_blocks)
+
+
+def test_asset_manifest_title_body_classification_matrix():
+    cases = [
+        (
+            "title with product scope path field",
+            """# Asset manifest
+
+## Scope
+
+- Path: `.sikula/task-assets/login-spacing.png` should be shown in the UI.
+""",
+            False,
+        ),
+        (
+            "title with product asset declarations",
+            """# Asset manifest
+
+## Assets
+
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing.png`
+""",
+            False,
+        ),
+        (
+            "title with direct manifest field",
+            """# Asset manifest
+
+- Path: `.sikula/task-assets/login-spacing.png`
+""",
+            True,
+        ),
+        (
+            "title with direct manifest subsection",
+            """# Asset manifest
+
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing.png`
+""",
+            True,
+        ),
+        (
+            "title with neutral intro before manifest subsection",
+            """# Asset manifest
+
+## Summary
+
+Generated asset entries.
+
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing.png`
+""",
+            True,
+        ),
+        (
+            "title stops before next h1",
+            """# Asset manifest
+
+# Follow-up task
+
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing.png`
+""",
+            False,
+        ),
+    ]
+
+    for _name, markdown, expected in cases:
+        assert _asset_manifest_title_has_structured_body(markdown) is expected
+
+
+def test_asset_manifest_title_body_ignores_fenced_manifest_example():
+    markdown = """# Asset manifest
+
+## Scope
+
+```md
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing.png`
+```
+"""
+
+    assert _asset_manifest_title_has_structured_body(markdown, ignore_fenced_blocks=True) is False
 
 
 def test_detect_asset_references_reads_structured_reference_and_delivery_assets(tmp_path: Path):
