@@ -177,15 +177,18 @@ Review steps:
       or path segments, success payload vs. error envelope handling, or typed value vs.
       string fallback mismatches. Do this even if tests pass or generated tests mirror the
       implementation's incorrect assumption.
-   l. Asset manifest consistency — if the task description or implementation prompt
-      contains an `Asset manifest`, verify that changed production assets and resource
-      files are supported by that manifest. Reference-only assets must not be copied into
-      production files. Delivery assets must be used only within the requested task scope.
-      If the manifest gives a requested target, verify the implementation honors it unless
-      the implementation prompt explains a project-conventional alternative. If no target
-      is specified, verify the chosen placement follows project conventions visible in the
-      codebase. Report unexpected production asset additions, missing delivery asset usage,
-      or reference-only asset copying as correctness/completeness issues.
+   l. Asset declaration consistency — if the task description or implementation prompt
+      contains an `Asset manifest` or structured asset declarations such as
+      `### Reference assets` / `### Delivery assets`, verify that changed production
+      assets and resource files are supported by those declarations.
+      Reference-only assets must not be copied into production files.
+      Delivery assets must be used only within the requested task scope.
+      If a declaration gives a requested target, verify the implementation honors it
+      unless the implementation prompt explains a project-conventional alternative. If
+      no target is specified, verify the chosen placement follows project conventions
+      visible in the codebase. Report unexpected production asset additions, missing
+      delivery asset usage, or reference-only asset copying as correctness/completeness
+      issues.
 {build_tool_review_policy}
 
 {test_review_policy}

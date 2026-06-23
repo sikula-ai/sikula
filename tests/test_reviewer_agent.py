@@ -279,12 +279,14 @@ class TestReviewerAgentPrompt:
         assert "validates" in prompt
         assert "API that does not know the expected result type" in prompt
 
-    def test_asset_manifest_consistency_checks_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+    def test_asset_declaration_consistency_checks_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
         prompt = stub_llm.readonly_calls[0]
-        assert "Asset manifest consistency" in prompt
+        assert "Asset declaration consistency" in prompt
+        assert "structured asset declarations" in prompt
+        assert "`### Reference assets` / `### Delivery assets`" in prompt
         assert "Reference-only assets must not be copied into" in prompt
         assert "Delivery assets must be used only within the requested task scope" in prompt
         assert "unexpected production asset additions" in prompt
