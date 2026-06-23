@@ -137,14 +137,13 @@ def _asset_manifest_title_has_manifest_body(lines: list[str], start_index: int) 
             continue
         heading_match = _REFINE_HEADING_RE.match(line)
         if heading_match:
-            return _normalize_refine_heading(heading_match.group(2)) in _ASSET_MANIFEST_CHILD_HEADINGS
+            normalized_heading = _normalize_refine_heading(heading_match.group(2))
+            return normalized_heading in _ASSET_MANIFEST_CHILD_HEADINGS
         text_heading_match = _REFINE_TEXT_HEADING_RE.match(line)
         if text_heading_match:
             normalized_text_heading = _normalize_refine_heading(text_heading_match.group(1))
-            if normalized_text_heading in _ASSET_MANIFEST_CHILD_HEADINGS:
+            if normalized_text_heading in {"asset manifest", *_ASSET_MANIFEST_CHILD_HEADINGS}:
                 return True
-            if "asset" not in normalized_text_heading:
-                return False
             continue
         if _ASSET_MANIFEST_ENTRY_RE.match(line):
             return True
