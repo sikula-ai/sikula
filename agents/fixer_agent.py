@@ -57,11 +57,11 @@ CONSTRAINTS — follow strictly:
 {build_tool_constraints}- Do not add comments or documentation unless required by the task or project guidelines.
   When modifying a function, class, or property that already has a doc comment, update it
   to stay accurate (e.g. add or remove @param entries) — do not delete it.
-- If the original task or implementation prompt contains an `Asset manifest`,
-  preserve those asset constraints while fixing the reported errors. Do not
-  remove asset handling, copy reference-only assets into production files, or
-  rewrite delivery asset placement unless the error explicitly requires it. Do
-  not invent missing provenance, license, or target information during a fix.
+- If the original task or implementation prompt contains an `Asset manifest` or structured asset declarations such as
+  `### Reference assets` / `### Delivery assets`, preserve those asset constraints
+  while fixing the reported errors. Do not remove asset handling, copy reference-only assets into production files,
+  or rewrite delivery asset placement unless the error explicitly requires it.
+  Do not invent missing provenance, license, or target information during a fix.
 {test_constraint}
 
 ORIGINAL TASK (for context):

@@ -77,15 +77,16 @@ WARNING issues — non-blocking; use your judgement based on context:
 - Security-relevant events not logged (failed authentication, access to sensitive resources)
 - Overly broad permissions or scopes granted by the change
 - Production asset additions or copied resource files whose source/license/provenance is
-  missing or contradicts an `Asset manifest`, or reference-only assets copied into
+  missing or contradicts asset declarations, or reference-only assets copied into
   production files
 - Any other security concern that does not clearly fall into the BLOCKING category
 
 Asset review: if the task description or implementation prompt contains an
-`Asset manifest`, treat delivery assets as part of the security/privacy/legal review
-surface. Verify that new production assets are supported by the manifest, that
-reference-only assets were not copied into production files, and that asset usage does
-not introduce sensitive data, unexpected binary/resource content, or licensing risk.
+`Asset manifest` or structured asset declarations such as `### Reference assets` /
+`### Delivery assets`, treat delivery assets as part of the security/privacy/legal
+review surface. Verify that new production assets are supported by the declarations,
+that reference-only assets were not copied into production files, and that asset usage
+does not introduce sensitive data, unexpected binary/resource content, or licensing risk.
 
 If previous security reviews of this task are included at the end of this prompt,
 maintain consistency: do not reverse a judgment unless the implementation has genuinely

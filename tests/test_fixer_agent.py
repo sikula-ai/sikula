@@ -284,7 +284,7 @@ class TestFixerAgentFixCycleRecord:
         assert state.task_description in prompt
         assert "compile error" in prompt
 
-    def test_prompt_preserves_asset_manifest_obligations(self, stub_llm: StubLLMClient, file_tool):
+    def test_prompt_preserves_asset_declaration_obligations(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["src/Login.kt"]
         state = _make_state()
         state.errors = ["compile error"]
@@ -292,12 +292,17 @@ class TestFixerAgentFixCycleRecord:
         _make_agent(stub_llm, file_tool=file_tool).run(state)
         prompt = state.fix_cycle_records[0]["fixer_prompt"]
 
-        assert "Asset manifest" in prompt
+        assert "structured asset declarations" in prompt
+        assert "`### Reference assets` / `### Delivery assets`" in prompt
         assert "preserve those asset constraints" in prompt
         assert "copy reference-only assets into production files" in prompt
         assert "invent missing provenance, license, or target information" in prompt
 
-    def test_doc_comment_rule_stays_unconditional_before_asset_manifest_rule(self, stub_llm: StubLLMClient, file_tool):
+    def test_doc_comment_rule_stays_unconditional_before_asset_declaration_rule(
+        self,
+        stub_llm: StubLLMClient,
+        file_tool,
+    ):
         stub_llm.agent_result = ["src/Login.kt"]
         state = _make_state()
         state.errors = ["compile error"]
@@ -307,7 +312,7 @@ class TestFixerAgentFixCycleRecord:
 
         comment_rule = "- Do not add comments or documentation unless required by the task or project guidelines."
         doc_comment_rule = "When modifying a function, class, or property that already has a doc comment, update it"
-        asset_rule = "- If the original task or implementation prompt contains an `Asset manifest`,"
+        asset_rule = "- If the original task or implementation prompt contains an `Asset manifest` or"
         assert prompt.index(comment_rule) < prompt.index(doc_comment_rule) < prompt.index(asset_rule)
 
     def test_test_failure_prompt_includes_generated_test_context(self, stub_llm: StubLLMClient, file_tool):
