@@ -9,9 +9,18 @@ import json
 from pathlib import Path
 import re
 from typing import Any
-
 import yaml
 
+from core.task_assets import (
+    asset_answer_entry_lines as _asset_answer_entry_lines,
+    asset_manifest_reference_lines as _asset_manifest_reference_lines,
+    asset_project_root as _asset_project_root,
+    asset_reference_ready_for_manifest as _asset_reference_ready_for_manifest,
+    detect_asset_references as _detect_asset_references,
+    detect_undeclared_asset_paths as _detect_undeclared_asset_paths,
+    public_asset_reference as _public_asset_reference,
+    replace_unresolved_asset_reference_paths as _replace_unresolved_asset_reference_paths,
+)
 from core.state import TaskState
 from core.validation_coverage import (
     configured_validation_commands,
@@ -28,6 +37,7 @@ _GENERATED_OPEN_QUESTIONS_MARKER = "<!-- sikula:generated-open-questions -->"
 _IMPLEMENTATION_CONTEXT_ENTRY_IDS = [
     "project_context.details",
     "project_context.validation_commands",
+    "asset_manifest.references",
 ]
 
 _STATUS_THRESHOLDS = (
@@ -128,6 +138,9 @@ _SECTION_ALIASES = {
         "files",
         "references",
     },
+    "asset_manifest": {
+        "asset manifest",
+    },
 }
 
 _SECURITY_RISK_RE = re.compile(
@@ -206,6 +219,7 @@ class ContractCheckResult:
     suggested_sections: list[str]
     validation: dict[str, Any]
     strong_signals: list[str] = field(default_factory=list)
+    asset_references: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -220,6 +234,7 @@ class ContractCheckResult:
             "clarifying_questions": [question.to_dict() for question in self.clarifying_questions],
             "suggested_sections": list(self.suggested_sections),
             "validation": dict(self.validation),
+            "asset_references": [_public_asset_reference(reference) for reference in self.asset_references],
         }
 
 
@@ -488,11 +503,21 @@ def check_contract(
     source_format: str = "markdown",
     project_config: dict | None = None,
     configured_validation_commands: list[str] | None = None,
+    asset_project_config: dict | None = None,
 ) -> ContractCheckResult:
     evaluation_text = _strip_generated_markers(_strip_generated_open_questions_section(text))
     parsed = _parse_markdown_task(evaluation_text)
     sections_detected = _sections_detected(parsed)
     validation = _validation_details(evaluation_text, project_config, configured_validation_commands)
+    asset_config = asset_project_config if asset_project_config is not None else project_config
+    asset_references = _detect_asset_references(evaluation_text, source_path=source_path, project_config=asset_config)
+    undeclared_asset_paths = _detect_undeclared_asset_paths(
+        evaluation_text,
+        project_config=asset_config,
+        asset_references=asset_references,
+    )
+    if undeclared_asset_paths:
+        validation = {**validation, "undeclared_asset_paths": undeclared_asset_paths}
     security_sensitive = bool(_SECURITY_RISK_RE.search(evaluation_text))
 
     scores = {
@@ -510,7 +535,15 @@ def check_contract(
     scores["task_size"] = _score_task_size(parsed, scores)
     weighted_score = _weighted_score(scores)
 
-    gaps = _build_gaps(parsed, sections_detected, scores, validation, security_sensitive)
+    gaps = _build_gaps(
+        parsed,
+        sections_detected,
+        scores,
+        validation,
+        security_sensitive,
+        asset_references,
+        undeclared_asset_paths,
+    )
     if any(gap.severity == "blocking" for gap in gaps):
         weighted_score = min(weighted_score, 69)
     elif gaps:
@@ -518,7 +551,7 @@ def check_contract(
     status = _status_for_score(weighted_score)
     questions = _build_questions(gaps, security_sensitive, evaluation_text)
     suggested_sections = _suggested_sections(gaps)
-    strong_signals = _strong_signals(scores, sections_detected, validation)
+    strong_signals = _strong_signals(scores, sections_detected, validation, asset_references)
 
     return ContractCheckResult(
         source={
@@ -536,6 +569,7 @@ def check_contract(
         suggested_sections=suggested_sections,
         validation=validation,
         strong_signals=strong_signals,
+        asset_references=asset_references,
     )
 
 
@@ -578,6 +612,29 @@ def render_contract_check(result: ContractCheckResult) -> str:
     if task_commands:
         lines.append("Validation commands found:")
         lines.extend(f"- {command}" for command in task_commands)
+        lines.append("")
+
+    undeclared_asset_paths = result.validation.get("undeclared_asset_paths") or []
+    if undeclared_asset_paths:
+        lines.append("Undeclared asset-like paths:")
+        for reference in undeclared_asset_paths:
+            path = reference.get("path")
+            line = reference.get("line")
+            location = f"line {line}" if line else "unknown line"
+            lines.append(f"- `{path}` ({location})")
+        lines.append("")
+
+    if result.asset_references:
+        lines.append("Declared asset references:")
+        for reference in result.asset_references:
+            path = reference.get("project_path") or reference.get("path")
+            status = reference.get("status") or "unknown"
+            kind = reference.get("kind") or "ambiguous"
+            git_status = reference.get("git_status")
+            details = [f"kind={kind}", f"status={status}"]
+            if git_status:
+                details.append(f"git={git_status}")
+            lines.append(f"- `{path}` ({', '.join(details)})")
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
@@ -760,6 +817,7 @@ def improve_contract_text(
     output_name: str | Path | None = None,
     project_config: dict | None = None,
     configured_validation_commands: list[str] | None = None,
+    asset_project_config: dict | None = None,
     generated_answer_entries: list[dict[str, Any]] | None = None,
 ) -> ContractTextImproveResult:
     """Apply contract answers without reading or writing workflow files."""
@@ -774,6 +832,7 @@ def improve_contract_text(
             source_format=source_format,
             project_config=project_config,
             configured_validation_commands=configured_validation_commands,
+            asset_project_config=asset_project_config,
         )
     question_dicts = _question_dicts(questions)
     normalized_answers = _normalize_contract_answers(answers)
@@ -784,6 +843,8 @@ def improve_contract_text(
         source_path,
         question_dicts,
         normalized_answers,
+        asset_references=source_result.asset_references,
+        project_config=asset_project_config if asset_project_config is not None else project_config,
         generated_answer_entries=generated_answer_entries,
     )
     check_result = check_contract(
@@ -792,6 +853,7 @@ def improve_contract_text(
         source_format="markdown",
         project_config=project_config,
         configured_validation_commands=configured_validation_commands,
+        asset_project_config=asset_project_config,
     )
     rendered, open_ids = _reconcile_rendered_open_questions(
         rendered,
@@ -806,6 +868,7 @@ def improve_contract_text(
         source_format="markdown",
         project_config=project_config,
         configured_validation_commands=configured_validation_commands,
+        asset_project_config=asset_project_config,
     )
     return ContractTextImproveResult(
         markdown=rendered,
@@ -889,11 +952,14 @@ def prepare_implementation_contract(
     answers: dict[str, str | dict[str, Any]] | None = None,
     project_context: PrepareProjectContext | dict[str, Any] | None = None,
     generated_answer_entries: list[dict[str, Any]] | None = None,
+    *,
+    project_config: dict | None = None,
 ) -> ContractPrepareResult:
     """Prepare an implementation contract through an in-memory check/improve loop."""
 
     source_format = "text" if contract_name and Path(contract_name).suffix.lower() == ".txt" else "markdown"
-    project_config = None
+    validation_project_config = project_config
+    asset_project_config = project_config or _prepare_project_config_from_contract_name(contract_name)
     normalized_project_context = _normalize_prepare_project_context(project_context)
     project_context_blockers = _prepare_project_context_blockers(normalized_project_context)
     validation_commands = _validation_commands_from_prepare_context(normalized_project_context)
@@ -908,8 +974,9 @@ def prepare_implementation_contract(
         evaluation_contract_markdown,
         source_path=contract_name,
         source_format=source_format,
-        project_config=project_config,
+        project_config=validation_project_config,
         configured_validation_commands=validation_commands,
+        asset_project_config=asset_project_config,
     )
 
     if answers:
@@ -922,8 +989,9 @@ def prepare_implementation_contract(
             answers=answers,
             check_result=check_result,
             safe_task_path=safe_task_path,
-            project_config=project_config,
+            project_config=validation_project_config,
             configured_validation_commands=validation_commands,
+            asset_project_config=asset_project_config,
             generated_answer_entries=generated_answer_entries,
         )
         active_answers = _answers_for_questions(answers, active_questions)
@@ -934,21 +1002,24 @@ def prepare_implementation_contract(
             answers=active_answers,
             source_result=check_result,
             output_name=safe_task_path,
-            project_config=project_config,
+            project_config=validation_project_config,
             configured_validation_commands=validation_commands,
+            asset_project_config=asset_project_config,
             generated_answer_entries=generated_answer_entries,
         )
         prepared_contract_markdown, resume_contract_markdown = _enrich_implementation_contract_markdown(
             improved.resume_markdown,
             normalized_project_context,
             generated_answer_entries=generated_answer_entries,
+            asset_references=improved.check_result.asset_references,
         )
         enriched_check_result = check_contract(
             prepared_contract_markdown,
             source_path=safe_task_path,
             source_format="markdown",
-            project_config=project_config,
+            project_config=validation_project_config,
             configured_validation_commands=validation_commands,
+            asset_project_config=asset_project_config,
         )
         return _build_prepare_result(
             contract_name=contract_name,
@@ -967,6 +1038,7 @@ def prepare_implementation_contract(
         source_contract_markdown,
         normalized_project_context,
         generated_answer_entries=generated_answer_entries,
+        asset_references=check_result.asset_references,
     )
     recheck_result = None
     if prepared_contract_markdown != evaluation_contract_markdown.strip() + "\n":
@@ -974,8 +1046,9 @@ def prepare_implementation_contract(
             prepared_contract_markdown,
             source_path=safe_task_path,
             source_format="markdown",
-            project_config=project_config,
+            project_config=validation_project_config,
             configured_validation_commands=validation_commands,
+            asset_project_config=asset_project_config,
         )
 
     return _build_prepare_result(
@@ -999,6 +1072,7 @@ def _prepare_active_questions_for_answers(
     safe_task_path: str,
     project_config: dict | None,
     configured_validation_commands: list[str] | None,
+    asset_project_config: dict | None,
     generated_answer_entries: list[dict[str, Any]] | None,
 ) -> list[ClarifyingQuestion]:
     questions = list(check_result.clarifying_questions)
@@ -1013,6 +1087,7 @@ def _prepare_active_questions_for_answers(
         contract_markdown,
         project_context,
         generated_answer_entries=generated_answer_entries,
+        asset_references=check_result.asset_references,
     )
     if enriched_markdown == _strip_generated_markers(contract_markdown).strip() + "\n":
         return questions
@@ -1023,6 +1098,7 @@ def _prepare_active_questions_for_answers(
         source_format="markdown",
         project_config=project_config,
         configured_validation_commands=configured_validation_commands,
+        asset_project_config=asset_project_config,
     )
     return _merge_clarifying_questions(questions, enriched_check_result.clarifying_questions)
 
@@ -1033,12 +1109,32 @@ def _strip_revisable_generated_entries(
     answers: dict[str, str | dict[str, Any]] | None,
     generated_answer_entries: list[dict[str, Any]],
 ) -> str:
-    if not generated_answer_entries:
-        return contract_markdown
     question_ids = [*_IMPLEMENTATION_CONTEXT_ENTRY_IDS]
     if answers:
+        question_ids.extend(_answered_marker_entry_ids(answers, contract_markdown))
         question_ids.extend(_answered_generated_entry_ids(answers, generated_answer_entries))
-    return _strip_tracked_generated_answer_entries(contract_markdown, question_ids, generated_answer_entries)
+    question_ids = list(dict.fromkeys(question_ids))
+    stripped = _strip_generated_answer_entries(contract_markdown, question_ids)
+    return _strip_tracked_generated_answer_entries(stripped, question_ids, generated_answer_entries)
+
+
+def _answered_marker_entry_ids(answers: dict[str, str | dict[str, Any]], contract_markdown: str) -> list[str]:
+    normalized_answers = _normalize_contract_answers(answers)
+    marker_ids = set(_generated_answer_entry_ids_from_markers(contract_markdown))
+    return [question_id for question_id in normalized_answers if question_id in marker_ids]
+
+
+def _generated_answer_entry_ids_from_markers(markdown: str) -> list[str]:
+    ids: list[str] = []
+    for line in markdown.splitlines():
+        marker_match = _GENERATED_ANSWER_ENTRY_RE.match(line)
+        if not marker_match:
+            continue
+        for value in marker_match.group(1).split(","):
+            question_id = value.strip()
+            if question_id:
+                ids.append(question_id)
+    return list(dict.fromkeys(ids))
 
 
 def _answered_generated_entry_ids(
@@ -1545,8 +1641,12 @@ def _insert_or_append_section_entries(lines: list[str], section: str, entries: l
             continue
         if _normalize_heading(heading_match.group(2)) == normalized_section:
             section_start = index
+            section_level = len(heading_match.group(1))
             section_end = index + 1
-            while section_end < len(lines) and not _HEADING_RE.match(lines[section_end]):
+            while section_end < len(lines):
+                next_heading = _HEADING_RE.match(lines[section_end])
+                if next_heading and len(next_heading.group(1)) <= section_level:
+                    break
                 section_end += 1
             break
 
@@ -1569,6 +1669,7 @@ def _enrich_implementation_contract_markdown(
     project_context: PrepareProjectContext | None,
     *,
     generated_answer_entries: list[dict[str, Any]] | None = None,
+    asset_references: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
     source = contract_markdown.strip()
     source = _strip_generated_answer_entries(source, _IMPLEMENTATION_CONTEXT_ENTRY_IDS)
@@ -1589,6 +1690,11 @@ def _enrich_implementation_contract_markdown(
         validation_entries = _implementation_validation_entry_lines(project_context, current_markdown)
         if validation_entries:
             _insert_or_append_section_entries(lines, "Validation", validation_entries)
+
+    current_markdown = "\n".join(lines)
+    asset_manifest_entries = _implementation_asset_manifest_entry_lines(asset_references or [], current_markdown)
+    if asset_manifest_entries:
+        _insert_or_append_section_entries(lines, "Asset manifest", asset_manifest_entries)
 
     resume_markdown = "\n".join(lines).rstrip() + "\n"
     return _strip_generated_markers(resume_markdown), resume_markdown
@@ -1636,6 +1742,64 @@ def _implementation_validation_entry_lines(
     ]
 
 
+def _implementation_asset_manifest_entry_lines(
+    asset_references: list[dict[str, Any]],
+    current_markdown: str,
+) -> list[str]:
+    existing_manifest = _markdown_section_content(current_markdown, "Asset manifest")
+    entries_by_kind: dict[str, list[str]] = {"reference": [], "delivery": []}
+    for reference in asset_references:
+        if not _asset_reference_ready_for_manifest(reference):
+            continue
+        project_path = str(reference.get("project_path") or reference.get("path") or "").strip()
+        if not project_path or project_path in existing_manifest:
+            continue
+        kind = str(reference.get("kind") or "reference").strip()
+        entries_by_kind.setdefault(kind, []).extend(_asset_manifest_reference_lines(reference))
+
+    entries: list[str] = []
+    for kind, heading in (("reference", "### Reference assets"), ("delivery", "### Delivery assets")):
+        kind_entries = entries_by_kind.get(kind) or []
+        if not kind_entries:
+            continue
+        if entries:
+            entries.append("")
+        entries.extend([heading, "", *kind_entries])
+    if not entries:
+        return []
+    return [
+        _generated_answer_entry_marker("asset_manifest.references"),
+        *entries,
+        _GENERATED_ANSWER_ENTRY_END_MARKER,
+    ]
+
+
+def _markdown_section_content(markdown: str, section: str) -> str:
+    normalized_section = _normalize_heading(section)
+    lines = markdown.splitlines()
+    for index, line in enumerate(lines):
+        heading_match = _HEADING_RE.match(line)
+        if not heading_match or _normalize_heading(heading_match.group(2)) != normalized_section:
+            continue
+        section_end = _markdown_section_end(lines, index)
+        return "\n".join(lines[index + 1 : section_end]).strip()
+    return ""
+
+
+def _markdown_section_end(lines: list[str], heading_index: int) -> int:
+    heading_match = _HEADING_RE.match(lines[heading_index])
+    if not heading_match:
+        return heading_index + 1
+    section_level = len(heading_match.group(1))
+    section_end = heading_index + 1
+    while section_end < len(lines):
+        next_heading = _HEADING_RE.match(lines[section_end])
+        if next_heading and len(next_heading.group(1)) <= section_level:
+            break
+        section_end += 1
+    return section_end
+
+
 def _clean_validation_command(command: str) -> str:
     return _single_line(command).strip("`")
 
@@ -1659,6 +1823,16 @@ def _normalize_prepare_project_context(
         known_constraints=_prepare_optional_string(project_context.get("known_constraints")),
         delivery_environment=delivery_environment,
     )
+
+
+def _prepare_project_config_from_contract_name(contract_name: str | None) -> dict[str, Any] | None:
+    if not contract_name:
+        return None
+    path = Path(str(contract_name))
+    if not path.is_absolute() and ".sikula" not in path.parts:
+        return None
+    project_root = _asset_project_root(contract_name, None)
+    return {"project": {"root_path": str(project_root)}}
 
 
 def _normalize_prepare_delivery_environment(project_context: dict[str, Any]) -> PrepareDeliveryEnvironment | None:
@@ -2053,6 +2227,8 @@ def _render_improved_contract(
     questions: list[dict[str, Any]],
     answers: dict[str, dict[str, Any]],
     *,
+    asset_references: list[dict[str, Any]] | None = None,
+    project_config: dict | None = None,
     generated_answer_entries: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[str], list[str]]:
     answered_question_ids = [question["id"] for question in questions if _answer_text(answers.get(question["id"], {}))]
@@ -2062,6 +2238,15 @@ def _render_improved_contract(
         answered_question_ids,
         generated_answer_entries or [],
     )
+    project_root = _asset_project_root(task_path, project_config)
+    local_files_answer = _answer_text(answers.get("assets.local_files", {}))
+    if local_files_answer:
+        task_text = _replace_unresolved_asset_reference_paths(
+            task_text,
+            asset_references or [],
+            local_files_answer,
+            project_root=project_root,
+        )
     task_text = _strip_generated_open_questions_section(task_text)
     lines = _improved_contract_base_lines(task_text, task_path)
     section_entries: dict[str, list[tuple[dict[str, Any], str, str]]] = {}
@@ -2076,6 +2261,10 @@ def _render_improved_contract(
         notes = _answer_notes(answer)
         if answer_text:
             answered_ids.append(question_id)
+            if question_id.startswith("assets."):
+                if notes:
+                    answered_notes.append((_contract_note_label_for_question(question_id, "Assets"), notes))
+                continue
             section = _contract_section_for_question(question_id)
             section_entries.setdefault(section, []).append((question, answer_text, notes))
             if notes:
@@ -2090,6 +2279,10 @@ def _render_improved_contract(
         lines.extend(["", f"## {section}", ""])
         for question, answer_text, _notes in entries:
             _append_answer_entry(lines, question["id"], section, answer_text)
+
+    asset_answer_entries = _asset_answer_entry_lines(asset_references or [], answers, project_root=project_root)
+    if asset_answer_entries:
+        _insert_or_append_section_entries(lines, "Assets", asset_answer_entries)
 
     _append_open_questions(lines, [question for question in questions if question["id"] in open_ids], answers)
 
@@ -2173,12 +2366,10 @@ def _strip_generated_answer_entries(task_text: str, question_ids: list[str]) -> 
         line = source_lines[index]
         heading_match = _HEADING_RE.match(line)
         if heading_match:
-            section_end = index + 1
-            while section_end < len(source_lines) and not _HEADING_RE.match(source_lines[section_end]):
-                section_end += 1
-            section_body = source_lines[index + 1 : section_end]
             normalized_heading = _normalize_heading(heading_match.group(2))
             if normalized_heading in target_sections:
+                section_end = _markdown_section_end(source_lines, index)
+                section_body = source_lines[index + 1 : section_end]
                 stripped_body, removed_marked_entry = _strip_marked_answer_entries(section_body, target_ids)
                 if removed_marked_entry:
                     stripped_body = _trim_blank_lines(stripped_body)
@@ -2191,9 +2382,6 @@ def _strip_generated_answer_entries(task_text: str, question_ids: list[str]) -> 
                             lines.append("")
                     index = section_end
                     continue
-            lines.extend(source_lines[index:section_end])
-            index = section_end
-            continue
 
         lines.append(line)
         index += 1
@@ -2394,6 +2582,10 @@ def _contract_section_for_question(question_id: str) -> str:
         return "Project context"
     if question_id == "project_context.validation_commands":
         return "Validation"
+    if question_id == "asset_manifest.references":
+        return "Asset manifest"
+    if question_id.startswith("assets."):
+        return "Assets"
     if question_id in {"scope.boundaries"}:
         return "Scope"
     if question_id in {"acceptance.criteria", "acceptance.negative_cases"}:
@@ -2424,6 +2616,9 @@ def _contract_note_label_for_question(question_id: str, section: str) -> str:
         "validation.commands": "Validation",
         "reviewer.focus": "Reviewer focus",
         "context.domain_rules": "Context",
+        "assets.local_files": "Assets",
+        "assets.intent": "Asset intent",
+        "assets.provenance": "Asset provenance",
     }
     return labels.get(question_id, section)
 
@@ -3116,6 +3311,8 @@ def _build_gaps(
     scores: dict[str, int],
     validation: dict[str, Any],
     security_sensitive: bool,
+    asset_references: list[dict[str, Any]],
+    undeclared_asset_paths: list[dict[str, Any]] | None = None,
 ) -> list[ContractGap]:
     gaps: list[ContractGap] = []
     if scores["scope_clarity"] < 50:
@@ -3235,6 +3432,81 @@ def _build_gaps(
                 "Repository context, affected surface, or domain rules are underspecified.",
             )
         )
+    gaps.extend(_asset_reference_gaps(asset_references, undeclared_asset_paths or []))
+    return gaps
+
+
+def _asset_reference_gaps(
+    asset_references: list[dict[str, Any]],
+    undeclared_asset_paths: list[dict[str, Any]],
+) -> list[ContractGap]:
+    gaps: list[ContractGap] = []
+    if undeclared_asset_paths:
+        gaps.append(
+            ContractGap(
+                "gap.assets.declarations",
+                "warning",
+                "assets",
+                "Local asset-like paths must be declared in a structured ## Assets section.",
+            )
+        )
+    if not asset_references:
+        return gaps
+    if any(reference.get("status") == "missing" for reference in asset_references):
+        gaps.append(
+            ContractGap(
+                "gap.assets.missing",
+                "blocking",
+                "assets",
+                "Declared local asset files are missing.",
+            )
+        )
+    if any(reference.get("status") == "outside_project" for reference in asset_references):
+        gaps.append(
+            ContractGap(
+                "gap.assets.outside_project",
+                "blocking",
+                "assets",
+                "Declared asset paths must resolve inside the project boundary.",
+            )
+        )
+    if any(reference.get("status") == "not_file" for reference in asset_references):
+        gaps.append(
+            ContractGap(
+                "gap.assets.not_file",
+                "blocking",
+                "assets",
+                "Declared asset paths must point to files, not directories.",
+            )
+        )
+    if any(reference.get("git_status") in {"dirty", "ignored", "untracked"} for reference in asset_references):
+        gaps.append(
+            ContractGap(
+                "gap.assets.worktree_availability",
+                "warning",
+                "assets",
+                "Declared assets are not cleanly tracked by git and may be unavailable in isolated Sikula runs.",
+            )
+        )
+    if any(reference.get("kind") == "ambiguous" for reference in asset_references):
+        gaps.append(
+            ContractGap(
+                "gap.assets.intent",
+                "warning",
+                "assets",
+                "Declared asset purpose is ambiguous; mark assets as reference-only or delivery assets.",
+            )
+        )
+    delivery_assets = [reference for reference in asset_references if reference.get("kind") == "delivery"]
+    if any(not reference.get("provenance_specified") for reference in delivery_assets):
+        gaps.append(
+            ContractGap(
+                "gap.assets.provenance",
+                "blocking",
+                "assets",
+                "Delivery assets need explicit source, license, or provenance before autonomous delivery.",
+            )
+        )
     return gaps
 
 
@@ -3350,6 +3622,42 @@ def _build_questions(gaps: list[ContractGap], security_sensitive: bool, text: st
                 False,
             )
         )
+    if "gap.assets.declarations" in gap_ids:
+        add(
+            ClarifyingQuestion(
+                "assets.declarations",
+                "Which local asset paths should be declared in the structured ## Assets section?",
+                "Sikula treats structured asset declarations as the source of truth for usage, target, and provenance.",
+                False,
+            )
+        )
+    if {"gap.assets.missing", "gap.assets.outside_project", "gap.assets.not_file"} & gap_ids:
+        add(
+            ClarifyingQuestion(
+                "assets.local_files",
+                "Which local project files should Sikula use for the declared assets?",
+                "Sikula needs local, project-bound asset files so isolated runs and review see the same inputs.",
+                True,
+            )
+        )
+    if "gap.assets.intent" in gap_ids:
+        add(
+            ClarifyingQuestion(
+                "assets.intent",
+                "Which declared assets are reference-only, and which should be used as delivery assets?",
+                "Reference assets guide the implementation; delivery assets may be copied into production code.",
+                False,
+            )
+        )
+    if "gap.assets.provenance" in gap_ids:
+        add(
+            ClarifyingQuestion(
+                "assets.provenance",
+                "What source, license, or provenance applies to each delivery asset?",
+                "The pipeline should not infer whether a production asset is legally safe to ship.",
+                True,
+            )
+        )
     return questions
 
 
@@ -3367,6 +3675,13 @@ def _suggested_sections(gaps: list[ContractGap]) -> list[str]:
         "gap.review.reviewer_focus": "Reviewer focus: call out risky areas for human review",
         "gap.task_size.too_large": "Scope: split the task or narrow the autonomous delivery boundary",
         "gap.context.repo_context": "Context: name affected files, APIs, domain rules, or project conventions",
+        "gap.assets.declarations": "Assets: declare local asset paths in structured ## Assets entries",
+        "gap.assets.missing": "Assets: provide local project files for declared assets",
+        "gap.assets.outside_project": "Assets: move declared files inside the project boundary",
+        "gap.assets.not_file": "Assets: declare concrete files rather than directories",
+        "gap.assets.worktree_availability": "Assets: track declared files or document no-isolate availability",
+        "gap.assets.intent": "Assets: label each asset as reference-only or delivery",
+        "gap.assets.provenance": "Assets: record source, license, or provenance for delivery assets",
     }
     labels_by_category = {
         "scope": "Scope",
@@ -3377,6 +3692,7 @@ def _suggested_sections(gaps: list[ContractGap]) -> list[str]:
         "validation": "Validation",
         "reviewer_focus": "Reviewer focus",
         "repo_context": "Context",
+        "assets": "Assets",
     }
     sections: list[str] = []
     for gap in gaps:
@@ -3387,7 +3703,10 @@ def _suggested_sections(gaps: list[ContractGap]) -> list[str]:
 
 
 def _strong_signals(
-    scores: dict[str, int], sections_detected: dict[str, bool], validation: dict[str, Any]
+    scores: dict[str, int],
+    sections_detected: dict[str, bool],
+    validation: dict[str, Any],
+    asset_references: list[dict[str, Any]],
 ) -> list[str]:
     signals: list[str] = []
     if scores["intent_clarity"] >= 75:
@@ -3404,4 +3723,6 @@ def _strong_signals(
         signals.append("Validation commands are explicit and covered by the configured pipeline.")
     elif validation.get("configured_commands"):
         signals.append("Configured Sikula validation pipeline is available.")
+    if asset_references and all(reference.get("status") == "available" for reference in asset_references):
+        signals.append("Declared local assets are available and hashed.")
     return signals

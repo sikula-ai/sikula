@@ -89,6 +89,7 @@ def auto_prepare_implementation_contract(
     *,
     contract_name: str | None = None,
     project_context: dict[str, Any] | None = None,
+    project_config: dict | None = None,
     generated_answer_entries: list[dict[str, Any]] | None = None,
     initial_answers: dict[str, dict[str, Any]] | None = None,
     answer_provider: ContractAutoAnswerProvider,
@@ -106,6 +107,7 @@ def auto_prepare_implementation_contract(
         contract_name=contract_name,
         answers=answers,
         project_context=project_context,
+        project_config=project_config,
         generated_answer_entries=generated_answer_entries,
     )
     if result.required_next_step == "provide_project_context" or not result.user_questions:
@@ -161,6 +163,7 @@ def auto_prepare_implementation_contract(
             contract_name=contract_name,
             answers=answers,
             project_context=project_context,
+            project_config=project_config,
             generated_answer_entries=generated_answer_entries,
         )
 

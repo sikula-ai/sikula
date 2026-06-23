@@ -90,6 +90,9 @@ Hard rules:
 - Do not run network commands or inspect external services.
 - Preserve the user's product intent, scope, and constraints.
 - Translate non-English input to English when needed.
+- Preserve local asset paths exactly, including screenshots, icons, fonts, data files, PDFs, or specs referenced by path.
+- Preserve explicit asset intent such as reference-only, delivery asset, do-not-copy, target, and source/license wording.
+- Do not invent asset target paths, source/license/provenance, or permission to ship an asset.
 - Do not invent product requirements, business policy, security policy, privacy policy, validation commands, files, APIs, or implementation details.
 - Use project guidelines only for terminology and product context that is already evident; do not infer new requirements from generic best practices.
 - Do not use other Sikula workflow artifacts from the configured workflow artifact directories as product evidence
@@ -161,6 +164,8 @@ Hard rules:
 - Do not run network commands or inspect external services.
 - Do not invent product requirements, business policy, security policy, privacy policy, validation commands, files, APIs, or implementation details.
 - Do not inspect arbitrary source files for implementation details; use project guidelines only for terminology and product context when useful.
+- Do not invent asset target paths, source/license/provenance, or permission to ship an asset.
+- If an asset's reference-vs-delivery intent or provenance is unclear, leave the related question unanswered.
 - If the answer is not directly supported by the task, product context, or guidelines, leave that question unanswered.
 - Do not use other Sikula workflow artifacts from the configured workflow artifact directories as product evidence
   unless the raw task explicitly references them.

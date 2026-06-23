@@ -23,10 +23,11 @@ unsure how much detail to include.
 
 Generated configs define `tasks.task_description_dir` for product task descriptions,
 `tasks.contract_dir` for prepared implementation contracts, and
-`tasks.contract_report_dir` for check reports, answers YAML, and sidecar
-metadata. The first two directories are meant to be source-controlled when they
-contain project tasks or contracts; `.sikula/contract-reports/` is generated
-working state and is ignored by `sikula init`.
+`tasks.task_asset_dir` for local task assets such as screenshots, icons, or
+spec excerpts. `tasks.contract_report_dir` stores check reports, answers YAML,
+and sidecar metadata. The task, contract, and task asset directories are meant
+to be source-controlled when they contain project inputs; `.sikula/contract-reports/`
+is generated working state and is ignored by `sikula init`.
 
 ## Check Readiness
 
@@ -213,6 +214,83 @@ plain-text `.txt` task files are supported too.
   web URLs.
 - Mention files, screenshots, specs, or mockups only if they are committed in the
   project and readable from the task worktree.
+
+## Task Assets
+
+Use local project files for screenshots, mockups, icons, specs, fixtures, or
+other non-text inputs. The recommended directory is `.sikula/task-assets/` or a
+per-task subdirectory under it:
+
+```text
+.sikula/task-assets/team-invites/login-spacing-bug.png
+.sikula/task-assets/team-invites/success-check.svg
+```
+
+Reference assets are read-only context. They can guide the analyst,
+implementer, reviewer, and test writer, but they must not be copied into
+production assets unless the task also lists them as delivery assets.
+
+Delivery assets are files that should become part of the branch output, such as
+icons, images, fonts, or fixtures. Delivery assets need explicit purpose,
+source/license/provenance, and optionally a target path or target subsystem when
+the product/design request already knows one. If no target is specified, Sikula's
+analyst should choose the correct platform location from the project structure
+and conventions.
+
+Declare task assets in an explicit section:
+
+```md
+## Assets
+
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing-bug.png`
+  - Usage: reference only.
+  - Notes: Shows the expected spacing on the login form.
+  - Do not copy this screenshot into app assets.
+
+### Delivery assets
+
+- Path: `.sikula/task-assets/success-check.svg`
+  - Usage: delivery asset.
+  - Purpose: new success state icon.
+  - Target: `app/src/main/res/drawable/success_check.svg`
+  - Source/license: provided by product team for this project.
+```
+
+Put per-asset metadata as nested bullets under that asset item. Same-level
+bullets are treated as separate task requirements, not as metadata for the
+previous asset.
+
+Sikula treats structured `## Assets` declarations as the source of truth during
+contract readiness checks. Declared paths are resolved inside the project
+boundary, hashed, and reported with lightweight metadata. A structured asset
+declaration is a bullet such as `Path: ...`, `Asset: ...`, `Reference asset:
+...`, or `Delivery asset: ...`; bare path bullets and prose such as "use
+`.sikula/task-assets/foo.png` as a mockup" are not asset declarations.
+
+You may still mention a declared asset path in the task body for human
+readability, but intent, target, and provenance must come from `## Assets`. If a
+local asset-like path appears outside `## Assets` without a matching structured
+declaration, `contract check` reports a warning instead of silently treating the
+path as a reference or delivery asset. Ordinary implementation target paths such
+as `app/assets/icon.svg` or `docs/new-guide.md` are not treated as asset inputs
+just because they appear in a task. Missing files, paths outside the project, or
+delivery assets without provenance are readiness blockers. Untracked, ignored,
+or dirty/staged assets are warnings because isolated runs may not receive the
+same inputs. Sikula does not fetch URLs during delivery runs; put the file in
+the project first and use URLs only as provenance or background context.
+
+When `sikula contract prepare` sees verified reference or delivery assets, it
+adds an `Asset manifest` section to the implementation contract with the
+resolved project path, hash, purpose, usage, and any explicit target or
+source/license details from the task. File metadata such as MIME type, file
+size, and git status is kept in structured check/report metadata unless it
+needs an actionable Markdown warning. Missing, ambiguous, or out-of-project
+assets remain follow-up questions instead of being silently added to the
+contract. If you answer an `assets.local_files` question, provide supported
+local project paths, one per unresolved asset. Free text such as `n/a` does not
+resolve a missing asset reference.
 
 ## Feature Example
 
