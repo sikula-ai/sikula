@@ -122,6 +122,27 @@ def test_detect_asset_references_reads_first_h1_asset_manifest_with_manifest_bod
     assert sorted(references) == [".sikula/task-assets/login-spacing.png"]
 
 
+def test_detect_asset_references_reads_first_h1_asset_manifest_after_neutral_subheading(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    markdown = """# Asset manifest
+
+## Summary
+
+These assets document the expected spacing.
+
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing.png`
+  - Usage: reference only.
+"""
+
+    references = _references_by_path(markdown, tmp_path)
+
+    assert sorted(references) == [".sikula/task-assets/login-spacing.png"]
+
+
 def test_detect_asset_references_reads_non_title_asset_manifest_sections(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing.png"
     asset_path.parent.mkdir(parents=True)

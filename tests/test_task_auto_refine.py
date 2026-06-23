@@ -157,6 +157,13 @@ def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_manifes
         )
 
 
+def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_neutral_subheading_before_manifest():
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output(
+            '{"task_markdown": "# Asset manifest\\n\\n## Summary\\n\\nGenerated assets.\\n\\n### Reference assets\\n\\n- Path: `.sikula/task-assets/x.png`"}'
+        )
+
+
 def test_parse_task_auto_refine_output_rejects_asset_manifest_as_later_h1_section():
     with pytest.raises(ValueError, match="must not contain an Asset manifest"):
         parse_task_auto_refine_output(

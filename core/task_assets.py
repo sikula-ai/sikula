@@ -1245,6 +1245,7 @@ def asset_manifest_h1_has_structured_body(
     ignore_fenced_blocks: bool = False,
 ) -> bool:
     in_fenced_block = False
+    in_manifest_context = True
     for line in lines[start_index:]:
         if ignore_fenced_blocks and _FENCED_BLOCK_RE.match(line):
             in_fenced_block = not in_fenced_block
@@ -1257,14 +1258,21 @@ def asset_manifest_h1_has_structured_body(
         if markdown_heading:
             if len(markdown_heading.group(1)) == 1:
                 return False
-            return _asset_manifest_body_heading(markdown_heading.group(2))
+            if _asset_manifest_body_heading(markdown_heading.group(2)):
+                return True
+            in_manifest_context = False
+            continue
         text_heading = _TEXT_HEADING_RE.match(line)
         if text_heading:
-            return _asset_manifest_body_heading(text_heading.group(1))
+            if _asset_manifest_body_heading(text_heading.group(1)):
+                return True
+            in_manifest_context = False
+            continue
         bullet = _BULLET_RE.match(line)
         if bullet:
             field = _structured_asset_field(bullet.group(1))
-            return bool(field and _asset_manifest_body_field_label(field[0]))
+            if in_manifest_context and field and _asset_manifest_body_field_label(field[0]):
+                return True
     return False
 
 
