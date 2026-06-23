@@ -96,7 +96,7 @@ def _contains_asset_manifest_section(markdown: str) -> bool:
     """Return whether markdown contains a heading parsed as Sikula's Asset manifest section."""
 
     in_fenced_block = False
-    seen_document_title = False
+    seen_heading = False
     for line in markdown.splitlines():
         if _FENCED_BLOCK_RE.match(line):
             in_fenced_block = not in_fenced_block
@@ -107,8 +107,10 @@ def _contains_asset_manifest_section(markdown: str) -> bool:
         if heading_match:
             heading_level = len(heading_match.group(1))
             normalized_heading = _normalize_refine_heading(heading_match.group(2))
-            if heading_level == 1 and not seen_document_title:
-                seen_document_title = True
+            is_document_title = heading_level == 1 and not seen_heading
+            seen_heading = True
+            if is_document_title:
+                continue
             elif normalized_heading == "asset manifest":
                 return True
         text_heading_match = _REFINE_TEXT_HEADING_RE.match(line)

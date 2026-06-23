@@ -77,6 +77,13 @@ def test_parse_task_auto_refine_output_rejects_asset_manifest_as_later_h1_sectio
         )
 
 
+def test_parse_task_auto_refine_output_rejects_asset_manifest_h1_after_non_title_heading():
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output(
+            '{"task_markdown": "## Goal\\n\\nDocument assets.\\n\\n# Asset manifest\\n\\n- Path: `.sikula/task-assets/x.png`"}'
+        )
+
+
 def test_parse_task_auto_refine_output_allows_asset_manifest_heading_inside_fenced_example():
     draft = parse_task_auto_refine_output(
         """{
