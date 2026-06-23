@@ -1635,13 +1635,21 @@ def _insert_or_append_section_entries(lines: list[str], section: str, entries: l
     normalized_section = _normalize_heading(section)
     section_start: int | None = None
     section_end = len(lines)
+    seen_heading = False
     for index, line in enumerate(lines):
         heading_match = _HEADING_RE.match(line)
         if not heading_match:
+            if _TEXT_HEADING_RE.match(line):
+                seen_heading = True
+            continue
+        heading_level = len(heading_match.group(1))
+        is_document_title = heading_level == 1 and not seen_heading
+        seen_heading = True
+        if is_document_title:
             continue
         if _normalize_heading(heading_match.group(2)) == normalized_section:
             section_start = index
-            section_level = len(heading_match.group(1))
+            section_level = heading_level
             section_end = index + 1
             while section_end < len(lines):
                 next_heading = _HEADING_RE.match(lines[section_end])
@@ -1777,9 +1785,17 @@ def _implementation_asset_manifest_entry_lines(
 def _markdown_section_content(markdown: str, section: str) -> str:
     normalized_section = _normalize_heading(section)
     lines = markdown.splitlines()
+    seen_heading = False
     for index, line in enumerate(lines):
         heading_match = _HEADING_RE.match(line)
-        if not heading_match or _normalize_heading(heading_match.group(2)) != normalized_section:
+        if not heading_match:
+            if _TEXT_HEADING_RE.match(line):
+                seen_heading = True
+            continue
+        heading_level = len(heading_match.group(1))
+        is_document_title = heading_level == 1 and not seen_heading
+        seen_heading = True
+        if is_document_title or _normalize_heading(heading_match.group(2)) != normalized_section:
             continue
         section_end = _markdown_section_end(lines, index)
         return "\n".join(lines[index + 1 : section_end]).strip()

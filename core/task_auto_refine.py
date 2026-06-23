@@ -12,11 +12,14 @@ from core.contract_check import TaskDescriptionPrepareResult, prepare_task_descr
 _REFINE_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 _REFINE_TEXT_HEADING_RE = re.compile(r"^\s{0,3}([A-Za-z][A-Za-z0-9 /&_-]{1,60}):\s*$")
 _FENCED_BLOCK_RE = re.compile(r"^\s{0,3}(```+|~~~+)")
-_ASSET_MANIFEST_ENTRY_RE = re.compile(
-    r"^\s{0,3}(?:[-*+]\s+)?(?:path|sha-?256|purpose|usage|requested target|target resolution|source/license)\s*:",
+_ASSET_MANIFEST_FIELD_RE = re.compile(
+    r"^\s*(?:[-*+]|\d+[.)])\s+"
+    r"(?:path|asset|reference asset|delivery asset|sha-?256|purpose|usage|target|target path|"
+    r"destination|destination path|requested target|target resolution|source/license|source license|"
+    r"license|licence|provenance)\s*:",
     re.IGNORECASE,
 )
-_ASSET_MANIFEST_CHILD_HEADINGS = {"reference assets", "delivery assets"}
+_ASSET_MANIFEST_CHILD_HEADINGS = {"reference asset", "reference assets", "delivery asset", "delivery assets"}
 
 
 @dataclass(frozen=True)
@@ -122,8 +125,10 @@ def _contains_asset_manifest_section(markdown: str) -> bool:
             elif normalized_heading == "asset manifest":
                 return True
         text_heading_match = _REFINE_TEXT_HEADING_RE.match(line)
-        if text_heading_match and _normalize_refine_heading(text_heading_match.group(1)) == "asset manifest":
-            return True
+        if text_heading_match:
+            seen_heading = True
+            if _normalize_refine_heading(text_heading_match.group(1)) == "asset manifest":
+                return True
     return False
 
 
@@ -137,15 +142,20 @@ def _asset_manifest_title_has_manifest_body(lines: list[str], start_index: int) 
             continue
         heading_match = _REFINE_HEADING_RE.match(line)
         if heading_match:
+            heading_level = len(heading_match.group(1))
             normalized_heading = _normalize_refine_heading(heading_match.group(2))
-            return normalized_heading in _ASSET_MANIFEST_CHILD_HEADINGS
+            if heading_level == 1:
+                return False
+            if normalized_heading in {"asset manifest", *_ASSET_MANIFEST_CHILD_HEADINGS}:
+                return True
+            continue
         text_heading_match = _REFINE_TEXT_HEADING_RE.match(line)
         if text_heading_match:
             normalized_text_heading = _normalize_refine_heading(text_heading_match.group(1))
             if normalized_text_heading in {"asset manifest", *_ASSET_MANIFEST_CHILD_HEADINGS}:
                 return True
             continue
-        if _ASSET_MANIFEST_ENTRY_RE.match(line):
+        if _ASSET_MANIFEST_FIELD_RE.match(line):
             return True
     return False
 

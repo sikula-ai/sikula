@@ -957,18 +957,28 @@ def detect_undeclared_asset_paths(
     paths: list[dict[str, Any]] = []
     seen: set[tuple[int, str]] = set()
     heading_stack: list[tuple[int, str]] = []
+    seen_heading = False
     lines = text.splitlines()
     for line_index, line in enumerate(lines):
         markdown_heading = _HEADING_RE.match(line)
         text_heading = _TEXT_HEADING_RE.match(line)
         if markdown_heading:
+            heading_level = len(markdown_heading.group(1))
+            raw_heading = markdown_heading.group(2).strip()
+            is_document_title = (
+                heading_level == 1 and not seen_heading and _normalize_heading(raw_heading) == "asset manifest"
+            )
+            seen_heading = True
+            if is_document_title:
+                continue
             heading_stack = _asset_update_heading_stack(
                 heading_stack,
-                level=len(markdown_heading.group(1)),
-                heading=markdown_heading.group(2).strip(),
+                level=heading_level,
+                heading=raw_heading,
             )
             continue
         if text_heading:
+            seen_heading = True
             heading_stack = _asset_update_heading_stack(
                 heading_stack,
                 level=_asset_text_heading_level(heading_stack),
@@ -1013,18 +1023,28 @@ def _asset_line_is_bare_asset_path(line: str, normalized_path: str) -> bool:
 def _parse_structured_asset_declarations(text: str) -> list[_StructuredAssetDeclaration]:
     declarations: list[_StructuredAssetDeclaration] = []
     heading_stack: list[tuple[int, str]] = []
+    seen_heading = False
     lines = text.splitlines()
     for line_index, line in enumerate(lines):
         markdown_heading = _HEADING_RE.match(line)
         text_heading = _TEXT_HEADING_RE.match(line)
         if markdown_heading:
+            heading_level = len(markdown_heading.group(1))
+            raw_heading = markdown_heading.group(2).strip()
+            is_document_title = (
+                heading_level == 1 and not seen_heading and _normalize_heading(raw_heading) == "asset manifest"
+            )
+            seen_heading = True
+            if is_document_title:
+                continue
             heading_stack = _asset_update_heading_stack(
                 heading_stack,
-                level=len(markdown_heading.group(1)),
-                heading=markdown_heading.group(2).strip(),
+                level=heading_level,
+                heading=raw_heading,
             )
             continue
         if text_heading:
+            seen_heading = True
             heading_stack = _asset_update_heading_stack(
                 heading_stack,
                 level=_asset_text_heading_level(heading_stack),

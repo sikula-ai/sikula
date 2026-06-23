@@ -94,6 +94,49 @@ def test_detect_asset_references_accepts_structured_path_label_outside_task_asse
     assert references["designs/login-spacing.png"]["status"] == "available"
 
 
+def test_detect_asset_references_treats_first_h1_asset_manifest_as_document_title(tmp_path: Path):
+    markdown = """# Asset manifest
+
+## Scope
+
+- Path: `.sikula/task-assets/login-spacing.png` is product copy, not a structured asset declaration.
+"""
+
+    assert _references_by_path(markdown, tmp_path) == {}
+
+
+def test_detect_asset_references_reads_non_title_asset_manifest_sections(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    markdown = """# Fix login spacing
+
+## Asset manifest
+
+- Path: `.sikula/task-assets/login-spacing.png`
+  - Usage: reference only.
+"""
+
+    references = _references_by_path(markdown, tmp_path)
+
+    assert sorted(references) == [".sikula/task-assets/login-spacing.png"]
+
+
+def test_detect_asset_references_still_reads_first_h1_assets_section(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    markdown = """# Assets
+
+- Path: `.sikula/task-assets/login-spacing.png`
+  - Usage: reference only.
+"""
+
+    references = _references_by_path(markdown, tmp_path)
+
+    assert sorted(references) == [".sikula/task-assets/login-spacing.png"]
+
+
 def test_detect_asset_references_ignores_bare_asset_path_in_asset_section(tmp_path: Path):
     asset_path = tmp_path / "designs" / "login-spacing.png"
     asset_path.parent.mkdir(parents=True)

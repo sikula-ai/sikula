@@ -78,12 +78,46 @@ def test_parse_task_auto_refine_output_allows_asset_manifest_title_with_text_sco
     assert "Scope:" in draft.task_markdown
 
 
-def test_parse_task_auto_refine_output_allows_asset_manifest_title_with_markdown_scope_asset_path():
+def test_parse_task_auto_refine_output_allows_asset_manifest_title_with_markdown_scope_asset_reference():
     draft = parse_task_auto_refine_output(
-        '{"task_markdown": "# Asset manifest\\n\\n## Scope\\n\\n- Path: `.sikula/task-assets/x.png` should be shown in the UI."}'
+        '{"task_markdown": "# Asset manifest\\n\\n## Scope\\n\\n- Show `.sikula/task-assets/x.png` in the UI."}'
     )
 
     assert "## Scope" in draft.task_markdown
+
+
+def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_markdown_scope_field():
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output(
+            '{"task_markdown": "# Asset manifest\\n\\n## Scope\\n\\n- Path: `.sikula/task-assets/x.png` should be shown in the UI."}'
+        )
+
+
+def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_product_assets_field():
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output(
+            '{"task_markdown": "# Asset manifest\\n\\n## Assets\\n\\n- Path: `.sikula/task-assets/x.png` is part of the product task."}'
+        )
+
+
+def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_numbered_manifest_field():
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output(
+            '{"task_markdown": "# Asset manifest\\n\\n1. Asset: `.sikula/task-assets/x.png`"}'
+        )
+
+
+def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_metadata_field():
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output('{"task_markdown": "# Asset manifest\\n\\n- Usage: reference only."}')
+
+
+def test_parse_task_auto_refine_output_allows_asset_manifest_title_after_next_h1():
+    draft = parse_task_auto_refine_output(
+        '{"task_markdown": "# Asset manifest\\n\\n# Follow-up task\\n\\n- Path: `.sikula/task-assets/x.png` is discussed here."}'
+    )
+
+    assert "# Follow-up task" in draft.task_markdown
 
 
 def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_manifest_entries():
@@ -107,6 +141,13 @@ def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_manifes
         )
 
 
+def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_markdown_manifest_intro_and_entries():
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output(
+            '{"task_markdown": "# Asset manifest\\n\\n## Generated manifest\\n\\n- Path: `.sikula/task-assets/x.png`"}'
+        )
+
+
 def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_manifest_subsections():
     with pytest.raises(ValueError, match="must not contain an Asset manifest"):
         parse_task_auto_refine_output(
@@ -125,6 +166,13 @@ def test_parse_task_auto_refine_output_rejects_asset_manifest_h1_after_non_title
     with pytest.raises(ValueError, match="must not contain an Asset manifest"):
         parse_task_auto_refine_output(
             '{"task_markdown": "## Goal\\n\\nDocument assets.\\n\\n# Asset manifest\\n\\n- Path: `.sikula/task-assets/x.png`"}'
+        )
+
+
+def test_parse_task_auto_refine_output_rejects_asset_manifest_h1_after_text_heading():
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output(
+            '{"task_markdown": "Scope:\\n\\n- Document assets.\\n\\n# Asset manifest\\n\\n- Notes."}'
         )
 
 
