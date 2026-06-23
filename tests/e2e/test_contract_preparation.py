@@ -78,6 +78,56 @@ Users should be able to invite teammates by email.
         raise AssertionError(f"unexpected readonly prompt:\n{prompt}")
 
 
+class AssetTaskRefineFakeLLM:
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def generate(self, system: str, user: str) -> str:
+        raise AssertionError("asset task refine smoke test must not call generate()")
+
+    def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
+        raise AssertionError("asset task refine smoke test must not call write agents")
+
+    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+        self.prompts.append(prompt)
+        assert "Sikula-detected local asset path candidates" in prompt
+        assert '".sikula/task-assets/login-spacing.png"' in prompt
+        return json.dumps(
+            {
+                "task_markdown": """# Fix login spacing
+
+## Goal
+
+Fix the login form spacing shown in the reference screenshot.
+
+## Scope
+
+- Adjust the login form spacing to match the provided reference screenshot.
+
+## Acceptance criteria
+
+- The login form spacing matches the reference screenshot.
+- Existing login behaviour remains unchanged.
+
+## Out of scope
+
+- Do not redesign the login screen.
+
+## Assets
+
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing.png`
+  - Usage: reference only.
+  - Notes: Shows the expected login form spacing.
+  - Do not copy this asset into production files.
+""",
+                "input_language": "en",
+                "normalized_to_english": False,
+            }
+        )
+
+
 def test_task_refine_auto_to_contract_prepare_auto_writes_auditable_artifacts(
     git_project: Path,
     monkeypatch,
@@ -194,6 +244,77 @@ def test_task_refine_auto_to_contract_prepare_auto_writes_auditable_artifacts(
     assert "Active questions:" in contract_audit["record"]["prompt"]
     assert "privacy.data_handling" in contract_audit["record"]["raw_output"]
     assert len(fake_llm.prompts) == 2
+
+
+def test_task_refine_auto_structures_asset_paths_without_manifest(
+    git_project: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    project_root = git_project
+    config_path = project_root / ".sikula" / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "project": {
+                    "name": "asset-refine-smoke",
+                    "build_tool": "python",
+                    "root_path": str(project_root),
+                    "language": "Python",
+                },
+                "tasks": {
+                    "task_description_dir": ".sikula/tasks",
+                    "contract_dir": ".sikula/contracts",
+                    "contract_report_dir": ".sikula/contract-reports",
+                    "task_asset_dir": ".sikula/task-assets",
+                },
+                "build": {"test_command": "pytest"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    task_path = project_root / ".sikula" / "tasks" / "login-spacing.md"
+    asset_path = project_root / ".sikula" / "task-assets" / "login-spacing.png"
+    task_path.parent.mkdir(parents=True, exist_ok=True)
+    asset_path.parent.mkdir(parents=True, exist_ok=True)
+    asset_path.write_bytes(b"fake-png")
+    task_path.write_text(
+        "Fix the login form spacing shown in `.sikula/task-assets/login-spacing.png`.",
+        encoding="utf-8",
+    )
+    refined_path = project_root / ".sikula" / "tasks" / "login-spacing.refined.md"
+    fake_llm = AssetTaskRefineFakeLLM()
+    monkeypatch.chdir(project_root)
+
+    with (
+        patch("core.llm_client.create_llm_client", return_value=fake_llm),
+        patch(
+            "sys.argv",
+            [
+                "sikula",
+                "task",
+                "refine",
+                str(task_path),
+                "--auto",
+                "--output",
+                str(refined_path),
+            ],
+        ),
+    ):
+        main()
+
+    output = capsys.readouterr().out
+    refined_markdown = refined_path.read_text(encoding="utf-8")
+    assert "Refined task description written:" in output
+    assert "Next step: sikula contract prepare" in output
+    assert "## Assets" in refined_markdown
+    assert "### Reference assets" in refined_markdown
+    assert "- Path: `.sikula/task-assets/login-spacing.png`" in refined_markdown
+    assert "Usage: reference only." in refined_markdown
+    assert "## Asset manifest" not in refined_markdown
+    assert len(fake_llm.prompts) == 1
 
 
 def test_contract_prepare_asset_manifest_round_trips_through_contract_check(

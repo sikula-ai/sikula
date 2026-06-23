@@ -118,6 +118,12 @@ answers YAML and rerun with `--answers`. In `--auto` mode, Sikula writes the
 normalized refined Markdown first and scopes any generated answers template to
 that new refined file.
 
+For task assets, `sikula task refine --auto` may turn explicit local asset
+paths from a rough product task into a structured `## Assets` section. It does
+not create an `Asset manifest`, validate asset hashes, decide licensing, or
+invent delivery targets; `sikula contract prepare` handles those
+project-aware readiness checks later.
+
 ### Direct Prepare Vs Refine First
 
 `sikula task refine` is optional. Use it when you want a cleaner product task
@@ -291,6 +297,11 @@ assets remain follow-up questions instead of being silently added to the
 contract. If you answer an `assets.local_files` question, provide supported
 local project paths, one per unresolved asset. Free text such as `n/a` does not
 resolve a missing asset reference.
+
+Fresh task-file runs also copy the prepared asset metadata into task state as a
+non-blocking audit snapshot. This makes asset usage easier to inspect later, but
+Sikula does not yet fail or resume-block a task when an asset hash changes after
+the contract was prepared.
 
 ## Feature Example
 

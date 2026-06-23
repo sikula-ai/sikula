@@ -230,6 +230,7 @@ class TestJsonStateStore:
         data.pop("runtime_metadata", None)
         data.pop("final_summary", None)
         data.pop("implementation_contract", None)
+        data.pop("implementation_asset_records", None)
         data.pop("testability_gaps", None)
         data.pop("test_execution_gate_records", None)
         data.pop("build_loop_key", None)
@@ -243,10 +244,55 @@ class TestJsonStateStore:
         assert loaded.runtime_metadata == {}
         assert loaded.final_summary == {}
         assert loaded.implementation_contract == {}
+        assert loaded.implementation_asset_records == []
         assert loaded.testability_gaps == []
         assert loaded.test_execution_gate_records == []
         assert loaded.build_loop_key is None
         assert loaded.build_loop_start_iteration == 0
+
+    def test_record_implementation_assets_sanitizes_records(self):
+        state = TaskState(task_id="assets1", task_description="asset task")
+
+        state.record_implementation_assets(
+            [
+                {
+                    "path": ".sikula/task-assets/icon.svg",
+                    "project_path": ".sikula/task-assets/icon.svg",
+                    "kind": "delivery",
+                    "status": "available",
+                    "line": 12,
+                    "size_bytes": 42,
+                    "target_specified": True,
+                    "requested_target": "app/assets/icon.svg",
+                    "provenance_specified": True,
+                    "source_license": "provided by product team; MIT.",
+                    "sha256": "sha256:abc",
+                    "mime_type": "image/svg+xml",
+                    "git_status": "tracked",
+                    "_raw_paths": [".sikula/task-assets/icon.svg"],
+                    "excerpt": "raw source excerpt",
+                }
+            ]
+        )
+
+        assert state.implementation_asset_records == [
+            {
+                "path": ".sikula/task-assets/icon.svg",
+                "project_path": ".sikula/task-assets/icon.svg",
+                "kind": "delivery",
+                "status": "available",
+                "line": 12,
+                "size_bytes": 42,
+                "target_specified": True,
+                "requested_target": "app/assets/icon.svg",
+                "provenance_specified": True,
+                "source_license": "provided by product team; MIT.",
+                "sha256": "sha256:abc",
+                "mime_type": "image/svg+xml",
+                "git_status": "tracked",
+            }
+        ]
+        assert state.history[-1]["action"] == "asset_snapshot"
 
     def test_record_testability_gap_captures_scope_and_metadata(self):
         state = TaskState(
@@ -660,6 +706,18 @@ class TestJsonStateStore:
             test_status="success",
             check_status="skipped",
         )
+        state.record_implementation_assets(
+            [
+                {"path": ".sikula/task-assets/reference.png", "kind": "reference", "status": "available"},
+                {
+                    "path": ".sikula/task-assets/icon.svg",
+                    "kind": "delivery",
+                    "status": "available",
+                    "git_status": "dirty",
+                    "source_license": "provided by product team; MIT.",
+                },
+            ]
+        )
         state.record("test_writer", "llm_retry", "temporary failure")
         state.record_validation("build", "success", elapsed_s=2.0)
         store.save(state)
@@ -678,6 +736,9 @@ class TestJsonStateStore:
         assert loaded.final_summary["security_reviewer_runs"] == 0
         assert loaded.final_summary["testability_gaps_count"] == 0
         assert loaded.final_summary["test_execution_gate_audits_count"] == 0
+        assert loaded.final_summary["implementation_asset_records_count"] == 2
+        assert loaded.final_summary["implementation_asset_records_by_kind"] == {"reference": 1, "delivery": 1}
+        assert loaded.final_summary["implementation_asset_warnings_count"] == 1
         assert loaded.final_summary["planner_retries_count"] == 0
         assert loaded.final_summary["llm_retries"] == 1
 

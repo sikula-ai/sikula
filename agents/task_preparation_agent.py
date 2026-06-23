@@ -93,6 +93,20 @@ Hard rules:
 - Preserve local asset paths exactly, including screenshots, icons, fonts, data files, PDFs, or specs referenced by path.
 - Preserve explicit asset intent such as reference-only, delivery asset, do-not-copy, target, and source/license wording.
 - Do not invent asset target paths, source/license/provenance, or permission to ship an asset.
+- When local asset paths are present, prefer a structured product-task `## Assets`
+  section. Use `### Reference assets` for explicitly reference-only screenshots,
+  mockups, PDFs, or specs. Use `### Delivery assets` only when the source clearly
+  says the asset should be copied, included, shipped, or used in production. Use a
+  neutral `### Assets` entry when a local path is mentioned but reference-vs-delivery
+  intent is unclear.
+- When multiple local image assets are listed near wording such as reference
+  screenshots, mockups, expected/final UI states, before/after states, or visual
+  references, treat them as `### Reference assets` unless the source explicitly
+  says they should be copied, included, shipped, or used as production assets.
+- Do not create an `Asset manifest`; Sikula contract prepare generates that later
+  after deterministic path validation and hashing.
+- Do not copy placeholder asset paths from the output shape below. Include `## Assets`
+  only for asset paths already present in the raw task or detected candidate list.
 - Do not invent product requirements, business policy, security policy, privacy policy, validation commands, files, APIs, or implementation details.
 - Use project guidelines only for terminology and product context that is already evident; do not infer new requirements from generic best practices.
 - Do not use other Sikula workflow artifacts from the configured workflow artifact directories as product evidence
@@ -124,6 +138,23 @@ Plain-language user or business outcome.
 
 - Existing product/domain context explicitly mentioned or safely named from the source.
 
+## Assets
+
+### Reference assets
+
+- Path: `<existing-project-relative-reference-asset-path>`
+  - Usage: reference only.
+  - Notes: Existing asset purpose from the source task.
+  - Do not copy this asset into production files.
+
+### Delivery assets
+
+- Path: `<existing-project-relative-delivery-asset-path>`
+  - Usage: delivery asset.
+  - Purpose: Existing delivery purpose from the source task.
+  - Target: existing requested target from the source task, if any.
+  - Source/license: existing provenance from the source task, if any.
+
 Project stack: {project_stack}
 
 Project guidelines files to inspect when useful:
@@ -136,6 +167,15 @@ Provided product context:
 ```json
 {product_context_json}
 ```
+
+Sikula-detected local asset path candidates from the raw task:
+```json
+{asset_candidates_json}
+```
+
+Use these candidates only as a reminder to preserve or structure paths already
+present in the task. They are not proof that a file exists, is licensed, or is
+safe to ship.
 
 Task name: {task_name}
 
@@ -399,11 +439,13 @@ class TaskPreparationAgent:
     def _build_task_normalization_prompt(self, request: TaskAutoRefineRequest) -> str:
         task_name = request.task_name or "task"
         product_context_json = json.dumps(request.product_context or {}, indent=2, sort_keys=True)
+        asset_candidates_json = json.dumps(request.asset_path_candidates or [], indent=2, sort_keys=True)
         return AGENT_SECURITY_PREFIX + _TASK_NORMALIZATION_PROMPT.format(
             project_stack=tech_stack(self.project_config),
             guidelines_files=guidelines_files(self.project_config),
             workflow_artifact_dirs=self._workflow_artifact_dirs(),
             product_context_json=product_context_json,
+            asset_candidates_json=asset_candidates_json,
             task_name=task_name,
             brief=request.brief,
         )

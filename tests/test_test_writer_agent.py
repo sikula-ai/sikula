@@ -306,6 +306,15 @@ class TestTestWriterAgentPrompt:
         assert "Do NOT write brittle tests" in prompt
         assert "opaque view trees" in prompt
 
+    def test_asset_manifest_testing_guard_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state(implementation_prompt="## Asset manifest\n\n- Path: `.sikula/task-assets/icon.svg`")
+        _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
+        prompt = stub_llm.agent_calls[0]
+        assert "Asset manifest" in prompt
+        assert "user-visible behaviour or stable public contract" in prompt
+        assert "replace asset coverage with brittle byte comparisons" in prompt
+        assert "TESTABILITY GAP policy" in prompt
+
     def test_framework_wiring_guard_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state(implementation_prompt="Add dependency injection and route registration")
         _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)

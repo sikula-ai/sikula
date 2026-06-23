@@ -272,6 +272,16 @@ class TestSecurityReviewerPrompt:
         assert "src/security.md" in prompt
         assert "# Security rules" in prompt
 
+    def test_asset_manifest_security_review_in_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        prompt = stub_llm.readonly_calls[0]
+        assert "Asset manifest" in prompt
+        assert "Production asset additions" in prompt
+        assert "reference-only assets were not copied into production files" in prompt
+        assert "licensing risk" in prompt
+
     def test_step_security_scope_precedes_full_task_context(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()

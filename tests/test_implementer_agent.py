@@ -204,6 +204,19 @@ class TestImplementerAgentStepRecord:
         assert "Cargo/Rust projects" not in prompt
         assert "Cargo.lock" not in prompt
 
+    def test_prompt_preserves_asset_manifest_obligations(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["src/Login.kt"]
+        state = _make_state()
+
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+        prompt = state.implement_cycle_records[0]["implementer_prompt"]
+
+        assert "Asset manifest" in prompt
+        assert "Use delivery assets only within the requested" in prompt
+        assert "scope" in prompt
+        assert "do not copy reference-only assets into production files" in prompt
+        assert "invent missing provenance, license, or target information" in prompt
+
     def test_record_stores_implementer_output(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["src/Login.kt"]
         stub_llm.agent_output = "Created LoginActivity"

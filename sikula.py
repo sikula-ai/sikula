@@ -958,6 +958,7 @@ def _run_task_refine_auto(
 ):
     from core.task_auto_refine import auto_refine_task_description
 
+    asset_path_candidates = _task_refine_asset_path_candidates(task_text, source_path=source_path, cfg=cfg)
     audit_recorder, _audit_path = _make_auto_preparation_audit_recorder(
         generated_by="sikula.task_refine",
         source_path=source_path,
@@ -969,6 +970,7 @@ def _run_task_refine_auto(
     return auto_refine_task_description(
         task_text,
         task_name=task_name,
+        asset_path_candidates=asset_path_candidates,
         answers=answers,
         normalize_provider=lambda request: agent.normalize_task_description(
             request,
@@ -982,6 +984,32 @@ def _run_task_refine_auto(
         ),
         audit_recorder=audit_recorder,
     )
+
+
+def _task_refine_asset_path_candidates(task_text: str, *, source_path: Path, cfg: dict) -> list[dict[str, object]]:
+    try:
+        from core.task_assets import detect_asset_references, detect_undeclared_asset_paths
+
+        asset_references = detect_asset_references(task_text, source_path=source_path, project_config=cfg)
+        candidates = detect_undeclared_asset_paths(
+            task_text,
+            project_config=cfg,
+            asset_references=asset_references,
+        )
+    except (OSError, ValueError):
+        return []
+
+    safe_candidates: list[dict[str, object]] = []
+    for candidate in candidates:
+        path = str(candidate.get("path") or "").strip()
+        if not path:
+            continue
+        line = candidate.get("line")
+        safe_candidate: dict[str, object] = {"path": path}
+        if isinstance(line, int) and line > 0:
+            safe_candidate["line"] = line
+        safe_candidates.append(safe_candidate)
+    return safe_candidates
 
 
 def cmd_task_refine(args: argparse.Namespace, cfg: dict) -> None:
@@ -2122,6 +2150,10 @@ def _contract_preflight_snapshot(result, task_path: Path, project_root: Path) ->
     }
 
 
+def _contract_preflight_asset_records(result) -> list[dict]:
+    return [dict(reference) for reference in getattr(result, "asset_references", []) if isinstance(reference, dict)]
+
+
 def _contract_preflight_error_snapshot(task_path: Path, project_root: Path, error: Exception) -> dict:
     source_format = "text" if task_path.suffix.lower() == ".txt" else "markdown"
     return {
@@ -2139,14 +2171,21 @@ def _contract_preflight_error_snapshot(task_path: Path, project_root: Path, erro
 
 
 def _build_contract_preflight_snapshot(task_path: Path, cfg: dict, project_root: Path) -> dict:
+    snapshot, _asset_records = _build_contract_preflight_snapshot_and_assets(task_path, cfg, project_root)
+    return snapshot
+
+
+def _build_contract_preflight_snapshot_and_assets(
+    task_path: Path, cfg: dict, project_root: Path
+) -> tuple[dict, list[dict]]:
     from core.contract_check import check_contract_file
 
     try:
         result = check_contract_file(task_path, project_config=cfg or None)
-        return _contract_preflight_snapshot(result, task_path, project_root)
+        return _contract_preflight_snapshot(result, task_path, project_root), _contract_preflight_asset_records(result)
     except Exception as exc:
         log.warning("Implementation contract preflight failed: %s", exc)
-        return _contract_preflight_error_snapshot(task_path, project_root, exc)
+        return _contract_preflight_error_snapshot(task_path, project_root, exc), []
 
 
 def _contract_preflight_config(cfg: dict, overrides: dict) -> dict:
@@ -2722,9 +2761,10 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
         state.task_file = Path(args.task_file).name
         state.config_snapshot = _run_config_snapshot(cfg, overrides)
         preflight_cfg = _contract_preflight_config(cfg, overrides)
-        state.implementation_contract = _build_contract_preflight_snapshot(
+        state.implementation_contract, implementation_asset_records = _build_contract_preflight_snapshot_and_assets(
             task_path, preflight_cfg, original_project_root
         )
+        state.record_implementation_assets(implementation_asset_records)
         state.record("orchestrator", "contract_check", _contract_preflight_record_result(state.implementation_contract))
         store.save(state)
         _print_contract_preflight_summary(state.implementation_contract)

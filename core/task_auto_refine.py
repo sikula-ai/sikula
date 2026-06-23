@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any, Callable
 
 from core.contract_auto_prepare import AutoPreparationAuditRecorder, load_auto_json_object
 from core.contract_check import TaskDescriptionPrepareResult, prepare_task_description
+
+_REFINE_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
+_REFINE_TEXT_HEADING_RE = re.compile(r"^\s{0,3}([A-Za-z][A-Za-z0-9 /&_-]{1,60}):\s*$")
+_FENCED_BLOCK_RE = re.compile(r"^\s{0,3}(```+|~~~+)")
 
 
 @dataclass(frozen=True)
@@ -14,6 +19,7 @@ class TaskAutoRefineRequest:
     brief: str
     task_name: str | None
     product_context: dict[str, Any] | None = None
+    asset_path_candidates: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,8 @@ def parse_task_auto_refine_output(output: str) -> TaskAutoRefineDraft:
     task_markdown = raw_markdown.strip() + "\n"
     if "sikula:generated-" in task_markdown:
         raise ValueError("auto task refine output must not contain Sikula generated markers")
+    if _contains_asset_manifest_section(task_markdown):
+        raise ValueError("auto task refine output must not contain an Asset manifest")
 
     input_language = payload.get("input_language")
     if input_language is not None:
@@ -82,6 +90,37 @@ def parse_task_auto_refine_output(output: str) -> TaskAutoRefineDraft:
         normalized_to_english=normalized_to_english,
         warnings=warnings,
     )
+
+
+def _contains_asset_manifest_section(markdown: str) -> bool:
+    """Return whether markdown contains a heading parsed as Sikula's Asset manifest section."""
+
+    in_fenced_block = False
+    seen_document_title = False
+    for line in markdown.splitlines():
+        if _FENCED_BLOCK_RE.match(line):
+            in_fenced_block = not in_fenced_block
+            continue
+        if in_fenced_block:
+            continue
+        heading_match = _REFINE_HEADING_RE.match(line)
+        if heading_match:
+            heading_level = len(heading_match.group(1))
+            normalized_heading = _normalize_refine_heading(heading_match.group(2))
+            if heading_level == 1 and not seen_document_title:
+                seen_document_title = True
+            elif normalized_heading == "asset manifest":
+                return True
+        text_heading_match = _REFINE_TEXT_HEADING_RE.match(line)
+        if text_heading_match and _normalize_refine_heading(text_heading_match.group(1)) == "asset manifest":
+            return True
+    return False
+
+
+def _normalize_refine_heading(value: str) -> str:
+    normalized = value.lower().replace("&", " and ")
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
 
 
 def parse_task_auto_answer_output(output: str, active_question_ids: set[str]) -> TaskAutoAnswerBatch:
@@ -127,6 +166,7 @@ def auto_refine_task_description(
     *,
     task_name: str | None = None,
     product_context: dict[str, Any] | None = None,
+    asset_path_candidates: list[dict[str, Any]] | None = None,
     answers: dict[str, Any] | None = None,
     normalize_provider: TaskAutoRefineProvider,
     answer_provider: TaskAutoAnswerProvider | None = None,
@@ -140,6 +180,7 @@ def auto_refine_task_description(
             brief=brief,
             task_name=task_name,
             product_context=product_context,
+            asset_path_candidates=list(asset_path_candidates or []),
         )
     )
     if audit_recorder:

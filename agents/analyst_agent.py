@@ -194,6 +194,16 @@ Steps:
       write a ⚠️ WARNING — invented keys will break the translation workflow.
       If new user-visible text is introduced without any value specified in the task
       description, write a ⚠️ WARNING for each.
+      Asset manifest: if the task description contains an `Asset manifest` or
+      structured asset declarations, carry the asset obligations into the
+      implementation prompt. Distinguish reference-only assets from delivery assets.
+      Reference-only assets may guide implementation but must not be copied into
+      production files. Delivery assets may be used only within the requested scope.
+      Preserve requested target hints and source/license/provenance exactly when
+      provided. If a delivery asset has no requested target, instruct the implementer
+      to choose the project-conventional location from the codebase and explain the
+      choice; do not invent a target path before reading the relevant project
+      conventions.
    3. Architecture constraints: patterns to follow from the project guidelines
    4. Hard rules:
       - Minimal changes only — touch nothing outside the described scope

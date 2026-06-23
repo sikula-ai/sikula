@@ -28,6 +28,7 @@ from sikula import (
     _prepare_project_context_from_config,
     _read_interactive_contract_answer,
     _should_store_interactive_answer,
+    _task_refine_asset_path_candidates,
     main,
 )
 
@@ -40,6 +41,54 @@ def _python_project_config(tmp_path: Path) -> dict:
         "run_checks": True,
         "build": {"checks": [{"name": "ruff", "command": "ruff check ."}]},
     }
+
+
+def test_task_refine_asset_path_candidates_tolerates_detector_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from core import task_assets
+
+    def raise_bad_asset_reference(*args, **kwargs):
+        raise ValueError("bad asset path")
+
+    monkeypatch.setattr(task_assets, "detect_asset_references", raise_bad_asset_reference)
+
+    assert (
+        _task_refine_asset_path_candidates(
+            "Use `.sikula/task-assets/login.png` as reference.",
+            source_path=tmp_path / ".sikula" / "tasks" / "task.md",
+            cfg=_python_project_config(tmp_path),
+        )
+        == []
+    )
+
+
+def test_task_refine_asset_path_candidates_sanitizes_detector_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from core import task_assets
+
+    monkeypatch.setattr(task_assets, "detect_asset_references", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        task_assets,
+        "detect_undeclared_asset_paths",
+        lambda *args, **kwargs: [
+            {"path": "", "line": 1},
+            {"path": ".sikula/task-assets/no-line.png", "line": 0},
+            {"path": " .sikula/task-assets/with-line.png ", "line": 7},
+            {"path": ".sikula/task-assets/string-line.png", "line": "8"},
+        ],
+    )
+
+    assert _task_refine_asset_path_candidates(
+        "Use `.sikula/task-assets/with-line.png` as reference.",
+        source_path=tmp_path / ".sikula" / "tasks" / "task.md",
+        cfg=_python_project_config(tmp_path),
+    ) == [
+        {"path": ".sikula/task-assets/no-line.png"},
+        {"path": ".sikula/task-assets/with-line.png", "line": 7},
+        {"path": ".sikula/task-assets/string-line.png"},
+    ]
 
 
 def test_contract_check_reports_available_reference_asset(tmp_path: Path):
