@@ -12,6 +12,7 @@ from typing import Any
 import yaml
 
 from core.task_assets import (
+    asset_manifest_h1_has_structured_body as _asset_manifest_h1_has_structured_body,
     asset_answer_entry_lines as _asset_answer_entry_lines,
     asset_manifest_reference_lines as _asset_manifest_reference_lines,
     asset_project_root as _asset_project_root,
@@ -1643,11 +1644,20 @@ def _insert_or_append_section_entries(lines: list[str], section: str, entries: l
                 seen_heading = True
             continue
         heading_level = len(heading_match.group(1))
-        is_document_title = heading_level == 1 and not seen_heading
+        normalized_heading = _normalize_heading(heading_match.group(2))
+        is_document_title = (
+            heading_level == 1
+            and not seen_heading
+            and not (
+                normalized_section == "asset manifest"
+                and normalized_heading == "asset manifest"
+                and _asset_manifest_h1_has_structured_body(lines, index + 1)
+            )
+        )
         seen_heading = True
         if is_document_title:
             continue
-        if _normalize_heading(heading_match.group(2)) == normalized_section:
+        if normalized_heading == normalized_section:
             section_start = index
             section_level = heading_level
             section_end = index + 1
@@ -1793,9 +1803,18 @@ def _markdown_section_content(markdown: str, section: str) -> str:
                 seen_heading = True
             continue
         heading_level = len(heading_match.group(1))
-        is_document_title = heading_level == 1 and not seen_heading
+        normalized_heading = _normalize_heading(heading_match.group(2))
+        is_document_title = (
+            heading_level == 1
+            and not seen_heading
+            and not (
+                normalized_section == "asset manifest"
+                and normalized_heading == "asset manifest"
+                and _asset_manifest_h1_has_structured_body(lines, index + 1)
+            )
+        )
         seen_heading = True
-        if is_document_title or _normalize_heading(heading_match.group(2)) != normalized_section:
+        if is_document_title or normalized_heading != normalized_section:
             continue
         section_end = _markdown_section_end(lines, index)
         return "\n".join(lines[index + 1 : section_end]).strip()

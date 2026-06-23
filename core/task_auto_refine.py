@@ -8,18 +8,11 @@ from typing import Any, Callable
 
 from core.contract_auto_prepare import AutoPreparationAuditRecorder, load_auto_json_object
 from core.contract_check import TaskDescriptionPrepareResult, prepare_task_description
+from core.task_assets import asset_manifest_h1_has_structured_body
 
 _REFINE_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 _REFINE_TEXT_HEADING_RE = re.compile(r"^\s{0,3}([A-Za-z][A-Za-z0-9 /&_-]{1,60}):\s*$")
 _FENCED_BLOCK_RE = re.compile(r"^\s{0,3}(```+|~~~+)")
-_ASSET_MANIFEST_FIELD_RE = re.compile(
-    r"^\s*(?:[-*+]|\d+[.)])\s+"
-    r"(?:path|asset|reference asset|delivery asset|sha-?256|purpose|usage|target|target path|"
-    r"destination|destination path|requested target|target resolution|source/license|source license|"
-    r"license|licence|provenance)\s*:",
-    re.IGNORECASE,
-)
-_ASSET_MANIFEST_CHILD_HEADINGS = {"reference asset", "reference assets", "delivery asset", "delivery assets"}
 
 
 @dataclass(frozen=True)
@@ -119,7 +112,11 @@ def _contains_asset_manifest_section(markdown: str) -> bool:
             is_document_title = heading_level == 1 and not seen_heading
             seen_heading = True
             if is_document_title:
-                if normalized_heading == "asset manifest" and _asset_manifest_title_has_manifest_body(lines, index + 1):
+                if normalized_heading == "asset manifest" and asset_manifest_h1_has_structured_body(
+                    lines,
+                    index + 1,
+                    ignore_fenced_blocks=True,
+                ):
                     return True
                 continue
             elif normalized_heading == "asset manifest":
@@ -129,34 +126,6 @@ def _contains_asset_manifest_section(markdown: str) -> bool:
             seen_heading = True
             if _normalize_refine_heading(text_heading_match.group(1)) == "asset manifest":
                 return True
-    return False
-
-
-def _asset_manifest_title_has_manifest_body(lines: list[str], start_index: int) -> bool:
-    in_fenced_block = False
-    for line in lines[start_index:]:
-        if _FENCED_BLOCK_RE.match(line):
-            in_fenced_block = not in_fenced_block
-            continue
-        if in_fenced_block or not line.strip():
-            continue
-        heading_match = _REFINE_HEADING_RE.match(line)
-        if heading_match:
-            heading_level = len(heading_match.group(1))
-            normalized_heading = _normalize_refine_heading(heading_match.group(2))
-            if heading_level == 1:
-                return False
-            if normalized_heading in {"asset manifest", *_ASSET_MANIFEST_CHILD_HEADINGS}:
-                return True
-            continue
-        text_heading_match = _REFINE_TEXT_HEADING_RE.match(line)
-        if text_heading_match:
-            normalized_text_heading = _normalize_refine_heading(text_heading_match.group(1))
-            if normalized_text_heading in {"asset manifest", *_ASSET_MANIFEST_CHILD_HEADINGS}:
-                return True
-            continue
-        if _ASSET_MANIFEST_FIELD_RE.match(line):
-            return True
     return False
 
 

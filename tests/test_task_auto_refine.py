@@ -86,18 +86,20 @@ def test_parse_task_auto_refine_output_allows_asset_manifest_title_with_markdown
     assert "## Scope" in draft.task_markdown
 
 
-def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_markdown_scope_field():
-    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
-        parse_task_auto_refine_output(
-            '{"task_markdown": "# Asset manifest\\n\\n## Scope\\n\\n- Path: `.sikula/task-assets/x.png` should be shown in the UI."}'
-        )
+def test_parse_task_auto_refine_output_allows_asset_manifest_title_with_markdown_scope_field():
+    draft = parse_task_auto_refine_output(
+        '{"task_markdown": "# Asset manifest\\n\\n## Scope\\n\\n- Path: `.sikula/task-assets/x.png` should be shown in the UI."}'
+    )
+
+    assert "## Scope" in draft.task_markdown
 
 
-def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_product_assets_field():
-    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
-        parse_task_auto_refine_output(
-            '{"task_markdown": "# Asset manifest\\n\\n## Assets\\n\\n- Path: `.sikula/task-assets/x.png` is part of the product task."}'
-        )
+def test_parse_task_auto_refine_output_allows_asset_manifest_title_with_product_assets_field():
+    draft = parse_task_auto_refine_output(
+        '{"task_markdown": "# Asset manifest\\n\\n## Assets\\n\\n- Path: `.sikula/task-assets/x.png` is part of the product task."}'
+    )
+
+    assert "## Assets" in draft.task_markdown
 
 
 def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_numbered_manifest_field():
@@ -180,6 +182,16 @@ def test_parse_task_auto_refine_output_allows_asset_manifest_heading_inside_fenc
     draft = parse_task_auto_refine_output(
         """{
   "task_markdown": "# Document asset manifests\\n\\n## Scope\\n\\n- Document this Markdown example:\\n\\n```md\\n## Asset manifest\\n\\n- Path: `.sikula/task-assets/x.png`\\n```"
+}"""
+    )
+
+    assert "```md\n## Asset manifest" in draft.task_markdown
+
+
+def test_parse_task_auto_refine_output_allows_exact_asset_manifest_title_with_fenced_manifest_example():
+    draft = parse_task_auto_refine_output(
+        """{
+  "task_markdown": "# Asset manifest\\n\\n## Scope\\n\\n- Document this Markdown example:\\n\\n```md\\n## Asset manifest\\n\\n- Path: `.sikula/task-assets/x.png`\\n```"
 }"""
     )
 
