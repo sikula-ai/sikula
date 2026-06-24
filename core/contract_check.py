@@ -11,8 +11,13 @@ import re
 from typing import Any
 import yaml
 
+from core.markdown_headings import (
+    MARKDOWN_HEADING_RE as _HEADING_RE,
+    MarkdownHeadingScanner,
+    TEXT_HEADING_RE as _TEXT_HEADING_RE,
+    normalize_heading as _normalize_heading,
+)
 from core.task_assets import (
-    asset_manifest_h1_has_structured_body as _asset_manifest_h1_has_structured_body,
     asset_answer_entry_lines as _asset_answer_entry_lines,
     asset_manifest_reference_lines as _asset_manifest_reference_lines,
     asset_project_root as _asset_project_root,
@@ -21,6 +26,7 @@ from core.task_assets import (
     detect_undeclared_asset_paths as _detect_undeclared_asset_paths,
     public_asset_reference as _public_asset_reference,
     replace_unresolved_asset_reference_paths as _replace_unresolved_asset_reference_paths,
+    task_description_has_asset_manifest_section as _task_description_has_asset_manifest_section,
 )
 from core.state import TaskState
 from core.validation_coverage import (
@@ -164,8 +170,6 @@ _NEGATIVE_CASE_RE = re.compile(
 _CONTEXT_RE = re.compile(
     r"(`[^`]+`|\b(src|app|api|endpoint|route|screen|view|model|service|repository|database)\b)", re.I
 )
-_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
-_TEXT_HEADING_RE = re.compile(r"^\s{0,3}([A-Za-z][A-Za-z0-9 /&_-]{1,60}):\s*$")
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$")
 
 
@@ -491,10 +495,21 @@ class _ParsedTask:
     word_count: int
 
 
-def check_contract_file(path: Path, *, project_config: dict | None = None) -> ContractCheckResult:
+def check_contract_file(
+    path: Path,
+    *,
+    project_config: dict | None = None,
+    document_kind: str = "task_description",
+) -> ContractCheckResult:
     text = path.read_text(encoding="utf-8").strip()
     source_format = "text" if path.suffix.lower() == ".txt" else "markdown"
-    return check_contract(text, source_path=path, source_format=source_format, project_config=project_config)
+    return check_contract(
+        text,
+        source_path=path,
+        source_format=source_format,
+        project_config=project_config,
+        document_kind=document_kind,
+    )
 
 
 def check_contract(
@@ -505,17 +520,24 @@ def check_contract(
     project_config: dict | None = None,
     configured_validation_commands: list[str] | None = None,
     asset_project_config: dict | None = None,
+    document_kind: str = "task_description",
 ) -> ContractCheckResult:
     evaluation_text = _strip_generated_markers(_strip_generated_open_questions_section(text))
     parsed = _parse_markdown_task(evaluation_text)
     sections_detected = _sections_detected(parsed)
     validation = _validation_details(evaluation_text, project_config, configured_validation_commands)
     asset_config = asset_project_config if asset_project_config is not None else project_config
-    asset_references = _detect_asset_references(evaluation_text, source_path=source_path, project_config=asset_config)
+    asset_references = _detect_asset_references(
+        evaluation_text,
+        source_path=source_path,
+        project_config=asset_config,
+        document_kind=document_kind,
+    )
     undeclared_asset_paths = _detect_undeclared_asset_paths(
         evaluation_text,
         project_config=asset_config,
         asset_references=asset_references,
+        document_kind=document_kind,
     )
     if undeclared_asset_paths:
         validation = {**validation, "undeclared_asset_paths": undeclared_asset_paths}
@@ -545,6 +567,15 @@ def check_contract(
         asset_references,
         undeclared_asset_paths,
     )
+    if document_kind == "task_description" and _task_description_has_asset_manifest_section(evaluation_text):
+        gaps.append(
+            ContractGap(
+                "gap.assets.manifest_reserved",
+                "blocking",
+                "assets",
+                "## Asset manifest is reserved for prepared implementation contracts; task descriptions must use ## Assets.",
+            )
+        )
     if any(gap.severity == "blocking" for gap in gaps):
         weighted_score = min(weighted_score, 69)
     elif gaps:
@@ -979,6 +1010,18 @@ def prepare_implementation_contract(
         configured_validation_commands=validation_commands,
         asset_project_config=asset_project_config,
     )
+    if _contract_check_has_gap(check_result, "gap.assets.manifest_reserved"):
+        return _build_prepare_result(
+            contract_name=contract_name,
+            project_context=normalized_project_context,
+            project_context_blockers=[],
+            safe_task_path=safe_task_path,
+            check_result=check_result,
+            recheck_result=None,
+            prepared_contract_markdown=evaluation_contract_markdown.strip() + "\n",
+            resume_contract_markdown=evaluation_contract_markdown.strip() + "\n",
+            suppress_questions=True,
+        )
 
     if answers:
         # Chat/MCP prepare clients may resend an accumulated answer map across rounds.
@@ -1021,6 +1064,7 @@ def prepare_implementation_contract(
             project_config=validation_project_config,
             configured_validation_commands=validation_commands,
             asset_project_config=asset_project_config,
+            document_kind="implementation_contract",
         )
         return _build_prepare_result(
             contract_name=contract_name,
@@ -1050,6 +1094,7 @@ def prepare_implementation_contract(
             project_config=validation_project_config,
             configured_validation_commands=validation_commands,
             asset_project_config=asset_project_config,
+            document_kind="implementation_contract",
         )
 
     return _build_prepare_result(
@@ -1100,6 +1145,7 @@ def _prepare_active_questions_for_answers(
         project_config=project_config,
         configured_validation_commands=configured_validation_commands,
         asset_project_config=asset_project_config,
+        document_kind="implementation_contract",
     )
     return _merge_clarifying_questions(questions, enriched_check_result.clarifying_questions)
 
@@ -1188,6 +1234,10 @@ def _merge_clarifying_questions(*question_groups: list[ClarifyingQuestion]) -> l
     return merged
 
 
+def _contract_check_has_gap(result: ContractCheckResult, gap_id: str) -> bool:
+    return any(gap.id == gap_id for gap in result.gaps)
+
+
 def _build_prepare_result(
     *,
     contract_name: str | None,
@@ -1200,10 +1250,11 @@ def _build_prepare_result(
     resume_contract_markdown: str | None = None,
     answered_question_ids: list[str] | None = None,
     open_question_ids: list[str] | None = None,
+    suppress_questions: bool = False,
 ) -> ContractPrepareResult:
     active_check = recheck_result or check_result
     answered_ids = list(answered_question_ids or [])
-    questions_for_user = active_check.clarifying_questions
+    questions_for_user = [] if suppress_questions else active_check.clarifying_questions
     active_question_ids = [question.id for question in questions_for_user]
     open_ids = list(dict.fromkeys([*(open_question_ids or []), *active_question_ids]))
     revised_answer_question_ids = [question.id for question in questions_for_user if question.id in set(answered_ids)]
@@ -1230,7 +1281,9 @@ def _build_prepare_result(
     )
     required_user_action = _required_user_action(required_next_step)
     user_questions = _prepare_user_questions(questions_for_user, revised_answer_question_ids)
-    answers_template = _prepare_answers_template(active_check, revised_answer_question_ids)
+    answers_template = (
+        {} if suppress_questions else _prepare_answers_template(active_check, revised_answer_question_ids)
+    )
     resume_markdown = resume_contract_markdown or prepared_contract_markdown
     resume_arguments = _prepare_resume_arguments(
         contract_markdown=resume_markdown,
@@ -1246,6 +1299,8 @@ def _build_prepare_result(
         active_check=active_check,
         project_context_blockers=project_context_blockers,
         ready_to_run=ready_to_run,
+        has_contract_questions=has_contract_questions,
+        required_next_step=required_next_step,
         required_user_action=required_user_action,
         suggested_next_steps=suggested_next_steps,
         revised_answer_question_ids=revised_answer_question_ids,
@@ -1636,30 +1691,16 @@ def _insert_or_append_section_entries(lines: list[str], section: str, entries: l
     normalized_section = _normalize_heading(section)
     section_start: int | None = None
     section_end = len(lines)
-    seen_heading = False
+    heading_scanner = MarkdownHeadingScanner()
     for index, line in enumerate(lines):
-        heading_match = _HEADING_RE.match(line)
-        if not heading_match:
-            if _TEXT_HEADING_RE.match(line):
-                seen_heading = True
+        heading = heading_scanner.match(line)
+        if heading is None or heading.is_text:
             continue
-        heading_level = len(heading_match.group(1))
-        normalized_heading = _normalize_heading(heading_match.group(2))
-        is_document_title = (
-            heading_level == 1
-            and not seen_heading
-            and not (
-                normalized_section == "asset manifest"
-                and normalized_heading == "asset manifest"
-                and _asset_manifest_h1_has_structured_body(lines, index + 1)
-            )
-        )
-        seen_heading = True
-        if is_document_title:
+        if heading.is_document_title:
             continue
-        if normalized_heading == normalized_section:
+        if heading.normalized == normalized_section:
             section_start = index
-            section_level = heading_level
+            section_level = heading.level
             section_end = index + 1
             while section_end < len(lines):
                 next_heading = _HEADING_RE.match(lines[section_end])
@@ -1795,26 +1836,12 @@ def _implementation_asset_manifest_entry_lines(
 def _markdown_section_content(markdown: str, section: str) -> str:
     normalized_section = _normalize_heading(section)
     lines = markdown.splitlines()
-    seen_heading = False
+    heading_scanner = MarkdownHeadingScanner()
     for index, line in enumerate(lines):
-        heading_match = _HEADING_RE.match(line)
-        if not heading_match:
-            if _TEXT_HEADING_RE.match(line):
-                seen_heading = True
+        heading = heading_scanner.match(line)
+        if heading is None or heading.is_text:
             continue
-        heading_level = len(heading_match.group(1))
-        normalized_heading = _normalize_heading(heading_match.group(2))
-        is_document_title = (
-            heading_level == 1
-            and not seen_heading
-            and not (
-                normalized_section == "asset manifest"
-                and normalized_heading == "asset manifest"
-                and _asset_manifest_h1_has_structured_body(lines, index + 1)
-            )
-        )
-        seen_heading = True
-        if is_document_title or normalized_heading != normalized_section:
+        if heading.is_document_title or heading.normalized != normalized_section:
             continue
         section_end = _markdown_section_end(lines, index)
         return "\n".join(lines[index + 1 : section_end]).strip()
@@ -1997,6 +2024,8 @@ def _prepare_assistant_response_markdown(
     active_check: ContractCheckResult,
     project_context_blockers: list[str],
     ready_to_run: bool,
+    has_contract_questions: bool,
+    required_next_step: str,
     required_user_action: str,
     suggested_next_steps: list[str],
     revised_answer_question_ids: list[str],
@@ -2006,8 +2035,10 @@ def _prepare_assistant_response_markdown(
         changed = "Some previous answers still need more detail."
     elif project_context_blockers:
         changed = "Project context is required before autonomous delivery."
-    elif active_check.clarifying_questions:
+    elif has_contract_questions:
         changed = "Contract needs user input before autonomous delivery."
+    elif required_next_step == "revise_contract":
+        changed = "Contract needs task description revisions before an implementation contract can be written."
     next_step = suggested_next_steps[0] if suggested_next_steps else "Review the contract readiness result."
     note = "Do not start `sikula run` until `ready_to_run` is true."
     if ready_to_run:
@@ -3066,12 +3097,6 @@ def _parse_markdown_task(text: str) -> _ParsedTask:
         bullets=bullets,
         word_count=len(re.findall(r"\b[\w'-]+\b", text)),
     )
-
-
-def _normalize_heading(value: str) -> str:
-    normalized = value.lower().replace("&", " and ")
-    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
-    return re.sub(r"\s+", " ", normalized).strip()
 
 
 def _known_section_heading(value: str) -> bool:

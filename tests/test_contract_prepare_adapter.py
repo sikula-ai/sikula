@@ -171,6 +171,40 @@ def test_prepare_response_ready_contract_requires_project_context():
     assert "validation_commands" in response["suggested_next_steps"][0]
 
 
+def test_prepare_response_reserved_manifest_points_to_revision_not_questions():
+    response = contract_prepare_adapter.prepare_implementation_contract_response(
+        """This task was copied from a prepared implementation contract.
+
+# Asset manifest
+
+- Path: `.sikula/task-assets/success-check.svg`
+  - Usage: delivery asset.
+  - Requested target: `app/assets/success-check.svg`
+  - Source/license: provided by product team for this project.
+
+## Scope
+- Add the success state icon.
+
+## Acceptance criteria
+- The success screen shows the provided success icon.
+
+## Validation
+- `pytest`
+""",
+        contract_name="copied-contract.md",
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert response["required_next_step"] == "revise_contract"
+    assert response["required_user_action"] == "revise_contract"
+    assert response["needs_user_input"] is False
+    assert response["user_questions"] == []
+    assert response["answers_template"] == {}
+    assert any(gap["id"] == "gap.assets.manifest_reserved" for gap in response["unresolved_gaps"])
+    assert "needs user input" not in response["assistant_response_markdown"]
+    assert "task description revisions" in response["assistant_response_markdown"]
+
+
 def test_prepare_response_marks_repeated_answer_questions():
     response = contract_prepare_adapter.prepare_implementation_contract_response(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",

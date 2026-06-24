@@ -128,7 +128,8 @@ readiness or return run guidance. `sikula contract prepare TASK_FILE --answers .
 --output ...` turns the task description into the delivery artifact by applying answers,
 preserving product sections, adding project context plus validation commands from the
 effective project config, and rechecking the returned Markdown. It refuses stale answer
-hashes and accidental overwrites. `--interactive` is a terminal convenience layer for
+hashes, accidental overwrites, and task-description input that already contains the
+reserved `## Asset manifest` section. `--interactive` is a terminal convenience layer for
 both refine and prepare: it creates or reuses an answers YAML, prompts for answers, saves
 that file under `.sikula/contract-reports`, and then writes the clean Markdown output.
 The same module also exposes side-effect-free in-memory helpers
@@ -146,10 +147,13 @@ client-reported local config presence is guidance only and is not a readiness si
 future MCP transport without adding scoring or rewrite logic; task-description responses
 do not expose implementation-contract readiness fields. Contract preparation helpers
 capture local task assets in the prepared contract manifest as path/hash snapshots.
-Asset detection treats structured `## Assets` declarations as authoritative; paths in
-prose or configured task-asset directories are reported only as undeclared-path
-warnings unless a matching structured declaration exists. Runtime hash mismatch
-enforcement belongs to the run-state asset audit work and is not performed by this
+Asset detection treats structured `## Assets` declarations as authoritative for product
+task descriptions; paths in prose or configured task-asset directories are reported only
+as undeclared-path warnings unless a matching structured declaration exists. `## Asset
+manifest` is reserved for prepared implementation contracts. Task-description validation
+reports a blocking format gap for that section, while implementation-contract preflight
+(`sikula contract check` and `sikula run`) reads it as the prepared manifest. Runtime hash
+mismatch enforcement belongs to the run-state asset audit work and is not performed by this
 warning-only preflight path. These commands and helpers
 do not create `TaskState`, start agents, create worktrees, or alter `review` flow. Fresh `sikula run
 TASK_FILE` uses the same deterministic checks to store a compact warning-only snapshot in

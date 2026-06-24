@@ -275,6 +275,14 @@ declaration is a bullet such as `Path: ...`, `Asset: ...`, `Reference asset:
 ...`, or `Delivery asset: ...`; bare path bullets and prose such as "use
 `.sikula/task-assets/foo.png` as a mockup" are not asset declarations.
 
+`## Asset manifest` is reserved for prepared implementation contracts. In task
+descriptions, use `## Assets`; when Sikula validates task-description input,
+a section named `## Asset manifest` is a blocking format gap instead of an
+asset declaration. A task title such as `# Asset manifest` is fine because it
+is not an asset section. `sikula contract prepare` refuses to write a new
+implementation contract from task-description input that contains the reserved
+section.
+
 You may still mention a declared asset path in the task body for human
 readability, but intent, target, and provenance must come from `## Assets`. If a
 local asset-like path appears outside `## Assets` without a matching structured

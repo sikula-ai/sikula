@@ -194,9 +194,10 @@ Steps:
       write a ⚠️ WARNING — invented keys will break the translation workflow.
       If new user-visible text is introduced without any value specified in the task
       description, write a ⚠️ WARNING for each.
-      Asset manifest: if the task description contains an `Asset manifest` or
-      structured asset declarations, carry the asset obligations into the
-      implementation prompt. Distinguish reference-only assets from delivery assets.
+      Asset declarations: if the task description contains structured asset
+      declarations or the implementation contract contains an `Asset manifest`,
+      carry the asset obligations into the implementation prompt. Distinguish
+      reference-only assets from delivery assets.
       Reference-only assets may guide implementation but must not be copied into
       production files. Delivery assets may be used only within the requested scope.
       Preserve requested target hints and source/license/provenance exactly when

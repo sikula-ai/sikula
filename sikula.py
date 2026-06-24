@@ -990,11 +990,17 @@ def _task_refine_asset_path_candidates(task_text: str, *, source_path: Path, cfg
     try:
         from core.task_assets import detect_asset_references, detect_undeclared_asset_paths
 
-        asset_references = detect_asset_references(task_text, source_path=source_path, project_config=cfg)
+        asset_references = detect_asset_references(
+            task_text,
+            source_path=source_path,
+            project_config=cfg,
+            document_kind="task_description",
+        )
         candidates = detect_undeclared_asset_paths(
             task_text,
             project_config=cfg,
             asset_references=asset_references,
+            document_kind="task_description",
         )
     except (OSError, ValueError):
         return []
@@ -1231,7 +1237,11 @@ def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
         print(f"Task path is not a file: {args.task_file}", file=sys.stderr)
         sys.exit(1)
 
-    result = check_contract_file(task_path, project_config=_contract_cli_project_config(cfg))
+    result = check_contract_file(
+        task_path,
+        project_config=_contract_cli_project_config(cfg),
+        document_kind="implementation_contract",
+    )
     write_result = None
     if args.write_report:
         report_root = project_root if cfg.get("project", {}).get("root_path") else None
@@ -1496,6 +1506,19 @@ def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
         print("Next step:")
         print(f"- Fill the answers file, then run: sikula contract prepare {args.task_file} --answers {answers_path}")
         print(f"- Or answer in the terminal: sikula contract prepare {args.task_file} --interactive")
+        if output_path.exists():
+            _print_existing_output_next_step_note(output_path)
+        sys.exit(1)
+
+    if result.required_next_step == "revise_contract":
+        print("Contract preparation needs task description revisions before writing an implementation contract.")
+        print("")
+        print(render_contract_check(result.recheck_result or result.check_result), end="")
+        if result.suggested_next_steps:
+            print("")
+            print("Next step:")
+            for step in result.suggested_next_steps:
+                print(f"- {step}")
         if output_path.exists():
             _print_existing_output_next_step_note(output_path)
         sys.exit(1)
@@ -2181,7 +2204,11 @@ def _build_contract_preflight_snapshot_and_assets(
     from core.contract_check import check_contract_file
 
     try:
-        result = check_contract_file(task_path, project_config=cfg or None)
+        result = check_contract_file(
+            task_path,
+            project_config=cfg or None,
+            document_kind="implementation_contract",
+        )
         return _contract_preflight_snapshot(result, task_path, project_root), _contract_preflight_asset_records(result)
     except Exception as exc:
         log.warning("Implementation contract preflight failed: %s", exc)

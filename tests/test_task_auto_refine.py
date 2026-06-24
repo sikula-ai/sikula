@@ -110,16 +110,12 @@ def test_parse_task_auto_refine_output_allows_asset_manifest_title_with_product_
     assert "### Reference assets" in draft.task_markdown
 
 
-def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_numbered_manifest_field():
-    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
-        parse_task_auto_refine_output(
-            '{"task_markdown": "# Asset manifest\\n\\n1. Asset: `.sikula/task-assets/x.png`"}'
-        )
+def test_parse_task_auto_refine_output_allows_manifest_looking_body_under_asset_manifest_title():
+    draft = parse_task_auto_refine_output(
+        '{"task_markdown": "# Asset manifest\\n\\n### Reference assets\\n\\n- Path: `.sikula/task-assets/x.png`\\n  - Usage: reference only."}'
+    )
 
-
-def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_metadata_field():
-    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
-        parse_task_auto_refine_output('{"task_markdown": "# Asset manifest\\n\\n- Usage: reference only."}')
+    assert draft.task_markdown.startswith("# Asset manifest\n")
 
 
 def test_parse_task_auto_refine_output_allows_asset_manifest_title_after_next_h1():
@@ -128,48 +124,6 @@ def test_parse_task_auto_refine_output_allows_asset_manifest_title_after_next_h1
     )
 
     assert "# Follow-up task" in draft.task_markdown
-
-
-def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_manifest_entries():
-    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
-        parse_task_auto_refine_output(
-            '{"task_markdown": "# Asset manifest\\n\\n- Path: `.sikula/task-assets/x.png`\\n  - SHA-256: `sha256:abc`"}'
-        )
-
-
-def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_intro_and_manifest_entries():
-    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
-        parse_task_auto_refine_output(
-            '{"task_markdown": "# Asset manifest\\n\\nGenerated asset entries:\\n\\n- Path: `.sikula/task-assets/x.png`"}'
-        )
-
-
-def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_manifest_intro_and_entries():
-    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
-        parse_task_auto_refine_output(
-            '{"task_markdown": "# Asset manifest\\n\\nGenerated manifest:\\n\\n- Path: `.sikula/task-assets/x.png`"}'
-        )
-
-
-def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_markdown_manifest_intro_and_entries():
-    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
-        parse_task_auto_refine_output(
-            '{"task_markdown": "# Asset manifest\\n\\n## Generated manifest\\n\\n- Path: `.sikula/task-assets/x.png`"}'
-        )
-
-
-def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_manifest_subsections():
-    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
-        parse_task_auto_refine_output(
-            '{"task_markdown": "# Asset manifest\\n\\n### Reference assets\\n\\n- Path: `.sikula/task-assets/x.png`"}'
-        )
-
-
-def test_parse_task_auto_refine_output_rejects_asset_manifest_title_with_neutral_subheading_before_manifest():
-    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
-        parse_task_auto_refine_output(
-            '{"task_markdown": "# Asset manifest\\n\\n## Summary\\n\\nGenerated assets.\\n\\n### Reference assets\\n\\n- Path: `.sikula/task-assets/x.png`"}'
-        )
 
 
 def test_parse_task_auto_refine_output_rejects_asset_manifest_as_later_h1_section():
@@ -190,6 +144,13 @@ def test_parse_task_auto_refine_output_rejects_asset_manifest_h1_after_text_head
     with pytest.raises(ValueError, match="must not contain an Asset manifest"):
         parse_task_auto_refine_output(
             '{"task_markdown": "Scope:\\n\\n- Document assets.\\n\\n# Asset manifest\\n\\n- Notes."}'
+        )
+
+
+def test_parse_task_auto_refine_output_rejects_asset_manifest_h1_after_prose_preamble():
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output(
+            '{"task_markdown": "This was copied from a prepared contract.\\n\\n# Asset manifest\\n\\n- Notes."}'
         )
 
 

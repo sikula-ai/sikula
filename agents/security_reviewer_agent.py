@@ -81,10 +81,10 @@ WARNING issues — non-blocking; use your judgement based on context:
   production files
 - Any other security concern that does not clearly fall into the BLOCKING category
 
-Asset review: if the task description or implementation prompt contains an
-`Asset manifest` or structured asset declarations such as `### Reference assets` /
-`### Delivery assets`, treat delivery assets as part of the security/privacy/legal
-review surface. Verify that new production assets are supported by the declarations,
+Asset review: if the task description or implementation prompt contains structured asset declarations such as
+`### Reference assets` / `### Delivery assets`, or the
+implementation prompt contains an `Asset manifest`, treat delivery assets as part
+of the security/privacy/legal review surface. Verify that new production assets are supported by the declarations,
 that reference-only assets were not copied into production files, and that asset usage
 does not introduce sensitive data, unexpected binary/resource content, or licensing risk.
 

@@ -178,9 +178,9 @@ Review steps:
       string fallback mismatches. Do this even if tests pass or generated tests mirror the
       implementation's incorrect assumption.
    l. Asset declaration consistency — if the task description or implementation prompt
-      contains an `Asset manifest` or structured asset declarations such as
-      `### Reference assets` / `### Delivery assets`, verify that changed production
-      assets and resource files are supported by those declarations.
+      contains structured asset declarations such as `### Reference assets` / `### Delivery assets`,
+      or the implementation prompt contains an `Asset manifest`,
+      verify that changed production assets and resource files are supported by those declarations.
       Reference-only assets must not be copied into production files.
       Delivery assets must be used only within the requested task scope.
       If a declaration gives a requested target, verify the implementation honors it

@@ -37,9 +37,10 @@ CONSTRAINTS — follow strictly:
 - Make MINIMAL changes — only what the task requires
 - Do not refactor unrelated code
 {build_tool_constraints}- Do not introduce new usages of deprecated APIs when a non-deprecated alternative exists and switching to it is a drop-in change; if migration requires broader refactoring, using the deprecated API is acceptable within the minimal-changes constraint
-- If the task or implementation prompt contains an `Asset manifest` or structured asset declarations such as
-  `### Reference assets` / `### Delivery assets`, treat those declarations as part
-  of the delivery contract. Use delivery assets only within the requested scope,
+- If the task or implementation prompt contains structured asset declarations such as
+  `### Reference assets` / `### Delivery assets`, or the implementation prompt contains
+  an `Asset manifest`, treat those declarations as part of the delivery contract.
+  Use delivery assets only within the requested scope,
   do not copy reference-only assets into production files, and do not invent missing provenance, license, or target information.
   When a delivery asset has no requested target, choose the project-conventional
   location from the codebase and keep the change minimal.

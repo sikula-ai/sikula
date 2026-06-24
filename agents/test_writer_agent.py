@@ -149,8 +149,9 @@ TESTING RULES:
   helpers. Do NOT write brittle tests that inspect UI framework internals, opaque view trees,
   reflection-only private storage, or component type-name strings unless the existing test
   suite already uses that exact pattern for the same UI framework.
-- If the task or implementation prompt contains an `Asset manifest` or structured asset declarations such as
-  `### Reference assets` / `### Delivery assets`, test the user-visible behaviour or stable public contract
+- If the task or implementation prompt contains structured asset declarations such as
+  `### Reference assets` / `### Delivery assets`, or the implementation prompt contains
+  an `Asset manifest`, test the user-visible behaviour or stable public contract
   produced by the asset usage. Do not replace asset coverage with brittle byte comparisons,
   source-path inspection, raw resource tree inspection, or assertions about private
   framework internals unless the project already exposes that exact resource contract as

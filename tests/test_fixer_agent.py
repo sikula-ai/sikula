@@ -312,7 +312,7 @@ class TestFixerAgentFixCycleRecord:
 
         comment_rule = "- Do not add comments or documentation unless required by the task or project guidelines."
         doc_comment_rule = "When modifying a function, class, or property that already has a doc comment, update it"
-        asset_rule = "- If the original task or implementation prompt contains an `Asset manifest` or"
+        asset_rule = "- If the original task or implementation prompt contains structured asset declarations"
         assert prompt.index(comment_rule) < prompt.index(doc_comment_rule) < prompt.index(asset_rule)
 
     def test_test_failure_prompt_includes_generated_test_context(self, stub_llm: StubLLMClient, file_tool):

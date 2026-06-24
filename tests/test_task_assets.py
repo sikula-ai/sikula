@@ -4,9 +4,9 @@ from hashlib import sha256
 from pathlib import Path
 
 from core.task_assets import (
-    asset_manifest_h1_has_structured_body,
     detect_asset_references,
     detect_undeclared_asset_paths,
+    task_description_has_asset_manifest_section,
 )
 
 
@@ -39,98 +39,81 @@ def _undeclared_paths(markdown: str, tmp_path: Path, *, task_asset_dir: str = ".
     )
 
 
-def _asset_manifest_title_has_structured_body(markdown: str, *, ignore_fenced_blocks: bool = False) -> bool:
-    lines = markdown.splitlines()
-    return asset_manifest_h1_has_structured_body(lines, 1, ignore_fenced_blocks=ignore_fenced_blocks)
-
-
-def test_asset_manifest_title_body_classification_matrix():
-    cases = [
-        (
-            "title with product scope path field",
-            """# Asset manifest
+def test_task_description_asset_manifest_section_detection_ignores_document_title():
+    markdown = """# Asset manifest
 
 ## Scope
 
-- Path: `.sikula/task-assets/login-spacing.png` should be shown in the UI.
-""",
-            False,
-        ),
-        (
-            "title with product asset declarations",
-            """# Asset manifest
+- Add filtering.
+"""
 
-## Assets
+    assert task_description_has_asset_manifest_section(markdown) is False
 
-### Reference assets
 
-- Path: `.sikula/task-assets/login-spacing.png`
-""",
-            False,
-        ),
-        (
-            "title with direct manifest field",
-            """# Asset manifest
+def test_task_description_asset_manifest_section_detection_rejects_reserved_sections():
+    cases = [
+        """# Task
+
+## Asset manifest
 
 - Path: `.sikula/task-assets/login-spacing.png`
 """,
-            True,
-        ),
-        (
-            "title with direct manifest subsection",
-            """# Asset manifest
+        """## Goal
 
-### Reference assets
+Document assets.
+
+# Asset manifest
 
 - Path: `.sikula/task-assets/login-spacing.png`
 """,
-            True,
-        ),
-        (
-            "title with neutral intro before manifest subsection",
-            """# Asset manifest
+        """Scope:
 
-## Summary
+- Document assets.
 
-Generated asset entries.
-
-### Reference assets
+Asset manifest:
 
 - Path: `.sikula/task-assets/login-spacing.png`
 """,
-            True,
-        ),
-        (
-            "title stops before next h1",
-            """# Asset manifest
+        """This task was copied from a prepared contract.
 
-# Follow-up task
-
-### Reference assets
+# Asset manifest
 
 - Path: `.sikula/task-assets/login-spacing.png`
 """,
-            False,
-        ),
     ]
 
-    for _name, markdown, expected in cases:
-        assert _asset_manifest_title_has_structured_body(markdown) is expected
+    for markdown in cases:
+        assert task_description_has_asset_manifest_section(markdown) is True
 
 
-def test_asset_manifest_title_body_ignores_fenced_manifest_example():
+def test_task_description_asset_manifest_section_detection_allows_fenced_examples():
     markdown = """# Asset manifest
 
 ## Scope
 
 ```md
-### Reference assets
+## Asset manifest
 
 - Path: `.sikula/task-assets/login-spacing.png`
 ```
 """
 
-    assert _asset_manifest_title_has_structured_body(markdown, ignore_fenced_blocks=True) is False
+    assert task_description_has_asset_manifest_section(markdown) is False
+
+
+def test_task_description_asset_manifest_section_detection_allows_product_manifest_copy():
+    markdown = """# Asset manifest
+
+## Manifest UI
+
+- Build a UI for editing manifests.
+
+## Assets
+
+- Path: `.sikula/task-assets/login-spacing.png`
+"""
+
+    assert task_description_has_asset_manifest_section(markdown) is False
 
 
 def test_detect_asset_references_reads_structured_reference_and_delivery_assets(tmp_path: Path):
@@ -203,7 +186,7 @@ def test_detect_asset_references_treats_first_h1_asset_manifest_as_document_titl
     assert _references_by_path(markdown, tmp_path) == {}
 
 
-def test_detect_asset_references_reads_first_h1_asset_manifest_with_manifest_body(tmp_path: Path):
+def test_detect_asset_references_treats_first_h1_asset_manifest_entries_as_title_body(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing.png"
     asset_path.parent.mkdir(parents=True)
     asset_path.write_bytes(b"fake-png")
@@ -215,12 +198,10 @@ def test_detect_asset_references_reads_first_h1_asset_manifest_with_manifest_bod
   - Usage: reference only.
 """
 
-    references = _references_by_path(markdown, tmp_path)
-
-    assert sorted(references) == [".sikula/task-assets/login-spacing.png"]
+    assert _references_by_path(markdown, tmp_path) == {}
 
 
-def test_detect_asset_references_reads_first_h1_asset_manifest_after_neutral_subheading(tmp_path: Path):
+def test_detect_asset_references_ignores_first_h1_asset_manifest_after_neutral_subheading(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing.png"
     asset_path.parent.mkdir(parents=True)
     asset_path.write_bytes(b"fake-png")
@@ -236,9 +217,7 @@ These assets document the expected spacing.
   - Usage: reference only.
 """
 
-    references = _references_by_path(markdown, tmp_path)
-
-    assert sorted(references) == [".sikula/task-assets/login-spacing.png"]
+    assert _references_by_path(markdown, tmp_path) == {}
 
 
 def test_detect_asset_references_reads_non_title_asset_manifest_sections(tmp_path: Path):
@@ -258,7 +237,7 @@ def test_detect_asset_references_reads_non_title_asset_manifest_sections(tmp_pat
     assert sorted(references) == [".sikula/task-assets/login-spacing.png"]
 
 
-def test_detect_asset_references_still_reads_first_h1_assets_section(tmp_path: Path):
+def test_detect_asset_references_treats_first_h1_assets_as_document_title(tmp_path: Path):
     asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing.png"
     asset_path.parent.mkdir(parents=True)
     asset_path.write_bytes(b"fake-png")
@@ -268,9 +247,7 @@ def test_detect_asset_references_still_reads_first_h1_assets_section(tmp_path: P
   - Usage: reference only.
 """
 
-    references = _references_by_path(markdown, tmp_path)
-
-    assert sorted(references) == [".sikula/task-assets/login-spacing.png"]
+    assert _references_by_path(markdown, tmp_path) == {}
 
 
 def test_detect_asset_references_ignores_bare_asset_path_in_asset_section(tmp_path: Path):

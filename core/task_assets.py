@@ -12,6 +12,12 @@ import subprocess
 from typing import Any, Iterable
 from urllib.parse import unquote, urlsplit
 
+from core.markdown_headings import (
+    MARKDOWN_HEADING_RE as _HEADING_RE,
+    MarkdownHeadingScanner,
+    normalize_heading as _normalize_heading,
+)
+
 
 class AssetKind(str, Enum):
     REFERENCE = "reference"
@@ -81,14 +87,6 @@ class _StructuredAssetDeclaration:
     source_license: str = ""
 
 
-@dataclass
-class _MarkdownSection:
-    heading: str
-    level: int
-    body_lines: list[str] = field(default_factory=list)
-    children: list["_MarkdownSection"] = field(default_factory=list)
-
-
 def _answer_text(answer: dict[str, Any] | None) -> str:
     if not isinstance(answer, dict):
         return ""
@@ -108,27 +106,9 @@ def _single_line(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def _normalize_heading(value: str) -> str:
-    normalized = value.lower().replace("&", " and ")
-    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
-    return re.sub(r"\s+", " ", normalized).strip()
-
-
-_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
-_TEXT_HEADING_RE = re.compile(r"^\s{0,3}([A-Za-z][A-Za-z0-9 /&_-]{1,60}):\s*$")
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$")
-_FENCED_BLOCK_RE = re.compile(r"^\s{0,3}(```+|~~~+)")
 _ASSET_REFERENCE_SECTION_HEADINGS = {"reference asset", "reference assets"}
 _ASSET_DELIVERY_SECTION_HEADINGS = {"delivery asset", "delivery assets"}
-_ASSET_MANIFEST_BODY_HEADINGS = {
-    "asset manifest",
-    *_ASSET_REFERENCE_SECTION_HEADINGS,
-    *_ASSET_DELIVERY_SECTION_HEADINGS,
-}
-_ASSET_MANIFEST_BODY_HEADING_HINT_RE = re.compile(
-    r"\bmanifest\b|\basset entries?\b|\basset metadata\b",
-    re.IGNORECASE,
-)
 _ASSET_PATH_FIELD_LABEL_KINDS = {
     "path": "",
     "asset": "",
@@ -138,7 +118,6 @@ _ASSET_PATH_FIELD_LABEL_KINDS = {
 _ASSET_USAGE_FIELD_LABELS = {"usage", "use"}
 _ASSET_TARGET_FIELD_LABELS = {"target", "target path", "destination", "destination path", "requested target"}
 _ASSET_PROVENANCE_FIELD_LABELS = {"source/license", "source license", "license", "licence", "provenance"}
-_ASSET_MANIFEST_METADATA_FIELD_LABELS = {"sha256", "sha 256", "purpose", "target resolution"}
 _ASSET_STRUCTURED_ROOT_HEADINGS = {"asset", "assets", "task asset", "task assets", "asset manifest"}
 _ASSET_ROOT_SECTION_HEADINGS = {
     "asset",
@@ -218,6 +197,19 @@ _GENERATED_ANSWER_ENTRY_END_MARKER = "<!-- /sikula:generated-answer -->"
 
 def public_asset_reference(reference: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in reference.items() if not str(key).startswith("_")}
+
+
+def task_description_has_asset_manifest_section(markdown: str, *, ignore_fenced_blocks: bool = True) -> bool:
+    """Return whether task-description Markdown contains the reserved implementation manifest section."""
+
+    scanner = MarkdownHeadingScanner(ignore_fenced_blocks=ignore_fenced_blocks)
+    for line in markdown.splitlines():
+        heading = scanner.match(line)
+        if heading is None or heading.is_document_title:
+            continue
+        if heading.normalized == "asset manifest":
+            return True
+    return False
 
 
 def _generated_answer_entry_marker(question_id: str) -> str:
@@ -960,11 +952,12 @@ def detect_asset_references(
     *,
     source_path: Path | str | None,
     project_config: dict | None,
+    document_kind: str = "all",
 ) -> list[dict[str, Any]]:
     project_root = _asset_project_root(source_path, project_config)
     references_by_path: dict[str, dict[str, Any]] = {}
     reference_order: list[str] = []
-    for declaration in _parse_structured_asset_declarations(text):
+    for declaration in _parse_structured_asset_declarations(text, document_kind=document_kind):
         reference = _asset_reference_metadata(
             declaration.path,
             project_root=project_root,
@@ -993,6 +986,7 @@ def detect_undeclared_asset_paths(
     *,
     project_config: dict | None,
     asset_references: list[dict[str, Any]] | None = None,
+    document_kind: str = "all",
 ) -> list[dict[str, Any]]:
     declared_keys: set[str] = set()
     for reference in asset_references or []:
@@ -1002,39 +996,31 @@ def detect_undeclared_asset_paths(
     paths: list[dict[str, Any]] = []
     seen: set[tuple[int, str]] = set()
     heading_stack: list[tuple[int, str]] = []
-    seen_heading = False
+    heading_scanner = MarkdownHeadingScanner()
     lines = text.splitlines()
     for line_index, line in enumerate(lines):
-        markdown_heading = _HEADING_RE.match(line)
-        text_heading = _TEXT_HEADING_RE.match(line)
-        if markdown_heading:
-            heading_level = len(markdown_heading.group(1))
-            raw_heading = markdown_heading.group(2).strip()
-            is_document_title = (
-                heading_level == 1
-                and not seen_heading
-                and _normalize_heading(raw_heading) == "asset manifest"
-                and not asset_manifest_h1_has_structured_body(lines, line_index + 1)
-            )
-            seen_heading = True
-            if is_document_title:
+        heading = heading_scanner.match(line)
+        if heading is not None:
+            if heading.is_document_title:
                 continue
-            heading_stack = _asset_update_heading_stack(
-                heading_stack,
-                level=heading_level,
-                heading=raw_heading,
-            )
-            continue
-        if text_heading:
-            seen_heading = True
-            heading_stack = _asset_update_heading_stack(
-                heading_stack,
-                level=_asset_text_heading_level(heading_stack),
-                heading=text_heading.group(1).strip(),
-            )
+            if heading.is_markdown:
+                heading_stack = _asset_update_heading_stack(
+                    heading_stack,
+                    level=heading.level,
+                    heading=heading.raw,
+                )
+            else:
+                heading_stack = _asset_update_heading_stack(
+                    heading_stack,
+                    level=_asset_text_heading_level(heading_stack),
+                    heading=heading.raw,
+                )
             continue
         context = _asset_reference_context(heading_stack, lines, line_index)
-        in_structured_asset_root = _asset_heading_stack_has_structured_asset_root(heading_stack)
+        in_structured_asset_root = _asset_heading_stack_has_structured_asset_root(
+            heading_stack,
+            document_kind=document_kind,
+        )
         for raw_path in _asset_path_candidates(line):
             normalized_path = _normalize_asset_path_candidate(raw_path)
             if not normalized_path:
@@ -1068,41 +1054,30 @@ def _asset_line_is_bare_asset_path(line: str, normalized_path: str) -> bool:
     return _normalize_asset_path_candidate(cleaned) == normalized_path
 
 
-def _parse_structured_asset_declarations(text: str) -> list[_StructuredAssetDeclaration]:
+def _parse_structured_asset_declarations(text: str, *, document_kind: str = "all") -> list[_StructuredAssetDeclaration]:
     declarations: list[_StructuredAssetDeclaration] = []
     heading_stack: list[tuple[int, str]] = []
-    seen_heading = False
+    heading_scanner = MarkdownHeadingScanner()
     lines = text.splitlines()
     for line_index, line in enumerate(lines):
-        markdown_heading = _HEADING_RE.match(line)
-        text_heading = _TEXT_HEADING_RE.match(line)
-        if markdown_heading:
-            heading_level = len(markdown_heading.group(1))
-            raw_heading = markdown_heading.group(2).strip()
-            is_document_title = (
-                heading_level == 1
-                and not seen_heading
-                and _normalize_heading(raw_heading) == "asset manifest"
-                and not asset_manifest_h1_has_structured_body(lines, line_index + 1)
-            )
-            seen_heading = True
-            if is_document_title:
+        heading = heading_scanner.match(line)
+        if heading is not None:
+            if heading.is_document_title:
                 continue
-            heading_stack = _asset_update_heading_stack(
-                heading_stack,
-                level=heading_level,
-                heading=raw_heading,
-            )
+            if heading.is_markdown:
+                heading_stack = _asset_update_heading_stack(
+                    heading_stack,
+                    level=heading.level,
+                    heading=heading.raw,
+                )
+            else:
+                heading_stack = _asset_update_heading_stack(
+                    heading_stack,
+                    level=_asset_text_heading_level(heading_stack),
+                    heading=heading.raw,
+                )
             continue
-        if text_heading:
-            seen_heading = True
-            heading_stack = _asset_update_heading_stack(
-                heading_stack,
-                level=_asset_text_heading_level(heading_stack),
-                heading=text_heading.group(1).strip(),
-            )
-            continue
-        if not _asset_heading_stack_has_structured_asset_root(heading_stack):
+        if not _asset_heading_stack_has_structured_asset_root(heading_stack, document_kind=document_kind):
             continue
 
         bullet = _BULLET_RE.match(line)
@@ -1123,7 +1098,7 @@ def _parse_structured_asset_declarations(text: str) -> list[_StructuredAssetDecl
         item_lines = _asset_reference_context_lines(lines, line_index)
         metadata = _structured_asset_item_metadata(item_lines[1:])
         kind = _structured_asset_resolved_kind(
-            _structured_asset_section_kind(heading_stack),
+            _structured_asset_section_kind(heading_stack, document_kind=document_kind),
             label_kind,
             metadata.get("usage_kind", ""),
         )
@@ -1207,14 +1182,14 @@ def _structured_asset_text_value(value: str) -> str:
     return cleaned.strip()
 
 
-def _structured_asset_section_kind(heading_stack: list[tuple[int, str]]) -> str:
+def _structured_asset_section_kind(heading_stack: list[tuple[int, str]], *, document_kind: str = "all") -> str:
     for _level, heading in reversed(heading_stack):
         normalized = _normalize_heading(heading)
         if normalized in _ASSET_REFERENCE_SECTION_HEADINGS:
             return AssetKind.REFERENCE.value
         if normalized in _ASSET_DELIVERY_SECTION_HEADINGS:
             return AssetKind.DELIVERY.value
-        if _asset_structured_root_heading(heading):
+        if _asset_structured_root_heading(heading, document_kind=document_kind):
             break
     return ""
 
@@ -1242,108 +1217,21 @@ def _structured_asset_resolved_kind(*kinds: str) -> str:
     return first_kind
 
 
-def _asset_heading_stack_has_structured_asset_root(heading_stack: list[tuple[int, str]]) -> bool:
-    return any(_asset_structured_root_heading(heading) for _level, heading in heading_stack)
-
-
-def asset_manifest_h1_has_structured_body(
-    lines: list[str],
-    start_index: int,
+def _asset_heading_stack_has_structured_asset_root(
+    heading_stack: list[tuple[int, str]],
     *,
-    ignore_fenced_blocks: bool = False,
+    document_kind: str = "all",
 ) -> bool:
-    root = _asset_manifest_h1_body_section(
-        lines,
-        start_index,
-        ignore_fenced_blocks=ignore_fenced_blocks,
+    return any(
+        _asset_structured_root_heading(heading, document_kind=document_kind) for _level, heading in heading_stack
     )
-    return _asset_manifest_section_has_structured_body(root, allow_body_fields=True)
 
 
-def _asset_manifest_h1_body_section(
-    lines: list[str],
-    start_index: int,
-    *,
-    ignore_fenced_blocks: bool,
-) -> _MarkdownSection:
-    root = _MarkdownSection(heading="Asset manifest", level=1)
-    stack = [root]
-    in_fenced_block = False
-    for line in lines[start_index:]:
-        if ignore_fenced_blocks and _FENCED_BLOCK_RE.match(line):
-            in_fenced_block = not in_fenced_block
-            continue
-        if ignore_fenced_blocks and in_fenced_block:
-            continue
-        if not line.strip():
-            continue
-        markdown_heading = _HEADING_RE.match(line)
-        if markdown_heading:
-            heading_level = len(markdown_heading.group(1))
-            if heading_level == 1:
-                break
-            _append_markdown_section(
-                stack,
-                _MarkdownSection(heading=markdown_heading.group(2), level=heading_level),
-            )
-            continue
-        text_heading = _TEXT_HEADING_RE.match(line)
-        if text_heading:
-            _append_markdown_section(
-                stack,
-                _MarkdownSection(heading=text_heading.group(1), level=2),
-            )
-            continue
-        stack[-1].body_lines.append(line)
-    return root
-
-
-def _append_markdown_section(stack: list[_MarkdownSection], section: _MarkdownSection) -> None:
-    while stack and stack[-1].level >= section.level:
-        stack.pop()
-    stack[-1].children.append(section)
-    stack.append(section)
-
-
-def _asset_manifest_section_has_structured_body(section: _MarkdownSection, *, allow_body_fields: bool) -> bool:
-    if allow_body_fields and any(_asset_manifest_body_line(line) for line in section.body_lines):
-        return True
-
-    for child in section.children:
-        if _asset_root_section_heading(child.heading):
-            continue
-        if _asset_manifest_body_heading(child.heading):
-            return True
-        if _asset_manifest_section_has_structured_body(child, allow_body_fields=False):
-            return True
-    return False
-
-
-def _asset_manifest_body_line(line: str) -> bool:
-    bullet = _BULLET_RE.match(line)
-    if not bullet:
-        return False
-    field = _structured_asset_field(bullet.group(1))
-    return bool(field and _asset_manifest_body_field_label(field[0]))
-
-
-def _asset_manifest_body_heading(heading: str) -> bool:
+def _asset_structured_root_heading(heading: str, *, document_kind: str = "all") -> bool:
     normalized = _normalize_heading(heading)
-    return normalized in _ASSET_MANIFEST_BODY_HEADINGS or bool(_ASSET_MANIFEST_BODY_HEADING_HINT_RE.search(normalized))
-
-
-def _asset_manifest_body_field_label(label: str) -> bool:
-    return (
-        label in _ASSET_PATH_FIELD_LABEL_KINDS
-        or label in _ASSET_USAGE_FIELD_LABELS
-        or label in _ASSET_TARGET_FIELD_LABELS
-        or label in _ASSET_PROVENANCE_FIELD_LABELS
-        or label in _ASSET_MANIFEST_METADATA_FIELD_LABELS
-    )
-
-
-def _asset_structured_root_heading(heading: str) -> bool:
-    return _normalize_heading(heading) in _ASSET_STRUCTURED_ROOT_HEADINGS
+    if document_kind == "task_description":
+        return normalized in {"asset", "assets", "task asset", "task assets"}
+    return normalized in _ASSET_STRUCTURED_ROOT_HEADINGS
 
 
 def _undeclared_asset_path_should_warn(path_text: str, context: str, project_config: dict | None) -> bool:
