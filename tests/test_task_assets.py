@@ -3,7 +3,11 @@ from __future__ import annotations
 from hashlib import sha256
 from pathlib import Path
 
-from core.task_assets import detect_asset_references, detect_undeclared_asset_paths
+from core.task_assets import (
+    detect_asset_references,
+    detect_undeclared_asset_paths,
+    task_description_has_asset_manifest_section,
+)
 
 
 def _project_config(project_root: Path, *, task_asset_dir: str = ".sikula/task-assets") -> dict:
@@ -33,6 +37,83 @@ def _undeclared_paths(markdown: str, tmp_path: Path, *, task_asset_dir: str = ".
         project_config=_project_config(tmp_path, task_asset_dir=task_asset_dir),
         asset_references=references,
     )
+
+
+def test_task_description_asset_manifest_section_detection_ignores_document_title():
+    markdown = """# Asset manifest
+
+## Scope
+
+- Add filtering.
+"""
+
+    assert task_description_has_asset_manifest_section(markdown) is False
+
+
+def test_task_description_asset_manifest_section_detection_rejects_reserved_sections():
+    cases = [
+        """# Task
+
+## Asset manifest
+
+- Path: `.sikula/task-assets/login-spacing.png`
+""",
+        """## Goal
+
+Document assets.
+
+# Asset manifest
+
+- Path: `.sikula/task-assets/login-spacing.png`
+""",
+        """Scope:
+
+- Document assets.
+
+Asset manifest:
+
+- Path: `.sikula/task-assets/login-spacing.png`
+""",
+        """This task was copied from a prepared contract.
+
+# Asset manifest
+
+- Path: `.sikula/task-assets/login-spacing.png`
+""",
+    ]
+
+    for markdown in cases:
+        assert task_description_has_asset_manifest_section(markdown) is True
+
+
+def test_task_description_asset_manifest_section_detection_allows_fenced_examples():
+    markdown = """# Asset manifest
+
+## Scope
+
+```md
+## Asset manifest
+
+- Path: `.sikula/task-assets/login-spacing.png`
+```
+"""
+
+    assert task_description_has_asset_manifest_section(markdown) is False
+
+
+def test_task_description_asset_manifest_section_detection_allows_product_manifest_copy():
+    markdown = """# Asset manifest
+
+## Manifest UI
+
+- Build a UI for editing manifests.
+
+## Assets
+
+- Path: `.sikula/task-assets/login-spacing.png`
+"""
+
+    assert task_description_has_asset_manifest_section(markdown) is False
 
 
 def test_detect_asset_references_reads_structured_reference_and_delivery_assets(tmp_path: Path):
@@ -92,6 +173,81 @@ def test_detect_asset_references_accepts_structured_path_label_outside_task_asse
     assert sorted(references) == ["designs/login-spacing.png"]
     assert references["designs/login-spacing.png"]["kind"] == "reference"
     assert references["designs/login-spacing.png"]["status"] == "available"
+
+
+def test_detect_asset_references_treats_first_h1_asset_manifest_as_document_title(tmp_path: Path):
+    markdown = """# Asset manifest
+
+## Scope
+
+- Path: `.sikula/task-assets/login-spacing.png` is product copy, not a structured asset declaration.
+"""
+
+    assert _references_by_path(markdown, tmp_path) == {}
+
+
+def test_detect_asset_references_treats_first_h1_asset_manifest_entries_as_title_body(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    markdown = """# Asset manifest
+
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing.png`
+  - Usage: reference only.
+"""
+
+    assert _references_by_path(markdown, tmp_path) == {}
+
+
+def test_detect_asset_references_ignores_first_h1_asset_manifest_after_neutral_subheading(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    markdown = """# Asset manifest
+
+## Summary
+
+These assets document the expected spacing.
+
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing.png`
+  - Usage: reference only.
+"""
+
+    assert _references_by_path(markdown, tmp_path) == {}
+
+
+def test_detect_asset_references_reads_non_title_asset_manifest_sections(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    markdown = """# Fix login spacing
+
+## Asset manifest
+
+- Path: `.sikula/task-assets/login-spacing.png`
+  - Usage: reference only.
+"""
+
+    references = _references_by_path(markdown, tmp_path)
+
+    assert sorted(references) == [".sikula/task-assets/login-spacing.png"]
+
+
+def test_detect_asset_references_treats_first_h1_assets_as_document_title(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    markdown = """# Assets
+
+- Path: `.sikula/task-assets/login-spacing.png`
+  - Usage: reference only.
+"""
+
+    assert _references_by_path(markdown, tmp_path) == {}
 
 
 def test_detect_asset_references_ignores_bare_asset_path_in_asset_section(tmp_path: Path):

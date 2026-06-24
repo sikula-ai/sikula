@@ -12,6 +12,12 @@ import subprocess
 from typing import Any, Iterable
 from urllib.parse import unquote, urlsplit
 
+from core.markdown_headings import (
+    MARKDOWN_HEADING_RE as _HEADING_RE,
+    MarkdownHeadingScanner,
+    normalize_heading as _normalize_heading,
+)
+
 
 class AssetKind(str, Enum):
     REFERENCE = "reference"
@@ -100,15 +106,37 @@ def _single_line(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def _normalize_heading(value: str) -> str:
-    normalized = value.lower().replace("&", " and ")
-    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
-    return re.sub(r"\s+", " ", normalized).strip()
-
-
-_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
-_TEXT_HEADING_RE = re.compile(r"^\s{0,3}([A-Za-z][A-Za-z0-9 /&_-]{1,60}):\s*$")
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$")
+_ASSET_REFERENCE_SECTION_HEADINGS = {"reference asset", "reference assets"}
+_ASSET_DELIVERY_SECTION_HEADINGS = {"delivery asset", "delivery assets"}
+_ASSET_PATH_FIELD_LABEL_KINDS = {
+    "path": "",
+    "asset": "",
+    "reference asset": AssetKind.REFERENCE.value,
+    "delivery asset": AssetKind.DELIVERY.value,
+}
+_ASSET_USAGE_FIELD_LABELS = {"usage", "use"}
+_ASSET_TARGET_FIELD_LABELS = {"target", "target path", "destination", "destination path", "requested target"}
+_ASSET_PROVENANCE_FIELD_LABELS = {"source/license", "source license", "license", "licence", "provenance"}
+_ASSET_STRUCTURED_ROOT_HEADINGS = {"asset", "assets", "task asset", "task assets", "asset manifest"}
+_ASSET_ROOT_SECTION_HEADINGS = {
+    "asset",
+    "assets",
+    "attachment",
+    "attachments",
+    "task asset",
+    "task assets",
+    "task attachment",
+    "task attachments",
+}
+_ASSET_SUBSECTION_HEADINGS = {
+    *_ASSET_REFERENCE_SECTION_HEADINGS,
+    *_ASSET_DELIVERY_SECTION_HEADINGS,
+    "mockup",
+    "mockups",
+    "screenshot",
+    "screenshots",
+}
 _ASSET_EXTENSIONS = {
     ".avif",
     ".csv",
@@ -169,6 +197,19 @@ _GENERATED_ANSWER_ENTRY_END_MARKER = "<!-- /sikula:generated-answer -->"
 
 def public_asset_reference(reference: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in reference.items() if not str(key).startswith("_")}
+
+
+def task_description_has_asset_manifest_section(markdown: str, *, ignore_fenced_blocks: bool = True) -> bool:
+    """Return whether task-description Markdown contains the reserved implementation manifest section."""
+
+    scanner = MarkdownHeadingScanner(ignore_fenced_blocks=ignore_fenced_blocks)
+    for line in markdown.splitlines():
+        heading = scanner.match(line)
+        if heading is None or heading.is_document_title:
+            continue
+        if heading.normalized == "asset manifest":
+            return True
+    return False
 
 
 def _generated_answer_entry_marker(question_id: str) -> str:
@@ -340,7 +381,7 @@ def _asset_answer_entry_block_kind(block: list[str]) -> str:
         if field is None:
             continue
         label, value = field
-        if label in {"usage", "use"}:
+        if label in _ASSET_USAGE_FIELD_LABELS:
             usage_kind = _structured_asset_usage_kind(value)
             if usage_kind:
                 return usage_kind
@@ -361,14 +402,10 @@ def _asset_declaration_answer_entry(answer_line: str, *, project_root: Path) -> 
     field = _structured_asset_field(cleaned)
     if field is not None:
         label, value = field
-        if label in {"path", "asset", "reference asset", "delivery asset"}:
+        if label in _ASSET_PATH_FIELD_LABEL_KINDS:
             path = _asset_path_from_answer_line(value, project_root=project_root)
             if path:
-                output_label = {
-                    "delivery asset": "Delivery asset",
-                    "reference asset": "Reference asset",
-                }.get(label, "Asset")
-                return f"- {output_label}: `{path}`"
+                return f"- {_structured_asset_path_output_label(label)}: `{path}`"
 
     path = _asset_path_from_answer_line(cleaned, project_root=project_root)
     if not path:
@@ -649,7 +686,7 @@ def _asset_line_is_target_metadata(line: str) -> bool:
     if field is None:
         return False
     label, value = field
-    return label in {"target", "target path", "destination", "destination path", "requested target"} and bool(value)
+    return label in _ASSET_TARGET_FIELD_LABELS and bool(value)
 
 
 def _replace_asset_token_in_line(line: str, reference: dict[str, Any], replacement_path: str) -> str:
@@ -915,11 +952,12 @@ def detect_asset_references(
     *,
     source_path: Path | str | None,
     project_config: dict | None,
+    document_kind: str = "all",
 ) -> list[dict[str, Any]]:
     project_root = _asset_project_root(source_path, project_config)
     references_by_path: dict[str, dict[str, Any]] = {}
     reference_order: list[str] = []
-    for declaration in _parse_structured_asset_declarations(text):
+    for declaration in _parse_structured_asset_declarations(text, document_kind=document_kind):
         reference = _asset_reference_metadata(
             declaration.path,
             project_root=project_root,
@@ -948,6 +986,7 @@ def detect_undeclared_asset_paths(
     *,
     project_config: dict | None,
     asset_references: list[dict[str, Any]] | None = None,
+    document_kind: str = "all",
 ) -> list[dict[str, Any]]:
     declared_keys: set[str] = set()
     for reference in asset_references or []:
@@ -957,26 +996,31 @@ def detect_undeclared_asset_paths(
     paths: list[dict[str, Any]] = []
     seen: set[tuple[int, str]] = set()
     heading_stack: list[tuple[int, str]] = []
+    heading_scanner = MarkdownHeadingScanner()
     lines = text.splitlines()
     for line_index, line in enumerate(lines):
-        markdown_heading = _HEADING_RE.match(line)
-        text_heading = _TEXT_HEADING_RE.match(line)
-        if markdown_heading:
-            heading_stack = _asset_update_heading_stack(
-                heading_stack,
-                level=len(markdown_heading.group(1)),
-                heading=markdown_heading.group(2).strip(),
-            )
-            continue
-        if text_heading:
-            heading_stack = _asset_update_heading_stack(
-                heading_stack,
-                level=_asset_text_heading_level(heading_stack),
-                heading=text_heading.group(1).strip(),
-            )
+        heading = heading_scanner.match(line)
+        if heading is not None:
+            if heading.is_document_title:
+                continue
+            if heading.is_markdown:
+                heading_stack = _asset_update_heading_stack(
+                    heading_stack,
+                    level=heading.level,
+                    heading=heading.raw,
+                )
+            else:
+                heading_stack = _asset_update_heading_stack(
+                    heading_stack,
+                    level=_asset_text_heading_level(heading_stack),
+                    heading=heading.raw,
+                )
             continue
         context = _asset_reference_context(heading_stack, lines, line_index)
-        in_structured_asset_root = _asset_heading_stack_has_structured_asset_root(heading_stack)
+        in_structured_asset_root = _asset_heading_stack_has_structured_asset_root(
+            heading_stack,
+            document_kind=document_kind,
+        )
         for raw_path in _asset_path_candidates(line):
             normalized_path = _normalize_asset_path_candidate(raw_path)
             if not normalized_path:
@@ -1010,28 +1054,30 @@ def _asset_line_is_bare_asset_path(line: str, normalized_path: str) -> bool:
     return _normalize_asset_path_candidate(cleaned) == normalized_path
 
 
-def _parse_structured_asset_declarations(text: str) -> list[_StructuredAssetDeclaration]:
+def _parse_structured_asset_declarations(text: str, *, document_kind: str = "all") -> list[_StructuredAssetDeclaration]:
     declarations: list[_StructuredAssetDeclaration] = []
     heading_stack: list[tuple[int, str]] = []
+    heading_scanner = MarkdownHeadingScanner()
     lines = text.splitlines()
     for line_index, line in enumerate(lines):
-        markdown_heading = _HEADING_RE.match(line)
-        text_heading = _TEXT_HEADING_RE.match(line)
-        if markdown_heading:
-            heading_stack = _asset_update_heading_stack(
-                heading_stack,
-                level=len(markdown_heading.group(1)),
-                heading=markdown_heading.group(2).strip(),
-            )
+        heading = heading_scanner.match(line)
+        if heading is not None:
+            if heading.is_document_title:
+                continue
+            if heading.is_markdown:
+                heading_stack = _asset_update_heading_stack(
+                    heading_stack,
+                    level=heading.level,
+                    heading=heading.raw,
+                )
+            else:
+                heading_stack = _asset_update_heading_stack(
+                    heading_stack,
+                    level=_asset_text_heading_level(heading_stack),
+                    heading=heading.raw,
+                )
             continue
-        if text_heading:
-            heading_stack = _asset_update_heading_stack(
-                heading_stack,
-                level=_asset_text_heading_level(heading_stack),
-                heading=text_heading.group(1).strip(),
-            )
-            continue
-        if not _asset_heading_stack_has_structured_asset_root(heading_stack):
+        if not _asset_heading_stack_has_structured_asset_root(heading_stack, document_kind=document_kind):
             continue
 
         bullet = _BULLET_RE.match(line)
@@ -1042,7 +1088,7 @@ def _parse_structured_asset_declarations(text: str) -> list[_StructuredAssetDecl
             continue
         label, value = field
         label_kind = _structured_asset_path_label_kind(label)
-        if label not in {"path", "asset", "reference asset", "delivery asset"}:
+        if label not in _ASSET_PATH_FIELD_LABEL_KINDS:
             continue
         raw_path = _structured_asset_path_value(value)
         path = _normalize_asset_path_candidate(raw_path or "") if raw_path else None
@@ -1052,7 +1098,7 @@ def _parse_structured_asset_declarations(text: str) -> list[_StructuredAssetDecl
         item_lines = _asset_reference_context_lines(lines, line_index)
         metadata = _structured_asset_item_metadata(item_lines[1:])
         kind = _structured_asset_resolved_kind(
-            _structured_asset_section_kind(heading_stack),
+            _structured_asset_section_kind(heading_stack, document_kind=document_kind),
             label_kind,
             metadata.get("usage_kind", ""),
         )
@@ -1080,11 +1126,11 @@ def _structured_asset_item_metadata(lines: list[str]) -> dict[str, str]:
         if field is None:
             continue
         label, value = field
-        if label in {"usage", "use"} and not metadata.get("usage_kind"):
+        if label in _ASSET_USAGE_FIELD_LABELS and not metadata.get("usage_kind"):
             metadata["usage_kind"] = _structured_asset_usage_kind(value)
-        elif label in {"target", "target path", "destination", "destination path", "requested target"}:
+        elif label in _ASSET_TARGET_FIELD_LABELS:
             metadata.setdefault("requested_target", _asset_path_metadata_value(value) or "")
-        elif label in {"source/license", "source license", "license", "licence", "provenance"}:
+        elif label in _ASSET_PROVENANCE_FIELD_LABELS:
             metadata.setdefault("source_license", _structured_asset_text_value(value))
     return metadata
 
@@ -1107,11 +1153,16 @@ def _structured_asset_label(value: str) -> str:
 
 
 def _structured_asset_path_label_kind(label: str) -> str:
-    if label == "reference asset":
-        return AssetKind.REFERENCE.value
-    if label == "delivery asset":
-        return AssetKind.DELIVERY.value
-    return ""
+    return _ASSET_PATH_FIELD_LABEL_KINDS.get(label, "")
+
+
+def _structured_asset_path_output_label(label: str) -> str:
+    label_kind = _structured_asset_path_label_kind(label)
+    if label_kind == AssetKind.REFERENCE.value:
+        return "Reference asset"
+    if label_kind == AssetKind.DELIVERY.value:
+        return "Delivery asset"
+    return "Asset"
 
 
 def _structured_asset_path_value(value: str) -> str | None:
@@ -1131,14 +1182,14 @@ def _structured_asset_text_value(value: str) -> str:
     return cleaned.strip()
 
 
-def _structured_asset_section_kind(heading_stack: list[tuple[int, str]]) -> str:
+def _structured_asset_section_kind(heading_stack: list[tuple[int, str]], *, document_kind: str = "all") -> str:
     for _level, heading in reversed(heading_stack):
         normalized = _normalize_heading(heading)
-        if normalized in {"reference asset", "reference assets"}:
+        if normalized in _ASSET_REFERENCE_SECTION_HEADINGS:
             return AssetKind.REFERENCE.value
-        if normalized in {"delivery asset", "delivery assets"}:
+        if normalized in _ASSET_DELIVERY_SECTION_HEADINGS:
             return AssetKind.DELIVERY.value
-        if _asset_structured_root_heading(heading):
+        if _asset_structured_root_heading(heading, document_kind=document_kind):
             break
     return ""
 
@@ -1166,18 +1217,21 @@ def _structured_asset_resolved_kind(*kinds: str) -> str:
     return first_kind
 
 
-def _asset_heading_stack_has_structured_asset_root(heading_stack: list[tuple[int, str]]) -> bool:
-    return any(_asset_structured_root_heading(heading) for _level, heading in heading_stack)
+def _asset_heading_stack_has_structured_asset_root(
+    heading_stack: list[tuple[int, str]],
+    *,
+    document_kind: str = "all",
+) -> bool:
+    return any(
+        _asset_structured_root_heading(heading, document_kind=document_kind) for _level, heading in heading_stack
+    )
 
 
-def _asset_structured_root_heading(heading: str) -> bool:
-    return _normalize_heading(heading) in {
-        "asset",
-        "assets",
-        "task asset",
-        "task assets",
-        "asset manifest",
-    }
+def _asset_structured_root_heading(heading: str, *, document_kind: str = "all") -> bool:
+    normalized = _normalize_heading(heading)
+    if document_kind == "task_description":
+        return normalized in {"asset", "assets", "task asset", "task assets"}
+    return normalized in _ASSET_STRUCTURED_ROOT_HEADINGS
 
 
 def _undeclared_asset_path_should_warn(path_text: str, context: str, project_config: dict | None) -> bool:
@@ -1203,30 +1257,11 @@ def _asset_text_heading_level(heading_stack: list[tuple[int, str]]) -> int:
 
 
 def _asset_root_section_heading(heading: str) -> bool:
-    return _normalize_heading(heading) in {
-        "asset",
-        "assets",
-        "attachment",
-        "attachments",
-        "task asset",
-        "task assets",
-        "task attachment",
-        "task attachments",
-    }
+    return _normalize_heading(heading) in _ASSET_ROOT_SECTION_HEADINGS
 
 
 def _asset_subsection_heading(heading: str) -> bool:
-    normalized = _normalize_heading(heading)
-    return normalized in {
-        "reference asset",
-        "reference assets",
-        "delivery asset",
-        "delivery assets",
-        "mockup",
-        "mockups",
-        "screenshot",
-        "screenshots",
-    }
+    return _normalize_heading(heading) in _ASSET_SUBSECTION_HEADINGS
 
 
 def _asset_context_headings(heading_stack: list[tuple[int, str]]) -> list[str]:

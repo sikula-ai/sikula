@@ -49,6 +49,72 @@ def _sanitize_synthetic_test_harness_finding(finding: dict) -> dict:
     return _strip_excerpt_fields(finding)
 
 
+_IMPLEMENTATION_ASSET_STRING_KEYS = (
+    "path",
+    "kind",
+    "status",
+    "project_path",
+    "sha256",
+    "mime_type",
+    "git_status",
+    "requested_target",
+    "source_license",
+)
+_IMPLEMENTATION_ASSET_INT_KEYS = ("line", "size_bytes")
+_IMPLEMENTATION_ASSET_BOOL_KEYS = ("target_specified", "provenance_specified")
+_IMPLEMENTATION_ASSET_WARNING_STATUSES = {"missing", "outside_project", "not_file"}
+_IMPLEMENTATION_ASSET_WARNING_GIT_STATUSES = {"dirty", "ignored", "untracked"}
+
+
+def _sanitize_implementation_asset_record(record: dict) -> dict:
+    sanitized: dict = {}
+    for key in _IMPLEMENTATION_ASSET_STRING_KEYS:
+        value = record.get(key)
+        if value is None:
+            continue
+        text = _short_text(str(value), limit=1000)
+        if text:
+            sanitized[key] = text
+    for key in _IMPLEMENTATION_ASSET_INT_KEYS:
+        value = record.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            sanitized[key] = value
+    for key in _IMPLEMENTATION_ASSET_BOOL_KEYS:
+        value = record.get(key)
+        if isinstance(value, bool):
+            sanitized[key] = value
+    return sanitized
+
+
+def _implementation_asset_kind_counts(records: list[dict]) -> dict:
+    counts: dict[str, int] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        kind = str(record.get("kind") or "unknown").strip() or "unknown"
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def _implementation_asset_has_warning(record: dict) -> bool:
+    if not isinstance(record, dict):
+        return False
+    status = str(record.get("status") or "").strip()
+    git_status = str(record.get("git_status") or "").strip()
+    kind = str(record.get("kind") or "").strip()
+    if status in _IMPLEMENTATION_ASSET_WARNING_STATUSES:
+        return True
+    if git_status in _IMPLEMENTATION_ASSET_WARNING_GIT_STATUSES:
+        return True
+    if kind == "ambiguous":
+        return True
+    return kind == "delivery" and not str(record.get("source_license") or "").strip()
+
+
+def _implementation_asset_warning_count(records: list[dict]) -> int:
+    return sum(1 for record in records if _implementation_asset_has_warning(record))
+
+
 def runtime_metadata_snapshot() -> dict:
     try:
         sikula_version = version("sikula")
@@ -110,6 +176,9 @@ def _final_summary(state: "TaskState") -> dict:
         "testability_gaps_count": len(state.testability_gaps),
         "test_execution_gate_audits_count": len(state.test_execution_gate_records),
         "synthetic_test_harness_audits_count": len(state.synthetic_test_harness_records),
+        "implementation_asset_records_count": len(state.implementation_asset_records),
+        "implementation_asset_records_by_kind": _implementation_asset_kind_counts(state.implementation_asset_records),
+        "implementation_asset_warnings_count": _implementation_asset_warning_count(state.implementation_asset_records),
         "analyst_retries_count": len(state.analyst_retry_records),
         "planner_retries_count": len(state.planner_retry_records),
         "llm_retries": sum(1 for entry in state.history if entry.get("action") == "llm_retry"),
@@ -168,6 +237,7 @@ class TaskState:
     schema_version: int = SCHEMA_VERSION
     config_snapshot: dict = field(default_factory=dict)
     implementation_contract: dict = field(default_factory=dict)
+    implementation_asset_records: list[dict] = field(default_factory=list)
     contract_gate_blocked: bool = False
     analyst_prompt: Optional[str] = None
     planner_prompt: Optional[str] = None
@@ -258,6 +328,18 @@ class TaskState:
         if error:
             entry["error"] = error
         self.history.append(entry)
+
+    def record_implementation_assets(self, records: list[dict]) -> None:
+        sanitized = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            sanitized_record = _sanitize_implementation_asset_record(record)
+            if sanitized_record:
+                sanitized.append(sanitized_record)
+        self.implementation_asset_records = sanitized
+        if sanitized:
+            self.record("orchestrator", "asset_snapshot", f"{len(sanitized)} implementation asset reference(s)")
 
     def record_analyst_retry(
         self,

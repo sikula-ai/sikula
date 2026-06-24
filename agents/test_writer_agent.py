@@ -149,6 +149,15 @@ TESTING RULES:
   helpers. Do NOT write brittle tests that inspect UI framework internals, opaque view trees,
   reflection-only private storage, or component type-name strings unless the existing test
   suite already uses that exact pattern for the same UI framework.
+- If the task or implementation prompt contains structured asset declarations such as
+  `### Reference assets` / `### Delivery assets`, or the implementation prompt contains
+  an `Asset manifest`, test the user-visible behaviour or stable public contract
+  produced by the asset usage. Do not replace asset coverage with brittle byte comparisons,
+  source-path inspection, raw resource tree inspection, or assertions about private
+  framework internals unless the project already exposes that exact resource contract as
+  a stable public test seam. If meaningful asset-related behaviour cannot be tested with
+  the configured test surface, follow the TESTABILITY GAP policy instead of adding skipped
+  or source-inspection tests.
 - For framework/container wiring such as dependency injection modules, provider trees,
   route registries, plugin registries, or service containers, do not hand-copy production
   registration logic into a local test-only container. Verify the real production

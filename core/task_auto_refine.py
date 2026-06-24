@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from core.contract_auto_prepare import AutoPreparationAuditRecorder, load_auto_json_object
 from core.contract_check import TaskDescriptionPrepareResult, prepare_task_description
+from core.task_assets import task_description_has_asset_manifest_section
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,7 @@ class TaskAutoRefineRequest:
     brief: str
     task_name: str | None
     product_context: dict[str, Any] | None = None
+    asset_path_candidates: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,8 @@ def parse_task_auto_refine_output(output: str) -> TaskAutoRefineDraft:
     task_markdown = raw_markdown.strip() + "\n"
     if "sikula:generated-" in task_markdown:
         raise ValueError("auto task refine output must not contain Sikula generated markers")
+    if task_description_has_asset_manifest_section(task_markdown):
+        raise ValueError("auto task refine output must not contain an Asset manifest")
 
     input_language = payload.get("input_language")
     if input_language is not None:
@@ -127,6 +131,7 @@ def auto_refine_task_description(
     *,
     task_name: str | None = None,
     product_context: dict[str, Any] | None = None,
+    asset_path_candidates: list[dict[str, Any]] | None = None,
     answers: dict[str, Any] | None = None,
     normalize_provider: TaskAutoRefineProvider,
     answer_provider: TaskAutoAnswerProvider | None = None,
@@ -140,6 +145,7 @@ def auto_refine_task_description(
             brief=brief,
             task_name=task_name,
             product_context=product_context,
+            asset_path_candidates=list(asset_path_candidates or []),
         )
     )
     if audit_recorder:

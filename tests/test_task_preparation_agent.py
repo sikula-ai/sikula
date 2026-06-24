@@ -175,7 +175,33 @@ def test_task_preparer_refine_prompt_disallows_unreferenced_sikula_artifacts(tmp
     assert "- reports and answers: .generated/sikula-contract-reports" in prompt
     assert "unless the raw task explicitly references them" in prompt
     assert "Preserve local asset paths exactly" in prompt
+    assert "Sikula-detected local asset path candidates" in prompt
+    assert "Use these candidates only as a reminder" in prompt
+    assert "Do not create an `Asset manifest`" in prompt
     assert "Do not invent asset target paths" in prompt
+    assert "expected/final UI states" in prompt
+    assert "treat them as `### Reference assets`" in prompt
+
+
+def test_task_preparer_refine_prompt_includes_asset_candidates(tmp_path: Path):
+    llm = CapturingLLM('{"task_markdown": "# Fix login spacing\\n\\n## Goal\\n\\nFix spacing."}')
+    agent = TaskPreparationAgent(llm=llm)
+
+    agent.normalize_task_description(
+        TaskAutoRefineRequest(
+            brief="Fix spacing shown in `.sikula/task-assets/login.png`.",
+            task_name="login-spacing.md",
+            asset_path_candidates=[{"path": ".sikula/task-assets/login.png", "line": 1}],
+        ),
+        project_root=tmp_path,
+    )
+
+    prompt = llm.prompts[0]
+    assert '"path": ".sikula/task-assets/login.png"' in prompt
+    assert '"line": 1' in prompt
+    assert "They are not proof that a file exists" in prompt
+    assert "### Reference assets" in prompt
+    assert "### Delivery assets" in prompt
 
 
 def test_task_preparer_refine_result_includes_audit_record(tmp_path: Path):

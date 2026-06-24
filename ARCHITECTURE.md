@@ -128,7 +128,8 @@ readiness or return run guidance. `sikula contract prepare TASK_FILE --answers .
 --output ...` turns the task description into the delivery artifact by applying answers,
 preserving product sections, adding project context plus validation commands from the
 effective project config, and rechecking the returned Markdown. It refuses stale answer
-hashes and accidental overwrites. `--interactive` is a terminal convenience layer for
+hashes, accidental overwrites, and task-description input that already contains the
+reserved `## Asset manifest` section. `--interactive` is a terminal convenience layer for
 both refine and prepare: it creates or reuses an answers YAML, prompts for answers, saves
 that file under `.sikula/contract-reports`, and then writes the clean Markdown output.
 The same module also exposes side-effect-free in-memory helpers
@@ -146,10 +147,13 @@ client-reported local config presence is guidance only and is not a readiness si
 future MCP transport without adding scoring or rewrite logic; task-description responses
 do not expose implementation-contract readiness fields. Contract preparation helpers
 capture local task assets in the prepared contract manifest as path/hash snapshots.
-Asset detection treats structured `## Assets` declarations as authoritative; paths in
-prose or configured task-asset directories are reported only as undeclared-path
-warnings unless a matching structured declaration exists. Runtime hash mismatch
-enforcement belongs to the run-state asset audit work and is not performed by this
+Asset detection treats structured `## Assets` declarations as authoritative for product
+task descriptions; paths in prose or configured task-asset directories are reported only
+as undeclared-path warnings unless a matching structured declaration exists. `## Asset
+manifest` is reserved for prepared implementation contracts. Task-description validation
+reports a blocking format gap for that section, while implementation-contract preflight
+(`sikula contract check` and `sikula run`) reads it as the prepared manifest. Runtime hash
+mismatch enforcement belongs to the run-state asset audit work and is not performed by this
 warning-only preflight path. These commands and helpers
 do not create `TaskState`, start agents, create worktrees, or alter `review` flow. Fresh `sikula run
 TASK_FILE` uses the same deterministic checks to store a compact warning-only snapshot in
@@ -1232,6 +1236,7 @@ Sikula processes at once is still unsupported.
 | `task_file` | `str \| None` | `cmd_run()` in `sikula.py` | Basename of the task file (e.g. `add-login.md`); set on first run via `--task-file`; used by `status` for display; `None` for tasks created before this field was added or when resuming via `--task-id` only |
 | `config_snapshot` | `dict` | `cmd_run()` / Orchestrator | Effective run configuration captured on first run before agents start (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `planner.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. It is also saved for contract-gate failures that exit before `Orchestrator.run()`. Visible in `show <task_id>`. |
 | `implementation_contract` | `dict` | `cmd_run()` in `sikula.py` | Implementation-contract snapshot for fresh task-file runs: task path/format/hash, readiness status/score, gap metadata, clarifying question IDs, and validation coverage counts. By default it is warning-only additive metadata. Fresh `run TASK_FILE` can opt into pre-agent gating with `--require-contract-ready` or `--min-contract-score N`; resume/review flows do not recompute or re-gate it. |
+| `implementation_asset_records` | `list[dict]` | `cmd_run()` in `sikula.py` | Sanitized, non-blocking asset metadata snapshot for fresh task-file runs, copied from the implementation-contract preflight asset references. Contains path/kind/status/project path/hash/size/MIME/git status/requested target/provenance metadata only; no raw asset content, OCR text, binary data, internal parser fields, or source excerpts. Used for audit and terminal summary counts, not for run/resume/review control-flow decisions. |
 | `contract_gate_blocked` | `bool` | `cmd_run()` in `sikula.py` | True when an opt-in contract readiness gate failed before worktree creation or agent startup. Such states are kept for audit but are not reset via `--reset-failed`; users should prepare the implementation contract and start a fresh task-file run. |
 | `analyst_prompt` | `str \| None` | AnalystAgent | Full assembled prompt sent to the analyst LLM (system + user sections, including inlined guidelines content); stored before the LLM call so it captures the exact input even on exception; enables post-run analysis of analyst behaviour |
 | `planner_prompt` | `str \| None` | PlannerAgent | Full assembled prompt sent to the planner LLM (system + user sections); stored before the LLM call; `None` when `run_planner: false` or planner not yet reached |

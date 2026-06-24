@@ -37,6 +37,142 @@ def test_parse_task_auto_refine_output_rejects_missing_markdown_or_generated_mar
     with pytest.raises(ValueError, match="must not contain Sikula generated markers"):
         parse_task_auto_refine_output('{"task_markdown": "# Task\\n\\n<!-- sikula:generated-open-questions -->"}')
 
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output('{"task_markdown": "# Task\\n\\n## Asset manifest\\n\\n- Path: `x.png`"}')
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "## Asset manifest ##",
+        "## Asset manifest:",
+        "Asset manifest:",
+    ],
+)
+def test_parse_task_auto_refine_output_rejects_recognized_asset_manifest_headings(heading: str):
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output(
+            '{"task_markdown": "# Task\\n\\n' + heading + '\\n\\n- Path: `.sikula/task-assets/x.png`"}'
+        )
+
+
+def test_parse_task_auto_refine_output_allows_product_titles_that_start_with_asset_manifest():
+    draft = parse_task_auto_refine_output(
+        '{"task_markdown": "# Asset manifest editor\\n\\n## Scope\\n\\n- Add filtering."}'
+    )
+
+    assert draft.task_markdown.startswith("# Asset manifest editor")
+
+
+def test_parse_task_auto_refine_output_allows_asset_manifest_as_product_title():
+    draft = parse_task_auto_refine_output('{"task_markdown": "# Asset manifest\\n\\n## Scope\\n\\n- Add editing."}')
+
+    assert draft.task_markdown.startswith("# Asset manifest\n")
+
+
+def test_parse_task_auto_refine_output_allows_asset_manifest_title_with_text_scope():
+    draft = parse_task_auto_refine_output(
+        '{"task_markdown": "# Asset manifest\\n\\nScope:\\n\\n- Add a UI for `.sikula/task-assets/x.png`."}'
+    )
+
+    assert "Scope:" in draft.task_markdown
+
+
+def test_parse_task_auto_refine_output_allows_asset_manifest_title_with_markdown_scope_asset_reference():
+    draft = parse_task_auto_refine_output(
+        '{"task_markdown": "# Asset manifest\\n\\n## Scope\\n\\n- Show `.sikula/task-assets/x.png` in the UI."}'
+    )
+
+    assert "## Scope" in draft.task_markdown
+
+
+def test_parse_task_auto_refine_output_allows_asset_manifest_title_with_markdown_scope_field():
+    draft = parse_task_auto_refine_output(
+        '{"task_markdown": "# Asset manifest\\n\\n## Scope\\n\\n- Path: `.sikula/task-assets/x.png` should be shown in the UI."}'
+    )
+
+    assert "## Scope" in draft.task_markdown
+
+
+def test_parse_task_auto_refine_output_allows_asset_manifest_title_with_product_assets_field():
+    draft = parse_task_auto_refine_output(
+        '{"task_markdown": "# Asset manifest\\n\\n## Assets\\n\\n- Path: `.sikula/task-assets/x.png` is part of the product task."}'
+    )
+
+    assert "## Assets" in draft.task_markdown
+
+
+def test_parse_task_auto_refine_output_allows_asset_manifest_title_with_product_asset_declarations():
+    draft = parse_task_auto_refine_output(
+        '{"task_markdown": "# Asset manifest\\n\\n## Assets\\n\\n### Reference assets\\n\\n- Path: `.sikula/task-assets/x.png`\\n  - Usage: reference only."}'
+    )
+
+    assert "### Reference assets" in draft.task_markdown
+
+
+def test_parse_task_auto_refine_output_allows_manifest_looking_body_under_asset_manifest_title():
+    draft = parse_task_auto_refine_output(
+        '{"task_markdown": "# Asset manifest\\n\\n### Reference assets\\n\\n- Path: `.sikula/task-assets/x.png`\\n  - Usage: reference only."}'
+    )
+
+    assert draft.task_markdown.startswith("# Asset manifest\n")
+
+
+def test_parse_task_auto_refine_output_allows_asset_manifest_title_after_next_h1():
+    draft = parse_task_auto_refine_output(
+        '{"task_markdown": "# Asset manifest\\n\\n# Follow-up task\\n\\n- Path: `.sikula/task-assets/x.png` is discussed here."}'
+    )
+
+    assert "# Follow-up task" in draft.task_markdown
+
+
+def test_parse_task_auto_refine_output_rejects_asset_manifest_as_later_h1_section():
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output(
+            '{"task_markdown": "# Task\\n\\n# Asset manifest\\n\\n- Path: `.sikula/task-assets/x.png`"}'
+        )
+
+
+def test_parse_task_auto_refine_output_rejects_asset_manifest_h1_after_non_title_heading():
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output(
+            '{"task_markdown": "## Goal\\n\\nDocument assets.\\n\\n# Asset manifest\\n\\n- Path: `.sikula/task-assets/x.png`"}'
+        )
+
+
+def test_parse_task_auto_refine_output_rejects_asset_manifest_h1_after_text_heading():
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output(
+            '{"task_markdown": "Scope:\\n\\n- Document assets.\\n\\n# Asset manifest\\n\\n- Notes."}'
+        )
+
+
+def test_parse_task_auto_refine_output_rejects_asset_manifest_h1_after_prose_preamble():
+    with pytest.raises(ValueError, match="must not contain an Asset manifest"):
+        parse_task_auto_refine_output(
+            '{"task_markdown": "This was copied from a prepared contract.\\n\\n# Asset manifest\\n\\n- Notes."}'
+        )
+
+
+def test_parse_task_auto_refine_output_allows_asset_manifest_heading_inside_fenced_example():
+    draft = parse_task_auto_refine_output(
+        """{
+  "task_markdown": "# Document asset manifests\\n\\n## Scope\\n\\n- Document this Markdown example:\\n\\n```md\\n## Asset manifest\\n\\n- Path: `.sikula/task-assets/x.png`\\n```"
+}"""
+    )
+
+    assert "```md\n## Asset manifest" in draft.task_markdown
+
+
+def test_parse_task_auto_refine_output_allows_exact_asset_manifest_title_with_fenced_manifest_example():
+    draft = parse_task_auto_refine_output(
+        """{
+  "task_markdown": "# Asset manifest\\n\\n## Scope\\n\\n- Document this Markdown example:\\n\\n```md\\n## Asset manifest\\n\\n- Path: `.sikula/task-assets/x.png`\\n```"
+}"""
+    )
+
+    assert "```md\n## Asset manifest" in draft.task_markdown
+
 
 def test_parse_task_auto_answer_output_accepts_active_answers_and_warns_for_inactive_ids():
     batch = parse_task_auto_answer_output(
@@ -102,6 +238,53 @@ Users should be able to invite teammates by email.
     assert result.result.needs_user_input is False
     assert result.result.required_next_step == "prepare_implementation_contract"
     assert "## Open questions" not in result.result.prepared_task_markdown
+
+
+def test_auto_refine_task_description_passes_asset_candidates_to_normalizer():
+    seen_candidates = []
+
+    def provider(request):
+        seen_candidates.extend(request.asset_path_candidates)
+        return TaskAutoRefineDraft(
+            task_markdown="""# Fix login spacing
+
+## Goal
+
+Fix the spacing shown in the provided screenshot.
+
+## Assets
+
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing.png`
+  - Usage: reference only.
+  - Do not copy this asset into production files.
+
+## Scope
+
+- Adjust login form spacing.
+
+## Acceptance criteria
+
+- The login form spacing matches the reference screenshot.
+
+## Out of scope
+
+- Do not redesign the login screen.
+"""
+        )
+
+    result = auto_refine_task_description(
+        "Fix spacing shown in `.sikula/task-assets/login-spacing.png`.",
+        task_name="login-spacing.md",
+        asset_path_candidates=[{"path": ".sikula/task-assets/login-spacing.png", "line": 1}],
+        normalize_provider=provider,
+    )
+
+    assert seen_candidates == [{"path": ".sikula/task-assets/login-spacing.png", "line": 1}]
+    assert "## Assets" in result.result.prepared_task_markdown
+    assert "## Asset manifest" not in result.result.prepared_task_markdown
+    assert "Do not copy this asset into production files." in result.result.prepared_task_markdown
 
 
 def test_auto_refine_task_description_can_auto_answer_product_questions():

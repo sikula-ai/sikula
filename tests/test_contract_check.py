@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from hashlib import sha256
 from pathlib import Path
 import subprocess
@@ -28,6 +29,7 @@ from sikula import (
     _prepare_project_context_from_config,
     _read_interactive_contract_answer,
     _should_store_interactive_answer,
+    _task_refine_asset_path_candidates,
     main,
 )
 
@@ -40,6 +42,58 @@ def _python_project_config(tmp_path: Path) -> dict:
         "run_checks": True,
         "build": {"checks": [{"name": "ruff", "command": "ruff check ."}]},
     }
+
+
+def _heading_count(markdown: str, heading: str) -> int:
+    return len(re.findall(rf"^#+\s+{re.escape(heading)}\s*$", markdown, flags=re.MULTILINE))
+
+
+def test_task_refine_asset_path_candidates_tolerates_detector_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from core import task_assets
+
+    def raise_bad_asset_reference(*args, **kwargs):
+        raise ValueError("bad asset path")
+
+    monkeypatch.setattr(task_assets, "detect_asset_references", raise_bad_asset_reference)
+
+    assert (
+        _task_refine_asset_path_candidates(
+            "Use `.sikula/task-assets/login.png` as reference.",
+            source_path=tmp_path / ".sikula" / "tasks" / "task.md",
+            cfg=_python_project_config(tmp_path),
+        )
+        == []
+    )
+
+
+def test_task_refine_asset_path_candidates_sanitizes_detector_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from core import task_assets
+
+    monkeypatch.setattr(task_assets, "detect_asset_references", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        task_assets,
+        "detect_undeclared_asset_paths",
+        lambda *args, **kwargs: [
+            {"path": "", "line": 1},
+            {"path": ".sikula/task-assets/no-line.png", "line": 0},
+            {"path": " .sikula/task-assets/with-line.png ", "line": 7},
+            {"path": ".sikula/task-assets/string-line.png", "line": "8"},
+        ],
+    )
+
+    assert _task_refine_asset_path_candidates(
+        "Use `.sikula/task-assets/with-line.png` as reference.",
+        source_path=tmp_path / ".sikula" / "tasks" / "task.md",
+        cfg=_python_project_config(tmp_path),
+    ) == [
+        {"path": ".sikula/task-assets/no-line.png"},
+        {"path": ".sikula/task-assets/with-line.png", "line": 7},
+        {"path": ".sikula/task-assets/string-line.png"},
+    ]
 
 
 def test_contract_check_reports_available_reference_asset(tmp_path: Path):
@@ -2076,6 +2130,47 @@ def test_prepare_implementation_contract_uses_project_context_validation_command
     assert all(gap.id != "gap.validation.coverage" for gap in result.unresolved_gaps)
 
 
+def test_prepare_implementation_contract_updates_h1_sections_after_prose_preamble():
+    task = """This task was drafted from a short project note.
+
+# Project context
+- Existing project context stays here.
+
+# Validation
+- `pytest`
+
+## Scope
+- Add search by country name.
+- Keep existing filtering.
+
+## Acceptance criteria
+- Search is case-insensitive.
+- Clearing search shows all countries.
+
+## Out of scope
+- Do not add server-side search.
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name="search.md",
+        project_context={
+            "stack": "Python",
+            "known_constraints": "Keep the change isolated to search UI state.",
+            "validation_commands": ["pytest", "ruff check ."],
+        },
+    )
+    prepared = result.prepared_contract_markdown
+
+    assert _heading_count(prepared, "Project context") == 1
+    assert _heading_count(prepared, "Validation") == 1
+    assert "\n## Project context\n" not in prepared
+    assert "\n## Validation\n" not in prepared
+    assert "- Stack: Python" in prepared
+    assert "- Known constraints: Keep the change isolated to search UI state." in prepared
+    assert "- `ruff check .`" in prepared
+
+
 def test_prepare_implementation_contract_does_not_use_inferred_asset_root_for_validation(tmp_path: Path):
     task = """# Add Android search
 
@@ -2221,6 +2316,333 @@ def test_prepare_implementation_contract_resume_replaces_nested_asset_manifest(
     assert second.prepared_contract_markdown.count("### Reference assets") == 1
     assert second.prepared_contract_markdown.count("- Path: `.sikula/task-assets/login-spacing-bug.png`") == 2
     assert second.resume_arguments["contract_markdown"].count("asset_manifest.references") == 1
+
+
+def test_prepare_implementation_contract_ignores_asset_manifest_document_title(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing-bug.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Asset manifest
+
+## Assets
+
+- Path: `.sikula/task-assets/login-spacing-bug.png`
+  - Usage: reference only.
+
+## Scope
+- Show the reference image in the Asset Manifest editor.
+
+## Acceptance criteria
+- The editor shows the selected reference image.
+
+## Validation
+- `pytest`
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/asset-manifest.md",
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.prepared_contract_markdown.startswith("# Asset manifest")
+    assert result.prepared_contract_markdown.count("## Asset manifest") == 1
+    assert "SHA-256: `sha256:" in result.prepared_contract_markdown
+    assert result.recheck_result is not None
+    assert result.recheck_result.asset_references[0]["status"] == "available"
+
+
+def test_prepare_implementation_contract_preserves_product_assets_under_asset_manifest_title(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing-bug.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Asset manifest
+
+## Assets
+
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing-bug.png`
+  - Usage: reference only.
+
+## Scope
+- Show the reference image in the Asset Manifest editor.
+
+## Acceptance criteria
+- The editor shows the selected reference image.
+
+## Validation
+- `pytest`
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/asset-manifest.md",
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.prepared_contract_markdown.startswith("# Asset manifest")
+    assert result.prepared_contract_markdown.count("## Asset manifest") == 1
+    assert "SHA-256: `sha256:" in result.prepared_contract_markdown
+    assert result.recheck_result is not None
+    assert result.recheck_result.asset_references[0]["status"] == "available"
+
+
+def test_contract_check_rejects_asset_manifest_section_in_task_description():
+    task = """# Add asset manifest UI
+
+## Asset manifest
+
+- Path: `.sikula/task-assets/login-spacing-bug.png`
+
+## Scope
+- Add filtering.
+
+## Acceptance criteria
+- Filtering works.
+
+## Validation
+- `pytest`
+"""
+
+    result = check_contract(task, configured_validation_commands=["pytest"])
+    implementation_result = check_contract(
+        task,
+        configured_validation_commands=["pytest"],
+        document_kind="implementation_contract",
+    )
+
+    assert any(gap.id == "gap.assets.manifest_reserved" and gap.severity == "blocking" for gap in result.gaps)
+    assert all(gap.id != "gap.assets.manifest_reserved" for gap in implementation_result.gaps)
+
+
+def test_prepare_implementation_contract_rejects_prepared_manifest_used_as_task_description(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    prepared_contract = """# Add success icon
+
+## Scope
+- Add the success state icon to the confirmation screen.
+
+## Acceptance criteria
+- The success screen shows the provided success icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+
+## Asset manifest
+
+### Delivery assets
+
+- Path: `.sikula/task-assets/success-check.svg`
+  - Usage: delivery asset.
+  - Requested target: `app/assets/success-check.svg`
+  - Source/license: provided by product team for this project.
+"""
+
+    result = prepare_implementation_contract(
+        prepared_contract,
+        contract_name=".sikula/contracts/success-icon.contract.md",
+        project_context={"validation_commands": ["pytest"]},
+        project_config=_python_project_config(tmp_path),
+    )
+
+    assert result.recheck_result is None
+    assert result.required_next_step == "revise_contract"
+    assert result.required_user_action == "revise_contract"
+    assert not result.ready_to_save
+    assert not result.ready_to_run
+    assert result.questions_for_user == []
+    assert result.answers_template == {}
+    assert result.check_result.asset_references == []
+    assert any(
+        gap.id == "gap.assets.manifest_reserved" and gap.severity == "blocking" for gap in result.unresolved_gaps
+    )
+    assert "## Asset manifest" in result.prepared_contract_markdown
+    assert result.prepared_contract_markdown.count("## Asset manifest") == 1
+    assert "## Project context" not in result.prepared_contract_markdown
+
+
+def test_prepare_implementation_contract_rejects_asset_manifest_h1_after_prose_preamble(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    task = """This task was copied from a prepared implementation contract.
+
+# Asset manifest
+
+- Path: `.sikula/task-assets/success-check.svg`
+  - Usage: delivery asset.
+  - Requested target: `app/assets/success-check.svg`
+  - Source/license: provided by product team for this project.
+
+## Scope
+- Add the success state icon.
+
+## Acceptance criteria
+- The success screen shows the provided success icon.
+
+## Validation
+- `pytest`
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/copied-contract.md",
+        project_context={"validation_commands": ["pytest"]},
+        project_config=_python_project_config(tmp_path),
+    )
+
+    assert result.recheck_result is None
+    assert result.required_next_step == "revise_contract"
+    assert result.check_result.asset_references == []
+    assert any(
+        gap.id == "gap.assets.manifest_reserved" and gap.severity == "blocking" for gap in result.unresolved_gaps
+    )
+
+
+def test_contract_prepare_cli_rejects_prepared_manifest_used_as_task_description(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    task_path = tmp_path / ".sikula" / "contracts" / "success-icon.contract.md"
+    task_path.parent.mkdir(parents=True)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    task_path.write_text(
+        """# Add success icon
+
+## Scope
+- Add the success state icon to the confirmation screen.
+
+## Acceptance criteria
+- The success screen shows the provided success icon.
+
+## Out of scope
+- Do not redesign the success screen.
+
+## Validation
+- `pytest`
+
+## Asset manifest
+
+### Delivery assets
+
+- Path: `.sikula/task-assets/success-check.svg`
+  - Usage: delivery asset.
+  - Requested target: `app/assets/success-check.svg`
+  - Source/license: provided by product team for this project.
+""",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / ".sikula" / "contracts" / "prepared-again.contract.md"
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sikula._prepare_project_context_from_config", return_value={"validation_commands": ["pytest"]}),
+        patch("sys.argv", ["sikula", "contract", "prepare", str(task_path), "--output", str(output_path)]),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    assert excinfo.value.code == 1
+    assert not output_path.exists()
+    assert "Contract preparation needs task description revisions" in out
+    assert "## Asset manifest is reserved for prepared implementation contracts" in out
+
+
+def test_prepare_implementation_contract_ignores_manifest_like_body_under_asset_manifest_title(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing-bug.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Asset manifest
+
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing-bug.png`
+  - Usage: reference only.
+
+## Scope
+- Show the reference image in the Asset Manifest editor.
+
+## Acceptance criteria
+- The editor shows the selected reference image.
+
+## Validation
+- `pytest`
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/asset-manifest.md",
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.check_result.asset_references == []
+    assert result.prepared_contract_markdown.count("## Asset manifest") == 0
+
+
+def test_prepare_implementation_contract_ignores_manifest_like_subheading_without_assets_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    asset_path = tmp_path / ".sikula" / "task-assets" / "login-spacing-bug.png"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"fake-png")
+    task = """# Asset manifest
+
+## Summary
+
+These entries describe reference material for the task.
+
+### Reference assets
+
+- Path: `.sikula/task-assets/login-spacing-bug.png`
+  - Usage: reference only.
+
+## Scope
+- Show the reference image in the Asset Manifest editor.
+
+## Acceptance criteria
+- The editor shows the selected reference image.
+
+## Validation
+- `pytest`
+"""
+
+    result = prepare_implementation_contract(
+        task,
+        contract_name=".sikula/tasks/asset-manifest.md",
+        project_context={"validation_commands": ["pytest"]},
+    )
+
+    assert result.check_result.asset_references == []
+    assert result.prepared_contract_markdown.count("## Asset manifest") == 0
 
 
 def test_prepare_implementation_contract_adds_delivery_asset_manifest_with_target_and_source(

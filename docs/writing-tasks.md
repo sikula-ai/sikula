@@ -118,6 +118,12 @@ answers YAML and rerun with `--answers`. In `--auto` mode, Sikula writes the
 normalized refined Markdown first and scopes any generated answers template to
 that new refined file.
 
+For task assets, `sikula task refine --auto` may turn explicit local asset
+paths from a rough product task into a structured `## Assets` section. It does
+not create an `Asset manifest`, validate asset hashes, decide licensing, or
+invent delivery targets; `sikula contract prepare` handles those
+project-aware readiness checks later.
+
 ### Direct Prepare Vs Refine First
 
 `sikula task refine` is optional. Use it when you want a cleaner product task
@@ -269,6 +275,14 @@ declaration is a bullet such as `Path: ...`, `Asset: ...`, `Reference asset:
 ...`, or `Delivery asset: ...`; bare path bullets and prose such as "use
 `.sikula/task-assets/foo.png` as a mockup" are not asset declarations.
 
+`## Asset manifest` is reserved for prepared implementation contracts. In task
+descriptions, use `## Assets`; when Sikula validates task-description input,
+a section named `## Asset manifest` is a blocking format gap instead of an
+asset declaration. A task title such as `# Asset manifest` is fine because it
+is not an asset section. `sikula contract prepare` refuses to write a new
+implementation contract from task-description input that contains the reserved
+section.
+
 You may still mention a declared asset path in the task body for human
 readability, but intent, target, and provenance must come from `## Assets`. If a
 local asset-like path appears outside `## Assets` without a matching structured
@@ -291,6 +305,11 @@ assets remain follow-up questions instead of being silently added to the
 contract. If you answer an `assets.local_files` question, provide supported
 local project paths, one per unresolved asset. Free text such as `n/a` does not
 resolve a missing asset reference.
+
+Fresh task-file runs also copy the prepared asset metadata into task state as a
+non-blocking audit snapshot. This makes asset usage easier to inspect later, but
+Sikula does not yet fail or resume-block a task when an asset hash changes after
+the contract was prepared.
 
 ## Feature Example
 

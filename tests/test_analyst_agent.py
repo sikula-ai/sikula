@@ -131,6 +131,18 @@ class TestAnalystAgentRun:
         assert "materially different rejected input" in task_state.analyst_prompt
         assert "classes" in task_state.analyst_prompt
 
+    def test_analyst_prompt_requires_asset_manifest_obligations(
+        self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
+    ):
+        stub_llm.readonly_result = VALID_ANALYST_PROMPT
+        agent = _make_agent(stub_llm, file_tool)
+        agent.run(task_state)
+        prompt = task_state.analyst_prompt
+        assert "Asset manifest" in prompt
+        assert "Reference-only assets may guide implementation" in prompt
+        assert "Delivery assets may be used only within the requested scope" in prompt
+        assert "source/license/provenance" in prompt
+
     def test_meta_output_is_retried_and_not_stored(self, stub_llm: StubLLMClient, task_state: TaskState, file_tool):
         stub_llm.readonly_results = [BAD_META_PROMPT, VALID_ANALYST_PROMPT]
         agent = _make_agent(stub_llm, file_tool)

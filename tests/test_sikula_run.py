@@ -664,6 +664,58 @@ class TestCmdRunStateStore:
         assert state.implementation_contract["source"]["sha256"].startswith("sha256:")
         assert not (tmp_path / ".sikula" / "contract-reports").exists()
 
+    def test_task_file_no_isolate_records_implementation_asset_snapshot(self, tmp_path: Path):
+        asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+        asset_path.parent.mkdir(parents=True)
+        asset_path.write_text("<svg viewBox='0 0 16 16'></svg>")
+        task_file = tmp_path / "task.md"
+        task_file.write_text(
+            "# Add success icon\n\n"
+            "## Scope\n"
+            "- Add the success icon to the confirmation UI.\n\n"
+            "## Assets\n\n"
+            "### Delivery assets\n\n"
+            "- Path: `.sikula/task-assets/success-check.svg`\n"
+            "  - Usage: delivery asset.\n"
+            "  - Target: `app/assets/success-check.svg`\n"
+            "  - Source/license: provided by product team; MIT.\n\n"
+            "## Acceptance criteria\n"
+            "- The confirmation UI uses the provided success icon.\n\n"
+            "## Validation\n"
+            "- pytest\n"
+        )
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            task_id = state_store.list_tasks()[0]
+            state = state_store.load(task_id)
+            state.done = True
+            mock.run.return_value = state
+            return mock
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            cmd_run(_run_args(task_file=str(task_file), no_isolate=True), _run_cfg(tmp_path))
+
+        exit_mock.assert_called_with(0)
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert len(state.implementation_asset_records) == 1
+        asset_record = state.implementation_asset_records[0]
+        assert asset_record["path"] == ".sikula/task-assets/success-check.svg"
+        assert asset_record["project_path"] == ".sikula/task-assets/success-check.svg"
+        assert asset_record["kind"] == "delivery"
+        assert asset_record["status"] == "available"
+        assert asset_record["requested_target"] == "app/assets/success-check.svg"
+        assert asset_record["source_license"] == "provided by product team; MIT."
+        assert asset_record["sha256"].startswith("sha256:")
+        assert "_raw_paths" not in asset_record
+        assert "excerpt" not in asset_record
+        assert any(entry["action"] == "asset_snapshot" for entry in state.history)
+
     def test_task_file_contract_preflight_uses_cli_phase_overrides(self, tmp_path: Path):
         task_file = tmp_path / "task.md"
         task_file.write_text(

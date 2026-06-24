@@ -28,7 +28,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   prepare runs with unanswered questions now write answers templates first and defer
   Markdown output until answers are supplied; `task refine --auto` can use a
   read-only `task_preparer` LLM agent to normalize rough or non-English product
-  requests before the deterministic product-question pass, while
+  requests before the deterministic product-question pass, including structuring
+  explicit local asset paths into product-level `## Assets` entries without
+  generating implementation-contract asset manifests, while
   `contract prepare --auto` uses the same agent to propose answers supported by
   the task, repository, guidelines, and Sikula config before the same
   deterministic prepare/recheck logic writes or defers the contract. Both auto
@@ -52,7 +54,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   undeclared asset-like paths in prose, hashing, reference-vs-delivery
   classification, delivery provenance checks, isolated-run availability warnings
   for untracked/dirty assets, answer-based missing-asset replacement, and
-  generated implementation-contract asset manifests.
+  generated implementation-contract asset manifests; runtime agent prompts now
+  treat prepared asset manifests as delivery obligations, and fresh task-file
+  runs record a non-blocking implementation asset metadata snapshot in task
+  state without run/resume hash enforcement yet.
 - Task terminal summaries now include a platform-neutral audit report with validation status, review status, non-blocking audit warnings, and recovered issues such as validation failures fixed by the build/fix loop.
 - Failed validation records now include high-signal diagnostic summary lines, and task terminal summaries sample and deduplicate those lines across recovered build/test/check failures so successful self-healed runs still reveal the concrete compiler error, failed test, sanitized assertion failure, or linter rule that was repaired without echoing source-code frames or assertion values, with an explicit pointer to `sikula show` for full state details.
 - The test writer now more strongly prefers behavioural seams over broad source-inspection tests, especially for UI implementation details that cannot be meaningfully exercised by existing project test infrastructure.
