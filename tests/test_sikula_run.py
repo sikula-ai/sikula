@@ -717,6 +717,103 @@ class TestCmdRunStateStore:
         assert "excerpt" not in asset_record
         assert any(entry["action"] == "asset_snapshot" for entry in state.history)
 
+    def test_task_file_no_isolate_records_delivery_asset_target_audit(self, tmp_path: Path, capsys):
+        asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+        asset_path.parent.mkdir(parents=True)
+        asset_path.write_text("<svg viewBox='0 0 16 16'></svg>")
+        task_file = tmp_path / "task.md"
+        task_file.write_text(
+            "# Add success icon\n\n"
+            "## Scope\n"
+            "- Add the success icon to the confirmation UI.\n\n"
+            "## Assets\n\n"
+            "### Delivery assets\n\n"
+            "- Path: `.sikula/task-assets/success-check.svg`\n"
+            "  - Usage: delivery asset.\n"
+            "  - Target: `app/assets/success-check.svg`\n"
+            "  - Source/license: provided by product team; MIT.\n\n"
+            "## Acceptance criteria\n"
+            "- The confirmation UI uses the provided success icon.\n\n"
+            "## Validation\n"
+            "- pytest\n"
+        )
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            task_id = state_store.list_tasks()[0]
+            state = state_store.load(task_id)
+            state.files_changed.append("app/assets/success-check.svg")
+            state.done = True
+            mock.run.return_value = state
+            return mock
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            cmd_run(_run_args(task_file=str(task_file), no_isolate=True), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "delivery asset target audits" not in out
+        exit_mock.assert_called_with(0)
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert len(state.implementation_asset_target_records) == 1
+        target_record = state.implementation_asset_target_records[0]
+        assert target_record["status"] == "matched"
+        assert target_record["requested_target"] == "app/assets/success-check.svg"
+        assert target_record["matched_path"] == "app/assets/success-check.svg"
+        assert "excerpt" not in target_record
+        assert any(entry["action"] == "asset_target_audit" for entry in state.history)
+
+    def test_task_file_no_isolate_warns_when_delivery_asset_target_missing(self, tmp_path: Path, capsys):
+        asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+        asset_path.parent.mkdir(parents=True)
+        asset_path.write_text("<svg viewBox='0 0 16 16'></svg>")
+        task_file = tmp_path / "task.md"
+        task_file.write_text(
+            "# Add success icon\n\n"
+            "## Scope\n"
+            "- Add the success icon to the confirmation UI.\n\n"
+            "## Assets\n\n"
+            "### Delivery assets\n\n"
+            "- Path: `.sikula/task-assets/success-check.svg`\n"
+            "  - Usage: delivery asset.\n"
+            "  - Target: `app/assets/success-check.svg`\n"
+            "  - Source/license: provided by product team; MIT.\n\n"
+            "## Acceptance criteria\n"
+            "- The confirmation UI uses the provided success icon.\n\n"
+            "## Validation\n"
+            "- pytest\n"
+        )
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            task_id = state_store.list_tasks()[0]
+            state = state_store.load(task_id)
+            state.files_changed.append("src/app.py")
+            state.done = True
+            mock.run.return_value = state
+            return mock
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            cmd_run(_run_args(task_file=str(task_file), no_isolate=True), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "delivery asset target audits: 1 warning(s)" in out
+        exit_mock.assert_called_with(0)
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert len(state.implementation_asset_target_records) == 1
+        target_record = state.implementation_asset_target_records[0]
+        assert target_record["status"] == "missing"
+        assert target_record["requested_target"] == "app/assets/success-check.svg"
+
     def test_task_file_no_isolate_records_contract_asset_hash_drift(self, tmp_path: Path, capsys):
         asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
         asset_path.parent.mkdir(parents=True)

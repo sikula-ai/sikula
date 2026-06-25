@@ -57,7 +57,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   generated implementation-contract asset manifests; runtime agent prompts now
   treat prepared asset manifests as delivery obligations, and fresh task-file
   runs record a non-blocking implementation asset metadata snapshot in task
-  state without run/resume hash enforcement yet.
+  state. Fresh runs and resumes record warning-only asset drift audit entries,
+  and successful task-file runs record warning-only delivery target audit entries
+  for explicit delivery asset targets without inferring platform-specific
+  conversions or blocking run/resume/review flows.
 - Task terminal summaries now include a platform-neutral audit report with validation status, review status, non-blocking audit warnings, and recovered issues such as validation failures fixed by the build/fix loop.
 - Failed validation records now include high-signal diagnostic summary lines, and task terminal summaries sample and deduplicate those lines across recovered build/test/check failures so successful self-healed runs still reveal the concrete compiler error, failed test, sanitized assertion failure, or linter rule that was repaired without echoing source-code frames or assertion values, with an explicit pointer to `sikula show` for full state details.
 - The test writer now more strongly prefers behavioural seams over broad source-inspection tests, especially for UI implementation details that cannot be meaningfully exercised by existing project test infrastructure.

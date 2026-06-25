@@ -231,6 +231,7 @@ class TestJsonStateStore:
         data.pop("final_summary", None)
         data.pop("implementation_contract", None)
         data.pop("implementation_asset_records", None)
+        data.pop("implementation_asset_target_records", None)
         data.pop("testability_gaps", None)
         data.pop("test_execution_gate_records", None)
         data.pop("build_loop_key", None)
@@ -245,6 +246,7 @@ class TestJsonStateStore:
         assert loaded.final_summary == {}
         assert loaded.implementation_contract == {}
         assert loaded.implementation_asset_records == []
+        assert loaded.implementation_asset_target_records == []
         assert loaded.testability_gaps == []
         assert loaded.test_execution_gate_records == []
         assert loaded.build_loop_key is None
@@ -335,6 +337,35 @@ class TestJsonStateStore:
             }
         ]
         assert state.history[-1]["action"] == "asset_drift"
+
+    def test_record_implementation_asset_targets_sanitizes_and_deduplicates_records(self):
+        state = TaskState(task_id="assettarget1", task_description="asset target task")
+
+        target_record = {
+            "path": ".sikula/task-assets/icon.svg",
+            "project_path": ".sikula/task-assets/icon.svg",
+            "kind": "delivery",
+            "phase": "completion",
+            "status": "missing",
+            "requested_target": "app/assets/icon.svg",
+            "matched_path": "",
+            "observed_at": "2026-06-25T10:00:00+00:00",
+            "excerpt": "raw source excerpt",
+        }
+        state.record_implementation_asset_targets([target_record, dict(target_record)])
+
+        assert state.implementation_asset_target_records == [
+            {
+                "path": ".sikula/task-assets/icon.svg",
+                "project_path": ".sikula/task-assets/icon.svg",
+                "kind": "delivery",
+                "phase": "completion",
+                "status": "missing",
+                "requested_target": "app/assets/icon.svg",
+                "observed_at": "2026-06-25T10:00:00+00:00",
+            }
+        ]
+        assert state.history[-1]["action"] == "asset_target_audit"
 
     def test_record_testability_gap_captures_scope_and_metadata(self):
         state = TaskState(
@@ -775,6 +806,18 @@ class TestJsonStateStore:
                 }
             ]
         )
+        state.record_implementation_asset_targets(
+            [
+                {
+                    "path": ".sikula/task-assets/icon.svg",
+                    "project_path": ".sikula/task-assets/icon.svg",
+                    "kind": "delivery",
+                    "phase": "completion",
+                    "status": "missing",
+                    "requested_target": "app/assets/icon.svg",
+                }
+            ]
+        )
         state.record("test_writer", "llm_retry", "temporary failure")
         state.record_validation("build", "success", elapsed_s=2.0)
         store.save(state)
@@ -797,6 +840,8 @@ class TestJsonStateStore:
         assert loaded.final_summary["implementation_asset_records_by_kind"] == {"reference": 1, "delivery": 1}
         assert loaded.final_summary["implementation_asset_warnings_count"] == 1
         assert loaded.final_summary["implementation_asset_drift_records_count"] == 1
+        assert loaded.final_summary["implementation_asset_target_records_count"] == 1
+        assert loaded.final_summary["implementation_asset_target_warnings_count"] == 1
         assert loaded.final_summary["planner_retries_count"] == 0
         assert loaded.final_summary["llm_retries"] == 1
 

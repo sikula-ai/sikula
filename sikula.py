@@ -2204,6 +2204,26 @@ def _record_snapshot_asset_drift(state, project_root: Path, store, *, phase: str
         store.save(state)
 
 
+def _record_asset_target_audit(state, project_root: Path, store, *, phase: str) -> None:
+    from core.task_asset_targets import audit_delivery_asset_targets
+
+    asset_records = getattr(state, "implementation_asset_records", [])
+    if not asset_records:
+        return
+    target_records = audit_delivery_asset_targets(
+        asset_records,
+        files_changed=getattr(state, "files_changed", []),
+        project_root=project_root,
+        phase=phase,
+    )
+    if not target_records:
+        return
+    before_count = len(getattr(state, "implementation_asset_target_records", []))
+    state.record_implementation_asset_targets(target_records)
+    if len(getattr(state, "implementation_asset_target_records", [])) != before_count:
+        store.save(state)
+
+
 def _contract_preflight_error_snapshot(task_path: Path, project_root: Path, error: Exception) -> dict:
     source_format = "text" if task_path.suffix.lower() == ".txt" else "markdown"
     return {
@@ -2588,6 +2608,15 @@ def _task_audit_warnings(state) -> list[str]:
     if asset_drift_records:
         warnings.append(f"asset drift audits: {len(asset_drift_records)} warning(s) (see: sikula show {state.task_id})")
 
+    asset_target_records = getattr(state, "implementation_asset_target_records", [])
+    asset_target_warning_count = sum(
+        1 for record in asset_target_records if record.get("status") in {"missing", "outside_project"}
+    )
+    if asset_target_warning_count:
+        warnings.append(
+            f"delivery asset target audits: {asset_target_warning_count} warning(s) (see: sikula show {state.task_id})"
+        )
+
     artifacts = getattr(state, "validation_artifact_records", [])
     if artifacts:
         cleaned = sum(1 for record in artifacts if record.get("status") == "cleaned")
@@ -2918,6 +2947,9 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
         raise AssertionError("unreachable — task_file/task_id check is in main()")
 
     total_s = time.time() - t_start
+    if state.done and not already_terminal:
+        project_root = Path(cfg.get("project", {}).get("root_path") or original_project_root)
+        _record_asset_target_audit(state, project_root, store, phase="completion")
 
     if worktree_base and state.done:
         if leave_current_worktree_before_finalize:
