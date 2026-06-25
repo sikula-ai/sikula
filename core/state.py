@@ -59,11 +59,27 @@ _IMPLEMENTATION_ASSET_STRING_KEYS = (
     "git_status",
     "requested_target",
     "source_license",
+    "declared_sha256",
 )
 _IMPLEMENTATION_ASSET_INT_KEYS = ("line", "size_bytes")
 _IMPLEMENTATION_ASSET_BOOL_KEYS = ("target_specified", "provenance_specified")
 _IMPLEMENTATION_ASSET_WARNING_STATUSES = {"missing", "outside_project", "not_file"}
 _IMPLEMENTATION_ASSET_WARNING_GIT_STATUSES = {"dirty", "ignored", "untracked"}
+_IMPLEMENTATION_ASSET_DRIFT_STRING_KEYS = (
+    "path",
+    "project_path",
+    "kind",
+    "phase",
+    "status",
+    "expected_source",
+    "expected_sha256",
+    "current_sha256",
+    "current_status",
+    "git_status",
+    "mime_type",
+    "observed_at",
+)
+_IMPLEMENTATION_ASSET_DRIFT_INT_KEYS = ("size_bytes",)
 
 
 def _sanitize_implementation_asset_record(record: dict) -> dict:
@@ -84,6 +100,35 @@ def _sanitize_implementation_asset_record(record: dict) -> dict:
         if isinstance(value, bool):
             sanitized[key] = value
     return sanitized
+
+
+def _sanitize_implementation_asset_drift_record(record: dict) -> dict:
+    sanitized: dict = {}
+    for key in _IMPLEMENTATION_ASSET_DRIFT_STRING_KEYS:
+        value = record.get(key)
+        if value is None:
+            continue
+        text = _short_text(str(value), limit=1000)
+        if text:
+            sanitized[key] = text
+    for key in _IMPLEMENTATION_ASSET_DRIFT_INT_KEYS:
+        value = record.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            sanitized[key] = value
+    return sanitized
+
+
+def _implementation_asset_drift_key(record: dict) -> tuple[str, str, str, str, str, str, str, str]:
+    return (
+        str(record.get("path") or "").strip(),
+        str(record.get("project_path") or "").strip(),
+        str(record.get("phase") or "").strip(),
+        str(record.get("status") or "").strip(),
+        str(record.get("expected_source") or "").strip(),
+        str(record.get("expected_sha256") or "").strip(),
+        str(record.get("current_sha256") or "").strip(),
+        str(record.get("current_status") or "").strip(),
+    )
 
 
 def _implementation_asset_kind_counts(records: list[dict]) -> dict:
@@ -179,6 +224,7 @@ def _final_summary(state: "TaskState") -> dict:
         "implementation_asset_records_count": len(state.implementation_asset_records),
         "implementation_asset_records_by_kind": _implementation_asset_kind_counts(state.implementation_asset_records),
         "implementation_asset_warnings_count": _implementation_asset_warning_count(state.implementation_asset_records),
+        "implementation_asset_drift_records_count": len(state.implementation_asset_drift_records),
         "analyst_retries_count": len(state.analyst_retry_records),
         "planner_retries_count": len(state.planner_retry_records),
         "llm_retries": sum(1 for entry in state.history if entry.get("action") == "llm_retry"),
@@ -238,6 +284,7 @@ class TaskState:
     config_snapshot: dict = field(default_factory=dict)
     implementation_contract: dict = field(default_factory=dict)
     implementation_asset_records: list[dict] = field(default_factory=list)
+    implementation_asset_drift_records: list[dict] = field(default_factory=list)
     contract_gate_blocked: bool = False
     analyst_prompt: Optional[str] = None
     planner_prompt: Optional[str] = None
@@ -340,6 +387,25 @@ class TaskState:
         self.implementation_asset_records = sanitized
         if sanitized:
             self.record("orchestrator", "asset_snapshot", f"{len(sanitized)} implementation asset reference(s)")
+
+    def record_implementation_asset_drift(self, records: list[dict]) -> None:
+        sanitized = []
+        existing_keys = {_implementation_asset_drift_key(record) for record in self.implementation_asset_drift_records}
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            sanitized_record = _sanitize_implementation_asset_drift_record(record)
+            if not sanitized_record:
+                continue
+            key = _implementation_asset_drift_key(sanitized_record)
+            if key in existing_keys:
+                continue
+            existing_keys.add(key)
+            sanitized.append(sanitized_record)
+        if not sanitized:
+            return
+        self.implementation_asset_drift_records.extend(sanitized)
+        self.record("orchestrator", "asset_drift", f"{len(sanitized)} implementation asset drift warning(s)")
 
     def record_analyst_retry(
         self,

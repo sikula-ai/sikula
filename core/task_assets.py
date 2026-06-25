@@ -46,6 +46,7 @@ class AssetReference:
     provenance_specified: bool = False
     source_license: str = ""
     sha256: str = ""
+    declared_sha256: str = ""
     size_bytes: int | None = None
     mime_type: str = ""
     git_status: str = ""
@@ -60,6 +61,7 @@ class AssetReference:
             ("provenance_specified", self.provenance_specified if self.provenance_specified else None),
             ("source_license", self.source_license),
             ("sha256", self.sha256),
+            ("declared_sha256", self.declared_sha256),
             ("size_bytes", self.size_bytes),
             ("mime_type", self.mime_type),
             ("git_status", self.git_status),
@@ -85,6 +87,7 @@ class _StructuredAssetDeclaration:
     requested_target: str = ""
     provenance_specified: bool = False
     source_license: str = ""
+    declared_sha256: str = ""
 
 
 def _answer_text(answer: dict[str, Any] | None) -> str:
@@ -118,6 +121,7 @@ _ASSET_PATH_FIELD_LABEL_KINDS = {
 _ASSET_USAGE_FIELD_LABELS = {"usage", "use"}
 _ASSET_TARGET_FIELD_LABELS = {"target", "target path", "destination", "destination path", "requested target"}
 _ASSET_PROVENANCE_FIELD_LABELS = {"source/license", "source license", "license", "licence", "provenance"}
+_ASSET_HASH_FIELD_LABELS = {"sha-256", "sha 256", "sha256"}
 _ASSET_STRUCTURED_ROOT_HEADINGS = {"asset", "assets", "task asset", "task assets", "asset manifest"}
 _ASSET_ROOT_SECTION_HEADINGS = {
     "asset",
@@ -968,6 +972,7 @@ def detect_asset_references(
             requested_target=declaration.requested_target,
             provenance_specified=declaration.provenance_specified,
             source_license=declaration.source_license,
+            declared_sha256=declaration.declared_sha256,
         )
         if reference is None:
             continue
@@ -1104,6 +1109,7 @@ def _parse_structured_asset_declarations(text: str, *, document_kind: str = "all
         )
         requested_target = metadata.get("requested_target", "")
         source_license = metadata.get("source_license", "")
+        declared_sha256 = metadata.get("declared_sha256", "")
         declarations.append(
             _StructuredAssetDeclaration(
                 path=path,
@@ -1114,6 +1120,7 @@ def _parse_structured_asset_declarations(text: str, *, document_kind: str = "all
                 requested_target=requested_target,
                 provenance_specified=bool(source_license),
                 source_license=source_license,
+                declared_sha256=declared_sha256,
             )
         )
     return declarations
@@ -1132,6 +1139,8 @@ def _structured_asset_item_metadata(lines: list[str]) -> dict[str, str]:
             metadata.setdefault("requested_target", _asset_path_metadata_value(value) or "")
         elif label in _ASSET_PROVENANCE_FIELD_LABELS:
             metadata.setdefault("source_license", _structured_asset_text_value(value))
+        elif label in _ASSET_HASH_FIELD_LABELS:
+            metadata.setdefault("declared_sha256", _structured_asset_sha256_value(value))
     return metadata
 
 
@@ -1180,6 +1189,11 @@ def _structured_asset_text_value(value: str) -> str:
     cleaned = _single_line(value).strip()
     cleaned = cleaned.strip("`\"'")
     return cleaned.strip()
+
+
+def _structured_asset_sha256_value(value: str) -> str:
+    match = re.search(r"\bsha256:[0-9a-fA-F]{64}\b", value)
+    return match.group(0).lower() if match else ""
 
 
 def _structured_asset_section_kind(heading_stack: list[tuple[int, str]], *, document_kind: str = "all") -> str:
@@ -1412,6 +1426,7 @@ def _merge_asset_reference(existing: dict[str, Any], update: dict[str, Any]) -> 
         "source_license",
         "mime_type",
         "sha256",
+        "declared_sha256",
         "size_bytes",
         "git_status",
     ):
@@ -1497,6 +1512,7 @@ def _asset_reference_metadata(
     requested_target: str | None = None,
     provenance_specified: bool = False,
     source_license: str | None = None,
+    declared_sha256: str | None = None,
 ) -> dict[str, Any] | None:
     requested_path = Path(path_text)
     candidate_path = requested_path if requested_path.is_absolute() else project_root / requested_path
@@ -1508,6 +1524,7 @@ def _asset_reference_metadata(
     raw_paths = [raw_path] if raw_path and raw_path != path_text else []
     requested_target = requested_target or ""
     source_license = source_license or ""
+    declared_sha256 = declared_sha256 or ""
 
     if not project_path:
         return AssetReference(
@@ -1520,6 +1537,7 @@ def _asset_reference_metadata(
             requested_target=requested_target,
             provenance_specified=provenance_specified,
             source_license=source_license or "",
+            declared_sha256=declared_sha256,
         ).to_dict(include_internal=True)
 
     if not resolved_path.exists():
@@ -1534,6 +1552,7 @@ def _asset_reference_metadata(
             requested_target=requested_target,
             provenance_specified=provenance_specified,
             source_license=source_license or "",
+            declared_sha256=declared_sha256,
         ).to_dict(include_internal=True)
     if not resolved_path.is_file():
         return AssetReference(
@@ -1547,6 +1566,7 @@ def _asset_reference_metadata(
             requested_target=requested_target,
             provenance_specified=provenance_specified,
             source_license=source_license or "",
+            declared_sha256=declared_sha256,
         ).to_dict(include_internal=True)
 
     mime_type, _encoding = mimetypes.guess_type(resolved_path.name)
@@ -1561,6 +1581,7 @@ def _asset_reference_metadata(
         requested_target=requested_target,
         provenance_specified=provenance_specified,
         source_license=source_license or "",
+        declared_sha256=declared_sha256,
         sha256=_file_sha256(resolved_path),
         size_bytes=resolved_path.stat().st_size,
         mime_type=mime_type or "",
@@ -1645,6 +1666,27 @@ def _git_command(project_root: Path, *args: str) -> subprocess.CompletedProcess[
 
 def asset_project_root(source_path: Path | str | None, project_config: dict | None) -> Path:
     return _asset_project_root(source_path, project_config)
+
+
+def current_asset_reference_metadata(reference: dict[str, Any], *, project_root: Path) -> dict[str, Any] | None:
+    """Return current filesystem metadata for a previously detected asset reference."""
+
+    path_text = str(reference.get("project_path") or reference.get("path") or "").strip()
+    if not path_text:
+        return None
+    line = reference.get("line")
+    line_number = line if isinstance(line, int) and not isinstance(line, bool) else 0
+    return _asset_reference_metadata(
+        path_text,
+        project_root=project_root,
+        line_number=line_number,
+        kind=str(reference.get("kind") or AssetKind.AMBIGUOUS.value),
+        target_specified=bool(reference.get("target_specified")),
+        requested_target=str(reference.get("requested_target") or ""),
+        provenance_specified=bool(reference.get("provenance_specified")),
+        source_license=str(reference.get("source_license") or ""),
+        declared_sha256=str(reference.get("declared_sha256") or ""),
+    )
 
 
 def replace_unresolved_asset_reference_paths(

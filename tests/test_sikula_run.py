@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+from hashlib import sha256
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -715,6 +716,105 @@ class TestCmdRunStateStore:
         assert "_raw_paths" not in asset_record
         assert "excerpt" not in asset_record
         assert any(entry["action"] == "asset_snapshot" for entry in state.history)
+
+    def test_task_file_no_isolate_records_contract_asset_hash_drift(self, tmp_path: Path, capsys):
+        asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+        asset_path.parent.mkdir(parents=True)
+        asset_path.write_text("<svg />", encoding="utf-8")
+        expected_sha = "sha256:" + sha256(asset_path.read_bytes()).hexdigest()
+        asset_path.write_text("<svg><path /></svg>", encoding="utf-8")
+        current_sha = "sha256:" + sha256(asset_path.read_bytes()).hexdigest()
+        task_file = tmp_path / "task.contract.md"
+        task_file.write_text(
+            "# Add success icon\n\n"
+            "## Scope\n"
+            "- Add the success icon to the confirmation UI.\n\n"
+            "## Asset manifest\n\n"
+            "### Delivery assets\n\n"
+            "- Path: `.sikula/task-assets/success-check.svg`\n"
+            f"  - SHA-256: `{expected_sha}`\n"
+            "  - Usage: delivery asset.\n"
+            "  - Source/license: provided by product team; MIT.\n\n"
+            "## Acceptance criteria\n"
+            "- The confirmation UI uses the provided success icon.\n\n"
+            "## Validation\n"
+            "- pytest\n"
+        )
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            task_id = state_store.list_tasks()[0]
+            state = state_store.load(task_id)
+            state.done = True
+            mock.run.return_value = state
+            return mock
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            cmd_run(_run_args(task_file=str(task_file), no_isolate=True), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "asset drift audits: 1 warning(s)" in out
+        exit_mock.assert_called_with(0)
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert len(state.implementation_asset_drift_records) == 1
+        drift = state.implementation_asset_drift_records[0]
+        assert drift["phase"] == "run_start"
+        assert drift["status"] == "changed"
+        assert drift["expected_source"] == "asset_manifest"
+        assert drift["expected_sha256"] == expected_sha
+        assert drift["current_sha256"] == current_sha
+        assert "excerpt" not in drift
+
+    def test_task_id_resume_records_asset_snapshot_drift(self, tmp_path: Path, capsys):
+        asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+        asset_path.parent.mkdir(parents=True)
+        asset_path.write_text("<svg />", encoding="utf-8")
+        expected_sha = "sha256:" + sha256(asset_path.read_bytes()).hexdigest()
+        asset_path.write_text("<svg><path /></svg>", encoding="utf-8")
+        current_sha = "sha256:" + sha256(asset_path.read_bytes()).hexdigest()
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = store.create("resume asset drift")
+        state.implementation_asset_records = [
+            {
+                "path": ".sikula/task-assets/success-check.svg",
+                "project_path": ".sikula/task-assets/success-check.svg",
+                "kind": "delivery",
+                "status": "available",
+                "sha256": expected_sha,
+                "source_license": "provided by product team; MIT.",
+            }
+        ]
+        store.save(state)
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            resumed = state_store.load(state.task_id)
+            resumed.done = True
+            mock.run.return_value = resumed
+            return mock
+
+        with (
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            cmd_run(_run_args(task_id=state.task_id), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "asset drift audits: 1 warning(s)" in out
+        exit_mock.assert_called_with(0)
+        loaded = store.load(state.task_id)
+        assert len(loaded.implementation_asset_drift_records) == 1
+        drift = loaded.implementation_asset_drift_records[0]
+        assert drift["phase"] == "resume"
+        assert drift["status"] == "changed"
+        assert drift["expected_source"] == "task_state_snapshot"
+        assert drift["expected_sha256"] == expected_sha
+        assert drift["current_sha256"] == current_sha
 
     def test_task_file_contract_preflight_uses_cli_phase_overrides(self, tmp_path: Path):
         task_file = tmp_path / "task.md"

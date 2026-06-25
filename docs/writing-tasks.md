@@ -308,8 +308,10 @@ resolve a missing asset reference.
 
 Fresh task-file runs also copy the prepared asset metadata into task state as a
 non-blocking audit snapshot. This makes asset usage easier to inspect later, but
-Sikula does not yet fail or resume-block a task when an asset hash changes after
-the contract was prepared.
+Sikula does not fail or resume-block a task when an asset hash changes after the
+contract was prepared. Instead, fresh runs and resumes record warning-only asset
+drift audit entries so a human reviewer can see that delivery used a different
+asset version than the prepared contract or original run snapshot.
 
 ## Feature Example
 
