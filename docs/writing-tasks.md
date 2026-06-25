@@ -313,6 +313,13 @@ contract was prepared. Instead, fresh runs and resumes record warning-only asset
 drift audit entries so a human reviewer can see that delivery used a different
 asset version than the prepared contract or original run snapshot.
 
+When a delivery asset includes an explicit target path, successful task-file
+runs also record a warning-only target audit. The audit only checks exact
+project-relative targets: whether the target was changed during the run, already
+exists unchanged, is missing, points outside the project, or was not specified.
+It does not infer platform-specific conversions such as SVG-to-vector XML or
+image-set generation, and it never blocks run, resume, or review flows.
+
 ## Feature Example
 
 ```md
