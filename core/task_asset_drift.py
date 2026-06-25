@@ -46,7 +46,10 @@ def detect_snapshot_asset_drift(
         expected_sha256 = _normalized_sha256(record.get("sha256"))
         if not expected_sha256:
             continue
-        current_record = current_asset_reference_metadata(record, project_root=project_root)
+        try:
+            current_record = current_asset_reference_metadata(record, project_root=project_root)
+        except Exception:
+            current_record = {"status": "unavailable"}
         finding = _drift_record(
             record,
             current_record=current_record,
