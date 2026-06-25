@@ -2177,6 +2177,33 @@ def _contract_preflight_asset_records(result) -> list[dict]:
     return [dict(reference) for reference in getattr(result, "asset_references", []) if isinstance(reference, dict)]
 
 
+def _record_contract_asset_drift(state, asset_records: list[dict], store, *, phase: str) -> None:
+    from core.task_asset_drift import detect_declared_asset_hash_drift
+
+    drift_records = detect_declared_asset_hash_drift(asset_records, phase=phase)
+    if not drift_records:
+        return
+    before_count = len(getattr(state, "implementation_asset_drift_records", []))
+    state.record_implementation_asset_drift(drift_records)
+    if len(getattr(state, "implementation_asset_drift_records", [])) != before_count:
+        store.save(state)
+
+
+def _record_snapshot_asset_drift(state, project_root: Path, store, *, phase: str) -> None:
+    from core.task_asset_drift import detect_snapshot_asset_drift
+
+    asset_records = getattr(state, "implementation_asset_records", [])
+    if not asset_records:
+        return
+    drift_records = detect_snapshot_asset_drift(asset_records, project_root=project_root, phase=phase)
+    if not drift_records:
+        return
+    before_count = len(getattr(state, "implementation_asset_drift_records", []))
+    state.record_implementation_asset_drift(drift_records)
+    if len(getattr(state, "implementation_asset_drift_records", [])) != before_count:
+        store.save(state)
+
+
 def _contract_preflight_error_snapshot(task_path: Path, project_root: Path, error: Exception) -> dict:
     source_format = "text" if task_path.suffix.lower() == ".txt" else "markdown"
     return {
@@ -2557,6 +2584,10 @@ def _task_audit_warnings(state) -> list[str]:
             f"synthetic test harness audits: {len(active_synthetic_records)} active (see: sikula show {state.task_id})"
         )
 
+    asset_drift_records = getattr(state, "implementation_asset_drift_records", [])
+    if asset_drift_records:
+        warnings.append(f"asset drift audits: {len(asset_drift_records)} warning(s) (see: sikula show {state.task_id})")
+
     artifacts = getattr(state, "validation_artifact_records", [])
     if artifacts:
         cleaned = sum(1 for record in artifacts if record.get("status") == "cleaned")
@@ -2792,6 +2823,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
             task_path, preflight_cfg, original_project_root
         )
         state.record_implementation_assets(implementation_asset_records)
+        _record_contract_asset_drift(state, implementation_asset_records, store, phase="run_start")
         state.record("orchestrator", "contract_check", _contract_preflight_record_result(state.implementation_contract))
         store.save(state)
         _print_contract_preflight_summary(state.implementation_contract)
@@ -2829,6 +2861,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
             state.worktree_path = str(worktree_project_root)
             state.worktree_base = str(worktree_base)
             state.worktree_branch = branch
+            _record_snapshot_asset_drift(state, worktree_project_root, store, phase="worktree_start")
             store.save(state)
             log.info("Worktree created: %s (branch: %s)", worktree_base, branch)
             cfg["project"]["root_path"] = str(worktree_project_root)
@@ -2864,6 +2897,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
                 if _path_is_within(Path.cwd(), worktree_base):
                     leave_current_worktree_before_finalize = True
                 cfg["project"]["root_path"] = str(wt)
+                _record_snapshot_asset_drift(state, wt, store, phase="resume")
             else:
                 print(f"Worktree no longer exists: {wt}")
                 print("Delete the task state and re-run with --task-file, or restore the worktree manually.")
@@ -2873,6 +2907,9 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
             print("It was likely cleaned up already, so it cannot be resumed safely.")
             print(f"Use 'sikula show {args.task_id}' for audit, or start a new task with --task-file.")
             sys.exit(1)
+        elif not already_terminal:
+            project_root = Path(cfg.get("project", {}).get("root_path") or original_project_root)
+            _record_snapshot_asset_drift(state, project_root, store, phase="resume")
 
         orch = build_orchestrator(cfg, overrides, state_store=store)
         state = orch.run(task_id=args.task_id)

@@ -267,6 +267,7 @@ class TestJsonStateStore:
                     "provenance_specified": True,
                     "source_license": "provided by product team; MIT.",
                     "sha256": "sha256:abc",
+                    "declared_sha256": "sha256:old",
                     "mime_type": "image/svg+xml",
                     "git_status": "tracked",
                     "_raw_paths": [".sikula/task-assets/icon.svg"],
@@ -288,11 +289,52 @@ class TestJsonStateStore:
                 "provenance_specified": True,
                 "source_license": "provided by product team; MIT.",
                 "sha256": "sha256:abc",
+                "declared_sha256": "sha256:old",
                 "mime_type": "image/svg+xml",
                 "git_status": "tracked",
             }
         ]
         assert state.history[-1]["action"] == "asset_snapshot"
+
+    def test_record_implementation_asset_drift_sanitizes_and_deduplicates_records(self):
+        state = TaskState(task_id="assetdrift1", task_description="asset drift task")
+
+        drift_record = {
+            "path": ".sikula/task-assets/icon.svg",
+            "project_path": ".sikula/task-assets/icon.svg",
+            "kind": "delivery",
+            "phase": "resume",
+            "status": "changed",
+            "expected_source": "task_state_snapshot",
+            "expected_sha256": "sha256:old",
+            "current_sha256": "sha256:new",
+            "current_status": "available",
+            "git_status": "dirty",
+            "mime_type": "image/svg+xml",
+            "size_bytes": 42,
+            "observed_at": "2026-06-25T10:00:00+00:00",
+            "excerpt": "raw source excerpt",
+        }
+        state.record_implementation_asset_drift([drift_record, dict(drift_record)])
+
+        assert state.implementation_asset_drift_records == [
+            {
+                "path": ".sikula/task-assets/icon.svg",
+                "project_path": ".sikula/task-assets/icon.svg",
+                "kind": "delivery",
+                "phase": "resume",
+                "status": "changed",
+                "expected_source": "task_state_snapshot",
+                "expected_sha256": "sha256:old",
+                "current_sha256": "sha256:new",
+                "current_status": "available",
+                "git_status": "dirty",
+                "mime_type": "image/svg+xml",
+                "observed_at": "2026-06-25T10:00:00+00:00",
+                "size_bytes": 42,
+            }
+        ]
+        assert state.history[-1]["action"] == "asset_drift"
 
     def test_record_testability_gap_captures_scope_and_metadata(self):
         state = TaskState(
@@ -718,6 +760,21 @@ class TestJsonStateStore:
                 },
             ]
         )
+        state.record_implementation_asset_drift(
+            [
+                {
+                    "path": ".sikula/task-assets/icon.svg",
+                    "project_path": ".sikula/task-assets/icon.svg",
+                    "kind": "delivery",
+                    "phase": "resume",
+                    "status": "changed",
+                    "expected_source": "task_state_snapshot",
+                    "expected_sha256": "sha256:old",
+                    "current_sha256": "sha256:new",
+                    "current_status": "available",
+                }
+            ]
+        )
         state.record("test_writer", "llm_retry", "temporary failure")
         state.record_validation("build", "success", elapsed_s=2.0)
         store.save(state)
@@ -739,6 +796,7 @@ class TestJsonStateStore:
         assert loaded.final_summary["implementation_asset_records_count"] == 2
         assert loaded.final_summary["implementation_asset_records_by_kind"] == {"reference": 1, "delivery": 1}
         assert loaded.final_summary["implementation_asset_warnings_count"] == 1
+        assert loaded.final_summary["implementation_asset_drift_records_count"] == 1
         assert loaded.final_summary["planner_retries_count"] == 0
         assert loaded.final_summary["llm_retries"] == 1
 

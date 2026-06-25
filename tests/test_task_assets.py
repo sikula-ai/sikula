@@ -116,6 +116,31 @@ def test_task_description_asset_manifest_section_detection_allows_product_manife
     assert task_description_has_asset_manifest_section(markdown) is False
 
 
+def test_detect_asset_references_preserves_declared_asset_manifest_hash(tmp_path: Path):
+    asset_path = tmp_path / ".sikula" / "task-assets" / "icon.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg><path /></svg>", encoding="utf-8")
+    expected_sha = "sha256:" + sha256(b"original").hexdigest()
+    current_sha = "sha256:" + sha256(asset_path.read_bytes()).hexdigest()
+    markdown = f"""# Add success icon
+
+## Asset manifest
+
+### Delivery assets
+
+- Path: `.sikula/task-assets/icon.svg`
+  - SHA-256: `{expected_sha}`
+  - Usage: delivery asset.
+  - Source/license: provided by product team.
+"""
+
+    references = _references_by_path(markdown, tmp_path)
+
+    assert references[".sikula/task-assets/icon.svg"]["declared_sha256"] == expected_sha
+    assert references[".sikula/task-assets/icon.svg"]["sha256"] == current_sha
+    assert current_sha != expected_sha
+
+
 def test_detect_asset_references_reads_structured_reference_and_delivery_assets(tmp_path: Path):
     reference_path = tmp_path / ".sikula" / "task-assets" / "login-spacing-bug.png"
     delivery_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
