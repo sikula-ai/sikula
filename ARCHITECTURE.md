@@ -1058,8 +1058,8 @@ not trigger another test-writing loop.
 | Error type | `allowed_write_paths` used in prompt | Test files |
 |---|---|---|
 | Build errors (`state.errors` non-empty) | `sandbox.allowed_write_paths` (production dirs) | Off-limits |
-| Build/check errors whose diagnostic references all point at test files or recognized test targets | First pass: `sandbox.allowed_test_write_paths`. Retry pass: same test-only write paths, only after the first pass violated scope and Sikula restored that pass's writes. Second production-enabled pass, only after no-change `production_defect` + `production_code` triage: `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May repair malformed/stale tests in the first pass. Production writes during a test-only pass are rejected: Sikula restores that pass's writes and retries once; a restore failure or second scope violation fails the task. If diagnostics name production paths or targets too, or name no paths or recognized targets at all, Sikula falls back to the normal build/check scope. |
-| Test failures only (`state.test_errors` non-empty, `state.errors` and `state.check_errors` both empty) | First pass: `sandbox.allowed_test_write_paths`. Retry pass: same test-only write paths, only after the first pass violated scope and Sikula restored that pass's writes. Second production-enabled pass, only after no-change `production_defect` + `production_code` triage: `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May repair malformed/stale tests in the first pass. If the failing test encodes the original task, implementation prompt, project guidelines, or a structured contract, the test-only pass must report a production defect without changing files so the separate production-enabled pass can fix it. Production writes during a test-only pass are rejected with the same restore-and-retry behaviour as test-origin validation failures. |
+| Build/check errors whose diagnostic references all point at test files or recognized test targets | First pass: `sandbox.allowed_test_write_paths`. Retry pass: same test-only write paths, only after the first pass violated scope and Sikula restored that pass's writes. Second production-enabled pass, after a triage that classifies any failure as `production_defect` (and did not explicitly choose `test_code`): `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths`. Test-only writes may be kept before this pass only when separate `stale_test`/`malformed_test` triage explicitly authorizes `test_code`; otherwise a production-defect triage must not change files before the confirmed pass. | May repair malformed/stale tests in the first pass. Production writes during a test-only pass are rejected: Sikula restores that pass's writes and retries once; a restore failure or second scope violation fails the task. If diagnostics name production paths or targets too, or name no paths or recognized targets at all, Sikula falls back to the normal build/check scope. |
+| Test failures only (`state.test_errors` non-empty, `state.errors` and `state.check_errors` both empty) | First pass: `sandbox.allowed_test_write_paths`. Retry pass: same test-only write paths, only after the first pass violated scope and Sikula restored that pass's writes. Second production-enabled pass, after a triage that classifies any failure as `production_defect` (and did not explicitly choose `test_code`): `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths`. Test-only writes may be kept before this pass only when separate `stale_test`/`malformed_test` triage explicitly authorizes `test_code`; otherwise a production-defect triage must not change files before the confirmed pass. | May repair malformed/stale tests in the first pass. If the failing test encodes the original task, implementation prompt, project guidelines, or a structured contract, the test-only pass must report a production defect without changing files unless a separate triage block authorizes an actual malformed/stale test repair. Production writes during a test-only pass are rejected with the same restore-and-retry behaviour as test-origin validation failures. |
 | Check errors only (`state.check_errors` non-empty, `state.errors` empty) | `sandbox.allowed_write_paths` + `sandbox.allowed_test_write_paths` | May modify production or test files if explicitly named in the check errors |
 
 **Input:**
@@ -1089,11 +1089,17 @@ allowed outputs for that pass. The fixer must not delete, relax, or rewrite asse
 make the run green. Its final response for these test-origin failures must begin with
 `TEST FAILURE TRIAGE`, classifying the failure as `production_defect`, `stale_test`,
 `malformed_test`, or `unclear`, naming the affected contract when present, and stating whether
-the chosen fix is production code or test code. If it chooses `production_code`, it must leave
-files unchanged; Sikula then runs a second production-enabled fixer pass and records both
-passes. If a test-only pass writes production files, or reports `production_code` while
-changing files, Sikula treats the attempt as tainted: it restores every write from that
-attempt to the pre-attempt worktree snapshot, records `test_only_scope_violation`, and
+the chosen fix is production code or test code (`chosen_fix` must be `production_code` or
+`test_code`, never `none`). When several independent failures are reported it emits one block
+per failure. If any block classifies a `production_defect` (and did not explicitly choose
+`test_code`), Sikula runs a second production-enabled fixer pass after the test-only pass and
+records both. A pass may legitimately repair a `stale_test`/`malformed_test` in test files *and*
+defer a separate `production_defect` to that confirmed pass; those authorized test-only writes are
+kept and merged into the change set so the production change still re-runs the full review. If a
+test-only pass writes production files, or requests a production fix while changing files that no
+block authorizes as a test fix, Sikula treats the attempt as tainted: it restores every
+write from that attempt to the pre-attempt worktree snapshot, records
+`test_only_scope_violation`, and
 retries the test-only pass once with explicit recovery context. A restore failure, a second
 test-only scope violation, or a production-confirmed second pass that changes only tests marks
 the task failed before the pipeline can accept the change.

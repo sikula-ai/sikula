@@ -5,8 +5,9 @@ from __future__ import annotations
 import re
 
 DEFAULT_DIAGNOSTIC_LIMIT = 4000
-DEFAULT_DIAGNOSTIC_SUMMARY_LINES = 8
+DEFAULT_DIAGNOSTIC_SUMMARY_LINES = 10
 DEFAULT_DIAGNOSTIC_SUMMARY_LINE_LIMIT = 260
+_MAX_DIAGNOSTIC_RANGES = 4
 
 _TRUNCATED = "\n... [truncated] ...\n"
 _TRUNCATED_BEFORE_DIAGNOSTICS = "\n... [truncated before diagnostics] ...\n"
@@ -239,8 +240,8 @@ def _diagnostic_blocks(text: str, context_lines: int) -> str:
         else:
             ranges.append((start, end))
 
-    if len(ranges) > 4:
-        ranges = ranges[:2] + ranges[-2:]
+    if len(ranges) > _MAX_DIAGNOSTIC_RANGES:
+        ranges = _select_highest_signal_ranges(lines, ranges, _MAX_DIAGNOSTIC_RANGES)
 
     parts: list[str] = []
     for start, end in ranges:
@@ -248,6 +249,30 @@ def _diagnostic_blocks(text: str, context_lines: int) -> str:
             parts.append(_DIAGNOSTIC_OMITTED)
         parts.append("".join(lines[start:end]))
     return "".join(parts)
+
+
+def _select_highest_signal_ranges(
+    lines: list[str], ranges: list[tuple[int, int]], max_keep: int
+) -> list[tuple[int, int]]:
+    """Keep the highest-signal diagnostic ranges instead of purely positional ones.
+
+    Verbose build logs (for example Gradle) emit many low-signal ``> Task ... FAILED``
+    markers around the one range that carries the real compiler/test diagnostic. Keeping
+    purely the first and last ranges by position can drop that range when it sits in the
+    middle. Rank ranges by their peak diagnostic score and break ties by proximity to the
+    output ends, so equal-signal logs still preserve the leading and trailing context
+    (matching the previous first-two/last-two behaviour). Selection stays platform-neutral
+    because it reuses the generic line scorer. Output order remains positional.
+    """
+    n = len(ranges)
+    ordered: list[tuple[int, int, int]] = []
+    for idx, (start, end) in enumerate(ranges):
+        score = max((_diagnostic_score(lines[i]) for i in range(start, end)), default=0)
+        distance_to_end = min(idx, n - 1 - idx)
+        ordered.append((-score, distance_to_end, idx))
+    ordered.sort()
+    keep_indexes = sorted(item[2] for item in ordered[:max_keep])
+    return [ranges[i] for i in keep_indexes]
 
 
 def _is_diagnostic_line(line: str) -> bool:
@@ -415,7 +440,7 @@ def _compose_diagnostic_excerpt(text: str, diagnostic: str, limit: int) -> str:
     if diagnostic_budget <= 0:
         return _head_tail(diagnostic, limit)
 
-    diagnostic_part = _head_tail(diagnostic, diagnostic_budget) if len(diagnostic) > diagnostic_budget else diagnostic
+    diagnostic_part = _truncate_diagnostic(diagnostic, diagnostic_budget)
 
     parts: list[str] = []
     if head_budget:
@@ -428,6 +453,45 @@ def _compose_diagnostic_excerpt(text: str, diagnostic: str, limit: int) -> str:
     if len(result) <= limit:
         return result
     return _head_tail(diagnostic, limit)
+
+
+def _truncate_diagnostic(diagnostic: str, budget: int) -> str:
+    """Truncate the extracted diagnostic to ``budget`` while keeping the primary error.
+
+    A plain head/tail truncation drops the middle, which is exactly where the highest-signal
+    compiler/test line (for example a ``e: file:line:col`` or ``error TS...``) often sits when a
+    verbose build log surrounds it with low-signal task chatter. When such a primary line exists,
+    centre the retained window on it; otherwise fall back to head/tail. Platform-neutral: the
+    primary line is identified with the generic line scorer.
+    """
+    if len(diagnostic) <= budget:
+        return diagnostic
+    focus = _primary_focus_offset(diagnostic)
+    if focus is None:
+        return _head_tail(diagnostic, budget)
+    return _window_around(diagnostic, focus, budget)
+
+
+def _primary_focus_offset(text: str) -> int | None:
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        if _diagnostic_score(line) >= 100:
+            return offset
+        offset += len(line)
+    return None
+
+
+def _window_around(text: str, focus: int, budget: int) -> str:
+    marker = _TRUNCATED
+    if budget <= 2 * len(marker) + 10:
+        return _head_tail(text, budget)
+    inner = budget - 2 * len(marker)
+    start = max(0, focus - inner // 4)
+    end = min(len(text), start + inner)
+    start = max(0, end - inner)
+    prefix = marker if start > 0 else ""
+    suffix = marker if end < len(text) else ""
+    return prefix + text[start:end] + suffix
 
 
 def _head_tail(text: str, limit: int) -> str:

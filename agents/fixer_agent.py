@@ -91,8 +91,14 @@ _TEST_ORIGIN_VALIDATION_CONSTRAINT = """\
   classification: production_defect | stale_test | malformed_test | unclear
   contract_affected: <task/guideline/structured contract, or none>
   chosen_fix: production_code | test_code
-- If the failure exposes a production defect, choose `production_code`, explain the defect,
-  and leave files unchanged; Sikula will run a separate production-enabled fixer pass
+- `chosen_fix` must be exactly `production_code` or `test_code` — never `none`, `unclear`, or
+  blank. If the failure exposes a production defect, set `classification: production_defect` and
+  `chosen_fix: production_code`, explain the defect, and leave files unchanged; Sikula will run a
+  separate production-enabled fixer pass
+- If several independent failures are reported, emit one `TEST FAILURE TRIAGE:` block per failure
+  (repeat the header for each). If ANY block is a `production_defect`, Sikula routes to the
+  production-enabled pass — do not downgrade it to `none` or `unclear` because another failure in
+  the same batch is harder to classify
 - If a test encodes the original task, implementation prompt, project guidelines, or a structured
   input/output contract, do not weaken the test
 - Modify tests only when the test is malformed, stale, or inconsistent with the accepted contract
@@ -155,8 +161,14 @@ _TEST_TEST_CONSTRAINT = """\
   classification: production_defect | stale_test | malformed_test | unclear
   contract_affected: <task/guideline/structured contract, or none>
   chosen_fix: production_code | test_code
-- If the failing test exposes a production defect, choose `production_code`, explain the
-  defect, and leave files unchanged; Sikula will run a separate production-enabled fixer pass
+- `chosen_fix` must be exactly `production_code` or `test_code` — never `none`, `unclear`, or
+  blank. If the failing test exposes a production defect, set `classification: production_defect`
+  and `chosen_fix: production_code`, explain the defect, and leave files unchanged; Sikula will
+  run a separate production-enabled fixer pass
+- If several independent failures are reported, emit one `TEST FAILURE TRIAGE:` block per failure
+  (repeat the header for each). If ANY block is a `production_defect`, Sikula routes to the
+  production-enabled pass — do not downgrade it to `none` or `unclear` because another failure in
+  the same batch is harder to classify
 - If a test encodes the original task, implementation prompt, project guidelines, or a structured
   input/output contract, do not weaken the test
 - Modify tests only when the test is malformed, stale, or inconsistent with the accepted contract
@@ -686,13 +698,58 @@ def _triage_field(output: str, field: str) -> str:
     return ""
 
 
+_TRIAGE_HEADER_RE = re.compile(r"test failure triage\b", re.IGNORECASE)
+
+
+def _triage_blocks(output: str) -> list[dict[str, str]]:
+    """Split fixer output into triage blocks, one per TEST FAILURE TRIAGE header.
+
+    The fixer is asked to emit a single ``TEST FAILURE TRIAGE:`` block, but when it faces
+    several independent failures it naturally emits one block per failure with varied headers
+    (``TEST FAILURE TRIAGE — Failure 1``, markdown bold, etc.). Parsing only the first
+    ``classification:``/``chosen_fix:`` line then masks a production defect reported in a
+    later block. Scan each header-delimited block independently. Returns the canonical
+    ``classification``/``chosen_fix`` field of each block (empty string when absent).
+    """
+    lines = output.splitlines()
+    header_indexes = [index for index, line in enumerate(lines) if _TRIAGE_HEADER_RE.search(line)]
+    if not header_indexes:
+        return []
+    blocks: list[dict[str, str]] = []
+    for position, start in enumerate(header_indexes):
+        end = header_indexes[position + 1] if position + 1 < len(header_indexes) else len(lines)
+        block_text = "\n".join(lines[start:end])
+        blocks.append(
+            {
+                "classification": _triage_field(block_text, "classification"),
+                "chosen_fix": _triage_field(block_text, "chosen_fix"),
+            }
+        )
+    return blocks
+
+
+def _block_requests_production_fix(block: dict[str, str]) -> bool:
+    # Classification is the determinative signal; route to the production-enabled pass unless
+    # the block explicitly selected a test-code fix. This keeps the historical
+    # production_defect + fumbled-chosen_fix output (e.g. "none") from aborting the run, while
+    # exact-match on classification still rejects echoed template placeholders such as
+    # "production_defect | stale_test | malformed_test | unclear".
+    return block.get("classification") == "production_defect" and block.get("chosen_fix") != "test_code"
+
+
 def _has_valid_production_test_failure_triage(output: str) -> bool:
-    if "test failure triage:" not in output.lower():
-        return False
-    return (
-        _triage_field(output, "classification") == "production_defect"
-        and _triage_field(output, "chosen_fix") == "production_code"
-    )
+    return any(_block_requests_production_fix(block) for block in _triage_blocks(output))
+
+
+def _block_authorizes_test_fix(block: dict[str, str]) -> bool:
+    # Retained test-file writes need an explicit stale/malformed-test classification and a
+    # test-code fix choice in the same block. ``unclear`` or production-code blocks must not let
+    # test rewrites ride along with a production-defect pass.
+    return block.get("classification") in {"stale_test", "malformed_test"} and block.get("chosen_fix") == "test_code"
+
+
+def _triage_authorizes_test_fix(output: str) -> bool:
+    return any(_block_authorizes_test_fix(block) for block in _triage_blocks(output))
 
 
 def _errors_section(state: TaskState) -> str:
@@ -1021,6 +1078,17 @@ class FixerAgent(BaseAgent):
                 data={"files_written": changed},
             )
 
+        def _with_retained_test_writes(result: AgentResult, retained_test_writes: list[str]) -> AgentResult:
+            if not retained_test_writes:
+                return result
+            for p in retained_test_writes:
+                if p not in state.files_changed:
+                    state.files_changed.append(p)
+            data = dict(result.data)
+            files_written = list(data.get("files_written") or [])
+            data["files_written"] = list(dict.fromkeys([*retained_test_writes, *files_written]))
+            return AgentResult(success=result.success, message=result.message, data=data)
+
         def _production_writes(changed: list[str], dirty_before: dict[str, str | None]) -> list[str]:
             before_contents = _changed_text_contents_before(agent_cwd, changed, dirty_before)
             after_contents = _changed_text_contents_after(agent_cwd, changed)
@@ -1097,6 +1165,7 @@ class FixerAgent(BaseAgent):
             test_constraint = _test_constraint(state, test_origin_validation=test_origin_validation)
             scope_recovery: str | None = None
             changed: list[str] = []
+            test_only_writes: list[str] = []
             fixer_output = ""
             final_allowed_write_paths = allowed_write_paths
             max_test_only_attempts = 2
@@ -1115,10 +1184,18 @@ class FixerAgent(BaseAgent):
                     return result
 
                 production_writes = _production_writes(changed, dirty_before)
-                production_request_with_writes = _has_valid_production_test_failure_triage(fixer_output) and bool(
-                    changed
+                # A production-fix declaration combined with writes is a scope violation only when
+                # the writes are unbacked — i.e. the triage did not also authorize a test fix for a
+                # separate failure. A genuine mixed triage (a stale_test/test_code block alongside a
+                # production_defect block) legitimately repairs the failing test here and defers the
+                # production defect to the confirmed pass, so its test-only writes are kept rather
+                # than restored. Production-file writes are still rejected unconditionally below.
+                unbacked_production_request = (
+                    _has_valid_production_test_failure_triage(fixer_output)
+                    and bool(changed)
+                    and not _triage_authorizes_test_fix(fixer_output)
                 )
-                if not production_writes and not production_request_with_writes:
+                if not production_writes and not unbacked_production_request:
                     generated_test_files = _generated_test_writes(state, changed)
                     if generated_test_files:
                         _record_generated_test_fix_attempt(state, generated_test_files)
@@ -1128,6 +1205,7 @@ class FixerAgent(BaseAgent):
                         and not _parse_generated_test_retriage(fixer_output)
                     )
                     if not missing_generated_test_retriage:
+                        test_only_writes = list(changed)
                         break
 
                     reason = (
@@ -1261,14 +1339,21 @@ class FixerAgent(BaseAgent):
                     previous_triage=fixer_output,
                 )
                 if result is not None:
-                    return result
+                    return _with_retained_test_writes(result, test_only_writes)
                 production_writes = _production_writes(changed, dirty_before)
-                if changed and not production_writes:
+                if not production_writes:
+                    changed_detail = f": {changed}" if changed else ""
                     msg = (
                         f"{failure_kind.capitalize()} production-confirmed fixer changed no production files "
-                        f"after production_defect triage: {changed}"
+                        f"after production_defect triage{changed_detail}"
                     )
-                    return _fail_after_changes(changed, msg)
+                    failed_changes = list(dict.fromkeys([*test_only_writes, *changed]))
+                    return _fail_after_changes(failed_changes, msg)
+                # Preserve the legitimate test-only fixes made before this confirmed pass so they
+                # are recorded in state.files_changed and still invalidate the security review
+                # alongside the production change (the merged set is no longer test-only).
+                if test_only_writes:
+                    changed = list(dict.fromkeys([*test_only_writes, *changed]))
         else:
             allowed_write_paths = _write_paths_for_state(state, sandbox, test_origin_validation=test_origin_validation)
             result, changed, fixer_output, _, _, final_allowed_write_paths = _run_once(
