@@ -61,7 +61,7 @@ def attach_task_asset(
         raise ValueError(f"unsupported asset extension: {source_file.suffix or '(none)'}")
 
     normalized_target = _normalize_target(target, project_root=project_root) if target.strip() else ""
-    destination_dir = task_asset_dir / _safe_stem(task_file.stem)
+    destination_dir = task_asset_dir / _safe_stem(_strip_known_task_suffixes(task_file.stem))
     destination_dir.mkdir(parents=True, exist_ok=True)
     _ensure_inside_project(destination_dir, project_root, label="task asset destination directory")
     destination = _available_destination(destination_dir, source_file)
@@ -204,6 +204,13 @@ def _safe_filename(name: str) -> str:
     stem = _safe_stem(path.stem)
     suffix = _safe_suffix(path.suffix)
     return f"{stem}{suffix}"
+
+
+def _strip_known_task_suffixes(stem: str) -> str:
+    for suffix in (".refined", ".contract", ".v2", ".v3"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
 
 
 def _safe_stem(value: str) -> str:

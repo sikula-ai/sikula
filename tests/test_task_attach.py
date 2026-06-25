@@ -60,6 +60,24 @@ def test_attach_reference_asset_copies_file_and_prints_snippet_without_writing_t
     assert "## Assets" not in task_file.read_text(encoding="utf-8")
 
 
+def test_attach_uses_base_task_stem_for_refined_or_contract_task_files(tmp_path: Path):
+    task_file = tmp_path / ".sikula" / "tasks" / "team-invites.refined.md"
+    task_file.parent.mkdir(parents=True)
+    task_file.write_text("# Add team invite\n", encoding="utf-8")
+    source = tmp_path / "mockup.png"
+    source.write_bytes(b"png")
+
+    result = attach_task_asset(
+        task_file=task_file,
+        source_file=source,
+        project_root=tmp_path,
+        task_asset_dir=tmp_path / ".sikula" / "task-assets",
+        kind="reference",
+    )
+
+    assert result.project_path == ".sikula/task-assets/team-invites/mockup.png"
+
+
 def test_attach_delivery_asset_writes_assets_section(tmp_path: Path):
     task_file = tmp_path / ".sikula" / "tasks" / "success.md"
     task_file.parent.mkdir(parents=True)
