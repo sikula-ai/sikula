@@ -70,6 +70,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   instead of accepting non-executable coverage.
 
 ### Fixed
+- The test-only fixer now handles a test phase with multiple failures. It parses every
+  `TEST FAILURE TRIAGE` block (not just the first) and routes to the production-enabled pass when
+  any block classifies a `production_defect` without explicitly choosing `test_code`, so a defect
+  reported alongside other failures is no longer masked into an "Agent made no file changes" abort.
+  A pass may now fix a `stale_test`/`malformed_test` block that explicitly chooses `test_code` in
+  test files and defer a separate `production_defect` in the same run: the authorized test write is
+  kept (and merged into the change set so the production change re-runs the full review/security
+  gate) instead of being restored as a scope violation. If the production-confirmed pass fails or
+  writes no production files, retained test writes are still recorded in the failed state/result for
+  resume and audit. Production-file writes and unbacked production-fix-with-writes are still
+  rejected, and `chosen_fix` must be `production_code` or `test_code` (never `none`).
+- Verbose build logs no longer hide the real compiler/test diagnostic from the fixer.
+  Diagnostic extraction ranked retained ranges by position (first two and last two) and
+  then head/tail-truncated the result, which dropped the middle range carrying the actual
+  `file:line` error when many low-signal `> Task ... FAILED` lines surrounded it — the
+  fixer received only "Compilation error. See log for more details". Ranges are now ranked
+  by peak signal (ties broken by proximity to the ends, preserving prior behaviour) and the
+  budget-limited window is centred on the primary error line; terminal summaries now show up to
+  10 sampled recovered diagnostics. Platform-neutral.
 - `sikula review` no longer asks the optional referenced-file enrichment agent
   to return an empty response when no local files are named or found. It now
   uses an explicit sentinel internally, avoiding unnecessary no-output retries

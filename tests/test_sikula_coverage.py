@@ -805,7 +805,7 @@ class TestTaskAuditReport:
         assert "Recovered issues:" in out
         assert (
             "validation recovered after failed check:ruff-format x1, test x1 "
-            "(showing up to 8 sampled diagnostics; see: sikula show t1)" in out
+            "(showing up to 10 sampled diagnostics; see: sikula show t1)" in out
         )
         assert "check:ruff-format: src/app.py:12:1: would reformat" in out
         assert "fixer used production-confirmed test failure triage: 1" in out
@@ -834,7 +834,7 @@ class TestTaskAuditReport:
         assert state.test_errors == []
         assert state.check_errors == []
         assert "Failed issues:" in out
-        assert "validation failed: test x1 (showing up to 8 sampled diagnostics; see: sikula show t1)" in out
+        assert "validation failed: test x1 (showing up to 10 sampled diagnostics; see: sikula show t1)" in out
         assert "test: tests/login_test.py:12: AssertionError: expected login" in out
         assert _task_failed_issues(state)
 
@@ -955,7 +955,7 @@ class TestTaskAuditReport:
         out = capsys.readouterr().out
         assert (
             "validation recovered after failed check:detekt x1, test x1 "
-            "(showing up to 8 sampled diagnostics; see: sikula show t1)" in out
+            "(showing up to 10 sampled diagnostics; see: sikula show t1)" in out
         )
         assert "test: CountryDetailScreenContractTest > detail content uses capital fallback() FAILED" in out
         assert "test: java.lang.AssertionError at CountryDetailScreenContractTest.kt:53" in out
@@ -1044,7 +1044,7 @@ class TestTaskAuditReport:
         out = capsys.readouterr().out
         assert (
             "validation recovered after failed check:detekt x1, test x4 "
-            "(showing up to 8 sampled diagnostics; see: sikula show t1)" in out
+            "(showing up to 10 sampled diagnostics; see: sikula show t1)" in out
         )
         assert "test #1: .../di/CountriesModuleSourceContractTest.kt:40:22" in out
         assert "test #2: CountriesRoutesTest > detail encodes code name and flag emoji values() FAILED" in out

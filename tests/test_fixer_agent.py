@@ -20,6 +20,7 @@ from agents.fixer_agent import (
     _tech_stack,
     _test_constraint,
     _test_failure_production_writes,
+    _triage_authorizes_test_fix,
     _validation_error_paths,
     _validation_error_targets,
     _write_paths_for_state,
@@ -450,6 +451,9 @@ class TestFixerAgentWritePaths:
         assert "TEST FAILURE TRIAGE:" in prompt
         assert "classification: production_defect | stale_test | malformed_test | unclear" in prompt
         assert "chosen_fix: production_code | test_code" in prompt
+        # B: chosen_fix must be decisive, and multiple failures must not mask a production defect
+        assert "never `none`" in prompt
+        assert "one `TEST FAILURE TRIAGE:` block per failure" in prompt
 
     def test_test_only_prompt_includes_synthetic_harness_audit_context(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["tests/LoginTest.kt"]
@@ -1019,6 +1023,120 @@ class TestFixerAgentTestFailureProductionGate:
         assert state.fix_cycle_records[0]["test_only_scope_violation"]["kind"] == "production_request_changed_files"
         assert "CONFIRMED TEST FAILURE TRIAGE" in llm.agent_calls[2]
 
+    def test_mixed_triage_keeps_test_fix_and_runs_production_pass(self, file_tool, tmp_project: Path):
+        # A genuine mixed pass: the fixer fixes a stale_test in a test file AND declares a
+        # separate production_defect. The test write is authorized (a test_code/stale_test block
+        # is present), so it must be kept — not restored as a scope violation — and the
+        # production-confirmed pass must still run to fix the deferred production defect.
+        mixed_triage = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: stale_test\n"
+            "contract_affected: none\n"
+            "chosen_fix: test_code\n\n"
+            "TEST FAILURE TRIAGE:\n"
+            "classification: production_defect\n"
+            "contract_affected: naming convention\n"
+            "chosen_fix: production_code\n"
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                ({"tests/LoginTest.py": "assert True\n"}, ["tests/LoginTest.py"], mixed_triage),
+                (
+                    {"src/main.py": "# production fix\n"},
+                    ["src/main.py"],
+                    "Fixed the confirmed production defect.",
+                ),
+            ]
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert result.success
+        # legitimate test fix is kept (not restored)
+        assert (tmp_project / "tests" / "LoginTest.py").read_text() == "assert True\n"
+        # deferred production defect is fixed by the confirmed pass
+        assert (tmp_project / "src" / "main.py").read_text() == "# production fix\n"
+        # both changes are recorded so the full review/security gate re-runs (production touched)
+        assert "tests/LoginTest.py" in state.files_changed
+        assert "src/main.py" in state.files_changed
+        assert [record["triage_pass"] for record in state.fix_cycle_records] == [
+            "test_only",
+            "production_confirmed",
+        ]
+        assert "test_only_scope_violation" not in state.fix_cycle_records[0]
+
+    def test_mixed_triage_noop_production_confirmed_pass_fails(self, file_tool, tmp_project: Path):
+        mixed_triage = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: stale_test\n"
+            "contract_affected: none\n"
+            "chosen_fix: test_code\n\n"
+            "TEST FAILURE TRIAGE:\n"
+            "classification: production_defect\n"
+            "contract_affected: naming convention\n"
+            "chosen_fix: production_code\n"
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                ({"tests/LoginTest.py": "assert True\n"}, ["tests/LoginTest.py"], mixed_triage),
+                ({}, [], "No production files changed."),
+            ]
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert not result.success
+        assert state.failed is True
+        assert "changed no production files" in result.message
+        assert (tmp_project / "tests" / "LoginTest.py").read_text() == "assert True\n"
+        assert state.files_changed == ["tests/LoginTest.py"]
+        assert state.test_errors == ["assertion failed"]
+        assert result.data == {"files_written": ["tests/LoginTest.py"]}
+        assert [record["triage_pass"] for record in state.fix_cycle_records] == [
+            "test_only",
+            "production_confirmed",
+        ]
+        assert state.fix_cycle_records[0]["files_written"] == ["tests/LoginTest.py"]
+        assert state.fix_cycle_records[1]["files_written"] == []
+
+    def test_mixed_triage_provider_error_records_retained_test_writes(self, file_tool, tmp_project: Path):
+        mixed_triage = (
+            "TEST FAILURE TRIAGE:\n"
+            "classification: stale_test\n"
+            "contract_affected: none\n"
+            "chosen_fix: test_code\n\n"
+            "TEST FAILURE TRIAGE:\n"
+            "classification: production_defect\n"
+            "contract_affected: naming convention\n"
+            "chosen_fix: production_code\n"
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                ({"tests/LoginTest.py": "assert True\n"}, ["tests/LoginTest.py"], mixed_triage),
+                RuntimeError("provider quota exceeded"),
+            ]
+        )
+        config = {"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}}
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        result = _make_agent(llm, file_tool=file_tool, project_config=config).run(state)
+
+        assert not result.success
+        assert result.message == "provider quota exceeded"
+        assert (tmp_project / "tests" / "LoginTest.py").read_text() == "assert True\n"
+        assert state.files_changed == ["tests/LoginTest.py"]
+        assert result.data == {"files_written": ["tests/LoginTest.py"]}
+        assert [record["triage_pass"] for record in state.fix_cycle_records] == [
+            "test_only",
+            "production_confirmed",
+        ]
+        assert state.fix_cycle_records[0]["files_written"] == ["tests/LoginTest.py"]
+        assert state.fix_cycle_records[1]["files_written"] == []
+
     def test_test_failure_production_fix_with_valid_triage_uses_second_pass(self, file_tool):
         triage = (
             "TEST FAILURE TRIAGE:\n"
@@ -1406,6 +1524,53 @@ class TestProductionTestFailureTriage:
     def test_test_code_triage_does_not_allow_production_fix(self):
         output = "TEST FAILURE TRIAGE:\nclassification: stale_test\ncontract_affected: none\nchosen_fix: test_code\n"
         assert not _has_valid_production_test_failure_triage(output)
+
+    def test_multi_block_triage_routes_when_any_block_is_production_defect(self):
+        # Real-world shape: the fixer faced two independent failures and emitted one
+        # per-failure block with em-dash headers. The first is unclear; the second is a
+        # production defect. The later production_defect block must not be masked by the
+        # first block's verdict.
+        output = (
+            "Here is the complete triage:\n\n"
+            "TEST FAILURE TRIAGE — Failure 1\n"
+            "classification: unclear\n"
+            "chosen_fix: none\n\n"
+            "TEST FAILURE TRIAGE — Failure 2\n"
+            "classification: production_defect\n"
+            "contract_affected: project guidelines\n"
+            "chosen_fix: production_code\n"
+        )
+        assert _has_valid_production_test_failure_triage(output)
+
+    def test_production_defect_without_explicit_production_code_still_routes(self):
+        # Safety net: classification is the determinative signal. A production_defect block
+        # whose chosen_fix the model fumbled (e.g. "none") must still route to the
+        # production-enabled pass rather than aborting on "no file changes".
+        output = (
+            "TEST FAILURE TRIAGE — Failure 2\n"
+            "classification: production_defect\n"
+            "chosen_fix: none (test-only pass; production file unchanged)\n"
+        )
+        assert _has_valid_production_test_failure_triage(output)
+
+    def test_single_unclear_block_does_not_route(self):
+        output = "TEST FAILURE TRIAGE:\nclassification: unclear\nchosen_fix: none\n"
+        assert not _has_valid_production_test_failure_triage(output)
+
+    def test_only_stale_or_malformed_triage_authorizes_retained_test_fix(self):
+        stale = "TEST FAILURE TRIAGE:\nclassification: stale_test\nchosen_fix: test_code\n"
+        malformed = "TEST FAILURE TRIAGE:\nclassification: malformed_test\nchosen_fix: test_code\n"
+        unclear = "TEST FAILURE TRIAGE:\nclassification: unclear\nchosen_fix: test_code\n"
+        stale_missing_choice = "TEST FAILURE TRIAGE:\nclassification: stale_test\n"
+        malformed_production_choice = (
+            "TEST FAILURE TRIAGE:\nclassification: malformed_test\nchosen_fix: production_code\n"
+        )
+
+        assert _triage_authorizes_test_fix(stale)
+        assert _triage_authorizes_test_fix(malformed)
+        assert not _triage_authorizes_test_fix(unclear)
+        assert not _triage_authorizes_test_fix(stale_missing_choice)
+        assert not _triage_authorizes_test_fix(malformed_production_choice)
 
 
 class TestTestOriginValidationDetection:

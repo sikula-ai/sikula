@@ -86,7 +86,7 @@ _BASE = Path(__file__).parent
 # in tests/test_platform_onboarding.py, and in the test execution gate audit registry if
 # the platform brings new test skip idioms.
 _SUPPORTED_BUILD_TOOLS = {"cargo", "gradle-android", "gradle-jvm", "maven", "node", "xcodebuild", "python"}
-_RECOVERED_DIAGNOSTIC_LIMIT = 8
+_RECOVERED_DIAGNOSTIC_LIMIT = 10
 _SIKULA_GITIGNORE_ENTRIES = ("state/", "worktrees/", "contract-reports/")
 
 

@@ -66,7 +66,9 @@ class TestDiagnosticExcerpt:
         assert "first compiler error" in excerpt
         assert "last test assertion" in excerpt
 
-    def test_many_diagnostic_ranges_keep_first_two_and_last_two(self):
+    def test_equal_signal_ranges_keep_first_two_and_last_two(self):
+        # When every diagnostic range carries the same signal, ties are broken by
+        # proximity to the output ends, preserving the leading and trailing context.
         output = "".join(f"error: marker {i}\n" + ("noise\n" * 200) for i in range(6))
 
         excerpt = diagnostic_excerpt(output, limit=2000, context_lines=0)
@@ -76,6 +78,41 @@ class TestDiagnosticExcerpt:
         assert "error: marker 4" in excerpt
         assert "error: marker 5" in excerpt
         assert "... [diagnostic output omitted] ..." in excerpt
+
+    def test_keeps_primary_compiler_diagnostic_among_many_noisy_ranges(self):
+        # Realistic verbose Gradle log: many low-signal "> Task ... FAILED" ranges
+        # surround the high-signal compiler "e:" errors in the MIDDLE, with the final
+        # build summary at the end. Selecting ranges purely by position drops the one
+        # range that carries the actual file:line error; it must survive instead.
+        head = "Type-safe project accessors is an incubating feature.\n"
+        head += "".join(
+            f"> Task :library:mod{i}:writeDebugAarMetadata\n> Task :library:mod{i}:processDebugResources FAILED\n"
+            for i in range(40)
+        )
+        primary = (
+            "e: file:///w/feature/health-scan/src/test/DeleteReminderDueDateUseCaseTest.kt:33:21 "
+            "Argument type mismatch: actual type is MockKMatcherScope, but Unit was expected.\n"
+            "e: file:///w/feature/health-scan/src/test/SetReminderDueDateUseCaseTest.kt:43:21 "
+            "Argument type mismatch: actual type is MockKMatcherScope, but Unit was expected.\n"
+        )
+        mid = "".join(
+            f"> Task :feature:f{i}:compileDebugKotlin\n> Task :feature:f{i}:other FAILED\n" for i in range(40)
+        )
+        tail = (
+            "FAILURE: Build failed with an exception.\n"
+            "* What went wrong:\n"
+            "Execution failed for task ':feature:health-scan:compileDebugUnitTestKotlin'.\n"
+            "> Compilation error. See log for more details\n"
+            "BUILD FAILED in 8m 22s\n"
+        )
+        output = head + primary + mid + tail
+
+        excerpt = diagnostic_excerpt(output, limit=6000)
+
+        assert "Argument type mismatch" in excerpt
+        assert "DeleteReminderDueDateUseCaseTest.kt:33:21" in excerpt
+        # the final build summary should still be retained alongside the primary diagnostic
+        assert "Compilation error. See log" in excerpt
 
     def test_tiny_limit_returns_tail_without_truncation_marker(self):
         assert diagnostic_excerpt("0123456789", limit=5) == "56789"
@@ -91,6 +128,15 @@ class TestDiagnosticExcerpt:
 
 
 class TestDiagnosticSummaryLines:
+    def test_default_summary_limit_keeps_ten_lines(self):
+        output = "\n".join(f"src/file_{index}.py:{index}:1: error: issue {index}" for index in range(12))
+
+        lines = diagnostic_summary_lines(output)
+
+        assert len(lines) == 10
+        assert lines[0] == "src/file_0.py:0:1: error: issue 0"
+        assert lines[-1] == "src/file_9.py:9:1: error: issue 9"
+
     def test_extracts_gradle_compiler_error_from_noisy_output(self):
         output = (
             "> Task :app:preBuild UP-TO-DATE\n"
