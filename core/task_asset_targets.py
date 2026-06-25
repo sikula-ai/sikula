@@ -46,7 +46,8 @@ def audit_delivery_asset_targets(
             )
             continue
 
-        if target_path in changed_paths:
+        target_exists = _target_exists(project_root / target_path)
+        if target_path in changed_paths and target_exists:
             records.append(
                 _target_record(
                     asset,
@@ -58,7 +59,7 @@ def audit_delivery_asset_targets(
             )
             continue
 
-        if _target_exists(project_root / target_path):
+        if target_exists:
             records.append(
                 _target_record(
                     asset,

@@ -6,6 +6,10 @@ from core.task_asset_targets import audit_delivery_asset_targets
 
 
 def test_delivery_asset_target_audit_matches_changed_requested_target(tmp_path: Path):
+    target = tmp_path / "app" / "assets" / "icon.svg"
+    target.parent.mkdir(parents=True)
+    target.write_text("<svg />", encoding="utf-8")
+
     records = audit_delivery_asset_targets(
         [
             {
@@ -32,6 +36,26 @@ def test_delivery_asset_target_audit_matches_changed_requested_target(tmp_path: 
             "observed_at": records[0]["observed_at"],
         }
     ]
+
+
+def test_delivery_asset_target_audit_records_missing_changed_deleted_target(tmp_path: Path):
+    records = audit_delivery_asset_targets(
+        [
+            {
+                "path": ".sikula/task-assets/icon.svg",
+                "project_path": ".sikula/task-assets/icon.svg",
+                "kind": "delivery",
+                "requested_target": "app/assets/icon.svg",
+            }
+        ],
+        files_changed=["app/assets/icon.svg"],
+        project_root=tmp_path,
+        phase="completion",
+    )
+
+    assert records[0]["status"] == "missing"
+    assert records[0]["requested_target"] == "app/assets/icon.svg"
+    assert records[0]["matched_path"] == ""
 
 
 def test_delivery_asset_target_audit_records_present_unchanged_target(tmp_path: Path):

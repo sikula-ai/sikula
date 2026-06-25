@@ -721,6 +721,9 @@ class TestCmdRunStateStore:
         asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
         asset_path.parent.mkdir(parents=True)
         asset_path.write_text("<svg viewBox='0 0 16 16'></svg>")
+        target_path = tmp_path / "app" / "assets" / "success-check.svg"
+        target_path.parent.mkdir(parents=True)
+        target_path.write_text("<svg viewBox='0 0 16 16'></svg>")
         task_file = tmp_path / "task.md"
         task_file.write_text(
             "# Add success icon\n\n"
