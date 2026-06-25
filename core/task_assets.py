@@ -199,6 +199,10 @@ _ASSET_UNDECLARED_HINT_RE = re.compile(
 _GENERATED_ANSWER_ENTRY_END_MARKER = "<!-- /sikula:generated-answer -->"
 
 
+def supported_asset_extensions() -> set[str]:
+    return set(_ASSET_EXTENSIONS)
+
+
 def public_asset_reference(reference: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in reference.items() if not str(key).startswith("_")}
 
