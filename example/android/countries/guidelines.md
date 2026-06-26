@@ -222,8 +222,9 @@ internal interface CountriesApi {
 - Each feature exposes a `fun NavGraphBuilder.<feature>Graph(navController: NavController)` extension.
 - Routes are `const val` strings in `<Feature>Routes.kt` inside the feature module.
 - Screens never hold a reference to `NavController` — navigation actions are passed as lambdas.
-- Encode dynamic route arguments with `Uri.encode(...)` before placing them in route paths or query
-  parameters.
+- Encode dynamic route arguments with a JVM-testable helper before placing them in route paths or
+  query parameters. Do not call Android framework APIs such as `android.net.Uri` from route-builder
+  functions that should be covered by local JVM unit tests.
 - Validate dynamic identifiers against the expected format before navigation or before calling a
   repository/API.
 - Prefer query parameters for display-only values such as titles or names, and use stable
@@ -232,12 +233,16 @@ internal interface CountriesApi {
 
 ```kotlin
 // feature/countries/navigation/CountriesRoutes.kt
-import android.net.Uri
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 
 object CountriesRoutes {
     const val LIST = "countries/list"
     const val DETAIL = "countries/detail/{code}"
-    fun detail(code: String) = "countries/detail/${Uri.encode(code)}"
+    fun detail(code: String) = "countries/detail/${encodeRouteArgument(code)}"
+
+    private fun encodeRouteArgument(value: String): String =
+        URLEncoder.encode(value, StandardCharsets.UTF_8.name()).replace("+", "%20")
 }
 
 // feature/countries/navigation/CountriesGraph.kt
