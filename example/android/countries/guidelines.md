@@ -111,6 +111,11 @@ Use standard Material 3 navigation components for screen-to-screen flows:
   Do not rely on click handling alone when the row needs to communicate navigation.
 - This project includes `material-icons-core`; use it for standard navigation icons instead of
   replacing icons with text.
+- Actionable icons must have localized `contentDescription` text from `res/values/strings.xml`.
+  If the task does not specify a label for a standard action, add a conventional localized string
+  such as `Back`, `Close`, `Search`, or `Retry`, then read it with `stringResource(...)`.
+- Decorative icons, such as a trailing disclosure icon in a clickable row, may use
+  `contentDescription = null` when the row itself communicates the action.
 
 ---
 
@@ -217,13 +222,27 @@ internal interface CountriesApi {
 - Each feature exposes a `fun NavGraphBuilder.<feature>Graph(navController: NavController)` extension.
 - Routes are `const val` strings in `<Feature>Routes.kt` inside the feature module.
 - Screens never hold a reference to `NavController` — navigation actions are passed as lambdas.
+- Encode dynamic route arguments with a JVM-testable helper before placing them in route paths or
+  query parameters. Do not call Android framework APIs such as `android.net.Uri` from route-builder
+  functions that should be covered by local JVM unit tests.
+- Validate dynamic identifiers against the expected format before navigation or before calling a
+  repository/API.
+- Prefer query parameters for display-only values such as titles or names, and use stable
+  identifiers for path parameters.
+- Add a small unit test for route builders when a route contains dynamic values.
 
 ```kotlin
 // feature/countries/navigation/CountriesRoutes.kt
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
+
 object CountriesRoutes {
     const val LIST = "countries/list"
     const val DETAIL = "countries/detail/{code}"
-    fun detail(code: String) = "countries/detail/$code"
+    fun detail(code: String) = "countries/detail/${encodeRouteArgument(code)}"
+
+    private fun encodeRouteArgument(value: String): String =
+        URLEncoder.encode(value, StandardCharsets.UTF_8.name()).replace("+", "%20")
 }
 
 // feature/countries/navigation/CountriesGraph.kt
