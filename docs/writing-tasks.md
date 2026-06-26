@@ -268,6 +268,29 @@ Put per-asset metadata as nested bullets under that asset item. Same-level
 bullets are treated as separate task requirements, not as metadata for the
 previous asset.
 
+You can also have Sikula copy a local file into the configured task asset
+directory and print the Markdown snippet:
+
+```bash
+sikula task attach .sikula/tasks/team-invites.md ~/Desktop/login-spacing.png \
+  --reference \
+  --note "Shows the expected spacing on the login form"
+```
+
+For delivery assets, provide the purpose and source/license information up
+front so the prepared contract does not have to ask for provenance later:
+
+```bash
+sikula task attach .sikula/tasks/team-invites.md ~/Desktop/success-check.svg \
+  --delivery \
+  --purpose "success state icon" \
+  --source "provided by product team for this project" \
+  --target app/src/main/res/drawable/success_check.svg
+```
+
+By default, `task attach` copies the file and prints a snippet for review. Add
+`--write` to append the snippet to the task file's `## Assets` section.
+
 Sikula treats structured `## Assets` declarations as the source of truth during
 contract readiness checks. Declared paths are resolved inside the project
 boundary, hashed, and reported with lightweight metadata. A structured asset

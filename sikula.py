@@ -289,6 +289,11 @@ def _resolve_contract_report_dir(cfg: dict) -> Path:
     return _resolve_project_path(cfg, raw)
 
 
+def _resolve_task_asset_dir(cfg: dict) -> Path:
+    raw = cfg.get("tasks", {}).get("task_asset_dir", ".sikula/task-assets")
+    return _resolve_project_path(cfg, raw)
+
+
 def _resolve_project_path(cfg: dict, raw: str) -> Path:
     p = Path(raw)
     if p.is_absolute():
@@ -1168,6 +1173,48 @@ def cmd_task_refine(args: argparse.Namespace, cfg: dict) -> None:
         print("- Then rerun task refine with a new --output path, or remove/rename the output written above first.")
     else:
         print(f"Next step: sikula contract prepare {output_path}")
+
+
+def cmd_task_attach(args: argparse.Namespace, cfg: dict) -> None:
+    from core.task_attach import attach_task_asset
+
+    project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
+    task_path = _resolve_task_path(args.task_file, project_root)
+    if task_path is None:
+        print(f"Task file not found: {args.task_file}", file=sys.stderr)
+        sys.exit(1)
+    if not task_path.is_file():
+        print(f"Task path is not a file: {args.task_file}", file=sys.stderr)
+        sys.exit(1)
+
+    kind = "delivery" if args.delivery else "reference"
+    task_asset_dir = _resolve_task_asset_dir(cfg)
+    try:
+        result = attach_task_asset(
+            task_file=task_path,
+            source_file=Path(args.asset_file),
+            project_root=project_root,
+            task_asset_dir=task_asset_dir,
+            kind=kind,
+            note=args.note or "",
+            purpose=args.purpose or "",
+            target=args.target or "",
+            source_license=args.source or "",
+            write=bool(args.write),
+        )
+    except (OSError, ValueError) as exc:
+        print(f"Failed to attach task asset: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Attached task asset: {result.project_path}")
+    print(f"Source file: {result.source_path}")
+    print(f"SHA-256: {result.sha256}")
+    print(f"Size: {result.size_bytes} bytes")
+    print(f"Task file updated: {'yes' if result.wrote_task_file else 'no'}")
+    if result.reused_existing:
+        print("Existing identical asset reused: yes")
+    print("Markdown snippet:")
+    print(result.snippet)
 
 
 def _print_task_refinement_scope_note() -> None:
@@ -4340,6 +4387,32 @@ def main() -> None:
         metavar="AGENT=SECONDS",
         help="Override timeout for task_preparer, e.g. --agent-timeout task_preparer=1200",
     )
+    task_attach_p = task_sub.add_parser("attach", help="Attach a local file as a task asset")
+    task_attach_p.add_argument("task_file", metavar="TASK_FILE", help="Path to task .txt/.md file")
+    task_attach_p.add_argument("asset_file", metavar="ASSET_FILE", help="Local file to copy into tasks.task_asset_dir")
+    task_attach_kind = task_attach_p.add_mutually_exclusive_group(required=True)
+    task_attach_kind.add_argument(
+        "--reference",
+        action="store_true",
+        default=False,
+        help="Attach the file as a reference-only asset",
+    )
+    task_attach_kind.add_argument(
+        "--delivery",
+        action="store_true",
+        default=False,
+        help="Attach the file as a delivery asset that should become part of the branch output",
+    )
+    task_attach_p.add_argument("--note", help="Reference-asset note to include in the Markdown snippet")
+    task_attach_p.add_argument("--purpose", help="Delivery-asset purpose; required with --delivery")
+    task_attach_p.add_argument("--target", help="Optional project-relative delivery target path")
+    task_attach_p.add_argument("--source", help="Delivery-asset source/license/provenance; required with --delivery")
+    task_attach_p.add_argument(
+        "--write",
+        action="store_true",
+        default=False,
+        help="Append the generated asset snippet to the task file; otherwise only print it",
+    )
 
     contract_p = sub.add_parser("contract", help="Inspect or prepare implementation contracts")
     contract_sub = contract_p.add_subparsers(dest="contract_command")
@@ -4634,6 +4707,8 @@ def main() -> None:
     elif args.command == "task":
         if args.task_command == "refine":
             cmd_task_refine(args, cfg)
+        elif args.task_command == "attach":
+            cmd_task_attach(args, cfg)
         else:
             task_p.print_help()
             sys.exit(1)
