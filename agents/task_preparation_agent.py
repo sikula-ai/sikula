@@ -6,7 +6,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 
-from agents.base_agent import AGENT_SECURITY_PREFIX, guidelines_files, tech_stack
+from agents.base_agent import AGENT_SECURITY_PREFIX, guidelines_files, read_only_agent_prompt, tech_stack
 from core.contract_auto_prepare import (
     AutoPreparationAuditRecorder,
     ContractAutoAnswerBatch,
@@ -279,7 +279,7 @@ class TaskPreparationAgent:
             for question in request.user_questions
             if isinstance(question, dict) and str(question.get("id") or "").strip()
         }
-        prompt = self._build_prompt(request)
+        prompt = read_only_agent_prompt(self._build_prompt(request))
         try:
             output = self.llm.run_readonly_agent(prompt, cwd=project_root)
         except Exception as exc:
@@ -328,7 +328,7 @@ class TaskPreparationAgent:
         project_root: Path,
         audit_recorder: AutoPreparationAuditRecorder | None = None,
     ) -> TaskAutoRefineDraft:
-        prompt = self._build_task_normalization_prompt(request)
+        prompt = read_only_agent_prompt(self._build_task_normalization_prompt(request))
         try:
             output = self.llm.run_readonly_agent(prompt, cwd=project_root)
         except Exception as exc:
@@ -382,7 +382,7 @@ class TaskPreparationAgent:
             for question in request.user_questions
             if isinstance(question, dict) and str(question.get("id") or "").strip()
         }
-        prompt = self._build_task_answer_prompt(request)
+        prompt = read_only_agent_prompt(self._build_task_answer_prompt(request))
         try:
             output = self.llm.run_readonly_agent(prompt, cwd=project_root)
         except Exception as exc:

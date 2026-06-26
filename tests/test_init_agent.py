@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from agents.base_agent import AGENT_SECURITY_PREFIX
+from agents.base_agent import AGENT_SECURITY_PREFIX, READONLY_AGENT_PREFIX
 from agents.init_agent import InitAgent
 
 
@@ -95,3 +95,4 @@ Progress line.
         agent.generate_guidelines(tmp_path)
         prompt_sent = llm.run_readonly_agent.call_args[0][0]
         assert prompt_sent.startswith(AGENT_SECURITY_PREFIX)
+        assert READONLY_AGENT_PREFIX in prompt_sent

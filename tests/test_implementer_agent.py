@@ -77,6 +77,16 @@ class TestImplementerAgentSuccess:
         assert state.implement_cycle_records[0]["implementer_output"] == "first"
         assert state.implement_cycle_records[1]["implementer_output"] == "second"
 
+    def test_record_stores_effective_provider_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["src/Login.kt"]
+        stub_llm.agent_prompt_prefix = "PROVIDER BOUNDARY\n"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        prompt = state.implement_cycle_records[0]["implementer_prompt"]
+        assert prompt.startswith("PROVIDER BOUNDARY\n")
+        assert stub_llm.agent_calls[0] == prompt
+
     def test_changed_files_added_to_state(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["src/Login.kt", "src/di/Module.kt"]
         state = _make_state()

@@ -699,6 +699,20 @@ No file content is passed in the prompt.
   agent run, Sikula writes generated agent definitions to a temporary OpenCode config
   directory and passes it via `OPENCODE_CONFIG_DIR`, so generated OpenCode files are not
   written into either the task worktree or the original checkout.
+  For `AntigravityClient`, Sikula invokes the CLI with `--new-project`, `--add-dir`
+  set to the task project root, and prompts passed through stdin via `--print -`.
+  Before starting `agy`, Sikula rejects absolute symlinks and relative symlinks that
+  resolve outside the project root on paths kept by its Antigravity workspace policy.
+  Untracked ignored local artifacts such as `.venv` and `node_modules` are pruned so
+  ordinary dependency/runtime directories do not block runs; tracked or preserved paths
+  inside soft-ignored directories are still checked. Antigravity CLI does not expose a
+  verified non-interactive read-only permission mode, so read-only calls validate the
+  source project, run against a disposable temporary copy, reject the result if that copy
+  changes, and sanitize temporary paths back to project-relative paths. Write-capable calls
+  run against the task worktree after the same symlink preflight.
+  Sikula also prepends an
+  Antigravity-specific workspace-boundary instruction to write-capable prompts so
+  the provider uses the task worktree rather than searching for a similar checkout.
   After each write-capable agent call, Sikula compares the files reported by that call
   with the active write path list and records a non-blocking `write_path_warning` in
   `state.history` when a file falls outside it. This is an audit signal, not a hard
@@ -707,6 +721,12 @@ No file content is passed in the prompt.
   `git rm *`; no network tools and no destructive shell commands. Provider-level
   enforcement varies below. When `git rm` is used, deletions are tracked by git, visible in
   `git diff`, and reversible.
+  All `run_readonly_agent()` prompts also include a shared read-only instruction that forbids
+  using tools or commands to create, modify, delete, move, rename, format, or write files,
+  while still allowing the model to return requested generated content in its final response.
+  Commands that change files or project state are also forbidden. The same instruction asks
+  read-only agents to reference project files with project-relative paths instead of absolute
+  local paths or `file://` URIs.
   For `CodexClient`: prompt-level for write agents; `--sandbox read-only` blocks file writes
   at the OS level but does not per-command filter shell execution.
   For `ClaudeClient` this is technically enforced via `--allowedTools` for all agents.
@@ -714,6 +734,8 @@ No file content is passed in the prompt.
   from `tools.core`); prompt-level for write agents.
   For `OpenCodeClient`: technically enforced for read-only agents (`bash: deny`); prompt-level
   for write agents.
+  For `AntigravityClient`: read-only calls run in a disposable copy; write-agent
+  command restrictions are prompt-level plus any provider behavior from `--sandbox`.
 - *No internet access* — all agent prompts include `AGENT_SECURITY_PREFIX`
   (defined in `agents/base_agent.py`), which instructs agents not to use network
   commands or access external services. Provider-specific tool restrictions may further reduce
@@ -1624,6 +1646,11 @@ All keys live under `test_writer:` in `.sikula/config.yaml`.
      Override `generate_sources()` only if the project uses codegen tools (Apollo, Sourcery, SwiftGen).
    - **Maven**: `sync()` resolves deps → default is fine.
      Override `generate_sources()` to run `mvn generate-sources` if the project uses OpenAPI Generator or similar.
+   If `generate_sources()` emits source/IDL files under gitignored build output paths
+   that analyst/reviewer/security-reviewer agents must inspect, update the
+   Antigravity read-only generated-source preservation rules in `core/llm_client.py`
+   and add regression coverage in `tests/test_llm_client.py`; keep gitignored secrets
+   and environment files excluded from provider workspace copies.
 3. Add a branch to `_build_tool()` in `core/orchestrator.py`: check `project_config["project"]["build_tool"] == "your_build_tool"` and return an instance of your new class. Add the new build tool name to the docstring comment beside the factory.
 4. Add auto-detection to `tools/scanner.py`: add an entry to `_SIGNATURES` (trigger files, build tool name, language, platform) and implement path detection helpers (`_detect_<platform>_paths()`).
 5. Extend `_generate_config()` in `sikula.py` to emit the platform-specific `build:` block so that `sikula init` generates a correct config for the new platform.
@@ -1691,9 +1718,9 @@ need strong reasoning to catch subtle issues reliably.
 
 ### Add an LLM provider
 
-Four providers are built in: `CodexClient` (`provider: "codex"`), `ClaudeClient` (`provider: "claude"`),
-`GeminiClient` (`provider: "gemini"`), and `OpenCodeClient` (`provider: "opencode"`, model in
-`provider/model` format).
+Five providers are built in: `CodexClient` (`provider: "codex"`), `ClaudeClient` (`provider: "claude"`),
+`GeminiClient` (`provider: "gemini"`), `OpenCodeClient` (`provider: "opencode"`, model in
+`provider/model` format), and `AntigravityClient` (`provider: "antigravity"`).
 See [Providers](docs/providers.md) for provider setup and the extension entry point. Three methods must be implemented in `core/llm_client.py`:
 
 | Method | Used by | Contract |
@@ -1724,7 +1751,7 @@ into `LLMTimeoutError`.
 ## Retry behaviour (`core/llm_client.py`)
 
 Retry is implemented by Sikula's built-in CLI-backed providers (`CodexClient`,
-`ClaudeClient`, `GeminiClient`, `OpenCodeClient`), not by the abstract `LLMClient`
+`ClaudeClient`, `GeminiClient`, `OpenCodeClient`, `AntigravityClient`), not by the abstract `LLMClient`
 interface itself. Custom providers must implement their own retry policy if they need one.
 
 Provider subprocess output is classified into typed `LLMProviderError` subclasses. Fatal

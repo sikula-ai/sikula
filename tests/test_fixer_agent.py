@@ -285,6 +285,17 @@ class TestFixerAgentFixCycleRecord:
         assert state.task_description in prompt
         assert "compile error" in prompt
 
+    def test_record_stores_effective_provider_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["src/Login.kt"]
+        stub_llm.agent_prompt_prefix = "PROVIDER BOUNDARY\n"
+        state = _make_state()
+        state.errors = ["compile error"]
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        prompt = state.fix_cycle_records[0]["fixer_prompt"]
+        assert prompt.startswith("PROVIDER BOUNDARY\n")
+        assert stub_llm.agent_calls[0] == prompt
+
     def test_prompt_preserves_asset_declaration_obligations(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["src/Login.kt"]
         state = _make_state()

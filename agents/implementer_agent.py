@@ -170,6 +170,7 @@ class ImplementerAgent(BaseAgent):
             if state.plan and state.active_scope != _SCOPE_FINAL_FULL_TASK and state.current_step < len(state.plan)
             else None
         )
+        prompt = self.llm.prepare_agent_prompt(prompt, cwd=file_tool._root)
 
         try:
             changed, agent_output = self.llm.run_agent(prompt, cwd=file_tool._root)

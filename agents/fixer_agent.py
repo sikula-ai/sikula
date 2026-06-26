@@ -997,6 +997,7 @@ class FixerAgent(BaseAgent):
                 previous_triage=previous_triage,
                 scope_recovery=scope_recovery,
             )
+            prompt = self.llm.prepare_agent_prompt(prompt, cwd=agent_cwd)
             dirty_before = _git_dirty_text_snapshot(agent_cwd) if uses_test_failure_triage else {}
             artifact_before = snapshot_validation_dirty_files(agent_cwd) if uses_test_failure_triage else {}
             try:

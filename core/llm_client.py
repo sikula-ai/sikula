@@ -11,6 +11,7 @@ Implementations:
   ClaudeClient   — provider: "claude"    — uses the claude CLI
   GeminiClient   — provider: "gemini"    — uses the gemini CLI
   OpenCodeClient — provider: "opencode"  — uses the opencode CLI (model: "provider/model")
+  AntigravityClient — provider: "antigravity" — uses the agy CLI
 
 To add another provider subclass LLMClient and register it in create_llm_client().
 """
@@ -25,6 +26,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -34,6 +36,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
+from urllib.parse import unquote
 
 log = logging.getLogger(__name__)
 
@@ -294,6 +297,14 @@ class LLMClient:
 
     def generate(self, system: str, user: str) -> str:
         raise NotImplementedError
+
+    def prepare_agent_prompt(self, prompt: str, cwd: Path) -> str:
+        """Return the effective prompt that will be sent to run_agent.
+
+        Providers with mandatory wrapper instructions can override this so
+        agents record the same prompt that the provider subprocess receives.
+        """
+        return prompt
 
     def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
         """Run as an autonomous agent with read-only tools in `cwd`. Returns text output."""
@@ -1743,6 +1754,771 @@ class CodexClient(LLMClient):
 
 
 # ---------------------------------------------------------------------------
+# AntigravityClient
+# ---------------------------------------------------------------------------
+
+_ANTIGRAVITY_GENERATE_TIMEOUT = 300
+_ANTIGRAVITY_HARD_IGNORED_COPY_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+}
+_ANTIGRAVITY_SOFT_IGNORED_COPY_DIRS = {
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "DerivedData",
+    "dist",
+    "node_modules",
+    "target",
+    "venv",
+}
+_ANTIGRAVITY_IGNORED_COPY_PATHS = {
+    ".sikula/state",
+    ".sikula/worktrees",
+}
+_ANTIGRAVITY_IGNORED_COPY_DIRS = _ANTIGRAVITY_HARD_IGNORED_COPY_DIRS | _ANTIGRAVITY_SOFT_IGNORED_COPY_DIRS
+_ANTIGRAVITY_GENERATED_SOURCE_SUFFIXES = (
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".go",
+    ".groovy",
+    ".h",
+    ".hpp",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".kts",
+    ".m",
+    ".mm",
+    ".proto",
+    ".py",
+    ".rs",
+    ".scala",
+    ".swift",
+    ".ts",
+    ".tsx",
+)
+_ANTIGRAVITY_LOG_DIAGNOSTIC_BYTES = 65536
+_ANTIGRAVITY_LOG_DIAGNOSTIC_LINES = 6
+_ANTIGRAVITY_LOG_DIAGNOSTIC_LINE_CHARS = 500
+_ANTIGRAVITY_LOG_DIAGNOSTIC_MARKERS = (
+    "401",
+    "api key",
+    "api-key",
+    "apikey",
+    "auth",
+    "billing",
+    "configuration",
+    "error",
+    "exception",
+    "failed",
+    "invalid key",
+    "invalid model",
+    "invalid token",
+    "login",
+    "missing key",
+    "missing token",
+    "model not supported",
+    "not authenticated",
+    "not enabled",
+    "not logged in",
+    "out of credits",
+    "quota",
+    "resource exhausted",
+    "unauthenticated",
+    "unauthorized",
+    "unknown model",
+    "unsupported model",
+)
+_ANTIGRAVITY_LOG_DIAGNOSTIC_KEYS = {
+    "code",
+    "diagnostic",
+    "details",
+    "error",
+    "errors",
+    "exception",
+    "message",
+    "msg",
+    "reason",
+    "status",
+}
+_ANTIGRAVITY_SECRET_KEY_PATTERN = (
+    r"[A-Za-z0-9_. -]*(?:api[_ -]?key|apikey|authorization|password|secret|token)[A-Za-z0-9_. -]*"
+)
+
+
+@dataclass(frozen=True)
+class _AntigravityCopyPolicy:
+    preserved_paths: frozenset[str]
+    preserved_dirs: frozenset[str]
+    ignored_paths: frozenset[str]
+    ignored_dirs: frozenset[str]
+    gitlink_paths: frozenset[str]
+
+
+def _antigravity_parse_text(output: str, context: str) -> str:
+    text = output.strip()
+    if not text:
+        raise LLMTransientError(f"antigravity {context} error: returned no text output")
+    return text
+
+
+def _antigravity_redact_diagnostic(text: str) -> str:
+    redacted = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
+    redacted = re.sub(
+        rf"(?i)([\"'])({_ANTIGRAVITY_SECRET_KEY_PATTERN})\1(\s*:\s*)([\"'])([^\"']+)([\"'])",
+        r"\1\2\1\3\4<redacted>\6",
+        redacted,
+    )
+    redacted = re.sub(
+        rf"(?i)\b({_ANTIGRAVITY_SECRET_KEY_PATTERN})(\s*[:=]\s*)([\"'])([^\"']+)([\"'])",
+        r"\1\2\3<redacted>\5",
+        redacted,
+    )
+    redacted = re.sub(
+        rf"(?i)\b({_ANTIGRAVITY_SECRET_KEY_PATTERN})(\s*[:=]\s*)([^\s,;\"']+)",
+        r"\1\2<redacted>",
+        redacted,
+    )
+    if len(redacted) > _ANTIGRAVITY_LOG_DIAGNOSTIC_LINE_CHARS:
+        redacted = redacted[:_ANTIGRAVITY_LOG_DIAGNOSTIC_LINE_CHARS].rstrip() + "..."
+    return redacted
+
+
+def _antigravity_marker_text(text: str) -> str | None:
+    normalized = re.sub(r"\x1b\[[0-9;]*m", "", text).strip()
+    if not normalized:
+        return None
+    lower = normalized.lower()
+    positions = [lower.find(marker) for marker in _ANTIGRAVITY_LOG_DIAGNOSTIC_MARKERS if marker in lower]
+    if not positions:
+        return None
+    pos = min(positions)
+    start = max(0, pos - 160)
+    end = min(len(normalized), pos + 340)
+    excerpt = normalized[start:end].strip()
+    if start > 0:
+        excerpt = "..." + excerpt
+    if end < len(normalized):
+        excerpt += "..."
+    return _antigravity_redact_diagnostic(excerpt)
+
+
+def _antigravity_json_diagnostic_strings(value: object, *, key: str | None = None) -> Iterator[str]:
+    if isinstance(value, dict):
+        for child_key, child_value in value.items():
+            child_key_text = str(child_key)
+            lower_key = child_key_text.lower()
+            if lower_key in _ANTIGRAVITY_LOG_DIAGNOSTIC_KEYS or "error" in lower_key:
+                yield from _antigravity_json_diagnostic_strings(child_value, key=child_key_text)
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from _antigravity_json_diagnostic_strings(item, key=key)
+        return
+    if isinstance(value, str):
+        marker_text = _antigravity_marker_text(value)
+        if marker_text:
+            yield f"{key}: {marker_text}" if key else marker_text
+
+
+def _antigravity_log_line_diagnostic(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped:
+        return None
+    if stripped.startswith("{"):
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            event = None
+        if event is not None:
+            for diagnostic in _antigravity_json_diagnostic_strings(event):
+                return diagnostic
+            return None
+    return _antigravity_marker_text(stripped)
+
+
+def _antigravity_log_diagnostic(log_file: Path) -> str:
+    try:
+        with log_file.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _ANTIGRAVITY_LOG_DIAGNOSTIC_BYTES))
+            text = handle.read().decode(errors="replace")
+    except OSError:
+        return ""
+
+    diagnostics: list[str] = []
+    for line in reversed(text.splitlines()):
+        diagnostic = _antigravity_log_line_diagnostic(line)
+        if diagnostic and diagnostic not in diagnostics:
+            diagnostics.append(diagnostic)
+        if len(diagnostics) >= _ANTIGRAVITY_LOG_DIAGNOSTIC_LINES:
+            break
+    diagnostics.reverse()
+    return "\n".join(diagnostics)
+
+
+def _antigravity_result_error(
+    result: subprocess.CompletedProcess[str],
+    operation: str,
+    log_diagnostic: str = "",
+) -> LLMProviderError:
+    stderr = (result.stderr or "").strip()
+    log_diagnostic = log_diagnostic.strip()
+    if stderr:
+        safe_stderr = _antigravity_redact_diagnostic(stderr)
+        if log_diagnostic:
+            combined = f"{safe_stderr}\nlog diagnostic:\n{log_diagnostic}"
+            combined_error = _provider_error("antigravity", operation, combined)
+            stderr_error = _provider_error("antigravity", operation, safe_stderr)
+            if isinstance(combined_error, LLMFatalError) and not isinstance(stderr_error, LLMFatalError):
+                return combined_error
+        return _provider_error("antigravity", operation, safe_stderr)
+    if log_diagnostic:
+        return _provider_error("antigravity", operation, f"log diagnostic:\n{log_diagnostic}")
+    if (result.stdout or "").strip():
+        return LLMTransientError(f"antigravity {operation} error: non-zero exit with stdout but no safe diagnostic")
+    return LLMTransientError(f"antigravity {operation} error: non-zero exit")
+
+
+def _antigravity_git_paths(cwd: Path, args: list[str]) -> set[str] | None:
+    result = subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        text=False,
+        cwd=cwd,
+    )
+    if result.returncode != 0:
+        return None
+    stdout = result.stdout
+    if isinstance(stdout, str):
+        stdout = stdout.encode()
+    return {path.decode(errors="surrogateescape") for path in stdout.split(b"\0") if path and not path.endswith(b"/")}
+
+
+def _antigravity_gitlink_paths(cwd: Path) -> set[str] | None:
+    result = subprocess.run(
+        ["git", "ls-files", "--stage", "-z"],
+        capture_output=True,
+        text=False,
+        cwd=cwd,
+    )
+    if result.returncode != 0:
+        return None
+    stdout = result.stdout
+    if isinstance(stdout, str):
+        stdout = stdout.encode()
+    gitlinks: set[str] = set()
+    for entry in stdout.split(b"\0"):
+        if not entry:
+            continue
+        metadata, _, path = entry.partition(b"\t")
+        mode = metadata.split(maxsplit=1)[0] if metadata else b""
+        if mode == b"160000" and path and not path.endswith(b"/"):
+            gitlinks.add(path.decode(errors="surrogateescape"))
+    return gitlinks
+
+
+def _antigravity_copy_policy(cwd: Path) -> _AntigravityCopyPolicy | None:
+    if not any((path / ".git").exists() for path in (cwd, *cwd.parents)):
+        return None
+    tracked_paths = _antigravity_git_paths(cwd, ["ls-files", "-z"])
+    untracked_paths = _antigravity_git_paths(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
+    ignored_paths = _antigravity_git_paths(cwd, ["ls-files", "--ignored", "--others", "--exclude-standard", "-z"])
+    gitlink_paths = _antigravity_gitlink_paths(cwd)
+    if tracked_paths is None or untracked_paths is None or ignored_paths is None or gitlink_paths is None:
+        return None
+    gitlink_paths = {
+        path for path in gitlink_paths if path and not path.startswith("../") and not Path(path).is_absolute()
+    }
+    tracked_paths = tracked_paths - gitlink_paths
+
+    generated_source_paths = {
+        path
+        for path in ignored_paths
+        if path
+        and not path.startswith("../")
+        and not Path(path).is_absolute()
+        and _antigravity_is_presync_generated_source(path)
+    }
+    preserved_paths = frozenset(
+        path
+        for path in tracked_paths | untracked_paths | generated_source_paths
+        if path and not path.startswith("../") and not Path(path).is_absolute()
+    )
+    ignored_paths = frozenset(
+        path for path in ignored_paths if path and not path.startswith("../") and not Path(path).is_absolute()
+    )
+    preserved_dirs: set[str] = set()
+    for path_text in preserved_paths:
+        path = Path(path_text)
+        for parent in path.parents:
+            if parent == Path("."):
+                break
+            preserved_dirs.add(parent.as_posix())
+    ignored_dirs: set[str] = set()
+    for path_text in ignored_paths:
+        path = Path(path_text)
+        for parent in path.parents:
+            if parent == Path("."):
+                break
+            ignored_dirs.add(parent.as_posix())
+    return _AntigravityCopyPolicy(
+        preserved_paths=preserved_paths,
+        preserved_dirs=frozenset(preserved_dirs),
+        ignored_paths=ignored_paths,
+        ignored_dirs=frozenset(ignored_dirs),
+        gitlink_paths=frozenset(gitlink_paths),
+    )
+
+
+def _antigravity_is_presync_generated_source(path: str) -> bool:
+    normalized = path.replace("\\", "/").lower()
+    if not normalized.endswith(_ANTIGRAVITY_GENERATED_SOURCE_SUFFIXES):
+        return False
+    parts = normalized.split("/")
+    for root in ("build", "target"):
+        try:
+            index = parts.index(root)
+        except ValueError:
+            continue
+        if any("generated" in part for part in parts[index + 1 :]):
+            return True
+    return False
+
+
+def _antigravity_is_hard_ignored_path(rel_path: Path) -> bool:
+    rel = rel_path.as_posix()
+    return rel in _ANTIGRAVITY_IGNORED_COPY_PATHS or rel_path.name in _ANTIGRAVITY_HARD_IGNORED_COPY_DIRS
+
+
+def _antigravity_is_soft_ignored_path(rel_path: Path) -> bool:
+    return rel_path.name in _ANTIGRAVITY_SOFT_IGNORED_COPY_DIRS
+
+
+def _antigravity_preserves_path(rel_path: Path, policy: _AntigravityCopyPolicy | None) -> bool:
+    if policy is None:
+        return False
+    rel = rel_path.as_posix()
+    return rel in policy.preserved_paths or rel in policy.preserved_dirs
+
+
+def _antigravity_ignores_path(rel_path: Path, policy: _AntigravityCopyPolicy | None) -> bool:
+    if policy is None:
+        return False
+    rel = rel_path.as_posix()
+    if rel in policy.gitlink_paths:
+        return True
+    if rel in policy.preserved_paths:
+        return False
+    if rel in policy.ignored_paths:
+        return True
+    if rel in policy.ignored_dirs and rel not in policy.preserved_dirs:
+        return True
+    return False
+
+
+def _antigravity_ignore_path(rel_path: Path, policy: _AntigravityCopyPolicy | None = None) -> bool:
+    if _antigravity_is_hard_ignored_path(rel_path):
+        return True
+    if _antigravity_is_soft_ignored_path(rel_path) and not _antigravity_preserves_path(rel_path, policy):
+        return True
+    return False
+
+
+def _antigravity_snapshot_ignore_path(rel_path: Path, policy: _AntigravityCopyPolicy | None = None) -> bool:
+    if _antigravity_is_hard_ignored_path(rel_path):
+        return True
+    if _antigravity_preserved_ignored_ancestor(rel_path, policy):
+        return False
+    if _antigravity_is_soft_ignored_path(rel_path) and not _antigravity_preserves_path(rel_path, policy):
+        return True
+    return False
+
+
+def _antigravity_copy_ignore(
+    root: Path,
+    policy: _AntigravityCopyPolicy | None,
+) -> Callable[[str, list[str]], set[str]]:
+    def _ignore(src: str, names: list[str]) -> set[str]:
+        try:
+            rel_dir = Path(src).resolve().relative_to(root.resolve())
+        except ValueError:
+            rel_dir = Path()
+        ignored: set[str] = set()
+        for name in names:
+            rel_path = rel_dir / name
+            path = Path(src) / name
+            if _antigravity_is_hard_ignored_path(rel_path):
+                ignored.add(name)
+                continue
+            if _antigravity_ignores_path(rel_path, policy):
+                ignored.add(name)
+                continue
+            if _antigravity_is_soft_ignored_path(rel_path):
+                if policy is None or not _antigravity_preserves_path(rel_path, policy):
+                    ignored.add(name)
+                continue
+            if policy is not None and rel_path.as_posix() in policy.preserved_dirs:
+                continue
+            if policy is not None and _antigravity_preserved_ignored_ancestor(rel_path, policy):
+                if path.is_dir():
+                    if rel_path.as_posix() not in policy.preserved_dirs:
+                        ignored.add(name)
+                elif rel_path.as_posix() not in policy.preserved_paths:
+                    ignored.add(name)
+        return ignored
+
+    return _ignore
+
+
+def _antigravity_preserved_ignored_ancestor(
+    rel_path: Path,
+    policy: _AntigravityCopyPolicy | None,
+) -> str | None:
+    if policy is None:
+        return None
+    parts = rel_path.parts
+    for index, part in enumerate(parts[:-1]):
+        if part not in _ANTIGRAVITY_SOFT_IGNORED_COPY_DIRS:
+            continue
+        prefix = Path(*parts[: index + 1]).as_posix()
+        if prefix in policy.preserved_dirs:
+            return prefix
+    return None
+
+
+def _antigravity_validate_workspace_symlinks(
+    root: Path,
+    *,
+    prune_ignored_paths: bool,
+    policy: _AntigravityCopyPolicy | None = None,
+) -> None:
+    resolved_root = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        directory = Path(dirpath)
+        try:
+            rel_dir = directory.resolve().relative_to(resolved_root)
+        except ValueError:
+            rel_dir = Path()
+
+        kept_dirs: list[str] = []
+        for name in dirnames:
+            path = directory / name
+            rel_path = rel_dir / name
+            if path.is_symlink():
+                _antigravity_validate_workspace_symlink(path, resolved_root, rel_path)
+                continue
+            if prune_ignored_paths and _antigravity_ignore_path(rel_path, policy):
+                continue
+            kept_dirs.append(name)
+        dirnames[:] = kept_dirs
+
+        for name in filenames:
+            path = directory / name
+            rel_path = rel_dir / name
+            if prune_ignored_paths and _antigravity_ignore_path(rel_path, policy):
+                continue
+            if path.is_symlink():
+                _antigravity_validate_workspace_symlink(path, resolved_root, rel_path)
+
+
+def _antigravity_validate_workspace_symlink(path: Path, resolved_root: Path, rel_path: Path) -> None:
+    try:
+        target_text = os.readlink(path)
+    except OSError as exc:
+        raise LLMConfigurationError(f"antigravity workspace cannot inspect symlink {rel_path.as_posix()}") from exc
+
+    if Path(target_text).is_absolute():
+        raise LLMConfigurationError(f"antigravity workspace rejects absolute symlink {rel_path.as_posix()}")
+
+    target_path = (path.parent / target_text).resolve(strict=False)
+    try:
+        target_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise LLMConfigurationError(f"antigravity workspace rejects external symlink {rel_path.as_posix()}") from exc
+
+
+def _antigravity_copy_workspace(cwd: Path, destination: Path) -> _AntigravityCopyPolicy | None:
+    policy = _antigravity_copy_policy(cwd)
+    _antigravity_validate_workspace_symlinks(cwd, prune_ignored_paths=True, policy=policy)
+    shutil.copytree(
+        cwd,
+        destination,
+        symlinks=True,
+        ignore=_antigravity_copy_ignore(cwd, policy),
+        ignore_dangling_symlinks=True,
+    )
+    _antigravity_validate_workspace_symlinks(destination, prune_ignored_paths=True, policy=policy)
+    return policy
+
+
+def _antigravity_directory_snapshot(
+    root: Path,
+    policy: _AntigravityCopyPolicy | None = None,
+) -> dict[str, str]:
+    snapshot: dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        directory = Path(dirpath)
+        rel_dir = directory.relative_to(root)
+        kept_dirs: list[str] = []
+        for name in dirnames:
+            path = directory / name
+            rel_path = rel_dir / name
+            if _antigravity_snapshot_ignore_path(rel_path, policy):
+                continue
+            if path.is_symlink():
+                try:
+                    snapshot[rel_path.as_posix()] = f"symlink-dir:{os.readlink(path)}"
+                except OSError:
+                    snapshot[rel_path.as_posix()] = "symlink-dir:<unreadable>"
+                continue
+            kept_dirs.append(name)
+        dirnames[:] = kept_dirs
+
+        for name in filenames:
+            path = directory / name
+            rel_path = rel_dir / name
+            if _antigravity_snapshot_ignore_path(rel_path, policy):
+                continue
+            key = rel_path.as_posix()
+            if path.is_symlink():
+                try:
+                    snapshot[key] = f"symlink:{os.readlink(path)}"
+                except OSError:
+                    snapshot[key] = "symlink:<unreadable>"
+                continue
+            try:
+                snapshot[key] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
+                snapshot[key] = "<unavailable>"
+    return snapshot
+
+
+def _antigravity_snapshot_changed(before: dict[str, str], after: dict[str, str]) -> bool:
+    return any(before.get(path) != after.get(path) for path in before.keys() | after.keys())
+
+
+def _antigravity_sanitize_readonly_output(output: str, workspace: Path) -> str:
+    roots: list[str] = []
+    for root_path in (workspace, workspace.resolve()):
+        root = root_path.as_posix().rstrip("/")
+        if root and root not in roots:
+            roots.append(root)
+
+    sanitized = output
+
+    def _replacement(match: re.Match[str]) -> str:
+        return unquote(match.group("suffix").lstrip("/"))
+
+    suffix_pattern = r"(?P<suffix>/[^\s<>\]\"'`)]+)"
+    for root in sorted(roots, key=len, reverse=True):
+        escaped_root = re.escape(root)
+        sanitized = re.sub(rf"file://{escaped_root}{suffix_pattern}", _replacement, sanitized)
+        sanitized = re.sub(rf"(?<![\w:/.-]){escaped_root}{suffix_pattern}", _replacement, sanitized)
+    return sanitized
+
+
+def _antigravity_write_agent_prompt(prompt: str, cwd: Path) -> str:
+    if prompt.startswith("ANTIGRAVITY WORKSPACE BOUNDARY:\n"):
+        return prompt
+    workspace = cwd.resolve().as_posix()
+    return (
+        "ANTIGRAVITY WORKSPACE BOUNDARY:\n"
+        f"- The only project root for this task is: {workspace}\n"
+        "- Use that directory for all reads, searches, writes, and git commands.\n"
+        "- If a tool starts in a scratch directory, switch to that project root before doing any work.\n"
+        "- Do not search for, inspect, or modify any other checkout or repository path, even if it looks similar.\n\n"
+        f"{prompt}"
+    )
+
+
+@contextmanager
+def _antigravity_log_file() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(prefix="sikula-antigravity-log-") as tmp:
+        yield Path(tmp) / "agy.log"
+
+
+class AntigravityClient(LLMClient):
+    """Calls Antigravity via the `agy --print -` CLI.
+
+    Antigravity CLI does not expose a verified non-interactive read-only mode.
+    Read-only calls therefore run against a disposable workspace copy and reject
+    the provider output if that copy is modified.
+    """
+
+    def __init__(self, config: LLMConfig) -> None:
+        self._config = config
+
+    def prepare_agent_prompt(self, prompt: str, cwd: Path) -> str:
+        return _antigravity_write_agent_prompt(prompt, cwd)
+
+    def _cmd(
+        self,
+        *,
+        cwd: Path | None,
+        timeout: int,
+        log_file: Path,
+        auto_approve_tools: bool,
+    ) -> list[str]:
+        cmd = ["agy", "--new-project"]
+        if cwd is not None:
+            cmd.extend(["--add-dir", str(cwd)])
+        if auto_approve_tools:
+            cmd.append("--dangerously-skip-permissions")
+        cmd.extend(
+            [
+                "--sandbox",
+                "--model",
+                self._config.model,
+                "--log-file",
+                str(log_file),
+                "--print-timeout",
+                f"{timeout}s",
+                "--print",
+                "-",
+            ]
+        )
+        return cmd
+
+    def generate(self, system: str, user: str) -> str:
+        prompt = f"{system}\n\n{user}"
+        log.info(
+            "Calling LLM via Antigravity (%s, ~%d tokens) — waiting for response...",
+            self._config.model,
+            len(prompt) // 4,
+        )
+
+        def _call():
+            with _antigravity_log_file() as log_file:
+                result = subprocess.run(
+                    self._cmd(
+                        cwd=None,
+                        timeout=_ANTIGRAVITY_GENERATE_TIMEOUT,
+                        log_file=log_file,
+                        auto_approve_tools=False,
+                    ),
+                    capture_output=True,
+                    input=prompt,
+                    text=True,
+                    timeout=_ANTIGRAVITY_GENERATE_TIMEOUT,
+                )
+                log_diagnostic = _antigravity_log_diagnostic(log_file)
+            if result.returncode != 0:
+                raise _antigravity_result_error(result, "CLI", log_diagnostic)
+            return _antigravity_parse_text(result.stdout, "CLI")
+
+        return _call_with_retry("generate", _call, self._config, "generate")
+
+    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+        log.info("Running Antigravity read-only agent (%s) — waiting for completion...", self._config.model)
+
+        def _call():
+            with tempfile.TemporaryDirectory(prefix="sikula-antigravity-readonly-") as tmp:
+                workspace = Path(tmp) / "workspace"
+                copy_policy = _antigravity_copy_workspace(cwd, workspace)
+                before = _antigravity_directory_snapshot(workspace, copy_policy)
+                with _antigravity_log_file() as log_file:
+                    result = subprocess.run(
+                        self._cmd(
+                            cwd=workspace,
+                            timeout=self._config.agent_timeout,
+                            log_file=log_file,
+                            auto_approve_tools=True,
+                        ),
+                        capture_output=True,
+                        input=prompt,
+                        text=True,
+                        cwd=workspace,
+                        timeout=self._config.agent_timeout,
+                    )
+                    log_diagnostic = _antigravity_log_diagnostic(log_file)
+                if result.returncode != 0:
+                    raise _antigravity_result_error(result, "agent", log_diagnostic)
+                after = _antigravity_directory_snapshot(workspace, copy_policy)
+                if _antigravity_snapshot_changed(before, after):
+                    raise LLMTransientError("antigravity read-only agent attempted to modify its disposable workspace")
+                output = _antigravity_parse_text(result.stdout, "agent")
+                return _antigravity_sanitize_readonly_output(output, workspace)
+
+        return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
+
+    def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
+        workspace = cwd.resolve()
+        policy = _antigravity_copy_policy(workspace)
+        _antigravity_validate_workspace_symlinks(workspace, prune_ignored_paths=True, policy=policy)
+        prompt = self.prepare_agent_prompt(prompt, workspace)
+        before = _git_snapshot(workspace)
+        log.info("Running Antigravity agent (%s) — waiting for completion...", self._config.model)
+
+        total = len(_RETRY_DELAYS) + 1
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+            try:
+                with _antigravity_log_file() as log_file:
+                    result = _run_agent_subprocess_streaming(
+                        self._cmd(
+                            cwd=workspace,
+                            timeout=self._config.agent_timeout,
+                            log_file=log_file,
+                            auto_approve_tools=True,
+                        ),
+                        cwd=workspace,
+                        env=None,
+                        timeout=self._config.agent_timeout,
+                        provider="antigravity",
+                        stdin_text=prompt,
+                    )
+                    log_diagnostic = _antigravity_log_diagnostic(log_file)
+                if result.returncode != 0:
+                    raise _antigravity_result_error(result, "agent", log_diagnostic)
+                after = _git_snapshot(workspace)
+                changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
+                return changed, result.stdout.strip()
+            except subprocess.TimeoutExpired as exc:
+                last_exc = LLMTimeoutError(f"antigravity agent timed out after {exc.timeout}s")
+                if delay is None:
+                    break
+                if _git_snapshot(workspace) != before:
+                    log.warning("Agent failed after partial file changes — not retrying")
+                    break
+                log.warning(
+                    "Agent call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1,
+                    total,
+                    last_exc,
+                    delay,
+                )
+                _notify_retry(self._config, "run_agent", attempt + 1, total, delay, last_exc)
+                time.sleep(delay)
+            except LLMTransientError as exc:
+                last_exc = exc
+                if delay is None:
+                    break
+                if _git_snapshot(workspace) != before:
+                    log.warning("Agent failed after partial file changes — not retrying")
+                    break
+                log.warning(
+                    "Agent call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1,
+                    total,
+                    exc,
+                    delay,
+                )
+                _notify_retry(self._config, "run_agent", attempt + 1, total, delay, exc)
+                time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -1756,4 +2532,6 @@ def create_llm_client(config: LLMConfig) -> LLMClient:
         return GeminiClient(config)
     if config.provider == "opencode":
         return OpenCodeClient(config)
+    if config.provider == "antigravity":
+        return AntigravityClient(config)
     raise ValueError(f"Unknown LLM provider: {config.provider!r}. Add it to llm_client.py.")

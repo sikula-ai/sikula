@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from agents.base_agent import load_extra_rules
+from agents.base_agent import AGENT_SECURITY_PREFIX, READONLY_AGENT_PREFIX, load_extra_rules, read_only_agent_prompt
 from tools.base_tool import ToolResult
 
 
@@ -15,6 +15,27 @@ def _file_tool(content: str | None) -> MagicMock:
     else:
         tool.read.return_value = ToolResult(success=True, output=content)
     return tool
+
+
+class TestReadOnlyAgentPrompt:
+    def test_inserts_readonly_constraint_after_security_prefix(self):
+        prompt = AGENT_SECURITY_PREFIX + "Review this change."
+
+        result = read_only_agent_prompt(prompt)
+
+        assert result.startswith(AGENT_SECURITY_PREFIX)
+        assert result[len(AGENT_SECURITY_PREFIX) :].startswith(READONLY_AGENT_PREFIX)
+        assert "use project-relative paths" in result
+        assert "file:// URIs" in result
+        assert "Return the requested analysis, review, or generated content" in result
+        assert result.endswith("Review this change.")
+
+    def test_does_not_duplicate_readonly_constraint(self):
+        prompt = AGENT_SECURITY_PREFIX + READONLY_AGENT_PREFIX + "Review this change."
+
+        result = read_only_agent_prompt(prompt)
+
+        assert result == prompt
 
 
 class TestLoadExtraRules:

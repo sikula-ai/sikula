@@ -46,7 +46,7 @@ The orchestration loop is platform-neutral. Stack-specific behavior lives in `Bu
 
 ### LLM Providers
 
-Sikula has built-in CLI integrations for Codex, Claude, Gemini, and OpenCode. See [Providers](docs/providers.md) for authentication, model configuration, per-agent overrides, and data-boundary notes.
+Sikula has built-in CLI integrations for Codex, Claude, Gemini, OpenCode, and Antigravity. See [Providers](docs/providers.md) for authentication, model configuration, per-agent overrides, and data-boundary notes.
 
 ## Demo
 
@@ -76,7 +76,7 @@ pipx install --editable .
 
 ### Set Up Your Project
 
-Generated configs use Codex by default. Claude, Gemini, and OpenCode are supported too; see [Providers](docs/providers.md).
+Generated configs use Codex by default. Claude, Gemini, OpenCode, and Antigravity are supported too; see [Providers](docs/providers.md).
 
 ```bash
 codex login
@@ -172,7 +172,7 @@ Use this when code already exists and you want an independent review/security ga
 
 - **`pipx: command not found`** - install `pipx` from <https://pipx.pypa.io/stable/installation/>.
 - **Config or guidelines missing in the task worktree** - commit `.sikula/config.yaml` and any generated `.sikula/guidelines.md` before the first isolated run.
-- **Provider is not authenticated** - run `codex login` or see [Providers](docs/providers.md) for Claude, Gemini, and OpenCode.
+- **Provider is not authenticated** - run `codex login` or see [Providers](docs/providers.md) for Claude, Gemini, OpenCode, and Antigravity.
 - **Task is too vague** - run `sikula contract check .sikula/tasks/my-task.md` and see [Writing Sikula Tasks](docs/writing-tasks.md).
 - **Run failed after creating a worktree** - inspect `sikula show <task-id>` and `.sikula/worktrees/<task-id>/`; retry with `sikula run --task-id <task-id> --reset-failed`.
 

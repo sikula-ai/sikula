@@ -395,6 +395,10 @@ platform-neutral and scoped to Sikula-modified tests. For source-controlled outp
 by sync, decide whether `is_sync_adoptable_file()` should classify them. For mixed
 source/test files, leave `is_test_only_change()` conservative unless syntax-aware diff
 analysis can prove the change is test-only.
+If `generate_sources()` produces source/IDL files under gitignored build output paths that
+read-only agents need for analysis or review, update Antigravity's read-only generated-source
+preservation rules and regression tests while keeping gitignored secrets and env files out of
+provider workspace copies.
 
 All methods return `ToolResult`. Treat subprocess exit code 0 as success. Platform-specific
 exit codes (e.g. pytest exit 5 = "no tests collected") may also be treated as success — document

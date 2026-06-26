@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Sikula now supports Antigravity CLI as `provider: antigravity` via `agy --print -`,
+  including stdin prompt delivery, write-agent workspace attachment through `--add-dir`,
+  and disposable-copy read-only calls because Antigravity CLI does not expose a verified
+  non-interactive read-only permission mode.
 - `sikula contract check TASK_FILE` now provides a deterministic, by-default read-only
   implementation-contract readiness preflight for Markdown/plain-text task files, with
   human-readable and `--json` output covering scope, acceptance criteria,

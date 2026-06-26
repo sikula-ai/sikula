@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from agents.base_agent import AGENT_SECURITY_PREFIX
+from agents.base_agent import AGENT_SECURITY_PREFIX, read_only_agent_prompt
 from core.llm_client import LLMClient
 
 log = logging.getLogger(__name__)
@@ -52,7 +52,9 @@ class InitAgent:
         self._tech_stack = tech_stack
 
     def generate_guidelines(self, project_root: Path) -> str:
-        prompt = AGENT_SECURITY_PREFIX + _SYSTEM.format(tech_stack=self._tech_stack) + "\n\n" + _USER
+        prompt = read_only_agent_prompt(
+            AGENT_SECURITY_PREFIX + _SYSTEM.format(tech_stack=self._tech_stack) + "\n\n" + _USER
+        )
         output = self._llm.run_readonly_agent(prompt, cwd=project_root)
         return _clean_guidelines_output(output)
 

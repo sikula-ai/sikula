@@ -397,6 +397,7 @@ class TestWriterAgent(BaseAgent):
         )
 
         prompt += _load_extra_rules(self.project_config, self.name, file_tool)
+        prompt = self.llm.prepare_agent_prompt(prompt, cwd=file_tool._root)
 
         agent_output = None
         changed: list[str] = []

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from agents.base_agent import READONLY_AGENT_PREFIX
 from agents.task_preparation_agent import TaskPreparationAgent
 from core.contract_auto_prepare import ContractAutoPrepareRequest
 from core.task_auto_refine import TaskAutoAnswerRequest, TaskAutoRefineRequest
@@ -54,6 +55,7 @@ def test_task_preparer_contract_prompt_disallows_unreferenced_sikula_artifacts(t
     )
 
     prompt = llm.prompts[0]
+    assert READONLY_AGENT_PREFIX in prompt
     assert "Configured Sikula workflow artifact directories:" in prompt
     assert "- task descriptions: docs/product-tasks" in prompt
     assert "- implementation contracts: docs/contracts" in prompt
@@ -83,6 +85,7 @@ def test_task_preparer_contract_answer_result_includes_audit_record(tmp_path: Pa
     record = batch.audit_records[0]
     assert record["phase"] == "contract_prepare_auto"
     assert record["round_index"] == 2
+    assert READONLY_AGENT_PREFIX in record["prompt"]
     assert "Active questions:" in record["prompt"]
     assert record["raw_output"] == llm.output
     assert record["parsed"]["answered_question_ids"] == ["scope.boundaries"]
@@ -223,6 +226,7 @@ def test_task_preparer_refine_result_includes_audit_record(tmp_path: Path):
     record = draft.audit_records[0]
     assert record["phase"] == "task_refine_auto"
     assert record["round_index"] == 1
+    assert READONLY_AGENT_PREFIX in record["prompt"]
     assert "Raw task description:" in record["prompt"]
     assert record["raw_output"] == llm.output
     assert record["parsed"]["input_language"] == "cs"
@@ -258,6 +262,7 @@ def test_task_preparer_refine_answer_prompt_stays_product_level(tmp_path: Path):
 
     prompt = llm.prompts[0]
     assert batch.answers == {"scope.boundaries": {"answer": "Add invite creation only.", "notes": "Task scope."}}
+    assert READONLY_AGENT_PREFIX in prompt
     assert "Active product task questions:" in prompt
     assert "Original raw task description:" in prompt
     assert "Current normalized task draft:" in prompt
@@ -287,6 +292,7 @@ def test_task_preparer_refine_answer_result_includes_audit_record(tmp_path: Path
     record = batch.audit_records[0]
     assert record["phase"] == "task_refine_auto_answers"
     assert record["round_index"] == 2
+    assert READONLY_AGENT_PREFIX in record["prompt"]
     assert "Active product task questions:" in record["prompt"]
     assert record["raw_output"] == llm.output
     assert record["parsed"]["answered_question_ids"] == ["acceptance.criteria"]
