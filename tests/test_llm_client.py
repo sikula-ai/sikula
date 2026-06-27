@@ -3010,6 +3010,7 @@ class TestAntigravityClientCommands:
 
         snapshot = _antigravity_directory_snapshot(tmp_path)
 
+        assert snapshot[".venv"] == "ignored-dir"
         assert ".venv/ignored.txt" not in snapshot
         assert snapshot["dir-link"] == "symlink-dir:target-dir"
         assert snapshot["file-link"] == "symlink:target.txt"
@@ -3127,6 +3128,26 @@ class TestAntigravityClientCommands:
 
         assert mock_run.call_count == 4
         assert (tmp_path / "repo.txt").read_text() == "source"
+
+    def test_run_readonly_agent_rejects_new_soft_ignored_directories(self, tmp_path: Path):
+        (tmp_path / "repo.txt").write_text("source")
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        def _fake_run(cmd, **kwargs):
+            package_dir = Path(kwargs["cwd"], "node_modules", "pkg")
+            package_dir.mkdir(parents=True)
+            (package_dir / "index.js").write_text("generated dependency")
+            return subprocess.CompletedProcess(cmd, 0, "analysis", "")
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run,
+            pytest.raises(LLMTransientError, match="disposable workspace"),
+        ):
+            client.run_readonly_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 4
+        assert not (tmp_path / "node_modules").exists()
 
     def test_run_readonly_agent_preserves_tracked_files_in_ignored_dirs(self, tmp_path: Path):
         repo = tmp_path / "repo"

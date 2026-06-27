@@ -2282,6 +2282,7 @@ def _antigravity_directory_snapshot(
             path = directory / name
             rel_path = rel_dir / name
             if _antigravity_snapshot_ignore_path(rel_path, policy):
+                snapshot[rel_path.as_posix()] = "ignored-dir"
                 continue
             if path.is_symlink():
                 try:
