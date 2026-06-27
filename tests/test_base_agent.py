@@ -37,6 +37,11 @@ class TestReadOnlyAgentPrompt:
 
         assert result == prompt
 
+    def test_adds_readonly_constraint_without_security_prefix(self):
+        result = read_only_agent_prompt("Review this change.")
+
+        assert result == READONLY_AGENT_PREFIX + "Review this change."
+
 
 class TestLoadExtraRules:
     def test_returns_empty_when_not_configured(self):

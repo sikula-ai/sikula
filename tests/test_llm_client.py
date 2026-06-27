@@ -27,6 +27,22 @@ from core.llm_client import (
     LLMTransientError,
     LLMTimeoutError,
     _agent_text_or_empty,
+    _AntigravityCopyPolicy,
+    _antigravity_copy_ignore,
+    _antigravity_copy_policy,
+    _antigravity_directory_snapshot,
+    _antigravity_git_paths,
+    _antigravity_gitlink_paths,
+    _antigravity_log_diagnostic,
+    _antigravity_log_line_diagnostic,
+    _antigravity_marker_text,
+    _antigravity_parse_text,
+    _antigravity_redact_diagnostic,
+    _antigravity_result_error,
+    _antigravity_snapshot_changed,
+    _antigravity_validate_workspace_symlink,
+    _antigravity_validate_workspace_symlinks,
+    _antigravity_write_agent_prompt,
     _call_with_retry,
     _claude_write_settings,
     _codex_parse_text,
@@ -2831,6 +2847,195 @@ class TestAntigravityClientCommands:
     def _run_result(text: str = "ok"):
         return subprocess.CompletedProcess(["agy"], 0, text, "")
 
+    def test_parse_text_rejects_empty_output(self):
+        with pytest.raises(LLMTransientError, match="returned no text output"):
+            _antigravity_parse_text("  \n", "CLI")
+
+    def test_diagnostic_helpers_cover_empty_long_json_and_log_limit(self, tmp_path: Path):
+        assert _antigravity_marker_text("") is None
+        assert _antigravity_marker_text("all good") is None
+        assert _antigravity_log_line_diagnostic("   ") is None
+        assert _antigravity_log_line_diagnostic("{not json") is None
+        assert _antigravity_log_line_diagnostic('{"event":"ok"}') is None
+
+        long_text = "x" * 180 + " unsupported model token=secret " + "y" * 380
+        marker = _antigravity_marker_text(long_text)
+        assert marker is not None
+        assert marker.startswith("...")
+        assert marker.endswith("...")
+        assert "token=<redacted>" in marker
+        assert "secret" not in marker
+
+        redacted = _antigravity_redact_diagnostic("ERROR " + "x" * 700 + " OPENAI_API_KEY=secret")
+        assert redacted.endswith("...")
+        assert len(redacted) <= 503
+
+        list_diagnostic = _antigravity_log_line_diagnostic(
+            '{"errors": ["quota exceeded token=secret", {"message": "not authenticated"}]}'
+        )
+        assert list_diagnostic == "errors: quota exceeded token=<redacted>"
+
+        log_file = tmp_path / "agy.log"
+        log_file.write_text("\n".join(f"ERROR unsupported model {index}" for index in range(8)))
+        diagnostic = _antigravity_log_diagnostic(log_file)
+        assert diagnostic.splitlines() == [f"ERROR unsupported model {index}" for index in range(2, 8)]
+
+    def test_result_error_covers_transient_fallbacks(self):
+        with_stdout = _antigravity_result_error(
+            subprocess.CompletedProcess(["agy"], 1, "partial stdout", ""),
+            "agent",
+        )
+        assert isinstance(with_stdout, LLMTransientError)
+        assert "stdout but no safe diagnostic" in str(with_stdout)
+
+        without_output = _antigravity_result_error(
+            subprocess.CompletedProcess(["agy"], 1, "", ""),
+            "agent",
+        )
+        assert isinstance(without_output, LLMTransientError)
+        assert str(without_output).endswith("non-zero exit")
+
+        stderr_error = _antigravity_result_error(
+            subprocess.CompletedProcess(["agy"], 1, "", "temporary outage"),
+            "agent",
+            "ERROR failed upstream",
+        )
+        assert isinstance(stderr_error, LLMTransientError)
+        assert "temporary outage" in str(stderr_error)
+        assert "log diagnostic" not in str(stderr_error)
+
+    def test_git_path_helpers_handle_failures_and_text_stdout(self, tmp_path: Path):
+        with patch(
+            "core.llm_client.subprocess.run",
+            return_value=subprocess.CompletedProcess(["git"], 1, "", ""),
+        ):
+            assert _antigravity_git_paths(tmp_path, ["ls-files", "-z"]) is None
+            assert _antigravity_gitlink_paths(tmp_path) is None
+
+        with patch(
+            "core.llm_client.subprocess.run",
+            return_value=subprocess.CompletedProcess(["git"], 0, "one.txt\0dir/\0two.txt\0", ""),
+        ):
+            assert _antigravity_git_paths(tmp_path, ["ls-files", "-z"]) == {"one.txt", "two.txt"}
+
+        gitlink_stdout = "160000 abcdef\tlibs/api\0not-a-gitlink\tREADME.md\0"
+        with patch(
+            "core.llm_client.subprocess.run",
+            return_value=subprocess.CompletedProcess(["git"], 0, gitlink_stdout, ""),
+        ):
+            assert _antigravity_gitlink_paths(tmp_path) == {"libs/api"}
+
+    def test_copy_policy_returns_none_when_git_listing_fails(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+
+        with patch("core.llm_client._antigravity_git_paths", return_value=None):
+            assert _antigravity_copy_policy(repo) is None
+
+    def test_copy_ignore_handles_outside_root_and_preserved_ignored_ancestors(self, tmp_path: Path):
+        root = tmp_path / "repo"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+
+        ignore_without_policy = _antigravity_copy_ignore(root, None)
+        assert ignore_without_policy(str(outside), [".git", ".venv", "keep.txt"]) == {".git", ".venv"}
+
+        dist = root / "dist"
+        dist.mkdir()
+        (dist / "nested").mkdir()
+        (dist / "keep.js").write_text("tracked")
+        (dist / "drop.js").write_text("ignored")
+        policy = _AntigravityCopyPolicy(
+            preserved_paths=frozenset({"dist/keep.js"}),
+            preserved_dirs=frozenset({"dist"}),
+            ignored_paths=frozenset({"dist/ignored-explicit.js"}),
+            ignored_dirs=frozenset({"dist"}),
+            gitlink_paths=frozenset(),
+        )
+
+        ignore = _antigravity_copy_ignore(root, policy)
+        assert ignore(str(dist), ["keep.js", "drop.js", "nested"]) == {"drop.js", "nested"}
+
+    def test_validate_workspace_symlinks_allows_internal_symlink_directories(self, tmp_path: Path):
+        target = tmp_path / "target"
+        target.mkdir()
+        try:
+            (tmp_path / "target-link").symlink_to("target")
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+
+        _antigravity_validate_workspace_symlinks(tmp_path, prune_ignored_paths=False)
+
+    def test_validate_workspace_symlink_reports_uninspectable_links(self, tmp_path: Path):
+        link = tmp_path / "broken-link"
+
+        with (
+            patch("core.llm_client.os.readlink", side_effect=OSError("denied")),
+            pytest.raises(LLMConfigurationError, match="cannot inspect symlink broken-link"),
+        ):
+            _antigravity_validate_workspace_symlink(link, tmp_path, Path("broken-link"))
+
+    def test_directory_snapshot_records_symlinks_and_ignored_paths(self, tmp_path: Path):
+        (tmp_path / ".venv").mkdir()
+        (tmp_path / ".venv" / "ignored.txt").write_text("ignored")
+        (tmp_path / "target-dir").mkdir()
+        (tmp_path / "target.txt").write_text("target")
+        try:
+            (tmp_path / "dir-link").symlink_to("target-dir")
+            (tmp_path / "file-link").symlink_to("target.txt")
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+
+        snapshot = _antigravity_directory_snapshot(tmp_path)
+
+        assert ".venv/ignored.txt" not in snapshot
+        assert snapshot["dir-link"] == "symlink-dir:target-dir"
+        assert snapshot["file-link"] == "symlink:target.txt"
+        assert _antigravity_snapshot_changed({"file-link": "old"}, snapshot)
+        assert not _antigravity_snapshot_changed(snapshot, dict(snapshot))
+
+    def test_directory_snapshot_handles_unreadable_symlinks_and_files(self, tmp_path: Path):
+        (tmp_path / "target-dir").mkdir()
+        (tmp_path / "target.txt").write_text("target")
+        (tmp_path / "regular.txt").write_text("regular")
+        try:
+            (tmp_path / "dir-link").symlink_to("target-dir")
+            (tmp_path / "file-link").symlink_to("target.txt")
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+
+        real_readlink = os.readlink
+
+        def _readlink(path):
+            if Path(path).name in {"dir-link", "file-link"}:
+                raise OSError("denied")
+            return real_readlink(path)
+
+        with patch("core.llm_client.os.readlink", side_effect=_readlink):
+            snapshot = _antigravity_directory_snapshot(tmp_path)
+
+        assert snapshot["dir-link"] == "symlink-dir:<unreadable>"
+        assert snapshot["file-link"] == "symlink:<unreadable>"
+
+        real_read_bytes = Path.read_bytes
+
+        def _read_bytes(path):
+            if Path(path).name == "regular.txt":
+                raise PermissionError("denied")
+            return real_read_bytes(path)
+
+        with patch.object(Path, "read_bytes", _read_bytes):
+            snapshot = _antigravity_directory_snapshot(tmp_path)
+
+        assert snapshot["regular.txt"] == "<unavailable>"
+
+    def test_write_agent_prompt_is_idempotent(self, tmp_path: Path):
+        prompt = _antigravity_write_agent_prompt("do work", tmp_path)
+
+        assert _antigravity_write_agent_prompt(prompt, tmp_path) == prompt
+
     def test_generate_uses_stdin_print_mode(self):
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
 
@@ -3483,3 +3688,128 @@ class TestAntigravityClientCommands:
         assert "unsupported model" in str(exc_info.value)
         assert mock_run.call_count == 1
         sleep.assert_not_called()
+
+    def test_run_agent_retries_timeout_then_succeeds(self, tmp_path: Path):
+        observer = MagicMock()
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                retry_observer=observer,
+            )
+        )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}, {"src/app.ts": "hash"}]),
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                side_effect=[
+                    subprocess.TimeoutExpired(cmd="agy", timeout=12),
+                    self._run_result("done"),
+                ],
+            ) as mock_run,
+        ):
+            changed, output = client.run_agent("prompt", tmp_path)
+
+        assert changed == ["src/app.ts"]
+        assert output == "done"
+        assert mock_run.call_count == 2
+        sleep.assert_called_once()
+        assert observer.call_args.args[0]["error_type"] == "LLMTimeoutError"
+
+    def test_run_agent_timeout_stops_when_partial_changes_exist(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {"src/app.ts": "hash"}]),
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                side_effect=subprocess.TimeoutExpired(cmd="agy", timeout=12),
+            ) as mock_run,
+            pytest.raises(LLMTimeoutError, match="timed out after 12s"),
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_run_agent_timeout_raises_after_final_attempt(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}, {}, {}]),
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                side_effect=[
+                    subprocess.TimeoutExpired(cmd="agy", timeout=12),
+                    subprocess.TimeoutExpired(cmd="agy", timeout=12),
+                    subprocess.TimeoutExpired(cmd="agy", timeout=12),
+                    subprocess.TimeoutExpired(cmd="agy", timeout=12),
+                ],
+            ) as mock_run,
+            pytest.raises(LLMTimeoutError, match="timed out after 12s"),
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 4
+        assert sleep.call_count == 3
+
+    def test_run_agent_retries_transient_error_then_succeeds(self, tmp_path: Path):
+        observer = MagicMock()
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                retry_observer=observer,
+            )
+        )
+        transient = subprocess.CompletedProcess(["agy"], 1, "partial stdout", "")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}, {"src/app.ts": "hash"}]),
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                side_effect=[transient, self._run_result("done")],
+            ) as mock_run,
+        ):
+            changed, output = client.run_agent("prompt", tmp_path)
+
+        assert changed == ["src/app.ts"]
+        assert output == "done"
+        assert mock_run.call_count == 2
+        sleep.assert_called_once()
+        assert observer.call_args.args[0]["error_type"] == "LLMTransientError"
+
+    def test_run_agent_transient_error_stops_when_partial_changes_exist(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        transient = subprocess.CompletedProcess(["agy"], 1, "partial stdout", "")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {"src/app.ts": "hash"}]),
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=transient) as mock_run,
+            pytest.raises(LLMTransientError, match="stdout but no safe diagnostic"),
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_run_agent_transient_error_raises_after_final_attempt(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        transient = subprocess.CompletedProcess(["agy"], 1, "partial stdout", "")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}, {}, {}]),
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=transient) as mock_run,
+            pytest.raises(LLMTransientError, match="stdout but no safe diagnostic"),
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 4
+        assert sleep.call_count == 3
