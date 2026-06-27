@@ -37,6 +37,8 @@ from core.llm_client import (
     _antigravity_log_line_diagnostic,
     _antigravity_marker_text,
     _antigravity_parse_text,
+    _antigravity_parse_version,
+    _antigravity_require_supported_version,
     _antigravity_redact_diagnostic,
     _antigravity_result_error,
     _antigravity_snapshot_changed,
@@ -82,7 +84,8 @@ class TestCreateLlmClient:
 
     def test_antigravity_provider(self):
         cfg = LLMConfig(provider="antigravity")
-        assert isinstance(create_llm_client(cfg), AntigravityClient)
+        with patch("core.llm_client._antigravity_require_supported_version"):
+            assert isinstance(create_llm_client(cfg), AntigravityClient)
 
     def test_unknown_provider_raises(self):
         cfg = LLMConfig(provider="unknown")
@@ -2843,9 +2846,81 @@ class TestGeminiClientCommands:
 
 
 class TestAntigravityClientCommands:
+    @pytest.fixture(autouse=True)
+    def _supported_antigravity_version(self):
+        with patch("core.llm_client._antigravity_require_supported_version"):
+            yield
+
     @staticmethod
     def _run_result(text: str = "ok"):
         return subprocess.CompletedProcess(["agy"], 0, text, "")
+
+    def test_parse_version_extracts_semver(self):
+        assert _antigravity_parse_version("agy 1.0.13") == (1, 0, 13)
+        assert _antigravity_parse_version("Antigravity CLI version 10.2.3") == (10, 2, 3)
+        assert _antigravity_parse_version("dev build") is None
+
+    def test_require_supported_version_accepts_minimum_version(self):
+        with patch(
+            "core.llm_client.subprocess.run",
+            return_value=subprocess.CompletedProcess(["agy", "--version"], 0, "1.0.12\n", ""),
+        ) as mock_run:
+            _antigravity_require_supported_version()
+
+        mock_run.assert_called_once_with(["agy", "--version"], capture_output=True, text=True, timeout=10)
+
+    def test_require_supported_version_rejects_old_version(self):
+        with (
+            patch(
+                "core.llm_client.subprocess.run",
+                return_value=subprocess.CompletedProcess(["agy", "--version"], 0, "1.0.11\n", ""),
+            ),
+            pytest.raises(LLMConfigurationError, match="agy 1.0.12 or newer"),
+        ):
+            _antigravity_require_supported_version()
+
+    def test_require_supported_version_rejects_unparseable_output(self):
+        with (
+            patch(
+                "core.llm_client.subprocess.run",
+                return_value=subprocess.CompletedProcess(["agy", "--version"], 0, "dev build\n", ""),
+            ),
+            pytest.raises(LLMConfigurationError, match="could not parse"),
+        ):
+            _antigravity_require_supported_version()
+
+    def test_require_supported_version_redacts_failed_check_output(self):
+        with (
+            patch(
+                "core.llm_client.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    ["agy", "--version"],
+                    1,
+                    "",
+                    "not authenticated OPENAI_API_KEY=secret",
+                ),
+            ),
+            pytest.raises(LLMConfigurationError) as exc_info,
+        ):
+            _antigravity_require_supported_version()
+
+        message = str(exc_info.value)
+        assert "OPENAI_API_KEY=<redacted>" in message
+        assert "secret" not in message
+
+    def test_require_supported_version_reports_missing_cli(self):
+        with (
+            patch("core.llm_client.subprocess.run", side_effect=FileNotFoundError),
+            pytest.raises(LLMConfigurationError, match="CLI not found"),
+        ):
+            _antigravity_require_supported_version()
+
+    def test_require_supported_version_reports_timeout(self):
+        with (
+            patch("core.llm_client.subprocess.run", side_effect=subprocess.TimeoutExpired("agy", 10)),
+            pytest.raises(LLMConfigurationError, match="timed out"),
+        ):
+            _antigravity_require_supported_version()
 
     def test_parse_text_rejects_empty_output(self):
         with pytest.raises(LLMTransientError, match="returned no text output"):

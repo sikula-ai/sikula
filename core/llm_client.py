@@ -1808,6 +1808,7 @@ _ANTIGRAVITY_GENERATED_SOURCE_SUFFIXES = (
 _ANTIGRAVITY_LOG_DIAGNOSTIC_BYTES = 65536
 _ANTIGRAVITY_LOG_DIAGNOSTIC_LINES = 6
 _ANTIGRAVITY_LOG_DIAGNOSTIC_LINE_CHARS = 500
+_ANTIGRAVITY_MIN_VERSION = (1, 0, 12)
 _ANTIGRAVITY_LOG_DIAGNOSTIC_MARKERS = (
     "401",
     "api key",
@@ -2356,6 +2357,42 @@ def _antigravity_log_file() -> Iterator[Path]:
         yield Path(tmp) / "agy.log"
 
 
+def _antigravity_parse_version(text: str) -> tuple[int, int, int] | None:
+    match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", text)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def _antigravity_require_supported_version() -> None:
+    try:
+        result = subprocess.run(
+            ["agy", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except FileNotFoundError as exc:
+        raise LLMConfigurationError("antigravity CLI not found: install `agy` and authenticate it") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise LLMConfigurationError("antigravity CLI version check timed out") from exc
+
+    output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
+    if result.returncode != 0:
+        diagnostic = _antigravity_redact_diagnostic(output) or f"exit code {result.returncode}"
+        raise LLMConfigurationError(f"antigravity CLI version check failed: {diagnostic}")
+
+    version = _antigravity_parse_version(output)
+    if version is None:
+        raise LLMConfigurationError("antigravity CLI version check failed: could not parse `agy --version` output")
+    if version < _ANTIGRAVITY_MIN_VERSION:
+        minimum = ".".join(str(part) for part in _ANTIGRAVITY_MIN_VERSION)
+        current = ".".join(str(part) for part in version)
+        raise LLMConfigurationError(
+            f"antigravity CLI {current} is unsupported; install agy {minimum} or newer"
+        )
+
+
 class AntigravityClient(LLMClient):
     """Calls Antigravity via the `agy --print -` CLI.
 
@@ -2365,6 +2402,7 @@ class AntigravityClient(LLMClient):
     """
 
     def __init__(self, config: LLMConfig) -> None:
+        _antigravity_require_supported_version()
         self._config = config
 
     def prepare_agent_prompt(self, prompt: str, cwd: Path) -> str:
