@@ -2904,6 +2904,26 @@ class TestAntigravityClientCommands:
         assert "temporary outage" in str(stderr_error)
         assert "log diagnostic" not in str(stderr_error)
 
+    def test_result_error_redacts_multi_token_authorization_headers(self):
+        error = _antigravity_result_error(
+            subprocess.CompletedProcess(
+                ["agy"],
+                1,
+                "",
+                "ERROR Authorization: Basic dXNlcjpwYXNz; Proxy-Authorization = Digest abc def",
+            ),
+            "agent",
+        )
+
+        message = str(error)
+        assert isinstance(error, LLMProviderError)
+        assert "Authorization: <redacted>" in message
+        assert "Proxy-Authorization = <redacted>" in message
+        assert "Basic" not in message
+        assert "dXNlcjpwYXNz" not in message
+        assert "Digest" not in message
+        assert "abc def" not in message
+
     def test_git_path_helpers_handle_failures_and_text_stdout(self, tmp_path: Path):
         with patch(
             "core.llm_client.subprocess.run",

@@ -1852,6 +1852,7 @@ _ANTIGRAVITY_LOG_DIAGNOSTIC_KEYS = {
 _ANTIGRAVITY_SECRET_KEY_PATTERN = (
     r"[A-Za-z0-9_. -]*(?:api[_ -]?key|apikey|authorization|password|secret|token)[A-Za-z0-9_. -]*"
 )
+_ANTIGRAVITY_AUTHORIZATION_KEY_PATTERN = r"[A-Za-z0-9_. -]*authorization[A-Za-z0-9_. -]*"
 
 
 @dataclass(frozen=True)
@@ -1872,6 +1873,11 @@ def _antigravity_parse_text(output: str, context: str) -> str:
 
 def _antigravity_redact_diagnostic(text: str) -> str:
     redacted = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
+    redacted = re.sub(
+        rf"(?i)\b({_ANTIGRAVITY_AUTHORIZATION_KEY_PATTERN})(\s*[:=]\s*)([^\r\n,;\"']+)",
+        r"\1\2<redacted>",
+        redacted,
+    )
     redacted = re.sub(
         rf"(?i)([\"'])({_ANTIGRAVITY_SECRET_KEY_PATTERN})\1(\s*:\s*)([\"'])([^\"']+)([\"'])",
         r"\1\2\1\3\4<redacted>\6",
