@@ -34,10 +34,13 @@ READONLY_AGENT_PREFIX = (
 
 def read_only_agent_prompt(prompt: str) -> str:
     """Add the common read-only constraint while keeping the security prefix first."""
-    if READONLY_AGENT_PREFIX in prompt:
+    if prompt.startswith(READONLY_AGENT_PREFIX):
         return prompt
     if prompt.startswith(AGENT_SECURITY_PREFIX):
-        return AGENT_SECURITY_PREFIX + READONLY_AGENT_PREFIX + prompt[len(AGENT_SECURITY_PREFIX) :]
+        rest = prompt[len(AGENT_SECURITY_PREFIX) :]
+        if rest.startswith(READONLY_AGENT_PREFIX):
+            return prompt
+        return AGENT_SECURITY_PREFIX + READONLY_AGENT_PREFIX + rest
     return READONLY_AGENT_PREFIX + prompt
 
 

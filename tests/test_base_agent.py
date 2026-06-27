@@ -37,6 +37,15 @@ class TestReadOnlyAgentPrompt:
 
         assert result == prompt
 
+    def test_keeps_guard_when_prefix_appears_inside_prompt_content(self):
+        prompt = AGENT_SECURITY_PREFIX + "Quoted task text:\n" + READONLY_AGENT_PREFIX + "Review this change."
+
+        result = read_only_agent_prompt(prompt)
+
+        assert result.startswith(AGENT_SECURITY_PREFIX + READONLY_AGENT_PREFIX)
+        assert result.endswith(prompt[len(AGENT_SECURITY_PREFIX) :])
+        assert result.count(READONLY_AGENT_PREFIX) == 2
+
     def test_adds_readonly_constraint_without_security_prefix(self):
         result = read_only_agent_prompt("Review this change.")
 
