@@ -3294,7 +3294,7 @@ class TestAntigravityClientCommands:
 
         mock_run.assert_not_called()
 
-    def test_run_agent_rejects_populated_submodule_gitlinks(self, tmp_path: Path):
+    def test_run_agent_rejects_submodule_gitlinks(self, tmp_path: Path):
         repo = tmp_path / "repo"
         repo.mkdir()
         submodule = repo / "libs" / "api"
@@ -3312,7 +3312,28 @@ class TestAntigravityClientCommands:
 
         with (
             patch("core.llm_client._run_agent_subprocess_streaming") as mock_run,
-            pytest.raises(LLMConfigurationError, match="populated git submodules: libs/api"),
+            pytest.raises(LLMConfigurationError, match="git submodules: libs/api"),
+        ):
+            client.run_agent("prompt", repo)
+
+        mock_run.assert_not_called()
+
+    def test_run_agent_rejects_unpopulated_submodule_gitlinks(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", "160000", "1" * 40, "libs/api"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client._run_agent_subprocess_streaming") as mock_run,
+            pytest.raises(LLMConfigurationError, match="git submodules: libs/api"),
         ):
             client.run_agent("prompt", repo)
 
