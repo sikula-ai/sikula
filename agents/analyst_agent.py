@@ -23,6 +23,7 @@ from agents.base_agent import (
     AgentResult,
     BaseAgent,
     gather_guidelines as _gather_guidelines,
+    read_only_agent_prompt,
     tech_stack as _tech_stack,
 )
 from core.state import TaskState
@@ -327,6 +328,7 @@ class AnalystAgent(BaseAgent):
             )
         )
 
+        full_prompt = read_only_agent_prompt(full_prompt)
         state.analyst_prompt = full_prompt
 
         prompt = ""

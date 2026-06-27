@@ -450,9 +450,11 @@ Task description:
 
 def _enrich_prompt_with_referenced_files(task_description: str, llm_client, project_root: Path) -> str:
     """Return contents of files referenced by name in the task description, or empty string."""
-    from agents.base_agent import AGENT_SECURITY_PREFIX
+    from agents.base_agent import AGENT_SECURITY_PREFIX, read_only_agent_prompt
 
-    prompt = AGENT_SECURITY_PREFIX + _REFERENCED_FILES_PROMPT.format(task_description=task_description)
+    prompt = read_only_agent_prompt(
+        AGENT_SECURITY_PREFIX + _REFERENCED_FILES_PROMPT.format(task_description=task_description)
+    )
     try:
         result = llm_client.run_readonly_agent(prompt, cwd=project_root).strip()
         if result == _NO_REFERENCED_FILES_SENTINEL:
@@ -3718,7 +3720,9 @@ def _generate_config(  # noqa: PLR0912
     write_paths_comment = "" if write_paths else "  # TODO: restrict to dirs agents may write production code to.\n"
     test_paths_comment = "" if test_write_paths else "  # TODO: restrict to dirs the test writer may write to.\n"
 
-    provider_comment = "" if provider else "  # TODO: change to your provider (codex/claude/gemini/opencode)"
+    provider_comment = (
+        "" if provider else "  # TODO: change to your provider (codex/claude/gemini/opencode/antigravity)"
+    )
     model_comment = "" if model else "  # TODO: change to your model"
     agent_model_comment = "" if model else "  # TODO: consider a stronger model"
 
@@ -4684,7 +4688,7 @@ def main() -> None:
     init_p.add_argument(
         "--provider",
         default=None,
-        help="LLM provider for --guidelines (codex/claude/gemini/opencode); falls back to config when present",
+        help="LLM provider for --guidelines (codex/claude/gemini/opencode/antigravity); falls back to config when present",
     )
     init_p.add_argument("--model", default=None, help="LLM model for --guidelines; falls back to config when present")
 

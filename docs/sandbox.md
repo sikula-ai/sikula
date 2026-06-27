@@ -54,10 +54,17 @@ These paths are passed to agents as constraints. Provider-specific hard enforcem
 Reviewer and security reviewer are read-only by design. They call `run_readonly_agent()` and should not write files.
 
 The analyst is also read-only. The implementer, fixer, and test writer are write-capable.
+Every `run_readonly_agent()` prompt includes a shared instruction not to use tools or commands
+to create, modify, delete, move, rename, format, or write files. The model may still return
+requested generated content in its final response; Sikula CLI code decides whether to write
+that output. The same instruction asks read-only agents to reference project files with
+project-relative paths instead of absolute local paths or `file://` URIs. Provider-level
+enforcement is still provider-specific.
 
 ## Provider Enforcement
 
-Provider enforcement depends on the CLI:
+Provider enforcement depends on the CLI. This table summarizes the controls Sikula
+configures; exact guarantees remain provider-specific.
 
 | Provider | Read-only calls | Write-capable calls |
 |---|---|---|
@@ -65,6 +72,9 @@ Provider enforcement depends on the CLI:
 | Claude | Uses generated Claude settings and allowed tools. | Bash restrictions are technically enforced via allowed tools. |
 | Gemini | Read-only settings exclude write and shell tools. | Workspace write tool checks path; shell restriction is prompt-level. |
 | OpenCode | Read-only agents deny bash in generated config. | Workspace boundary depends on OpenCode; write restrictions are prompt-level. |
+| Antigravity | Disposable copy; rejects copy changes and external symlinks on kept paths. | Rejects external symlinks on kept paths; runs `agy` on the task worktree with a workspace instruction. |
+
+For Antigravity, Sikula protects the task checkout by using a disposable copy for read-only calls and kept-path symlink validation before write-capable calls; OS-level prevention of writes outside those workspaces depends on Antigravity CLI sandbox behavior.
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md) for exact implementation details.
 

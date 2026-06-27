@@ -86,12 +86,15 @@ class BuildTool(BaseTool):
       3. Add detection logic to tools/scanner.py (_SIGNATURES and path detection).
       4. Add a .sikula/config.yaml in the project directory.
       5. Update tests/test_platform_onboarding.py so factory/scanner/init wiring is covered.
-      6. If the platform supports inline tests in source files with suffixes not already
+      6. If generate_sources() emits source/IDL files under gitignored build output
+         directories that read-only agents must inspect, update Antigravity's read-only
+         generated-source preservation rules and tests while keeping ignored secrets excluded.
+      7. If the platform supports inline tests in source files with suffixes not already
          covered, extend _TEST_GATE_AUDIT_SOURCE_SUFFIXES in core/orchestrator.py.
-      7. If the platform uses test-framework skip/disable/ignore/assumption idioms
+      8. If the platform uses test-framework skip/disable/ignore/assumption idioms
          not already covered, extend core/test_execution_gate_audit.py and
          tests/test_test_execution_gate_audit.py.
-      8. If the platform uses fake runtime idioms not already covered, extend
+      9. If the platform uses fake runtime idioms not already covered, extend
          core/synthetic_test_harness_audit.py and tests/test_synthetic_test_harness_audit.py.
     """
 

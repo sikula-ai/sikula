@@ -100,6 +100,16 @@ class TestTestWriterAgentSuccess:
         assert result.success
         assert "files_written" in result.data
 
+    def test_record_stores_effective_provider_prompt(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["tests/LoginTest.kt"]
+        stub_llm.agent_prompt_prefix = "PROVIDER BOUNDARY\n"
+        state = _make_state()
+        _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
+
+        prompt = state.test_write_records[0]["test_writer_prompt"]
+        assert prompt.startswith("PROVIDER BOUNDARY\n")
+        assert stub_llm.agent_calls[0] == prompt
+
     def test_changed_files_added_to_test_files_written(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["tests/LoginTest.kt"]
         state = _make_state()

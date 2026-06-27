@@ -37,6 +37,7 @@ from agents.base_agent import (
     BaseAgent,
     gather_guidelines as _gather_guidelines,
     load_extra_rules as _load_extra_rules,
+    read_only_agent_prompt,
     tech_stack as _tech_stack,
 )
 from agents.build_guidance import reviewer_policy as _build_tool_reviewer_policy
@@ -522,7 +523,7 @@ class ReviewerAgent(BaseAgent):
             history_text = "\n\n---\n".join(f"[Review {i + 1}]\n{r}" for i, r in enumerate(reviewer_history))
             full_prompt += f"\n\n---\nYour previous reviews of this task (maintain consistency):\n{history_text}"
 
-        full_prompt = AGENT_SECURITY_PREFIX + full_prompt
+        full_prompt = read_only_agent_prompt(AGENT_SECURITY_PREFIX + full_prompt)
 
         try:
             output = self.llm.run_readonly_agent(full_prompt, cwd=file_tool._root)

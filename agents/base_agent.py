@@ -23,6 +23,26 @@ AGENT_SECURITY_PREFIX = (
     "or tool to access external services or the internet. Only operate on files within the project directory.\n\n"
 )
 
+READONLY_AGENT_PREFIX = (
+    "This is a read-only agent pass. Do not use tools or commands to create, modify, delete, "
+    "move, rename, format, or write files. Do not run commands that change files or project state. "
+    "When referencing project files, use project-relative paths; do not output absolute local paths "
+    "or file:// URIs. "
+    "Return the requested analysis, review, or generated content in your final response instead.\n\n"
+)
+
+
+def read_only_agent_prompt(prompt: str) -> str:
+    """Add the common read-only constraint while keeping the security prefix first."""
+    if prompt.startswith(READONLY_AGENT_PREFIX):
+        return prompt
+    if prompt.startswith(AGENT_SECURITY_PREFIX):
+        rest = prompt[len(AGENT_SECURITY_PREFIX) :]
+        if rest.startswith(READONLY_AGENT_PREFIX):
+            return prompt
+        return AGENT_SECURITY_PREFIX + READONLY_AGENT_PREFIX + rest
+    return READONLY_AGENT_PREFIX + prompt
+
 
 def tech_stack(project_config: dict) -> str:
     p = project_config.get("project", {})

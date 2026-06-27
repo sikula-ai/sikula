@@ -7,7 +7,7 @@ The README shows the shortest happy path. This guide covers install variants, pr
 - Python 3.10+
 - `git`
 - `pipx`
-- One authenticated LLM CLI provider, such as Codex, Claude, Gemini, or OpenCode
+- One authenticated LLM CLI provider, such as Codex, Claude, Gemini, OpenCode, or Antigravity
 - A target project that is already a git repository
 
 Install `pipx` from the official guide if it is not available on your system: <https://pipx.pypa.io/stable/installation/>.
@@ -51,7 +51,7 @@ Generated configs use `provider: codex` by default:
 codex login
 ```
 
-Other built-in provider values are `claude`, `gemini`, and `opencode`. See [Providers](providers.md).
+Other built-in provider values are `claude`, `gemini`, `opencode`, and `antigravity`. See [Providers](providers.md).
 
 ## Initialize Your Project
 

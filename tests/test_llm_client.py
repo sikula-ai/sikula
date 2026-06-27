@@ -27,6 +27,24 @@ from core.llm_client import (
     LLMTransientError,
     LLMTimeoutError,
     _agent_text_or_empty,
+    _AntigravityCopyPolicy,
+    _antigravity_copy_ignore,
+    _antigravity_copy_policy,
+    _antigravity_directory_snapshot,
+    _antigravity_git_paths,
+    _antigravity_gitlink_paths,
+    _antigravity_log_diagnostic,
+    _antigravity_log_line_diagnostic,
+    _antigravity_marker_text,
+    _antigravity_parse_text,
+    _antigravity_parse_version,
+    _antigravity_require_supported_version,
+    _antigravity_redact_diagnostic,
+    _antigravity_result_error,
+    _antigravity_snapshot_changed,
+    _antigravity_validate_workspace_symlink,
+    _antigravity_validate_workspace_symlinks,
+    _antigravity_write_agent_prompt,
     _call_with_retry,
     _claude_write_settings,
     _codex_parse_text,
@@ -44,7 +62,7 @@ from core.llm_client import (
     _terminate_process,
     create_llm_client,
 )
-from core.llm_client import ClaudeClient, CodexClient, GeminiClient, OpenCodeClient
+from core.llm_client import AntigravityClient, ClaudeClient, CodexClient, GeminiClient, OpenCodeClient
 
 
 class TestCreateLlmClient:
@@ -63,6 +81,12 @@ class TestCreateLlmClient:
     def test_codex_provider(self):
         cfg = LLMConfig(provider="codex")
         assert isinstance(create_llm_client(cfg), CodexClient)
+
+    def test_antigravity_provider(self):
+        cfg = LLMConfig(provider="antigravity")
+        with patch("core.llm_client._antigravity_require_supported_version") as version_check:
+            assert isinstance(create_llm_client(cfg), AntigravityClient)
+        version_check.assert_not_called()
 
     def test_unknown_provider_raises(self):
         cfg = LLMConfig(provider="unknown")
@@ -2820,3 +2844,1119 @@ class TestGeminiClientCommands:
         assert output == "ok"
         assert mock_run.call_count == 2
         assert observer.call_args.args[0]["error_type"] == "LLMTimeoutError"
+
+
+class TestAntigravityClientCommands:
+    @pytest.fixture(autouse=True)
+    def _supported_antigravity_version(self):
+        with patch("core.llm_client._antigravity_require_supported_version"):
+            yield
+
+    @staticmethod
+    def _run_result(text: str = "ok"):
+        return subprocess.CompletedProcess(["agy"], 0, text, "")
+
+    def test_parse_version_extracts_semver(self):
+        assert _antigravity_parse_version("agy 1.0.13") == (1, 0, 13)
+        assert _antigravity_parse_version("Antigravity CLI version 10.2.3") == (10, 2, 3)
+        assert _antigravity_parse_version("dev build") is None
+
+    def test_client_checks_supported_version_on_first_use_only(self):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client._antigravity_require_supported_version") as version_check,
+            patch("core.llm_client.subprocess.run", return_value=self._run_result("answer")),
+        ):
+            assert client.generate("system", "user") == "answer"
+            assert client.generate("system", "user") == "answer"
+
+        version_check.assert_called_once()
+
+    def test_require_supported_version_accepts_minimum_version(self):
+        with patch(
+            "core.llm_client.subprocess.run",
+            return_value=subprocess.CompletedProcess(["agy", "--version"], 0, "1.0.13\n", ""),
+        ) as mock_run:
+            _antigravity_require_supported_version()
+
+        mock_run.assert_called_once_with(["agy", "--version"], capture_output=True, text=True, timeout=10)
+
+    def test_require_supported_version_rejects_old_version(self):
+        with (
+            patch(
+                "core.llm_client.subprocess.run",
+                return_value=subprocess.CompletedProcess(["agy", "--version"], 0, "1.0.12\n", ""),
+            ),
+            pytest.raises(LLMConfigurationError, match="agy 1.0.13 or newer"),
+        ):
+            _antigravity_require_supported_version()
+
+    def test_require_supported_version_rejects_unparseable_output(self):
+        with (
+            patch(
+                "core.llm_client.subprocess.run",
+                return_value=subprocess.CompletedProcess(["agy", "--version"], 0, "dev build\n", ""),
+            ),
+            pytest.raises(LLMConfigurationError, match="could not parse"),
+        ):
+            _antigravity_require_supported_version()
+
+    def test_require_supported_version_redacts_failed_check_output(self):
+        with (
+            patch(
+                "core.llm_client.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    ["agy", "--version"],
+                    1,
+                    "",
+                    "not authenticated OPENAI_API_KEY=secret",
+                ),
+            ),
+            pytest.raises(LLMConfigurationError) as exc_info,
+        ):
+            _antigravity_require_supported_version()
+
+        message = str(exc_info.value)
+        assert "OPENAI_API_KEY=<redacted>" in message
+        assert "secret" not in message
+
+    def test_require_supported_version_reports_missing_cli(self):
+        with (
+            patch("core.llm_client.subprocess.run", side_effect=FileNotFoundError),
+            pytest.raises(LLMConfigurationError, match="CLI not found"),
+        ):
+            _antigravity_require_supported_version()
+
+    def test_require_supported_version_reports_timeout(self):
+        with (
+            patch("core.llm_client.subprocess.run", side_effect=subprocess.TimeoutExpired("agy", 10)),
+            pytest.raises(LLMConfigurationError, match="timed out"),
+        ):
+            _antigravity_require_supported_version()
+
+    def test_parse_text_rejects_empty_output(self):
+        with pytest.raises(LLMTransientError, match="returned no text output"):
+            _antigravity_parse_text("  \n", "CLI")
+
+    def test_diagnostic_helpers_cover_empty_long_json_and_log_limit(self, tmp_path: Path):
+        assert _antigravity_marker_text("") is None
+        assert _antigravity_marker_text("all good") is None
+        assert _antigravity_log_line_diagnostic("   ") is None
+        assert _antigravity_log_line_diagnostic("{not json") is None
+        assert _antigravity_log_line_diagnostic('{"event":"ok"}') is None
+
+        long_text = "x" * 180 + " unsupported model token=secret " + "y" * 380
+        marker = _antigravity_marker_text(long_text)
+        assert marker is not None
+        assert marker.startswith("...")
+        assert marker.endswith("...")
+        assert "token=<redacted>" in marker
+        assert "secret" not in marker
+
+        redacted = _antigravity_redact_diagnostic("ERROR " + "x" * 700 + " OPENAI_API_KEY=secret")
+        assert redacted.endswith("...")
+        assert len(redacted) <= 503
+
+        list_diagnostic = _antigravity_log_line_diagnostic(
+            '{"errors": ["quota exceeded token=secret", {"message": "not authenticated"}]}'
+        )
+        assert list_diagnostic == "errors: quota exceeded token=<redacted>"
+
+        log_file = tmp_path / "agy.log"
+        log_file.write_text("\n".join(f"ERROR unsupported model {index}" for index in range(8)))
+        diagnostic = _antigravity_log_diagnostic(log_file)
+        assert diagnostic.splitlines() == [f"ERROR unsupported model {index}" for index in range(2, 8)]
+
+    def test_result_error_covers_transient_fallbacks(self):
+        with_stdout = _antigravity_result_error(
+            subprocess.CompletedProcess(["agy"], 1, "partial stdout", ""),
+            "agent",
+        )
+        assert isinstance(with_stdout, LLMTransientError)
+        assert "stdout but no safe diagnostic" in str(with_stdout)
+
+        without_output = _antigravity_result_error(
+            subprocess.CompletedProcess(["agy"], 1, "", ""),
+            "agent",
+        )
+        assert isinstance(without_output, LLMTransientError)
+        assert str(without_output).endswith("non-zero exit")
+
+        stderr_error = _antigravity_result_error(
+            subprocess.CompletedProcess(["agy"], 1, "", "temporary outage"),
+            "agent",
+            "ERROR failed upstream",
+        )
+        assert isinstance(stderr_error, LLMTransientError)
+        assert "temporary outage" in str(stderr_error)
+        assert "log diagnostic" not in str(stderr_error)
+
+    def test_result_error_classifies_long_stderr_before_truncating(self):
+        error = _antigravity_result_error(
+            subprocess.CompletedProcess(
+                ["agy"],
+                1,
+                "",
+                "ERROR " + "x" * 800 + " unsupported model token=secret",
+            ),
+            "agent",
+        )
+
+        message = str(error)
+        assert isinstance(error, LLMConfigurationError)
+        assert "unsupported model" in message
+        assert "token=<redacted>" in message
+        assert "secret" not in message
+        assert "x" * 600 not in message
+
+    def test_result_error_redacts_multi_token_authorization_headers(self):
+        error = _antigravity_result_error(
+            subprocess.CompletedProcess(
+                ["agy"],
+                1,
+                "",
+                "ERROR Authorization: Basic dXNlcjpwYXNz; Proxy-Authorization = Digest abc def",
+            ),
+            "agent",
+        )
+
+        message = str(error)
+        assert isinstance(error, LLMProviderError)
+        assert "Authorization: <redacted>" in message
+        assert "Proxy-Authorization = <redacted>" in message
+        assert "Basic" not in message
+        assert "dXNlcjpwYXNz" not in message
+        assert "Digest" not in message
+        assert "abc def" not in message
+
+    def test_git_path_helpers_handle_failures_and_text_stdout(self, tmp_path: Path):
+        with patch(
+            "core.llm_client.subprocess.run",
+            return_value=subprocess.CompletedProcess(["git"], 1, "", ""),
+        ):
+            assert _antigravity_git_paths(tmp_path, ["ls-files", "-z"]) is None
+            assert _antigravity_gitlink_paths(tmp_path) is None
+
+        with patch(
+            "core.llm_client.subprocess.run",
+            return_value=subprocess.CompletedProcess(["git"], 0, "one.txt\0dir/\0two.txt\0", ""),
+        ):
+            assert _antigravity_git_paths(tmp_path, ["ls-files", "-z"]) == {"one.txt", "two.txt"}
+
+        gitlink_stdout = "160000 abcdef\tlibs/api\0not-a-gitlink\tREADME.md\0"
+        with patch(
+            "core.llm_client.subprocess.run",
+            return_value=subprocess.CompletedProcess(["git"], 0, gitlink_stdout, ""),
+        ):
+            assert _antigravity_gitlink_paths(tmp_path) == {"libs/api"}
+
+    def test_copy_policy_returns_none_when_git_listing_fails(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+
+        with patch("core.llm_client._antigravity_git_paths", return_value=None):
+            assert _antigravity_copy_policy(repo) is None
+
+    def test_copy_ignore_handles_outside_root_and_preserved_ignored_ancestors(self, tmp_path: Path):
+        root = tmp_path / "repo"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+
+        ignore_without_policy = _antigravity_copy_ignore(root, None)
+        assert ignore_without_policy(str(outside), [".git", ".venv", "keep.txt"]) == {".git", ".venv"}
+
+        dist = root / "dist"
+        dist.mkdir()
+        (dist / "nested").mkdir()
+        (dist / "keep.js").write_text("tracked")
+        (dist / "drop.js").write_text("ignored")
+        policy = _AntigravityCopyPolicy(
+            preserved_paths=frozenset({"dist/keep.js"}),
+            preserved_dirs=frozenset({"dist"}),
+            ignored_paths=frozenset({"dist/ignored-explicit.js"}),
+            ignored_dirs=frozenset({"dist"}),
+            gitlink_paths=frozenset(),
+        )
+
+        ignore = _antigravity_copy_ignore(root, policy)
+        assert ignore(str(dist), ["keep.js", "drop.js", "nested"]) == {"drop.js", "nested"}
+
+    def test_validate_workspace_symlinks_allows_internal_symlink_directories(self, tmp_path: Path):
+        target = tmp_path / "target"
+        target.mkdir()
+        try:
+            (tmp_path / "target-link").symlink_to("target")
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+
+        _antigravity_validate_workspace_symlinks(tmp_path, prune_ignored_paths=False)
+
+    def test_validate_workspace_symlink_reports_uninspectable_links(self, tmp_path: Path):
+        link = tmp_path / "broken-link"
+
+        with (
+            patch("core.llm_client.os.readlink", side_effect=OSError("denied")),
+            pytest.raises(LLMConfigurationError, match="cannot inspect symlink broken-link"),
+        ):
+            _antigravity_validate_workspace_symlink(link, tmp_path, Path("broken-link"))
+
+    def test_directory_snapshot_records_symlinks_and_ignored_paths(self, tmp_path: Path):
+        (tmp_path / ".venv").mkdir()
+        (tmp_path / ".venv" / "ignored.txt").write_text("ignored")
+        (tmp_path / "target-dir").mkdir()
+        (tmp_path / "target.txt").write_text("target")
+        try:
+            (tmp_path / "dir-link").symlink_to("target-dir")
+            (tmp_path / "file-link").symlink_to("target.txt")
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+
+        snapshot = _antigravity_directory_snapshot(tmp_path)
+
+        assert snapshot[".venv"] == "ignored-dir"
+        assert ".venv/ignored.txt" not in snapshot
+        assert snapshot["dir-link"] == "symlink-dir:target-dir"
+        assert snapshot["file-link"] == "symlink:target.txt"
+        assert _antigravity_snapshot_changed({"file-link": "old"}, snapshot)
+        assert not _antigravity_snapshot_changed(snapshot, dict(snapshot))
+
+    def test_directory_snapshot_handles_unreadable_symlinks_and_files(self, tmp_path: Path):
+        (tmp_path / "target-dir").mkdir()
+        (tmp_path / "target.txt").write_text("target")
+        (tmp_path / "regular.txt").write_text("regular")
+        try:
+            (tmp_path / "dir-link").symlink_to("target-dir")
+            (tmp_path / "file-link").symlink_to("target.txt")
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+
+        real_readlink = os.readlink
+
+        def _readlink(path):
+            if Path(path).name in {"dir-link", "file-link"}:
+                raise OSError("denied")
+            return real_readlink(path)
+
+        with patch("core.llm_client.os.readlink", side_effect=_readlink):
+            snapshot = _antigravity_directory_snapshot(tmp_path)
+
+        assert snapshot["dir-link"] == "symlink-dir:<unreadable>"
+        assert snapshot["file-link"] == "symlink:<unreadable>"
+
+        real_read_bytes = Path.read_bytes
+
+        def _read_bytes(path):
+            if Path(path).name == "regular.txt":
+                raise PermissionError("denied")
+            return real_read_bytes(path)
+
+        with patch.object(Path, "read_bytes", _read_bytes):
+            snapshot = _antigravity_directory_snapshot(tmp_path)
+
+        assert snapshot["regular.txt"] == "<unavailable>"
+
+    def test_write_agent_prompt_is_idempotent(self, tmp_path: Path):
+        prompt = _antigravity_write_agent_prompt("do work", tmp_path)
+
+        assert _antigravity_write_agent_prompt(prompt, tmp_path) == prompt
+
+    def test_generate_uses_stdin_print_mode(self):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with patch("core.llm_client.subprocess.run", return_value=self._run_result("answer")) as mock_run:
+            assert client.generate("system", "user") == "answer"
+
+        cmd = mock_run.call_args.args[0]
+        assert cmd[:2] == ["agy", "--new-project"]
+        assert "--add-dir" not in cmd
+        assert cmd[cmd.index("--model") + 1] == "Gemini 3.5 Flash (High)"
+        assert "--sandbox" in cmd
+        assert "--dangerously-skip-permissions" not in cmd
+        assert cmd[cmd.index("--print") + 1] == "-"
+        assert cmd.index("--model") < cmd.index("--print")
+        assert mock_run.call_args.kwargs["input"] == "system\n\nuser"
+        assert "system\n\nuser" not in cmd
+
+    def test_run_readonly_agent_uses_disposable_workspace(self, tmp_path: Path):
+        (tmp_path / "repo.txt").write_text("source")
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        seen: dict[str, object] = {}
+
+        def _fake_run(cmd, **kwargs):
+            workspace = Path(kwargs["cwd"])
+            seen["cmd"] = cmd
+            seen["cwd"] = workspace
+            seen["input"] = kwargs["input"]
+            assert (workspace / "repo.txt").read_text() == "source"
+            output = (
+                f"See [sikula.py](file://{workspace.resolve()}/sikula.py#L12), "
+                f"{workspace}/core/llm_client.py, and /tmp/unrelated.py."
+            )
+            return subprocess.CompletedProcess(cmd, 0, output, "")
+
+        with patch("core.llm_client.subprocess.run", side_effect=_fake_run):
+            output = client.run_readonly_agent("prompt", tmp_path)
+
+        cmd = seen["cmd"]
+        assert isinstance(cmd, list)
+        workspace = seen["cwd"]
+        assert isinstance(workspace, Path)
+        assert workspace != tmp_path
+        assert cmd[cmd.index("--add-dir") + 1] == str(workspace)
+        assert "--dangerously-skip-permissions" in cmd
+        assert cmd[cmd.index("--print") + 1] == "-"
+        assert seen["input"] == "prompt"
+        assert (tmp_path / "repo.txt").read_text() == "source"
+        assert str(workspace) not in output
+        assert str(workspace.resolve()) not in output
+        assert "file://" not in output
+        assert "[sikula.py](sikula.py#L12)" in output
+        assert "core/llm_client.py" in output
+        assert "/tmp/unrelated.py" in output
+
+    def test_run_readonly_agent_rejects_disposable_workspace_writes(self, tmp_path: Path):
+        (tmp_path / "repo.txt").write_text("source")
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        def _fake_run(cmd, **kwargs):
+            Path(kwargs["cwd"], "repo.txt").write_text("changed in copy")
+            return subprocess.CompletedProcess(cmd, 0, "analysis", "")
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run,
+            pytest.raises(LLMTransientError, match="disposable workspace"),
+        ):
+            client.run_readonly_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 4
+        assert (tmp_path / "repo.txt").read_text() == "source"
+
+    def test_run_readonly_agent_rejects_new_soft_ignored_directories(self, tmp_path: Path):
+        (tmp_path / "repo.txt").write_text("source")
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        def _fake_run(cmd, **kwargs):
+            package_dir = Path(kwargs["cwd"], "node_modules", "pkg")
+            package_dir.mkdir(parents=True)
+            (package_dir / "index.js").write_text("generated dependency")
+            return subprocess.CompletedProcess(cmd, 0, "analysis", "")
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run,
+            pytest.raises(LLMTransientError, match="disposable workspace"),
+        ):
+            client.run_readonly_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 4
+        assert not (tmp_path / "node_modules").exists()
+
+    def test_run_readonly_agent_preserves_tracked_files_in_ignored_dirs(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".gitignore").write_text("dist/noise.js\n")
+        dist = repo / "dist"
+        dist.mkdir()
+        (dist / "bundle.js").write_text("tracked bundle")
+        (dist / "noise.js").write_text("ignored noise")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", ".gitignore", "dist/bundle.js"], cwd=repo, check=True, capture_output=True)
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        seen: dict[str, Path] = {}
+        real_run = subprocess.run
+
+        def _fake_run(cmd, **kwargs):
+            if cmd and cmd[0] == "git":
+                return real_run(cmd, **kwargs)
+            workspace = Path(kwargs["cwd"])
+            seen["workspace"] = workspace
+            assert (workspace / "dist" / "bundle.js").read_text() == "tracked bundle"
+            assert not (workspace / "dist" / "noise.js").exists()
+            return subprocess.CompletedProcess(cmd, 0, "reviewed dist/bundle.js", "")
+
+        with patch("core.llm_client.subprocess.run", side_effect=_fake_run):
+            output = client.run_readonly_agent("prompt", repo)
+
+        assert output == "reviewed dist/bundle.js"
+        assert seen["workspace"] != repo
+
+    def test_run_readonly_agent_excludes_gitignored_secret_files(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".gitignore").write_text(".env\n")
+        (repo / "README.md").write_text("tracked docs")
+        (repo / ".env").write_text("OPENAI_API_KEY=secret")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", ".gitignore", "README.md"], cwd=repo, check=True, capture_output=True)
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        real_run = subprocess.run
+
+        def _fake_run(cmd, **kwargs):
+            if cmd and cmd[0] == "git":
+                return real_run(cmd, **kwargs)
+            workspace = Path(kwargs["cwd"])
+            assert (workspace / "README.md").read_text() == "tracked docs"
+            assert not (workspace / ".env").exists()
+            return subprocess.CompletedProcess(cmd, 0, "reviewed", "")
+
+        with patch("core.llm_client.subprocess.run", side_effect=_fake_run):
+            output = client.run_readonly_agent("prompt", repo)
+
+        assert output == "reviewed"
+
+    def test_run_readonly_agent_treats_submodule_gitlinks_as_opaque(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        submodule = repo / "libs" / "api"
+        submodule.mkdir(parents=True)
+        (submodule / ".gitignore").write_text(".env\n")
+        (submodule / ".env").write_text("OPENAI_API_KEY=submodule-secret")
+        (submodule / "README.md").write_text("submodule docs")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", "160000", "1" * 40, "libs/api"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        real_run = subprocess.run
+
+        def _fake_run(cmd, **kwargs):
+            if cmd and cmd[0] == "git":
+                return real_run(cmd, **kwargs)
+            workspace = Path(kwargs["cwd"])
+            assert not (workspace / "libs" / "api" / ".env").exists()
+            assert not (workspace / "libs" / "api" / "README.md").exists()
+            return subprocess.CompletedProcess(cmd, 0, "reviewed", "")
+
+        with patch("core.llm_client.subprocess.run", side_effect=_fake_run):
+            output = client.run_readonly_agent("prompt", repo)
+
+        assert output == "reviewed"
+
+    def test_run_readonly_agent_preserves_gitignored_presync_generated_sources(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".gitignore").write_text("build/\ntarget/\n.env\n")
+        (repo / "README.md").write_text("tracked docs")
+        gradle_generated = repo / "build" / "generated" / "source" / "openapi" / "Dto.java"
+        gradle_generated.parent.mkdir(parents=True)
+        gradle_generated.write_text("class Dto {}")
+        maven_generated = repo / "target" / "generated-sources" / "openapi" / "Model.java"
+        maven_generated.parent.mkdir(parents=True)
+        maven_generated.write_text("class Model {}")
+        ignored_class = repo / "build" / "classes" / "Secret.java"
+        ignored_class.parent.mkdir(parents=True)
+        ignored_class.write_text("class Secret {}")
+        (repo / ".env").write_text("OPENAI_API_KEY=secret")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", ".gitignore", "README.md"], cwd=repo, check=True, capture_output=True)
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        real_run = subprocess.run
+
+        def _fake_run(cmd, **kwargs):
+            if cmd and cmd[0] == "git":
+                return real_run(cmd, **kwargs)
+            workspace = Path(kwargs["cwd"])
+            assert (workspace / "build" / "generated" / "source" / "openapi" / "Dto.java").exists()
+            assert (workspace / "target" / "generated-sources" / "openapi" / "Model.java").exists()
+            assert not (workspace / "build" / "classes" / "Secret.java").exists()
+            assert not (workspace / ".env").exists()
+            return subprocess.CompletedProcess(cmd, 0, "reviewed generated sources", "")
+
+        with patch("core.llm_client.subprocess.run", side_effect=_fake_run):
+            output = client.run_readonly_agent("prompt", repo)
+
+        assert output == "reviewed generated sources"
+
+    def test_run_readonly_agent_detects_new_files_in_preserved_ignored_dirs(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        dist = repo / "dist"
+        dist.mkdir()
+        (dist / "bundle.js").write_text("tracked bundle")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "dist/bundle.js"], cwd=repo, check=True, capture_output=True)
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        real_run = subprocess.run
+        agy_calls = 0
+
+        def _fake_run(cmd, **kwargs):
+            nonlocal agy_calls
+            if cmd and cmd[0] == "git":
+                return real_run(cmd, **kwargs)
+            agy_calls += 1
+            workspace = Path(kwargs["cwd"])
+            (workspace / "dist" / "generated.js").write_text("should be detected")
+            return subprocess.CompletedProcess(cmd, 0, "analysis", "")
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run,
+            pytest.raises(LLMTransientError, match="disposable workspace"),
+        ):
+            client.run_readonly_agent("prompt", repo)
+
+        assert agy_calls == 4
+        assert mock_run.call_count >= agy_calls
+        assert not (repo / "dist" / "generated.js").exists()
+
+    def test_run_readonly_agent_classifies_nonzero_before_workspace_mutation(self, tmp_path: Path):
+        (tmp_path / "repo.txt").write_text("source")
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        def _fake_run(cmd, **kwargs):
+            workspace = Path(kwargs["cwd"])
+            (workspace / "repo.txt").write_text("changed in copy")
+            log_file = Path(cmd[cmd.index("--log-file") + 1])
+            log_file.write_text("ERROR unsupported model: Gemini")
+            return subprocess.CompletedProcess(cmd, 1, "", "see log for details")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run,
+            pytest.raises(LLMConfigurationError, match="unsupported model"),
+        ):
+            client.run_readonly_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+        assert (tmp_path / "repo.txt").read_text() == "source"
+
+    def test_run_readonly_agent_rejects_external_symlinks_before_copying(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        external = tmp_path / "external.txt"
+        external.write_text("outside")
+        try:
+            (repo / "external-link.txt").symlink_to(os.path.relpath(external, repo))
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client.subprocess.run") as mock_run,
+            pytest.raises(LLMConfigurationError, match="external symlink external-link.txt"),
+        ):
+            client.run_readonly_agent("prompt", repo)
+
+        mock_run.assert_not_called()
+        assert external.read_text() == "outside"
+
+    def test_run_readonly_agent_prunes_ignored_top_level_symlink_before_copying(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        external = tmp_path / "external-node-modules"
+        external.mkdir()
+        try:
+            (repo / "node_modules").symlink_to(os.path.relpath(external, repo))
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        def _fake_run(cmd, **kwargs):
+            workspace = Path(kwargs["cwd"])
+            assert not (workspace / "node_modules").exists()
+            return subprocess.CompletedProcess(cmd, 0, "reviewed", "")
+
+        with patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run:
+            output = client.run_readonly_agent("prompt", repo)
+
+        assert output == "reviewed"
+        assert mock_run.called
+
+    def test_run_readonly_agent_prunes_gitignored_symlink_before_copying(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        external = tmp_path / "local-sdk"
+        external.mkdir()
+        (repo / ".gitignore").write_text("local-sdk\n")
+        try:
+            (repo / "local-sdk").symlink_to(os.path.relpath(external, repo))
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True, capture_output=True)
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        real_run = subprocess.run
+
+        def _fake_run(cmd, **kwargs):
+            if cmd and cmd[0] == "git":
+                return real_run(cmd, **kwargs)
+            workspace = Path(kwargs["cwd"])
+            assert not (workspace / "local-sdk").exists()
+            return subprocess.CompletedProcess(cmd, 0, "reviewed", "")
+
+        with patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run:
+            output = client.run_readonly_agent("prompt", repo)
+
+        assert output == "reviewed"
+        assert mock_run.called
+
+    def test_run_readonly_agent_prunes_symlinks_inside_ignored_directories_before_copying(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        venv_bin = repo / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        try:
+            (venv_bin / "python3").symlink_to("/usr/bin/python3")
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        def _fake_run(cmd, **kwargs):
+            workspace = Path(kwargs["cwd"])
+            assert not (workspace / ".venv").exists()
+            return subprocess.CompletedProcess(cmd, 0, "reviewed", "")
+
+        with patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run:
+            output = client.run_readonly_agent("prompt", repo)
+
+        assert output == "reviewed"
+        assert mock_run.called
+
+    def test_run_agent_adds_workspace_and_detects_changed_files(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        workspace = tmp_path.resolve()
+
+        with (
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {"src/app.ts": "hash"}]),
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=self._run_result("done")) as mock_run,
+        ):
+            changed, output = client.run_agent("prompt", tmp_path)
+
+        cmd = mock_run.call_args.args[0]
+        assert cmd[:2] == ["agy", "--new-project"]
+        assert cmd[cmd.index("--add-dir") + 1] == str(workspace)
+        assert cmd[cmd.index("--model") + 1] == "Gemini 3.5 Flash (High)"
+        assert "--sandbox" in cmd
+        assert "--dangerously-skip-permissions" in cmd
+        assert cmd[cmd.index("--print") + 1] == "-"
+        assert mock_run.call_args.kwargs["cwd"] == workspace
+        stdin_text = mock_run.call_args.kwargs["stdin_text"]
+        assert "ANTIGRAVITY WORKSPACE BOUNDARY" in stdin_text
+        assert stdin_text.count("ANTIGRAVITY WORKSPACE BOUNDARY") == 1
+        assert f"The only project root for this task is: {workspace}" in stdin_text
+        assert "Do not search for, inspect, or modify any other checkout or repository path" in stdin_text
+        assert stdin_text.endswith("prompt")
+        assert changed == ["src/app.ts"]
+        assert output == "done"
+
+    def test_run_agent_rejects_external_symlinks_before_starting_provider(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        external = tmp_path / "external.txt"
+        external.write_text("outside")
+        try:
+            (repo / "external-link.txt").symlink_to(os.path.relpath(external, repo))
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client._run_agent_subprocess_streaming") as mock_run,
+            pytest.raises(LLMConfigurationError, match="external symlink external-link.txt"),
+        ):
+            client.run_agent("prompt", repo)
+
+        mock_run.assert_not_called()
+        assert external.read_text() == "outside"
+
+    def test_run_agent_prunes_ignored_top_level_symlink(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        external = tmp_path / "external-node-modules"
+        external.mkdir()
+        try:
+            (repo / "node_modules").symlink_to(os.path.relpath(external, repo))
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}]),
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=self._run_result("done")) as mock_run,
+        ):
+            changed, output = client.run_agent("prompt", repo)
+
+        assert changed == []
+        assert output == "done"
+        assert mock_run.called
+
+    def test_run_agent_prunes_gitignored_symlink(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        external = tmp_path / "local-sdk"
+        external.mkdir()
+        (repo / ".gitignore").write_text("local-sdk\n")
+        try:
+            (repo / "local-sdk").symlink_to(os.path.relpath(external, repo))
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True, capture_output=True)
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}]),
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=self._run_result("done")) as mock_run,
+        ):
+            changed, output = client.run_agent("prompt", repo)
+
+        assert changed == []
+        assert output == "done"
+        assert mock_run.called
+
+    def test_run_agent_validates_tracked_symlinks_inside_soft_ignored_directories(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        node_modules = repo / "node_modules"
+        node_modules.mkdir()
+        try:
+            (node_modules / "hack").symlink_to("/tmp/antigravity-outside-target")
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "node_modules/hack"], cwd=repo, check=True, capture_output=True)
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client._run_agent_subprocess_streaming") as mock_run,
+            pytest.raises(LLMConfigurationError, match="absolute symlink node_modules/hack"),
+        ):
+            client.run_agent("prompt", repo)
+
+        mock_run.assert_not_called()
+
+    def test_run_agent_rejects_submodule_gitlinks(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        submodule = repo / "libs" / "api"
+        submodule.mkdir(parents=True)
+        (submodule / "README.md").write_text("submodule docs")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", "160000", "1" * 40, "libs/api"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client._run_agent_subprocess_streaming") as mock_run,
+            pytest.raises(LLMConfigurationError, match="git submodules: libs/api"),
+        ):
+            client.run_agent("prompt", repo)
+
+        mock_run.assert_not_called()
+
+    def test_run_agent_rejects_unpopulated_submodule_gitlinks(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", "160000", "1" * 40, "libs/api"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client._run_agent_subprocess_streaming") as mock_run,
+            pytest.raises(LLMConfigurationError, match="git submodules: libs/api"),
+        ):
+            client.run_agent("prompt", repo)
+
+        mock_run.assert_not_called()
+
+    def test_run_agent_prunes_symlinks_inside_ignored_directories(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        venv_bin = repo / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        try:
+            (venv_bin / "python3").symlink_to("/usr/bin/python3")
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}]),
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=self._run_result("done")) as mock_run,
+        ):
+            changed, output = client.run_agent("prompt", repo)
+
+        assert changed == []
+        assert output == "done"
+        assert mock_run.called
+
+    def test_generate_nonzero_exit_uses_antigravity_log_diagnostic(self):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        def _fake_run(cmd, **kwargs):
+            log_file = Path(cmd[cmd.index("--log-file") + 1])
+            log_file.write_text(
+                "ERROR not authenticated "
+                "token=supersecret "
+                'api_key="quotedsecret" '
+                "OPENAI_API_KEY=envsecret "
+                "access_token=accesssecret "
+                'refresh_token="refreshsecret" '
+                '{"token":"jsonsecret","client_secret":"clientsecret"}'
+            )
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run,
+            pytest.raises(LLMAuthError) as exc_info,
+        ):
+            client.generate("system", "user")
+
+        message = str(exc_info.value)
+        assert "log diagnostic" in message
+        assert "not authenticated" in message
+        assert "token=<redacted>" in message
+        assert 'api_key="<redacted>"' in message
+        assert "OPENAI_API_KEY=<redacted>" in message
+        assert "access_token=<redacted>" in message
+        assert 'refresh_token="<redacted>"' in message
+        assert '"token":"<redacted>"' in message
+        assert '"client_secret":"<redacted>"' in message
+        assert "supersecret" not in message
+        assert "quotedsecret" not in message
+        assert "envsecret" not in message
+        assert "accesssecret" not in message
+        assert "refreshsecret" not in message
+        assert "jsonsecret" not in message
+        assert "clientsecret" not in message
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_generate_nonzero_exit_redacts_antigravity_stderr(self):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        stderr = "ERROR not authenticated OPENAI_API_KEY=envsecret client_secret=clientsecret"
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch(
+                "core.llm_client.subprocess.run",
+                return_value=subprocess.CompletedProcess(["agy"], 1, "", stderr),
+            ) as mock_run,
+            pytest.raises(LLMAuthError) as exc_info,
+        ):
+            client.generate("system", "user")
+
+        message = str(exc_info.value)
+        assert "OPENAI_API_KEY=<redacted>" in message
+        assert "client_secret=<redacted>" in message
+        assert "envsecret" not in message
+        assert "clientsecret" not in message
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_generate_nonzero_exit_uses_log_diagnostic_when_stderr_is_generic(self):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        def _fake_run(cmd, **kwargs):
+            log_file = Path(cmd[cmd.index("--log-file") + 1])
+            log_file.write_text("ERROR not authenticated token=supersecret")
+            return subprocess.CompletedProcess(cmd, 1, "", "see log for details")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run,
+            pytest.raises(LLMAuthError) as exc_info,
+        ):
+            client.generate("system", "user")
+
+        message = str(exc_info.value)
+        assert "see log for details" in message
+        assert "not authenticated" in message
+        assert "token=<redacted>" in message
+        assert "supersecret" not in message
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_run_agent_nonzero_exit_is_classified(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="gemini-nope"))
+        result = subprocess.CompletedProcess(["agy"], 1, "", "unsupported model")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=result) as mock_run,
+            pytest.raises(LLMConfigurationError, match="unsupported model"),
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_run_agent_nonzero_exit_uses_antigravity_log_diagnostic(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        def _fake_streaming(cmd, **kwargs):
+            log_file = Path(cmd[cmd.index("--log-file") + 1])
+            log_file.write_text('{"error": {"message": "unsupported model: Gemini"}}')
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client._run_agent_subprocess_streaming", side_effect=_fake_streaming) as mock_run,
+            pytest.raises(LLMConfigurationError) as exc_info,
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        assert "unsupported model" in str(exc_info.value)
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_run_agent_retries_timeout_then_succeeds(self, tmp_path: Path):
+        observer = MagicMock()
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                retry_observer=observer,
+            )
+        )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}, {"src/app.ts": "hash"}]),
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                side_effect=[
+                    subprocess.TimeoutExpired(cmd="agy", timeout=12),
+                    self._run_result("done"),
+                ],
+            ) as mock_run,
+        ):
+            changed, output = client.run_agent("prompt", tmp_path)
+
+        assert changed == ["src/app.ts"]
+        assert output == "done"
+        assert mock_run.call_count == 2
+        sleep.assert_called_once()
+        assert observer.call_args.args[0]["error_type"] == "LLMTimeoutError"
+
+    def test_run_agent_timeout_stops_when_partial_changes_exist(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {"src/app.ts": "hash"}]),
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                side_effect=subprocess.TimeoutExpired(cmd="agy", timeout=12),
+            ) as mock_run,
+            pytest.raises(LLMTimeoutError, match="timed out after 12s"),
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_run_agent_timeout_raises_after_final_attempt(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}, {}, {}]),
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                side_effect=[
+                    subprocess.TimeoutExpired(cmd="agy", timeout=12),
+                    subprocess.TimeoutExpired(cmd="agy", timeout=12),
+                    subprocess.TimeoutExpired(cmd="agy", timeout=12),
+                    subprocess.TimeoutExpired(cmd="agy", timeout=12),
+                ],
+            ) as mock_run,
+            pytest.raises(LLMTimeoutError, match="timed out after 12s"),
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 4
+        assert sleep.call_count == 3
+
+    def test_run_agent_retries_transient_error_then_succeeds(self, tmp_path: Path):
+        observer = MagicMock()
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                retry_observer=observer,
+            )
+        )
+        transient = subprocess.CompletedProcess(["agy"], 1, "partial stdout", "")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}, {"src/app.ts": "hash"}]),
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                side_effect=[transient, self._run_result("done")],
+            ) as mock_run,
+        ):
+            changed, output = client.run_agent("prompt", tmp_path)
+
+        assert changed == ["src/app.ts"]
+        assert output == "done"
+        assert mock_run.call_count == 2
+        sleep.assert_called_once()
+        assert observer.call_args.args[0]["error_type"] == "LLMTransientError"
+
+    def test_run_agent_transient_error_stops_when_partial_changes_exist(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        transient = subprocess.CompletedProcess(["agy"], 1, "partial stdout", "")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {"src/app.ts": "hash"}]),
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=transient) as mock_run,
+            pytest.raises(LLMTransientError, match="stdout but no safe diagnostic"),
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_run_agent_transient_error_raises_after_final_attempt(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        transient = subprocess.CompletedProcess(["agy"], 1, "partial stdout", "")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}, {}, {}]),
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=transient) as mock_run,
+            pytest.raises(LLMTransientError, match="stdout but no safe diagnostic"),
+        ):
+            client.run_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 4
+        assert sleep.call_count == 3

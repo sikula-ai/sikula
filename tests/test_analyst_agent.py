@@ -7,7 +7,7 @@ from typing import Any
 
 
 from agents.analyst_agent import AnalystAgent
-from agents.base_agent import AGENT_SECURITY_PREFIX
+from agents.base_agent import AGENT_SECURITY_PREFIX, READONLY_AGENT_PREFIX
 from tests.conftest import StubLLMClient
 from core.state import TaskState
 
@@ -267,3 +267,5 @@ class TestAnalystAgentSecurityPrefix:
         stub_llm.readonly_result = VALID_ANALYST_PROMPT
         _make_agent(stub_llm, file_tool).run(task_state)
         assert stub_llm.readonly_calls[0].startswith(AGENT_SECURITY_PREFIX)
+        assert READONLY_AGENT_PREFIX in stub_llm.readonly_calls[0]
+        assert READONLY_AGENT_PREFIX in task_state.analyst_prompt

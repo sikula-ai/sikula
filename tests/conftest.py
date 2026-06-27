@@ -38,6 +38,7 @@ class StubLLMClient(LLMClient):
         self.generate_calls: list[tuple[str, str]] = []
         self.readonly_calls: list[str] = []
         self.agent_calls: list[str] = []
+        self.agent_prompt_prefix: str = ""
 
     def generate(self, system: str, user: str) -> str:
         self.generate_calls.append((system, user))
@@ -58,6 +59,11 @@ class StubLLMClient(LLMClient):
         if self.agent_error:
             raise self.agent_error
         return self.agent_result, self.agent_output
+
+    def prepare_agent_prompt(self, prompt: str, cwd: Path) -> str:
+        if not self.agent_prompt_prefix:
+            return prompt
+        return self.agent_prompt_prefix + prompt
 
 
 # ---------------------------------------------------------------------------

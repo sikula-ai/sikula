@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agents.base_agent import AGENT_SECURITY_PREFIX
+from agents.base_agent import AGENT_SECURITY_PREFIX, READONLY_AGENT_PREFIX
 from agents.reviewer_agent import (
     ReviewerAgent,
     _MAX_DIFF_CHARS,
@@ -1357,6 +1357,8 @@ class TestReviewerAgentSecurityPrefix:
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool).run(state)
         assert stub_llm.readonly_calls[0].startswith(AGENT_SECURITY_PREFIX)
+        assert READONLY_AGENT_PREFIX in stub_llm.readonly_calls[0]
+        assert READONLY_AGENT_PREFIX in state.review_cycle_records[0]["reviewer_prompt"]
 
 
 class TestReviewerAgentApprovalContractPrompt:
