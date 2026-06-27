@@ -8,7 +8,7 @@ Sikula has built-in CLI integrations for Codex, Claude, Gemini, OpenCode, and An
 | `claude` | `claude -p` | Uses Claude Code Agent SDK behavior. |
 | `gemini` | `gemini` | Uses Gemini CLI. |
 | `opencode` | `opencode run` | Model must usually be in `provider/model` format. |
-| `antigravity` | `agy --print -` | Uses Antigravity CLI 1.0.12 or newer. Model names are passed directly to `agy --model`; use the exact display names from `agy models`, for example `"Gemini 3.5 Flash (High)"`. |
+| `antigravity` | `agy --print -` | Uses Antigravity CLI 1.0.13 or newer. Model names are passed directly to `agy --model`; use the exact display names from `agy models`, for example `"Gemini 3.5 Flash (High)"`. |
 
 Provider CLIs and model names change over time. Keep model examples in your project config current with the provider documentation you use.
 
@@ -71,7 +71,7 @@ opencode auth login
 agy
 ```
 
-Provider-specific API-key or enterprise authentication should be configured according to that provider's documentation. For Antigravity, run `agy --version` and `agy models` to verify the CLI is version 1.0.12 or newer, installed, and authenticated before using it through Sikula. Sikula loads `.env` from the project root at startup; existing shell environment variables take precedence.
+Provider-specific API-key or enterprise authentication should be configured according to that provider's documentation. For Antigravity, run `agy --version` and `agy models` to verify the CLI is version 1.0.13 or newer, installed, and authenticated before using it through Sikula. Antigravity CLI is still evolving quickly, so Sikula may raise this minimum as the provider interface stabilizes. Sikula loads `.env` from the project root at startup; existing shell environment variables take precedence.
 
 ## Data Boundary
 

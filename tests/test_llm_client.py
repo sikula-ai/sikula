@@ -2863,7 +2863,7 @@ class TestAntigravityClientCommands:
     def test_require_supported_version_accepts_minimum_version(self):
         with patch(
             "core.llm_client.subprocess.run",
-            return_value=subprocess.CompletedProcess(["agy", "--version"], 0, "1.0.12\n", ""),
+            return_value=subprocess.CompletedProcess(["agy", "--version"], 0, "1.0.13\n", ""),
         ) as mock_run:
             _antigravity_require_supported_version()
 
@@ -2873,9 +2873,9 @@ class TestAntigravityClientCommands:
         with (
             patch(
                 "core.llm_client.subprocess.run",
-                return_value=subprocess.CompletedProcess(["agy", "--version"], 0, "1.0.11\n", ""),
+                return_value=subprocess.CompletedProcess(["agy", "--version"], 0, "1.0.12\n", ""),
             ),
-            pytest.raises(LLMConfigurationError, match="agy 1.0.12 or newer"),
+            pytest.raises(LLMConfigurationError, match="agy 1.0.13 or newer"),
         ):
             _antigravity_require_supported_version()
 
