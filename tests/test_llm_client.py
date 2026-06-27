@@ -84,8 +84,9 @@ class TestCreateLlmClient:
 
     def test_antigravity_provider(self):
         cfg = LLMConfig(provider="antigravity")
-        with patch("core.llm_client._antigravity_require_supported_version"):
+        with patch("core.llm_client._antigravity_require_supported_version") as version_check:
             assert isinstance(create_llm_client(cfg), AntigravityClient)
+        version_check.assert_not_called()
 
     def test_unknown_provider_raises(self):
         cfg = LLMConfig(provider="unknown")
@@ -2859,6 +2860,18 @@ class TestAntigravityClientCommands:
         assert _antigravity_parse_version("agy 1.0.13") == (1, 0, 13)
         assert _antigravity_parse_version("Antigravity CLI version 10.2.3") == (10, 2, 3)
         assert _antigravity_parse_version("dev build") is None
+
+    def test_client_checks_supported_version_on_first_use_only(self):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client._antigravity_require_supported_version") as version_check,
+            patch("core.llm_client.subprocess.run", return_value=self._run_result("answer")),
+        ):
+            assert client.generate("system", "user") == "answer"
+            assert client.generate("system", "user") == "answer"
+
+        version_check.assert_called_once()
 
     def test_require_supported_version_accepts_minimum_version(self):
         with patch(

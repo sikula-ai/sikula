@@ -2400,8 +2400,14 @@ class AntigravityClient(LLMClient):
     """
 
     def __init__(self, config: LLMConfig) -> None:
-        _antigravity_require_supported_version()
         self._config = config
+        self._version_checked = False
+
+    def _ensure_supported_version(self) -> None:
+        if self._version_checked:
+            return
+        _antigravity_require_supported_version()
+        self._version_checked = True
 
     def prepare_agent_prompt(self, prompt: str, cwd: Path) -> str:
         return _antigravity_write_agent_prompt(prompt, cwd)
@@ -2435,6 +2441,7 @@ class AntigravityClient(LLMClient):
         return cmd
 
     def generate(self, system: str, user: str) -> str:
+        self._ensure_supported_version()
         prompt = f"{system}\n\n{user}"
         log.info(
             "Calling LLM via Antigravity (%s, ~%d tokens) — waiting for response...",
@@ -2464,6 +2471,7 @@ class AntigravityClient(LLMClient):
         return _call_with_retry("generate", _call, self._config, "generate")
 
     def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+        self._ensure_supported_version()
         log.info("Running Antigravity read-only agent (%s) — waiting for completion...", self._config.model)
 
         def _call():
@@ -2497,6 +2505,7 @@ class AntigravityClient(LLMClient):
         return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
 
     def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
+        self._ensure_supported_version()
         workspace = cwd.resolve()
         policy = _antigravity_copy_policy(workspace)
         if policy is not None and policy.gitlink_paths:
