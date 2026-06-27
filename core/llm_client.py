@@ -2456,6 +2456,13 @@ class AntigravityClient(LLMClient):
     def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
         workspace = cwd.resolve()
         policy = _antigravity_copy_policy(workspace)
+        if policy is not None:
+            populated_gitlinks = sorted(path for path in policy.gitlink_paths if (workspace / path).exists())
+            if populated_gitlinks:
+                paths = ", ".join(populated_gitlinks)
+                raise LLMConfigurationError(
+                    f"antigravity write agent does not support populated git submodules: {paths}"
+                )
         _antigravity_validate_workspace_symlinks(workspace, prune_ignored_paths=True, policy=policy)
         prompt = self.prepare_agent_prompt(prompt, workspace)
         before = _git_snapshot(workspace)

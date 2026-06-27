@@ -3294,6 +3294,30 @@ class TestAntigravityClientCommands:
 
         mock_run.assert_not_called()
 
+    def test_run_agent_rejects_populated_submodule_gitlinks(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        submodule = repo / "libs" / "api"
+        submodule.mkdir(parents=True)
+        (submodule / "README.md").write_text("submodule docs")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", "160000", "1" * 40, "libs/api"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client._run_agent_subprocess_streaming") as mock_run,
+            pytest.raises(LLMConfigurationError, match="populated git submodules: libs/api"),
+        ):
+            client.run_agent("prompt", repo)
+
+        mock_run.assert_not_called()
+
     def test_run_agent_prunes_symlinks_inside_ignored_directories(self, tmp_path: Path):
         repo = tmp_path / "repo"
         repo.mkdir()
