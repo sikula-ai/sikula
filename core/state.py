@@ -16,11 +16,11 @@ import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Optional
 
 from core.diagnostics import diagnostic_excerpt, diagnostic_summary_lines
+from core.version import sikula_version
 
 
 def _now() -> str:
@@ -204,12 +204,8 @@ def _implementation_asset_target_warning_count(records: list[dict]) -> int:
 
 
 def runtime_metadata_snapshot() -> dict:
-    try:
-        sikula_version = version("sikula")
-    except PackageNotFoundError:
-        sikula_version = "unknown"
     return {
-        "sikula_version": sikula_version,
+        "sikula_version": sikula_version(),
         "python_version": platform.python_version(),
         "platform": platform.platform(),
         "system": platform.system(),

@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import core.version as version_module
+
 _sikula = importlib.import_module("sikula")
 _parse_agent_llm_overrides = _sikula._parse_agent_llm_overrides
 _contract_score_threshold = _sikula._contract_score_threshold
@@ -26,8 +28,8 @@ _print_task_audit_report = _sikula._print_task_audit_report
 _task_audit_warnings = _sikula._task_audit_warnings
 _task_failed_issues = _sikula._task_failed_issues
 _task_recovered_issues = _sikula._task_recovered_issues
-_dev_version_suffix = _sikula._dev_version_suffix
-_sikula_version = _sikula._sikula_version
+_dev_version_suffix = version_module.dev_version_suffix
+_sikula_version = version_module.sikula_version
 cmd_run = _sikula.cmd_run
 cmd_show = _sikula.cmd_show
 cmd_status = _sikula.cmd_status
@@ -1683,7 +1685,7 @@ class TestMain:
 
         p1, p2, p3 = self._patch_config(tmp_path)
         with patch("sys.argv", ["sikula", "status"]):
-            with patch("sikula._pkg_version", side_effect=PackageNotFoundError):
+            with patch("core.version._pkg_version", side_effect=PackageNotFoundError):
                 with p1, p2, p3:
                     with patch("sikula.cmd_status"):
                         main()
@@ -1694,7 +1696,7 @@ class TestVersionLabel:
         assert _dev_version_suffix(tmp_path) == ""
 
     def test_dev_version_suffix_is_empty_when_git_is_missing(self, tmp_path: Path):
-        with patch("sikula.subprocess.run", side_effect=FileNotFoundError):
+        with patch("core.version.subprocess.run", side_effect=FileNotFoundError):
             assert _dev_version_suffix(tmp_path) == ""
 
     def test_dev_version_suffix_includes_branch_and_commit_for_git_checkout(self, tmp_path: Path):
@@ -1711,17 +1713,17 @@ class TestVersionLabel:
         assert suffix.startswith("-dev+feature.test.version.")
 
     def test_sikula_version_appends_dev_suffix_to_installed_version(self):
-        with patch("sikula._pkg_version", return_value="1.2.3"):
-            with patch("sikula._dev_version_suffix", return_value="-dev+branch.abc123"):
+        with patch("core.version._pkg_version", return_value="1.2.3"):
+            with patch("core.version.dev_version_suffix", return_value="-dev+branch.abc123"):
                 assert _sikula_version() == "1.2.3-dev+branch.abc123"
 
     def test_sikula_version_omits_dev_suffix_when_git_is_missing(self):
-        with patch("sikula._pkg_version", return_value="1.2.3"):
-            with patch("sikula.subprocess.run", side_effect=FileNotFoundError):
+        with patch("core.version._pkg_version", return_value="1.2.3"):
+            with patch("core.version.subprocess.run", side_effect=FileNotFoundError):
                 assert _sikula_version() == "1.2.3"
 
     def test_sikula_version_returns_dev_when_package_is_not_installed(self):
         from importlib.metadata import PackageNotFoundError
 
-        with patch("sikula._pkg_version", side_effect=PackageNotFoundError):
+        with patch("core.version._pkg_version", side_effect=PackageNotFoundError):
             assert _sikula_version() == "dev"

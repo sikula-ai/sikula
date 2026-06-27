@@ -63,7 +63,6 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 from hashlib import sha256
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
 import json
 import logging
 import os
@@ -79,6 +78,7 @@ import yaml
 from dotenv import load_dotenv
 
 from core.diagnostics import diagnostic_identity_key, diagnostic_summary_lines
+from core.version import sikula_version as _sikula_version
 
 _BASE = Path(__file__).parent
 # When adding a new platform: add it here, in _build_tool() in core/orchestrator.py,
@@ -88,39 +88,6 @@ _BASE = Path(__file__).parent
 _SUPPORTED_BUILD_TOOLS = {"cargo", "gradle-android", "gradle-jvm", "maven", "node", "xcodebuild", "python"}
 _RECOVERED_DIAGNOSTIC_LIMIT = 10
 _SIKULA_GITIGNORE_ENTRIES = ("state/", "worktrees/", "contract-reports/")
-
-
-def _git_output(args: list[str], cwd: Path) -> str | None:
-    try:
-        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip() or None
-
-
-def _is_git_checkout(path: Path = _BASE) -> bool:
-    return _git_output(["rev-parse", "--is-inside-work-tree"], path) == "true"
-
-
-def _dev_version_suffix(path: Path = _BASE) -> str:
-    if not _is_git_checkout(path):
-        return ""
-    branch = _git_output(["branch", "--show-current"], path)
-    commit = _git_output(["rev-parse", "--short", "HEAD"], path)
-    parts = [re.sub(r"[^A-Za-z0-9.]+", ".", p).strip(".") for p in (branch, commit) if p]
-    return "-dev" + (f"+{'.'.join(parts)}" if parts else "")
-
-
-def _sikula_version() -> str:
-    try:
-        base_version = _pkg_version("sikula")
-    except PackageNotFoundError:
-        base_version = "dev"
-    if base_version == "dev":
-        return "dev"
-    return base_version + _dev_version_suffix()
 
 
 def _resolve_task_path(task_file: str, project_root: Path) -> Path | None:

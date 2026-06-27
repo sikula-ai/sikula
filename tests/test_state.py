@@ -158,15 +158,12 @@ class TestJsonStateStore:
         assert state.runtime_metadata["sikula_version"]
         assert state.runtime_metadata["system"]
 
-    def test_runtime_metadata_uses_unknown_when_package_version_is_unavailable(self, monkeypatch):
-        def missing_version(_: str) -> str:
-            raise state_module.PackageNotFoundError
-
-        monkeypatch.setattr(state_module, "version", missing_version)
+    def test_runtime_metadata_uses_shared_sikula_version(self, monkeypatch):
+        monkeypatch.setattr(state_module, "sikula_version", lambda: "1.2.3-dev+branch.abc123")
 
         metadata = state_module.runtime_metadata_snapshot()
 
-        assert metadata["sikula_version"] == "unknown"
+        assert metadata["sikula_version"] == "1.2.3-dev+branch.abc123"
 
     def test_validation_record_captures_iteration_step_and_error_excerpt(self):
         state = TaskState(task_id="v1", task_description="validation task")
