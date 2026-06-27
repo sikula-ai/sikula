@@ -2129,6 +2129,8 @@ def _antigravity_ignores_path(rel_path: Path, policy: _AntigravityCopyPolicy | N
 def _antigravity_ignore_path(rel_path: Path, policy: _AntigravityCopyPolicy | None = None) -> bool:
     if _antigravity_is_hard_ignored_path(rel_path):
         return True
+    if _antigravity_ignores_path(rel_path, policy):
+        return True
     if _antigravity_is_soft_ignored_path(rel_path) and not _antigravity_preserves_path(rel_path, policy):
         return True
     return False
@@ -2214,10 +2216,10 @@ def _antigravity_validate_workspace_symlinks(
         for name in dirnames:
             path = directory / name
             rel_path = rel_dir / name
+            if prune_ignored_paths and _antigravity_ignore_path(rel_path, policy):
+                continue
             if path.is_symlink():
                 _antigravity_validate_workspace_symlink(path, resolved_root, rel_path)
-                continue
-            if prune_ignored_paths and _antigravity_ignore_path(rel_path, policy):
                 continue
             kept_dirs.append(name)
         dirnames[:] = kept_dirs

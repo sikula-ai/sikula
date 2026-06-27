@@ -3102,7 +3102,7 @@ class TestAntigravityClientCommands:
         mock_run.assert_not_called()
         assert external.read_text() == "outside"
 
-    def test_run_readonly_agent_validates_ignored_top_level_symlink_before_copying(self, tmp_path: Path):
+    def test_run_readonly_agent_prunes_ignored_top_level_symlink_before_copying(self, tmp_path: Path):
         repo = tmp_path / "repo"
         repo.mkdir()
         external = tmp_path / "external-node-modules"
@@ -3114,13 +3114,45 @@ class TestAntigravityClientCommands:
 
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
 
-        with (
-            patch("core.llm_client.subprocess.run") as mock_run,
-            pytest.raises(LLMConfigurationError, match="external symlink node_modules"),
-        ):
-            client.run_readonly_agent("prompt", repo)
+        def _fake_run(cmd, **kwargs):
+            workspace = Path(kwargs["cwd"])
+            assert not (workspace / "node_modules").exists()
+            return subprocess.CompletedProcess(cmd, 0, "reviewed", "")
 
-        mock_run.assert_not_called()
+        with patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run:
+            output = client.run_readonly_agent("prompt", repo)
+
+        assert output == "reviewed"
+        assert mock_run.called
+
+    def test_run_readonly_agent_prunes_gitignored_symlink_before_copying(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        external = tmp_path / "local-sdk"
+        external.mkdir()
+        (repo / ".gitignore").write_text("local-sdk\n")
+        try:
+            (repo / "local-sdk").symlink_to(os.path.relpath(external, repo))
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True, capture_output=True)
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        real_run = subprocess.run
+
+        def _fake_run(cmd, **kwargs):
+            if cmd and cmd[0] == "git":
+                return real_run(cmd, **kwargs)
+            workspace = Path(kwargs["cwd"])
+            assert not (workspace / "local-sdk").exists()
+            return subprocess.CompletedProcess(cmd, 0, "reviewed", "")
+
+        with patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run:
+            output = client.run_readonly_agent("prompt", repo)
+
+        assert output == "reviewed"
+        assert mock_run.called
 
     def test_run_readonly_agent_prunes_symlinks_inside_ignored_directories_before_copying(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -3193,7 +3225,7 @@ class TestAntigravityClientCommands:
         mock_run.assert_not_called()
         assert external.read_text() == "outside"
 
-    def test_run_agent_validates_ignored_top_level_symlink(self, tmp_path: Path):
+    def test_run_agent_prunes_ignored_top_level_symlink(self, tmp_path: Path):
         repo = tmp_path / "repo"
         repo.mkdir()
         external = tmp_path / "external-node-modules"
@@ -3206,12 +3238,39 @@ class TestAntigravityClientCommands:
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
 
         with (
-            patch("core.llm_client._run_agent_subprocess_streaming") as mock_run,
-            pytest.raises(LLMConfigurationError, match="external symlink node_modules"),
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}]),
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=self._run_result("done")) as mock_run,
         ):
-            client.run_agent("prompt", repo)
+            changed, output = client.run_agent("prompt", repo)
 
-        mock_run.assert_not_called()
+        assert changed == []
+        assert output == "done"
+        assert mock_run.called
+
+    def test_run_agent_prunes_gitignored_symlink(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        external = tmp_path / "local-sdk"
+        external.mkdir()
+        (repo / ".gitignore").write_text("local-sdk\n")
+        try:
+            (repo / "local-sdk").symlink_to(os.path.relpath(external, repo))
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True, capture_output=True)
+
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}]),
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=self._run_result("done")) as mock_run,
+        ):
+            changed, output = client.run_agent("prompt", repo)
+
+        assert changed == []
+        assert output == "done"
+        assert mock_run.called
 
     def test_run_agent_validates_tracked_symlinks_inside_soft_ignored_directories(self, tmp_path: Path):
         repo = tmp_path / "repo"
