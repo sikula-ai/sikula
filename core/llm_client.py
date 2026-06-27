@@ -1838,6 +1838,44 @@ _ANTIGRAVITY_LOG_DIAGNOSTIC_MARKERS = (
     "unknown model",
     "unsupported model",
 )
+_ANTIGRAVITY_PROVIDER_ERROR_MARKERS = (
+    "usage_limit_reached",
+    "usage limit has been reached",
+    "quota exceeded",
+    "quota_exceeded",
+    "resource exhausted",
+    "insufficient_quota",
+    "credit balance is too low",
+    "out of credits",
+    "exceeded your current quota",
+    "401",
+    "unauthorized",
+    "unauthenticated",
+    "authentication failed",
+    "not authenticated",
+    "no auth",
+    "login required",
+    "not logged in",
+    "api key",
+    "api-key",
+    "apikey",
+    "invalid key",
+    "missing key",
+    "invalid token",
+    "missing token",
+    "billing disabled",
+    "billing account",
+    "invalid model",
+    "model not supported",
+    "unsupported model",
+    "unknown model",
+    "unknown provider",
+    "provider not found",
+    "invalid provider",
+    "invalid configuration",
+    "configuration error",
+    "not enabled for this account",
+)
 _ANTIGRAVITY_LOG_DIAGNOSTIC_KEYS = {
     "code",
     "diagnostic",
@@ -1899,12 +1937,12 @@ def _antigravity_redact_diagnostic(text: str) -> str:
     return redacted
 
 
-def _antigravity_marker_text(text: str) -> str | None:
+def _antigravity_marker_text_for_markers(text: str, markers: tuple[str, ...]) -> str | None:
     normalized = re.sub(r"\x1b\[[0-9;]*m", "", text).strip()
     if not normalized:
         return None
     lower = normalized.lower()
-    positions = [lower.find(marker) for marker in _ANTIGRAVITY_LOG_DIAGNOSTIC_MARKERS if marker in lower]
+    positions = [lower.find(marker) for marker in markers if marker in lower]
     if not positions:
         return None
     pos = min(positions)
@@ -1916,6 +1954,14 @@ def _antigravity_marker_text(text: str) -> str | None:
     if end < len(normalized):
         excerpt += "..."
     return _antigravity_redact_diagnostic(excerpt)
+
+
+def _antigravity_marker_text(text: str) -> str | None:
+    return _antigravity_marker_text_for_markers(text, _ANTIGRAVITY_LOG_DIAGNOSTIC_MARKERS)
+
+
+def _antigravity_provider_error_marker_text(text: str) -> str | None:
+    return _antigravity_marker_text_for_markers(text, _ANTIGRAVITY_PROVIDER_ERROR_MARKERS)
 
 
 def _antigravity_json_diagnostic_strings(value: object, *, key: str | None = None) -> Iterator[str]:
@@ -1981,7 +2027,7 @@ def _antigravity_result_error(
     stderr = (result.stderr or "").strip()
     log_diagnostic = log_diagnostic.strip()
     if stderr:
-        safe_stderr = _antigravity_redact_diagnostic(stderr)
+        safe_stderr = _antigravity_provider_error_marker_text(stderr) or _antigravity_redact_diagnostic(stderr)
         if log_diagnostic:
             combined = f"{safe_stderr}\nlog diagnostic:\n{log_diagnostic}"
             combined_error = _provider_error("antigravity", operation, combined)

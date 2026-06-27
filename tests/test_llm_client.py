@@ -2992,6 +2992,24 @@ class TestAntigravityClientCommands:
         assert "temporary outage" in str(stderr_error)
         assert "log diagnostic" not in str(stderr_error)
 
+    def test_result_error_classifies_long_stderr_before_truncating(self):
+        error = _antigravity_result_error(
+            subprocess.CompletedProcess(
+                ["agy"],
+                1,
+                "",
+                "ERROR " + "x" * 800 + " unsupported model token=secret",
+            ),
+            "agent",
+        )
+
+        message = str(error)
+        assert isinstance(error, LLMConfigurationError)
+        assert "unsupported model" in message
+        assert "token=<redacted>" in message
+        assert "secret" not in message
+        assert "x" * 600 not in message
+
     def test_result_error_redacts_multi_token_authorization_headers(self):
         error = _antigravity_result_error(
             subprocess.CompletedProcess(
