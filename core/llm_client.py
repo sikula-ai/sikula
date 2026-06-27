@@ -2388,9 +2388,7 @@ def _antigravity_require_supported_version() -> None:
     if version < _ANTIGRAVITY_MIN_VERSION:
         minimum = ".".join(str(part) for part in _ANTIGRAVITY_MIN_VERSION)
         current = ".".join(str(part) for part in version)
-        raise LLMConfigurationError(
-            f"antigravity CLI {current} is unsupported; install agy {minimum} or newer"
-        )
+        raise LLMConfigurationError(f"antigravity CLI {current} is unsupported; install agy {minimum} or newer")
 
 
 class AntigravityClient(LLMClient):
