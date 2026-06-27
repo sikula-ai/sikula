@@ -74,6 +74,8 @@ configures; exact guarantees remain provider-specific.
 | OpenCode | Read-only agents deny bash in generated config. | Workspace boundary depends on OpenCode; write restrictions are prompt-level. |
 | Antigravity | Disposable copy; rejects copy changes and external symlinks on kept paths. | Rejects external symlinks on kept paths; runs `agy` on the task worktree with a workspace instruction. |
 
+For Antigravity, Sikula protects the task checkout by using a disposable copy for read-only calls and kept-path symlink validation before write-capable calls; OS-level prevention of writes outside those workspaces depends on Antigravity CLI sandbox behavior.
+
 See [ARCHITECTURE.md](../ARCHITECTURE.md) for exact implementation details.
 
 ## Network Access
