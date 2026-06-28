@@ -773,7 +773,16 @@ class TestTaskAuditReport:
         )
         state.review_cycle_records.append({"has_warnings": True, "reviewer_output": "## Warnings\n- Reviewer warning"})
         state.security_review_cycle_records.append(
-            {"has_warnings": True, "reviewer_output": "## Warnings\n- Security warning"}
+            {
+                "has_warnings": True,
+                "reviewer_output": (
+                    "## Warnings\n\n"
+                    "### Security warning\n"
+                    "File: src/auth.py\n"
+                    "Concern: missing audit trail\n"
+                    "Suggestion: add structured logging"
+                ),
+            }
         )
         state.testability_gaps.append({"message": "missing UI harness"})
         state.validation_artifact_records.append({"status": "cleaned", "artifacts": [{"path": "tmp.log"}]})
@@ -804,6 +813,7 @@ class TestTaskAuditReport:
         assert "Reviewer warning" in out
         assert "Security warnings:" in out
         assert "Security warning" in out
+        assert "concern: missing audit trail" in out
         assert "Testability gaps:" in out
         assert "validation artifacts: 3 (1 cleaned, 1 blocked, 1 cleanup failed)" in out
         assert "LLM retries: 1" in out

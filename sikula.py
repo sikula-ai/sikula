@@ -2584,15 +2584,47 @@ def _extract_reviewer_warnings(output: str) -> list[str]:
     lines = output.splitlines()
     in_warnings = False
     extracted = []
+    current_title: str | None = None
+    current_details: dict[str, str] = {}
+
+    def _flush_structured_warning() -> None:
+        nonlocal current_title, current_details
+        if not current_title:
+            return
+        details = []
+        for key in ("file", "concern", "suggestion"):
+            value = current_details.get(key)
+            if value:
+                details.append(f"{key}: {value}")
+        suffix = f" — {'; '.join(details)}" if details else ""
+        extracted.append(_short_audit_line(f"{current_title}{suffix}"))
+        current_title = None
+        current_details = {}
+
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("## "):
+            if in_warnings:
+                _flush_structured_warning()
             in_warnings = stripped.lower() == "## warnings"
             continue
+        if not in_warnings:
+            continue
+        if stripped.startswith("### "):
+            _flush_structured_warning()
+            current_title = stripped[4:].strip()
+            current_details = {}
+            continue
+        field = re.match(r"(?i)^(file|concern|suggestion):\s*(.+)$", stripped)
+        if current_title and field:
+            current_details[field.group(1).lower()] = field.group(2).strip()
+            continue
         if in_warnings and stripped.startswith(("-", "*")):
+            _flush_structured_warning()
             text = stripped[1:].strip()
             if text:
                 extracted.append(_short_audit_line(text))
+    _flush_structured_warning()
     return extracted
 
 

@@ -1552,7 +1552,13 @@ class TestCmdRunStateStore:
         state.security_review_cycle_records.append(
             {
                 "has_warnings": True,
-                "reviewer_output": "## Warnings\n- Security warning",
+                "reviewer_output": (
+                    "## Warnings\n\n"
+                    "### Missing auth audit trail\n"
+                    "File: src/auth.py\n"
+                    "Concern: failed logins are not recorded\n"
+                    "Suggestion: add structured security logging"
+                ),
             }
         )
         store.save(state)
@@ -1576,7 +1582,10 @@ class TestCmdRunStateStore:
         assert "- Second warning" in out
 
         assert "Security warnings:" in out
-        assert "- Security warning" in out
+        assert "- Missing auth audit trail" in out
+        assert "file: src/auth.py" in out
+        assert "concern: failed logins are not recorded" in out
+        assert "suggestion: add structured security logging" in out
         exit_mock.assert_called_with(0)
 
     def test_terminal_done_truncates_long_warnings(self, tmp_path: Path, capsys):
