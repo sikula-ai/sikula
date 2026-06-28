@@ -575,3 +575,4 @@ python3 -m ruff format .
 - **Always** write all code comments in English.
 - **Always** run `ruff check .` after any code change; fix all reported issues before finishing.
 - **Always** follow the naming conventions table above for new agents, tools, constants, and methods.
+- **Always** ensure LLM output parsers degrade safely and do not crash the orchestrator on hallucinated formatting.
