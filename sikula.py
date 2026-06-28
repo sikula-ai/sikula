@@ -2630,24 +2630,6 @@ def _task_audit_warnings(state) -> list[str]:
             agent = entry.get("agent") or "agent"
             warnings.append(f"{agent}: {_short_audit_line(entry.get('result'))}")
 
-    review_warning_count = sum(1 for record in getattr(state, "review_cycle_records", []) if record.get("has_warnings"))
-    if review_warning_count:
-        warnings.append(f"reviewer warnings: {review_warning_count} (see: sikula show {state.task_id})")
-
-    security_warning_count = sum(
-        1 for record in getattr(state, "security_review_cycle_records", []) if record.get("has_warnings")
-    )
-    if security_warning_count:
-        warnings.append(f"security reviewer warnings: {security_warning_count} (see: sikula show {state.task_id})")
-
-    testability_gaps = getattr(state, "testability_gaps", [])
-    if testability_gaps:
-        unique_count = len(_unique_testability_gaps(testability_gaps))
-        detail = f"{len(testability_gaps)}"
-        if unique_count != len(testability_gaps):
-            detail += f" ({unique_count} unique)"
-        warnings.append(f"testability gaps: {detail} (see: sikula show {state.task_id})")
-
     gate_records = getattr(state, "test_execution_gate_records", [])
     active_gate_records = [record for record in gate_records if record.get("status") != "resolved"]
     if active_gate_records:
@@ -2823,20 +2805,20 @@ def _print_task_audit_report(state) -> int:
         print("Audit warnings:")
         _print_limited_lines(warnings, state.task_id, limit=len(warnings))
 
-        review_lines = _reviewer_warning_sample_lines(state)
-        if review_lines:
-            print("Reviewer warnings:")
-            _print_limited_lines(review_lines, state.task_id, limit=len(review_lines))
+    review_lines = _reviewer_warning_sample_lines(state)
+    if review_lines:
+        print("Reviewer warnings:")
+        _print_limited_lines(review_lines, state.task_id, limit=len(review_lines))
 
-        sec_lines = _security_warning_sample_lines(state)
-        if sec_lines:
-            print("Security warnings:")
-            _print_limited_lines(sec_lines, state.task_id, limit=len(sec_lines))
+    sec_lines = _security_warning_sample_lines(state)
+    if sec_lines:
+        print("Security warnings:")
+        _print_limited_lines(sec_lines, state.task_id, limit=len(sec_lines))
 
-        gap_lines = _testability_gap_sample_lines(state)
-        if gap_lines:
-            print("Testability gaps:")
-            _print_limited_lines(gap_lines, state.task_id, limit=len(gap_lines))
+    gap_lines = _testability_gap_sample_lines(state)
+    if gap_lines:
+        print("Testability gaps:")
+        _print_limited_lines(gap_lines, state.task_id, limit=len(gap_lines))
 
     if recovered:
         print("Recovered issues:")

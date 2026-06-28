@@ -1569,9 +1569,6 @@ class TestCmdRunStateStore:
             cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
 
         out = capsys.readouterr().out
-        assert "Audit warnings:" in out
-        assert "reviewer warnings: 1" in out
-        assert "security reviewer warnings: 1" in out
 
         assert "Reviewer warnings:" in out
         assert "- First warning" in out
@@ -1619,8 +1616,8 @@ class TestCmdRunStateStore:
             cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
 
         out = capsys.readouterr().out
-        assert "Audit warnings:" in out
-        assert "reviewer warnings: 1" in out
+        # Reviewer warnings are now printed in their own section.
+        assert "Audit warnings:" not in out
         assert "Reviewer warnings:" in out
 
         # Should print the first 10

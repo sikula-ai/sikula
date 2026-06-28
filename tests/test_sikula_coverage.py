@@ -794,13 +794,10 @@ class TestTaskAuditReport:
         warning_count = _print_task_audit_report(state)
 
         out = capsys.readouterr().out
-        assert warning_count == 7
+        assert warning_count == 4
         assert "Audit warnings:" in out
         assert "analyst: missing optional architecture context" in out
         assert "implementer: files outside allowed_write_paths" in out
-        assert "reviewer warnings: 1" in out
-        assert "security reviewer warnings: 1" in out
-        assert "testability gaps: 1" in out
         assert "Testability gaps:" in out
         assert "validation artifacts: 3 (1 cleaned, 1 blocked, 1 cleanup failed)" in out
         assert "LLM retries: 1" in out
@@ -920,8 +917,7 @@ class TestTaskAuditReport:
         warning_count = _print_task_audit_report(state)
 
         out = capsys.readouterr().out
-        assert warning_count == 1
-        assert "testability gaps: 2 (1 unique)" in out
+        assert warning_count == 0
         assert out.count("gap: browser navigation [medium]") == 1
         assert "reason: configured validation has no browser runtime" in out
         assert "covered_by: route contract tests" in out
@@ -1126,8 +1122,6 @@ class TestPrintReviewSummary:
         )
         _print_review_summary(s, "feature/x", "main", 10.0)
         out = capsys.readouterr().out
-        assert "Audit warnings:" in out
-        assert "testability gaps: 1" in out
         assert "Testability gaps:" in out
         assert "gap: native share" in out
 
