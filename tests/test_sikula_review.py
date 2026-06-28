@@ -24,6 +24,12 @@ _run_review_agent_with_retry_history = _sikula._run_review_agent_with_retry_hist
 cmd_review = _sikula.cmd_review
 
 
+@pytest.fixture(autouse=True)
+def mock_sikula_version():
+    with patch("core.state.sikula_version", return_value="dev"):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

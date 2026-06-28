@@ -1533,6 +1533,112 @@ class TestCmdRunStateStore:
         assert "implementer: files outside allowed_write_paths" in out
         exit_mock.assert_called_with(0)
 
+    def test_terminal_done_prints_reviewer_warnings(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        state = TaskState(task_id="abc123", task_description="resume me")
+        state.done = True
+        state.build_status = "success"
+        state.test_status = "success"
+        state.check_status = "success"
+        state.review_cycle_records.append(
+            {
+                "has_warnings": True,
+                "reviewer_output": "## Warnings\n- First warning\n- Second warning",
+            }
+        )
+        state.security_review_cycle_records.append(
+            {
+                "has_warnings": True,
+                "reviewer_output": "## Warnings\n- Security warning",
+            }
+        )
+        store.save(state)
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            mock.run.return_value = state_store.load("abc123")
+            return mock
+
+        with (
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "Audit warnings:" in out
+        assert "reviewer warnings: 1" in out
+        assert "security reviewer warnings: 1" in out
+
+        assert "Reviewer warnings:" in out
+        assert "- First warning" in out
+        assert "- Second warning" in out
+
+        assert "Security warnings:" in out
+        assert "- Security warning" in out
+        exit_mock.assert_called_with(0)
+
+    def test_terminal_done_truncates_long_warnings(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        state = TaskState(task_id="abc123", task_description="resume me")
+        state.done = True
+        state.build_status = "success"
+        state.test_status = "success"
+        state.check_status = "success"
+
+        # 12 warnings (over the limit of 10)
+        # And a very long warning that should be truncated string-wise
+        long_warning = "x" * 300
+        output_lines = ["## Warnings"]
+        output_lines.append(f"- {long_warning}")
+        output_lines.extend(f"- Warning {i}" for i in range(11))
+
+        state.review_cycle_records.append(
+            {
+                "has_warnings": True,
+                "reviewer_output": "\n".join(output_lines),
+            }
+        )
+        store.save(state)
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            mock.run.return_value = state_store.load("abc123")
+            return mock
+
+        with (
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "Audit warnings:" in out
+        assert "reviewer warnings: 1" in out
+        assert "Reviewer warnings:" in out
+
+        # Should print the first 10
+        # The first is the truncated long string
+        truncated_long_string = "x" * 177 + "..."  # limit 180 - 3
+        assert truncated_long_string in out
+
+        assert "- Warning 0" in out
+        assert "- Warning 8" in out
+
+        # Should not print the 11th record directly
+        assert "- Warning 9" not in out
+        assert "- Warning 10" not in out
+
+        # Should print the "X more" message (12 total warnings - 10 limit = 2 more)
+        assert "... 2 more warning(s) (see: sikula show abc123)" in out
+        exit_mock.assert_called_with(0)
+
     def test_task_id_terminal_failed_prints_reset_failed_hint(self, tmp_path: Path, capsys):
         from core.state import JsonStateStore, TaskState
 
