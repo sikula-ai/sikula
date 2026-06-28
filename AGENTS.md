@@ -28,3 +28,5 @@ Focus especially on:
 - Sandbox enforcement: Do not accept changes that bypass or weaken the `Sandbox` restrictions (`allowed_read_paths`, `allowed_write_paths`).
 - Parser robustness: Agent output parsers (e.g. for structured LLM blocks) must degrade safely and not crash the orchestrator if formatting is hallucinated.
 - Output decoupling: CLI text output must remain decoupled from core pipeline logic to ensure machine-readable formats (e.g. `--json`) consume the exact `TaskState` schema directly.
+- CLI-provider changes: verify prompt transport, timeout handling, diagnostic redaction, retry classification, and read-only/write-mode boundaries.
+- Prompt privacy: stored prompts are audit artifacts; do not expose them through ordinary diagnostics or external reports. `sikula show` is the explicit full-state audit exception.

@@ -205,6 +205,12 @@ can exit immediately or stop reading stdin on quota, authentication, or configur
 failures; Sikula must still enforce `agent_timeout` and drain/classify stdout/stderr
 instead of hanging or surfacing a raw broken-pipe exception.
 
+When adding or materially changing CLI-backed provider diagnostics, avoid surfacing raw
+provider stderr, stdout, or log payloads in exceptions, retry records, or task state. Prefer
+provider-specific safe diagnostic extraction and redact common secrets before returning
+errors. Existing providers may have different legacy diagnostic behavior; do not broaden
+raw diagnostic exposure when touching them.
+
 ### State recording
 
 Call `state.record(self.name, action, result)` after every meaningful action.
@@ -234,6 +240,14 @@ Every agent that invokes an LLM must append one record per invocation to the app
 stored in dedicated fields (`state.analyst_prompt` and `state.implementation_prompt`)
 because that output drives the whole task. Rejected analyst outputs that trigger analysis
 retry are append-only records in `state.analyst_retry_records`.
+
+Prompts stored in `TaskState` are local audit artifacts. They should remain faithful to
+what the agent received, including provider-added boundary instructions, and should not be
+automatically redacted before persistence. Avoid adding secrets to prompts in the first
+place, and do not surface stored prompts through ordinary terminal summaries, retry
+messages, provider diagnostics, CI output, PR comments, or external reports. `sikula show`
+is the explicit full-state audit/debug command and may print prompts; remind users to
+review and redact its output before sharing it outside the local project context.
 
 Each agent record must include at minimum: the agent's prompt, LLM output (`None` on
 exception), files written, timestamp, and the correlation keys needed to locate the record
@@ -429,6 +443,11 @@ return ToolResult(success=True, output=output)
 
 `TaskState` is the single source of truth. The orchestrator persists it to JSON after every
 agent operation — do not cache state values in local variables across agent calls.
+
+Runtime metadata, CLI version output, and other user-facing Sikula version labels must use
+`core.version.sikula_version()` rather than calling `importlib.metadata.version("sikula")`
+directly. This keeps task-state audit records aligned with `sikula --version`, including
+development checkout suffixes.
 
 ### Schema migrations
 
