@@ -771,8 +771,10 @@ class TestTaskAuditReport:
             "write_path_warning",
             "files outside allowed_write_paths: ['README.md']; allowed: ['src/']",
         )
-        state.review_cycle_records.append({"has_warnings": True})
-        state.security_review_cycle_records.append({"has_warnings": True})
+        state.review_cycle_records.append({"has_warnings": True, "reviewer_output": "## Warnings\n- Reviewer warning"})
+        state.security_review_cycle_records.append(
+            {"has_warnings": True, "reviewer_output": "## Warnings\n- Security warning"}
+        )
         state.testability_gaps.append({"message": "missing UI harness"})
         state.validation_artifact_records.append({"status": "cleaned", "artifacts": [{"path": "tmp.log"}]})
         state.validation_artifact_records.append({"status": "blocked", "artifacts": [{"path": "Cargo.lock"}]})
@@ -794,10 +796,14 @@ class TestTaskAuditReport:
         warning_count = _print_task_audit_report(state)
 
         out = capsys.readouterr().out
-        assert warning_count == 4
+        assert warning_count == 7
         assert "Audit warnings:" in out
         assert "analyst: missing optional architecture context" in out
         assert "implementer: files outside allowed_write_paths" in out
+        assert "Reviewer warnings:" in out
+        assert "Reviewer warning" in out
+        assert "Security warnings:" in out
+        assert "Security warning" in out
         assert "Testability gaps:" in out
         assert "validation artifacts: 3 (1 cleaned, 1 blocked, 1 cleanup failed)" in out
         assert "LLM retries: 1" in out
@@ -917,7 +923,7 @@ class TestTaskAuditReport:
         warning_count = _print_task_audit_report(state)
 
         out = capsys.readouterr().out
-        assert warning_count == 0
+        assert warning_count == 1
         assert out.count("gap: browser navigation [medium]") == 1
         assert "reason: configured validation has no browser runtime" in out
         assert "covered_by: route contract tests" in out

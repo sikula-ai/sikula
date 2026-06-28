@@ -2612,6 +2612,14 @@ def _llm_warning_sample_lines(records: list[dict], task_id: str, limit: int) -> 
     return lines
 
 
+def _llm_warning_count(records: list[dict]) -> int:
+    count = 0
+    for record in records:
+        if record.get("has_warnings"):
+            count += max(1, len(_extract_reviewer_warnings(record.get("reviewer_output", ""))))
+    return count
+
+
 def _reviewer_warning_sample_lines(state, limit: int = _RECOVERED_DIAGNOSTIC_LIMIT) -> list[str]:
     return _llm_warning_sample_lines(getattr(state, "review_cycle_records", []), state.task_id, limit)
 
@@ -2733,6 +2741,15 @@ def _testability_gap_sample_lines(state, limit: int = _RECOVERED_DIAGNOSTIC_LIMI
     return lines
 
 
+def _task_warning_count(state) -> int:
+    return (
+        len(_task_audit_warnings(state))
+        + _llm_warning_count(getattr(state, "review_cycle_records", []))
+        + _llm_warning_count(getattr(state, "security_review_cycle_records", []))
+        + len(_unique_testability_gaps(getattr(state, "testability_gaps", [])))
+    )
+
+
 def _task_recovered_issues(state) -> list[str]:
     recovered: list[str] = []
     validation_failures = _validation_failure_summary(getattr(state, "validation_cycle_records", []))
@@ -2828,7 +2845,7 @@ def _print_task_audit_report(state) -> int:
         print("Failed issues:")
         _print_limited_lines(failed, state.task_id, limit=len(failed))
 
-    return len(warnings)
+    return _task_warning_count(state)
 
 
 def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
@@ -3031,9 +3048,9 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
             longest_label = f"{h['agent']}/{h['action']}"
 
     max_iter = cfg.get("sandbox", {}).get("max_iterations", 10)
-    audit_warning_count = len(_task_audit_warnings(state))
+    warning_count = _task_warning_count(state)
     if state.done:
-        status = f"✓ DONE with warnings ({audit_warning_count})" if audit_warning_count else "✓ DONE"
+        status = f"✓ DONE with warnings ({warning_count})" if warning_count else "✓ DONE"
     elif state.failed:
         status = "✗ FAILED"
     else:

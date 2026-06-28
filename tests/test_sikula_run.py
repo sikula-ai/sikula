@@ -1570,6 +1570,7 @@ class TestCmdRunStateStore:
 
         out = capsys.readouterr().out
 
+        assert "Task abc123: ✓ DONE with warnings (3)" in out
         assert "Reviewer warnings:" in out
         assert "- First warning" in out
         assert "- Second warning" in out
@@ -1616,6 +1617,7 @@ class TestCmdRunStateStore:
             cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
 
         out = capsys.readouterr().out
+        assert "Task abc123: ✓ DONE with warnings (12)" in out
         # Reviewer warnings are now printed in their own section.
         assert "Audit warnings:" not in out
         assert "Reviewer warnings:" in out
