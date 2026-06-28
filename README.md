@@ -175,6 +175,7 @@ Use these projects to inspect working Sikula configs, task files, and validation
 For a standalone frontend demo, see [sikula-example-web-project](https://github.com/sikula-ai/sikula-example-web-project): a small Bun, Vite, React, and TypeScript repository with its own Sikula config, task file, guidelines, validation pipeline, and auditable run state.
 
 The Rust example includes commented `extra_rules` files you can enable to see project-specific planner, reviewer, security reviewer, and test writer rules in action.
+The React example demonstrates how to provide physical delivery assets in a task description (see `add-search-by-name.md`).
 
 | Example | Stack |
 |---|---|
