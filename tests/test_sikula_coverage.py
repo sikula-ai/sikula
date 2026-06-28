@@ -1707,6 +1707,21 @@ class TestMain:
 
 
 class TestVersionLabel:
+    def _git_init(self, root: Path) -> None:
+        subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=root, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=root, check=True, capture_output=True)
+
+    def _commit_all(self, root: Path, message: str = "init") -> None:
+        subprocess.run(["git", "add", "."], cwd=root, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", message], cwd=root, check=True, capture_output=True)
+
+    def _write_sikula_source_markers(self, root: Path) -> None:
+        (root / "core").mkdir()
+        (root / "core" / "version.py").write_text("# version helper")
+        (root / "sikula.py").write_text("# cli")
+        (root / "pyproject.toml").write_text('[project]\nname = "sikula"\n')
+
     def test_dev_version_suffix_is_empty_outside_git_checkout(self, tmp_path: Path):
         assert _dev_version_suffix(tmp_path) == ""
 
@@ -1714,18 +1729,26 @@ class TestVersionLabel:
         with patch("core.version.subprocess.run", side_effect=FileNotFoundError):
             assert _dev_version_suffix(tmp_path) == ""
 
-    def test_dev_version_suffix_includes_branch_and_commit_for_git_checkout(self, tmp_path: Path):
-        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=tmp_path, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "T"], cwd=tmp_path, check=True, capture_output=True)
-        (tmp_path / "README.md").write_text("test")
-        subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+    def test_dev_version_suffix_includes_branch_and_commit_for_sikula_source_checkout(self, tmp_path: Path):
+        self._git_init(tmp_path)
+        self._write_sikula_source_markers(tmp_path)
+        self._commit_all(tmp_path)
         subprocess.run(["git", "checkout", "-b", "feature/test-version"], cwd=tmp_path, check=True, capture_output=True)
 
         suffix = _dev_version_suffix(tmp_path)
 
         assert suffix.startswith("-dev+feature.test.version.")
+
+    def test_dev_version_suffix_ignores_project_local_virtualenv_checkout(self, tmp_path: Path):
+        self._git_init(tmp_path)
+        (tmp_path / "app.py").write_text("# user project")
+        self._commit_all(tmp_path)
+        subprocess.run(["git", "checkout", "-b", "app/main"], cwd=tmp_path, check=True, capture_output=True)
+        site_packages = tmp_path / ".venv" / "lib" / "python3.13" / "site-packages" / "core"
+        site_packages.mkdir(parents=True)
+        (site_packages / "version.py").write_text("# installed package")
+
+        assert _dev_version_suffix(site_packages) == ""
 
     def test_sikula_version_appends_dev_suffix_to_installed_version(self):
         with patch("core.version._pkg_version", return_value="1.2.3"):
