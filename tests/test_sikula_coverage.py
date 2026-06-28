@@ -771,15 +771,17 @@ class TestTaskAuditReport:
             "write_path_warning",
             "files outside allowed_write_paths: ['README.md']; allowed: ['src/']",
         )
-        state.review_cycle_records.append({"has_warnings": True, "reviewer_output": "## Warnings\n- Reviewer warning"})
+        state.review_cycle_records.append(
+            {"has_warnings": True, "reviewer_output": "## Warnings\n- Raw reviewer detail SECRET_REVIEWER=abc123"}
+        )
         state.security_review_cycle_records.append(
             {
                 "has_warnings": True,
                 "reviewer_output": (
                     "## Warnings\n\n"
-                    "### Security warning\n"
+                    "### Raw security detail\n"
                     "File: src/auth.py\n"
-                    "Concern: missing audit trail\n"
+                    "Concern: missing audit trail SECRET_TOKEN=abc123\n"
                     "Suggestion: add structured logging"
                 ),
             }
@@ -810,10 +812,13 @@ class TestTaskAuditReport:
         assert "analyst: missing optional architecture context" in out
         assert "implementer: files outside allowed_write_paths" in out
         assert "Reviewer warnings:" in out
-        assert "Reviewer warning" in out
+        assert "1 warning(s) recorded (see: sikula show t1)" in out
+        assert "Raw reviewer detail" not in out
+        assert "SECRET_REVIEWER" not in out
         assert "Security warnings:" in out
-        assert "Security warning" in out
-        assert "concern: missing audit trail" in out
+        assert "Raw security detail" not in out
+        assert "missing audit trail" not in out
+        assert "SECRET_TOKEN" not in out
         assert "Testability gaps:" in out
         assert "validation artifacts: 3 (1 cleaned, 1 blocked, 1 cleanup failed)" in out
         assert "LLM retries: 1" in out

@@ -2628,20 +2628,11 @@ def _extract_reviewer_warnings(output: str) -> list[str]:
     return extracted
 
 
-def _llm_warning_sample_lines(records: list[dict], task_id: str, limit: int) -> list[str]:
-    all_warnings = []
-    for record in records:
-        if record.get("has_warnings"):
-            all_warnings.extend(_extract_reviewer_warnings(record.get("reviewer_output", "")))
-
-    if not all_warnings:
+def _llm_warning_summary_lines(records: list[dict], task_id: str) -> list[str]:
+    warning_count = _llm_warning_count(records)
+    if not warning_count:
         return []
-
-    lines = all_warnings[:limit]
-    remaining = len(all_warnings) - limit
-    if remaining > 0:
-        lines.append(f"... {remaining} more warning(s) (see: sikula show {task_id})")
-    return lines
+    return [f"{warning_count} warning(s) recorded (see: sikula show {task_id})"]
 
 
 def _llm_warning_count(records: list[dict]) -> int:
@@ -2652,12 +2643,12 @@ def _llm_warning_count(records: list[dict]) -> int:
     return count
 
 
-def _reviewer_warning_sample_lines(state, limit: int = _RECOVERED_DIAGNOSTIC_LIMIT) -> list[str]:
-    return _llm_warning_sample_lines(getattr(state, "review_cycle_records", []), state.task_id, limit)
+def _reviewer_warning_summary_lines(state) -> list[str]:
+    return _llm_warning_summary_lines(getattr(state, "review_cycle_records", []), state.task_id)
 
 
-def _security_warning_sample_lines(state, limit: int = _RECOVERED_DIAGNOSTIC_LIMIT) -> list[str]:
-    return _llm_warning_sample_lines(getattr(state, "security_review_cycle_records", []), state.task_id, limit)
+def _security_warning_summary_lines(state) -> list[str]:
+    return _llm_warning_summary_lines(getattr(state, "security_review_cycle_records", []), state.task_id)
 
 
 def _task_audit_warnings(state) -> list[str]:
@@ -2854,12 +2845,12 @@ def _print_task_audit_report(state) -> int:
         print("Audit warnings:")
         _print_limited_lines(warnings, state.task_id, limit=len(warnings))
 
-    review_lines = _reviewer_warning_sample_lines(state)
+    review_lines = _reviewer_warning_summary_lines(state)
     if review_lines:
         print("Reviewer warnings:")
         _print_limited_lines(review_lines, state.task_id, limit=len(review_lines))
 
-    sec_lines = _security_warning_sample_lines(state)
+    sec_lines = _security_warning_summary_lines(state)
     if sec_lines:
         print("Security warnings:")
         _print_limited_lines(sec_lines, state.task_id, limit=len(sec_lines))
