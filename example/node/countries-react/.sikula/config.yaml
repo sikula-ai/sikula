@@ -3,7 +3,9 @@
 # This file is a fully commented example config for a TypeScript / React / Vite project.
 # Copy and adapt it for your own Node.js project.
 #
-# Run from the project directory: sikula run .sikula/tasks/<task-file>
+# 1. Refine task: sikula task refine .sikula/tasks/<task-file> --auto
+# 2. Prepare contract: sikula contract prepare .sikula/tasks/<refined-task-file> --auto
+# 3. Run the contract: sikula run .sikula/contracts/<contract-file>
 # Or with explicit config from anywhere:
 #   sikula --config example/node/countries-react/.sikula/config.yaml run .sikula/tasks/<task-file>
 
@@ -59,7 +61,7 @@ tasks:
   state_dir: .sikula/state/
 
 # Default LLM settings — apply to all agents unless overridden under agents: below.
-# Built-in provider values: codex, claude, gemini, opencode.
+# Built-in provider values: codex, claude, gemini, opencode, antigravity.
 # To use another provider, change provider/model, for example:
 #   provider: claude
 #   model: claude-sonnet-4-6

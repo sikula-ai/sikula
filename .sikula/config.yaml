@@ -3,7 +3,9 @@
 # This config is used when Sikula runs tasks against its own codebase.
 # It also serves as a reference Python/PythonTool config.
 #
-# Run from the repo root: sikula run .sikula/tasks/<task-file>
+# 1. Refine task: sikula task refine .sikula/tasks/<task-file> --auto
+# 2. Prepare contract: sikula contract prepare .sikula/tasks/<refined-task-file> --auto
+# 3. Run the contract: sikula run .sikula/contracts/<contract-file>
 
 project:
   name: sikula
@@ -59,7 +61,7 @@ progress:
   heartbeat_interval_seconds: 60
 
 # Default LLM settings — apply to all agents unless overridden under agents: below.
-# Built-in provider values: codex, claude, gemini, opencode.
+# Built-in provider values: codex, claude, gemini, opencode, antigravity.
 llm:
   provider: codex
   model: gpt-5.3-codex       # Default model for planner, implementer, test writer, and fixer.
