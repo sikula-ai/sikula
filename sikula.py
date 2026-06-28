@@ -63,7 +63,6 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 from hashlib import sha256
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
 import json
 import logging
 import os
@@ -79,6 +78,7 @@ import yaml
 from dotenv import load_dotenv
 
 from core.diagnostics import diagnostic_identity_key, diagnostic_summary_lines
+from core.version import sikula_version as _sikula_version
 
 _BASE = Path(__file__).parent
 # When adding a new platform: add it here, in _build_tool() in core/orchestrator.py,
@@ -88,39 +88,6 @@ _BASE = Path(__file__).parent
 _SUPPORTED_BUILD_TOOLS = {"cargo", "gradle-android", "gradle-jvm", "maven", "node", "xcodebuild", "python"}
 _RECOVERED_DIAGNOSTIC_LIMIT = 10
 _SIKULA_GITIGNORE_ENTRIES = ("state/", "worktrees/", "contract-reports/")
-
-
-def _git_output(args: list[str], cwd: Path) -> str | None:
-    try:
-        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip() or None
-
-
-def _is_git_checkout(path: Path = _BASE) -> bool:
-    return _git_output(["rev-parse", "--is-inside-work-tree"], path) == "true"
-
-
-def _dev_version_suffix(path: Path = _BASE) -> str:
-    if not _is_git_checkout(path):
-        return ""
-    branch = _git_output(["branch", "--show-current"], path)
-    commit = _git_output(["rev-parse", "--short", "HEAD"], path)
-    parts = [re.sub(r"[^A-Za-z0-9.]+", ".", p).strip(".") for p in (branch, commit) if p]
-    return "-dev" + (f"+{'.'.join(parts)}" if parts else "")
-
-
-def _sikula_version() -> str:
-    try:
-        base_version = _pkg_version("sikula")
-    except PackageNotFoundError:
-        base_version = "dev"
-    if base_version == "dev":
-        return "dev"
-    return base_version + _dev_version_suffix()
 
 
 def _resolve_task_path(task_file: str, project_root: Path) -> Path | None:
@@ -2611,6 +2578,79 @@ def _audit_diagnostic_line_priority(line: str) -> int:
     return 2
 
 
+def _extract_reviewer_warnings(output: str) -> list[str]:
+    if not output:
+        return []
+    lines = output.splitlines()
+    in_warnings = False
+    extracted = []
+    current_title: str | None = None
+    current_details: dict[str, str] = {}
+
+    def _flush_structured_warning() -> None:
+        nonlocal current_title, current_details
+        if not current_title:
+            return
+        details = []
+        for key in ("file", "concern", "suggestion"):
+            value = current_details.get(key)
+            if value:
+                details.append(f"{key}: {value}")
+        suffix = f" — {'; '.join(details)}" if details else ""
+        extracted.append(_short_audit_line(f"{current_title}{suffix}"))
+        current_title = None
+        current_details = {}
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            if in_warnings:
+                _flush_structured_warning()
+            in_warnings = stripped.lower() == "## warnings"
+            continue
+        if not in_warnings:
+            continue
+        if stripped.startswith("### "):
+            _flush_structured_warning()
+            current_title = stripped[4:].strip()
+            current_details = {}
+            continue
+        field = re.match(r"(?i)^(file|concern|suggestion):\s*(.+)$", stripped)
+        if current_title and field:
+            current_details[field.group(1).lower()] = field.group(2).strip()
+            continue
+        if in_warnings and stripped.startswith(("-", "*")):
+            _flush_structured_warning()
+            text = stripped[1:].strip()
+            if text:
+                extracted.append(_short_audit_line(text))
+    _flush_structured_warning()
+    return extracted
+
+
+def _llm_warning_summary_lines(records: list[dict], task_id: str) -> list[str]:
+    warning_count = _llm_warning_count(records)
+    if not warning_count:
+        return []
+    return [f"{warning_count} warning(s) recorded (see: sikula show {task_id})"]
+
+
+def _llm_warning_count(records: list[dict]) -> int:
+    count = 0
+    for record in records:
+        if record.get("has_warnings"):
+            count += max(1, len(_extract_reviewer_warnings(record.get("reviewer_output", ""))))
+    return count
+
+
+def _reviewer_warning_summary_lines(state) -> list[str]:
+    return _llm_warning_summary_lines(getattr(state, "review_cycle_records", []), state.task_id)
+
+
+def _security_warning_summary_lines(state) -> list[str]:
+    return _llm_warning_summary_lines(getattr(state, "security_review_cycle_records", []), state.task_id)
+
+
 def _task_audit_warnings(state) -> list[str]:
     warnings: list[str] = []
     for warning in getattr(state, "analyst_warnings", []):
@@ -2620,24 +2660,6 @@ def _task_audit_warnings(state) -> list[str]:
         if entry.get("action") == "write_path_warning":
             agent = entry.get("agent") or "agent"
             warnings.append(f"{agent}: {_short_audit_line(entry.get('result'))}")
-
-    review_warning_count = sum(1 for record in getattr(state, "review_cycle_records", []) if record.get("has_warnings"))
-    if review_warning_count:
-        warnings.append(f"reviewer warnings: {review_warning_count}")
-
-    security_warning_count = sum(
-        1 for record in getattr(state, "security_review_cycle_records", []) if record.get("has_warnings")
-    )
-    if security_warning_count:
-        warnings.append(f"security reviewer warnings: {security_warning_count}")
-
-    testability_gaps = getattr(state, "testability_gaps", [])
-    if testability_gaps:
-        unique_count = len(_unique_testability_gaps(testability_gaps))
-        detail = f"{len(testability_gaps)}"
-        if unique_count != len(testability_gaps):
-            detail += f" ({unique_count} unique)"
-        warnings.append(f"testability gaps: {detail} (see: sikula show {state.task_id})")
 
     gate_records = getattr(state, "test_execution_gate_records", [])
     active_gate_records = [record for record in gate_records if record.get("status") != "resolved"]
@@ -2733,13 +2755,22 @@ def _testability_gap_label(gap: dict) -> str:
     return label
 
 
-def _testability_gap_sample_lines(state, limit: int = 3) -> list[str]:
+def _testability_gap_sample_lines(state, limit: int = _RECOVERED_DIAGNOSTIC_LIMIT) -> list[str]:
     gaps = _unique_testability_gaps(getattr(state, "testability_gaps", []))
     lines = [_testability_gap_label(gap) for gap in gaps[:limit]]
     remaining = len(gaps) - limit
     if remaining > 0:
         lines.append(f"... {remaining} more unique gap(s) (see: sikula show {state.task_id})")
     return lines
+
+
+def _task_warning_count(state) -> int:
+    return (
+        len(_task_audit_warnings(state))
+        + _llm_warning_count(getattr(state, "review_cycle_records", []))
+        + _llm_warning_count(getattr(state, "security_review_cycle_records", []))
+        + len(_unique_testability_gaps(getattr(state, "testability_gaps", [])))
+    )
 
 
 def _task_recovered_issues(state) -> list[str]:
@@ -2812,21 +2843,32 @@ def _print_task_audit_report(state) -> int:
 
     if warnings:
         print("Audit warnings:")
-        _print_limited_lines(warnings, state.task_id)
-        gap_lines = _testability_gap_sample_lines(state)
-        if gap_lines:
-            print("Testability gaps:")
-            _print_limited_lines(gap_lines, state.task_id, limit=len(gap_lines))
+        _print_limited_lines(warnings, state.task_id, limit=len(warnings))
+
+    review_lines = _reviewer_warning_summary_lines(state)
+    if review_lines:
+        print("Reviewer warnings:")
+        _print_limited_lines(review_lines, state.task_id, limit=len(review_lines))
+
+    sec_lines = _security_warning_summary_lines(state)
+    if sec_lines:
+        print("Security warnings:")
+        _print_limited_lines(sec_lines, state.task_id, limit=len(sec_lines))
+
+    gap_lines = _testability_gap_sample_lines(state)
+    if gap_lines:
+        print("Testability gaps:")
+        _print_limited_lines(gap_lines, state.task_id, limit=len(gap_lines))
 
     if recovered:
         print("Recovered issues:")
-        _print_limited_lines(recovered, state.task_id, limit=_RECOVERED_DIAGNOSTIC_LIMIT + 2)
+        _print_limited_lines(recovered, state.task_id, limit=len(recovered))
 
     if failed:
         print("Failed issues:")
-        _print_limited_lines(failed, state.task_id, limit=_RECOVERED_DIAGNOSTIC_LIMIT + 2)
+        _print_limited_lines(failed, state.task_id, limit=len(failed))
 
-    return len(warnings)
+    return _task_warning_count(state)
 
 
 def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
@@ -3029,9 +3071,9 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
             longest_label = f"{h['agent']}/{h['action']}"
 
     max_iter = cfg.get("sandbox", {}).get("max_iterations", 10)
-    audit_warning_count = len(_task_audit_warnings(state))
+    warning_count = _task_warning_count(state)
     if state.done:
-        status = f"✓ DONE with warnings ({audit_warning_count})" if audit_warning_count else "✓ DONE"
+        status = f"✓ DONE with warnings ({warning_count})" if warning_count else "✓ DONE"
     elif state.failed:
         status = "✗ FAILED"
     else:

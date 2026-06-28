@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import core.version as version_module
+
 _sikula = importlib.import_module("sikula")
 _parse_agent_llm_overrides = _sikula._parse_agent_llm_overrides
 _contract_score_threshold = _sikula._contract_score_threshold
@@ -26,8 +28,8 @@ _print_task_audit_report = _sikula._print_task_audit_report
 _task_audit_warnings = _sikula._task_audit_warnings
 _task_failed_issues = _sikula._task_failed_issues
 _task_recovered_issues = _sikula._task_recovered_issues
-_dev_version_suffix = _sikula._dev_version_suffix
-_sikula_version = _sikula._sikula_version
+_dev_version_suffix = version_module.dev_version_suffix
+_sikula_version = version_module.sikula_version
 cmd_run = _sikula.cmd_run
 cmd_show = _sikula.cmd_show
 cmd_status = _sikula.cmd_status
@@ -769,8 +771,21 @@ class TestTaskAuditReport:
             "write_path_warning",
             "files outside allowed_write_paths: ['README.md']; allowed: ['src/']",
         )
-        state.review_cycle_records.append({"has_warnings": True})
-        state.security_review_cycle_records.append({"has_warnings": True})
+        state.review_cycle_records.append(
+            {"has_warnings": True, "reviewer_output": "## Warnings\n- Raw reviewer detail SECRET_REVIEWER=abc123"}
+        )
+        state.security_review_cycle_records.append(
+            {
+                "has_warnings": True,
+                "reviewer_output": (
+                    "## Warnings\n\n"
+                    "### Raw security detail\n"
+                    "File: src/auth.py\n"
+                    "Concern: missing audit trail SECRET_TOKEN=abc123\n"
+                    "Suggestion: add structured logging"
+                ),
+            }
+        )
         state.testability_gaps.append({"message": "missing UI harness"})
         state.validation_artifact_records.append({"status": "cleaned", "artifacts": [{"path": "tmp.log"}]})
         state.validation_artifact_records.append({"status": "blocked", "artifacts": [{"path": "Cargo.lock"}]})
@@ -796,9 +811,14 @@ class TestTaskAuditReport:
         assert "Audit warnings:" in out
         assert "analyst: missing optional architecture context" in out
         assert "implementer: files outside allowed_write_paths" in out
-        assert "reviewer warnings: 1" in out
-        assert "security reviewer warnings: 1" in out
-        assert "testability gaps: 1" in out
+        assert "Reviewer warnings:" in out
+        assert "1 warning(s) recorded (see: sikula show t1)" in out
+        assert "Raw reviewer detail" not in out
+        assert "SECRET_REVIEWER" not in out
+        assert "Security warnings:" in out
+        assert "Raw security detail" not in out
+        assert "missing audit trail" not in out
+        assert "SECRET_TOKEN" not in out
         assert "Testability gaps:" in out
         assert "validation artifacts: 3 (1 cleaned, 1 blocked, 1 cleanup failed)" in out
         assert "LLM retries: 1" in out
@@ -919,7 +939,6 @@ class TestTaskAuditReport:
 
         out = capsys.readouterr().out
         assert warning_count == 1
-        assert "testability gaps: 2 (1 unique)" in out
         assert out.count("gap: browser navigation [medium]") == 1
         assert "reason: configured validation has no browser runtime" in out
         assert "covered_by: route contract tests" in out
@@ -1124,8 +1143,6 @@ class TestPrintReviewSummary:
         )
         _print_review_summary(s, "feature/x", "main", 10.0)
         out = capsys.readouterr().out
-        assert "Audit warnings:" in out
-        assert "testability gaps: 1" in out
         assert "Testability gaps:" in out
         assert "gap: native share" in out
 
@@ -1683,45 +1700,68 @@ class TestMain:
 
         p1, p2, p3 = self._patch_config(tmp_path)
         with patch("sys.argv", ["sikula", "status"]):
-            with patch("sikula._pkg_version", side_effect=PackageNotFoundError):
+            with patch("core.version._pkg_version", side_effect=PackageNotFoundError):
                 with p1, p2, p3:
                     with patch("sikula.cmd_status"):
                         main()
 
 
 class TestVersionLabel:
+    def _git_init(self, root: Path) -> None:
+        subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=root, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=root, check=True, capture_output=True)
+
+    def _commit_all(self, root: Path, message: str = "init") -> None:
+        subprocess.run(["git", "add", "."], cwd=root, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", message], cwd=root, check=True, capture_output=True)
+
+    def _write_sikula_source_markers(self, root: Path) -> None:
+        (root / "core").mkdir()
+        (root / "core" / "version.py").write_text("# version helper")
+        (root / "sikula.py").write_text("# cli")
+        (root / "pyproject.toml").write_text('[project]\nname = "sikula"\n')
+
     def test_dev_version_suffix_is_empty_outside_git_checkout(self, tmp_path: Path):
         assert _dev_version_suffix(tmp_path) == ""
 
     def test_dev_version_suffix_is_empty_when_git_is_missing(self, tmp_path: Path):
-        with patch("sikula.subprocess.run", side_effect=FileNotFoundError):
+        with patch("core.version.subprocess.run", side_effect=FileNotFoundError):
             assert _dev_version_suffix(tmp_path) == ""
 
-    def test_dev_version_suffix_includes_branch_and_commit_for_git_checkout(self, tmp_path: Path):
-        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=tmp_path, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "T"], cwd=tmp_path, check=True, capture_output=True)
-        (tmp_path / "README.md").write_text("test")
-        subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+    def test_dev_version_suffix_includes_branch_and_commit_for_sikula_source_checkout(self, tmp_path: Path):
+        self._git_init(tmp_path)
+        self._write_sikula_source_markers(tmp_path)
+        self._commit_all(tmp_path)
         subprocess.run(["git", "checkout", "-b", "feature/test-version"], cwd=tmp_path, check=True, capture_output=True)
 
         suffix = _dev_version_suffix(tmp_path)
 
         assert suffix.startswith("-dev+feature.test.version.")
 
+    def test_dev_version_suffix_ignores_project_local_virtualenv_checkout(self, tmp_path: Path):
+        self._git_init(tmp_path)
+        (tmp_path / "app.py").write_text("# user project")
+        self._commit_all(tmp_path)
+        subprocess.run(["git", "checkout", "-b", "app/main"], cwd=tmp_path, check=True, capture_output=True)
+        site_packages = tmp_path / ".venv" / "lib" / "python3.13" / "site-packages" / "core"
+        site_packages.mkdir(parents=True)
+        (site_packages / "version.py").write_text("# installed package")
+
+        assert _dev_version_suffix(site_packages) == ""
+
     def test_sikula_version_appends_dev_suffix_to_installed_version(self):
-        with patch("sikula._pkg_version", return_value="1.2.3"):
-            with patch("sikula._dev_version_suffix", return_value="-dev+branch.abc123"):
+        with patch("core.version._pkg_version", return_value="1.2.3"):
+            with patch("core.version.dev_version_suffix", return_value="-dev+branch.abc123"):
                 assert _sikula_version() == "1.2.3-dev+branch.abc123"
 
     def test_sikula_version_omits_dev_suffix_when_git_is_missing(self):
-        with patch("sikula._pkg_version", return_value="1.2.3"):
-            with patch("sikula.subprocess.run", side_effect=FileNotFoundError):
+        with patch("core.version._pkg_version", return_value="1.2.3"):
+            with patch("core.version.subprocess.run", side_effect=FileNotFoundError):
                 assert _sikula_version() == "1.2.3"
 
     def test_sikula_version_returns_dev_when_package_is_not_installed(self):
         from importlib.metadata import PackageNotFoundError
 
-        with patch("sikula._pkg_version", side_effect=PackageNotFoundError):
+        with patch("core.version._pkg_version", side_effect=PackageNotFoundError):
             assert _sikula_version() == "dev"

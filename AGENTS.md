@@ -24,3 +24,9 @@ Focus especially on:
 - Do not accept changes that make task state less useful for debugging, auditing, or resume.
 - Treat legal, licensing, policy, release, and project-governance documents (`LICENSE`, `NOTICE`, `CLA.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `PRIVACY.md`, `SECURITY.md`, `RELEASE.md`, `CHANGELOG.md`, `THIRD_PARTY_NOTICES.md`, `AGENTS.md`) as maintainer-owned; do not suggest incidental changes unless the PR explicitly targets them.
 - Keep review comments focused on material correctness, security, maintainability, and testing risks.
+- Encourage PRs to reach towards 90% test coverage, but treat it as a goal rather than a strict merge blocker.
+- Sandbox enforcement: Do not accept changes that bypass or weaken the `Sandbox` restrictions (`allowed_read_paths`, `allowed_write_paths`).
+- Parser robustness: Agent output parsers (e.g. for structured LLM blocks) must degrade safely and not crash the orchestrator if formatting is hallucinated.
+- Output decoupling: CLI text output must remain decoupled from core pipeline logic to ensure machine-readable formats (e.g. `--json`) consume the exact `TaskState` schema directly.
+- CLI-provider changes: verify prompt transport, timeout handling, diagnostic redaction, retry classification, and read-only/write-mode boundaries.
+- Prompt privacy: stored prompts are audit artifacts; do not expose them through ordinary diagnostics or external reports. `sikula show` is the explicit full-state audit exception.

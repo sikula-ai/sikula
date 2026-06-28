@@ -3,7 +3,9 @@
 # This file is a fully commented example config for a TypeScript app using Bun for
 # backend runtime, browser bundling, package management, and tests.
 #
-# Run from the project directory: sikula run .sikula/tasks/<task-file>
+# 1. Refine task: sikula task refine .sikula/tasks/<task-file> --auto
+# 2. Prepare contract: sikula contract prepare .sikula/tasks/<refined-task-file> --auto
+# 3. Run the contract: sikula run .sikula/contracts/<contract-file>
 # Or with explicit config from anywhere:
 #   sikula --config example/node/countries-bun-fullstack/.sikula/config.yaml run .sikula/tasks/<task-file>
 
@@ -59,7 +61,7 @@ tasks:
   state_dir: .sikula/state/
 
 # Default LLM settings — apply to all agents unless overridden under agents: below.
-# Built-in provider values: codex, claude, gemini, opencode.
+# Built-in provider values: codex, claude, gemini, opencode, antigravity.
 llm:
   provider: codex
   model: gpt-5.3-codex       # Default model for planner, implementer, test writer, and fixer.
@@ -83,6 +85,9 @@ agents:
 # fixer:
 #   llm:
 #     model: gpt-5.4-mini     # Faster/cheaper model — fixer works from explicit error output.
+# task_preparer:
+#   llm:
+#     model: gpt-5.5          # Stronger model: product refinement and contract prep set the foundation.
 
 # Run PlannerAgent after the analyst.
 run_planner: true

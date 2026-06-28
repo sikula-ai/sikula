@@ -225,7 +225,7 @@ plain-text `.txt` task files are supported too.
 
 Use local project files for screenshots, mockups, icons, specs, fixtures, or
 other non-text inputs. The recommended directory is `.sikula/task-assets/` or a
-per-task subdirectory under it:
+per-task subdirectory under it (for a working example, see `example/node/countries-react/.sikula/tasks/add-search-by-name.md`):
 
 ```text
 .sikula/task-assets/team-invites/login-spacing-bug.png

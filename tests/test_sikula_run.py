@@ -1533,6 +1533,143 @@ class TestCmdRunStateStore:
         assert "implementer: files outside allowed_write_paths" in out
         exit_mock.assert_called_with(0)
 
+    def test_terminal_done_prints_reviewer_warnings(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        state = TaskState(task_id="abc123", task_description="resume me")
+        state.done = True
+        state.build_status = "success"
+        state.test_status = "success"
+        state.check_status = "success"
+        state.review_cycle_records.append(
+            {
+                "has_warnings": True,
+                "reviewer_output": "## Warnings\n- First warning\n- Second warning",
+            }
+        )
+        state.security_review_cycle_records.append(
+            {
+                "has_warnings": True,
+                "reviewer_output": (
+                    "## Warnings\n\n"
+                    "### Missing auth audit trail\n"
+                    "File: src/auth.py\n"
+                    "Concern: failed logins are not recorded\n"
+                    "Suggestion: add structured security logging"
+                ),
+            }
+        )
+        store.save(state)
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            mock.run.return_value = state_store.load("abc123")
+            return mock
+
+        with (
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+
+        assert "Task abc123: ✓ DONE with warnings (3)" in out
+        assert "Reviewer warnings:" in out
+        assert "2 warning(s) recorded (see: sikula show abc123)" in out
+        assert "First warning" not in out
+        assert "Second warning" not in out
+
+        assert "Security warnings:" in out
+        assert "1 warning(s) recorded (see: sikula show abc123)" in out
+        assert "Missing auth audit trail" not in out
+        assert "src/auth.py" not in out
+        assert "failed logins are not recorded" not in out
+        assert "structured security logging" not in out
+        exit_mock.assert_called_with(0)
+
+    def test_terminal_done_keeps_warning_text_behind_show(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        state = TaskState(task_id="abc123", task_description="resume me")
+        state.done = True
+        state.build_status = "success"
+        state.test_status = "success"
+        state.check_status = "success"
+
+        output_lines = ["## Warnings"]
+        output_lines.append("- SECRET_TOKEN=abc123")
+        output_lines.extend(f"- Warning {i}" for i in range(11))
+
+        state.review_cycle_records.append(
+            {
+                "has_warnings": True,
+                "reviewer_output": "\n".join(output_lines),
+            }
+        )
+        store.save(state)
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            mock.run.return_value = state_store.load("abc123")
+            return mock
+
+        with (
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "Task abc123: ✓ DONE with warnings (12)" in out
+        assert "Audit warnings:" not in out
+        assert "Reviewer warnings:" in out
+        assert "12 warning(s) recorded (see: sikula show abc123)" in out
+        assert "SECRET_TOKEN" not in out
+        assert "Warning 0" not in out
+        assert "Warning 10" not in out
+        exit_mock.assert_called_with(0)
+
+    def test_terminal_done_keeps_unparseable_warning_visible_as_count(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        state = TaskState(task_id="abc123", task_description="resume me")
+        state.done = True
+        state.build_status = "success"
+        state.test_status = "success"
+        state.check_status = "success"
+        state.security_review_cycle_records.append(
+            {
+                "has_warnings": True,
+                "reviewer_output": "## Warnings\nThis prose warning mentions SECRET_TOKEN=abc123.",
+            }
+        )
+        store.save(state)
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            mock.run.return_value = state_store.load("abc123")
+            return mock
+
+        with (
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "Task abc123: ✓ DONE with warnings (1)" in out
+        assert "Security warnings:" in out
+        assert "1 warning(s) recorded (see: sikula show abc123)" in out
+        assert "SECRET_TOKEN" not in out
+        exit_mock.assert_called_with(0)
+
     def test_task_id_terminal_failed_prints_reset_failed_hint(self, tmp_path: Path, capsys):
         from core.state import JsonStateStore, TaskState
 

@@ -81,6 +81,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   instead of accepting non-executable coverage.
 
 ### Fixed
+- Task state metadata now correctly appends the full development version suffix (branch and commit) instead of just logging the base package version (e.g., `0.2.0`) when Sikula is run from a git checkout, ensuring run auditability aligns with `sikula --version`.
 - The test-only fixer now handles a test phase with multiple failures. It parses every
   `TEST FAILURE TRIAGE` block (not just the first) and routes to the production-enabled pass when
   any block classifies a `production_defect` without explicitly choosing `test_code`, so a defect
