@@ -28,7 +28,14 @@ Report-only review:
 - runs `SecurityReviewerAgent` if review passes and security review is enabled
 - prints a review summary
 - exits `0` when approved and `1` when issues are found
-- removes the review worktree on completion
+- removes the review worktree on completion, provider failure, or interruption,
+  including interruption during optional referenced-file enrichment
+
+Report-only review state is kept for audit with `sikula show <task-id>`, but it
+is not resumable. If a report-only review fails or is interrupted, re-run
+`sikula review` to start a fresh review. While the report-only review process is
+still running, `sikula status` reports `wait` instead of suggesting a duplicate
+review run.
 
 ## Fix Mode
 

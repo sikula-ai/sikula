@@ -46,6 +46,17 @@ _RETRY_DELAYS: tuple[int, ...] = (30, 60, 120)
 _MAX_RETRY_ERROR_CHARS = 1000
 _RETRY_ERROR_HEAD_CHARS = 350
 _STREAM_READ_CHARS = 65536
+_LOCAL_ENVIRONMENT_ERRNOS = frozenset(
+    err
+    for err in (
+        errno.EACCES,
+        errno.EPERM,
+        errno.EROFS,
+        errno.ENOSPC,
+        getattr(errno, "EDQUOT", None),
+    )
+    if err is not None
+)
 
 RetryObserver = Callable[[dict[str, object]], None]
 
@@ -76,6 +87,10 @@ class LLMAuthError(LLMFatalError):
 
 class LLMConfigurationError(LLMFatalError):
     """Provider/model configuration is invalid."""
+
+
+class LLMEnvironmentError(LLMFatalError):
+    """Local provider CLI runtime environment is unusable."""
 
 
 StreamErrorParser = Callable[[str], LLMProviderError | None]
@@ -156,6 +171,13 @@ def _notify_retry(
         )
     except Exception:
         log.exception("LLM retry observer failed")
+
+
+def _local_environment_error_from_os_error(label: str, exc: OSError) -> LLMEnvironmentError | None:
+    if exc.errno not in _LOCAL_ENVIRONMENT_ERRNOS:
+        return None
+    message = str(exc).strip() or exc.__class__.__name__
+    return LLMEnvironmentError(f"{label} local environment error: {message}")
 
 
 def _provider_error(provider: str, operation: str, message: str) -> LLMProviderError:
@@ -260,6 +282,11 @@ def _call_with_retry(label: str, fn, config: LLMConfig | None = None, operation:
             if config is not None:
                 _notify_retry(config, operation or label, attempt + 1, total, delay, exc)
             time.sleep(delay)
+        except OSError as exc:
+            environment_error = _local_environment_error_from_os_error(label, exc)
+            if environment_error is not None:
+                raise environment_error from exc
+            raise
     raise last_exc  # type: ignore[misc]
 
 
@@ -952,7 +979,13 @@ def _run_agent_subprocess_streaming(
     }
     if os.name == "posix":
         popen_kwargs["start_new_session"] = True
-    process = subprocess.Popen(cmd, **popen_kwargs)
+    try:
+        process = subprocess.Popen(cmd, **popen_kwargs)
+    except OSError as exc:
+        environment_error = _local_environment_error_from_os_error(f"{provider} agent", exc)
+        if environment_error is not None:
+            raise environment_error from exc
+        raise
     assert process.stdin is not None
     assert process.stdout is not None
     assert process.stderr is not None
@@ -1013,6 +1046,9 @@ def _run_agent_subprocess_streaming(
         except queue.Empty:
             return
         _terminate_process(process, process_group=True)
+        environment_error = _local_environment_error_from_os_error(f"{provider} agent", writer_error)
+        if environment_error is not None:
+            raise environment_error from writer_error
         raise writer_error
 
     def _reader(name: str, stream) -> None:

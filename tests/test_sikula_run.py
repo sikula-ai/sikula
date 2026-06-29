@@ -1703,6 +1703,44 @@ class TestCmdRunStateStore:
         assert "Build attempts:  10 total (max 10/loop)" in out
         assert "Total time:" not in out
 
+    def test_failed_report_only_review_prints_rerun_review_hint(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        state = TaskState(task_id="abc123", task_description="Review branch changes")
+        state.failed = True
+        state.review_mode = "review_report"
+        state.worktree_branch = "feature/review-me"
+        store.save(state)
+
+        with patch("sys.exit"):
+            cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "Report-only review tasks cannot be retried with sikula run." in out
+        assert "Re-run 'sikula review' to start a fresh review." in out
+        assert "--reset-failed" not in out
+
+    def test_failed_report_only_review_cannot_be_reset_failed(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        state = TaskState(task_id="abc123", task_description="Review branch changes")
+        state.failed = True
+        state.review_mode = "review_report"
+        state.worktree_branch = "feature/review-me"
+        store.save(state)
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_run(_run_args(task_id="abc123", reset_failed=True), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert exc.value.code == 1
+        assert "report-only review task and cannot be reset or resumed" in out
+        assert "Re-run 'sikula review' to start a fresh review." in out
+
     def test_task_id_contract_gate_failed_prints_contract_check_hint(self, tmp_path: Path, capsys):
         from core.state import JsonStateStore, TaskState
 

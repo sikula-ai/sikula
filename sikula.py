@@ -844,6 +844,12 @@ def _reset_failed_state(task_id: str, cfg: dict, store) -> None:
         print(f"Inspect state: sikula show {task_id}")
         sys.exit(1)
 
+    if state.review_mode == "review_report":
+        print(f"Task {task_id} is a report-only review task and cannot be reset or resumed.")
+        print("Re-run 'sikula review' to start a fresh review.")
+        print(f"Inspect state: sikula show {task_id}")
+        sys.exit(1)
+
     state.failed = False
     # Reset iteration counters so their loops are not immediately blocked on resume.
     # review_approved, security_approved, and tests_up_to_date are intentionally kept —
@@ -3087,6 +3093,9 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
             if _contract_gate_blocked_without_worktree(state):
                 print("The contract readiness gate blocked delivery before a worktree was created.")
                 print(f"Suggested next step: {_contract_gate_next_action(state)}")
+            elif state.review_mode == "review_report":
+                print("Report-only review tasks cannot be retried with sikula run.")
+                print("Re-run 'sikula review' to start a fresh review.")
             else:
                 print(f"Use --reset-failed to retry: sikula run --task-id {state.task_id} --reset-failed")
         print()
@@ -3227,9 +3236,17 @@ def _status_next_action(state, status: str) -> str:
     if status == "DONE":
         return "review branch" if state.worktree_branch else "review changes"
     if status == "FAILED":
+        if state.review_mode == "review_report":
+            return "re-run sikula review"
         if _contract_gate_blocked_without_worktree(state):
             return _contract_gate_next_action(state)
         return f"sikula run --task-id {state.task_id} --reset-failed"
+    if state.review_mode == "review_report":
+        if state.active_operation and _active_operation_is_fresh(state.active_operation):
+            return "wait"
+        if state.pid and _pid_running(state.pid):
+            return "wait"
+        return "re-run sikula review"
     if status == "CLEANED":
         return f"sikula show {state.task_id}"
     if status == "INTERRUPTED":
@@ -3441,6 +3458,169 @@ def _run_review_agent_with_retry_history(agent, name: str, state, store, heartbe
             return agent.run(state)
 
 
+def _exception_summary(exc: BaseException, limit: int = 1000) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    return message[:limit]
+
+
+def _record_report_only_review_failure(state, store, exc: BaseException) -> None:
+    state.done = False
+    state.failed = True
+    state.active_operation = None
+    state.test_status = state.test_status or "skipped"
+    state.check_status = state.check_status or "skipped"
+    state.record(
+        "sikula",
+        "review_failed",
+        f"report-only review failed: {exc.__class__.__name__}",
+        error=_exception_summary(exc),
+    )
+    store.save(state)
+
+
+def _cleanup_report_only_review_worktree(state, store, git_root: Path, worktree_base: Path) -> None:
+    result = "report-only review worktree already missing"
+    if worktree_base.exists():
+        if not _remove_worktree(worktree_base, git_root, force=False):
+            log.warning("Could not remove report-only review worktree: %s", worktree_base)
+            state.record("sikula", "cleanup_failed", "report-only review worktree cleanup failed")
+            store.save(state)
+            return
+        result = "report-only review worktree removed"
+
+    state.record("sikula", "cleanup", result)
+    state.worktree_path = None
+    state.worktree_base = None
+    store.save(state)
+
+
+def _enrich_review_state_prompt(
+    state, store, description: str, base_llm_cfg: dict, cfg: dict, project_root: Path
+) -> None:
+    from core.llm_client import create_llm_client
+
+    enrichment_llm = create_llm_client(
+        _make_llm_config(base_llm_cfg, cfg.get("agents", {}).get("analyst", {}).get("llm", {}))
+    )
+    extra = _enrich_prompt_with_referenced_files(description, enrichment_llm, project_root)
+    if extra:
+        state.implementation_prompt = description + "\n\n---\n\nFiles referenced in the task:\n\n" + extra
+        store.save(state)
+        log.info("implementation_prompt enriched with design file contents")
+
+
+def _run_report_only_review(
+    *,
+    args: argparse.Namespace,
+    cfg: dict,
+    state,
+    store,
+    task_id: str,
+    task_label: str,
+    description: str,
+    branch: str,
+    base_branch: str,
+    files_changed: list[str],
+    base_llm_cfg: dict,
+    run_security_review: bool,
+    heartbeat_interval_seconds: int,
+    worktree_project_root: Path,
+    git_root: Path,
+    worktree_base: Path,
+    t_start: float,
+) -> float:
+    try:
+        _enrich_review_state_prompt(state, store, description, base_llm_cfg, cfg, worktree_project_root)
+
+        from agents.reviewer_agent import ReviewerAgent
+        from agents.security_reviewer_agent import SecurityReviewerAgent
+        from core.llm_client import create_llm_client
+        from tools.base_tool import Sandbox
+        from tools.file_tool import FileTool
+        from tools.git_tool import GitTool
+
+        sandbox_cfg = cfg.get("sandbox", {})
+        sandbox = Sandbox(
+            project_root=worktree_project_root,
+            allowed_write_paths=sandbox_cfg.get("allowed_write_paths", []),
+            allowed_read_paths=sandbox_cfg.get("allowed_read_paths", ["."]),
+        )
+        file_tool = FileTool(sandbox=sandbox, project_root=worktree_project_root)
+        git_tool = GitTool(sandbox=sandbox, project_root=worktree_project_root)
+        tools = {"file": file_tool, "git": git_tool}
+
+        agent_llm_overrides = _parse_agent_llm_overrides(args.agent_model, args.agent_provider, args.agent_timeout)
+        agents_cfg = cfg.get("agents", {})
+
+        def _review_agent_snapshot(name: str) -> dict:
+            snap: dict = {
+                "provider": _make_llm_config(base_llm_cfg, agents_cfg.get(name, {}).get("llm", {})).provider,
+                "model": _make_llm_config(base_llm_cfg, agents_cfg.get(name, {}).get("llm", {})).model,
+            }
+            extra_rules = cfg.get(name, {}).get("extra_rules")
+            if extra_rules:
+                snap["extra_rules"] = extra_rules
+            return snap
+
+        state.config_snapshot = {
+            "project": cfg.get("project", {}).get("name"),
+            "run_security_review": run_security_review,
+            "progress": {
+                "heartbeat_interval_seconds": heartbeat_interval_seconds,
+            },
+            "sandbox": {
+                "allowed_write_paths": sandbox_cfg.get("allowed_write_paths", []),
+                "allowed_test_write_paths": sandbox_cfg.get("allowed_test_write_paths", []),
+                "allowed_read_paths": sandbox_cfg.get("allowed_read_paths", ["."]),
+            },
+            "test_writer": cfg.get("test_writer", {}),
+            "agents": {name: _review_agent_snapshot(name) for name in ("reviewer", "security_reviewer")},
+        }
+        store.save(state)
+
+        def _llm(name: str):
+            yaml_agent = agents_cfg.get(name, {}).get("llm", {})
+            cli_agent = agent_llm_overrides.get(name, {})
+            return create_llm_client(_make_llm_config(base_llm_cfg, {**yaml_agent, **cli_agent}))
+
+        log.info("Task %s — %s", task_id, task_label)
+        log.info("Reviewing '%s' vs '%s' (%d file(s) changed)...", branch, base_branch, len(files_changed))
+
+        log.info("--- Phase: review ---")
+        reviewer = ReviewerAgent(llm=_llm("reviewer"), tools=tools, project_config=cfg)
+        _run_review_agent_with_retry_history(reviewer, "reviewer", state, store, heartbeat_interval_seconds)
+        store.save(state)
+
+        if state.review_approved and run_security_review:
+            log.info("--- Phase: security review ---")
+            security_reviewer = SecurityReviewerAgent(llm=_llm("security_reviewer"), tools=tools, project_config=cfg)
+            _run_review_agent_with_retry_history(
+                security_reviewer,
+                "security_reviewer",
+                state,
+                store,
+                heartbeat_interval_seconds,
+            )
+            store.save(state)
+
+        approved = state.review_approved and (state.security_approved if run_security_review else True)
+        state.test_status = "skipped"
+        state.check_status = "skipped"
+        state.done = approved
+        state.failed = not approved
+        total_s = time.time() - t_start
+        store.save(state)
+        return total_s
+    except BaseException as exc:
+        _record_report_only_review_failure(state, store, exc)
+        raise
+    finally:
+        try:
+            _cleanup_report_only_review_worktree(state, store, git_root, worktree_base)
+        except Exception:
+            log.exception("Report-only review worktree cleanup failed")
+
+
 def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
     """Checkout an existing branch in a worktree and run code + security review."""
     import uuid
@@ -3586,6 +3766,8 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
         worktree_branch=branch,
         runtime_metadata=runtime_metadata_snapshot(),
     )
+    if not args.fix:
+        state.pid = os.getpid()
     store.save(state)
     task_label = Path(args.description_file).name if args.description_file else description.splitlines()[0][:60]
 
@@ -3596,20 +3778,12 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
 
     base_llm_cfg = cfg.get("llm", {})
 
-    # Analyst is skipped in review mode — enrich implementation_prompt with any design/spec
-    # files referenced by name in the task description so reviewer and fixer have visual context.
-    from core.llm_client import create_llm_client as _create_llm_client
-
-    _enrichment_llm = _create_llm_client(
-        _make_llm_config(base_llm_cfg, cfg.get("agents", {}).get("analyst", {}).get("llm", {}))
-    )
-    _extra = _enrich_prompt_with_referenced_files(description, _enrichment_llm, worktree_project_root)
-    if _extra:
-        state.implementation_prompt = description + "\n\n---\n\nFiles referenced in the task:\n\n" + _extra
-        store.save(state)
-        log.info("implementation_prompt enriched with design file contents")
-
     if args.fix:
+        # Analyst is skipped in review mode — enrich implementation_prompt with any
+        # design/spec files referenced by name in the task description so reviewer
+        # and fixer have visual context.
+        _enrich_review_state_prompt(state, store, description, base_llm_cfg, cfg, worktree_project_root)
+
         # Fix mode: full orchestrator loop — review, fix, build, checks all per config.
         # Only planner is always disabled (no planning needed for an existing branch).
         cfg["project"]["root_path"] = str(worktree_project_root)
@@ -3642,86 +3816,25 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
         else:
             log.info("Worktree preserved for inspection/resume: %s", worktree_base)
     else:
-        # Report-only mode: run agents directly without modifying the branch
-        from agents.reviewer_agent import ReviewerAgent
-        from agents.security_reviewer_agent import SecurityReviewerAgent
-        from core.llm_client import create_llm_client
-        from tools.base_tool import Sandbox
-        from tools.file_tool import FileTool
-        from tools.git_tool import GitTool
-
-        sandbox_cfg = cfg.get("sandbox", {})
-        sandbox = Sandbox(
-            project_root=worktree_project_root,
-            allowed_write_paths=sandbox_cfg.get("allowed_write_paths", []),
-            allowed_read_paths=sandbox_cfg.get("allowed_read_paths", ["."]),
+        total_s = _run_report_only_review(
+            args=args,
+            cfg=cfg,
+            state=state,
+            store=store,
+            task_id=task_id,
+            task_label=task_label,
+            description=description,
+            branch=branch,
+            base_branch=base_branch,
+            files_changed=files_changed,
+            base_llm_cfg=base_llm_cfg,
+            run_security_review=run_security_review,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            worktree_project_root=worktree_project_root,
+            git_root=git_root,
+            worktree_base=worktree_base,
+            t_start=t_start,
         )
-        file_tool = FileTool(sandbox=sandbox, project_root=worktree_project_root)
-        git_tool = GitTool(sandbox=sandbox, project_root=worktree_project_root)
-        tools = {"file": file_tool, "git": git_tool}
-
-        agent_llm_overrides = _parse_agent_llm_overrides(args.agent_model, args.agent_provider, args.agent_timeout)
-        agents_cfg = cfg.get("agents", {})
-
-        def _review_agent_snapshot(name: str) -> dict:
-            snap: dict = {
-                "provider": _make_llm_config(base_llm_cfg, agents_cfg.get(name, {}).get("llm", {})).provider,
-                "model": _make_llm_config(base_llm_cfg, agents_cfg.get(name, {}).get("llm", {})).model,
-            }
-            extra_rules = cfg.get(name, {}).get("extra_rules")
-            if extra_rules:
-                snap["extra_rules"] = extra_rules
-            return snap
-
-        state.config_snapshot = {
-            "project": cfg.get("project", {}).get("name"),
-            "run_security_review": run_security_review,
-            "progress": {
-                "heartbeat_interval_seconds": heartbeat_interval_seconds,
-            },
-            "sandbox": {
-                "allowed_write_paths": sandbox_cfg.get("allowed_write_paths", []),
-                "allowed_test_write_paths": sandbox_cfg.get("allowed_test_write_paths", []),
-                "allowed_read_paths": sandbox_cfg.get("allowed_read_paths", ["."]),
-            },
-            "test_writer": cfg.get("test_writer", {}),
-            "agents": {name: _review_agent_snapshot(name) for name in ("reviewer", "security_reviewer")},
-        }
-        store.save(state)
-
-        def _llm(name: str):
-            yaml_agent = agents_cfg.get(name, {}).get("llm", {})
-            cli_agent = agent_llm_overrides.get(name, {})
-            return create_llm_client(_make_llm_config(base_llm_cfg, {**yaml_agent, **cli_agent}))
-
-        log.info("Task %s — %s", task_id, task_label)
-        log.info("Reviewing '%s' vs '%s' (%d file(s) changed)...", branch, base_branch, len(files_changed))
-
-        log.info("--- Phase: review ---")
-        reviewer = ReviewerAgent(llm=_llm("reviewer"), tools=tools, project_config=cfg)
-        _run_review_agent_with_retry_history(reviewer, "reviewer", state, store, heartbeat_interval_seconds)
-        store.save(state)
-
-        if state.review_approved and run_security_review:
-            log.info("--- Phase: security review ---")
-            security_reviewer = SecurityReviewerAgent(llm=_llm("security_reviewer"), tools=tools, project_config=cfg)
-            _run_review_agent_with_retry_history(
-                security_reviewer,
-                "security_reviewer",
-                state,
-                store,
-                heartbeat_interval_seconds,
-            )
-            store.save(state)
-
-        approved = state.review_approved and (state.security_approved if run_security_review else True)
-        state.test_status = "skipped"
-        state.check_status = "skipped"
-        state.done = approved
-        state.failed = not approved
-        total_s = time.time() - t_start
-        store.save(state)
-        subprocess.run(["git", "worktree", "remove", str(worktree_base)], cwd=git_root, check=False)
 
     approved = state.review_approved and (state.security_approved if run_security_review else True)
     _print_review_summary(state, branch, base_branch, total_s, run_security_review=run_security_review)
