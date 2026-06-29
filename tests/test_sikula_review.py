@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -157,6 +158,54 @@ class TestCmdReviewReportOnlyState:
         state = _run_review(tmp_path, reviewer_approved=True, run_security_review=False)
         assert state.done
         assert not state.failed
+
+    def test_enrichment_interrupt_marks_failed_and_cleans_worktree(self, tmp_path: Path):
+        cfg = _cfg(tmp_path)
+        worktree_base = tmp_path / ".sikula" / "worktrees" / "task123"
+
+        def capture_subprocess(cmd, *args, **kwargs):
+            if cmd[0:2] == ["git", "rev-parse"]:
+                return _sub(stdout="abc1234\n")
+            if cmd[0:3] == ["git", "worktree", "add"]:
+                worktree_base.mkdir(parents=True)
+                return _sub()
+            if cmd[0:3] == ["git", "diff", "--name-only"]:
+                return _sub(stdout="src/main.py\n")
+            if cmd[0:2] == ["git", "diff"]:
+                return _sub(stdout="@@ -1 +1 @@\n+x")
+            return _sub()
+
+        def interrupt_after_pid_is_saved(*_args, **_kwargs):
+            state = JsonStateStore(tmp_path / "state").load("task123")
+            assert state is not None
+            assert state.pid == os.getpid()
+            raise KeyboardInterrupt
+
+        with (
+            patch("uuid.uuid4", return_value=MagicMock(hex="task123")),
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture_subprocess),
+            patch("sikula._enrich_prompt_with_referenced_files", side_effect=interrupt_after_pid_is_saved),
+            patch("sikula._remove_worktree", return_value=True) as remove_worktree,
+            pytest.raises(KeyboardInterrupt),
+        ):
+            cmd_review(_args(), cfg)
+
+        store = JsonStateStore(tmp_path / "state")
+        state = store.load("task123")
+        assert state is not None
+        assert state.failed
+        assert not state.done
+        assert state.active_operation is None
+        assert state.test_status == "skipped"
+        assert state.check_status == "skipped"
+        assert state.pid == os.getpid()
+        assert state.worktree_path is None
+        assert state.worktree_base is None
+        assert state.worktree_branch == "feat/x"
+        assert [entry["action"] for entry in state.history] == ["review_failed", "cleanup"]
+        remove_worktree.assert_called_once_with(worktree_base, tmp_path, force=False)
 
     def test_config_snapshot_contains_security_review_flag(self, tmp_path: Path):
         state = _run_review(tmp_path, reviewer_approved=True)
@@ -533,6 +582,56 @@ class TestCmdReviewWorktreeSetup:
             cmd_review(_args(fix=False), cfg)
 
         assert not copied
+
+    def test_report_only_cleans_worktree_and_marks_state_failed_on_agent_error(self, tmp_path: Path):
+        calls = []
+        worktree_path = None
+
+        def capture(cmd, **kwargs):
+            nonlocal worktree_path
+            calls.append(cmd)
+            if cmd[0:2] == ["git", "rev-parse"]:
+                return _sub(stdout="abc1234\n")
+            if cmd[0:3] == ["git", "worktree", "add"]:
+                worktree_path = Path(cmd[-2])
+                worktree_path.mkdir(parents=True)
+                return _sub()
+            if cmd[0:3] == ["git", "diff", "--name-only"]:
+                return _sub(stdout="src/main.py\n")
+            if cmd[0:2] == ["git", "diff"]:
+                return _sub(stdout="@@ -1 +1 @@\n+x")
+            if cmd[0:3] == ["git", "worktree", "remove"]:
+                return _sub()
+            return _sub()
+
+        mock_reviewer = MagicMock()
+        mock_reviewer.run.side_effect = RuntimeError("provider bootstrap failed")
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture),
+            patch("sikula._enrich_prompt_with_referenced_files", return_value=""),
+            patch("agents.reviewer_agent.ReviewerAgent", return_value=mock_reviewer),
+            pytest.raises(RuntimeError, match="provider bootstrap failed"),
+        ):
+            cmd_review(_args(fix=False), _cfg(tmp_path))
+
+        assert worktree_path is not None
+        assert any(c[0:3] == ["git", "worktree", "remove"] and c[-1] == str(worktree_path) for c in calls)
+
+        store = JsonStateStore(tmp_path / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state.failed
+        assert not state.done
+        assert state.active_operation is None
+        assert state.test_status == "skipped"
+        assert state.check_status == "skipped"
+        assert state.worktree_path is None
+        assert state.worktree_base is None
+        assert state.worktree_branch == "feat/x"
+        assert any(entry["action"] == "review_failed" for entry in state.history)
+        assert any(entry["action"] == "cleanup" and "worktree removed" in entry["result"] for entry in state.history)
 
 
 class TestWorktreeErrorMessage:

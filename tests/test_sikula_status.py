@@ -104,6 +104,55 @@ class TestCmdStatusInterrupted:
         assert "active: Running reviewer agent" in out
         assert "next: wait" in out
 
+    def test_interrupted_report_only_review_suggests_rerun_review(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        s = TaskState(task_id="t1", task_description="Review branch changes")
+        s.review_mode = "review_report"
+        s.plan_decided = True
+        s.pid = 999999999
+        store.save(s)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=True, verbose=False, status_filter=[]))
+
+        rows = json.loads(capsys.readouterr().out)
+        assert rows[0]["status"] == "INTERRUPTED"
+        assert rows[0]["next_action"] == "re-run sikula review"
+
+    def test_live_report_only_review_without_heartbeat_waits(self, tmp_path: Path, capsys):
+        import os
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        s = TaskState(task_id="t1", task_description="Review branch changes")
+        s.review_mode = "review_report"
+        s.plan_decided = True
+        s.pid = os.getpid()
+        store.save(s)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=True, verbose=False, status_filter=[]))
+
+        rows = json.loads(capsys.readouterr().out)
+        assert rows[0]["next_action"] == "wait"
+
+    def test_stale_report_only_review_suggests_rerun_review(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        s = TaskState(task_id="t1", task_description="Review branch changes")
+        s.review_mode = "review_report"
+        s.plan_decided = True
+        store.save(s)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=True, verbose=False, status_filter=[]))
+
+        rows = json.loads(capsys.readouterr().out)
+        assert rows[0]["next_action"] == "re-run sikula review"
+
     def test_in_progress_task_with_live_pid_shows_phase_status(self, tmp_path: Path, capsys):
         import os
         from core.state import JsonStateStore, TaskState
@@ -254,6 +303,22 @@ class TestCmdStatusOutput:
                 "next_action": "sikula run --task-id t1 --reset-failed",
             }
         ]
+
+    def test_status_failed_report_only_review_suggests_rerun_review(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        s = TaskState(task_id="t1", task_description="Review branch changes")
+        s.failed = True
+        s.review_mode = "review_report"
+        store.save(s)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=True, verbose=False, status_filter=[]))
+
+        rows = json.loads(capsys.readouterr().out)
+        assert rows[0]["status"] == "FAILED"
+        assert rows[0]["next_action"] == "re-run sikula review"
 
     def test_status_contract_gate_failed_suggests_contract_check_not_reset(self, tmp_path: Path, capsys):
         from core.state import JsonStateStore, TaskState

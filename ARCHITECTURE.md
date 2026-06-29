@@ -479,9 +479,20 @@ Orchestrator is **not** used. Agents are instantiated and called directly.
       │
       └─ issues → state.failed = True
 
-   worktree removed on completion regardless of outcome
+   worktree removed on completion, provider failure, or interruption
+   (including during optional enrichment)
    exit 0 (approved) or 1 (issues found)
 ```
+
+Report-only review state is retained for audit. If the reviewer/security-reviewer
+agent or optional referenced-file enrichment raises unexpectedly, `cmd_review()` marks
+the state failed, clears the active operation, records the failure and cleanup, and
+removes `worktree_path` / `worktree_base` after the detached worktree is removed.
+Report-only review records the live Sikula process PID so `sikula status` can keep
+showing `wait` while the review process is still running, including before progress
+heartbeats start or when they are disabled. Once stale, report-only review is not reset
+or resumed through `sikula run --task-id`; operators start a fresh review with
+`sikula review`.
 
 **Fix mode (`--fix`):**
 
@@ -522,7 +533,7 @@ starting another review → fix → test-write cycle.
 | Diff source | `GitTool.diff_head()` (live, per agent call) | PR-style diff stored in `state.review_diff`; report-only keeps the initial `git diff base...branch`, `review --fix` refreshes it before reviewer/security-reviewer calls |
 | Task context | Analyst output → `implementation_prompt` | PR description as both `task_description` and `implementation_prompt` |
 | Planner | Per config | Always disabled (`plan_decided = True` on state creation) |
-| Resume | Supported via `--task-id` | Report-only review is not resumed; `review --fix` uses regular task resume (`--reset-failed` required for terminal failed state) |
+| Resume | Supported via `--task-id` | Report-only review is not reset or resumed; `review --fix` uses regular task resume (`--reset-failed` required for terminal failed state) |
 | Report-only path | No | Yes — bypasses orchestrator entirely |
 
 ---
@@ -1292,7 +1303,7 @@ Sikula processes at once is still unsupported.
 | `analyst_retry_records` | `list[dict]` | AnalystAgent | Append-only records for analyst outputs rejected before `implementation_prompt` is stored, including attempt number, reason, whether another retry follows, timestamp, the rejected output, and the retry prompt when another attempt follows. These records are audit-only and never drive pipeline control flow. |
 | `planner_retry_records` | `list[dict]` | PlannerAgent | Append-only records for planner outputs rejected because the parsed step count exceeded `planner.max_steps`, including attempt number, reason, max step count, parsed step count, whether another retry follows, timestamp, the rejected output, and the retry prompt when another attempt follows. These records are audit-only and never drive pipeline control flow. |
 | `review_diff` | `str \| None` | `cmd_review()` in `sikula.py` / Orchestrator | PR-style diff passed to ReviewerAgent and SecurityReviewerAgent; initially set to `git diff base...branch` (three-dot) in `sikula review` mode; refreshed in `"review_fix"` mode before reviewer/security-reviewer calls so uncommitted fixes are included; `None` in standard `sikula run` flow (agents fall back to `GitTool.diff_head()`) |
-| `review_mode` | `str \| None` | `cmd_review()` in `sikula.py` | Review task kind: `"review_report"` for report-only review (not resumable) or `"review_fix"` for `sikula review --fix` (resumable via `sikula run --task-id`) |
+| `review_mode` | `str \| None` | `cmd_review()` in `sikula.py` | Review task kind: `"review_report"` for report-only review (not reset or resumable) or `"review_fix"` for `sikula review --fix` (resumable via `sikula run --task-id`) |
 | `review_base_branch` | `str \| None` | `cmd_review()` in `sikula.py` | Base branch used to refresh `review_diff` in `"review_fix"` mode. Report-only review keeps the original frozen diff; review-fix refreshes against the merge base before reviewer/security-reviewer calls so fixes are reviewed against the current branch state. |
 | `implement_cycle_records` | `list[dict]` | ImplementerAgent | Structured observability — one entry per implementer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = review/security fix after a post-fixer validation pass), `review_iteration` (`0` = initial or security fix; `>0` = review fix pass N), `security_review_iteration` (`0` = initial or review fix; `>0` = security fix pass N), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `step_description`, `implementer_prompt`, `implementer_output` (`None` on exception), `files_written`, `timestamp`; both iteration counters `== 0` and `build_iteration == 0` means initial implementation; never read for pipeline decisions. **Correlation note:** to find the reviewer record that triggered this implementer, look for a `review_cycle_records` entry with the same `step`, `build_iteration`, and `review_iteration: N-1` |
 | `review_cycle_records` | `list[dict]` | ReviewerAgent | Structured observability — one entry per reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = after a post-fixer validation pass), `review_iteration` (fix-pass index within this step's review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, reviewer history is limited to earlier final full-task reviews, not step-scoped reviews. **Correlation note:** a reviewer record with `review_iteration: N` that found issues triggered the implementer record with `review_iteration: N+1` — the orchestrator increments the counter before calling the implementer |
@@ -1321,7 +1332,7 @@ Sikula processes at once is still unsupported.
 | `runtime_metadata` | `dict` | `StateStore.create()` / `cmd_review()` | Runtime snapshot captured when the task state is created: Sikula package version when available, Python version, platform, system, and machine. Used for later debugging only |
 | `final_summary` | `dict` | `JsonStateStore.save()` | Compact terminal summary written when `done` or `failed` is reached: result, branch, commit, build/test/check status, counts for files, validation records, fix attempts, review records, test-writer runs, test audit records, LLM retries, history events, timestamps, and wall elapsed time when available. The CLI also derives a human-readable completion report from the same state, including validation status, review status, audit warnings, sampled unique testability gap details, and recovered issues. |
 | `done` | `bool` | Orchestrator | Set True on passing build or after implement in no-build mode when no active deterministic audit finding still requires the build/fix loop |
-| `failed` | `bool` | Orchestrator | Hard abort: set True on review timeout, active build/fix loop iteration limit reached, or unhandled agent exception; loop exits immediately. Use `--reset-failed` CLI flag to clear this and resume; the flag also resets `review_iterations`, `security_review_iterations`, `build_iterations`, and active build-loop markers, clears `errors`/`test_errors`/`check_errors` (prevents stale error blobs from appearing in the fixer's prompt on the first resumed iteration), and auto-populates `files_changed` from `git diff` if empty. Sync, build, and check failures are NOT hard aborts — they store the error and run the fixer |
+| `failed` | `bool` | Orchestrator | Hard abort: set True on review timeout, active build/fix loop iteration limit reached, or unhandled agent exception; loop exits immediately. Use `--reset-failed` CLI flag to clear this and resume for normal run and `review --fix` tasks; audit-only failures such as contract-gate failures before worktree creation and report-only review failures are not reset or resumed. The flag resets `review_iterations`, `security_review_iterations`, `build_iterations`, and active build-loop markers, clears `errors`/`test_errors`/`check_errors` (prevents stale error blobs from appearing in the fixer's prompt on the first resumed iteration), and auto-populates `files_changed` from `git diff` if empty. Sync, build, and check failures are NOT hard aborts — they store the error and run the fixer |
 | `finished_at` | `str \| None` | `JsonStateStore.save()` | ISO-8601 UTC timestamp set once when the task first reaches a terminal `done` or `failed` state; not overwritten by later saves |
 | `plan` | `list[str]` | PlannerAgent | Ordered step descriptions; empty = single-pass mode |
 | `plan_decided` | `bool` | PlannerAgent | Set True after any successful planner decision (SINGLE_PASS or split); guards re-run on resume; not set on planner failure (allows retry) |
@@ -1758,7 +1769,11 @@ Provider subprocess output is classified into typed `LLMProviderError` subclasse
 provider/account failures such as quota exhaustion (`LLMQuotaExceeded`), authentication
 failure (`LLMAuthError`), and invalid provider/model configuration
 (`LLMConfigurationError`) are not retried. Retryable failures use `LLMTransientError`;
-subprocess timeouts are wrapped as `LLMTimeoutError`.
+subprocess timeouts are wrapped as `LLMTimeoutError`. Local provider subprocess
+`OSError` failures with permission, read-only filesystem, quota, or disk-space errno
+values are converted to `LLMEnvironmentError` for read-only and write-agent calls;
+free-form provider stderr/stdout text is not classified as an environment error by
+filesystem phrases alone.
 
 The built-in providers retry `generate()` and `run_readonly_agent()` through
 `_call_with_retry()` only for retryable failures. Up to **4 attempts** total are made, with

@@ -22,6 +22,7 @@ from core.llm_client import (
     LLMAuthError,
     LLMConfig,
     LLMConfigurationError,
+    LLMEnvironmentError,
     LLMProviderError,
     LLMQuotaExceeded,
     LLMTransientError,
@@ -55,6 +56,7 @@ from core.llm_client import (
     _gemini_write_settings,
     _opencode_log_error,
     _opencode_stream_error,
+    _provider_error,
     _run_agent_subprocess_streaming,
     _opencode_agent_env,
     _opencode_parse_text,
@@ -202,6 +204,24 @@ class TestCallWithRetry:
         assert fn.call_count == 1
         sleep.assert_not_called()
 
+    def test_local_environment_os_error_is_fatal(self):
+        fn = MagicMock(side_effect=PermissionError(errno.EACCES, "Permission denied", "codex"))
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            pytest.raises(LLMEnvironmentError, match="local environment error"),
+        ):
+            _call_with_retry("test", fn)
+
+        assert fn.call_count == 1
+        sleep.assert_not_called()
+
+    def test_other_os_error_is_not_reclassified(self):
+        fn = MagicMock(side_effect=OSError(errno.EINVAL, "bad file descriptor"))
+        with pytest.raises(OSError, match="bad file descriptor"):
+            _call_with_retry("test", fn)
+
+        assert fn.call_count == 1
+
     def test_does_not_retry_plain_runtime_error(self):
         fn = MagicMock(side_effect=RuntimeError("not classified"))
         with pytest.raises(RuntimeError, match="not classified"):
@@ -213,6 +233,26 @@ class TestCallWithRetry:
         with pytest.raises(ValueError):
             _call_with_retry("test", fn)
         assert fn.call_count == 1
+
+
+class TestProviderErrorClassification:
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "failed to initialize in-process app-server client: Read-only file system",
+            "could not create runtime socket: Permission denied",
+            "provider cache write failed: No space left on device",
+        ],
+    )
+    def test_provider_output_environment_phrases_remain_retryable(self, message: str):
+        error = _provider_error("provider", "agent", message)
+
+        assert isinstance(error, LLMTransientError)
+
+    def test_temporary_provider_errors_remain_retryable(self):
+        error = _provider_error("provider", "agent", "temporary policy error")
+
+        assert isinstance(error, LLMTransientError)
 
 
 class TestAgentTextOrEmpty:
@@ -368,6 +408,22 @@ class TestStreamingProcessHelpers:
         sleep.assert_called_once_with(0.2)
         process.terminate.assert_not_called()
         process.kill.assert_not_called()
+
+    def test_streaming_agent_popen_environment_os_error_is_fatal(self, tmp_path: Path):
+        with (
+            patch(
+                "core.llm_client.subprocess.Popen",
+                side_effect=PermissionError(errno.EACCES, "Permission denied", "provider"),
+            ),
+            pytest.raises(LLMEnvironmentError, match="provider agent local environment error"),
+        ):
+            _run_agent_subprocess_streaming(
+                ["provider", "agent"],
+                cwd=tmp_path,
+                env=None,
+                timeout=30,
+                provider="provider",
+            )
 
     def test_streaming_agent_timeout_terminates_process(self, tmp_path: Path):
         class HangingProcess:
@@ -2477,19 +2533,21 @@ class TestCodexClientCommands:
         assert mock_run.call_count == 1
         sleep.assert_not_called()
 
-    def test_run_readonly_agent_failure_reports_plain_stdout_error(self, tmp_path: Path):
+    def test_run_readonly_agent_plain_stdout_environment_text_remains_retryable(self, tmp_path: Path):
         client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
         failure = MagicMock(
             returncode=1,
-            stdout="Error: failed to initialize in-process app-server client",
+            stdout="Error: failed to initialize in-process app-server client: Read-only file system",
             stderr="",
         )
         with (
             patch("core.llm_client.time.sleep"),
-            patch("core.llm_client.subprocess.run", return_value=failure),
-            pytest.raises(RuntimeError, match="failed to initialize in-process app-server client"),
+            patch("core.llm_client.subprocess.run", return_value=failure) as mock_run,
+            pytest.raises(LLMTransientError, match="failed to initialize in-process app-server client"),
         ):
             client.run_readonly_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 4
 
     def test_run_agent_uses_workspace_write_sandbox(self, tmp_path: Path):
         client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))

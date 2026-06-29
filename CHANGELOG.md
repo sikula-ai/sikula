@@ -105,6 +105,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   to return an empty response when no local files are named or found. It now
   uses an explicit sentinel internally, avoiding unnecessary no-output retries
   while leaving review behaviour unchanged when there is no extra context.
+- `sikula review` report-only runs now clean up their detached review worktree when
+  optional context enrichment is interrupted, when a provider fails, or when the
+  review is interrupted; preserve the state file as audit-only failed state; and
+  use the recorded process PID to avoid suggesting duplicate reruns while the
+  review is still live. Stale report-only tasks are reported as needing a fresh
+  `sikula review` instead of being reset or resumed through `sikula run --task-id`.
+- Local LLM provider subprocess `OSError` failures caused by permission, read-only
+  filesystem, quota, or local disk exhaustion are now classified as fatal environment
+  errors for both read-only and write-agent calls, while provider stderr/stdout text
+  remains classified through the existing quota/auth/config/transient rules.
 - OpenCode runs that exit successfully but produce no assistant text now include cleaned
   stderr and structured tool-call diagnostics in the reported no-output/no-change error,
   so rejected tool calls and provider diagnostics are visible without dumping raw JSON events.
