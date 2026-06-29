@@ -6,171 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-29
+
 ### Added
-- Sikula now supports Antigravity CLI as `provider: antigravity` via `agy --print -`,
-  including stdin prompt delivery, write-agent workspace attachment through `--add-dir`,
-  and disposable-copy read-only calls because Antigravity CLI does not expose a verified
-  non-interactive read-only permission mode.
-- `sikula contract check TASK_FILE` now provides a deterministic, by-default read-only
-  implementation-contract readiness preflight for Markdown/plain-text task files, with
-  human-readable and `--json` output covering scope, acceptance criteria,
-  security/privacy, validation coverage based on the same enabled build/test/check phases
-  used by `sikula run`, gaps, and stable clarifying question IDs, plus optional
-  `.sikula/contract-reports` report and hash-scoped answers-template artifacts via
-  `--write-report`; `sikula run TASK_FILE` now stores a warning-only contract snapshot
-  in task state, supports opt-in pre-agent gates via `--require-contract-ready` and
-  `--min-contract-score`, keeps gate-failed pre-worktree states audit-only with the
-  effective run config snapshot instead of resettable through `--task-id --reset-failed`,
-  and `sikula init` ignores generated contract report artifacts by default.
-- `sikula task refine TASK_FILE --output ...` and `sikula contract prepare TASK_FILE
-  --answers ... --output ...` now separate product task-description refinement from
-  project-aware implementation-contract preparation. The prepare step turns filled
-  answers into a Markdown contract under `.sikula/contracts`, preserves unanswered items
-  as open questions, refuses stale answer hashes or accidental overwrites, re-runs the
-  contract check on the generated output, and supports `--interactive` terminal prompts
-  that save answers YAML under `.sikula/contract-reports`. Non-interactive refine and
-  prepare runs with unanswered questions now write answers templates first and defer
-  Markdown output until answers are supplied; `task refine --auto` can use a
-  read-only `task_preparer` LLM agent to normalize rough or non-English product
-  requests before the deterministic product-question pass, including structuring
-  explicit local asset paths into product-level `## Assets` entries without
-  generating implementation-contract asset manifests, while
-  `contract prepare --auto` uses the same agent to propose answers supported by
-  the task, repository, guidelines, and Sikula config before the same
-  deterministic prepare/recheck logic writes or defers the contract. Both auto
-  modes now record prompt/raw-response audit artifacts, including provider
-  failures and malformed auto responses that fail parsing, under
-  `.sikula/contract-reports/*.auto-llm.jsonl`; auto answers only fill empty
-  supplied/template answer entries, and `contract prepare --auto` refuses
-  existing output paths before creating an LLM client or ignoring filled default
-  answers that were not passed with `--answers`.
-- Contract preparation now has side-effect-free in-memory core helpers for future
-  chat/MCP adapters, reusing the same contract scoring, answer application, and recheck
-  logic as the file-based CLI flow instead of duplicating business rules. The
-  prepare workflow now separates product task-description refinement from
-  project-aware implementation-contract preparation, renders effective project
-  context and validation commands into the returned Markdown, reports missing
-  project/validation context as structured blockers, and exposes separate
-  MCP-ready adapter response shapes for both stages.
-- Contract readiness and preparation now support local task assets from the
-  configured `tasks.task_asset_dir`, including deterministic path validation,
-  structured `## Assets` declarations as the source of truth, warnings for
-  undeclared asset-like paths in prose, hashing, reference-vs-delivery
-  classification, delivery provenance checks, isolated-run availability warnings
-  for untracked/dirty assets, answer-based missing-asset replacement, and
-  generated implementation-contract asset manifests; runtime agent prompts now
-  treat prepared asset manifests as delivery obligations, and fresh task-file
-  runs record a non-blocking implementation asset metadata snapshot in task
-  state. Fresh runs and resumes record warning-only asset drift audit entries,
-  and successful task-file runs record warning-only delivery target audit entries
-  for explicit delivery asset targets without inferring platform-specific
-  conversions or blocking run/resume/review flows.
-- `sikula task attach TASK_FILE ASSET_FILE` now copies a local file into the
-  configured task asset directory, prints a structured `## Assets` Markdown
-  snippet, and can append that snippet with `--write`; reference vs delivery
-  intent remains explicit through `--reference` or `--delivery`.
-- Task terminal summaries now include a platform-neutral audit report with validation status, review status, non-blocking audit warnings, and recovered issues such as validation failures fixed by the build/fix loop.
-- Failed validation records now include high-signal diagnostic summary lines, and task terminal summaries sample and deduplicate those lines across recovered build/test/check failures so successful self-healed runs still reveal the concrete compiler error, failed test, sanitized assertion failure, or linter rule that was repaired without echoing source-code frames or assertion values, with an explicit pointer to `sikula show` for full state details.
-- The test writer now more strongly prefers behavioural seams over broad source-inspection tests, especially for UI implementation details that cannot be meaningfully exercised by existing project test infrastructure.
-- Cargo projects now support `build.sync_command`; the default Cargo sync uses `cargo fetch --locked` when `Cargo.lock` exists at the Cargo workspace/project root and `cargo fetch` otherwise, with a one-time plain `cargo fetch` fallback and sync validation metadata when Cargo reports that the lockfile needs updating.
-- Build sync now has platform-neutral adoption and audit for source-controlled generated outputs such as lockfiles and dependency verification metadata: existing tracked sync outputs are added to `files_changed`, semantic review/test gates are invalidated, unexpected non-ignored artifacts are cleaned or fail closed, and project-specific new output patterns can be configured with `build.sync_adopt_paths`.
-- Sikula now has platform-neutral generated-test audits for synthetic runtime harnesses and
-  skipped, disabled, ignored, assumption-gated, or environment-gated placeholder tests.
-  Findings are deduplicated, fed back into later test-writer/fixer prompts, surfaced in task
-  summaries, and can recover generated test output or record an auditable `TESTABILITY GAP`
-  instead of accepting non-executable coverage.
+- **Antigravity Integration**: Added support for Antigravity CLI as an LLM provider via `agy --print -`.
+- **Contracts & Delivery**: Added `sikula contract check` for implementation-contract preflights and JSON reporting.
+- **Task Refinement**: Added `sikula task refine` and `sikula contract prepare` to separate product requirement gathering from technical implementation, with interactive and `--auto` LLM-assisted modes.
+- **MCP Adapters**: Contract preparation now supports side-effect-free core helpers for future chat and MCP integrations.
+- **Assets Support**: Full lifecycle support for local task assets, including `sikula task attach`, deterministic validation, hashing, and delivery provenance checks.
+- **Terminal UX**: Task summaries now include a comprehensive audit report with validation status, recovered issues, and sampled diagnostics for self-healed compiler/test failures.
+- **Test Generation**: The test-writer agent now more strongly prefers behavioural seams over broad source-inspection tests.
+- **Generated-Test Audits**: Added platform-neutral audits for synthetic test harnesses and skipped/disabled tests, surfacing "Testability Gaps" instead of accepting non-executable coverage.
+- **Cargo Improvements**: Cargo projects now support `build.sync_command` with smart lockfile resyncing.
+- **Build Sync**: Added platform-neutral adoption of source-controlled generated outputs (like lockfiles), configurable via `build.sync_adopt_paths`.
 
 ### Fixed
-- Task state metadata now correctly appends the full development version suffix (branch and commit) instead of just logging the base package version (e.g., `0.2.0`) when Sikula is run from a git checkout, ensuring run auditability aligns with `sikula --version`.
-- The test-only fixer now handles a test phase with multiple failures. It parses every
-  `TEST FAILURE TRIAGE` block (not just the first) and routes to the production-enabled pass when
-  any block classifies a `production_defect` without explicitly choosing `test_code`, so a defect
-  reported alongside other failures is no longer masked into an "Agent made no file changes" abort.
-  A pass may now fix a `stale_test`/`malformed_test` block that explicitly chooses `test_code` in
-  test files and defer a separate `production_defect` in the same run: the authorized test write is
-  kept (and merged into the change set so the production change re-runs the full review/security
-  gate) instead of being restored as a scope violation. If the production-confirmed pass fails or
-  writes no production files, retained test writes are still recorded in the failed state/result for
-  resume and audit. Production-file writes and unbacked production-fix-with-writes are still
-  rejected, and `chosen_fix` must be `production_code` or `test_code` (never `none`).
-- Verbose build logs no longer hide the real compiler/test diagnostic from the fixer.
-  Diagnostic extraction ranked retained ranges by position (first two and last two) and
-  then head/tail-truncated the result, which dropped the middle range carrying the actual
-  `file:line` error when many low-signal `> Task ... FAILED` lines surrounded it — the
-  fixer received only "Compilation error. See log for more details". Ranges are now ranked
-  by peak signal (ties broken by proximity to the ends, preserving prior behaviour) and the
-  budget-limited window is centred on the primary error line; terminal summaries now show up to
-  10 sampled recovered diagnostics. Platform-neutral.
-- `sikula review` no longer asks the optional referenced-file enrichment agent
-  to return an empty response when no local files are named or found. It now
-  uses an explicit sentinel internally, avoiding unnecessary no-output retries
-  while leaving review behaviour unchanged when there is no extra context.
-- `sikula review` report-only runs now clean up their detached review worktree when
-  optional context enrichment is interrupted, when a provider fails, or when the
-  review is interrupted; preserve the state file as audit-only failed state; and
-  use the recorded process PID to avoid suggesting duplicate reruns while the
-  review is still live. Stale report-only tasks are reported as needing a fresh
-  `sikula review` instead of being reset or resumed through `sikula run --task-id`.
-- Local LLM provider subprocess `OSError` failures caused by permission, read-only
-  filesystem, quota, or local disk exhaustion are now classified as fatal environment
-  errors for both read-only and write-agent calls, while provider stderr/stdout text
-  remains classified through the existing quota/auth/config/transient rules.
-- OpenCode runs that exit successfully but produce no assistant text now include cleaned
-  stderr and structured tool-call diagnostics in the reported no-output/no-change error,
-  so rejected tool calls and provider diagnostics are visible without dumping raw JSON events.
-- OpenCode write-agent runs now monitor structured provider error events and OpenCode's
-  `--print-logs` stderr stream for `responseBody` / `responseHeaders` fields carrying fatal
-  quota/auth/config failures, so exhausted credits fail immediately instead of waiting for the
-  long agent timeout while avoiding false positives from normal agent prose that mentions API
-  keys, 401s, or invalid models.
-- OpenCode, Codex, and Gemini non-zero exits now prefer provider-owned structured stdout
-  error events before stderr fallback text, so fatal quota/auth/config errors are not hidden
-  by unrelated CLI warning/log output.
-- Fatal LLM provider failures such as quota exhaustion, authentication failures, and invalid
-  provider/model configuration are now classified separately from transient failures and fail
-  without retry; reviewer, security reviewer, test writer, and fixer phases now fail
-  immediately when the agent returns an unsuccessful technical/provider result instead of
-  continuing from stale state or looping until an iteration limit.
-- Review-fix and security-fix implementer passes now abort immediately when the implementer
-  returns an unsuccessful result, preserving the underlying provider/agent failure instead of
-  treating an unchanged diff as a completed fix attempt.
-- Codex and Claude prompts are now passed through stdin instead of as command-line
-  arguments, preventing large reviewer/analyst prompts from failing before the provider starts
-  with OS argument-length errors.
-- Write-agent CLI providers now write prompts through a timeout-aware stdin writer and
-  tolerate early stdin pipe closure when the provider exits immediately with a
-  quota/auth/config error, allowing Sikula to keep enforcing `agent_timeout` while draining
-  and classifying provider output instead of surfacing an unexpected broken-pipe agent
-  exception or hanging during prompt delivery.
-- Planner outputs that exceed `planner.max_steps` are now rejected, retried once with a stricter
-  format prompt, and then failed before implementation if still over limit; planner config is
-  also captured in task config snapshots for auditability.
-- Generated-test prompting and recovery now prefer stable behavioural seams over broad
-  source-inspection tests, synthetic runtime/framework harnesses, or skipped/disabled
-  placeholder coverage. Repeated generated-test failures require structured re-triage, and
-  missing safe runtime coverage is recorded as an auditable `TESTABILITY GAP` with optional
-  `covered_by` metadata.
-- Generated-test audit recovery is now resume-safe, sandbox-safe, and prompt-safe: Sikula
-  persists pending audit state, rolls back partial test-writer output before rerun, rejects
-  symlinked restore paths, omits raw source excerpts from durable state and prompts, clears
-  transient recovery snapshots on cleanup/delete, and routes active execution gates through
-  build/fix validation or fails no-build completion.
-- Fixer follow-up agent passes now log why they are launching, making restored
-  generated-test re-triage violations, test-only scope violations, and
-  production-confirmed passes visible in live task logs.
-- Terminal audit summaries now sample unique testability gap details, including `reason`
-  and `covered_by` when available, while preserving total-vs-unique counts so repeated gap
-  records remain auditable without duplicating the visible summary.
-- Test-only fixer changes on recognized test artifact paths now preserve already-approved reviewer and test-writer gates while still forcing deterministic build/test/check validation and a fresh security review, preventing unchanged production diffs from repeatedly triggering new test-writer passes without accepting unreviewed executable test changes.
-- Build/fix loops now give the last allowed fixer change one final validation-only pass before failing; if that validation still fails, Sikula aborts without starting another fixer attempt.
-- Test writer and fixer prompts now avoid brittle framework/container wiring tests that hand-copy production registrations into local test-only harnesses; test-failure fixer prompts also identify Sikula-generated tests so malformed generated tests can be replaced or removed without weakening pre-existing tests or accepted contracts.
-- Test-only fixer scope violations are now recoverable: Sikula restores all writes from the violating test-only pass, records the violation for audit, and retries once before failing closed.
-- Analyst outputs that are empty, generic, or meta-completion text are now rejected before
-  `implementation_prompt` is stored; Sikula retries analysis once and then fails before
-  planner/implementer phases if no usable implementation prompt is produced.
-- Codex and Gemini provider failures now preserve readable errors emitted on stdout JSON
-  streams for generate, read-only agent, and write-agent calls instead of reporting only
-  fallback stderr or `non-zero exit`.
+- **Terminal UX**: Terminal audit summaries now sample unique testability gaps and improved compiler diagnostic extraction to center on the actual error line instead of generic tail logs.
+- **LLM Error Handling**: Fatal provider errors (quota, auth, read-only filesystem) now fail pipelines immediately across all providers (Codex, Claude, Gemini, OpenCode, Antigravity), with better JSON parsing for root-cause surfacing.
+- **LLM Delivery**: Very large prompts are now delivered via stdin (instead of arguments) for Codex and Claude, avoiding OS argument-length limits and handling broken pipes safely.
+- **Pipeline Recovery**: Empty Analyst outputs and Planner step-limit violations are now safely rejected and retried with stricter format constraints before failing the task.
+- **Test-Only Fixes**: Test-only fixer scope violations are now recoverable, and valid test-only fixes safely preserve reviewer gates while still forcing deterministic CI validation.
+- **Agent Logging**: Fixer follow-up passes now clearly log their launch reason (e.g., test-only scope violation, re-triage).
+- **Review Integrity**: `sikula review` cleanly tears down detached worktrees upon interruption and uses explicit sentinels to avoid pointless retries when no local context files are found.
+- **Auditability**: Task state now records the same development version suffix as `sikula --version` when Sikula runs from a source checkout, without misattributing project-local virtualenv git metadata.
+- **Example Dependencies**: Updated the React/Vite countries example dependencies to resolve Dependabot alerts for Vite and form-data.
 
 ## [0.2.0] - 2026-05-31
 
