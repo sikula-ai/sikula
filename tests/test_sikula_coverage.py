@@ -1133,6 +1133,64 @@ class TestPrintReviewSummary:
         out = capsys.readouterr().out
         assert "APPROVED" in out
 
+    @pytest.mark.parametrize(
+        ("delivery_status", "expected_result"),
+        [
+            (None, "DELIVERY PENDING"),
+            ("pending", "DELIVERY PENDING"),
+            ("committed", "DELIVERY PENDING"),
+            ("failed", "DELIVERY FAILED"),
+        ],
+    )
+    def test_current_branch_delivery_not_reported_as_approved(
+        self,
+        capsys,
+        delivery_status: str | None,
+        expected_result: str,
+    ):
+        s = self._make_state(review_approved=True, security_approved=True)
+        s.done = True
+        s.review_mode = "review_fix"
+        s.review_delivery_mode = "current_branch"
+        s.review_delivery_status = delivery_status
+        s.worktree_path = "/tmp/sikula-worktree"
+        s.worktree_base = "/tmp/sikula-worktree"
+
+        _print_review_summary(s, "feature/current", "main", 10.0)
+
+        out = capsys.readouterr().out
+        assert expected_result in out
+        assert "APPROVED" not in out
+
+    def test_cleaned_current_branch_delivery_not_reported_as_approved(self, capsys):
+        s = self._make_state(review_approved=True, security_approved=True)
+        s.done = True
+        s.review_mode = "review_fix"
+        s.review_delivery_mode = "current_branch"
+        s.review_delivery_status = "failed"
+
+        _print_review_summary(s, "feature/current", "main", 10.0)
+
+        out = capsys.readouterr().out
+        assert "DELIVERY CLEANED" in out
+        assert "APPROVED" not in out
+
+    @pytest.mark.parametrize("delivery_status", ["delivered", "no_changes"])
+    def test_current_branch_terminal_delivery_can_report_approved(
+        self,
+        capsys,
+        delivery_status: str,
+    ):
+        s = self._make_state(review_approved=True, security_approved=True)
+        s.done = True
+        s.review_mode = "review_fix"
+        s.review_delivery_mode = "current_branch"
+        s.review_delivery_status = delivery_status
+
+        _print_review_summary(s, "feature/current", "main", 10.0)
+
+        assert "APPROVED" in capsys.readouterr().out
+
     def test_testability_gaps_are_visible(self, capsys):
         s = self._make_state(review_approved=True, security_approved=True)
         s.record_testability_gap(
@@ -1673,14 +1731,118 @@ class TestMain:
         mock_cleanup.assert_called_once()
         assert mock_cleanup.call_args.args[0].delete_state is True
 
-    def test_review_command_dispatches_to_cmd_review(self, tmp_path: Path):
+    @pytest.mark.parametrize(
+        (
+            "argv_tail",
+            "expected_branch",
+            "expected_current_branch",
+            "expected_fix",
+            "expected_base_branch",
+            "expected_description",
+            "expected_description_file",
+        ),
+        [
+            (
+                ["--branch", "feature/x", "--description", "Review branch changes"],
+                "feature/x",
+                False,
+                False,
+                "main",
+                "Review branch changes",
+                None,
+            ),
+            (
+                ["--fix", "--branch", "feature/x", "--description", "Review branch changes"],
+                "feature/x",
+                False,
+                True,
+                "main",
+                "Review branch changes",
+                None,
+            ),
+            (
+                [
+                    "--fix",
+                    "--current-branch",
+                    "--base-branch",
+                    "develop",
+                    "--description-file",
+                    "pr.md",
+                ],
+                None,
+                True,
+                True,
+                "develop",
+                None,
+                "pr.md",
+            ),
+        ],
+    )
+    def test_review_command_dispatches_to_cmd_review(
+        self,
+        tmp_path: Path,
+        argv_tail: list[str],
+        expected_branch: str | None,
+        expected_current_branch: bool,
+        expected_fix: bool,
+        expected_base_branch: str,
+        expected_description: str | None,
+        expected_description_file: str | None,
+    ):
         p1, p2, p3 = self._patch_config(tmp_path)
-        argv = ["sikula", "review", "--branch", "feature/x", "--description", "Review branch changes"]
+        argv = ["sikula", "review", *argv_tail]
         with patch("sys.argv", argv):
             with p1, p2, p3:
                 with patch("sikula.cmd_review") as mock_review:
                     main()
         mock_review.assert_called_once()
+        args = mock_review.call_args.args[0]
+        assert args.branch == expected_branch
+        assert args.current_branch is expected_current_branch
+        assert args.fix is expected_fix
+        assert args.base_branch == expected_base_branch
+        assert args.description == expected_description
+        assert args.description_file == expected_description_file
+
+    def test_review_help_includes_current_branch_flag(self, capsys):
+        with patch("sys.argv", ["sikula", "review", "--help"]):
+            with pytest.raises(SystemExit) as exc:
+                main()
+
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "--current-branch" in out
+        assert "currently checked-out branch" in out
+        assert "only valid with --fix" in out
+
+    def test_review_command_requires_branch_or_current_branch(self, tmp_path: Path, capsys):
+        with patch("sys.argv", ["sikula", "review", "--description", "Review branch changes"]):
+            with patch("sikula._load_runtime_config") as load_config:
+                with pytest.raises(SystemExit) as exc:
+                    main()
+
+        assert exc.value.code == 2
+        assert not load_config.called
+        assert "one of the arguments --branch --current-branch is required" in capsys.readouterr().err
+
+    def test_review_command_rejects_branch_with_current_branch(self, tmp_path: Path, capsys):
+        argv = [
+            "sikula",
+            "review",
+            "--branch",
+            "feature/x",
+            "--current-branch",
+            "--description",
+            "Review branch changes",
+        ]
+        with patch("sys.argv", argv):
+            with patch("sikula._load_runtime_config") as load_config:
+                with pytest.raises(SystemExit) as exc:
+                    main()
+
+        assert exc.value.code == 2
+        assert not load_config.called
+        assert "not allowed with argument" in capsys.readouterr().err
 
     def test_init_command_dispatches_to_cmd_init(self, tmp_path: Path):
         with patch("sys.argv", ["sikula", "init"]):

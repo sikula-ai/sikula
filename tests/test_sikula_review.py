@@ -58,6 +58,7 @@ def _subprocess_sequence(*results):
 def _args(**kwargs):
     defaults = dict(
         branch="feat/x",
+        current_branch=False,
         base_branch="main",
         fix=False,
         description="Test review",
@@ -339,6 +340,17 @@ class TestCmdReviewReportOnlyState:
 
 
 class TestCmdReviewDescriptionValidation:
+    def test_current_branch_requires_fix_before_git_work(self, tmp_path: Path, capsys):
+        with (
+            patch("sikula._find_git_root") as find_git_root,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(_args(branch=None, current_branch=True, fix=False), _cfg(tmp_path))
+
+        assert exc_info.value.code == 1
+        assert not find_git_root.called
+        assert "--current-branch is only valid with sikula review --fix" in capsys.readouterr().out
+
     def test_requires_description_or_description_file(self, tmp_path: Path, capsys):
         with (
             patch("sikula._find_git_root") as find_git_root,
@@ -502,6 +514,508 @@ class TestCmdReviewWorktreeSetup:
         worktree_call = next(c for c in calls if "worktree" in c and "add" in c)
         assert "--detach" not in worktree_call
         assert "feat/x" in worktree_call
+
+    def test_current_branch_fix_mode_uses_detached_head_at_start_commit(self, tmp_path: Path):
+        calls = []
+        target_commit = "1111111111111111111111111111111111111111"
+        branch_name = "feature/current"
+
+        def capture(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0:2] == ["git", "symbolic-ref"]:
+                return _sub(stdout=f"{branch_name}\n")
+            if cmd == ["git", "diff", "--cached", "--name-only"]:
+                return _sub()
+            if cmd == ["git", "diff", "--name-only"]:
+                return _sub()
+            if cmd[0:2] == ["git", "ls-files"]:
+                return _sub()
+            if cmd == ["git", "rev-parse", "--verify", "main^{commit}"]:
+                return _sub(stdout="0000000000000000000000000000000000000000\n")
+            if cmd == ["git", "rev-parse", "--verify", "HEAD^{commit}"]:
+                return _sub(stdout=f"{target_commit}\n")
+            if cmd[0:3] == ["git", "worktree", "add"]:
+                return _sub()
+            if cmd == ["git", "diff", "main...HEAD"]:
+                return _sub(stdout="@@ -1 +1 @@\n+x")
+            if cmd == ["git", "diff", "--name-only", "main...HEAD"]:
+                return _sub(stdout="src/main.py\n")
+            return _sub()
+
+        captured: dict = {}
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            captured["root_path"] = cfg_arg["project"]["root_path"]
+            captured["state_store"] = state_store
+            task_id = state_store.list_tasks()[0]
+            state = state_store.load(task_id)
+            captured["state_before_run"] = state
+            state.done = True
+            state.failed = False
+            state.review_approved = True
+            state.security_approved = True
+            mock = MagicMock()
+            mock.run.return_value = state
+            return mock
+
+        with (
+            patch("uuid.uuid4", return_value=MagicMock(hex="taskcurrent")),
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture),
+            patch("sikula._enrich_prompt_with_referenced_files", return_value=""),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sikula._deliver_current_branch_review_fix", return_value=(True, False, None)),
+            patch("sikula._print_review_summary"),
+            patch("sys.exit"),
+        ):
+            cmd_review(_args(branch=None, current_branch=True, fix=True), _cfg(tmp_path))
+
+        worktree_base = tmp_path / ".sikula" / "worktrees" / "taskcurrent"
+        assert ["git", "worktree", "add", "--detach", str(worktree_base), target_commit] in calls
+        assert ["git", "diff", "main...HEAD"] in calls
+        assert ["git", "diff", "--name-only", "main...HEAD"] in calls
+        assert not any(cmd[0:2] in (["git", "checkout"], ["git", "switch"]) for cmd in calls)
+        assert not any(branch_name in cmd for cmd in calls if cmd[0:3] == ["git", "worktree", "add"])
+
+        state = captured["state_before_run"]
+        assert state.review_mode == "review_fix"
+        assert state.review_delivery_mode == "current_branch"
+        assert state.review_target_branch == branch_name
+        assert state.review_target_start_commit == target_commit
+        assert state.review_delivery_status == "pending"
+        assert state.worktree_branch == branch_name
+        assert state.files_changed == ["src/main.py"]
+        assert state.review_diff == "@@ -1 +1 @@\n+x"
+        assert captured["root_path"] == str(worktree_base)
+
+    def test_current_branch_fix_mode_copies_env_files(self, tmp_path: Path):
+        (tmp_path / "local.properties").write_text("sdk.dir=/opt/android-sdk\n")
+        copied = []
+
+        def capture(cmd, **kwargs):
+            if cmd[0:2] == ["git", "symbolic-ref"]:
+                return _sub(stdout="feature/current\n")
+            if cmd == ["git", "diff", "--cached", "--name-only"]:
+                return _sub()
+            if cmd == ["git", "diff", "--name-only"]:
+                return _sub()
+            if cmd[0:2] == ["git", "ls-files"]:
+                return _sub()
+            if cmd == ["git", "rev-parse", "--verify", "main^{commit}"]:
+                return _sub(stdout="0000000000000000000000000000000000000000\n")
+            if cmd == ["git", "rev-parse", "--verify", "HEAD^{commit}"]:
+                return _sub(stdout="1111111111111111111111111111111111111111\n")
+            if cmd[0:3] == ["git", "diff", "--name-only"]:
+                return _sub(stdout="src/main.py\n")
+            if cmd[0:2] == ["git", "diff"]:
+                return _sub(stdout="@@ -1 +1 @@\n+x")
+            return _sub()
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            state = state_store.load(state_store.list_tasks()[0])
+            state.done = True
+            state.failed = False
+            state.review_approved = True
+            state.security_approved = True
+            mock = MagicMock()
+            mock.run.return_value = state
+            return mock
+
+        cfg = _cfg(tmp_path)
+        cfg["project"]["build_tool"] = "gradle-android"
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture),
+            patch("sikula._enrich_prompt_with_referenced_files", return_value=""),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sikula._deliver_current_branch_review_fix", return_value=(True, False, None)),
+            patch("sikula._print_review_summary"),
+            patch("sikula.shutil.copy2", side_effect=lambda s, d: copied.append((str(s), str(d)))),
+            patch("sys.exit"),
+        ):
+            cmd_review(_args(branch=None, current_branch=True, fix=True), cfg)
+
+        assert any("local.properties" in src for src, _ in copied)
+
+    def test_current_branch_fix_mode_uses_current_branch_delivery_helper(self, tmp_path: Path):
+        target_commit = "1111111111111111111111111111111111111111"
+        fix_commit = "2222222222222222222222222222222222222222"
+        branch_name = "feature/current"
+        captured: dict = {}
+
+        def capture(cmd, **kwargs):
+            if cmd[0:2] == ["git", "symbolic-ref"]:
+                return _sub(stdout=f"{branch_name}\n")
+            if cmd == ["git", "diff", "--cached", "--name-only"]:
+                return _sub()
+            if cmd == ["git", "diff", "--name-only"]:
+                return _sub()
+            if cmd[0:2] == ["git", "ls-files"]:
+                return _sub()
+            if cmd == ["git", "rev-parse", "--verify", "main^{commit}"]:
+                return _sub(stdout="0000000000000000000000000000000000000000\n")
+            if cmd == ["git", "rev-parse", "--verify", "HEAD^{commit}"]:
+                return _sub(stdout=f"{target_commit}\n")
+            if cmd[0:3] == ["git", "worktree", "add"]:
+                return _sub()
+            if cmd == ["git", "diff", "main...HEAD"]:
+                return _sub(stdout="@@ -1 +1 @@\n+x")
+            if cmd == ["git", "diff", "--name-only", "main...HEAD"]:
+                return _sub(stdout="src/main.py\n")
+            return _sub()
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            task_id = state_store.list_tasks()[0]
+            state = state_store.load(task_id)
+            state.done = True
+            state.failed = False
+            state.review_approved = True
+            state.security_approved = True
+            captured["state"] = state
+            mock = MagicMock()
+            mock.run.return_value = state
+            return mock
+
+        def deliver_success(worktree_base, git_root, state_arg, store_arg, commit_msg):
+            state_arg.review_delivery_status = "delivered"
+            state_arg.review_delivery_result = f"delivered {fix_commit} to {branch_name}"
+            state_arg.result_commit = fix_commit
+            store_arg.save(state_arg)
+            return True, True, fix_commit
+
+        with (
+            patch("uuid.uuid4", return_value=MagicMock(hex="taskcurrent")),
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture),
+            patch("sikula._enrich_prompt_with_referenced_files", return_value=""),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sikula._deliver_current_branch_review_fix", side_effect=deliver_success) as delivery,
+            patch("sikula._finalize_worktree") as finalize,
+            patch("sikula._print_review_summary"),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(_args(branch=None, current_branch=True, fix=True), _cfg(tmp_path))
+
+        assert exc_info.value.code == 0
+        finalize.assert_not_called()
+        delivery.assert_called_once()
+        assert delivery.call_args.args[0] == tmp_path / ".sikula" / "worktrees" / "taskcurrent"
+        assert delivery.call_args.args[1] == tmp_path
+        assert delivery.call_args.args[2] is captured["state"]
+        assert delivery.call_args.args[3] is not None
+        assert delivery.call_args.kwargs["commit_msg"] == (
+            "sikula: review fixes for feature/current\n\nTask ID: taskcurrent"
+        )
+
+    def test_current_branch_fix_mode_exits_nonzero_when_delivery_fails(self, tmp_path: Path, capsys):
+        target_commit = "1111111111111111111111111111111111111111"
+
+        def capture(cmd, **kwargs):
+            if cmd[0:2] == ["git", "symbolic-ref"]:
+                return _sub(stdout="feature/current\n")
+            if cmd == ["git", "diff", "--cached", "--name-only"]:
+                return _sub()
+            if cmd == ["git", "diff", "--name-only"]:
+                return _sub()
+            if cmd[0:2] == ["git", "ls-files"]:
+                return _sub()
+            if cmd == ["git", "rev-parse", "--verify", "main^{commit}"]:
+                return _sub(stdout="0000000000000000000000000000000000000000\n")
+            if cmd == ["git", "rev-parse", "--verify", "HEAD^{commit}"]:
+                return _sub(stdout=f"{target_commit}\n")
+            if cmd[0:3] == ["git", "worktree", "add"]:
+                return _sub()
+            if cmd == ["git", "diff", "main...HEAD"]:
+                return _sub(stdout="@@ -1 +1 @@\n+x")
+            if cmd == ["git", "diff", "--name-only", "main...HEAD"]:
+                return _sub(stdout="src/main.py\n")
+            return _sub()
+
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            state = state_store.load(state_store.list_tasks()[0])
+            state.done = True
+            state.failed = False
+            state.review_approved = True
+            state.security_approved = True
+            mock = MagicMock()
+            mock.run.return_value = state
+            return mock
+
+        def fail_delivery(worktree_base, git_root, state_arg, store_arg, commit_msg):
+            state_arg.review_delivery_status = "failed"
+            state_arg.review_delivery_result = "current worktree is not clean: unstaged changes (1)"
+            store_arg.save(state_arg)
+            return False, True, "fixcommit"
+
+        with (
+            patch("uuid.uuid4", return_value=MagicMock(hex="taskcurrent")),
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture),
+            patch("sikula._enrich_prompt_with_referenced_files", return_value=""),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sikula._deliver_current_branch_review_fix", side_effect=fail_delivery) as delivery,
+            patch("sikula._finalize_worktree") as finalize,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(_args(branch=None, current_branch=True, fix=True), _cfg(tmp_path))
+
+        assert exc_info.value.code == 1
+        delivery.assert_called_once()
+        finalize.assert_not_called()
+        out = capsys.readouterr().out
+        assert "DELIVERY FAILED" in out
+        assert "APPROVED" not in out
+
+    def test_current_branch_fix_mode_rejects_detached_head_before_worktree(self, tmp_path: Path, capsys):
+        calls = []
+
+        def capture(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0:2] == ["git", "symbolic-ref"]:
+                return _sub(returncode=1)
+            if cmd == ["git", "rev-parse", "--verify", "HEAD"]:
+                return _sub(stdout="1111111111111111111111111111111111111111\n")
+            return _sub()
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(_args(branch=None, current_branch=True, fix=True), _cfg(tmp_path))
+
+        assert exc_info.value.code == 1
+        assert "HEAD is detached" in capsys.readouterr().out
+        assert not any(cmd[0:3] == ["git", "worktree", "add"] for cmd in calls)
+        assert not (tmp_path / "state").exists()
+
+    @pytest.mark.parametrize(
+        ("returncode", "stdout", "stderr"),
+        [
+            (0, "", ""),
+            (1, "", "fatal: not a symbolic ref\n"),
+        ],
+    )
+    def test_current_branch_fix_mode_rejects_unknown_branch_before_worktree(
+        self,
+        tmp_path: Path,
+        capsys,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+    ):
+        calls = []
+
+        def capture(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0:2] == ["git", "symbolic-ref"]:
+                return _sub(returncode=returncode, stdout=stdout, stderr=stderr)
+            return _sub()
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(_args(branch=None, current_branch=True, fix=True), _cfg(tmp_path))
+
+        assert exc_info.value.code == 1
+        assert "could not determine the current branch" in capsys.readouterr().out
+        assert not any(cmd[0:3] == ["git", "worktree", "add"] for cmd in calls)
+        assert not (tmp_path / "state").exists()
+
+    @pytest.mark.parametrize(
+        ("staged", "unstaged", "untracked", "expected_heading", "expected_path"),
+        [
+            ("src/staged.py\n", "", "", "Staged changes:", "src/staged.py"),
+            ("", "src/unstaged.py\n", "", "Unstaged changes:", "src/unstaged.py"),
+            ("", "", "src/untracked.py\n", "Untracked files:", "src/untracked.py"),
+        ],
+    )
+    def test_current_branch_fix_mode_rejects_dirty_worktree_before_worktree(
+        self,
+        tmp_path: Path,
+        capsys,
+        staged: str,
+        unstaged: str,
+        untracked: str,
+        expected_heading: str,
+        expected_path: str,
+    ):
+        calls = []
+
+        def capture(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0:2] == ["git", "symbolic-ref"]:
+                return _sub(stdout="feature/current\n")
+            if cmd == ["git", "diff", "--cached", "--name-only"]:
+                return _sub(stdout=staged)
+            if cmd == ["git", "diff", "--name-only"]:
+                return _sub(stdout=unstaged)
+            if cmd[0:2] == ["git", "ls-files"]:
+                return _sub(stdout=untracked)
+            return _sub()
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(_args(branch=None, current_branch=True, fix=True), _cfg(tmp_path))
+
+        output = capsys.readouterr().out
+        assert exc_info.value.code == 1
+        assert "--current-branch requires a clean current worktree" in output
+        assert expected_heading in output
+        assert expected_path in output
+        assert "Commit, stash, or remove these changes and rerun the command." in output
+        assert not any(cmd[0:3] == ["git", "worktree", "add"] for cmd in calls)
+        assert not any(cmd[0:2] == ["git", "rev-parse"] for cmd in calls)
+        assert ["git", "ls-files", "--others", "--exclude-standard"] in calls
+        assert not (tmp_path / "state").exists()
+
+    def test_current_branch_fix_mode_rejects_clean_check_error_before_worktree(self, tmp_path: Path, capsys):
+        calls = []
+
+        def capture(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0:2] == ["git", "symbolic-ref"]:
+                return _sub(stdout="feature/current\n")
+            if cmd == ["git", "diff", "--cached", "--name-only"]:
+                return _sub(returncode=128, stderr="fatal: could not read index\n")
+            return _sub()
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(_args(branch=None, current_branch=True, fix=True), _cfg(tmp_path))
+
+        output = capsys.readouterr().out
+        assert exc_info.value.code == 1
+        assert "--current-branch requires a clean current worktree" in output
+        assert "fatal: could not read index" in output
+        assert "Commit, stash, or remove these changes and rerun the command." in output
+        assert not any(cmd[0:3] == ["git", "worktree", "add"] for cmd in calls)
+        assert not any(cmd[0:2] == ["git", "rev-parse"] for cmd in calls)
+        assert not (tmp_path / "state").exists()
+
+    def test_current_branch_fix_mode_rejects_unresolved_base_before_worktree(self, tmp_path: Path, capsys):
+        calls = []
+
+        def capture(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0:2] == ["git", "symbolic-ref"]:
+                return _sub(stdout="feature/current\n")
+            if cmd == ["git", "diff", "--cached", "--name-only"]:
+                return _sub()
+            if cmd == ["git", "diff", "--name-only"]:
+                return _sub()
+            if cmd[0:2] == ["git", "ls-files"]:
+                return _sub()
+            if cmd == ["git", "rev-parse", "--verify", "missing-base^{commit}"]:
+                return _sub(returncode=128, stderr="fatal: ambiguous argument 'missing-base'\n")
+            return _sub()
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(
+                _args(branch=None, current_branch=True, fix=True, base_branch="missing-base"),
+                _cfg(tmp_path),
+            )
+
+        assert exc_info.value.code == 1
+        assert "base branch/ref 'missing-base' could not be resolved" in capsys.readouterr().out
+        assert not any(cmd[0:3] == ["git", "worktree", "add"] for cmd in calls)
+        assert not (tmp_path / "state").exists()
+
+    def test_current_branch_fix_mode_rejects_unresolved_head_before_worktree(self, tmp_path: Path, capsys):
+        calls = []
+
+        def capture(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0:2] == ["git", "symbolic-ref"]:
+                return _sub(stdout="feature/current\n")
+            if cmd == ["git", "diff", "--cached", "--name-only"]:
+                return _sub()
+            if cmd == ["git", "diff", "--name-only"]:
+                return _sub()
+            if cmd[0:2] == ["git", "ls-files"]:
+                return _sub()
+            if cmd == ["git", "rev-parse", "--verify", "main^{commit}"]:
+                return _sub(stdout="0000000000000000000000000000000000000000\n")
+            if cmd == ["git", "rev-parse", "--verify", "HEAD^{commit}"]:
+                return _sub(returncode=128, stderr="fatal: bad revision 'HEAD'\n")
+            return _sub()
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(_args(branch=None, current_branch=True, fix=True), _cfg(tmp_path))
+
+        assert exc_info.value.code == 1
+        assert "could not resolve HEAD for --current-branch" in capsys.readouterr().out
+        assert not any(cmd[0:3] == ["git", "worktree", "add"] for cmd in calls)
+        assert not (tmp_path / "state").exists()
+
+    def test_current_branch_fix_mode_removes_worktree_when_diff_fails(self, tmp_path: Path, capsys):
+        calls = []
+        target_commit = "1111111111111111111111111111111111111111"
+
+        def capture(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0:2] == ["git", "symbolic-ref"]:
+                return _sub(stdout="feature/current\n")
+            if cmd == ["git", "diff", "--cached", "--name-only"]:
+                return _sub()
+            if cmd == ["git", "diff", "--name-only"]:
+                return _sub()
+            if cmd[0:2] == ["git", "ls-files"]:
+                return _sub()
+            if cmd == ["git", "rev-parse", "--verify", "main^{commit}"]:
+                return _sub(stdout="0000000000000000000000000000000000000000\n")
+            if cmd == ["git", "rev-parse", "--verify", "HEAD^{commit}"]:
+                return _sub(stdout=f"{target_commit}\n")
+            if cmd[0:3] == ["git", "worktree", "add"]:
+                return _sub()
+            if cmd == ["git", "diff", "main...HEAD"]:
+                return _sub(returncode=128, stderr="fatal: bad revision 'main...HEAD'\n")
+            if cmd[0:3] == ["git", "worktree", "remove"]:
+                return _sub()
+            return _sub()
+
+        with (
+            patch("uuid.uuid4", return_value=MagicMock(hex="taskdiff")),
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(_args(branch=None, current_branch=True, fix=True), _cfg(tmp_path))
+
+        assert exc_info.value.code == 1
+        worktree_base = tmp_path / ".sikula" / "worktrees" / "taskdiff"
+        assert ["git", "worktree", "add", "--detach", str(worktree_base), target_commit] in calls
+        assert ["git", "worktree", "remove", str(worktree_base)] in calls
+        assert "Failed to compute diff between 'main' and 'HEAD'" in capsys.readouterr().out
+        assert not (tmp_path / "state").exists()
 
     def test_fix_mode_copies_env_files(self, tmp_path: Path):
         """Fix mode must copy gitignored build files (e.g. local.properties) into the worktree."""
@@ -719,6 +1233,10 @@ class TestCmdReviewFixStateStore:
         state = captured["state_store"].load(tasks[0])
         assert state.review_mode == "review_fix"
         assert state.review_base_branch == "main"
+        assert state.review_delivery_mode is None
+        assert state.review_target_branch is None
+        assert state.review_target_start_commit is None
+        assert state.review_delivery_status is None
 
 
 # ---------------------------------------------------------------------------

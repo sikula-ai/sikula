@@ -73,6 +73,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Sequence
 
 import yaml
 from dotenv import load_dotenv
@@ -531,6 +532,127 @@ def _tracked_clean_file_status(git_root: Path, path: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def _current_branch_name(git_root: Path) -> tuple[str | None, str | None]:
+    r = subprocess.run(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=git_root,
+    )
+    if r.returncode == 0:
+        branch = r.stdout.strip()
+        return (branch, None) if branch else (None, "unknown")
+    if r.stderr.strip():
+        return None, "unknown"
+
+    head = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=git_root,
+    )
+    if head.returncode == 0:
+        return None, "detached"
+    return None, "unknown"
+
+
+def _resolve_git_commit(git_root: Path, ref: str) -> tuple[str | None, str]:
+    r = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        cwd=git_root,
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip().splitlines()[0], ""
+    return None, _short_audit_line(r.stderr.strip() or r.stdout.strip() or "unknown revision")
+
+
+def _git_path_lines(git_root: Path, args: list[str]) -> tuple[list[str], str | None]:
+    r = subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        cwd=git_root,
+    )
+    if r.returncode != 0:
+        return [], _short_audit_line(r.stderr.strip() or r.stdout.strip() or "git command failed")
+    return [line.strip() for line in r.stdout.splitlines() if line.strip()], None
+
+
+def _git_excluded_path_prefixes(git_root: Path, exclude_paths: Sequence[Path] | None) -> set[str]:
+    if not exclude_paths:
+        return set()
+    root = git_root.resolve()
+    prefixes: set[str] = set()
+    for path in exclude_paths:
+        try:
+            rel = Path(path).resolve().relative_to(root)
+        except ValueError:
+            continue
+        rel_text = rel.as_posix()
+        if rel_text and rel_text != ".":
+            prefixes.add(rel_text)
+    return prefixes
+
+
+def _filter_git_paths(paths: list[str], excluded_prefixes: set[str]) -> list[str]:
+    if not excluded_prefixes:
+        return paths
+    filtered = []
+    for path in paths:
+        normalized = path.replace("\\", "/")
+        if any(normalized == prefix or normalized.startswith(f"{prefix}/") for prefix in excluded_prefixes):
+            continue
+        filtered.append(path)
+    return filtered
+
+
+def _current_worktree_changes(
+    git_root: Path,
+    *,
+    exclude_paths: Sequence[Path] | None = None,
+) -> tuple[list[str], list[str], list[str], str | None]:
+    excluded_prefixes = _git_excluded_path_prefixes(git_root, exclude_paths)
+    staged, error = _git_path_lines(git_root, ["diff", "--cached", "--name-only"])
+    if error:
+        return [], [], [], error
+    unstaged, error = _git_path_lines(git_root, ["diff", "--name-only"])
+    if error:
+        return [], [], [], error
+    untracked, error = _git_path_lines(git_root, ["ls-files", "--others", "--exclude-standard"])
+    if error:
+        return [], [], [], error
+    staged = _filter_git_paths(staged, excluded_prefixes)
+    unstaged = _filter_git_paths(unstaged, excluded_prefixes)
+    untracked = _filter_git_paths(untracked, excluded_prefixes)
+    return staged, unstaged, untracked, None
+
+
+def _print_current_branch_clean_error(
+    staged: list[str],
+    unstaged: list[str],
+    untracked: list[str],
+    error: str | None,
+) -> None:
+    print("Error: --current-branch requires a clean current worktree before review fixes start.")
+    if error:
+        print(f"  {error}")
+    if staged:
+        print("Staged changes:")
+        for path in staged:
+            print(f"  {path}")
+    if unstaged:
+        print("Unstaged changes:")
+        for path in unstaged:
+            print(f"  {path}")
+    if untracked:
+        print("Untracked files:")
+        for path in untracked:
+            print(f"  {path}")
+    print("Commit, stash, or remove these changes and rerun the command.")
+
+
 def _isolation_context_files(cfg: dict) -> list[tuple[str, Path]]:
     """Return files that must be present unchanged in isolated task worktrees."""
     result: list[tuple[str, Path]] = []
@@ -597,13 +719,19 @@ def _create_worktree(git_root: Path, worktree_base: Path, branch: str) -> tuple[
     return r.returncode == 0, r.stderr.strip()
 
 
-def _finalize_worktree(
+def _default_worktree_commit_message(state: object) -> str:
+    branch_short = (state.worktree_branch or state.task_id).removeprefix("sikula/")
+    stem = (
+        branch_short.removesuffix(f"-{state.task_id}") if branch_short.endswith(f"-{state.task_id}") else branch_short
+    )
+    return f"sikula: {stem}\n\nTask ID: {state.task_id}"
+
+
+def _commit_worktree_changes(
     worktree_base: Path,
-    git_root: Path,
-    state,
+    state: object,
     commit_msg: str | None = None,
-) -> tuple[bool, bool, str | None]:
-    """Commit all changes and remove the worktree. Returns (success, committed, commit_sha)."""
+) -> tuple[bool, bool, str | None, str | None]:
     subprocess.run(["git", "add", "-A"], cwd=worktree_base, check=False)
     status = subprocess.run(
         ["git", "status", "--porcelain"],
@@ -611,38 +739,46 @@ def _finalize_worktree(
         text=True,
         cwd=worktree_base,
     )
-    committed = False
+    if not status.stdout.strip():
+        return True, False, None, None
+
+    message = commit_msg or _default_worktree_commit_message(state)
+    r = subprocess.run(
+        ["git", "commit", "-m", message],
+        capture_output=True,
+        text=True,
+        cwd=worktree_base,
+        check=False,
+    )
+    if r.returncode != 0:
+        error = _short_audit_line(r.stderr.strip() or r.stdout.strip() or "git commit failed")
+        return False, False, None, error
+
+    r = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=worktree_base,
+        check=False,
+    )
     commit_sha = None
-    if status.stdout.strip():
-        if commit_msg is None:
-            branch_short = state.worktree_branch.removeprefix("sikula/")
-            stem = (
-                branch_short.removesuffix(f"-{state.task_id}")
-                if branch_short.endswith(f"-{state.task_id}")
-                else branch_short
-            )
-            commit_msg = f"sikula: {stem}\n\nTask ID: {state.task_id}"
-        r = subprocess.run(
-            ["git", "commit", "-m", commit_msg],
-            capture_output=True,
-            text=True,
-            cwd=worktree_base,
-            check=False,
-        )
-        if r.returncode != 0:
-            log.error("Failed to commit worktree changes: %s", r.stderr.strip())
-            return False, False, None
-        committed = True
-        r = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            cwd=worktree_base,
-            check=False,
-        )
-        if r.returncode == 0:
-            commit_sha = r.stdout.strip()
-            state.result_commit = commit_sha
+    if r.returncode == 0:
+        commit_sha = r.stdout.strip()
+        state.result_commit = commit_sha
+    return True, True, commit_sha, None
+
+
+def _finalize_worktree(
+    worktree_base: Path,
+    git_root: Path,
+    state,
+    commit_msg: str | None = None,
+) -> tuple[bool, bool, str | None]:
+    """Commit all changes and remove the worktree. Returns (success, committed, commit_sha)."""
+    commit_ok, committed, commit_sha, error = _commit_worktree_changes(worktree_base, state, commit_msg=commit_msg)
+    if not commit_ok:
+        log.error("Failed to commit worktree changes: %s", error or "git commit failed")
+        return False, False, None
     r = subprocess.run(
         ["git", "worktree", "remove", str(worktree_base)],
         cwd=git_root,
@@ -655,6 +791,282 @@ def _finalize_worktree(
             check=False,
         )
     return r.returncode == 0, committed, commit_sha
+
+
+def _current_branch_delivery_terminal(state: object) -> bool:
+    return state.review_delivery_status in {"delivered", "no_changes"}
+
+
+def _current_branch_delivery_pending(state: object) -> bool:
+    return (
+        state.review_mode == "review_fix"
+        and state.review_delivery_mode == "current_branch"
+        and not _current_branch_delivery_terminal(state)
+    )
+
+
+def _current_branch_delivery_needs_finalization(state: object) -> bool:
+    return bool(
+        state.done
+        and not state.failed
+        and _current_branch_delivery_pending(state)
+        and (state.worktree_base or state.worktree_path)
+    )
+
+
+def _current_branch_delivery_cleaned(state: object) -> bool:
+    return bool(
+        state.done
+        and not state.failed
+        and _current_branch_delivery_pending(state)
+        and not state.worktree_base
+        and not state.worktree_path
+    )
+
+
+def _print_current_branch_delivery_failure(worktree_base: Path, reason: str) -> None:
+    print("Current-branch delivery failed:")
+    print(f"  {reason}")
+    print(f"Worktree preserved for inspection/resume: {worktree_base}")
+
+
+def _mark_current_branch_delivery_failed(state: object, store: object, worktree_base: Path, reason: str) -> None:
+    safe_reason = _short_audit_line(reason, limit=500)
+    state.review_delivery_status = "failed"
+    state.review_delivery_result = safe_reason
+    state.record("sikula", "review_delivery_failed", safe_reason)
+    store.save(state)
+    _print_current_branch_delivery_failure(worktree_base, safe_reason)
+
+
+def _remove_delivered_worktree(state: object, store: object, git_root: Path, worktree_base: Path) -> bool:
+    if not worktree_base.exists():
+        state.worktree_path = None
+        state.worktree_base = None
+        store.save(state)
+        return True
+    if not _remove_worktree(worktree_base, git_root, force=False) and not _remove_worktree(
+        worktree_base, git_root, force=True
+    ):
+        return False
+    state.worktree_path = None
+    state.worktree_base = None
+    store.save(state)
+    return True
+
+
+def _worktree_clean_error(
+    git_root: Path,
+    *,
+    label: str,
+    exclude_paths: Sequence[Path] | None = None,
+) -> str | None:
+    staged, unstaged, untracked, error = _current_worktree_changes(git_root, exclude_paths=exclude_paths)
+    if error:
+        return f"could not verify {label} cleanliness: {error}"
+    problems = []
+    if staged:
+        problems.append(f"staged changes ({len(staged)})")
+    if unstaged:
+        problems.append(f"unstaged changes ({len(unstaged)})")
+    if untracked:
+        problems.append(f"untracked files ({len(untracked)})")
+    if not problems:
+        return None
+    return f"{label} is not clean: " + ", ".join(problems)
+
+
+def _current_worktree_clean_error(git_root: Path, *, exclude_paths: Sequence[Path] | None = None) -> str | None:
+    return _worktree_clean_error(git_root, label="current worktree", exclude_paths=exclude_paths)
+
+
+def _state_store_internal_paths(store: object) -> list[Path]:
+    internal_paths = getattr(store, "internal_paths", None)
+    if not callable(internal_paths):
+        return []
+    return [Path(path) for path in internal_paths()]
+
+
+def _recorded_isolated_fix_reuse_error(worktree_base: Path, recorded_commit: str) -> str | None:
+    current_head, head_error = _resolve_git_commit(worktree_base, "HEAD")
+    if current_head is None:
+        return f"could not resolve isolated worktree HEAD: {head_error}"
+    if current_head != recorded_commit:
+        return f"isolated worktree HEAD changed from recorded fix commit {recorded_commit[:12]} to {current_head[:12]}"
+    return _worktree_clean_error(worktree_base, label="isolated worktree")
+
+
+def _current_branch_delivery_safety_error(
+    git_root: Path,
+    target_branch: str,
+    target_start_commit: str,
+    delivered_commit: str | None = None,
+    clean_exclude_paths: Sequence[Path] | None = None,
+) -> tuple[str | None, str | None]:
+    branch_name, branch_error = _current_branch_name(git_root)
+    if branch_name != target_branch:
+        if branch_error == "detached":
+            reason = f"current HEAD is detached; expected branch '{target_branch}'"
+        elif branch_name:
+            reason = f"current branch is '{branch_name}', expected '{target_branch}'"
+        else:
+            reason = f"could not determine current branch; expected '{target_branch}'"
+        return reason, None
+
+    clean_error = _current_worktree_clean_error(git_root, exclude_paths=clean_exclude_paths)
+    if clean_error:
+        return clean_error, None
+
+    current_head, head_error = _resolve_git_commit(git_root, "HEAD")
+    if current_head is None:
+        return f"could not resolve current HEAD: {head_error}", None
+    if delivered_commit and current_head == delivered_commit:
+        return None, current_head
+    if current_head != target_start_commit:
+        return f"current branch HEAD changed from {target_start_commit[:12]} to {current_head[:12]}", current_head
+    return None, current_head
+
+
+def _deliver_current_branch_review_fix(
+    worktree_base: Path,
+    git_root: Path,
+    state: object,
+    store: object,
+    commit_msg: str,
+) -> tuple[bool, bool, str | None]:
+    target_branch = state.review_target_branch or state.worktree_branch
+    target_start_commit = state.review_target_start_commit
+    clean_exclude_paths = _state_store_internal_paths(store)
+    if not target_branch:
+        _mark_current_branch_delivery_failed(state, store, worktree_base, "missing current-branch target metadata")
+        return False, False, None
+    if not target_start_commit:
+        _mark_current_branch_delivery_failed(
+            state,
+            store,
+            worktree_base,
+            "missing current-branch start commit metadata",
+        )
+        return False, False, None
+
+    commit_sha = state.review_isolated_fix_commit
+    committed = bool(commit_sha)
+    if commit_sha:
+        resolved_commit, commit_error = _resolve_git_commit(worktree_base, commit_sha)
+        if resolved_commit is None:
+            _mark_current_branch_delivery_failed(
+                state,
+                store,
+                worktree_base,
+                f"isolated fix commit '{commit_sha}' could not be resolved: {commit_error}",
+            )
+            return False, False, None
+        commit_sha = resolved_commit
+        reuse_error = _recorded_isolated_fix_reuse_error(worktree_base, commit_sha)
+        if reuse_error:
+            _mark_current_branch_delivery_failed(state, store, worktree_base, reuse_error)
+            return False, committed, commit_sha
+        state.result_commit = commit_sha
+        state.review_delivery_status = "committed"
+        state.review_delivery_result = f"isolated fix commit ready: {commit_sha}"
+        store.save(state)
+    else:
+        commit_ok, committed, commit_sha, error = _commit_worktree_changes(worktree_base, state, commit_msg=commit_msg)
+        if not commit_ok:
+            _mark_current_branch_delivery_failed(
+                state,
+                store,
+                worktree_base,
+                f"isolated fix commit failed: {error or 'git commit failed'}",
+            )
+            return False, False, None
+        if not committed:
+            isolated_head, _head_error = _resolve_git_commit(worktree_base, "HEAD")
+            if isolated_head and isolated_head != target_start_commit:
+                commit_sha = isolated_head
+                committed = True
+            else:
+                safety_error, _ = _current_branch_delivery_safety_error(
+                    git_root,
+                    target_branch,
+                    target_start_commit,
+                    clean_exclude_paths=clean_exclude_paths,
+                )
+                if safety_error:
+                    _mark_current_branch_delivery_failed(state, store, worktree_base, safety_error)
+                    return False, False, None
+                state.review_delivery_status = "no_changes"
+                state.review_delivery_result = "no changes to deliver"
+                state.record("sikula", "review_delivery", state.review_delivery_result)
+                store.save(state)
+                if _remove_delivered_worktree(state, store, git_root, worktree_base):
+                    return True, False, None
+                _mark_current_branch_delivery_failed(
+                    state,
+                    store,
+                    worktree_base,
+                    "worktree cleanup failed after no-change result",
+                )
+                return False, False, None
+        if not commit_sha:
+            _mark_current_branch_delivery_failed(
+                state,
+                store,
+                worktree_base,
+                "could not determine isolated fix commit",
+            )
+            return False, False, None
+        state.review_isolated_fix_commit = commit_sha
+        state.result_commit = commit_sha
+        state.review_delivery_status = "committed"
+        state.review_delivery_result = f"isolated fix commit created: {commit_sha}"
+        state.record("sikula", "review_delivery_committed", state.review_delivery_result)
+        store.save(state)
+
+    safety_error, current_head = _current_branch_delivery_safety_error(
+        git_root,
+        target_branch,
+        target_start_commit,
+        delivered_commit=commit_sha,
+        clean_exclude_paths=clean_exclude_paths,
+    )
+    if safety_error:
+        _mark_current_branch_delivery_failed(state, store, worktree_base, safety_error)
+        return False, committed, commit_sha
+    if current_head == commit_sha:
+        state.review_delivery_status = "delivered"
+        state.review_delivery_result = f"delivered {commit_sha} to {target_branch}"
+        state.record("sikula", "review_delivery_delivered", state.review_delivery_result)
+        store.save(state)
+        if not _remove_delivered_worktree(state, store, git_root, worktree_base):
+            state.record("sikula", "cleanup_failed", "current-branch review worktree cleanup failed")
+            state.review_delivery_result = f"{state.review_delivery_result}; worktree cleanup failed"
+            store.save(state)
+            log.warning("Could not remove delivered worktree: %s", worktree_base)
+        return True, committed, commit_sha
+
+    merge = subprocess.run(
+        ["git", "merge", "--ff-only", commit_sha],
+        capture_output=True,
+        text=True,
+        cwd=git_root,
+        check=False,
+    )
+    if merge.returncode != 0:
+        error = _short_audit_line(merge.stderr.strip() or merge.stdout.strip() or "git merge --ff-only failed")
+        _mark_current_branch_delivery_failed(state, store, worktree_base, f"fast-forward merge failed: {error}")
+        return False, committed, commit_sha
+
+    state.review_delivery_status = "delivered"
+    state.review_delivery_result = f"delivered {commit_sha} to {target_branch}"
+    state.record("sikula", "review_delivery_delivered", state.review_delivery_result)
+    store.save(state)
+    if not _remove_delivered_worktree(state, store, git_root, worktree_base):
+        state.record("sikula", "cleanup_failed", "current-branch review worktree cleanup failed")
+        state.review_delivery_result = f"{state.review_delivery_result}; worktree cleanup failed"
+        store.save(state)
+        log.warning("Could not remove delivered worktree: %s", worktree_base)
+    return True, committed, commit_sha
 
 
 def _worktree_dirty(worktree_base: Path) -> bool:
@@ -2910,6 +3322,8 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
     worktree_base: Path | None = None  # git root of the worktree (for git ops)
     leave_current_worktree_before_finalize = False
     already_terminal = False
+    current_branch_delivery_retry = False
+    delivery_failed = False
 
     if args.reset_failed:
         if not args.task_id:
@@ -3000,7 +3414,8 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
         if not state:
             print(f"Task {args.task_id} not found")
             sys.exit(1)
-        already_terminal = state.done or state.failed
+        current_branch_delivery_retry = _current_branch_delivery_needs_finalization(state)
+        already_terminal = (state.done or state.failed) and not current_branch_delivery_retry
         is_review_fix_resume = state.review_mode == "review_fix"
         if state.review_mode == "review_report" and not already_terminal:
             print(f"Task {args.task_id} is a report-only review task and cannot be resumed.")
@@ -3014,7 +3429,24 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
                 if saved_security_review is not None:
                     overrides["run_security_review"] = saved_security_review
 
-        if already_terminal:
+        if current_branch_delivery_retry:
+            if not state.worktree_base:
+                print(f"Task {args.task_id} has no worktree path recorded.")
+                print("It was likely cleaned up already, so current-branch delivery cannot be retried safely.")
+                sys.exit(1)
+            worktree_base = Path(state.worktree_base)
+            if not worktree_base.exists():
+                print(f"Worktree no longer exists: {worktree_base}")
+                print("Restore the worktree manually, or inspect the task state before deleting it.")
+                sys.exit(1)
+            if _path_is_within(Path.cwd(), worktree_base):
+                leave_current_worktree_before_finalize = True
+        elif _current_branch_delivery_cleaned(state):
+            print(f"Task {args.task_id} has no current-branch delivery worktree recorded.")
+            print("It was likely cleaned up already, so delivery cannot be retried safely.")
+            print(f"Use 'sikula show {args.task_id}' for audit, or start a new review-fix task.")
+            sys.exit(1)
+        elif already_terminal:
             pass
         elif state.worktree_path:
             wt = Path(state.worktree_path)
@@ -3037,14 +3469,15 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
             project_root = Path(cfg.get("project", {}).get("root_path") or original_project_root)
             _record_snapshot_asset_drift(state, project_root, store, phase="resume")
 
-        orch = build_orchestrator(cfg, overrides, state_store=store)
-        state = orch.run(task_id=args.task_id)
+        if not current_branch_delivery_retry:
+            orch = build_orchestrator(cfg, overrides, state_store=store)
+            state = orch.run(task_id=args.task_id)
 
     else:
         raise AssertionError("unreachable — task_file/task_id check is in main()")
 
     total_s = time.time() - t_start
-    if state.done and not already_terminal:
+    if state.done and not already_terminal and not current_branch_delivery_retry:
         project_root = Path(cfg.get("project", {}).get("root_path") or original_project_root)
         _record_asset_target_audit(state, project_root, store, phase="completion")
 
@@ -3055,17 +3488,34 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
         commit_msg = None
         if state.review_mode == "review_fix" and state.worktree_branch:
             commit_msg = f"sikula: review fixes for {state.worktree_branch}\n\nTask ID: {state.task_id}"
-        success, committed, _ = _finalize_worktree(worktree_base, git_root, state, commit_msg=commit_msg)
-        store.save(state)
-        if success:
-            state.worktree_path = None
-            state.worktree_base = None
-            store.save(state)
-            if committed:
-                log.info("Changes committed to branch %s", state.worktree_branch)
-            log.info("Worktree removed: %s", worktree_base)
+        if _current_branch_delivery_pending(state):
+            success, committed, _ = _deliver_current_branch_review_fix(
+                worktree_base,
+                git_root,
+                state,
+                store,
+                commit_msg=commit_msg or _default_worktree_commit_message(state),
+            )
+            delivery_failed = not success
         else:
-            log.warning("Could not finalize worktree — inspect manually: %s", worktree_base)
+            success, committed, _ = _finalize_worktree(worktree_base, git_root, state, commit_msg=commit_msg)
+            store.save(state)
+            if success:
+                state.worktree_path = None
+                state.worktree_base = None
+                store.save(state)
+                if committed:
+                    log.info("Changes committed to branch %s", state.worktree_branch)
+                log.info("Worktree removed: %s", worktree_base)
+            else:
+                log.warning("Could not finalize worktree — inspect manually: %s", worktree_base)
+        if _current_branch_delivery_terminal(state):
+            if committed:
+                log.info("Current-branch review fixes delivered to %s", state.worktree_branch)
+            else:
+                log.info("No fixes needed — worktree removed")
+        else:
+            delivery_failed = delivery_failed or _current_branch_delivery_pending(state)
     elif worktree_base and not state.done:
         log.info("Worktree preserved for inspection/resume: %s", worktree_base)
 
@@ -3078,9 +3528,9 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
 
     max_iter = cfg.get("sandbox", {}).get("max_iterations", 10)
     warning_count = _task_warning_count(state)
-    if state.done:
+    if state.done and not delivery_failed:
         status = f"✓ DONE with warnings ({warning_count})" if warning_count else "✓ DONE"
-    elif state.failed:
+    elif state.failed or delivery_failed:
         status = "✗ FAILED"
     else:
         status = "⚠ INCOMPLETE"
@@ -3116,7 +3566,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
     if state.errors:
         print(f"Errors:          {len(state.errors)} remaining (see: sikula show {state.task_id})")
 
-    sys.exit(0 if state.done else 1)
+    sys.exit(0 if state.done and not delivery_failed else 1)
 
 
 def _pid_running(pid: int) -> bool:
@@ -3128,6 +3578,10 @@ def _pid_running(pid: int) -> bool:
 
 
 def _status_label(state) -> str:
+    if _current_branch_delivery_needs_finalization(state):
+        return "delivery failed" if state.review_delivery_status == "failed" else "delivery pending"
+    if _current_branch_delivery_cleaned(state):
+        return "CLEANED"
     if state.done:
         return "DONE"
     if state.failed:
@@ -3233,6 +3687,8 @@ def _status_updated(state) -> str:
 
 
 def _status_next_action(state, status: str) -> str:
+    if _current_branch_delivery_needs_finalization(state):
+        return f"sikula run --task-id {state.task_id}"
     if status == "DONE":
         return "review branch" if state.worktree_branch else "review changes"
     if status == "FAILED":
@@ -3282,6 +3738,8 @@ def _status_matches(row: dict, filters: set[str]) -> bool:
         return True
     status = row["status"].lower().replace(" ", "_")
     if status in filters:
+        return True
+    if "failed" in filters and status == "delivery_failed":
         return True
     if "active" in filters and row["status"] not in {"DONE", "FAILED", "CLEANED"}:
         return True
@@ -3428,8 +3886,21 @@ def _print_review_summary(
     print(f"Files:   {len(state.files_changed)} changed")
     print(f"Time:    {_fmt_time(total_s)}")
     print(f"{'=' * 60}")
-    approved = state.review_approved and (state.security_approved if run_security_review else True)
-    print(f"Result:  {'APPROVED' if approved else 'ISSUES FOUND'}")
+    delivery_pending = _current_branch_delivery_needs_finalization(state)
+    delivery_cleaned = _current_branch_delivery_cleaned(state)
+    approved = (
+        state.review_approved
+        and (state.security_approved if run_security_review else True)
+        and not delivery_pending
+        and not delivery_cleaned
+    )
+    if delivery_pending:
+        result = "DELIVERY FAILED" if state.review_delivery_status == "failed" else "DELIVERY PENDING"
+    elif delivery_cleaned:
+        result = "DELIVERY CLEANED"
+    else:
+        result = "APPROVED" if approved else "ISSUES FOUND"
+    print(f"Result:  {result}")
     _print_task_audit_report(state)
     print(f"\nState ID: {state.task_id}  (sikula show {state.task_id})")
 
@@ -3627,6 +4098,10 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
 
     from core.state import JsonStateStore, TaskState, runtime_metadata_snapshot
 
+    if getattr(args, "current_branch", False) and not args.fix:
+        print("Error: --current-branch is only valid with sikula review --fix.")
+        sys.exit(1)
+
     build_tool = cfg.get("project", {}).get("build_tool")
     if args.fix and build_tool not in _SUPPORTED_BUILD_TOOLS:
         supported = ", ".join(sorted(_SUPPORTED_BUILD_TOOLS))
@@ -3657,8 +4132,10 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
         print("Error: review description is empty.")
         sys.exit(1)
 
+    current_branch_mode = getattr(args, "current_branch", False)
     branch = args.branch
     base_branch = args.base_branch
+    target_start_commit: str | None = None
     original_project_root = Path(cfg["project"]["root_path"]).resolve()
 
     git_root = _find_git_root(original_project_root)
@@ -3668,21 +4145,55 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
         sys.exit(1)
 
     _ensure_gitignore(git_root)
+
+    if current_branch_mode:
+        branch_name, branch_error = _current_branch_name(git_root)
+        if branch_error == "detached":
+            print("Error: --current-branch requires a named current branch; HEAD is detached.")
+            sys.exit(1)
+        if branch_name is None:
+            print("Error: could not determine the current branch for --current-branch.")
+            sys.exit(1)
+        branch = branch_name
+
+        staged, unstaged, untracked, clean_error = _current_worktree_changes(git_root)
+        if staged or unstaged or untracked or clean_error:
+            _print_current_branch_clean_error(staged, unstaged, untracked, clean_error)
+            sys.exit(1)
+
+        resolved_base_commit, base_error = _resolve_git_commit(git_root, base_branch)
+        if resolved_base_commit is None:
+            print(f"Error: base branch/ref '{base_branch}' could not be resolved: {base_error}")
+            sys.exit(1)
+
+        target_start_commit, head_error = _resolve_git_commit(git_root, "HEAD")
+        if target_start_commit is None:
+            print(f"Error: could not resolve HEAD for --current-branch: {head_error}")
+            sys.exit(1)
+
     task_id = uuid.uuid4().hex
     worktree_base = git_root / ".sikula" / "worktrees" / task_id
     worktree_base.parent.mkdir(parents=True, exist_ok=True)
 
     if args.fix:
-        # Fix mode writes commits back to the branch — use a real branch checkout so that
-        # _finalize_worktree advances the branch ref.  If the branch is already checked out
-        # in the caller's worktree, git worktree add will fail with a clear error; the user
-        # should switch away first (e.g. git checkout main).
-        r = subprocess.run(
-            ["git", "worktree", "add", str(worktree_base), branch],
-            capture_output=True,
-            text=True,
-            cwd=git_root,
-        )
+        if current_branch_mode:
+            r = subprocess.run(
+                ["git", "worktree", "add", "--detach", str(worktree_base), target_start_commit],
+                capture_output=True,
+                text=True,
+                cwd=git_root,
+            )
+        else:
+            # Fix mode writes commits back to the branch — use a real branch checkout so that
+            # _finalize_worktree advances the branch ref.  If the branch is already checked out
+            # in the caller's worktree, git worktree add will fail with a clear error; the user
+            # should switch away first (e.g. git checkout main).
+            r = subprocess.run(
+                ["git", "worktree", "add", str(worktree_base), branch],
+                capture_output=True,
+                text=True,
+                cwd=git_root,
+            )
         if r.returncode != 0:
             print(_worktree_error_message(branch, r.stderr.strip()))
             sys.exit(1)
@@ -3722,21 +4233,22 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
                 shutil.copy2(src, dst)
                 log.info("Copied %s to worktree", name)
 
-    # Compute three-dot diff: all commits introduced by branch vs base
+    # Compute three-dot diff: all commits introduced by the selected target vs base
+    diff_target = "HEAD" if current_branch_mode else branch
     diff_r = subprocess.run(
-        ["git", "diff", f"{base_branch}...{branch}"],
+        ["git", "diff", f"{base_branch}...{diff_target}"],
         capture_output=True,
         text=True,
         cwd=git_root,
     )
     if diff_r.returncode != 0:
-        print(f"Failed to compute diff between '{base_branch}' and '{branch}': {diff_r.stderr.strip()}")
+        print(f"Failed to compute diff between '{base_branch}' and '{diff_target}': {diff_r.stderr.strip()}")
         subprocess.run(["git", "worktree", "remove", str(worktree_base)], cwd=git_root, check=False)
         sys.exit(1)
     review_diff = diff_r.stdout
 
     files_r = subprocess.run(
-        ["git", "diff", "--name-only", f"{base_branch}...{branch}"],
+        ["git", "diff", "--name-only", f"{base_branch}...{diff_target}"],
         capture_output=True,
         text=True,
         cwd=git_root,
@@ -3760,6 +4272,10 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
         review_diff=review_diff,
         review_mode="review_fix" if args.fix else "review_report",
         review_base_branch=base_branch,
+        review_delivery_mode="current_branch" if current_branch_mode else None,
+        review_target_branch=branch if current_branch_mode else None,
+        review_target_start_commit=target_start_commit if current_branch_mode else None,
+        review_delivery_status="pending" if current_branch_mode else None,
         plan_decided=True,
         worktree_path=str(worktree_project_root),
         worktree_base=str(worktree_base),
@@ -3804,15 +4320,29 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
 
         if state.done:
             fix_msg = f"sikula: review fixes for {branch}\n\nTask ID: {state.task_id}"
-            success, committed, _ = _finalize_worktree(worktree_base, git_root, state, commit_msg=fix_msg)
-            store.save(state)
-            if success:
-                if committed:
-                    log.info("Changes committed to branch %s", branch)
-                else:
-                    log.info("No fixes needed — worktree removed")
+            if current_branch_mode:
+                success, committed, _ = _deliver_current_branch_review_fix(
+                    worktree_base,
+                    git_root,
+                    state,
+                    store,
+                    commit_msg=fix_msg,
+                )
+                if success:
+                    if committed:
+                        log.info("Current-branch review fixes delivered to %s", branch)
+                    else:
+                        log.info("No fixes needed — worktree removed")
             else:
-                log.warning("Could not finalize worktree — inspect manually: %s", worktree_base)
+                success, committed, _ = _finalize_worktree(worktree_base, git_root, state, commit_msg=fix_msg)
+                store.save(state)
+                if success:
+                    if committed:
+                        log.info("Changes committed to branch %s", branch)
+                    else:
+                        log.info("No fixes needed — worktree removed")
+                else:
+                    log.warning("Could not finalize worktree — inspect manually: %s", worktree_base)
         else:
             log.info("Worktree preserved for inspection/resume: %s", worktree_base)
     else:
@@ -3836,7 +4366,11 @@ def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
             t_start=t_start,
         )
 
-    approved = state.review_approved and (state.security_approved if run_security_review else True)
+    approved = (
+        state.review_approved
+        and (state.security_approved if run_security_review else True)
+        and not _current_branch_delivery_needs_finalization(state)
+    )
     _print_review_summary(state, branch, base_branch, total_s, run_security_review=run_security_review)
     sys.exit(0 if approved else 1)
 
@@ -4786,7 +5320,14 @@ def main() -> None:
     )
 
     review_p = sub.add_parser("review", help="Review an existing branch (report-only or --fix)")
-    review_p.add_argument("--branch", required=True, help="Branch to review (must already exist)")
+    review_target = review_p.add_mutually_exclusive_group(required=True)
+    review_target.add_argument("--branch", help="Branch to review (must already exist)")
+    review_target.add_argument(
+        "--current-branch",
+        action="store_true",
+        default=False,
+        help="Use the currently checked-out branch as the review-fix target; only valid with --fix",
+    )
     review_p.add_argument("--base-branch", default="main", help="Base branch to diff against (default: main)")
     review_context = review_p.add_mutually_exclusive_group(required=True)
     review_context.add_argument(

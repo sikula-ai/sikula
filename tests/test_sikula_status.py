@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _sikula = importlib.import_module("sikula")
 cmd_status = _sikula.cmd_status
 _pid_running = _sikula._pid_running
@@ -355,6 +357,95 @@ class TestCmdStatusOutput:
         assert rows[0]["status"] == "FAILED"
         assert rows[0]["next_action"] == "sikula contract check .sikula/tasks/my-task.md --write-report"
 
+    @pytest.mark.parametrize(
+        ("delivery_status", "expected_status"),
+        [
+            (None, "delivery pending"),
+            ("pending", "delivery pending"),
+            ("committed", "delivery pending"),
+            ("failed", "delivery failed"),
+        ],
+    )
+    def test_status_json_current_branch_delivery_needs_retry_action(
+        self,
+        tmp_path: Path,
+        capsys,
+        delivery_status: str | None,
+        expected_status: str,
+    ):
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        s = TaskState(
+            task_id="t1",
+            task_description="Review branch changes",
+            done=True,
+            review_mode="review_fix",
+            review_delivery_mode="current_branch",
+            review_delivery_status=delivery_status,
+            worktree_path=str(tmp_path / "worktree"),
+            worktree_base=str(tmp_path / "worktree"),
+            worktree_branch="feature/current",
+        )
+        store.save(s)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=True, verbose=False, status_filter=[]))
+
+        rows = json.loads(capsys.readouterr().out)
+        assert rows[0]["status"] == expected_status
+        assert rows[0]["next_action"] == "sikula run --task-id t1"
+
+    def test_status_json_cleaned_current_branch_delivery_is_audit_only(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        s = TaskState(
+            task_id="t1",
+            task_description="Review branch changes",
+            done=True,
+            review_mode="review_fix",
+            review_delivery_mode="current_branch",
+            review_delivery_status="failed",
+            worktree_branch="feature/current",
+        )
+        store.save(s)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=True, verbose=False, status_filter=[]))
+
+        rows = json.loads(capsys.readouterr().out)
+        assert rows[0]["status"] == "CLEANED"
+        assert rows[0]["next_action"] == "sikula show t1"
+
+    @pytest.mark.parametrize("delivery_status", ["delivered", "no_changes"])
+    def test_status_json_current_branch_terminal_delivery_is_done(
+        self,
+        tmp_path: Path,
+        capsys,
+        delivery_status: str,
+    ):
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        s = TaskState(
+            task_id="t1",
+            task_description="Review branch changes",
+            done=True,
+            review_mode="review_fix",
+            review_delivery_mode="current_branch",
+            review_delivery_status=delivery_status,
+            worktree_branch="feature/current",
+        )
+        store.save(s)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=True, verbose=False, status_filter=[]))
+
+        rows = json.loads(capsys.readouterr().out)
+        assert rows[0]["status"] == "DONE"
+        assert rows[0]["next_action"] == "review branch"
+
     def test_status_json_includes_active_operation_when_present(self, tmp_path: Path, capsys):
         import os
         from core.state import JsonStateStore, TaskState
@@ -393,4 +484,30 @@ class TestCmdStatusOutput:
         out = capsys.readouterr().out
         assert "active task" in out
         assert "failed task" in out
+        assert "done task" not in out
+
+    def test_failed_filter_includes_current_branch_delivery_failed(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        delivery_failed = TaskState(
+            task_id="delivery",
+            task_description="current branch task",
+            done=True,
+            review_mode="review_fix",
+            review_delivery_mode="current_branch",
+            review_delivery_status="failed",
+            worktree_path=str(tmp_path / "worktree"),
+            worktree_base=str(tmp_path / "worktree"),
+        )
+        done = TaskState(task_id="done", task_description="done task", done=True)
+        for state in [delivery_failed, done]:
+            store.save(state)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=False, verbose=False, status_filter=["failed"]))
+
+        out = capsys.readouterr().out
+        assert "current branch task" in out
+        assert "delivery failed" in out
         assert "done task" not in out
