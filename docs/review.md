@@ -61,6 +61,56 @@ If the task reaches terminal failed state, reset the failed marker before retryi
 sikula run --task-id <task-id> --reset-failed
 ```
 
+## Current-Branch Fix Mode
+
+Use current-branch mode when you are already on the branch Sikula should review
+and fix:
+
+```bash
+sikula review \
+  --fix \
+  --current-branch \
+  --base-branch main \
+  --description-file pr.md
+```
+
+`--current-branch` is valid only with `--fix` and is mutually exclusive with
+`--branch`. Sikula uses the currently checked-out branch as the review target
+and final delivery target.
+
+Before agents start, Sikula fails clearly if:
+
+- `HEAD` is detached or the current branch cannot be determined
+- the current worktree has staged, unstaged, or untracked changes
+- the base branch or ref cannot be resolved
+
+Current-branch fix mode still keeps write-capable agent work out of the
+operator's checkout. Sikula records the current branch and starting `HEAD`,
+creates an isolated detached worktree at that commit, computes the initial diff
+as `<base>...HEAD`, and runs the normal review-fix orchestrator loop there. It
+does not switch branches and does not check out the target branch into a second
+worktree.
+
+On success, Sikula commits fixes inside the isolated worktree first. It then
+rechecks that the operator is still on the original branch, the operator's
+worktree is clean, and the branch `HEAD` is still the recorded starting commit.
+Only then does it deliver with a safe fast-forward. Sikula does not push, create
+pull requests, or mutate remotes.
+
+If delivery cannot be completed safely, the isolated worktree is preserved and
+the task remains retryable:
+
+```bash
+sikula run --task-id <task-id>
+```
+
+If the preserved worktree is intentionally removed with `sikula cleanup --force`,
+the task remains available for audit through `sikula show <task-id>`, but the
+delivery can no longer be retried from that state.
+
+Use `--reset-failed` only after a terminal failed state, as with other
+`review --fix` tasks.
+
 ## Review Context
 
 `--description` or `--description-file` is required. Treat it like a PR description: explain what changed, why it changed, and what reviewers should care about.

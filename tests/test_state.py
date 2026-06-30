@@ -6,9 +6,21 @@ import json
 import threading
 from pathlib import Path
 
+import pytest
 
 import core.state as state_module
 from core.state import JsonStateStore, TaskState
+
+
+_REVIEW_DELIVERY_FIELD_VALUES = (
+    ("review_delivery_mode", "current_branch"),
+    ("review_target_branch", "feature/current-branch"),
+    ("review_target_start_commit", "1111111111111111111111111111111111111111"),
+    ("review_isolated_fix_commit", "2222222222222222222222222222222222222222"),
+    ("review_delivery_status", "delivered"),
+    ("review_delivery_result", "Delivered by fast-forward"),
+)
+_REVIEW_DELIVERY_FIELDS = tuple(field_name for field_name, _ in _REVIEW_DELIVERY_FIELD_VALUES)
 
 
 class _NonReentrantLock:
@@ -58,6 +70,14 @@ class TestTaskStateRecord:
         assert len(state.history) == 2
 
 
+class TestTaskStateReviewDeliveryMetadata:
+    @pytest.mark.parametrize("field_name", _REVIEW_DELIVERY_FIELDS)
+    def test_review_delivery_fields_default_to_none(self, field_name: str):
+        state = TaskState(task_id="t1", task_description="task")
+
+        assert getattr(state, field_name) is None
+
+
 class TestJsonStateStore:
     def test_create_returns_saved_state(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
@@ -90,6 +110,18 @@ class TestJsonStateStore:
         assert loaded.test_writer_audit_agent_completed is True
         assert loaded.test_writer_audit_files_written == ["tests/LoginTest.py"]
         assert loaded.test_writer_audit_gate_counts == {"tests/LoginTest.py": {"skip:abc123": 1}}
+
+    @pytest.mark.parametrize(("field_name", "value"), _REVIEW_DELIVERY_FIELD_VALUES)
+    def test_review_delivery_fields_round_trip(self, tmp_path: Path, field_name: str, value: str):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="delivery1", task_description="review delivery task")
+        setattr(state, field_name, value)
+
+        store.save(state)
+        loaded = store.load("delivery1")
+
+        assert loaded is not None
+        assert getattr(loaded, field_name) == value
 
     def test_text_snapshots_are_stored_outside_task_json(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
@@ -248,6 +280,21 @@ class TestJsonStateStore:
         assert loaded.test_execution_gate_records == []
         assert loaded.build_loop_key is None
         assert loaded.build_loop_start_iteration == 0
+
+    @pytest.mark.parametrize("field_name", _REVIEW_DELIVERY_FIELDS)
+    def test_load_old_state_without_review_delivery_field_defaults_to_none(self, tmp_path: Path, field_name: str):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="olddelivery1", task_description="old review delivery task")
+        store.save(state)
+        path = tmp_path / "olddelivery1.json"
+        data = json.loads(path.read_text())
+        data.pop(field_name, None)
+        path.write_text(json.dumps(data))
+
+        loaded = store.load("olddelivery1")
+
+        assert loaded is not None
+        assert getattr(loaded, field_name) is None
 
     def test_record_implementation_assets_sanitizes_records(self):
         state = TaskState(task_id="assets1", task_description="asset task")
@@ -537,6 +584,37 @@ class TestJsonStateStore:
 
         assert state_module._terminal_result(state) == "incomplete"
 
+    @pytest.mark.parametrize(
+        ("done", "failed", "delivery_status", "expected_result"),
+        [
+            (True, False, None, "incomplete"),
+            (True, False, "pending", "incomplete"),
+            (True, False, "committed", "incomplete"),
+            (True, False, "failed", "failed"),
+            (True, True, "pending", "failed"),
+            (True, False, "delivered", "done"),
+            (True, False, "no_changes", "done"),
+        ],
+    )
+    def test_terminal_result_accounts_for_current_branch_delivery_status(
+        self,
+        done: bool,
+        failed: bool,
+        delivery_status: str | None,
+        expected_result: str,
+    ):
+        state = TaskState(
+            task_id="summary_delivery_status",
+            task_description="review delivery task",
+            done=done,
+            failed=failed,
+            review_mode="review_fix",
+            review_delivery_mode="current_branch",
+            review_delivery_status=delivery_status,
+        )
+
+        assert state_module._terminal_result(state) == expected_result
+
     def test_load_returns_none_for_missing_id(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
         assert store.load("nonexistent") is None
@@ -743,6 +821,103 @@ class TestJsonStateStore:
         assert reloaded is not None
         assert reloaded.finished_at == "2026-01-01T00:00:00Z"
 
+    @pytest.mark.parametrize("delivery_status", [None, "pending", "committed"])
+    def test_finished_at_deferred_for_incomplete_current_branch_delivery(
+        self, tmp_path: Path, delivery_status: str | None
+    ):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(
+            task_id="current_branch_incomplete",
+            task_description="current branch delivery task",
+            done=True,
+            review_mode="review_fix",
+            review_delivery_mode="current_branch",
+            review_delivery_status=delivery_status,
+        )
+
+        store.save(state)
+        loaded = store.load("current_branch_incomplete")
+
+        assert loaded is not None
+        assert loaded.finished_at is None
+        assert loaded.final_summary == {}
+
+    def test_incomplete_current_branch_delivery_clears_stale_audit_metadata(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(
+            task_id="current_branch_stale_audit",
+            task_description="current branch delivery task",
+            done=True,
+            review_mode="review_fix",
+            review_delivery_mode="current_branch",
+            review_delivery_status="pending",
+            finished_at="2026-01-01T00:00:00Z",
+            final_summary={"result": "done"},
+        )
+
+        store.save(state)
+        loaded = store.load("current_branch_stale_audit")
+
+        assert loaded is not None
+        assert loaded.finished_at is None
+        assert loaded.final_summary == {}
+
+    @pytest.mark.parametrize(
+        ("delivery_status", "expected_result"),
+        [
+            ("failed", "failed"),
+            ("delivered", "done"),
+            ("no_changes", "done"),
+        ],
+    )
+    def test_finished_at_set_for_terminal_current_branch_delivery(
+        self,
+        tmp_path: Path,
+        delivery_status: str,
+        expected_result: str,
+    ):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(
+            task_id=f"current_branch_{delivery_status}",
+            task_description="current branch delivery task",
+            done=True,
+            review_mode="review_fix",
+            review_delivery_mode="current_branch",
+            review_delivery_status=delivery_status,
+        )
+
+        store.save(state)
+        loaded = store.load(f"current_branch_{delivery_status}")
+
+        assert loaded is not None
+        assert loaded.finished_at is not None
+        assert loaded.final_summary["result"] == expected_result
+
+    def test_finished_at_set_when_current_branch_delivery_later_completes(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(
+            task_id="current_branch_later_delivered",
+            task_description="current branch delivery task",
+            done=True,
+            review_mode="review_fix",
+            review_delivery_mode="current_branch",
+            review_delivery_status="pending",
+        )
+        store.save(state)
+        loaded = store.load("current_branch_later_delivered")
+
+        assert loaded is not None
+        assert loaded.finished_at is None
+        assert loaded.final_summary == {}
+
+        loaded.review_delivery_status = "delivered"
+        store.save(loaded)
+        reloaded = store.load("current_branch_later_delivered")
+
+        assert reloaded is not None
+        assert reloaded.finished_at is not None
+        assert reloaded.final_summary["result"] == "done"
+
     def test_final_audit_fields_round_trip(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
         state = TaskState(
@@ -841,6 +1016,68 @@ class TestJsonStateStore:
         assert loaded.final_summary["implementation_asset_target_warnings_count"] == 1
         assert loaded.final_summary["planner_retries_count"] == 0
         assert loaded.final_summary["llm_retries"] == 1
+
+    @pytest.mark.parametrize("field_name", _REVIEW_DELIVERY_FIELDS)
+    def test_final_summary_includes_empty_review_delivery_metadata(self, tmp_path: Path, field_name: str):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="summary_empty_delivery", task_description="summary task", done=True)
+
+        store.save(state)
+        loaded = store.load("summary_empty_delivery")
+
+        assert loaded is not None
+        assert loaded.final_summary[field_name] is None
+
+    def test_final_summary_includes_review_delivery_metadata(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="summary_delivery", task_description="summary task", done=True)
+        for field_name, value in _REVIEW_DELIVERY_FIELD_VALUES:
+            setattr(state, field_name, value)
+
+        store.save(state)
+        loaded = store.load("summary_delivery")
+
+        assert loaded is not None
+        for field_name, value in _REVIEW_DELIVERY_FIELD_VALUES:
+            assert loaded.final_summary[field_name] == value
+
+    @pytest.mark.parametrize(
+        ("delivery_status", "expected_result"),
+        [
+            (None, "incomplete"),
+            ("pending", "incomplete"),
+            ("committed", "incomplete"),
+            ("failed", "failed"),
+            ("delivered", "done"),
+            ("no_changes", "done"),
+        ],
+    )
+    def test_final_summary_result_accounts_for_current_branch_delivery_status(
+        self,
+        tmp_path: Path,
+        delivery_status: str | None,
+        expected_result: str,
+    ):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(
+            task_id="summary_delivery_result",
+            task_description="summary task",
+            done=True,
+            review_mode="review_fix",
+            review_delivery_mode="current_branch",
+            review_delivery_status=delivery_status,
+        )
+
+        store.save(state)
+        loaded = store.load("summary_delivery_result")
+
+        assert loaded is not None
+        if expected_result == "incomplete":
+            assert loaded.final_summary == {}
+            assert loaded.finished_at is None
+        else:
+            assert loaded.final_summary["result"] == expected_result
+            assert loaded.finished_at is not None
 
     def test_final_summary_counts_planner_retries(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)

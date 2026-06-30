@@ -151,6 +151,21 @@ sikula review \
 
 Use this when code already exists and you want an independent review/security gate before merge. See [Reviewing Branches](docs/review.md) for report-only mode, `--fix`, security review, and CI usage.
 
+When you are already on the branch you want Sikula to fix, use current-branch
+fix mode:
+
+```bash
+sikula review \
+  --fix \
+  --current-branch \
+  --base-branch main \
+  --description-file pr.md
+```
+
+This keeps write-capable agent work in an isolated Sikula worktree, then
+fast-forwards the originally current branch only after review, validation, and
+delivery safety checks pass.
+
 ## Common First-Run Issues
 
 - **`pipx: command not found`** - install `pipx` from <https://pipx.pypa.io/stable/installation/>.

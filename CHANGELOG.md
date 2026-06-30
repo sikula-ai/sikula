@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- **Review Fix Current Branch**: Added `sikula review --fix --current-branch` so operators can apply review fixes to the currently checked-out branch while Sikula keeps write-capable agent work in an isolated worktree, delivers by local fast-forward only after safety checks pass, and never pushes or opens pull requests.
+
 ## [0.3.0] - 2026-06-29
 
 ### Added

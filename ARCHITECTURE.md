@@ -436,15 +436,22 @@ cmd_review()
    ├─ worktree creation (differs by mode):
    │    report-only: git worktree add --detach .sikula/worktrees/<task_id> <sha>
    │                 (detached HEAD — works even when caller is on the reviewed branch)
-   │    --fix:       git worktree add .sikula/worktrees/<task_id> <branch>
-   │                 (real branch checkout — required so _finalize_worktree can commit)
+   │    --fix --branch:
+   │                 git worktree add .sikula/worktrees/<task_id> <branch>
+   │                 (real branch checkout — _finalize_worktree commits to <branch>)
    │                 + copy gitignored build files via BuildTool.env_files()
    │                   (e.g. local.properties on Android — same as cmd_run())
+   │    --fix --current-branch:
+   │                 guard: current branch is named, current worktree is clean,
+   │                        base ref resolves, and HEAD resolves
+   │                 git worktree add --detach .sikula/worktrees/<task_id> <start_head>
+   │                 (detached isolated worktree — avoids checking out the active branch twice)
+   │                 + copy gitignored build files via BuildTool.env_files()
    │
-   ├─ git diff <base_branch>...<branch>  →  state.review_diff
+   ├─ git diff <base_branch>...<target>  →  state.review_diff
    │    (initial three-dot diff: all commits introduced by branch)
    │
-   ├─ git diff --name-only <base_branch>...<branch>  →  state.files_changed
+   ├─ git diff --name-only <base_branch>...<target>  →  state.files_changed
    │
    ├─ guard: no files changed → worktree removed, exit 0
    │
@@ -455,6 +462,7 @@ cmd_review()
         review_mode           = "review_fix" or "review_report"
         review_base_branch    = <base_branch>
         files_changed         = <list of changed files>
+        current-branch fields = populated only for --fix --current-branch
 ```
 
 After state creation, `cmd_review()` asks a read-only enrichment agent to inspect the
@@ -509,15 +517,37 @@ final reviewer/security-reviewer validation pass over the refreshed diff. That p
 validation-only: if it rejects the test-writer changes, the task fails instead of
 starting another review → fix → test-write cycle.
 
+For `--fix --current-branch`, the current checkout is the review and delivery
+target but not the writeable agent workspace. Sikula records the target branch
+and starting commit in task state, runs the normal review-fix loop in the
+detached isolated worktree, commits fixes there, then revalidates the original
+checkout before delivery. Delivery requires the operator to still be on the
+target branch, the current worktree to be clean, and `HEAD` to equal the
+recorded starting commit. If those checks pass, Sikula runs `git merge
+--ff-only <isolated_fix_commit>` from the original checkout. If they fail, or
+the fast-forward fails, `review_delivery_status` becomes `"failed"` and the
+isolated worktree is preserved for inspection or retry. A pending or failed
+current-branch delivery is retried with `sikula run --task-id <task_id>` without
+rerunning the agents; terminal failed tasks still require `--reset-failed`.
+
 ```
    Orchestrator.run()
       │
       ├─ state.done = True, files changed →
-      │     git commit to <branch>: "sikula: review fixes for <branch>"
-      │     worktree removed
+      │     --branch:
+      │        git commit to <branch>: "sikula: review fixes for <branch>"
+      │        worktree removed
+      │     --current-branch:
+      │        git commit in detached isolated worktree
+      │        verify original checkout branch/cleanliness/start HEAD
+      │        git merge --ff-only <isolated_fix_commit>
+      │        worktree removed after delivery
       │
       ├─ state.done = True, no files changed →
-      │     worktree removed ("no fixes needed")
+      │     --branch: worktree removed ("no fixes needed")
+      │     --current-branch: verify original checkout branch/cleanliness/start HEAD,
+      │                       mark review_delivery_status = "no_changes",
+      │                       then remove worktree
       │
       └─ state.done = False (failure) →
             worktree preserved at .sikula/worktrees/<task_id>/
@@ -535,6 +565,12 @@ starting another review → fix → test-write cycle.
 | Planner | Per config | Always disabled (`plan_decided = True` on state creation) |
 | Resume | Supported via `--task-id` | Report-only review is not reset or resumed; `review --fix` uses regular task resume (`--reset-failed` required for terminal failed state) |
 | Report-only path | No | Yes — bypasses orchestrator entirely |
+
+In current-branch review-fix mode, the `cmd_review()` branch column is the
+operator's current branch, but the isolated task worktree is detached at the
+recorded starting commit. This preserves the same inspect/resume boundary as
+other Sikula worktree runs while avoiding a second checkout of the active
+branch.
 
 ---
 
@@ -1305,6 +1341,12 @@ Sikula processes at once is still unsupported.
 | `review_diff` | `str \| None` | `cmd_review()` in `sikula.py` / Orchestrator | PR-style diff passed to ReviewerAgent and SecurityReviewerAgent; initially set to `git diff base...branch` (three-dot) in `sikula review` mode; refreshed in `"review_fix"` mode before reviewer/security-reviewer calls so uncommitted fixes are included; `None` in standard `sikula run` flow (agents fall back to `GitTool.diff_head()`) |
 | `review_mode` | `str \| None` | `cmd_review()` in `sikula.py` | Review task kind: `"review_report"` for report-only review (not reset or resumable) or `"review_fix"` for `sikula review --fix` (resumable via `sikula run --task-id`) |
 | `review_base_branch` | `str \| None` | `cmd_review()` in `sikula.py` | Base branch used to refresh `review_diff` in `"review_fix"` mode. Report-only review keeps the original frozen diff; review-fix refreshes against the merge base before reviewer/security-reviewer calls so fixes are reviewed against the current branch state. |
+| `review_delivery_mode` | `str \| None` | `cmd_review()` / `cmd_run()` in `sikula.py` | Review-fix delivery strategy metadata. `None` for report-only review, normal `--branch` review-fix, and standard task runs. `"current_branch"` for `sikula review --fix --current-branch`; this tells resume/finalization to deliver the isolated fix commit back to the originally current branch instead of treating `worktree_branch` as a checked-out delivery branch. |
+| `review_target_branch` | `str \| None` | `cmd_review()` in `sikula.py` | Named branch that was current when `--current-branch` started. Delivery and retry require the operator's checkout to still be on this branch before fast-forwarding or declaring a no-change result. |
+| `review_target_start_commit` | `str \| None` | `cmd_review()` in `sikula.py` | Commit SHA for the target branch `HEAD` captured before creating the detached isolated worktree. Current-branch delivery requires the target branch to still point at this commit unless it already equals the delivered commit. |
+| `review_isolated_fix_commit` | `str \| None` | `_deliver_current_branch_review_fix()` in `sikula.py` | Commit SHA created in the detached isolated worktree for current-branch review fixes. Persisted so `sikula run --task-id` can retry delivery without rerunning agents or creating a second isolated commit. |
+| `review_delivery_status` | `str \| None` | `cmd_review()` / `cmd_run()` in `sikula.py` | Current-branch delivery state. `None` outside current-branch review-fix. `"pending"` means agents have not produced a terminal delivery result yet; `"committed"` means an isolated fix commit exists and delivery can be retried; `"failed"` means delivery safety checks, commit creation, fast-forward, or cleanup failed and the worktree is preserved; `"delivered"` means the target branch has the isolated fix commit; `"no_changes"` means agents produced no changes after safety checks passed. `"delivered"` and `"no_changes"` are terminal delivery states. |
+| `review_delivery_result` | `str \| None` | `cmd_review()` / `cmd_run()` in `sikula.py` | Short human-readable audit result for current-branch delivery, including failure reasons and delivered/no-change summaries. It is for status, `sikula show`, and final summary reporting only; it must not replace the explicit status field for control-flow decisions. |
 | `implement_cycle_records` | `list[dict]` | ImplementerAgent | Structured observability — one entry per implementer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = review/security fix after a post-fixer validation pass), `review_iteration` (`0` = initial or security fix; `>0` = review fix pass N), `security_review_iteration` (`0` = initial or review fix; `>0` = security fix pass N), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `step_description`, `implementer_prompt`, `implementer_output` (`None` on exception), `files_written`, `timestamp`; both iteration counters `== 0` and `build_iteration == 0` means initial implementation; never read for pipeline decisions. **Correlation note:** to find the reviewer record that triggered this implementer, look for a `review_cycle_records` entry with the same `step`, `build_iteration`, and `review_iteration: N-1` |
 | `review_cycle_records` | `list[dict]` | ReviewerAgent | Structured observability — one entry per reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = after a post-fixer validation pass), `review_iteration` (fix-pass index within this step's review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, reviewer history is limited to earlier final full-task reviews, not step-scoped reviews. **Correlation note:** a reviewer record with `review_iteration: N` that found issues triggered the implementer record with `review_iteration: N+1` — the orchestrator increments the counter before calling the implementer |
 | `security_review_cycle_records` | `list[dict]` | SecurityReviewerAgent | Structured observability — one entry per security reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = after a post-fixer validation pass), `security_review_iteration` (fix-pass index within this step's security review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the security reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, security history is limited to earlier final full-task security reviews. **Migration note:** state files from schema version 1 stored security reviewer entries inside `review_cycle_records` with `reviewer = "security_reviewer"`; `JsonStateStore.load()` moves them here and removes the redundant `reviewer` field. |
@@ -1330,10 +1372,10 @@ Sikula processes at once is still unsupported.
 | `result_commit` | `str \| None` | `_finalize_worktree()` in `sikula.py` | Commit SHA created by Sikula when an isolated `run` or `review --fix` task finalizes with file changes; `None` for report-only review, `--no-isolate`, or runs with no commit to create |
 | `history` | `list[dict]` | `state.record()` | Append-only audit log: agent, action, result, timestamp, elapsed_s, plus action-specific entries such as `llm_retry` provider/model/attempt fields and `write_path_warning` write-scope audit messages; in step mode, `step_start` / `step_done` orchestrator entries delimit each step's events |
 | `runtime_metadata` | `dict` | `StateStore.create()` / `cmd_review()` | Runtime snapshot captured when the task state is created: Sikula package version when available, Python version, platform, system, and machine. Used for later debugging only |
-| `final_summary` | `dict` | `JsonStateStore.save()` | Compact terminal summary written when `done` or `failed` is reached: result, branch, commit, build/test/check status, counts for files, validation records, fix attempts, review records, test-writer runs, test audit records, LLM retries, history events, timestamps, and wall elapsed time when available. The CLI also derives a human-readable completion report from the same state, including validation status, review status, audit warnings, sampled unique testability gap details, and recovered issues. |
+| `final_summary` | `dict` | `JsonStateStore.save()` | Compact terminal summary written when the state reaches an audit-terminal result: normal `done` / `failed`, or for current-branch review-fix delivery only after `review_delivery_status` becomes `"delivered"`, `"no_changes"`, or `"failed"`. Pending/committed current-branch delivery keeps this empty so audit timing reflects delivery completion, not just orchestrator completion. The summary includes result, branch, commit, build/test/check status, counts for files, validation records, fix attempts, review records, test-writer runs, test audit records, LLM retries, history events, timestamps, and wall elapsed time when available. The CLI also derives a human-readable completion report from the same state, including validation status, review status, audit warnings, sampled unique testability gap details, and recovered issues. |
 | `done` | `bool` | Orchestrator | Set True on passing build or after implement in no-build mode when no active deterministic audit finding still requires the build/fix loop |
 | `failed` | `bool` | Orchestrator | Hard abort: set True on review timeout, active build/fix loop iteration limit reached, or unhandled agent exception; loop exits immediately. Use `--reset-failed` CLI flag to clear this and resume for normal run and `review --fix` tasks; audit-only failures such as contract-gate failures before worktree creation and report-only review failures are not reset or resumed. The flag resets `review_iterations`, `security_review_iterations`, `build_iterations`, and active build-loop markers, clears `errors`/`test_errors`/`check_errors` (prevents stale error blobs from appearing in the fixer's prompt on the first resumed iteration), and auto-populates `files_changed` from `git diff` if empty. Sync, build, and check failures are NOT hard aborts — they store the error and run the fixer |
-| `finished_at` | `str \| None` | `JsonStateStore.save()` | ISO-8601 UTC timestamp set once when the task first reaches a terminal `done` or `failed` state; not overwritten by later saves |
+| `finished_at` | `str \| None` | `JsonStateStore.save()` | ISO-8601 UTC timestamp set once when the task first reaches an audit-terminal result; not overwritten by later terminal saves. For current-branch review-fix, pending/committed delivery does not set this timestamp even when the orchestrator has set `done = True`; it is set only when delivery reaches `"delivered"`, `"no_changes"`, or `"failed"`. |
 | `plan` | `list[str]` | PlannerAgent | Ordered step descriptions; empty = single-pass mode |
 | `plan_decided` | `bool` | PlannerAgent | Set True after any successful planner decision (SINGLE_PASS or split); guards re-run on resume; not set on planner failure (allows retry) |
 | `plan_completed` | `bool` | Orchestrator | Set True after the final planned step completes its step-scoped implement/review/security/test-write phase. On resume, skips the step loop and continues with the final full-task gate/build instead of rerunning the last step. |

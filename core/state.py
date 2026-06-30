@@ -223,11 +223,23 @@ def _parse_iso(value: str | None) -> datetime | None:
 
 
 def _terminal_result(state: "TaskState") -> str:
+    if (
+        state.review_mode == "review_fix"
+        and state.review_delivery_mode == "current_branch"
+        and state.review_delivery_status not in {"delivered", "no_changes"}
+    ):
+        if state.failed or state.review_delivery_status == "failed":
+            return "failed"
+        return "incomplete"
     if state.done:
         return "done"
     if state.failed:
         return "failed"
     return "incomplete"
+
+
+def _is_terminal_for_audit(state: "TaskState") -> bool:
+    return _terminal_result(state) != "incomplete"
 
 
 def _final_summary(state: "TaskState") -> dict:
@@ -256,6 +268,12 @@ def _final_summary(state: "TaskState") -> dict:
         "security_review_records_count": len(state.security_review_cycle_records),
         "reviewer_runs": len(state.review_cycle_records),
         "security_reviewer_runs": len(state.security_review_cycle_records),
+        "review_delivery_mode": state.review_delivery_mode,
+        "review_target_branch": state.review_target_branch,
+        "review_target_start_commit": state.review_target_start_commit,
+        "review_isolated_fix_commit": state.review_isolated_fix_commit,
+        "review_delivery_status": state.review_delivery_status,
+        "review_delivery_result": state.review_delivery_result,
         "test_writer_runs": len(state.test_write_records),
         "testability_gaps_count": len(state.testability_gaps),
         "test_execution_gate_audits_count": len(state.test_execution_gate_records),
@@ -360,6 +378,12 @@ class TaskState:
     review_diff: Optional[str] = None
     review_mode: Optional[str] = None
     review_base_branch: Optional[str] = None
+    review_delivery_mode: Optional[str] = None
+    review_target_branch: Optional[str] = None
+    review_target_start_commit: Optional[str] = None
+    review_isolated_fix_commit: Optional[str] = None
+    review_delivery_status: Optional[str] = None
+    review_delivery_result: Optional[str] = None
     test_files_written: list[str] = field(default_factory=list)
     tests_up_to_date: bool = False
     generated_test_fix_counts: dict[str, int] = field(default_factory=dict)
@@ -796,10 +820,14 @@ class JsonStateStore(StateStore):
 
     def save(self, state: TaskState) -> None:
         with self._lock:
-            if (state.done or state.failed) and not state.finished_at:
+            terminal_for_audit = _is_terminal_for_audit(state)
+            if terminal_for_audit and not state.finished_at:
                 state.finished_at = _now()
-            if state.done or state.failed:
+            if terminal_for_audit:
                 state.final_summary = _final_summary(state)
+            else:
+                state.finished_at = None
+                state.final_summary = {}
             state.updated_at = _now()
             self._write_json(self._path(state.task_id), asdict(state))
 
