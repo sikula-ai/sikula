@@ -67,7 +67,7 @@ progress:
 # Built-in provider values: codex, claude, gemini, opencode, antigravity.
 llm:
   provider: codex
-  model: gpt-5.5             # Default model for planner, implementer, test writer, fixer, and task prep.
+  model: gpt-5.3-codex       # Default model for planner, implementer, test writer, and fixer.
   agent_timeout: 1800        # Seconds to wait for a single agent call before timing out.
 
 # Per-agent LLM overrides — any field omitted falls back to llm: above.
