@@ -361,6 +361,52 @@ class TestCurrentBranchReviewDelivery:
         assert loaded.worktree_path == str(worktree)
         assert loaded.worktree_base == str(worktree)
 
+    def test_recorded_isolated_commit_retry_rejects_unresolvable_commit(self, tmp_path: Path):
+        git_root = tmp_path / "repo"
+        git_root.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        fix_commit = "2222222222222222222222222222222222222222"
+        state = self._state(
+            worktree,
+            review_delivery_status="failed",
+            review_isolated_fix_commit=fix_commit,
+        )
+        store = self._save(tmp_path, state)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            cwd = kwargs.get("cwd")
+            if cmd == ["git", "rev-parse", "--verify", f"{fix_commit}^{{commit}}"] and cwd == worktree:
+                return _git_result(returncode=1, stderr="fatal: bad object\n")
+            return _git_result()
+
+        with (
+            patch("sikula.subprocess.run", side_effect=fake_run),
+            patch("sikula._remove_worktree") as remove_worktree,
+        ):
+            success, committed, commit_sha = _deliver_current_branch_review_fix(
+                worktree,
+                git_root,
+                state,
+                store,
+                commit_msg="ignored",
+            )
+
+        assert not success
+        assert not committed
+        assert commit_sha is None
+        assert not any(cmd[0:2] == ["git", "merge"] for cmd in calls)
+        remove_worktree.assert_not_called()
+        loaded = store.load("abc123")
+        assert loaded.review_delivery_status == "failed"
+        assert loaded.review_delivery_result == (
+            "isolated fix commit '2222222222222222222222222222222222222222' could not be resolved: fatal: bad object"
+        )
+        assert loaded.worktree_path == str(worktree)
+        assert loaded.worktree_base == str(worktree)
+
     def test_recorded_isolated_commit_retry_rejects_dirty_isolated_worktree(self, tmp_path: Path):
         git_root = tmp_path / "repo"
         git_root.mkdir()
@@ -406,6 +452,66 @@ class TestCurrentBranchReviewDelivery:
         loaded = store.load("abc123")
         assert loaded.review_delivery_status == "failed"
         assert loaded.review_delivery_result == "isolated worktree is not clean: unstaged changes (1)"
+        assert loaded.worktree_path == str(worktree)
+        assert loaded.worktree_base == str(worktree)
+
+    def test_isolated_commit_failure_marks_delivery_failed_and_preserves_worktree(self, tmp_path: Path):
+        git_root = tmp_path / "repo"
+        git_root.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        state = self._state(worktree)
+        store = self._save(tmp_path, state)
+
+        with (
+            patch("sikula._commit_worktree_changes", return_value=(False, False, None, "commit denied")),
+            patch("sikula._remove_worktree") as remove_worktree,
+        ):
+            success, committed, commit_sha = _deliver_current_branch_review_fix(
+                worktree,
+                git_root,
+                state,
+                store,
+                commit_msg="sikula: review fixes for feature/current\n\nTask ID: abc123",
+            )
+
+        assert not success
+        assert not committed
+        assert commit_sha is None
+        remove_worktree.assert_not_called()
+        loaded = store.load("abc123")
+        assert loaded.review_delivery_status == "failed"
+        assert loaded.review_delivery_result == "isolated fix commit failed: commit denied"
+        assert loaded.worktree_path == str(worktree)
+        assert loaded.worktree_base == str(worktree)
+
+    def test_missing_isolated_commit_sha_marks_delivery_failed_and_preserves_worktree(self, tmp_path: Path):
+        git_root = tmp_path / "repo"
+        git_root.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        state = self._state(worktree)
+        store = self._save(tmp_path, state)
+
+        with (
+            patch("sikula._commit_worktree_changes", return_value=(True, True, None, None)),
+            patch("sikula._remove_worktree") as remove_worktree,
+        ):
+            success, committed, commit_sha = _deliver_current_branch_review_fix(
+                worktree,
+                git_root,
+                state,
+                store,
+                commit_msg="sikula: review fixes for feature/current\n\nTask ID: abc123",
+            )
+
+        assert not success
+        assert not committed
+        assert commit_sha is None
+        remove_worktree.assert_not_called()
+        loaded = store.load("abc123")
+        assert loaded.review_delivery_status == "failed"
+        assert loaded.review_delivery_result == "could not determine isolated fix commit"
         assert loaded.worktree_path == str(worktree)
         assert loaded.worktree_base == str(worktree)
 
@@ -462,6 +568,22 @@ class TestCurrentBranchReviewDelivery:
         loaded = store.load("abc123")
         assert loaded.review_delivery_status == "delivered"
         assert loaded.review_delivery_result == f"delivered {fix_commit} to feature/current"
+        assert loaded.worktree_path is None
+        assert loaded.worktree_base is None
+
+    def test_remove_delivered_worktree_treats_missing_worktree_as_cleaned(self, tmp_path: Path):
+        git_root = tmp_path / "repo"
+        git_root.mkdir()
+        missing_worktree = tmp_path / "missing-wt"
+        state = self._state(missing_worktree)
+        store = self._save(tmp_path, state)
+
+        with patch("sikula._remove_worktree") as remove_worktree:
+            removed = _sikula._remove_delivered_worktree(state, store, git_root, missing_worktree)
+
+        assert removed
+        remove_worktree.assert_not_called()
+        loaded = store.load("abc123")
         assert loaded.worktree_path is None
         assert loaded.worktree_base is None
 
@@ -567,6 +689,125 @@ class TestCurrentBranchReviewDelivery:
         out = capsys.readouterr().out
         assert "Current-branch delivery failed:" in out
         assert f"Worktree preserved for inspection/resume: {worktree}" in out
+
+    def test_unresolved_current_head_fails_after_isolated_commit_and_preserves_worktree(self, tmp_path: Path):
+        git_root = tmp_path / "repo"
+        git_root.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        fix_commit = "2222222222222222222222222222222222222222"
+        state = self._state(worktree, review_isolated_fix_commit=fix_commit)
+        store = self._save(tmp_path, state)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            cwd = kwargs.get("cwd")
+            if cmd == ["git", "rev-parse", "--verify", f"{fix_commit}^{{commit}}"] and cwd == worktree:
+                return _git_result(stdout=f"{fix_commit}\n")
+            if cmd == ["git", "rev-parse", "--verify", "HEAD^{commit}"] and cwd == worktree:
+                return _git_result(stdout=f"{fix_commit}\n")
+            if cmd == ["git", "symbolic-ref", "--quiet", "--short", "HEAD"] and cwd == git_root:
+                return _git_result(stdout="feature/current\n")
+            if cmd == ["git", "diff", "--cached", "--name-only"] and cwd == git_root:
+                return _git_result()
+            if cmd == ["git", "diff", "--name-only"] and cwd == git_root:
+                return _git_result()
+            if cmd == ["git", "ls-files", "--others", "--exclude-standard"] and cwd == git_root:
+                return _git_result()
+            if cmd == ["git", "rev-parse", "--verify", "HEAD^{commit}"] and cwd == git_root:
+                return _git_result(returncode=1, stderr="fatal: bad revision HEAD\n")
+            return _git_result()
+
+        with (
+            patch("sikula.subprocess.run", side_effect=fake_run),
+            patch("sikula._remove_worktree") as remove_worktree,
+        ):
+            success, committed, commit_sha = _deliver_current_branch_review_fix(
+                worktree,
+                git_root,
+                state,
+                store,
+                commit_msg="ignored",
+            )
+
+        assert not success
+        assert committed
+        assert commit_sha == fix_commit
+        assert not any(cmd[0:2] == ["git", "merge"] for cmd in calls)
+        remove_worktree.assert_not_called()
+        loaded = store.load("abc123")
+        assert loaded.review_delivery_status == "failed"
+        assert loaded.review_delivery_result == "could not resolve current HEAD: fatal: bad revision HEAD"
+        assert loaded.worktree_path == str(worktree)
+        assert loaded.worktree_base == str(worktree)
+
+    @pytest.mark.parametrize(
+        ("symbolic_ref_result", "head_result", "expected_reason"),
+        [
+            (
+                _git_result(returncode=1),
+                _git_result(stdout="1111111111111111111111111111111111111111\n"),
+                "current HEAD is detached; expected branch 'feature/current'",
+            ),
+            (
+                _git_result(returncode=1, stderr="fatal: not a symbolic ref\n"),
+                None,
+                "could not determine current branch; expected 'feature/current'",
+            ),
+        ],
+    )
+    def test_delivery_safety_rejects_detached_or_unknown_current_branch(
+        self,
+        tmp_path: Path,
+        symbolic_ref_result,
+        head_result,
+        expected_reason: str,
+    ):
+        git_root = tmp_path / "repo"
+        git_root.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        fix_commit = "2222222222222222222222222222222222222222"
+        state = self._state(worktree, review_isolated_fix_commit=fix_commit)
+        store = self._save(tmp_path, state)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            cwd = kwargs.get("cwd")
+            if cmd == ["git", "rev-parse", "--verify", f"{fix_commit}^{{commit}}"] and cwd == worktree:
+                return _git_result(stdout=f"{fix_commit}\n")
+            if cmd == ["git", "rev-parse", "--verify", "HEAD^{commit}"] and cwd == worktree:
+                return _git_result(stdout=f"{fix_commit}\n")
+            if cmd == ["git", "symbolic-ref", "--quiet", "--short", "HEAD"] and cwd == git_root:
+                return symbolic_ref_result
+            if cmd == ["git", "rev-parse", "--verify", "HEAD"] and cwd == git_root and head_result is not None:
+                return head_result
+            return _git_result()
+
+        with (
+            patch("sikula.subprocess.run", side_effect=fake_run),
+            patch("sikula._remove_worktree") as remove_worktree,
+        ):
+            success, committed, commit_sha = _deliver_current_branch_review_fix(
+                worktree,
+                git_root,
+                state,
+                store,
+                commit_msg="ignored",
+            )
+
+        assert not success
+        assert committed
+        assert commit_sha == fix_commit
+        assert not any(cmd[0:2] == ["git", "merge"] for cmd in calls)
+        remove_worktree.assert_not_called()
+        loaded = store.load("abc123")
+        assert loaded.review_delivery_status == "failed"
+        assert loaded.review_delivery_result == expected_reason
+        assert loaded.worktree_path == str(worktree)
+        assert loaded.worktree_base == str(worktree)
 
     def test_delivery_ignores_state_store_paths_in_current_worktree_clean_check(self, tmp_path: Path):
         git_root = tmp_path / "repo"
@@ -2448,6 +2689,76 @@ class TestCmdRunStateStore:
         out = capsys.readouterr().out
         assert "has no current-branch delivery worktree recorded" in out
         assert "sikula show abc123" in out
+
+    def test_current_branch_delivery_retry_requires_recorded_worktree_base(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        worktree = tmp_path / "wt"
+        worktree.mkdir(parents=True)
+        state = TaskState(
+            task_id="abc123",
+            task_description="Review branch changes",
+            review_mode="review_fix",
+            review_delivery_mode="current_branch",
+            review_delivery_status="failed",
+            review_target_branch="feature/current",
+            review_target_start_commit="1111111111111111111111111111111111111111",
+            done=True,
+            worktree_path=str(worktree),
+            worktree_branch="feature/current",
+        )
+        store.save(state)
+
+        with (
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            patch("sikula._deliver_current_branch_review_fix") as delivery,
+            pytest.raises(SystemExit) as exc,
+        ):
+            cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
+
+        assert exc.value.code == 1
+        build_orchestrator.assert_not_called()
+        delivery.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Task abc123 has no worktree path recorded." in out
+        assert "current-branch delivery cannot be retried safely" in out
+
+    def test_current_branch_delivery_retry_requires_existing_worktree(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        missing_worktree = tmp_path / "missing-wt"
+        state = TaskState(
+            task_id="abc123",
+            task_description="Review branch changes",
+            review_mode="review_fix",
+            review_delivery_mode="current_branch",
+            review_delivery_status="failed",
+            review_target_branch="feature/current",
+            review_target_start_commit="1111111111111111111111111111111111111111",
+            done=True,
+            worktree_path=str(missing_worktree),
+            worktree_base=str(missing_worktree),
+            worktree_branch="feature/current",
+        )
+        store.save(state)
+
+        with (
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            patch("sikula._deliver_current_branch_review_fix") as delivery,
+            pytest.raises(SystemExit) as exc,
+        ):
+            cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
+
+        assert exc.value.code == 1
+        build_orchestrator.assert_not_called()
+        delivery.assert_not_called()
+        out = capsys.readouterr().out
+        assert f"Worktree no longer exists: {missing_worktree}" in out
+        assert "Restore the worktree manually" in out
 
     def test_report_only_review_task_cannot_be_resumed(self, tmp_path: Path, capsys):
         from core.state import JsonStateStore, TaskState

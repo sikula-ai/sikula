@@ -975,6 +975,48 @@ class TestCmdReviewWorktreeSetup:
         assert not any(cmd[0:3] == ["git", "worktree", "add"] for cmd in calls)
         assert not (tmp_path / "state").exists()
 
+    def test_current_branch_fix_mode_removes_worktree_when_diff_fails(self, tmp_path: Path, capsys):
+        calls = []
+        target_commit = "1111111111111111111111111111111111111111"
+
+        def capture(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0:2] == ["git", "symbolic-ref"]:
+                return _sub(stdout="feature/current\n")
+            if cmd == ["git", "diff", "--cached", "--name-only"]:
+                return _sub()
+            if cmd == ["git", "diff", "--name-only"]:
+                return _sub()
+            if cmd[0:2] == ["git", "ls-files"]:
+                return _sub()
+            if cmd == ["git", "rev-parse", "--verify", "main^{commit}"]:
+                return _sub(stdout="0000000000000000000000000000000000000000\n")
+            if cmd == ["git", "rev-parse", "--verify", "HEAD^{commit}"]:
+                return _sub(stdout=f"{target_commit}\n")
+            if cmd[0:3] == ["git", "worktree", "add"]:
+                return _sub()
+            if cmd == ["git", "diff", "main...HEAD"]:
+                return _sub(returncode=128, stderr="fatal: bad revision 'main...HEAD'\n")
+            if cmd[0:3] == ["git", "worktree", "remove"]:
+                return _sub()
+            return _sub()
+
+        with (
+            patch("uuid.uuid4", return_value=MagicMock(hex="taskdiff")),
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(_args(branch=None, current_branch=True, fix=True), _cfg(tmp_path))
+
+        assert exc_info.value.code == 1
+        worktree_base = tmp_path / ".sikula" / "worktrees" / "taskdiff"
+        assert ["git", "worktree", "add", "--detach", str(worktree_base), target_commit] in calls
+        assert ["git", "worktree", "remove", str(worktree_base)] in calls
+        assert "Failed to compute diff between 'main' and 'HEAD'" in capsys.readouterr().out
+        assert not (tmp_path / "state").exists()
+
     def test_fix_mode_copies_env_files(self, tmp_path: Path):
         """Fix mode must copy gitignored build files (e.g. local.properties) into the worktree."""
         (tmp_path / "local.properties").write_text("sdk.dir=/opt/android-sdk\n")
