@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 import subprocess
 from typing import Any
 
 import yaml
 
 SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION = 1
+_DELIVERY_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,7 @@ class DeliveryPlanUnit:
     phase: str | None = None
     kind: str | None = None
     repo_id: str | None = None
+    source_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -210,16 +213,29 @@ def _load_plan_yaml(path: Path, errors: list[DeliveryPlanIssue]) -> Any:
         return None
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         errors.append(DeliveryPlanIssue("error", "plan.read_failed", f"Failed to read plan file: {exc}"))
         return None
     except yaml.YAMLError as exc:
-        errors.append(DeliveryPlanIssue("error", "plan.parse_failed", f"Failed to parse plan YAML: {exc}"))
+        errors.append(DeliveryPlanIssue("error", "plan.parse_failed", _safe_yaml_error_message(exc)))
         return None
     if not isinstance(data, dict):
         errors.append(DeliveryPlanIssue("error", "plan.invalid_type", "Delivery plan must be a YAML mapping."))
         return None
     return data
+
+
+def _safe_yaml_error_message(exc: yaml.YAMLError) -> str:
+    message = f"Failed to parse plan YAML ({type(exc).__name__})"
+    mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
+    if mark is not None:
+        line = getattr(mark, "line", None)
+        column = getattr(mark, "column", None)
+        if isinstance(line, int) and isinstance(column, int):
+            message += f" at line {line + 1}, column {column + 1}"
+        elif isinstance(line, int):
+            message += f" at line {line + 1}"
+    return message + "."
 
 
 def _parse_delivery_plan(
@@ -244,6 +260,15 @@ def _parse_delivery_plan(
         )
 
     plan_id = _require_string(data, "plan_id", "plan_id", errors)
+    if plan_id and not _DELIVERY_PLAN_ID_RE.fullmatch(plan_id):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "plan_id.invalid",
+                "plan_id may contain only letters, numbers, dots, underscores, and hyphens.",
+                "plan_id",
+            )
+        )
     title = _require_string(data, "title", "title", errors)
     final_branch = _require_string(data, "final_branch", "final_branch", errors)
     planning_mode = _optional_string(data, "planning_mode", "planning_mode", errors)
@@ -291,7 +316,9 @@ def _parse_repositories(value: Any, errors: list[DeliveryPlanIssue]) -> list[Del
         return [DeliveryRepository(id="main", root=".", implicit=True)]
     if not value:
         errors.append(
-            DeliveryPlanIssue("error", "repositories.empty", "repositories must include one repository.", "repositories")
+            DeliveryPlanIssue(
+                "error", "repositories.empty", "repositories must include one repository.", "repositories"
+            )
         )
         return [DeliveryRepository(id="main", root=".", implicit=True)]
     if len(value) > 1:
@@ -307,7 +334,9 @@ def _parse_repositories(value: Any, errors: list[DeliveryPlanIssue]) -> list[Del
     item = value[0]
     if not isinstance(item, dict):
         errors.append(
-            DeliveryPlanIssue("error", "repositories.item_invalid", "repository entries must be mappings.", "repositories[0]")
+            DeliveryPlanIssue(
+                "error", "repositories.item_invalid", "repository entries must be mappings.", "repositories[0]"
+            )
         )
         return [DeliveryRepository(id="main", root=".", implicit=True)]
 
@@ -365,7 +394,9 @@ def _parse_units(
         errors.append(DeliveryPlanIssue("error", "units.invalid_type", "units must be a non-empty list.", "units"))
         return []
     if not value:
-        errors.append(DeliveryPlanIssue("error", "units.empty", "units must include at least one delivery unit.", "units"))
+        errors.append(
+            DeliveryPlanIssue("error", "units.empty", "units must include at least one delivery unit.", "units")
+        )
         return []
 
     seen: set[str] = set()
@@ -373,9 +404,7 @@ def _parse_units(
     for idx, item in enumerate(value):
         unit_path = f"units[{idx}]"
         if not isinstance(item, dict):
-            errors.append(
-                DeliveryPlanIssue("error", "units.item_invalid", "unit entries must be mappings.", unit_path)
-            )
+            errors.append(DeliveryPlanIssue("error", "units.item_invalid", "unit entries must be mappings.", unit_path))
             continue
         unit_id = _require_string(item, "id", f"{unit_path}.id", errors)
         title = _optional_string(item, "title", f"{unit_path}.title", errors)
@@ -434,13 +463,18 @@ def _parse_units(
                     phase=phase,
                     kind=kind,
                     repo_id=repo_id,
+                    source_path=unit_path,
                 )
             )
     return units
 
 
 def _validate_task_path(task_path: str, *, project_root: Path, errors: list[DeliveryPlanIssue], path: str) -> None:
-    raw_path = Path(task_path)
+    try:
+        raw_path = Path(task_path)
+    except (OSError, ValueError):
+        _add_invalid_task_path_error(errors, path)
+        return
     if raw_path.is_absolute():
         errors.append(
             DeliveryPlanIssue(
@@ -451,24 +485,47 @@ def _validate_task_path(task_path: str, *, project_root: Path, errors: list[Deli
             )
         )
         return
-    resolved = (project_root / raw_path).resolve()
+    try:
+        resolved = (project_root / raw_path).resolve()
+    except (OSError, ValueError):
+        _add_invalid_task_path_error(errors, path)
+        return
     if not _path_is_within(resolved, project_root):
         errors.append(
-            DeliveryPlanIssue("error", "units.task_path_outside_project", "Unit task_path escapes the project root.", path)
+            DeliveryPlanIssue(
+                "error", "units.task_path_outside_project", "Unit task_path escapes the project root.", path
+            )
         )
         return
-    if not resolved.is_file():
+    try:
+        task_file_exists = resolved.is_file()
+    except (OSError, ValueError):
+        _add_invalid_task_path_error(errors, path)
+        return
+    if not task_file_exists:
         errors.append(
             DeliveryPlanIssue("error", "units.task_path_missing", f"Unit task_path does not exist: {task_path}", path)
         )
 
 
+def _add_invalid_task_path_error(errors: list[DeliveryPlanIssue], path: str) -> None:
+    errors.append(
+        DeliveryPlanIssue(
+            "error",
+            "units.task_path_invalid",
+            "Unit task_path is not a valid project-relative filesystem path.",
+            path,
+        )
+    )
+
+
 def _validate_dependencies(units: list[DeliveryPlanUnit], errors: list[DeliveryPlanIssue]) -> None:
     unit_ids = {unit.id for unit in units}
     deps_by_id = {unit.id: unit.depends_on for unit in units}
-    for idx, unit in enumerate(units):
+    for unit in units:
         for dep_idx, dependency in enumerate(unit.depends_on):
-            path = f"units[{idx}].depends_on[{dep_idx}]"
+            unit_path = unit.source_path or "units"
+            path = f"{unit_path}.depends_on[{dep_idx}]"
             if dependency == unit.id:
                 errors.append(
                     DeliveryPlanIssue("error", "dependencies.self_reference", "Unit cannot depend on itself.", path)

@@ -8,6 +8,7 @@ Usage (project-centric, run from project root):
   sikula task refine task.md --auto --output task.refined.md
   sikula contract prepare task.refined.md --output .sikula/contracts/task.contract.md
   sikula delivery check .sikula/delivery/my-plan/plan.yaml
+  sikula delivery status .sikula/delivery/my-plan/plan.yaml
   sikula run task.md                 # auto-discovers .sikula/config.yaml
   sikula run --task-id <task-id>     # resume existing task
   sikula status
@@ -1713,6 +1714,18 @@ def cmd_delivery_check(args: argparse.Namespace, cfg: dict) -> None:
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
     else:
         print(render_delivery_plan_check(result), end="")
+    if not result.valid:
+        sys.exit(1)
+
+
+def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
+    from core.delivery_progress import get_delivery_status, render_delivery_status
+
+    result = get_delivery_status(args.plan_file)
+    if args.json:
+        print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+    else:
+        print(render_delivery_status(result), end="")
     if not result.valid:
         sys.exit(1)
 
@@ -5183,6 +5196,9 @@ def main() -> None:
     delivery_check_p = delivery_sub.add_parser("check", help="Check a delivery plan file")
     delivery_check_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
     delivery_check_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
+    delivery_status_p = delivery_sub.add_parser("status", help="Show delivery plan progress")
+    delivery_status_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
+    delivery_status_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
 
     run_p = sub.add_parser("run", help="Run a task")
     run_p.add_argument(
@@ -5413,10 +5429,13 @@ def main() -> None:
         cmd_init(args)
         return
 
-    cfg = _load_runtime_config(
-        args.config,
-        required=args.command not in {"contract", "delivery", "task"},
-    )
+    if args.command == "delivery":
+        cfg = {}
+    else:
+        cfg = _load_runtime_config(
+            args.config,
+            required=args.command not in {"contract", "task"},
+        )
 
     if args.command == "run":
         task_file = args.task_file_pos or args.task_file
@@ -5442,6 +5461,8 @@ def main() -> None:
     elif args.command == "delivery":
         if args.delivery_command == "check":
             cmd_delivery_check(args, cfg)
+        elif args.delivery_command == "status":
+            cmd_delivery_status(args, cfg)
         else:
             delivery_p.print_help()
             sys.exit(1)

@@ -30,17 +30,21 @@ delivery units. A delivery unit remains a normal Sikula task/contract/run; the
 plan records ordering, dependencies, streams, and eventual output branch
 metadata.
 
-The current MVP exposes only:
+The current MVP exposes:
 
 ```bash
 sikula delivery check .sikula/delivery/<slug>/plan.yaml
+sikula delivery status .sikula/delivery/<slug>/plan.yaml
 ```
 
-This command validates the tracked plan file and can emit JSON. It does not
-create worktrees, create task state, run agents, prepare contracts, or update
-branches. The validator currently enforces single-repository scope and rejects
-multi-repo plans until cross-repo branching, locking, validation, and result-set
-semantics exist. See [Delivery Plans](delivery-plans.md).
+These commands validate the tracked plan file and can emit JSON. `delivery
+status` also reads ignored parent progress from
+`.sikula/state/delivery/<plan-id>/progress.json` when present; if progress does
+not exist yet, units are reported as pending from the plan. They do not create
+worktrees, create task state, run agents, prepare contracts, or update branches.
+The validator currently enforces single-repository scope and rejects multi-repo
+plans until cross-repo branching, locking, validation, and result-set semantics
+exist. See [Delivery Plans](delivery-plans.md).
 
 ## Gated Pipeline
 

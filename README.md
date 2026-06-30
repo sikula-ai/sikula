@@ -133,9 +133,11 @@ These commands also support interactive modes (`--interactive`) and answers-file
 ```bash
 sikula delivery check .sikula/delivery/my-plan/plan.yaml
 sikula delivery check .sikula/delivery/my-plan/plan.yaml --json
+sikula delivery status .sikula/delivery/my-plan/plan.yaml
+sikula delivery status .sikula/delivery/my-plan/plan.yaml --json
 ```
 
-Use this to validate the tracked parent plan for larger work split into delivery units. The current MVP checks plan structure, unit dependencies, task paths, stream references, and single-repository scope; it does not run units yet. See [Delivery Plans](docs/delivery-plans.md).
+Use this to validate and inspect the tracked parent plan for larger work split into delivery units. The current MVP checks plan structure, unit dependencies, task paths, stream references, single-repository scope, and privacy-safe parent progress; it does not run units yet. See [Delivery Plans](docs/delivery-plans.md).
 
 **Run a task into a branch**
 

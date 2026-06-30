@@ -95,6 +95,18 @@ def test_delivery_plan_check_rejects_unsupported_schema_version(tmp_path: Path) 
     assert "schema_version.unsupported" in _codes(result)
 
 
+def test_delivery_plan_check_rejects_plan_id_that_cannot_be_used_for_state_path(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["plan_id"] = "../bad"
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is False
+    assert "plan_id.invalid" in _codes(result)
+
+
 def test_delivery_plan_check_reports_duplicate_and_unknown_dependencies(tmp_path: Path) -> None:
     _git_init(tmp_path)
     data = _base_plan(tmp_path)
@@ -107,6 +119,22 @@ def test_delivery_plan_check_reports_duplicate_and_unknown_dependencies(tmp_path
     assert result.valid is False
     assert "units.duplicate_id" in _codes(result)
     assert "dependencies.unknown_unit" in _codes(result)
+
+
+def test_delivery_plan_check_preserves_unit_index_for_dependency_errors_after_skipped_units(
+    tmp_path: Path,
+) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["units"][0]["id"] = ""
+    data["units"][1]["depends_on"] = ["missing-unit"]
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    dependency_errors = [issue for issue in result.errors if issue.code == "dependencies.unknown_unit"]
+    assert len(dependency_errors) == 1
+    assert dependency_errors[0].path == "units[1].depends_on[0]"
 
 
 def test_delivery_plan_check_reports_dependency_cycles(tmp_path: Path) -> None:
@@ -134,6 +162,20 @@ def test_delivery_plan_check_rejects_missing_and_escaping_task_paths(tmp_path: P
     assert result.valid is False
     assert "units.task_path_missing" in _codes(result)
     assert "units.task_path_outside_project" in _codes(result)
+
+
+def test_delivery_plan_check_reports_invalid_task_path_string(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["units"][0]["task_path"] = "bad\0"
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    invalid_path_errors = [issue for issue in result.errors if issue.code == "units.task_path_invalid"]
+    assert len(invalid_path_errors) == 1
+    assert invalid_path_errors[0].path == "units[0].task_path"
+    assert "bad" not in invalid_path_errors[0].message
 
 
 def test_delivery_plan_check_rejects_multi_repo_plan_before_multi_repo_support(tmp_path: Path) -> None:
@@ -230,12 +272,30 @@ def test_delivery_plan_check_reports_invalid_yaml(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = tmp_path / ".sikula" / "delivery" / "demo" / "plan.yaml"
     plan_path.parent.mkdir(parents=True)
-    plan_path.write_text("schema_version: [unterminated\n", encoding="utf-8")
+    plan_path.write_text("schema_version: [unterminated\nsecret: OPENAI_API_KEY=sk-test\n", encoding="utf-8")
 
     result = check_delivery_plan_file(plan_path)
 
     assert result.valid is False
     assert "plan.parse_failed" in _codes(result)
+    message = result.errors[0].message
+    assert "ParserError" in message
+    assert "line " in message
+    assert "OPENAI_API_KEY" not in message
+    assert "sk-test" not in message
+    assert "unterminated" not in message
+
+
+def test_delivery_plan_check_reports_non_utf8_plan_file(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = tmp_path / ".sikula" / "delivery" / "demo" / "plan.yaml"
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_bytes(b"\xff\xfe\x00")
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is False
+    assert "plan.read_failed" in _codes(result)
 
 
 def test_delivery_plan_check_reports_non_mapping_yaml(tmp_path: Path) -> None:
@@ -482,7 +542,7 @@ def test_delivery_check_cli_exits_nonzero_for_invalid_plan(tmp_path: Path, capsy
     assert "Status: invalid" in capsys.readouterr().out
 
 
-def test_main_dispatches_delivery_check_without_required_project_config(tmp_path: Path) -> None:
+def test_main_dispatches_delivery_check_without_loading_project_config(tmp_path: Path) -> None:
     plan_path = tmp_path / "plan.yaml"
     plan_path.write_text("schema_version: 1\n", encoding="utf-8")
 
@@ -491,5 +551,5 @@ def test_main_dispatches_delivery_check_without_required_project_config(tmp_path
             with patch("sikula.cmd_delivery_check") as delivery_check:
                 main()
 
-    load_config.assert_called_once_with(None, required=False)
+    load_config.assert_not_called()
     delivery_check.assert_called_once()

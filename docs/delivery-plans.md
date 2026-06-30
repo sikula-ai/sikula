@@ -1,8 +1,8 @@
 # Delivery Plans
 
 Delivery plans are the planned parent layer for large work that should be split
-into small Sikula delivery units. The first MVP slice only validates a tracked
-plan file. It does not run units yet.
+into small Sikula delivery units. The current MVP validates a tracked plan file
+and reports privacy-safe parent progress. It does not run units yet.
 
 Use delivery plans when a request is too large for one implementation contract or
 when the work spans multiple streams such as backend, web, Android, iOS, docs, or
@@ -16,7 +16,7 @@ large request
   -> final delivery branch
 ```
 
-## Current MVP Command
+## Current MVP Commands
 
 Validate a plan file:
 
@@ -25,8 +25,15 @@ sikula delivery check .sikula/delivery/<slug>/plan.yaml
 sikula delivery check .sikula/delivery/<slug>/plan.yaml --json
 ```
 
-The command checks plan structure only. It does not create worktrees, run agents,
-prepare contracts, write task state, or update branches.
+Show parent progress for a plan:
+
+```bash
+sikula delivery status .sikula/delivery/<slug>/plan.yaml
+sikula delivery status .sikula/delivery/<slug>/plan.yaml --json
+```
+
+These commands do not create worktrees, run agents, prepare contracts, write task
+state, or update branches.
 
 The MVP validator checks:
 
@@ -37,6 +44,11 @@ The MVP validator checks:
 - unit dependency references and cycles,
 - optional stream references,
 - single-repository scope.
+
+`delivery status` first runs the same plan validation, then reads ignored parent
+progress from `.sikula/state/delivery/<plan-id>/progress.json` when present. If
+that progress file does not exist yet, all delivery units are reported from the
+plan as `pending`, with dependency blockers derived from `depends_on`.
 
 ## Plan Shape
 
@@ -88,6 +100,6 @@ can coordinate cross-repo branches, locks, validation, and result sets.
 
 ## Privacy
 
-`delivery check --json` returns plan metadata, validation issues, and unit paths.
-It does not embed unit task file bodies, prompts, provider output, diffs, logs, or
-task state.
+`delivery check --json` and `delivery status --json` return plan metadata,
+validation issues, unit paths, and compact progress fields. They do not embed unit
+task file bodies, prompts, provider output, diffs, logs, or task state.

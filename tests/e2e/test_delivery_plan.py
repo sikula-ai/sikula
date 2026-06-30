@@ -73,6 +73,94 @@ def test_delivery_check_cli_validates_plan_without_project_config(
     assert "Units: 2" in out
 
 
+def test_delivery_status_cli_reports_pending_units_without_project_config(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    unit_1 = _write_delivery_unit(git_project, "01-foundation.md", "# Unit 01\n\nAdd foundation.\n")
+    unit_2 = _write_delivery_unit(git_project, "02-feature.md", "# Unit 02\n\nBuild on foundation.\n")
+    plan_path = _write_delivery_plan(
+        git_project,
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-smoke",
+            "title": "Delivery status smoke",
+            "final_branch": "sikula/delivery/delivery-status-smoke",
+            "streams": [{"id": "app", "label": "App"}],
+            "units": [
+                {
+                    "id": "01-foundation",
+                    "title": "Add foundation",
+                    "stream": "app",
+                    "platform": "shared",
+                    "task_path": unit_1,
+                    "depends_on": [],
+                },
+                {
+                    "id": "02-feature",
+                    "title": "Add feature",
+                    "stream": "app",
+                    "platform": "shared",
+                    "task_path": unit_2,
+                    "depends_on": ["01-foundation"],
+                },
+            ],
+        },
+    )
+    monkeypatch.chdir(git_project)
+
+    with patch("sys.argv", ["sikula", "delivery", "status", plan_path.relative_to(git_project).as_posix(), "--json"]):
+        main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valid"] is True
+    assert payload["status"] == "pending"
+    assert payload["progress_exists"] is False
+    assert payload["units"][0]["eligible"] is True
+    assert payload["units"][1]["blocked_by"] == ["01-foundation"]
+
+
+def test_delivery_commands_ignore_malformed_project_config(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    unit_1 = _write_delivery_unit(git_project, "01-foundation.md", "# Unit 01\n\nAdd foundation.\n")
+    plan_path = _write_delivery_plan(
+        git_project,
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-config-independent",
+            "title": "Delivery config independent",
+            "final_branch": "sikula/delivery/config-independent",
+            "units": [
+                {
+                    "id": "01-foundation",
+                    "title": "Add foundation",
+                    "task_path": unit_1,
+                    "depends_on": [],
+                }
+            ],
+        },
+    )
+    (git_project / ".sikula" / "config.yaml").write_text("root_path: [unterminated\n", encoding="utf-8")
+    monkeypatch.chdir(git_project)
+
+    with patch("sys.argv", ["sikula", "delivery", "check", plan_path.relative_to(git_project).as_posix(), "--json"]):
+        main()
+
+    check_payload = json.loads(capsys.readouterr().out)
+    assert check_payload["valid"] is True
+
+    with patch("sys.argv", ["sikula", "delivery", "status", plan_path.relative_to(git_project).as_posix(), "--json"]):
+        main()
+
+    status_payload = json.loads(capsys.readouterr().out)
+    assert status_payload["valid"] is True
+    assert status_payload["status"] == "pending"
+
+
 def test_delivery_check_cli_reports_invalid_plan_as_json(
     git_project: Path,
     monkeypatch: pytest.MonkeyPatch,
