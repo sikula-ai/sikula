@@ -128,6 +128,15 @@ Use this when you want to clarify a product task description into a formal imple
 
 These commands also support interactive modes (`--interactive`) and answers-file injection for strict control. See [Writing Sikula Tasks](docs/writing-tasks.md) for full details on advanced contract workflows.
 
+**Check a delivery plan**
+
+```bash
+sikula delivery check .sikula/delivery/my-plan/plan.yaml
+sikula delivery check .sikula/delivery/my-plan/plan.yaml --json
+```
+
+Use this to validate the tracked parent plan for larger work split into delivery units. The current MVP checks plan structure, unit dependencies, task paths, stream references, and single-repository scope; it does not run units yet. See [Delivery Plans](docs/delivery-plans.md).
+
 **Run a task into a branch**
 
 ```bash
@@ -217,6 +226,7 @@ The main README is the documentation entry point. Deeper guides live under `docs
 |---|---|
 | First install, setup, and run | [First Run](docs/first-run.md) |
 | Writing good task files | [Writing Sikula Tasks](docs/writing-tasks.md) |
+| Checking large-work delivery plans | [Delivery Plans](docs/delivery-plans.md) |
 | Gated delivery pipeline and state model | [Pipeline And State](docs/pipeline.md) |
 | Project configuration, guidelines, and agent-specific rules | [Configuration](docs/configuration.md) |
 | Provider setup and model config | [Providers](docs/providers.md) |
