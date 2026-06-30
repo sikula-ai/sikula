@@ -26,9 +26,6 @@ sandbox:
     - agents/
     - core/
     - tools/
-    - docs/
-    - ARCHITECTURE.md
-    - README.md
     - sikula.py
 
   # Directories the TestWriterAgent may write to.
