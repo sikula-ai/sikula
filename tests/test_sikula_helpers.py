@@ -20,6 +20,13 @@ load_config = _sikula.load_config
 cmd_init = _sikula.cmd_init
 
 
+def test_config_cli_module_imports() -> None:
+    import sikula_cli.config as config_cli
+
+    assert callable(config_cli._load_runtime_config)
+    assert callable(config_cli._resolve_config)
+
+
 # ---------------------------------------------------------------------------
 # _find_project_root
 # ---------------------------------------------------------------------------

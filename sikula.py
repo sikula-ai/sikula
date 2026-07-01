@@ -78,10 +78,10 @@ from pathlib import Path
 from typing import Sequence
 
 import yaml
-from dotenv import load_dotenv
 
 from core.diagnostics import diagnostic_identity_key, diagnostic_summary_lines
 from core.version import sikula_version as _sikula_version
+from sikula_cli import config as cli_config
 from sikula_cli.delivery import (
     cmd_delivery_check,
     cmd_delivery_status,
@@ -112,55 +112,6 @@ def _resolve_task_path(task_file: str, project_root: Path) -> Path | None:
     return cwd_path if cwd_path.exists() else None
 
 
-def _find_project_root(start: Path | None = None) -> Path | None:
-    """Walk up from start (default CWD) to find the nearest .sikula/config.yaml."""
-    current = (start or Path.cwd()).resolve()
-    for directory in [current, *current.parents]:
-        if (directory / ".sikula" / "config.yaml").exists():
-            return directory
-    return None
-
-
-def _load_project_env(project_root: Path) -> None:
-    """Load project-local environment variables for provider CLIs and SDKs."""
-    load_dotenv(project_root / ".env", override=False)
-
-
-def _sikula_worktree_base_for_path(path: Path) -> Path | None:
-    """Return the task worktree base when path is inside .sikula/worktrees/<task-id>."""
-    root = path.resolve()
-    for candidate in [root, *root.parents]:
-        if candidate.parent.name == "worktrees" and candidate.parent.parent.name == ".sikula":
-            return candidate
-    return None
-
-
-def _original_project_root_from_worktree(project_root: Path) -> Path | None:
-    """Map a Sikula task worktree project root back to the original project root.
-
-    Isolated task worktrees live under:
-      <git-root>/.sikula/worktrees/<task-id>/<project-relative-path>
-
-    The worktree contains the tracked .sikula/config.yaml too, but task state is kept
-    in the original project .sikula/state. Commands such as `status`, `show`, and
-    `run --task-id` should therefore resolve config from the original project when
-    invoked inside a task worktree.
-    """
-    root = project_root.resolve()
-    worktree_base = _sikula_worktree_base_for_path(root)
-    if not worktree_base:
-        return None
-    git_root = worktree_base.parent.parent.parent
-    try:
-        rel = root.relative_to(worktree_base)
-    except ValueError:
-        return None
-    original_root = (git_root / rel).resolve()
-    if (original_root / ".sikula" / "config.yaml").exists():
-        return original_root
-    return None
-
-
 _VALID_AGENTS = {
     "analyst",
     "planner",
@@ -176,113 +127,88 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Config loading
+# Config loading compatibility wrappers
 # ---------------------------------------------------------------------------
 
 
+def _find_project_root(start: Path | None = None) -> Path | None:
+    return cli_config._find_project_root(start)
+
+
+def _load_project_env(project_root: Path) -> None:
+    cli_config._load_project_env(project_root)
+
+
+def _sikula_worktree_base_for_path(path: Path) -> Path | None:
+    return cli_config._sikula_worktree_base_for_path(path)
+
+
+def _original_project_root_from_worktree(project_root: Path) -> Path | None:
+    return cli_config._original_project_root_from_worktree(
+        project_root,
+        sikula_worktree_base_for_path=_sikula_worktree_base_for_path,
+    )
+
+
 def _resolve_config(config_arg: str | None) -> tuple[Path, Path | None]:
-    """Return (config_path, discovered_project_root).
-
-    discovered_project_root is set only when .sikula/config.yaml was auto-discovered;
-    it is used to resolve relative paths in the config against the true project root
-    rather than CWD (which may be a subdirectory).
-    """
-    if config_arg:
-        return Path(config_arg), None
-
-    # Auto-discover .sikula/config.yaml by walking up from CWD.
-    project_root = _find_project_root()
-    if project_root:
-        original_root = _original_project_root_from_worktree(project_root)
-        if original_root:
-            return original_root / ".sikula" / "config.yaml", original_root
-        return project_root / ".sikula" / "config.yaml", project_root
-
-    print("No config found. Run 'sikula init' to set up this project, or use --config.")
-    sys.exit(1)
+    return cli_config._resolve_config(
+        config_arg,
+        find_project_root=_find_project_root,
+        original_project_root_from_worktree=_original_project_root_from_worktree,
+    )
 
 
 def _resolve_optional_config(config_arg: str | None) -> tuple[Path, Path | None] | None:
-    if config_arg:
-        return _resolve_config(config_arg)
-
-    project_root = _find_project_root()
-    if not project_root:
-        return None
-    original_root = _original_project_root_from_worktree(project_root)
-    if original_root:
-        return original_root / ".sikula" / "config.yaml", original_root
-    return project_root / ".sikula" / "config.yaml", project_root
+    return cli_config._resolve_optional_config(
+        config_arg,
+        resolve_config=_resolve_config,
+        find_project_root=_find_project_root,
+        original_project_root_from_worktree=_original_project_root_from_worktree,
+    )
 
 
 def _load_runtime_config(config_arg: str | None, *, required: bool = True) -> dict:
-    resolved = _resolve_config(config_arg) if required else _resolve_optional_config(config_arg)
-    if resolved is None:
-        return {}
-
-    config_path, discovered_root = resolved
-    cfg = load_config(config_path)
-    cfg["_config_path"] = str(config_path.resolve())
-    raw = cfg.get("project", {}).get("root_path", ".")
-    cfg["project"]["root_path"] = str(_resolve_root_path(raw, discovered_root, config_path))
-    _load_project_env(Path(cfg["project"]["root_path"]))
-    return cfg
+    return cli_config._load_runtime_config(
+        config_arg,
+        required=required,
+        resolve_config=_resolve_config,
+        resolve_optional_config=_resolve_optional_config,
+        load_config=load_config,
+        resolve_root_path=_resolve_root_path,
+        load_project_env=_load_project_env,
+    )
 
 
 def _resolve_root_path(raw: str, discovered_root: Path | None, config_path: Path) -> Path:
-    """Resolve project root_path to an absolute Path.
-
-    Absolute raw values are returned as-is.
-    Relative values are resolved against discovered_root (auto-discovery) or
-    config_path.parent.parent (explicit --config, where config lives at .sikula/config.yaml).
-    """
-    p = Path(raw)
-    if p.is_absolute():
-        return p
-    root_base = discovered_root if discovered_root is not None else config_path.parent.parent
-    return (root_base / p).resolve()
+    return cli_config._resolve_root_path(raw, discovered_root, config_path)
 
 
 def _resolve_state_dir(cfg: dict) -> Path:
-    """Resolve state_dir relative to project_root; absolute paths are used as-is."""
-    raw = cfg.get("tasks", {}).get("state_dir", ".sikula/state")
-    return _resolve_project_path(cfg, raw)
+    return cli_config._resolve_state_dir(cfg)
 
 
 def _resolve_task_description_dir(cfg: dict) -> Path:
-    raw = cfg.get("tasks", {}).get("task_description_dir", ".sikula/tasks")
-    return _resolve_project_path(cfg, raw)
+    return cli_config._resolve_task_description_dir(cfg)
 
 
 def _resolve_contract_dir(cfg: dict) -> Path:
-    raw = cfg.get("tasks", {}).get("contract_dir", ".sikula/contracts")
-    return _resolve_project_path(cfg, raw)
+    return cli_config._resolve_contract_dir(cfg)
 
 
 def _resolve_contract_report_dir(cfg: dict) -> Path:
-    raw = cfg.get("tasks", {}).get("contract_report_dir", ".sikula/contract-reports")
-    return _resolve_project_path(cfg, raw)
+    return cli_config._resolve_contract_report_dir(cfg)
 
 
 def _resolve_task_asset_dir(cfg: dict) -> Path:
-    raw = cfg.get("tasks", {}).get("task_asset_dir", ".sikula/task-assets")
-    return _resolve_project_path(cfg, raw)
+    return cli_config._resolve_task_asset_dir(cfg)
 
 
 def _resolve_project_path(cfg: dict, raw: str) -> Path:
-    p = Path(raw)
-    if p.is_absolute():
-        return p
-    project_root_raw = cfg.get("project", {}).get("root_path", ".")
-    project_root = Path(project_root_raw).resolve()
-    return project_root / p
+    return cli_config._resolve_project_path(cfg, raw)
 
 
 def load_config(path: Path) -> dict:
-    if not path.exists():
-        print(f"Config not found: {path}")
-        sys.exit(1)
-    return yaml.safe_load(path.read_text())
+    return cli_config.load_config(path)
 
 
 def _make_llm_config(base: dict, override: dict):
