@@ -35,7 +35,7 @@
 | `TaskAsset` helpers | `core/task_assets.py` | Deterministic local task-asset parsing, path canonicalization, answer mapping, and asset-manifest line rendering used by contract preparation |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
 | `JsonStateStore` | `core/state.py` | Stores each task as `<task_id>.json` in the configured state dir; serializes same-process access and writes via temp-file replacement so heartbeat updates and audit saves cannot interleave partial JSON writes |
-| `sikula_cli` command modules | `sikula_cli/*.py` | Focused CLI command wrappers and parser registration helpers; `sikula.py` remains the public entrypoint and compatibility surface |
+| `sikula_cli` modules | `sikula_cli/*.py` | Focused CLI command wrappers, parser registration helpers, and CLI config discovery/path helpers; `sikula.py` remains the public entrypoint and compatibility surface |
 
 ---
 
