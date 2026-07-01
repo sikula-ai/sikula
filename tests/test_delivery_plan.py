@@ -13,6 +13,12 @@ from core.delivery_plan import DeliveryPlanIssue, check_delivery_plan_file, rend
 from sikula import cmd_delivery_check, main
 
 
+def test_delivery_cli_module_imports() -> None:
+    import sikula_cli.delivery as delivery_cli
+
+    assert callable(delivery_cli.register_parser)
+
+
 def _git_init(root: Path) -> None:
     subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
 
