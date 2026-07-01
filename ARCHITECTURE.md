@@ -177,6 +177,25 @@ task-hash scoped: when the task content hash changes, existing filled answers ar
 only under `previous_answers`, while active `answers` are reset for the new hash so future
 `contract prepare` or run preflight logic does not treat stale answers as authoritative.
 
+**Delivery plan check command:** `sikula delivery check PLAN_FILE` is the first
+delivery-plan MVP primitive. It is implemented by `core/delivery_plan.py` and
+validates tracked `.sikula/delivery/<slug>/plan.yaml` files without creating
+`TaskState`, starting agents, creating worktrees, preparing contracts, or
+updating branches. The validator checks schema version, required plan metadata,
+delivery unit IDs, unit task paths, dependency references/cycles, optional stream
+references, and the MVP single-repository boundary. If `repositories` is omitted,
+the plan is treated as one implicit repository with `id: main` and `root: .`;
+multi-repo plans are rejected until cross-repo execution semantics are added.
+
+**Delivery plan status command:** `sikula delivery status PLAN_FILE` is a
+read-only parent-progress view implemented by `core/delivery_progress.py`. It
+reuses delivery plan validation, then reads ignored progress from
+`.sikula/state/delivery/<plan-id>/progress.json` when present. Missing progress
+is normal before the first unit runs; status derives pending units and dependency
+blockers from the tracked plan. The JSON result is allowlisted metadata only: it
+does not embed unit task bodies, raw child `TaskState`, prompts, provider output,
+logs, diffs, or validation output.
+
 ---
 
 ## Execution flow (`Orchestrator.run()`)

@@ -23,6 +23,29 @@ The product task description captures the user or business intent. The implement
 
 Use [Writing Sikula Tasks](writing-tasks.md) for contract commands and task examples. `sikula contract check TASK_FILE` and `sikula run TASK_FILE` use the same effective build/test/check phases from the Sikula config when scoring validation coverage. `sikula task refine` is the explicit product-description refinement step; its optional `--auto` mode can use a read-only LLM assistant to normalize a rough or non-English product request and propose supported product-level answers before deterministic product-question handling. `sikula contract prepare` is the explicit step that writes a project-aware Markdown implementation contract from a task description and answers; it expects product-task asset declarations in `## Assets`, while the generated `## Asset manifest` belongs to prepared implementation contracts. Its optional `--auto` mode can use a read-only LLM assistant to propose supported delivery answers before the same deterministic prepare/recheck logic runs. Both auto modes keep local prompt/raw-response audit records, including provider failures and malformed responses that fail parsing, under `.sikula/contract-reports/*.auto-llm.jsonl`. `sikula run TASK_FILE` then runs the file you pass to it and records a compact, warning-only contract snapshot before agents start; it does not rewrite the task file automatically. Fresh task-file runs can opt into pre-agent readiness gates with `--require-contract-ready` or `--min-contract-score N`; gate-failed states are kept for audit but must be restarted from the task file after the contract is prepared, not reset through `--task-id`. Review modes use the existing branch diff as their primary artifact and do not reuse the delivery contract-readiness gate.
 
+## Delivery Plans
+
+Delivery plans are a parent layer for large work that will be split into small
+delivery units. A delivery unit remains a normal Sikula task/contract/run; the
+plan records ordering, dependencies, streams, and eventual output branch
+metadata.
+
+The current MVP exposes:
+
+```bash
+sikula delivery check .sikula/delivery/<slug>/plan.yaml
+sikula delivery status .sikula/delivery/<slug>/plan.yaml
+```
+
+These commands validate the tracked plan file and can emit JSON. `delivery
+status` also reads ignored parent progress from
+`.sikula/state/delivery/<plan-id>/progress.json` when present; if progress does
+not exist yet, units are reported as pending from the plan. They do not create
+worktrees, create task state, run agents, prepare contracts, or update branches.
+The validator currently enforces single-repository scope and rejects multi-repo
+plans until cross-repo branching, locking, validation, and result-set semantics
+exist. See [Delivery Plans](delivery-plans.md).
+
 ## Gated Pipeline
 
 The normal run pipeline is:
