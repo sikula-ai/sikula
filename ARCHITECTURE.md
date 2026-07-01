@@ -35,6 +35,7 @@
 | `TaskAsset` helpers | `core/task_assets.py` | Deterministic local task-asset parsing, path canonicalization, answer mapping, and asset-manifest line rendering used by contract preparation |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
 | `JsonStateStore` | `core/state.py` | Stores each task as `<task_id>.json` in the configured state dir; serializes same-process access and writes via temp-file replacement so heartbeat updates and audit saves cannot interleave partial JSON writes |
+| `sikula_cli` command modules | `sikula_cli/*.py` | Focused CLI command wrappers and parser registration helpers; `sikula.py` remains the public entrypoint and compatibility surface |
 
 ---
 
@@ -178,8 +179,9 @@ only under `previous_answers`, while active `answers` are reset for the new hash
 `contract prepare` or run preflight logic does not treat stale answers as authoritative.
 
 **Delivery plan check command:** `sikula delivery check PLAN_FILE` is the first
-delivery-plan MVP primitive. It is implemented by `core/delivery_plan.py` and
-validates tracked `.sikula/delivery/<slug>/plan.yaml` files without creating
+delivery-plan MVP primitive. Its CLI wrapper lives in `sikula_cli/delivery.py`;
+deterministic validation is implemented by `core/delivery_plan.py`. It validates
+tracked `.sikula/delivery/<slug>/plan.yaml` files without creating
 `TaskState`, starting agents, creating worktrees, preparing contracts, or
 updating branches. The validator checks schema version, required plan metadata,
 delivery unit IDs, unit task paths, dependency references/cycles, optional stream
@@ -188,8 +190,10 @@ the plan is treated as one implicit repository with `id: main` and `root: .`;
 multi-repo plans are rejected until cross-repo execution semantics are added.
 
 **Delivery plan status command:** `sikula delivery status PLAN_FILE` is a
-read-only parent-progress view implemented by `core/delivery_progress.py`. It
-reuses delivery plan validation, then reads ignored progress from
+read-only parent-progress view. Its CLI wrapper lives in
+`sikula_cli/delivery.py`; progress derivation is implemented by
+`core/delivery_progress.py`. It reuses delivery plan validation, then reads
+ignored progress from
 `.sikula/state/delivery/<plan-id>/progress.json` when present. Missing progress
 is normal before the first unit runs; status derives pending units and dependency
 blockers from the tracked plan. The JSON result is allowlisted metadata only: it

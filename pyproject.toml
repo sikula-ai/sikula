@@ -53,7 +53,7 @@ py-modules = ["sikula"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agents*", "core*", "tools*"]
+include = ["agents*", "core*", "sikula_cli*", "tools*"]
 
 [tool.ruff]
 line-length = 120
