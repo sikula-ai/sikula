@@ -39,7 +39,9 @@ def test_contract_cli_module_imports() -> None:
     import sikula_cli.contract as contract_cli
 
     assert callable(contract_cli.register_check_parser)
+    assert callable(contract_cli.register_prepare_parser)
     assert callable(contract_cli.cmd_contract_check)
+    assert callable(contract_cli.cmd_contract_prepare)
 
 
 def test_contract_check_register_parser_sets_flags() -> None:
@@ -55,6 +57,42 @@ def test_contract_check_register_parser_sets_flags() -> None:
     assert args.task_file == "task.md"
     assert args.json is True
     assert args.write_report is True
+
+
+def test_contract_prepare_register_parser_sets_flags() -> None:
+    import sikula_cli.contract as contract_cli
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="contract_command")
+    contract_cli.register_prepare_parser(subparsers)
+
+    args = parser.parse_args(
+        [
+            "prepare",
+            "task.md",
+            "--answers",
+            "answers.yaml",
+            "--auto",
+            "--output",
+            "contract.md",
+            "--agent-model",
+            "task_preparer=gpt-5.5",
+            "--agent-provider",
+            "task_preparer=codex",
+            "--agent-timeout",
+            "task_preparer=1200",
+        ]
+    )
+
+    assert args.contract_command == "prepare"
+    assert args.task_file == "task.md"
+    assert args.answers == "answers.yaml"
+    assert args.auto is True
+    assert args.interactive is False
+    assert args.output == "contract.md"
+    assert args.agent_model == ["task_preparer=gpt-5.5"]
+    assert args.agent_provider == ["task_preparer=codex"]
+    assert args.agent_timeout == ["task_preparer=1200"]
 
 
 class TestContractCliModule:
@@ -108,6 +146,18 @@ class TestContractCliModule:
 
         assert exc.value.code == 1
         assert "Task path is not a file: task-dir" in capsys.readouterr().err
+
+    def test_cmd_contract_prepare_rejects_auto_interactive(self, capsys):
+        import sikula_cli.contract as contract_cli
+
+        with pytest.raises(SystemExit) as exc:
+            contract_cli.cmd_contract_prepare(
+                argparse.Namespace(auto=True, interactive=True),
+                {},
+            )
+
+        assert exc.value.code == 2
+        assert "--auto cannot be combined with --interactive" in capsys.readouterr().err
 
 
 def _python_project_config(tmp_path: Path) -> dict:

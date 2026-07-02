@@ -1726,6 +1726,34 @@ class TestMain:
         assert args.json is True
         assert args.write_report is True
 
+    def test_contract_prepare_command_dispatches_to_cmd_contract_prepare(self, tmp_path: Path):
+        cfg = self._cfg(tmp_path)
+        argv = [
+            "sikula",
+            "contract",
+            "prepare",
+            "task.md",
+            "--answers",
+            "answers.yaml",
+            "--auto",
+            "--output",
+            "contract.md",
+            "--agent-model",
+            "task_preparer=gpt-5.5",
+        ]
+        with patch("sys.argv", argv):
+            with patch("sikula._load_runtime_config", return_value=cfg):
+                with patch("sikula.cmd_contract_prepare") as mock_prepare:
+                    main()
+        mock_prepare.assert_called_once()
+        args = mock_prepare.call_args.args[0]
+        assert args.contract_command == "prepare"
+        assert args.task_file == "task.md"
+        assert args.answers == "answers.yaml"
+        assert args.auto is True
+        assert args.output == "contract.md"
+        assert args.agent_model == ["task_preparer=gpt-5.5"]
+
     def test_status_command_dispatches_to_cmd_status(self, tmp_path: Path):
         p1, p2, p3 = self._patch_config(tmp_path)
         with patch("sys.argv", ["sikula", "status"]):

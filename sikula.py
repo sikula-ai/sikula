@@ -1615,266 +1615,31 @@ def _run_contract_prepare_auto(
     )
 
 
+def _contract_prepare_context() -> cli_contract.ContractPrepareContext:
+    return cli_contract.ContractPrepareContext(
+        resolve_task_path=_resolve_task_path,
+        project_config=_contract_cli_project_config,
+        prepare_project_context_from_config=_prepare_project_context_from_config,
+        resolve_output_path=_resolve_output_path,
+        default_contract_path=_default_contract_path,
+        resolve_contract_report_dir=_resolve_contract_report_dir,
+        load_prepare_answers=_load_prepare_answers,
+        collect_prepare_answers_interactive=_collect_prepare_answers_interactive,
+        resolve_answers_path=_resolve_answers_path,
+        existing_prepare_answers_path=_existing_prepare_answers_path,
+        prepare_default_answers_has_current_filled_values=_prepare_default_answers_has_current_filled_values,
+        run_contract_prepare_auto=_run_contract_prepare_auto,
+        write_prepare_answers_template=_write_prepare_answers_template,
+        prepare_answers_path=_prepare_answers_path,
+        print_project_context_required=_print_contract_prepare_project_context_required,
+        print_existing_output_next_step_note=_print_existing_output_next_step_note,
+        print_existing_output_hint=_print_existing_output_hint,
+        print_open_question_details=_print_open_question_details,
+    )
+
+
 def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
-    from core.contract_check import (
-        load_generated_answer_entries_for_contract,
-        prepare_implementation_contract,
-        render_contract_check,
-        write_prepared_contract,
-    )
-
-    if args.auto and args.interactive:
-        print("Failed to prepare contract: --auto cannot be combined with --interactive", file=sys.stderr)
-        sys.exit(2)
-
-    project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
-    task_path = _resolve_task_path(args.task_file, project_root)
-    if task_path is None:
-        print(f"Task file not found: {args.task_file}")
-        sys.exit(1)
-    if not task_path.is_file():
-        print(f"Task path is not a file: {args.task_file}", file=sys.stderr)
-        sys.exit(1)
-
-    task_text = task_path.read_text(encoding="utf-8")
-    project_context = _prepare_project_context_from_config(cfg)
-    prepare_project_config = _contract_cli_project_config(cfg)
-    output_path = _resolve_output_path(args.output) if args.output else _default_contract_path(task_path, cfg)
-    report_root = project_root if cfg.get("project", {}).get("root_path") else None
-    report_dir = _resolve_contract_report_dir(cfg) if cfg.get("_config_path") else None
-    generated_answer_entries = load_generated_answer_entries_for_contract(
-        task_path,
-        source_text=task_text,
-        project_root=report_root,
-        report_dir=report_dir,
-    )
-    if project_context is None or not project_context.get("validation_commands"):
-        result = prepare_implementation_contract(
-            task_text,
-            contract_name=str(task_path),
-            project_context=project_context,
-            project_config=prepare_project_config,
-            generated_answer_entries=generated_answer_entries,
-        )
-        if result.required_next_step == "provide_project_context":
-            _print_contract_prepare_project_context_required(result, args.task_file)
-            if output_path.exists():
-                _print_existing_output_next_step_note(output_path)
-            sys.exit(1)
-
-    answers: dict[str, dict] = {}
-    answers_supplied = bool(args.interactive or args.answers)
-    existing_default_answers_path = None
-    if args.interactive:
-        try:
-            first = prepare_implementation_contract(
-                task_text,
-                contract_name=str(task_path),
-                project_context=project_context,
-                project_config=prepare_project_config,
-                generated_answer_entries=generated_answer_entries,
-            )
-            answers = _collect_prepare_answers_interactive(
-                generated_by="sikula.contract_prepare",
-                label="contract preparation",
-                source_path=task_path,
-                source_text=task_text,
-                project_root=project_root,
-                questions=first.user_questions,
-                cfg=cfg,
-                answers_path=_resolve_answers_path(args.answers) if args.answers else None,
-            )
-        except (EOFError, OSError, ValueError) as exc:
-            print(f"Failed to collect contract answers: {exc}", file=sys.stderr)
-            sys.exit(1)
-    elif args.answers:
-        try:
-            answers = _load_prepare_answers(
-                _resolve_answers_path(args.answers), source_path=task_path, source_text=task_text
-            )
-        except (OSError, ValueError) as exc:
-            print(f"Failed to load contract answers: {exc}", file=sys.stderr)
-            sys.exit(1)
-    elif args.auto:
-        existing_default_answers_path = _existing_prepare_answers_path(
-            task_path,
-            cfg,
-            generated_by="sikula.contract_prepare",
-        )
-
-    result = prepare_implementation_contract(
-        task_text,
-        contract_name=str(task_path),
-        answers=answers,
-        project_context=project_context,
-        project_config=prepare_project_config,
-        generated_answer_entries=generated_answer_entries,
-    )
-    if result.required_next_step == "provide_project_context":
-        _print_contract_prepare_project_context_required(result, args.task_file)
-        if output_path.exists():
-            _print_existing_output_next_step_note(output_path)
-        sys.exit(1)
-
-    auto_answer_count = 0
-    if args.auto and output_path.exists():
-        print(f"Failed to prepare contract: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
-        _print_existing_output_hint(output_path)
-        sys.exit(1)
-
-    if args.auto and existing_default_answers_path:
-        try:
-            has_current_filled_default_answers = _prepare_default_answers_has_current_filled_values(
-                answers_path=existing_default_answers_path,
-                generated_by="sikula.contract_prepare",
-                source_path=task_path,
-                source_text=task_text,
-                project_root=project_root,
-                questions=result.user_questions,
-                cfg=cfg,
-            )
-        except (OSError, ValueError) as exc:
-            print(f"Failed to inspect existing contract answers: {exc}", file=sys.stderr)
-            sys.exit(1)
-        if has_current_filled_default_answers:
-            print(
-                "Failed to auto-prepare contract: existing contract answers contain filled values; "
-                f"rerun with --answers {existing_default_answers_path}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-    if args.auto and result.user_questions:
-        try:
-            auto_result = _run_contract_prepare_auto(
-                args=args,
-                cfg=cfg,
-                project_root=project_root,
-                source_path=task_path,
-                task_text=task_text,
-                output_path=output_path,
-                project_context=project_context,
-                generated_answer_entries=generated_answer_entries,
-                answers=answers,
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            print(f"Failed to auto-prepare contract: {exc}", file=sys.stderr)
-            sys.exit(1)
-        result = auto_result.result
-        answers = auto_result.answers
-        auto_answer_count = len(auto_result.auto_answers)
-        if args.answers and auto_answer_count:
-            try:
-                _write_prepare_answers_template(
-                    generated_by="sikula.contract_prepare",
-                    source_path=task_path,
-                    source_text=task_text,
-                    project_root=project_root,
-                    questions=result.user_questions,
-                    cfg=cfg,
-                    answers=answers,
-                    answers_path=_resolve_answers_path(args.answers),
-                )
-            except (OSError, ValueError) as exc:
-                print(f"Failed to update contract answers: {exc}", file=sys.stderr)
-                sys.exit(1)
-        elif existing_default_answers_path and auto_answer_count and not result.needs_user_input:
-            try:
-                _write_prepare_answers_template(
-                    generated_by="sikula.contract_prepare",
-                    source_path=task_path,
-                    source_text=task_text,
-                    project_root=project_root,
-                    questions=result.user_questions,
-                    cfg=cfg,
-                    answers=answers,
-                )
-            except (OSError, ValueError) as exc:
-                print(f"Failed to update contract answers: {exc}", file=sys.stderr)
-                sys.exit(1)
-
-    if result.needs_user_input and not answers_supplied:
-        answers_path = _write_prepare_answers_template(
-            generated_by="sikula.contract_prepare",
-            source_path=task_path,
-            source_text=task_text,
-            project_root=project_root,
-            questions=result.user_questions,
-            cfg=cfg,
-            answers=answers if args.auto else None,
-        )
-        print("Contract preparation needs answers before writing an implementation contract.")
-        print(f"Contract preparation answers template written: {answers_path}")
-        if args.auto:
-            print(f"Auto-applied answers: {auto_answer_count}")
-        print(f"Applied answers: {len(result.answered_question_ids)}")
-        print(f"Open questions: {len(result.open_question_ids)}")
-        _print_open_question_details(result.user_questions)
-        print("Next step:")
-        print(f"- Fill the answers file, then run: sikula contract prepare {args.task_file} --answers {answers_path}")
-        print(f"- Or answer in the terminal: sikula contract prepare {args.task_file} --interactive")
-        if output_path.exists():
-            _print_existing_output_next_step_note(output_path)
-        sys.exit(1)
-
-    if result.required_next_step == "revise_contract":
-        print("Contract preparation needs task description revisions before writing an implementation contract.")
-        print("")
-        print(render_contract_check(result.recheck_result or result.check_result), end="")
-        if result.suggested_next_steps:
-            print("")
-            print("Next step:")
-            for step in result.suggested_next_steps:
-                print(f"- {step}")
-        if output_path.exists():
-            _print_existing_output_next_step_note(output_path)
-        sys.exit(1)
-
-    if output_path.exists():
-        print(f"Failed to prepare contract: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
-        _print_existing_output_hint(output_path)
-        sys.exit(1)
-
-    try:
-        write_prepared_contract(
-            result,
-            output_path=output_path,
-            project_root=report_root,
-            report_dir=report_dir,
-        )
-    except (OSError, ValueError) as exc:
-        print(f"Failed to prepare contract: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Implementation contract written: {output_path}")
-    if args.auto:
-        print(f"Auto-applied answers: {auto_answer_count}")
-    print(f"Applied answers: {len(result.answered_question_ids)}")
-    print(f"Open questions: {len(result.open_question_ids)}")
-    print("")
-    print(render_contract_check(result.recheck_result or result.check_result), end="")
-    if result.ready_to_run:
-        print("")
-        print(f"Next step: sikula run {output_path}")
-    elif result.needs_user_input:
-        answers_path = (
-            _resolve_answers_path(args.answers)
-            if args.answers
-            else _prepare_answers_path(
-                task_path,
-                cfg,
-                generated_by="sikula.contract_prepare",
-            )
-        )
-        print("")
-        print("Next step:")
-        print(f"- Fill/update the answers file: {answers_path}")
-        print(
-            "- Then rerun contract prepare with a new --output path, or remove/rename the output written above first."
-        )
-    else:
-        print("")
-        print(f"Next step: review the contract check output above before running sikula run {output_path}")
+    return cli_contract.cmd_contract_prepare(args, cfg, _contract_prepare_context())
 
 
 def _resolve_answers_path(value: str) -> Path:
@@ -4722,52 +4487,7 @@ def main() -> None:
     contract_p = sub.add_parser("contract", help="Inspect or prepare implementation contracts")
     contract_sub = contract_p.add_subparsers(dest="contract_command")
     cli_contract.register_check_parser(contract_sub)
-    contract_prepare_p = contract_sub.add_parser(
-        "prepare",
-        help="Create a project-aware Markdown implementation contract",
-    )
-    contract_prepare_p.add_argument("task_file", metavar="TASK_FILE", help="Path to refined task .txt/.md file")
-    contract_prepare_p.add_argument(
-        "--answers",
-        help="Path to .sikula/contract-reports/*.answers.yaml created by Sikula prepare/check tooling",
-    )
-    contract_prepare_p.add_argument(
-        "--auto",
-        action="store_true",
-        default=False,
-        help="Use a read-only LLM assistant to answer supported contract-preparation questions",
-    )
-    contract_prepare_p.add_argument(
-        "--interactive",
-        action="store_true",
-        default=False,
-        help="Prompt for missing contract answers before writing the implementation contract",
-    )
-    contract_prepare_p.add_argument(
-        "--output",
-        help="Write the implementation contract to this file; defaults to contracts.<stem>.contract.md",
-    )
-    contract_prepare_p.add_argument(
-        "--agent-model",
-        action="append",
-        default=None,
-        metavar="AGENT=MODEL",
-        help="Override model for task_preparer, e.g. --agent-model task_preparer=gpt-5.5",
-    )
-    contract_prepare_p.add_argument(
-        "--agent-provider",
-        action="append",
-        default=None,
-        metavar="AGENT=PROVIDER",
-        help="Override provider for task_preparer, e.g. --agent-provider task_preparer=claude",
-    )
-    contract_prepare_p.add_argument(
-        "--agent-timeout",
-        action="append",
-        default=None,
-        metavar="AGENT=SECONDS",
-        help="Override timeout for task_preparer, e.g. --agent-timeout task_preparer=1200",
-    )
+    cli_contract.register_prepare_parser(contract_sub)
 
     delivery_p = register_delivery_parser(sub)
 
