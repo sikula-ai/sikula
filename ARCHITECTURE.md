@@ -127,11 +127,15 @@ scores whether it is specific enough to act as an implementation contract, repor
 and stable clarifying question IDs, and can emit the same result as JSON. By default it
 does not write files; with `--write-report` it writes an explicit
 `.sikula/contract-reports/*.check.json` report and matching `.answers.yaml` template for
-follow-up answers. `sikula task refine TASK_FILE --output ...` prepares the product brief
-side of the flow: it can normalize a product request into task-description Markdown and
-ask product-level clarifying questions, but it does not evaluate Sikula delivery
-readiness or return run guidance. `sikula contract prepare TASK_FILE --answers ...
---output ...` turns the task description into the delivery artifact by applying answers,
+follow-up answers. `sikula task attach TASK_FILE ASSET_FILE` parser registration and
+handler logic live in `sikula_cli/task.py`; the command copies local reference or delivery
+assets into the configured task asset directory and optionally appends the
+generated Markdown snippet to the task file. `sikula task refine TASK_FILE
+--output ...` prepares the product brief side of the flow: it can normalize a
+product request into task-description Markdown and ask product-level clarifying
+questions, but it does not evaluate Sikula delivery readiness or return run
+guidance. `sikula contract prepare TASK_FILE --answers ... --output ...` turns
+the task description into the delivery artifact by applying answers,
 preserving product sections, adding project context plus validation commands from the
 effective project config, and rechecking the returned Markdown. It refuses stale answer
 hashes, accidental overwrites, and task-description input that already contains the

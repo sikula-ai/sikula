@@ -1685,6 +1685,33 @@ class TestMain:
                     main()
         mock_load_env.assert_called_once_with(tmp_path)
 
+    def test_task_attach_command_dispatches_to_cmd_task_attach(self, tmp_path: Path):
+        cfg = self._cfg(tmp_path)
+        argv = [
+            "sikula",
+            "task",
+            "attach",
+            "task.md",
+            "mockup.png",
+            "--reference",
+            "--note",
+            "Expected layout.",
+            "--write",
+        ]
+        with patch("sys.argv", argv):
+            with patch("sikula._load_runtime_config", return_value=cfg):
+                with patch("sikula.cmd_task_attach") as mock_attach:
+                    main()
+        mock_attach.assert_called_once()
+        args = mock_attach.call_args.args[0]
+        assert args.task_command == "attach"
+        assert args.task_file == "task.md"
+        assert args.asset_file == "mockup.png"
+        assert args.reference is True
+        assert args.delivery is False
+        assert args.note == "Expected layout."
+        assert args.write is True
+
     def test_status_command_dispatches_to_cmd_status(self, tmp_path: Path):
         p1, p2, p3 = self._patch_config(tmp_path)
         with patch("sys.argv", ["sikula", "status"]):

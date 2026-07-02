@@ -11,6 +11,128 @@ from core.task_attach import append_task_asset_snippet, attach_task_asset
 from sikula import cmd_task_attach
 
 
+def test_task_cli_module_imports() -> None:
+    import sikula_cli.task as task_cli
+
+    assert callable(task_cli.register_attach_parser)
+    assert callable(task_cli.cmd_task_attach)
+
+
+def test_task_attach_register_parser_sets_flags() -> None:
+    import sikula_cli.task as task_cli
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="task_command")
+    task_cli.register_attach_parser(subparsers)
+
+    reference_args = parser.parse_args(["attach", "task.md", "mockup.png", "--reference", "--note", "Expected"])
+    assert reference_args.task_command == "attach"
+    assert reference_args.task_file == "task.md"
+    assert reference_args.asset_file == "mockup.png"
+    assert reference_args.reference is True
+    assert reference_args.delivery is False
+    assert reference_args.note == "Expected"
+
+    delivery_args = parser.parse_args(
+        [
+            "attach",
+            "task.md",
+            "icon.svg",
+            "--delivery",
+            "--purpose",
+            "Success icon",
+            "--target",
+            "app/assets/icon.svg",
+            "--source",
+            "Provided by product",
+            "--write",
+        ]
+    )
+    assert delivery_args.reference is False
+    assert delivery_args.delivery is True
+    assert delivery_args.purpose == "Success icon"
+    assert delivery_args.target == "app/assets/icon.svg"
+    assert delivery_args.source == "Provided by product"
+    assert delivery_args.write is True
+
+
+class TestTaskCliModule:
+    def test_default_resolve_task_path(self, tmp_path: Path, monkeypatch):
+        import sikula_cli.task as task_cli
+
+        task = tmp_path / "task.md"
+        task.write_text("# Task\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+
+        assert task_cli._default_resolve_task_path("task.md", tmp_path) == task
+        assert task_cli._default_resolve_task_path(str(task), tmp_path) == task
+        assert task_cli._default_resolve_task_path("missing.md", tmp_path) is None
+        assert task_cli._default_resolve_task_path(str(tmp_path / "missing.md"), tmp_path) is None
+
+    def test_cmd_task_attach_reports_missing_task(self, tmp_path: Path, capsys):
+        import sikula_cli.task as task_cli
+
+        with pytest.raises(SystemExit) as exc:
+            task_cli.cmd_task_attach(
+                _args(task_file="missing.md", asset_file="asset.png", reference=True), _cfg(tmp_path)
+            )
+
+        assert exc.value.code == 1
+        assert "Task file not found: missing.md" in capsys.readouterr().err
+
+    def test_cmd_task_attach_reports_non_file_task_path(self, tmp_path: Path, capsys):
+        import sikula_cli.task as task_cli
+
+        task_dir = tmp_path / "task-dir"
+        task_dir.mkdir()
+        context = task_cli.TaskContext(
+            resolve_task_path=lambda _task_file, _project_root: task_dir,
+            resolve_task_asset_dir=lambda _cfg: tmp_path / ".sikula" / "task-assets",
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            task_cli.cmd_task_attach(
+                _args(task_file="task-dir", asset_file="asset.png", reference=True), _cfg(tmp_path), context
+            )
+
+        assert exc.value.code == 1
+        assert "Task path is not a file: task-dir" in capsys.readouterr().err
+
+    def test_cmd_task_attach_reports_core_attach_failure(self, tmp_path: Path, capsys):
+        import sikula_cli.task as task_cli
+
+        task_file = tmp_path / "task.md"
+        task_file.write_text("# Task\n", encoding="utf-8")
+        asset = tmp_path / "icon.svg"
+        asset.write_text("<svg />", encoding="utf-8")
+
+        with pytest.raises(SystemExit) as exc:
+            task_cli.cmd_task_attach(
+                _args(task_file=str(task_file), asset_file=str(asset), delivery=True, source="Provided by product."),
+                _cfg(tmp_path),
+            )
+
+        assert exc.value.code == 1
+        assert "Failed to attach task asset: --purpose is required" in capsys.readouterr().err
+
+    def test_cmd_task_attach_reports_reused_existing_asset(self, tmp_path: Path, capsys):
+        import sikula_cli.task as task_cli
+
+        task_file = tmp_path / "task.md"
+        task_file.write_text("# Task\n", encoding="utf-8")
+        asset_dir = tmp_path / ".sikula" / "task-assets" / "task"
+        asset_dir.mkdir(parents=True)
+        existing = asset_dir / "mockup.png"
+        existing.write_bytes(b"png")
+
+        task_cli.cmd_task_attach(
+            _args(task_file=str(task_file), asset_file=str(existing), reference=True),
+            _cfg(tmp_path),
+        )
+
+        assert "Existing identical asset reused: yes" in capsys.readouterr().out
+
+
 def _cfg(project_root: Path, *, task_asset_dir: str = ".sikula/task-assets") -> dict:
     return {
         "project": {"root_path": str(project_root)},
