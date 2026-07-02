@@ -18,6 +18,82 @@ _pid_running = _sikula._pid_running
 _SIKULA_PY = str(Path(__file__).parent.parent / "sikula.py")
 
 
+def test_status_cli_module_imports() -> None:
+    import sikula_cli.status as status_cli
+
+    assert callable(status_cli.cmd_status)
+    assert callable(status_cli.cmd_show)
+
+
+class TestStatusCliModule:
+    def test_default_current_branch_delivery_helpers(self):
+        from core.state import TaskState
+        import sikula_cli.status as status_cli
+
+        state = TaskState(
+            task_id="delivery",
+            task_description="current branch task",
+            done=True,
+            review_mode="review_fix",
+            review_delivery_mode="current_branch",
+            review_delivery_status="failed",
+            worktree_base="/tmp/worktree",
+        )
+
+        assert status_cli._status_label(state) == "delivery failed"
+        assert status_cli._status_next_action(state, "delivery failed") == "sikula run --task-id delivery"
+
+        state.review_delivery_status = "pending"
+        state.worktree_base = None
+        assert status_cli._status_label(state) == "CLEANED"
+
+        state.review_delivery_status = "delivered"
+        assert status_cli._status_label(state) == "DONE"
+
+    def test_default_contract_gate_helpers(self):
+        from core.state import TaskState
+        import sikula_cli.status as status_cli
+
+        state = TaskState(task_id="blocked", task_description="blocked task", failed=True)
+        state.contract_gate_blocked = True
+        assert status_cli._status_next_action(state, "FAILED") == "sikula show blocked"
+
+        state.implementation_contract = {"source": {"path": ".sikula/tasks/task.md"}}
+        assert (
+            status_cli._status_next_action(state, "FAILED")
+            == "sikula contract check .sikula/tasks/task.md --write-report"
+        )
+
+    def test_active_operation_fallback_helpers(self):
+        from datetime import datetime, timedelta, timezone
+        import sikula_cli.status as status_cli
+
+        assert status_cli._active_operation_label({"phase": "build", "scope": "final_full_task"}) == "final build"
+        assert status_cli._active_operation_is_fresh({"last_heartbeat_at": "not-a-date"}) is False
+        assert status_cli._active_operation_elapsed(None) is None
+        assert status_cli._active_operation_elapsed({"started_at": "not-a-date"}) is None
+
+        started = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        assert status_cli._active_operation_elapsed({"started_at": started}) == "2m"
+
+        updated = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        state = type("State", (), {"updated_at": updated})()
+        assert status_cli._status_updated(state) == "2h ago"
+
+    def test_module_cmd_status_empty_and_no_match(self, tmp_path: Path, capsys):
+        import sikula_cli.status as status_cli
+        from core.state import JsonStateStore, TaskState
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        status_cli.cmd_status(cfg, argparse.Namespace(json=True, verbose=False, status_filter=[]))
+        assert capsys.readouterr().out.strip() == "[]"
+
+        store = JsonStateStore(tmp_path)
+        store.save(TaskState(task_id="done", task_description="done task", done=True))
+        status_cli.cmd_status(cfg, argparse.Namespace(json=False, verbose=False, status_filter=["failed"]))
+        assert capsys.readouterr().out.strip() == "No matching tasks."
+
+
 class TestVersionFlag:
     def test_version_flag_exits_cleanly(self):
         result = subprocess.run(

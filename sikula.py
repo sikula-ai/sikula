@@ -82,6 +82,7 @@ import yaml
 from core.diagnostics import diagnostic_identity_key, diagnostic_summary_lines
 from core.version import sikula_version as _sikula_version
 from sikula_cli import config as cli_config
+from sikula_cli import status as cli_status
 from sikula_cli.delivery import (
     cmd_delivery_check,
     cmd_delivery_status,
@@ -3502,240 +3503,63 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> None:
     sys.exit(0 if state.done and not delivery_failed else 1)
 
 
+def _status_context() -> cli_status.StatusContext:
+    return cli_status.StatusContext(
+        resolve_state_dir=_resolve_state_dir,
+        current_branch_delivery_needs_finalization=_current_branch_delivery_needs_finalization,
+        current_branch_delivery_cleaned=_current_branch_delivery_cleaned,
+        contract_gate_blocked_without_worktree=_contract_gate_blocked_without_worktree,
+        contract_gate_next_action=_contract_gate_next_action,
+        pid_running=_pid_running,
+    )
+
+
 def _pid_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return False
+    return cli_status._pid_running(pid)
 
 
 def _status_label(state) -> str:
-    if _current_branch_delivery_needs_finalization(state):
-        return "delivery failed" if state.review_delivery_status == "failed" else "delivery pending"
-    if _current_branch_delivery_cleaned(state):
-        return "CLEANED"
-    if state.done:
-        return "DONE"
-    if state.failed:
-        return "FAILED"
-    if state.worktree_branch and not state.worktree_path:
-        return "CLEANED"
-    if state.active_operation and _active_operation_is_fresh(state.active_operation):
-        return _active_operation_label(state.active_operation)
-    if state.pid and not _pid_running(state.pid):
-        return "INTERRUPTED"
-    if state.active_operation:
-        return _active_operation_label(state.active_operation)
-    final_scope = state.active_scope == "final_full_task"
-    if state.build_status == "failed":
-        return "final build failed" if final_scope else "build failed"
-    if state.build_iterations and state.build_status != "success":
-        return "final building" if final_scope else "building"
-    if state.tests_up_to_date:
-        return "final validation" if final_scope else "testing"
-    if state.security_approved:
-        return "final test writing" if final_scope else "writing tests"
-    if state.review_approved:
-        return "final security review" if final_scope else "security review"
-    if state.files_changed:
-        return "final review" if final_scope else "reviewing"
-    if state.plan_decided:
-        return "implementing"
-    if state.presync_done:
-        return "analyzing"
-    return "starting"
+    return cli_status._status_label(state, _status_context())
 
 
 def _active_operation_label(active_operation: dict) -> str:
-    agent = active_operation.get("agent")
-    if agent:
-        return str(agent)
-    phase = str(active_operation.get("phase", "running"))
-    if active_operation.get("scope") == "final_full_task":
-        return f"final {phase}"
-    return phase
+    return cli_status._active_operation_label(active_operation)
 
 
 def _active_operation_is_fresh(active_operation: dict) -> bool:
-    last_heartbeat_at = active_operation.get("last_heartbeat_at")
-    try:
-        from datetime import datetime, timezone
-
-        last_heartbeat = datetime.fromisoformat(last_heartbeat_at)
-        if last_heartbeat.tzinfo is None:
-            last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
-        age_s = max(0, int((datetime.now(timezone.utc) - last_heartbeat.astimezone(timezone.utc)).total_seconds()))
-    except (TypeError, ValueError):
-        return False
-    interval_s = int(active_operation.get("heartbeat_interval_seconds") or 60)
-    return age_s <= max(120, interval_s * 2 + 10)
+    return cli_status._active_operation_is_fresh(active_operation)
 
 
 def _active_operation_elapsed(active_operation: dict | None) -> str | None:
-    if not active_operation:
-        return None
-    started_at = active_operation.get("started_at")
-    try:
-        from datetime import datetime, timezone
-
-        started = datetime.fromisoformat(started_at)
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-        elapsed = max(0, int((datetime.now(timezone.utc) - started.astimezone(timezone.utc)).total_seconds()))
-    except (TypeError, ValueError):
-        return None
-    if elapsed < 60:
-        return f"{elapsed}s"
-    if elapsed < 3600:
-        return f"{elapsed // 60}m"
-    return f"{elapsed // 3600}h {elapsed % 3600 // 60}m"
+    return cli_status._active_operation_elapsed(active_operation)
 
 
 def _status_step(state) -> str:
-    if not state.plan:
-        return "-"
-    total = len(state.plan)
-    current = max(1, min(state.current_step + 1, total))
-    return f"{current}/{total}"
+    return cli_status._status_step(state)
 
 
 def _status_updated(state) -> str:
-    try:
-        from datetime import datetime, timezone
-
-        updated = datetime.fromisoformat(state.updated_at)
-        if updated.tzinfo is None:
-            updated = updated.replace(tzinfo=timezone.utc)
-        elapsed = max(0, int((datetime.now(timezone.utc) - updated.astimezone(timezone.utc)).total_seconds()))
-    except (TypeError, ValueError):
-        return "-"
-    if elapsed < 60:
-        return f"{elapsed}s ago"
-    if elapsed < 3600:
-        return f"{elapsed // 60}m ago"
-    if elapsed < 86400:
-        return f"{elapsed // 3600}h ago"
-    return f"{elapsed // 86400}d ago"
+    return cli_status._status_updated(state)
 
 
 def _status_next_action(state, status: str) -> str:
-    if _current_branch_delivery_needs_finalization(state):
-        return f"sikula run --task-id {state.task_id}"
-    if status == "DONE":
-        return "review branch" if state.worktree_branch else "review changes"
-    if status == "FAILED":
-        if state.review_mode == "review_report":
-            return "re-run sikula review"
-        if _contract_gate_blocked_without_worktree(state):
-            return _contract_gate_next_action(state)
-        return f"sikula run --task-id {state.task_id} --reset-failed"
-    if state.review_mode == "review_report":
-        if state.active_operation and _active_operation_is_fresh(state.active_operation):
-            return "wait"
-        if state.pid and _pid_running(state.pid):
-            return "wait"
-        return "re-run sikula review"
-    if status == "CLEANED":
-        return f"sikula show {state.task_id}"
-    if status == "INTERRUPTED":
-        return f"sikula run --task-id {state.task_id}"
-    if state.active_operation and _active_operation_is_fresh(state.active_operation):
-        return "wait"
-    return "wait" if state.pid and _pid_running(state.pid) else f"sikula run --task-id {state.task_id}"
+    return cli_status._status_next_action(state, status, _status_context())
 
 
 def _status_row(state) -> dict:
-    status = _status_label(state)
-    task_label = state.task_file
-    if not task_label:
-        task_label = state.task_description.splitlines()[0][:60] if state.task_description else "(no description)"
-    row = {
-        "id": state.task_id,
-        "status": status,
-        "step": _status_step(state),
-        "build": state.build_iterations if state.build_iterations else None,
-        "updated": state.updated_at,
-        "updated_human": _status_updated(state),
-        "task": task_label,
-        "next_action": _status_next_action(state, status),
-    }
-    if state.active_operation and (status != "INTERRUPTED" or _active_operation_is_fresh(state.active_operation)):
-        row["active_operation"] = state.active_operation
-        row["active_elapsed"] = _active_operation_elapsed(state.active_operation)
-    return row
+    return cli_status._status_row(state, _status_context())
 
 
 def _status_matches(row: dict, filters: set[str]) -> bool:
-    if not filters:
-        return True
-    status = row["status"].lower().replace(" ", "_")
-    if status in filters:
-        return True
-    if "failed" in filters and status == "delivery_failed":
-        return True
-    if "active" in filters and row["status"] not in {"DONE", "FAILED", "CLEANED"}:
-        return True
-    return False
+    return cli_status._status_matches(row, filters)
 
 
 def cmd_status(cfg: dict, args: argparse.Namespace | None = None) -> None:
-    from core.state import JsonStateStore
-
-    args = args or argparse.Namespace(json=False, verbose=False, status_filter=[])
-    state_dir = _resolve_state_dir(cfg)
-    store = JsonStateStore(state_dir)
-    tasks = store.list_tasks()
-    if not tasks:
-        if args.json:
-            print("[]")
-        else:
-            print("No tasks yet.")
-        return
-    states = [s for tid in tasks if (s := store.load(tid)) is not None]
-    states.sort(key=lambda s: s.created_at)
-    filters = {f.lower().replace("-", "_") for f in args.status_filter}
-    rows = [row for s in states if _status_matches((row := _status_row(s)), filters)]
-    if args.json:
-        print(json.dumps(rows, indent=2))
-        return
-    if not rows:
-        print("No matching tasks.")
-        return
-    if args.verbose:
-        print(f"{'ID':<32}  {'STATUS':<16}  {'STEP':>5}  {'BUILD':>5}  {'UPDATED':>8}  TASK")
-        for row in rows:
-            build_col = str(row["build"]) if row["build"] is not None else "-"
-            print(
-                f"{row['id']:<32}  {row['status']:<16}  {row['step']:>5}  "
-                f"{build_col:>5}  {row['updated_human']:>8}  {row['task']}"
-            )
-            if row.get("active_operation"):
-                active = row["active_operation"]
-                elapsed = row.get("active_elapsed") or "-"
-                message = active.get("message") or row["status"]
-                print(f"{'':<32}  active: {message} ({elapsed})")
-            print(f"{'':<32}  next: {row['next_action']}")
-        return
-    print(f"{'ID':<32}  {'STATUS':<16}  {'STEP':>5}  {'BUILD':>5}  {'UPDATED':>8}  TASK")
-    for row in rows:
-        build_col = str(row["build"]) if row["build"] is not None else "-"
-        print(
-            f"{row['id']:<32}  {row['status']:<16}  {row['step']:>5}  "
-            f"{build_col:>5}  {row['updated_human']:>8}  {row['task']}"
-        )
+    return cli_status.cmd_status(cfg, args, _status_context())
 
 
 def cmd_show(task_id: str, cfg: dict) -> None:
-    from core.state import JsonStateStore
-
-    state_dir = _resolve_state_dir(cfg)
-    store = JsonStateStore(state_dir)
-    state = store.load(task_id)
-    if not state:
-        print(f"Task {task_id} not found")
-        sys.exit(1)
-    print(json.dumps(state.__dict__, indent=2))
+    return cli_status.cmd_show(task_id, cfg, _status_context())
 
 
 def cmd_cleanup(args: argparse.Namespace, cfg: dict) -> None:
