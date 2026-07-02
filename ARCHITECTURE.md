@@ -122,10 +122,12 @@ finalization Sikula switches the process directory back to the original project 
 worktree can be removed safely.
 
 **Contract check and preparation commands:** `sikula contract check TASK_FILE` is a
-read-only preflight implemented by `core/contract_check.py`. It parses the task file,
-scores whether it is specific enough to act as an implementation contract, reports gaps
-and stable clarifying question IDs, and can emit the same result as JSON. By default it
-does not write files; with `--write-report` it writes an explicit
+read-only preflight whose CLI parser registration and handler logic live in
+`sikula_cli/contract.py`; the contract scoring itself is implemented by
+`core/contract_check.py`. It parses the task file, scores whether it is specific enough
+to act as an implementation contract, reports gaps and stable clarifying question IDs,
+and can emit the same result as JSON. By default it does not write files; with
+`--write-report` it writes an explicit
 `.sikula/contract-reports/*.check.json` report and matching `.answers.yaml` template for
 follow-up answers. `sikula task attach TASK_FILE ASSET_FILE` parser registration and
 handler logic live in `sikula_cli/task.py`; the command copies local reference or delivery
@@ -142,7 +144,7 @@ hashes, accidental overwrites, and task-description input that already contains 
 reserved `## Asset manifest` section. `--interactive` is a terminal convenience layer for
 both refine and prepare: it creates or reuses an answers YAML, prompts for answers, saves
 that file under `.sikula/contract-reports`, and then writes the clean Markdown output.
-The same module also exposes side-effect-free in-memory helpers
+The core module also exposes side-effect-free in-memory helpers
 (`prepare_task_description()`, `improve_contract_text()`, and
 `prepare_implementation_contract()`) so chat/MCP adapters can reuse the same scoring,
 question, answer-application, and recheck logic without temporary YAML files or duplicate

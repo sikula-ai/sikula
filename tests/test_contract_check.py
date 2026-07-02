@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import re
 from hashlib import sha256
@@ -32,6 +33,81 @@ from sikula import (
     _task_refine_asset_path_candidates,
     main,
 )
+
+
+def test_contract_cli_module_imports() -> None:
+    import sikula_cli.contract as contract_cli
+
+    assert callable(contract_cli.register_check_parser)
+    assert callable(contract_cli.cmd_contract_check)
+
+
+def test_contract_check_register_parser_sets_flags() -> None:
+    import sikula_cli.contract as contract_cli
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="contract_command")
+    contract_cli.register_check_parser(subparsers)
+
+    args = parser.parse_args(["check", "task.md", "--json", "--write-report"])
+
+    assert args.contract_command == "check"
+    assert args.task_file == "task.md"
+    assert args.json is True
+    assert args.write_report is True
+
+
+class TestContractCliModule:
+    def test_cmd_contract_check_prints_json(self, tmp_path: Path, capsys):
+        import sikula_cli.contract as contract_cli
+
+        task_path = tmp_path / "task.md"
+        task_path.write_text(
+            "# Add search\n\n## Acceptance criteria\n- Search filters countries by name.\n",
+            encoding="utf-8",
+        )
+
+        contract_cli.cmd_contract_check(
+            argparse.Namespace(task_file=str(task_path), json=True, write_report=False),
+            {},
+        )
+
+        data = json.loads(capsys.readouterr().out)
+        assert data["schema_version"] == 1
+        assert data["source"]["path"] == str(task_path)
+
+    def test_cmd_contract_check_reports_missing_task(self, capsys):
+        import sikula_cli.contract as contract_cli
+
+        with pytest.raises(SystemExit) as exc:
+            contract_cli.cmd_contract_check(
+                argparse.Namespace(task_file="missing.md", json=False, write_report=False),
+                {},
+            )
+
+        assert exc.value.code == 1
+        assert "Task file not found: missing.md" in capsys.readouterr().out
+
+    def test_cmd_contract_check_reports_non_file_task_path(self, tmp_path: Path, capsys):
+        import sikula_cli.contract as contract_cli
+
+        task_dir = tmp_path / "task-dir"
+        task_dir.mkdir()
+        context = contract_cli.ContractContext(
+            resolve_task_path=lambda _task_file, _project_root: task_dir,
+            project_config=lambda _cfg: None,
+            resolve_contract_report_dir=lambda _cfg: tmp_path / ".sikula" / "contract-reports",
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            contract_cli.cmd_contract_check(
+                argparse.Namespace(task_file="task-dir", json=False, write_report=False),
+                {},
+                context,
+            )
+
+        assert exc.value.code == 1
+        assert "Task path is not a file: task-dir" in capsys.readouterr().err
 
 
 def _python_project_config(tmp_path: Path) -> dict:

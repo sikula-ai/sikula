@@ -81,6 +81,7 @@ import yaml
 
 from core.diagnostics import diagnostic_identity_key, diagnostic_summary_lines
 from core.version import sikula_version as _sikula_version
+from sikula_cli import contract as cli_contract
 from sikula_cli import cleanup as cli_cleanup
 from sikula_cli import config as cli_config
 from sikula_cli import status as cli_status
@@ -1564,49 +1565,16 @@ def _print_existing_output_hint(output_path: Path) -> None:
     )
 
 
-def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
-    from core.contract_check import check_contract_file, render_contract_check, write_contract_report
-
-    project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
-    task_path = _resolve_task_path(args.task_file, project_root)
-    if task_path is None:
-        print(f"Task file not found: {args.task_file}")
-        sys.exit(1)
-    if not task_path.is_file():
-        print(f"Task path is not a file: {args.task_file}", file=sys.stderr)
-        sys.exit(1)
-
-    result = check_contract_file(
-        task_path,
-        project_config=_contract_cli_project_config(cfg),
-        document_kind="implementation_contract",
+def _contract_context() -> cli_contract.ContractContext:
+    return cli_contract.ContractContext(
+        resolve_task_path=_resolve_task_path,
+        project_config=_contract_cli_project_config,
+        resolve_contract_report_dir=_resolve_contract_report_dir,
     )
-    write_result = None
-    if args.write_report:
-        report_root = project_root if cfg.get("project", {}).get("root_path") else None
-        report_dir = _resolve_contract_report_dir(cfg) if cfg.get("_config_path") else None
-        try:
-            write_result = write_contract_report(
-                result,
-                task_path=task_path,
-                project_root=report_root,
-                report_dir=report_dir,
-            )
-        except (OSError, ValueError) as exc:
-            print(f"Failed to write contract report: {exc}", file=sys.stderr)
-            sys.exit(1)
 
-    if args.json:
-        data = result.to_dict()
-        if write_result:
-            data["written_report"] = write_result.to_dict()
-        print(json.dumps(data, indent=2, sort_keys=True))
-    else:
-        print(render_contract_check(result), end="")
-        if write_result:
-            print("Generated contract report artifacts:")
-            print(f"- {write_result.report_path}")
-            print(f"- {write_result.answers_path}")
+
+def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
+    return cli_contract.cmd_contract_check(args, cfg, _contract_context())
 
 
 def _run_contract_prepare_auto(
@@ -4753,15 +4721,7 @@ def main() -> None:
 
     contract_p = sub.add_parser("contract", help="Inspect or prepare implementation contracts")
     contract_sub = contract_p.add_subparsers(dest="contract_command")
-    contract_check_p = contract_sub.add_parser("check", help="Check a task file as an implementation contract")
-    contract_check_p.add_argument("task_file", metavar="TASK_FILE", help="Path to task .txt/.md file")
-    contract_check_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
-    contract_check_p.add_argument(
-        "--write-report",
-        action="store_true",
-        default=False,
-        help="Write .sikula/contract-reports check report and answers template artifacts",
-    )
+    cli_contract.register_check_parser(contract_sub)
     contract_prepare_p = contract_sub.add_parser(
         "prepare",
         help="Create a project-aware Markdown implementation contract",
