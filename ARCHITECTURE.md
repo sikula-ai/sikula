@@ -102,10 +102,12 @@ audit while making resume impossible; it also removes transient internal recover
 cleanup/delete also refuse to remove a worktree that contains the current process directory,
 so a user's shell is not left inside a deleted tree.
 
-**Status command:** `sikula status` derives a compact task overview from state JSON. It
-reports terminal states (`DONE`, `FAILED`, `CLEANED`), interrupted runs whose recorded PID
-is no longer alive, current pipeline phase, planner step progress, build/fix iteration
-count, and last update age. `--verbose` adds the next useful command for each row,
+**Status/show commands:** `sikula status` and `sikula show` are implemented by
+`sikula_cli/status.py` with compatibility wrappers in `sikula.py`. `sikula status`
+derives a compact task overview from state JSON. It reports terminal states
+(`DONE`, `FAILED`, `CLEANED`), interrupted runs whose recorded PID is no longer
+alive, current pipeline phase, planner step progress, build/fix iteration count,
+and last update age. `--verbose` adds the next useful command for each row,
 `--json` emits the same derived rows for scripts, and `--active` / `--failed` /
 `--cleaned` / `--done` filter the list. When invoked inside a preserved task worktree,
 config auto-discovery maps back to the original project root so status reads the original
