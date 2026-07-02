@@ -22,6 +22,131 @@ cmd_cleanup = _sikula.cmd_cleanup
 cmd_run = _sikula.cmd_run
 
 
+def test_cleanup_cli_module_imports() -> None:
+    import sikula_cli.cleanup as cleanup_cli
+
+    assert callable(cleanup_cli.register_parser)
+    assert callable(cleanup_cli.cmd_cleanup)
+
+
+def test_core_worktree_module_imports() -> None:
+    import core.worktree as worktree
+
+    assert callable(worktree.find_git_root)
+    assert callable(worktree.current_worktree_changes)
+    assert callable(worktree.remove_worktree)
+
+
+class TestCleanupCliModule:
+    def test_register_parser_sets_delete_state_defaults(self):
+        import sikula_cli.cleanup as cleanup_cli
+
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command")
+        cleanup_cli.register_parser(subparsers)
+
+        cleanup_args = parser.parse_args(["cleanup", "abc123"])
+        assert cleanup_args.delete_state is False
+
+        delete_args = parser.parse_args(["delete", "abc123"])
+        assert delete_args.delete_state is True
+
+    def test_default_git_helpers(self, tmp_path: Path, monkeypatch):
+        import core.worktree as worktree
+        import sikula_cli.cleanup as cleanup_cli
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            if cmd == ["git", "rev-parse", "--show-toplevel"]:
+                return _git_result(stdout=str(tmp_path))
+            if cmd == ["git", "status", "--porcelain"]:
+                return _git_result(stdout="")
+            if cmd[:3] == ["git", "worktree", "remove"]:
+                return _git_result(returncode=0)
+            return _git_result(returncode=1)
+
+        monkeypatch.setattr(worktree.subprocess, "run", fake_run)
+
+        assert cleanup_cli._default_find_git_root(tmp_path) == tmp_path.resolve()
+        assert cleanup_cli._default_worktree_dirty(tmp_path) is False
+        assert cleanup_cli._default_remove_worktree(tmp_path / "wt", tmp_path, force=True) is True
+        assert ["git", "worktree", "remove", "--force", str(tmp_path / "wt")] in [call[0] for call in calls]
+
+    def test_default_git_helpers_treat_errors_as_safe_failures(self, tmp_path: Path, monkeypatch):
+        import core.worktree as worktree
+        import sikula_cli.cleanup as cleanup_cli
+
+        def fake_run(cmd, **_):
+            if cmd == ["git", "status", "--porcelain"]:
+                return _git_result(returncode=1)
+            return _git_result(returncode=1)
+
+        monkeypatch.setattr(worktree.subprocess, "run", fake_run)
+
+        assert cleanup_cli._default_find_git_root(tmp_path) is None
+        assert cleanup_cli._default_worktree_dirty(tmp_path) is True
+        assert cleanup_cli._default_remove_worktree(tmp_path / "wt", tmp_path, force=False) is False
+
+    def test_default_path_is_within(self, tmp_path: Path):
+        import sikula_cli.cleanup as cleanup_cli
+
+        base = tmp_path / "base"
+        child = base / "src"
+        outside = tmp_path / "outside"
+        child.mkdir(parents=True)
+        outside.mkdir()
+
+        assert cleanup_cli._default_path_is_within(child, base) is True
+        assert cleanup_cli._default_path_is_within(outside, base) is False
+
+    def test_cmd_cleanup_reports_missing_state(self, tmp_path: Path, capsys):
+        import sikula_cli.cleanup as cleanup_cli
+
+        context = cleanup_cli.CleanupContext(resolve_state_dir=lambda _cfg: tmp_path / ".sikula" / "state")
+
+        with pytest.raises(SystemExit) as exc:
+            cleanup_cli.cmd_cleanup(_cleanup_args(), _run_cfg(tmp_path), context)
+
+        assert exc.value.code == 1
+        assert "Task abc123 not found" in capsys.readouterr().out
+
+    def test_cmd_cleanup_reports_remove_failure(self, tmp_path: Path, capsys):
+        import sikula_cli.cleanup as cleanup_cli
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _saved_state(tmp_path, worktree=worktree)
+        context = cleanup_cli.CleanupContext(
+            resolve_state_dir=lambda _cfg: tmp_path / ".sikula" / "state",
+            path_is_within=lambda _path, _base: False,
+            worktree_dirty=lambda _worktree: False,
+            find_git_root=lambda _path: tmp_path,
+            remove_worktree=lambda _worktree, _git_root, *, force: False,
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cleanup_cli.cmd_cleanup(_cleanup_args(force=True), _run_cfg(tmp_path), context)
+
+        assert exc.value.code == 1
+        assert "Failed to remove worktree" in capsys.readouterr().out
+
+    def test_cmd_delete_dry_run_without_worktree_reports_state_path(self, tmp_path: Path, capsys):
+        import sikula_cli.cleanup as cleanup_cli
+
+        _saved_state(tmp_path)
+        context = cleanup_cli.CleanupContext(resolve_state_dir=lambda _cfg: tmp_path / ".sikula" / "state")
+
+        cleanup_cli.cmd_cleanup(_cleanup_args(delete_state=True), _run_cfg(tmp_path), context)
+
+        out = capsys.readouterr().out
+        assert "DELETE (dry run)" in out
+        assert "Task has no isolated worktree recorded" in out
+        assert "Would delete state" in out
+        assert "No changes made" in out
+
+
 def _git_result(returncode=0, stdout="", stderr=""):
     result = MagicMock()
     result.returncode = returncode

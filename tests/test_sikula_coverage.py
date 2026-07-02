@@ -1685,6 +1685,75 @@ class TestMain:
                     main()
         mock_load_env.assert_called_once_with(tmp_path)
 
+    def test_task_attach_command_dispatches_to_cmd_task_attach(self, tmp_path: Path):
+        cfg = self._cfg(tmp_path)
+        argv = [
+            "sikula",
+            "task",
+            "attach",
+            "task.md",
+            "mockup.png",
+            "--reference",
+            "--note",
+            "Expected layout.",
+            "--write",
+        ]
+        with patch("sys.argv", argv):
+            with patch("sikula._load_runtime_config", return_value=cfg):
+                with patch("sikula.cmd_task_attach") as mock_attach:
+                    main()
+        mock_attach.assert_called_once()
+        args = mock_attach.call_args.args[0]
+        assert args.task_command == "attach"
+        assert args.task_file == "task.md"
+        assert args.asset_file == "mockup.png"
+        assert args.reference is True
+        assert args.delivery is False
+        assert args.note == "Expected layout."
+        assert args.write is True
+
+    def test_contract_check_command_dispatches_to_cmd_contract_check(self, tmp_path: Path):
+        cfg = self._cfg(tmp_path)
+        argv = ["sikula", "contract", "check", "task.md", "--json", "--write-report"]
+        with patch("sys.argv", argv):
+            with patch("sikula._load_runtime_config", return_value=cfg):
+                with patch("sikula.cmd_contract_check") as mock_check:
+                    main()
+        mock_check.assert_called_once()
+        args = mock_check.call_args.args[0]
+        assert args.contract_command == "check"
+        assert args.task_file == "task.md"
+        assert args.json is True
+        assert args.write_report is True
+
+    def test_contract_prepare_command_dispatches_to_cmd_contract_prepare(self, tmp_path: Path):
+        cfg = self._cfg(tmp_path)
+        argv = [
+            "sikula",
+            "contract",
+            "prepare",
+            "task.md",
+            "--answers",
+            "answers.yaml",
+            "--auto",
+            "--output",
+            "contract.md",
+            "--agent-model",
+            "task_preparer=gpt-5.5",
+        ]
+        with patch("sys.argv", argv):
+            with patch("sikula._load_runtime_config", return_value=cfg):
+                with patch("sikula.cmd_contract_prepare") as mock_prepare:
+                    main()
+        mock_prepare.assert_called_once()
+        args = mock_prepare.call_args.args[0]
+        assert args.contract_command == "prepare"
+        assert args.task_file == "task.md"
+        assert args.answers == "answers.yaml"
+        assert args.auto is True
+        assert args.output == "contract.md"
+        assert args.agent_model == ["task_preparer=gpt-5.5"]
+
     def test_status_command_dispatches_to_cmd_status(self, tmp_path: Path):
         p1, p2, p3 = self._patch_config(tmp_path)
         with patch("sys.argv", ["sikula", "status"]):
@@ -1722,6 +1791,18 @@ class TestMain:
         mock_cleanup.assert_called_once()
         assert mock_cleanup.call_args.args[0].delete_state is False
 
+    def test_cleanup_command_passes_force_and_discard_flags(self, tmp_path: Path):
+        p1, p2, p3 = self._patch_config(tmp_path)
+        with patch("sys.argv", ["sikula", "cleanup", "abc123", "--force", "--discard"]):
+            with p1, p2, p3:
+                with patch("sikula.cmd_cleanup") as mock_cleanup:
+                    main()
+        mock_cleanup.assert_called_once()
+        args = mock_cleanup.call_args.args[0]
+        assert args.delete_state is False
+        assert args.force is True
+        assert args.discard is True
+
     def test_delete_command_dispatches_to_cmd_cleanup_with_delete_state(self, tmp_path: Path):
         p1, p2, p3 = self._patch_config(tmp_path)
         with patch("sys.argv", ["sikula", "delete", "abc123"]):
@@ -1730,6 +1811,18 @@ class TestMain:
                     main()
         mock_cleanup.assert_called_once()
         assert mock_cleanup.call_args.args[0].delete_state is True
+
+    def test_delete_command_passes_force_and_discard_flags(self, tmp_path: Path):
+        p1, p2, p3 = self._patch_config(tmp_path)
+        with patch("sys.argv", ["sikula", "delete", "abc123", "--force", "--discard"]):
+            with p1, p2, p3:
+                with patch("sikula.cmd_cleanup") as mock_cleanup:
+                    main()
+        mock_cleanup.assert_called_once()
+        args = mock_cleanup.call_args.args[0]
+        assert args.delete_state is True
+        assert args.force is True
+        assert args.discard is True
 
     @pytest.mark.parametrize(
         (

@@ -79,10 +79,15 @@ from typing import Sequence
 
 import yaml
 
+from core import worktree as core_worktree
 from core.diagnostics import diagnostic_identity_key, diagnostic_summary_lines
 from core.version import sikula_version as _sikula_version
+from sikula_cli import contract as cli_contract
+from sikula_cli import cleanup as cli_cleanup
 from sikula_cli import config as cli_config
+from sikula_cli import review as cli_review
 from sikula_cli import status as cli_status
+from sikula_cli import task as cli_task
 from sikula_cli.delivery import (
     cmd_delivery_check,
     cmd_delivery_status,
@@ -318,17 +323,7 @@ def _build_tool_class(cfg: dict):
 
 
 def _worktree_error_message(branch: str, stderr: str) -> str:
-    """Return a human-readable error message for a failed `git worktree add`."""
-    if "already checked out" in stderr or "is already used by worktree" in stderr:
-        return (
-            f"Branch '{branch}' is already checked out.\n"
-            f"If you are currently on '{branch}', switch away first:\n"
-            f"  git checkout main\n"
-            "If a previous --fix run left a stale worktree, remove it:\n"
-            "  git worktree list   # find the path\n"
-            "  git worktree remove <path>"
-        )
-    return f"Failed to create worktree for branch '{branch}': {stderr}"
+    return core_worktree.worktree_error_message(branch, stderr)
 
 
 _NO_REFERENCED_FILES_SENTINEL = "NO_REFERENCED_FILES"
@@ -375,23 +370,11 @@ def _branch_stem(task_file: str) -> str:
 
 
 def _ensure_gitignore(git_root: Path) -> None:
-    entry = ".sikula/worktrees/"
-    exclude = git_root / ".git" / "info" / "exclude"
-    exclude.parent.mkdir(parents=True, exist_ok=True)
-    if exclude.exists() and any(line.strip() == entry for line in exclude.read_text().splitlines()):
-        return
-    with exclude.open("a") as f:
-        f.write(f"\n{entry}\n")
+    core_worktree.ensure_gitignore(git_root)
 
 
 def _ensure_project_gitignore_entry(project_root: Path, entry: str) -> None:
-    gitignore = project_root / ".gitignore"
-    existing = gitignore.read_text() if gitignore.exists() else ""
-    if any(line.strip() == entry for line in existing.splitlines()):
-        return
-    prefix = "" if not existing or existing.endswith("\n") else "\n"
-    with gitignore.open("a") as f:
-        f.write(f"{prefix}{entry}\n")
+    core_worktree.ensure_project_gitignore_entry(project_root, entry)
 
 
 def _ensure_sikula_gitignore(sikula_dir: Path) -> None:
@@ -419,127 +402,35 @@ def _ensure_provider_gitignore_entry(project_root: Path, provider: str | None) -
 
 
 def _find_git_root(path: Path) -> Path | None:
-    """Return the git repository root containing path, or None if not in a git repo."""
-    r = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-        cwd=path,
-    )
-    if r.returncode != 0:
-        return None
-    return Path(r.stdout.strip()).resolve()
+    return core_worktree.find_git_root(path)
 
 
 def _git_relative_path(git_root: Path, path: Path) -> str | None:
-    try:
-        return path.resolve().relative_to(git_root.resolve()).as_posix()
-    except ValueError:
-        return None
+    return core_worktree.git_relative_path(git_root, path)
 
 
 def _tracked_clean_file_status(git_root: Path, path: Path) -> tuple[bool, str]:
-    """Return whether path exists, is tracked, and matches HEAD in git_root."""
-    rel = _git_relative_path(git_root, path)
-    if rel is None:
-        return True, ""
-    if not path.exists():
-        return False, "does not exist"
-
-    tracked = subprocess.run(
-        ["git", "ls-files", "--error-unmatch", "--", rel],
-        capture_output=True,
-        text=True,
-        cwd=git_root,
-    )
-    if tracked.returncode != 0:
-        return False, "not tracked by git"
-
-    staged = subprocess.run(["git", "diff", "--cached", "--quiet", "--", rel], cwd=git_root)
-    if staged.returncode != 0:
-        return False, "has staged changes not committed to HEAD"
-
-    unstaged = subprocess.run(["git", "diff", "--quiet", "--", rel], cwd=git_root)
-    if unstaged.returncode != 0:
-        return False, "has unstaged changes"
-
-    return True, ""
+    return core_worktree.tracked_clean_file_status(git_root, path)
 
 
 def _current_branch_name(git_root: Path) -> tuple[str | None, str | None]:
-    r = subprocess.run(
-        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
-        capture_output=True,
-        text=True,
-        cwd=git_root,
-    )
-    if r.returncode == 0:
-        branch = r.stdout.strip()
-        return (branch, None) if branch else (None, "unknown")
-    if r.stderr.strip():
-        return None, "unknown"
-
-    head = subprocess.run(
-        ["git", "rev-parse", "--verify", "HEAD"],
-        capture_output=True,
-        text=True,
-        cwd=git_root,
-    )
-    if head.returncode == 0:
-        return None, "detached"
-    return None, "unknown"
+    return core_worktree.current_branch_name(git_root)
 
 
 def _resolve_git_commit(git_root: Path, ref: str) -> tuple[str | None, str]:
-    r = subprocess.run(
-        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
-        capture_output=True,
-        text=True,
-        cwd=git_root,
-    )
-    if r.returncode == 0 and r.stdout.strip():
-        return r.stdout.strip().splitlines()[0], ""
-    return None, _short_audit_line(r.stderr.strip() or r.stdout.strip() or "unknown revision")
+    return core_worktree.resolve_git_commit(git_root, ref)
 
 
 def _git_path_lines(git_root: Path, args: list[str]) -> tuple[list[str], str | None]:
-    r = subprocess.run(
-        ["git", *args],
-        capture_output=True,
-        text=True,
-        cwd=git_root,
-    )
-    if r.returncode != 0:
-        return [], _short_audit_line(r.stderr.strip() or r.stdout.strip() or "git command failed")
-    return [line.strip() for line in r.stdout.splitlines() if line.strip()], None
+    return core_worktree.git_path_lines(git_root, args)
 
 
 def _git_excluded_path_prefixes(git_root: Path, exclude_paths: Sequence[Path] | None) -> set[str]:
-    if not exclude_paths:
-        return set()
-    root = git_root.resolve()
-    prefixes: set[str] = set()
-    for path in exclude_paths:
-        try:
-            rel = Path(path).resolve().relative_to(root)
-        except ValueError:
-            continue
-        rel_text = rel.as_posix()
-        if rel_text and rel_text != ".":
-            prefixes.add(rel_text)
-    return prefixes
+    return core_worktree.git_excluded_path_prefixes(git_root, exclude_paths)
 
 
 def _filter_git_paths(paths: list[str], excluded_prefixes: set[str]) -> list[str]:
-    if not excluded_prefixes:
-        return paths
-    filtered = []
-    for path in paths:
-        normalized = path.replace("\\", "/")
-        if any(normalized == prefix or normalized.startswith(f"{prefix}/") for prefix in excluded_prefixes):
-            continue
-        filtered.append(path)
-    return filtered
+    return core_worktree.filter_git_paths(paths, excluded_prefixes)
 
 
 def _current_worktree_changes(
@@ -547,20 +438,7 @@ def _current_worktree_changes(
     *,
     exclude_paths: Sequence[Path] | None = None,
 ) -> tuple[list[str], list[str], list[str], str | None]:
-    excluded_prefixes = _git_excluded_path_prefixes(git_root, exclude_paths)
-    staged, error = _git_path_lines(git_root, ["diff", "--cached", "--name-only"])
-    if error:
-        return [], [], [], error
-    unstaged, error = _git_path_lines(git_root, ["diff", "--name-only"])
-    if error:
-        return [], [], [], error
-    untracked, error = _git_path_lines(git_root, ["ls-files", "--others", "--exclude-standard"])
-    if error:
-        return [], [], [], error
-    staged = _filter_git_paths(staged, excluded_prefixes)
-    unstaged = _filter_git_paths(unstaged, excluded_prefixes)
-    untracked = _filter_git_paths(untracked, excluded_prefixes)
-    return staged, unstaged, untracked, None
+    return core_worktree.current_worktree_changes(git_root, exclude_paths=exclude_paths)
 
 
 def _print_current_branch_clean_error(
@@ -1004,30 +882,15 @@ def _deliver_current_branch_review_fix(
 
 
 def _worktree_dirty(worktree_base: Path) -> bool:
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-        cwd=worktree_base,
-    )
-    return bool(status.stdout.strip()) if status.returncode == 0 else True
+    return core_worktree.worktree_dirty(worktree_base)
 
 
 def _remove_worktree(worktree_base: Path, git_root: Path, *, force: bool) -> bool:
-    cmd = ["git", "worktree", "remove"]
-    if force:
-        cmd.append("--force")
-    cmd.append(str(worktree_base))
-    result = subprocess.run(cmd, cwd=git_root, check=False)
-    return result.returncode == 0
+    return core_worktree.remove_worktree(worktree_base, git_root, force=force)
 
 
 def _path_is_within(path: Path, base: Path) -> bool:
-    try:
-        path.resolve().relative_to(base.resolve())
-        return True
-    except ValueError:
-        return False
+    return core_worktree.path_is_within(path, base)
 
 
 def _run_phase_flag(cfg: dict, overrides: dict, key: str) -> bool:
@@ -1496,46 +1359,15 @@ def cmd_task_refine(args: argparse.Namespace, cfg: dict) -> None:
         print(f"Next step: sikula contract prepare {output_path}")
 
 
+def _task_context() -> cli_task.TaskContext:
+    return cli_task.TaskContext(
+        resolve_task_path=_resolve_task_path,
+        resolve_task_asset_dir=_resolve_task_asset_dir,
+    )
+
+
 def cmd_task_attach(args: argparse.Namespace, cfg: dict) -> None:
-    from core.task_attach import attach_task_asset
-
-    project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
-    task_path = _resolve_task_path(args.task_file, project_root)
-    if task_path is None:
-        print(f"Task file not found: {args.task_file}", file=sys.stderr)
-        sys.exit(1)
-    if not task_path.is_file():
-        print(f"Task path is not a file: {args.task_file}", file=sys.stderr)
-        sys.exit(1)
-
-    kind = "delivery" if args.delivery else "reference"
-    task_asset_dir = _resolve_task_asset_dir(cfg)
-    try:
-        result = attach_task_asset(
-            task_file=task_path,
-            source_file=Path(args.asset_file),
-            project_root=project_root,
-            task_asset_dir=task_asset_dir,
-            kind=kind,
-            note=args.note or "",
-            purpose=args.purpose or "",
-            target=args.target or "",
-            source_license=args.source or "",
-            write=bool(args.write),
-        )
-    except (OSError, ValueError) as exc:
-        print(f"Failed to attach task asset: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Attached task asset: {result.project_path}")
-    print(f"Source file: {result.source_path}")
-    print(f"SHA-256: {result.sha256}")
-    print(f"Size: {result.size_bytes} bytes")
-    print(f"Task file updated: {'yes' if result.wrote_task_file else 'no'}")
-    if result.reused_existing:
-        print("Existing identical asset reused: yes")
-    print("Markdown snippet:")
-    print(result.snippet)
+    return cli_task.cmd_task_attach(args, cfg, _task_context())
 
 
 def _print_task_refinement_scope_note() -> None:
@@ -1593,49 +1425,16 @@ def _print_existing_output_hint(output_path: Path) -> None:
     )
 
 
-def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
-    from core.contract_check import check_contract_file, render_contract_check, write_contract_report
-
-    project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
-    task_path = _resolve_task_path(args.task_file, project_root)
-    if task_path is None:
-        print(f"Task file not found: {args.task_file}")
-        sys.exit(1)
-    if not task_path.is_file():
-        print(f"Task path is not a file: {args.task_file}", file=sys.stderr)
-        sys.exit(1)
-
-    result = check_contract_file(
-        task_path,
-        project_config=_contract_cli_project_config(cfg),
-        document_kind="implementation_contract",
+def _contract_context() -> cli_contract.ContractContext:
+    return cli_contract.ContractContext(
+        resolve_task_path=_resolve_task_path,
+        project_config=_contract_cli_project_config,
+        resolve_contract_report_dir=_resolve_contract_report_dir,
     )
-    write_result = None
-    if args.write_report:
-        report_root = project_root if cfg.get("project", {}).get("root_path") else None
-        report_dir = _resolve_contract_report_dir(cfg) if cfg.get("_config_path") else None
-        try:
-            write_result = write_contract_report(
-                result,
-                task_path=task_path,
-                project_root=report_root,
-                report_dir=report_dir,
-            )
-        except (OSError, ValueError) as exc:
-            print(f"Failed to write contract report: {exc}", file=sys.stderr)
-            sys.exit(1)
 
-    if args.json:
-        data = result.to_dict()
-        if write_result:
-            data["written_report"] = write_result.to_dict()
-        print(json.dumps(data, indent=2, sort_keys=True))
-    else:
-        print(render_contract_check(result), end="")
-        if write_result:
-            print("Generated contract report artifacts:")
-            print(f"- {write_result.report_path}")
-            print(f"- {write_result.answers_path}")
+
+def cmd_contract_check(args: argparse.Namespace, cfg: dict) -> None:
+    return cli_contract.cmd_contract_check(args, cfg, _contract_context())
 
 
 def _run_contract_prepare_auto(
@@ -1676,266 +1475,31 @@ def _run_contract_prepare_auto(
     )
 
 
+def _contract_prepare_context() -> cli_contract.ContractPrepareContext:
+    return cli_contract.ContractPrepareContext(
+        resolve_task_path=_resolve_task_path,
+        project_config=_contract_cli_project_config,
+        prepare_project_context_from_config=_prepare_project_context_from_config,
+        resolve_output_path=_resolve_output_path,
+        default_contract_path=_default_contract_path,
+        resolve_contract_report_dir=_resolve_contract_report_dir,
+        load_prepare_answers=_load_prepare_answers,
+        collect_prepare_answers_interactive=_collect_prepare_answers_interactive,
+        resolve_answers_path=_resolve_answers_path,
+        existing_prepare_answers_path=_existing_prepare_answers_path,
+        prepare_default_answers_has_current_filled_values=_prepare_default_answers_has_current_filled_values,
+        run_contract_prepare_auto=_run_contract_prepare_auto,
+        write_prepare_answers_template=_write_prepare_answers_template,
+        prepare_answers_path=_prepare_answers_path,
+        print_project_context_required=_print_contract_prepare_project_context_required,
+        print_existing_output_next_step_note=_print_existing_output_next_step_note,
+        print_existing_output_hint=_print_existing_output_hint,
+        print_open_question_details=_print_open_question_details,
+    )
+
+
 def cmd_contract_prepare(args: argparse.Namespace, cfg: dict) -> None:
-    from core.contract_check import (
-        load_generated_answer_entries_for_contract,
-        prepare_implementation_contract,
-        render_contract_check,
-        write_prepared_contract,
-    )
-
-    if args.auto and args.interactive:
-        print("Failed to prepare contract: --auto cannot be combined with --interactive", file=sys.stderr)
-        sys.exit(2)
-
-    project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
-    task_path = _resolve_task_path(args.task_file, project_root)
-    if task_path is None:
-        print(f"Task file not found: {args.task_file}")
-        sys.exit(1)
-    if not task_path.is_file():
-        print(f"Task path is not a file: {args.task_file}", file=sys.stderr)
-        sys.exit(1)
-
-    task_text = task_path.read_text(encoding="utf-8")
-    project_context = _prepare_project_context_from_config(cfg)
-    prepare_project_config = _contract_cli_project_config(cfg)
-    output_path = _resolve_output_path(args.output) if args.output else _default_contract_path(task_path, cfg)
-    report_root = project_root if cfg.get("project", {}).get("root_path") else None
-    report_dir = _resolve_contract_report_dir(cfg) if cfg.get("_config_path") else None
-    generated_answer_entries = load_generated_answer_entries_for_contract(
-        task_path,
-        source_text=task_text,
-        project_root=report_root,
-        report_dir=report_dir,
-    )
-    if project_context is None or not project_context.get("validation_commands"):
-        result = prepare_implementation_contract(
-            task_text,
-            contract_name=str(task_path),
-            project_context=project_context,
-            project_config=prepare_project_config,
-            generated_answer_entries=generated_answer_entries,
-        )
-        if result.required_next_step == "provide_project_context":
-            _print_contract_prepare_project_context_required(result, args.task_file)
-            if output_path.exists():
-                _print_existing_output_next_step_note(output_path)
-            sys.exit(1)
-
-    answers: dict[str, dict] = {}
-    answers_supplied = bool(args.interactive or args.answers)
-    existing_default_answers_path = None
-    if args.interactive:
-        try:
-            first = prepare_implementation_contract(
-                task_text,
-                contract_name=str(task_path),
-                project_context=project_context,
-                project_config=prepare_project_config,
-                generated_answer_entries=generated_answer_entries,
-            )
-            answers = _collect_prepare_answers_interactive(
-                generated_by="sikula.contract_prepare",
-                label="contract preparation",
-                source_path=task_path,
-                source_text=task_text,
-                project_root=project_root,
-                questions=first.user_questions,
-                cfg=cfg,
-                answers_path=_resolve_answers_path(args.answers) if args.answers else None,
-            )
-        except (EOFError, OSError, ValueError) as exc:
-            print(f"Failed to collect contract answers: {exc}", file=sys.stderr)
-            sys.exit(1)
-    elif args.answers:
-        try:
-            answers = _load_prepare_answers(
-                _resolve_answers_path(args.answers), source_path=task_path, source_text=task_text
-            )
-        except (OSError, ValueError) as exc:
-            print(f"Failed to load contract answers: {exc}", file=sys.stderr)
-            sys.exit(1)
-    elif args.auto:
-        existing_default_answers_path = _existing_prepare_answers_path(
-            task_path,
-            cfg,
-            generated_by="sikula.contract_prepare",
-        )
-
-    result = prepare_implementation_contract(
-        task_text,
-        contract_name=str(task_path),
-        answers=answers,
-        project_context=project_context,
-        project_config=prepare_project_config,
-        generated_answer_entries=generated_answer_entries,
-    )
-    if result.required_next_step == "provide_project_context":
-        _print_contract_prepare_project_context_required(result, args.task_file)
-        if output_path.exists():
-            _print_existing_output_next_step_note(output_path)
-        sys.exit(1)
-
-    auto_answer_count = 0
-    if args.auto and output_path.exists():
-        print(f"Failed to prepare contract: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
-        _print_existing_output_hint(output_path)
-        sys.exit(1)
-
-    if args.auto and existing_default_answers_path:
-        try:
-            has_current_filled_default_answers = _prepare_default_answers_has_current_filled_values(
-                answers_path=existing_default_answers_path,
-                generated_by="sikula.contract_prepare",
-                source_path=task_path,
-                source_text=task_text,
-                project_root=project_root,
-                questions=result.user_questions,
-                cfg=cfg,
-            )
-        except (OSError, ValueError) as exc:
-            print(f"Failed to inspect existing contract answers: {exc}", file=sys.stderr)
-            sys.exit(1)
-        if has_current_filled_default_answers:
-            print(
-                "Failed to auto-prepare contract: existing contract answers contain filled values; "
-                f"rerun with --answers {existing_default_answers_path}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-    if args.auto and result.user_questions:
-        try:
-            auto_result = _run_contract_prepare_auto(
-                args=args,
-                cfg=cfg,
-                project_root=project_root,
-                source_path=task_path,
-                task_text=task_text,
-                output_path=output_path,
-                project_context=project_context,
-                generated_answer_entries=generated_answer_entries,
-                answers=answers,
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            print(f"Failed to auto-prepare contract: {exc}", file=sys.stderr)
-            sys.exit(1)
-        result = auto_result.result
-        answers = auto_result.answers
-        auto_answer_count = len(auto_result.auto_answers)
-        if args.answers and auto_answer_count:
-            try:
-                _write_prepare_answers_template(
-                    generated_by="sikula.contract_prepare",
-                    source_path=task_path,
-                    source_text=task_text,
-                    project_root=project_root,
-                    questions=result.user_questions,
-                    cfg=cfg,
-                    answers=answers,
-                    answers_path=_resolve_answers_path(args.answers),
-                )
-            except (OSError, ValueError) as exc:
-                print(f"Failed to update contract answers: {exc}", file=sys.stderr)
-                sys.exit(1)
-        elif existing_default_answers_path and auto_answer_count and not result.needs_user_input:
-            try:
-                _write_prepare_answers_template(
-                    generated_by="sikula.contract_prepare",
-                    source_path=task_path,
-                    source_text=task_text,
-                    project_root=project_root,
-                    questions=result.user_questions,
-                    cfg=cfg,
-                    answers=answers,
-                )
-            except (OSError, ValueError) as exc:
-                print(f"Failed to update contract answers: {exc}", file=sys.stderr)
-                sys.exit(1)
-
-    if result.needs_user_input and not answers_supplied:
-        answers_path = _write_prepare_answers_template(
-            generated_by="sikula.contract_prepare",
-            source_path=task_path,
-            source_text=task_text,
-            project_root=project_root,
-            questions=result.user_questions,
-            cfg=cfg,
-            answers=answers if args.auto else None,
-        )
-        print("Contract preparation needs answers before writing an implementation contract.")
-        print(f"Contract preparation answers template written: {answers_path}")
-        if args.auto:
-            print(f"Auto-applied answers: {auto_answer_count}")
-        print(f"Applied answers: {len(result.answered_question_ids)}")
-        print(f"Open questions: {len(result.open_question_ids)}")
-        _print_open_question_details(result.user_questions)
-        print("Next step:")
-        print(f"- Fill the answers file, then run: sikula contract prepare {args.task_file} --answers {answers_path}")
-        print(f"- Or answer in the terminal: sikula contract prepare {args.task_file} --interactive")
-        if output_path.exists():
-            _print_existing_output_next_step_note(output_path)
-        sys.exit(1)
-
-    if result.required_next_step == "revise_contract":
-        print("Contract preparation needs task description revisions before writing an implementation contract.")
-        print("")
-        print(render_contract_check(result.recheck_result or result.check_result), end="")
-        if result.suggested_next_steps:
-            print("")
-            print("Next step:")
-            for step in result.suggested_next_steps:
-                print(f"- {step}")
-        if output_path.exists():
-            _print_existing_output_next_step_note(output_path)
-        sys.exit(1)
-
-    if output_path.exists():
-        print(f"Failed to prepare contract: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
-        _print_existing_output_hint(output_path)
-        sys.exit(1)
-
-    try:
-        write_prepared_contract(
-            result,
-            output_path=output_path,
-            project_root=report_root,
-            report_dir=report_dir,
-        )
-    except (OSError, ValueError) as exc:
-        print(f"Failed to prepare contract: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Implementation contract written: {output_path}")
-    if args.auto:
-        print(f"Auto-applied answers: {auto_answer_count}")
-    print(f"Applied answers: {len(result.answered_question_ids)}")
-    print(f"Open questions: {len(result.open_question_ids)}")
-    print("")
-    print(render_contract_check(result.recheck_result or result.check_result), end="")
-    if result.ready_to_run:
-        print("")
-        print(f"Next step: sikula run {output_path}")
-    elif result.needs_user_input:
-        answers_path = (
-            _resolve_answers_path(args.answers)
-            if args.answers
-            else _prepare_answers_path(
-                task_path,
-                cfg,
-                generated_by="sikula.contract_prepare",
-            )
-        )
-        print("")
-        print("Next step:")
-        print(f"- Fill/update the answers file: {answers_path}")
-        print(
-            "- Then rerun contract prepare with a new --output path, or remove/rename the output written above first."
-        )
-    else:
-        print("")
-        print(f"Next step: review the contract check output above before running sikula run {output_path}")
+    return cli_contract.cmd_contract_prepare(args, cfg, _contract_prepare_context())
 
 
 def _resolve_answers_path(value: str) -> Path:
@@ -3562,77 +3126,18 @@ def cmd_show(task_id: str, cfg: dict) -> None:
     return cli_status.cmd_show(task_id, cfg, _status_context())
 
 
+def _cleanup_context() -> cli_cleanup.CleanupContext:
+    return cli_cleanup.CleanupContext(
+        resolve_state_dir=_resolve_state_dir,
+        path_is_within=_path_is_within,
+        worktree_dirty=_worktree_dirty,
+        find_git_root=_find_git_root,
+        remove_worktree=_remove_worktree,
+    )
+
+
 def cmd_cleanup(args: argparse.Namespace, cfg: dict) -> None:
-    """Remove a task worktree, optionally deleting the persisted state as well."""
-    from core.state import JsonStateStore
-
-    state_dir = _resolve_state_dir(cfg)
-    store = JsonStateStore(state_dir)
-    state = store.load(args.task_id)
-    if not state:
-        print(f"Task {args.task_id} not found")
-        sys.exit(1)
-
-    action = "delete" if args.delete_state else "cleanup"
-    dry_run = not args.force
-    removed_worktree = False
-    clear_worktree_refs = False
-
-    print(f"Task {state.task_id}: {action.upper()}{' (dry run)' if dry_run else ''}")
-
-    if state.worktree_base or state.worktree_path:
-        worktree_base = Path(state.worktree_base or state.worktree_path)
-        if worktree_base.exists():
-            if not dry_run and _path_is_within(Path.cwd(), worktree_base):
-                print(f"Refusing to remove the current working tree: {worktree_base}")
-                print("Run this command from the original project or another directory.")
-                sys.exit(1)
-            dirty = _worktree_dirty(worktree_base)
-            if dirty and not dry_run and not args.discard:
-                print(f"Worktree has uncommitted changes: {worktree_base}")
-                print("Refusing to remove it. Re-run with --discard to delete those changes.")
-                sys.exit(1)
-            if dry_run:
-                print(f"Would remove worktree: {worktree_base}")
-                if dirty:
-                    print("Worktree has uncommitted changes; applying this cleanup requires --discard.")
-            else:
-                git_root = (
-                    _find_git_root(Path(cfg["project"]["root_path"]).resolve())
-                    or Path(cfg["project"]["root_path"]).resolve()
-                )
-                if not _remove_worktree(worktree_base, git_root, force=args.discard):
-                    print(f"Failed to remove worktree: {worktree_base}")
-                    sys.exit(1)
-                removed_worktree = True
-                clear_worktree_refs = True
-                print(f"Removed worktree: {worktree_base}")
-        else:
-            print(f"Worktree already missing: {worktree_base}")
-            clear_worktree_refs = True
-    else:
-        print("Task has no isolated worktree recorded.")
-
-    if args.delete_state:
-        if dry_run:
-            print(f"Would delete state: {state_dir / (state.task_id + '.json')}")
-        else:
-            store.delete(state.task_id)
-            print(f"Deleted state: {state.task_id}")
-    elif not dry_run:
-        store.delete_text_snapshots(state.task_id)
-        state.record(
-            "sikula",
-            "cleanup",
-            "worktree removed" if removed_worktree else "worktree already missing or not recorded",
-        )
-        if clear_worktree_refs:
-            state.worktree_path = None
-            state.worktree_base = None
-        store.save(state)
-
-    if dry_run:
-        print("No changes made. Re-run with --force to apply.")
+    return cli_cleanup.cmd_cleanup(args, cfg, _cleanup_context())
 
 
 def _print_review_summary(
@@ -3849,287 +3354,33 @@ def _run_report_only_review(
             log.exception("Report-only review worktree cleanup failed")
 
 
+def _review_context() -> cli_review.ReviewContext:
+    return cli_review.ReviewContext(
+        supported_build_tools=_SUPPORTED_BUILD_TOOLS,
+        find_git_root=_find_git_root,
+        ensure_gitignore=_ensure_gitignore,
+        current_branch_name=_current_branch_name,
+        current_worktree_changes=_current_worktree_changes,
+        print_current_branch_clean_error=_print_current_branch_clean_error,
+        resolve_git_commit=_resolve_git_commit,
+        worktree_error_message=_worktree_error_message,
+        build_tool_class=_build_tool_class,
+        resolve_state_dir=_resolve_state_dir,
+        heartbeat_interval_seconds=_heartbeat_interval_seconds,
+        enrich_review_state_prompt=_enrich_review_state_prompt,
+        parse_agent_llm_overrides=_parse_agent_llm_overrides,
+        build_orchestrator=build_orchestrator,
+        deliver_current_branch_review_fix=_deliver_current_branch_review_fix,
+        finalize_worktree=_finalize_worktree,
+        run_report_only_review=_run_report_only_review,
+        current_branch_delivery_needs_finalization=_current_branch_delivery_needs_finalization,
+        print_review_summary=_print_review_summary,
+        logger=log,
+    )
+
+
 def cmd_review(args: argparse.Namespace, cfg: dict) -> None:
-    """Checkout an existing branch in a worktree and run code + security review."""
-    import uuid
-
-    from core.state import JsonStateStore, TaskState, runtime_metadata_snapshot
-
-    if getattr(args, "current_branch", False) and not args.fix:
-        print("Error: --current-branch is only valid with sikula review --fix.")
-        sys.exit(1)
-
-    build_tool = cfg.get("project", {}).get("build_tool")
-    if args.fix and build_tool not in _SUPPORTED_BUILD_TOOLS:
-        supported = ", ".join(sorted(_SUPPORTED_BUILD_TOOLS))
-        val = repr(build_tool) if build_tool else "not set"
-        print(f"Unsupported build_tool: {val}. Set project.build_tool in .sikula/config.yaml to one of: {supported}")
-        sys.exit(1)
-
-    if args.description and args.description_file:
-        print("Error: use either --description or --description-file, not both.")
-        sys.exit(1)
-
-    if args.description_file:
-        desc_path = Path(args.description_file)
-        if not desc_path.is_absolute():
-            desc_path = Path.cwd() / desc_path
-        if not desc_path.exists():
-            print(f"Description file not found: {desc_path}")
-            sys.exit(1)
-        description = desc_path.read_text().strip()
-    elif args.description:
-        description = args.description.strip()
-    else:
-        print("Error: sikula review requires --description or --description-file.")
-        print("The description is used as the review scope; without it the reviewer has to guess intent.")
-        sys.exit(1)
-
-    if not description:
-        print("Error: review description is empty.")
-        sys.exit(1)
-
-    current_branch_mode = getattr(args, "current_branch", False)
-    branch = args.branch
-    base_branch = args.base_branch
-    target_start_commit: str | None = None
-    original_project_root = Path(cfg["project"]["root_path"]).resolve()
-
-    git_root = _find_git_root(original_project_root)
-    if git_root is None:
-        print(f"Error: project root is not inside a git repository: {original_project_root}")
-        print("  Run 'git init' first.")
-        sys.exit(1)
-
-    _ensure_gitignore(git_root)
-
-    if current_branch_mode:
-        branch_name, branch_error = _current_branch_name(git_root)
-        if branch_error == "detached":
-            print("Error: --current-branch requires a named current branch; HEAD is detached.")
-            sys.exit(1)
-        if branch_name is None:
-            print("Error: could not determine the current branch for --current-branch.")
-            sys.exit(1)
-        branch = branch_name
-
-        staged, unstaged, untracked, clean_error = _current_worktree_changes(git_root)
-        if staged or unstaged or untracked or clean_error:
-            _print_current_branch_clean_error(staged, unstaged, untracked, clean_error)
-            sys.exit(1)
-
-        resolved_base_commit, base_error = _resolve_git_commit(git_root, base_branch)
-        if resolved_base_commit is None:
-            print(f"Error: base branch/ref '{base_branch}' could not be resolved: {base_error}")
-            sys.exit(1)
-
-        target_start_commit, head_error = _resolve_git_commit(git_root, "HEAD")
-        if target_start_commit is None:
-            print(f"Error: could not resolve HEAD for --current-branch: {head_error}")
-            sys.exit(1)
-
-    task_id = uuid.uuid4().hex
-    worktree_base = git_root / ".sikula" / "worktrees" / task_id
-    worktree_base.parent.mkdir(parents=True, exist_ok=True)
-
-    if args.fix:
-        if current_branch_mode:
-            r = subprocess.run(
-                ["git", "worktree", "add", "--detach", str(worktree_base), target_start_commit],
-                capture_output=True,
-                text=True,
-                cwd=git_root,
-            )
-        else:
-            # Fix mode writes commits back to the branch — use a real branch checkout so that
-            # _finalize_worktree advances the branch ref.  If the branch is already checked out
-            # in the caller's worktree, git worktree add will fail with a clear error; the user
-            # should switch away first (e.g. git checkout main).
-            r = subprocess.run(
-                ["git", "worktree", "add", str(worktree_base), branch],
-                capture_output=True,
-                text=True,
-                cwd=git_root,
-            )
-        if r.returncode != 0:
-            print(_worktree_error_message(branch, r.stderr.strip()))
-            sys.exit(1)
-    else:
-        # Report-only mode never commits — use detached HEAD so that the review can run
-        # even when the caller is currently on the branch being reviewed.
-        sha_r = subprocess.run(
-            ["git", "rev-parse", branch],
-            capture_output=True,
-            text=True,
-            cwd=git_root,
-        )
-        if sha_r.returncode != 0:
-            print(f"Branch '{branch}' not found: {sha_r.stderr.strip()}")
-            sys.exit(1)
-        r = subprocess.run(
-            ["git", "worktree", "add", "--detach", str(worktree_base), sha_r.stdout.strip()],
-            capture_output=True,
-            text=True,
-            cwd=git_root,
-        )
-        if r.returncode != 0:
-            print(_worktree_error_message(branch, r.stderr.strip()))
-            sys.exit(1)
-
-    log.info("Worktree created: %s (branch: %s)", worktree_base, branch)
-
-    rel = original_project_root.relative_to(git_root)
-    worktree_project_root = worktree_base / rel
-
-    if args.fix:
-        # Copy gitignored environment files the build needs (e.g. local.properties on Android).
-        for name in _build_tool_class(cfg).env_files():
-            src = original_project_root / name
-            dst = worktree_project_root / name
-            if src.exists() and not dst.exists():
-                shutil.copy2(src, dst)
-                log.info("Copied %s to worktree", name)
-
-    # Compute three-dot diff: all commits introduced by the selected target vs base
-    diff_target = "HEAD" if current_branch_mode else branch
-    diff_r = subprocess.run(
-        ["git", "diff", f"{base_branch}...{diff_target}"],
-        capture_output=True,
-        text=True,
-        cwd=git_root,
-    )
-    if diff_r.returncode != 0:
-        print(f"Failed to compute diff between '{base_branch}' and '{diff_target}': {diff_r.stderr.strip()}")
-        subprocess.run(["git", "worktree", "remove", str(worktree_base)], cwd=git_root, check=False)
-        sys.exit(1)
-    review_diff = diff_r.stdout
-
-    files_r = subprocess.run(
-        ["git", "diff", "--name-only", f"{base_branch}...{diff_target}"],
-        capture_output=True,
-        text=True,
-        cwd=git_root,
-    )
-    files_changed = (
-        [line.strip() for line in files_r.stdout.splitlines() if line.strip()] if files_r.returncode == 0 else []
-    )
-
-    if not files_changed:
-        print(f"No files changed between '{base_branch}' and '{branch}'")
-        subprocess.run(["git", "worktree", "remove", str(worktree_base)], cwd=git_root, check=False)
-        sys.exit(0)
-
-    state_dir = _resolve_state_dir(cfg)
-    store = JsonStateStore(state_dir)
-    state = TaskState(
-        task_id=task_id,
-        task_description=description,
-        implementation_prompt=description,
-        files_changed=files_changed,
-        review_diff=review_diff,
-        review_mode="review_fix" if args.fix else "review_report",
-        review_base_branch=base_branch,
-        review_delivery_mode="current_branch" if current_branch_mode else None,
-        review_target_branch=branch if current_branch_mode else None,
-        review_target_start_commit=target_start_commit if current_branch_mode else None,
-        review_delivery_status="pending" if current_branch_mode else None,
-        plan_decided=True,
-        worktree_path=str(worktree_project_root),
-        worktree_base=str(worktree_base),
-        worktree_branch=branch,
-        runtime_metadata=runtime_metadata_snapshot(),
-    )
-    if not args.fix:
-        state.pid = os.getpid()
-    store.save(state)
-    task_label = Path(args.description_file).name if args.description_file else description.splitlines()[0][:60]
-
-    t_start = time.time()
-    cli_security_review = getattr(args, "security_review", None)
-    run_security_review = cfg.get("run_security_review", True) if cli_security_review is None else cli_security_review
-    heartbeat_interval_seconds = _heartbeat_interval_seconds(cfg)
-
-    base_llm_cfg = cfg.get("llm", {})
-
-    if args.fix:
-        # Analyst is skipped in review mode — enrich implementation_prompt with any
-        # design/spec files referenced by name in the task description so reviewer
-        # and fixer have visual context.
-        _enrich_review_state_prompt(state, store, description, base_llm_cfg, cfg, worktree_project_root)
-
-        # Fix mode: full orchestrator loop — review, fix, build, checks all per config.
-        # Only planner is always disabled (no planning needed for an existing branch).
-        cfg["project"]["root_path"] = str(worktree_project_root)
-
-        overrides = {
-            "run_planner": False,
-            "run_review": True,
-            "run_security_review": run_security_review,
-            "agent_llms": _parse_agent_llm_overrides(
-                getattr(args, "agent_model", None),
-                getattr(args, "agent_provider", None),
-                getattr(args, "agent_timeout", None),
-            ),
-        }
-        orch = build_orchestrator(cfg, overrides, state_store=store)
-        state = orch.run(task_id=task_id, label=task_label)
-        total_s = time.time() - t_start
-
-        if state.done:
-            fix_msg = f"sikula: review fixes for {branch}\n\nTask ID: {state.task_id}"
-            if current_branch_mode:
-                success, committed, _ = _deliver_current_branch_review_fix(
-                    worktree_base,
-                    git_root,
-                    state,
-                    store,
-                    commit_msg=fix_msg,
-                )
-                if success:
-                    if committed:
-                        log.info("Current-branch review fixes delivered to %s", branch)
-                    else:
-                        log.info("No fixes needed — worktree removed")
-            else:
-                success, committed, _ = _finalize_worktree(worktree_base, git_root, state, commit_msg=fix_msg)
-                store.save(state)
-                if success:
-                    if committed:
-                        log.info("Changes committed to branch %s", branch)
-                    else:
-                        log.info("No fixes needed — worktree removed")
-                else:
-                    log.warning("Could not finalize worktree — inspect manually: %s", worktree_base)
-        else:
-            log.info("Worktree preserved for inspection/resume: %s", worktree_base)
-    else:
-        total_s = _run_report_only_review(
-            args=args,
-            cfg=cfg,
-            state=state,
-            store=store,
-            task_id=task_id,
-            task_label=task_label,
-            description=description,
-            branch=branch,
-            base_branch=base_branch,
-            files_changed=files_changed,
-            base_llm_cfg=base_llm_cfg,
-            run_security_review=run_security_review,
-            heartbeat_interval_seconds=heartbeat_interval_seconds,
-            worktree_project_root=worktree_project_root,
-            git_root=git_root,
-            worktree_base=worktree_base,
-            t_start=t_start,
-        )
-
-    approved = (
-        state.review_approved
-        and (state.security_approved if run_security_review else True)
-        and not _current_branch_delivery_needs_finalization(state)
-    )
-    _print_review_summary(state, branch, base_branch, total_s, run_security_review=run_security_review)
-    sys.exit(0 if approved else 1)
+    return cli_review.cmd_review(args, cfg, _review_context())
 
 
 # ---------------------------------------------------------------------------
@@ -4837,90 +4088,12 @@ def main() -> None:
         metavar="AGENT=SECONDS",
         help="Override timeout for task_preparer, e.g. --agent-timeout task_preparer=1200",
     )
-    task_attach_p = task_sub.add_parser("attach", help="Attach a local file as a task asset")
-    task_attach_p.add_argument("task_file", metavar="TASK_FILE", help="Path to task .txt/.md file")
-    task_attach_p.add_argument("asset_file", metavar="ASSET_FILE", help="Local file to copy into tasks.task_asset_dir")
-    task_attach_kind = task_attach_p.add_mutually_exclusive_group(required=True)
-    task_attach_kind.add_argument(
-        "--reference",
-        action="store_true",
-        default=False,
-        help="Attach the file as a reference-only asset",
-    )
-    task_attach_kind.add_argument(
-        "--delivery",
-        action="store_true",
-        default=False,
-        help="Attach the file as a delivery asset that should become part of the branch output",
-    )
-    task_attach_p.add_argument("--note", help="Reference-asset note to include in the Markdown snippet")
-    task_attach_p.add_argument("--purpose", help="Delivery-asset purpose; required with --delivery")
-    task_attach_p.add_argument("--target", help="Optional project-relative delivery target path")
-    task_attach_p.add_argument("--source", help="Delivery-asset source/license/provenance; required with --delivery")
-    task_attach_p.add_argument(
-        "--write",
-        action="store_true",
-        default=False,
-        help="Append the generated asset snippet to the task file; otherwise only print it",
-    )
+    cli_task.register_attach_parser(task_sub)
 
     contract_p = sub.add_parser("contract", help="Inspect or prepare implementation contracts")
     contract_sub = contract_p.add_subparsers(dest="contract_command")
-    contract_check_p = contract_sub.add_parser("check", help="Check a task file as an implementation contract")
-    contract_check_p.add_argument("task_file", metavar="TASK_FILE", help="Path to task .txt/.md file")
-    contract_check_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
-    contract_check_p.add_argument(
-        "--write-report",
-        action="store_true",
-        default=False,
-        help="Write .sikula/contract-reports check report and answers template artifacts",
-    )
-    contract_prepare_p = contract_sub.add_parser(
-        "prepare",
-        help="Create a project-aware Markdown implementation contract",
-    )
-    contract_prepare_p.add_argument("task_file", metavar="TASK_FILE", help="Path to refined task .txt/.md file")
-    contract_prepare_p.add_argument(
-        "--answers",
-        help="Path to .sikula/contract-reports/*.answers.yaml created by Sikula prepare/check tooling",
-    )
-    contract_prepare_p.add_argument(
-        "--auto",
-        action="store_true",
-        default=False,
-        help="Use a read-only LLM assistant to answer supported contract-preparation questions",
-    )
-    contract_prepare_p.add_argument(
-        "--interactive",
-        action="store_true",
-        default=False,
-        help="Prompt for missing contract answers before writing the implementation contract",
-    )
-    contract_prepare_p.add_argument(
-        "--output",
-        help="Write the implementation contract to this file; defaults to contracts.<stem>.contract.md",
-    )
-    contract_prepare_p.add_argument(
-        "--agent-model",
-        action="append",
-        default=None,
-        metavar="AGENT=MODEL",
-        help="Override model for task_preparer, e.g. --agent-model task_preparer=gpt-5.5",
-    )
-    contract_prepare_p.add_argument(
-        "--agent-provider",
-        action="append",
-        default=None,
-        metavar="AGENT=PROVIDER",
-        help="Override provider for task_preparer, e.g. --agent-provider task_preparer=claude",
-    )
-    contract_prepare_p.add_argument(
-        "--agent-timeout",
-        action="append",
-        default=None,
-        metavar="AGENT=SECONDS",
-        help="Override timeout for task_preparer, e.g. --agent-timeout task_preparer=1200",
-    )
+    cli_contract.register_check_parser(contract_sub)
+    cli_contract.register_prepare_parser(contract_sub)
 
     delivery_p = register_delivery_parser(sub)
 
@@ -5012,125 +4185,9 @@ def main() -> None:
         help="Override agent_timeout for one agent, e.g. --agent-timeout implementer=2400",
     )
 
-    status_p = sub.add_parser("status", help="List all tasks")
-    status_p.add_argument("--json", action="store_true", default=False, help="Print task status rows as JSON")
-    status_p.add_argument("--verbose", action="store_true", default=False, help="Include next suggested action")
-    status_p.add_argument(
-        "--active",
-        dest="status_filter",
-        action="append_const",
-        const="active",
-        default=[],
-        help="Show only active or interrupted tasks",
-    )
-    status_p.add_argument(
-        "--done",
-        dest="status_filter",
-        action="append_const",
-        const="done",
-        help="Show only completed tasks",
-    )
-    status_p.add_argument(
-        "--failed",
-        dest="status_filter",
-        action="append_const",
-        const="failed",
-        help="Show only failed tasks",
-    )
-    status_p.add_argument(
-        "--cleaned",
-        dest="status_filter",
-        action="append_const",
-        const="cleaned",
-        help="Show only cleaned audit-only tasks",
-    )
-
-    show_p = sub.add_parser("show", help="Show full task state as JSON")
-    show_p.add_argument("task_id")
-
-    cleanup_p = sub.add_parser("cleanup", help="Remove a task worktree but keep its state JSON")
-    cleanup_p.add_argument("task_id")
-    cleanup_p.add_argument(
-        "--force",
-        action="store_true",
-        default=False,
-        help="Apply cleanup. Without this flag, cleanup only prints what would happen.",
-    )
-    cleanup_p.add_argument(
-        "--discard",
-        action="store_true",
-        default=False,
-        help="Allow removing a dirty worktree and discarding uncommitted changes.",
-    )
-
-    delete_p = sub.add_parser("delete", help="Delete a task worktree and its state JSON")
-    delete_p.add_argument("task_id")
-    delete_p.add_argument(
-        "--force",
-        action="store_true",
-        default=False,
-        help="Apply deletion. Without this flag, delete only prints what would happen.",
-    )
-    delete_p.add_argument(
-        "--discard",
-        action="store_true",
-        default=False,
-        help="Allow removing a dirty worktree and discarding uncommitted changes.",
-    )
-
-    review_p = sub.add_parser("review", help="Review an existing branch (report-only or --fix)")
-    review_target = review_p.add_mutually_exclusive_group(required=True)
-    review_target.add_argument("--branch", help="Branch to review (must already exist)")
-    review_target.add_argument(
-        "--current-branch",
-        action="store_true",
-        default=False,
-        help="Use the currently checked-out branch as the review-fix target; only valid with --fix",
-    )
-    review_p.add_argument("--base-branch", default="main", help="Base branch to diff against (default: main)")
-    review_context = review_p.add_mutually_exclusive_group(required=True)
-    review_context.add_argument(
-        "--description", default=None, help="Human-readable PR description (context for the reviewer)"
-    )
-    review_context.add_argument(
-        "--description-file",
-        default=None,
-        metavar="FILE",
-        help="Path to a file containing the PR description",
-    )
-    review_p.add_argument(
-        "--fix",
-        action="store_true",
-        default=False,
-        help="Apply fixes: run implementer on review issues and commit them to the branch",
-    )
-    review_p.add_argument(
-        "--security-review",
-        action=_boa,
-        default=None,
-        help="Override run_security_review (default: from project config)",
-    )
-    review_p.add_argument(
-        "--agent-model",
-        action="append",
-        default=None,
-        metavar="AGENT=MODEL",
-        help="Override model for one agent (repeatable)",
-    )
-    review_p.add_argument(
-        "--agent-provider",
-        action="append",
-        default=None,
-        metavar="AGENT=PROVIDER",
-        help="Override provider for one agent (repeatable)",
-    )
-    review_p.add_argument(
-        "--agent-timeout",
-        action="append",
-        default=None,
-        metavar="AGENT=SECONDS",
-        help="Override timeout for one agent (repeatable)",
-    )
+    cli_status.register_parser(sub)
+    cli_cleanup.register_parser(sub)
+    cli_review.register_parser(sub)
 
     init_p = sub.add_parser("init", help="Initialize a new .sikula project config")
     init_p.add_argument("--force", action="store_true", default=False, help="Overwrite existing config")

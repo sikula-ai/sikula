@@ -33,6 +33,7 @@
 | `LLMClient` | `core/llm_client.py` | Abstract interface: `generate()` for single-shot text; `run_readonly_agent()` for read-only autonomous agents; `run_agent()` for autonomous file-editing agents |
 | `ContractCheck` helpers | `core/contract_check.py` | Deterministic implementation-contract readiness checks for Markdown/plain-text task files; `sikula run` stores a warning-only state snapshot and `sikula contract check --write-report` explicitly writes report artifacts |
 | `TaskAsset` helpers | `core/task_assets.py` | Deterministic local task-asset parsing, path canonicalization, answer mapping, and asset-manifest line rendering used by contract preparation |
+| `Worktree` helpers | `core/worktree.py` | Shared low-level git/worktree operations used by run, review, cleanup/delete, and init CLI surfaces; command-specific state mutation stays in the owning command layer |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
 | `JsonStateStore` | `core/state.py` | Stores each task as `<task_id>.json` in the configured state dir; serializes same-process access and writes via temp-file replacement so heartbeat updates and audit saves cannot interleave partial JSON writes |
 | `sikula_cli` modules | `sikula_cli/*.py` | Focused CLI command wrappers, parser registration helpers, and CLI config discovery/path helpers; `sikula.py` remains the public entrypoint and compatibility surface |
@@ -86,7 +87,9 @@ cmd_run()
 
 **`--no-isolate`**: skips worktree creation; changes land as uncommitted working-tree modifications in the original project root. No branch is created. A git repository is still required — git is used to detect which files the agent changed.
 
-**Cleanup/delete commands:**
+**Cleanup/delete commands:** `sikula cleanup` and `sikula delete` parser
+registration and handlers are implemented by `sikula_cli/cleanup.py` with
+compatibility wrappers in `sikula.py`.
 
 ```
 sikula cleanup <task_id>          # dry run
@@ -100,10 +103,14 @@ Both commands refuse dirty worktrees unless `--discard` is passed. `cleanup` rec
 audit while making resume impossible; it also removes transient internal recovery snapshots.
 `delete` removes the state JSON and internal snapshots after worktree cleanup. Forced
 cleanup/delete also refuse to remove a worktree that contains the current process directory,
-so a user's shell is not left inside a deleted tree.
+so a user's shell is not left inside a deleted tree. Shared git/worktree primitives such
+as root detection, dirty checks, path containment, worktree removal, current-branch
+inspection, and commit resolution live in `core/worktree.py`; `sikula.py` keeps
+compatibility wrappers for existing tests and command contexts.
 
-**Status/show commands:** `sikula status` and `sikula show` are implemented by
-`sikula_cli/status.py` with compatibility wrappers in `sikula.py`. `sikula status`
+**Status/show commands:** `sikula status` and `sikula show` parser registration
+and handlers are implemented by `sikula_cli/status.py` with compatibility
+wrappers in `sikula.py`. `sikula status`
 derives a compact task overview from state JSON. It reports terminal states
 (`DONE`, `FAILED`, `CLEANED`), interrupted runs whose recorded PID is no longer
 alive, current pipeline phase, planner step progress, build/fix iteration count,
@@ -119,23 +126,30 @@ finalization Sikula switches the process directory back to the original project 
 worktree can be removed safely.
 
 **Contract check and preparation commands:** `sikula contract check TASK_FILE` is a
-read-only preflight implemented by `core/contract_check.py`. It parses the task file,
-scores whether it is specific enough to act as an implementation contract, reports gaps
-and stable clarifying question IDs, and can emit the same result as JSON. By default it
-does not write files; with `--write-report` it writes an explicit
+read-only preflight whose CLI parser registration and handler logic live in
+`sikula_cli/contract.py`; the contract scoring itself is implemented by
+`core/contract_check.py`. It parses the task file, scores whether it is specific enough
+to act as an implementation contract, reports gaps and stable clarifying question IDs,
+and can emit the same result as JSON. By default it does not write files; with
+`--write-report` it writes an explicit
 `.sikula/contract-reports/*.check.json` report and matching `.answers.yaml` template for
-follow-up answers. `sikula task refine TASK_FILE --output ...` prepares the product brief
-side of the flow: it can normalize a product request into task-description Markdown and
-ask product-level clarifying questions, but it does not evaluate Sikula delivery
-readiness or return run guidance. `sikula contract prepare TASK_FILE --answers ...
---output ...` turns the task description into the delivery artifact by applying answers,
+follow-up answers. `sikula contract prepare TASK_FILE --answers ... --output ...`
+uses the same `sikula_cli/contract.py` command module and turns the task
+description into the delivery artifact by applying answers,
 preserving product sections, adding project context plus validation commands from the
 effective project config, and rechecking the returned Markdown. It refuses stale answer
 hashes, accidental overwrites, and task-description input that already contains the
 reserved `## Asset manifest` section. `--interactive` is a terminal convenience layer for
 both refine and prepare: it creates or reuses an answers YAML, prompts for answers, saves
 that file under `.sikula/contract-reports`, and then writes the clean Markdown output.
-The same module also exposes side-effect-free in-memory helpers
+`sikula task attach TASK_FILE ASSET_FILE` parser registration and handler logic live in
+`sikula_cli/task.py`; the command copies local reference or delivery assets into the
+configured task asset directory and optionally appends the generated Markdown snippet to
+the task file. `sikula task refine TASK_FILE --output ...` prepares the product brief
+side of the flow: it can normalize a product request into task-description Markdown and
+ask product-level clarifying questions, but it does not evaluate Sikula delivery
+readiness or return run guidance.
+The core module also exposes side-effect-free in-memory helpers
 (`prepare_task_description()`, `improve_contract_text()`, and
 `prepare_implementation_contract()`) so chat/MCP adapters can reuse the same scoring,
 question, answer-application, and recheck logic without temporary YAML files or duplicate
@@ -448,7 +462,7 @@ Note: `step_start` is recorded at the top of the while loop, before idempotency 
 
 ## Review flow (`sikula review`)
 
-`cmd_review()` in `sikula.py`. Isolates an existing branch in a git worktree, runs the reviewer and security reviewer against a PR-style diff, and exits with a summary. Report-only review uses the initial computed diff; `review --fix` refreshes the diff as fixes are made.
+`cmd_review()` in `sikula_cli/review.py` (with a compatibility wrapper in `sikula.py`). Isolates an existing branch in a git worktree, runs the reviewer and security reviewer against a PR-style diff, and exits with a summary. Report-only review uses the initial computed diff; `review --fix` refreshes the diff as fixes are made.
 
 **Setup (both modes):**
 
@@ -1363,15 +1377,15 @@ Sikula processes at once is still unsupported.
 | `analyst_warnings` | `list[str]` | AnalystAgent | Warnings produced by the analyst (e.g. ambiguous task scope, missing context); logged for visibility, never block the pipeline |
 | `analyst_retry_records` | `list[dict]` | AnalystAgent | Append-only records for analyst outputs rejected before `implementation_prompt` is stored, including attempt number, reason, whether another retry follows, timestamp, the rejected output, and the retry prompt when another attempt follows. These records are audit-only and never drive pipeline control flow. |
 | `planner_retry_records` | `list[dict]` | PlannerAgent | Append-only records for planner outputs rejected because the parsed step count exceeded `planner.max_steps`, including attempt number, reason, max step count, parsed step count, whether another retry follows, timestamp, the rejected output, and the retry prompt when another attempt follows. These records are audit-only and never drive pipeline control flow. |
-| `review_diff` | `str \| None` | `cmd_review()` in `sikula.py` / Orchestrator | PR-style diff passed to ReviewerAgent and SecurityReviewerAgent; initially set to `git diff base...branch` (three-dot) in `sikula review` mode; refreshed in `"review_fix"` mode before reviewer/security-reviewer calls so uncommitted fixes are included; `None` in standard `sikula run` flow (agents fall back to `GitTool.diff_head()`) |
-| `review_mode` | `str \| None` | `cmd_review()` in `sikula.py` | Review task kind: `"review_report"` for report-only review (not reset or resumable) or `"review_fix"` for `sikula review --fix` (resumable via `sikula run --task-id`) |
-| `review_base_branch` | `str \| None` | `cmd_review()` in `sikula.py` | Base branch used to refresh `review_diff` in `"review_fix"` mode. Report-only review keeps the original frozen diff; review-fix refreshes against the merge base before reviewer/security-reviewer calls so fixes are reviewed against the current branch state. |
-| `review_delivery_mode` | `str \| None` | `cmd_review()` / `cmd_run()` in `sikula.py` | Review-fix delivery strategy metadata. `None` for report-only review, normal `--branch` review-fix, and standard task runs. `"current_branch"` for `sikula review --fix --current-branch`; this tells resume/finalization to deliver the isolated fix commit back to the originally current branch instead of treating `worktree_branch` as a checked-out delivery branch. |
-| `review_target_branch` | `str \| None` | `cmd_review()` in `sikula.py` | Named branch that was current when `--current-branch` started. Delivery and retry require the operator's checkout to still be on this branch before fast-forwarding or declaring a no-change result. |
-| `review_target_start_commit` | `str \| None` | `cmd_review()` in `sikula.py` | Commit SHA for the target branch `HEAD` captured before creating the detached isolated worktree. Current-branch delivery requires the target branch to still point at this commit unless it already equals the delivered commit. |
+| `review_diff` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / Orchestrator | PR-style diff passed to ReviewerAgent and SecurityReviewerAgent; initially set to `git diff base...branch` (three-dot) in `sikula review` mode; refreshed in `"review_fix"` mode before reviewer/security-reviewer calls so uncommitted fixes are included; `None` in standard `sikula run` flow (agents fall back to `GitTool.diff_head()`) |
+| `review_mode` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` | Review task kind: `"review_report"` for report-only review (not reset or resumable) or `"review_fix"` for `sikula review --fix` (resumable via `sikula run --task-id`) |
+| `review_base_branch` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` | Base branch used to refresh `review_diff` in `"review_fix"` mode. Report-only review keeps the original frozen diff; review-fix refreshes against the merge base before reviewer/security-reviewer calls so fixes are reviewed against the current branch state. |
+| `review_delivery_mode` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / `cmd_run()` in `sikula.py` | Review-fix delivery strategy metadata. `None` for report-only review, normal `--branch` review-fix, and standard task runs. `"current_branch"` for `sikula review --fix --current-branch`; this tells resume/finalization to deliver the isolated fix commit back to the originally current branch instead of treating `worktree_branch` as a checked-out delivery branch. |
+| `review_target_branch` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` | Named branch that was current when `--current-branch` started. Delivery and retry require the operator's checkout to still be on this branch before fast-forwarding or declaring a no-change result. |
+| `review_target_start_commit` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` | Commit SHA for the target branch `HEAD` captured before creating the detached isolated worktree. Current-branch delivery requires the target branch to still point at this commit unless it already equals the delivered commit. |
 | `review_isolated_fix_commit` | `str \| None` | `_deliver_current_branch_review_fix()` in `sikula.py` | Commit SHA created in the detached isolated worktree for current-branch review fixes. Persisted so `sikula run --task-id` can retry delivery without rerunning agents or creating a second isolated commit. |
-| `review_delivery_status` | `str \| None` | `cmd_review()` / `cmd_run()` in `sikula.py` | Current-branch delivery state. `None` outside current-branch review-fix. `"pending"` means agents have not produced a terminal delivery result yet; `"committed"` means an isolated fix commit exists and delivery can be retried; `"failed"` means delivery safety checks, commit creation, fast-forward, or cleanup failed and the worktree is preserved; `"delivered"` means the target branch has the isolated fix commit; `"no_changes"` means agents produced no changes after safety checks passed. `"delivered"` and `"no_changes"` are terminal delivery states. |
-| `review_delivery_result` | `str \| None` | `cmd_review()` / `cmd_run()` in `sikula.py` | Short human-readable audit result for current-branch delivery, including failure reasons and delivered/no-change summaries. It is for status, `sikula show`, and final summary reporting only; it must not replace the explicit status field for control-flow decisions. |
+| `review_delivery_status` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / `cmd_run()` in `sikula.py` | Current-branch delivery state. `None` outside current-branch review-fix. `"pending"` means agents have not produced a terminal delivery result yet; `"committed"` means an isolated fix commit exists and delivery can be retried; `"failed"` means delivery safety checks, commit creation, fast-forward, or cleanup failed and the worktree is preserved; `"delivered"` means the target branch has the isolated fix commit; `"no_changes"` means agents produced no changes after safety checks passed. `"delivered"` and `"no_changes"` are terminal delivery states. |
+| `review_delivery_result` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / `cmd_run()` in `sikula.py` | Short human-readable audit result for current-branch delivery, including failure reasons and delivered/no-change summaries. It is for status, `sikula show`, and final summary reporting only; it must not replace the explicit status field for control-flow decisions. |
 | `implement_cycle_records` | `list[dict]` | ImplementerAgent | Structured observability — one entry per implementer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = review/security fix after a post-fixer validation pass), `review_iteration` (`0` = initial or security fix; `>0` = review fix pass N), `security_review_iteration` (`0` = initial or review fix; `>0` = security fix pass N), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `step_description`, `implementer_prompt`, `implementer_output` (`None` on exception), `files_written`, `timestamp`; both iteration counters `== 0` and `build_iteration == 0` means initial implementation; never read for pipeline decisions. **Correlation note:** to find the reviewer record that triggered this implementer, look for a `review_cycle_records` entry with the same `step`, `build_iteration`, and `review_iteration: N-1` |
 | `review_cycle_records` | `list[dict]` | ReviewerAgent | Structured observability — one entry per reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = after a post-fixer validation pass), `review_iteration` (fix-pass index within this step's review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, reviewer history is limited to earlier final full-task reviews, not step-scoped reviews. **Correlation note:** a reviewer record with `review_iteration: N` that found issues triggered the implementer record with `review_iteration: N+1` — the orchestrator increments the counter before calling the implementer |
 | `security_review_cycle_records` | `list[dict]` | SecurityReviewerAgent | Structured observability — one entry per security reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = after a post-fixer validation pass), `security_review_iteration` (fix-pass index within this step's security review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the security reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, security history is limited to earlier final full-task security reviews. **Migration note:** state files from schema version 1 stored security reviewer entries inside `review_cycle_records` with `reviewer = "security_reviewer"`; `JsonStateStore.load()` moves them here and removes the redundant `reviewer` field. |
@@ -1391,12 +1405,12 @@ Sikula processes at once is still unsupported.
 | `test_writer_audit_gate_counts` | `dict[str, dict[str, int]]` | Orchestrator | Sanitized per-file execution-gate signature counts captured before TestWriterAgent runs. Used only to finish pending execution-gate audits on resume without exposing raw source snapshots in task state. A matching limited text restore snapshot for task-known/reported test files is stored separately as a temporary internal state-store blob for recovery and removed when the pending audit is cleared; broad roots such as `"."` do not cause Sikula to persist a full source snapshot. |
 | `fixer_changed_code` | `bool` | Orchestrator | Set True when FixerAgent writes files; used on resume to continue deterministic build/test/check validation before stale semantic gates rerun; cleared after the following compile check succeeds |
 | `tests_up_to_date` | `bool` | TestWriterAgent / Orchestrator | Set True after test write; reset to False when Fixer changes production-impacting files; preserved for test-only fixer changes on recognized test artifact paths so validation can rerun without redundant test-writer passes while security review still reruns for the executable test changes. A pending test-writer audit takes precedence over this flag on resume. |
-| `worktree_path` | `str \| None` | `cmd_run()` / `cmd_review()` in `sikula.py` | Absolute path of the effective project root within the worktree — equals `worktree_base` when `root_path` is itself a git root, or `worktree_base/<rel>` for subdirectory projects; used as `cwd` by all agents; `None` for `--no-isolate` runs |
-| `worktree_base` | `str \| None` | `cmd_run()` / `cmd_review()` in `sikula.py` | Absolute path of the git worktree root (where `git add/commit/worktree remove` run); equals `worktree_path` when project is its own git root; `None` for `--no-isolate` runs |
-| `worktree_branch` | `str \| None` | `cmd_run()` / `cmd_review()` in `sikula.py` | Branch name for the worktree; `sikula/<stem>-<task_id>` for `cmd_run()`; the existing PR branch name for `cmd_review()`; `None` for `--no-isolate` runs |
+| `worktree_path` | `str \| None` | `cmd_run()` in `sikula.py` / `cmd_review()` in `sikula_cli/review.py` | Absolute path of the effective project root within the worktree — equals `worktree_base` when `root_path` is itself a git root, or `worktree_base/<rel>` for subdirectory projects; used as `cwd` by all agents; `None` for `--no-isolate` runs |
+| `worktree_base` | `str \| None` | `cmd_run()` in `sikula.py` / `cmd_review()` in `sikula_cli/review.py` | Absolute path of the git worktree root (where `git add/commit/worktree remove` run); equals `worktree_path` when project is its own git root; `None` for `--no-isolate` runs |
+| `worktree_branch` | `str \| None` | `cmd_run()` in `sikula.py` / `cmd_review()` in `sikula_cli/review.py` | Branch name for the worktree; `sikula/<stem>-<task_id>` for `cmd_run()`; the existing PR branch name for `cmd_review()`; `None` for `--no-isolate` runs |
 | `result_commit` | `str \| None` | `_finalize_worktree()` in `sikula.py` | Commit SHA created by Sikula when an isolated `run` or `review --fix` task finalizes with file changes; `None` for report-only review, `--no-isolate`, or runs with no commit to create |
 | `history` | `list[dict]` | `state.record()` | Append-only audit log: agent, action, result, timestamp, elapsed_s, plus action-specific entries such as `llm_retry` provider/model/attempt fields and `write_path_warning` write-scope audit messages; in step mode, `step_start` / `step_done` orchestrator entries delimit each step's events |
-| `runtime_metadata` | `dict` | `StateStore.create()` / `cmd_review()` | Runtime snapshot captured when the task state is created: Sikula package version when available, Python version, platform, system, and machine. Used for later debugging only |
+| `runtime_metadata` | `dict` | `StateStore.create()` / `cmd_review()` in `sikula_cli/review.py` | Runtime snapshot captured when the task state is created: Sikula package version when available, Python version, platform, system, and machine. Used for later debugging only |
 | `final_summary` | `dict` | `JsonStateStore.save()` | Compact terminal summary written when the state reaches an audit-terminal result: normal `done` / `failed`, or for current-branch review-fix delivery only after `review_delivery_status` becomes `"delivered"`, `"no_changes"`, or `"failed"`. Pending/committed current-branch delivery keeps this empty so audit timing reflects delivery completion, not just orchestrator completion. The summary includes result, branch, commit, build/test/check status, counts for files, validation records, fix attempts, review records, test-writer runs, test audit records, LLM retries, history events, timestamps, and wall elapsed time when available. The CLI also derives a human-readable completion report from the same state, including validation status, review status, audit warnings, sampled unique testability gap details, and recovered issues. |
 | `done` | `bool` | Orchestrator | Set True on passing build or after implement in no-build mode when no active deterministic audit finding still requires the build/fix loop |
 | `failed` | `bool` | Orchestrator | Hard abort: set True on review timeout, active build/fix loop iteration limit reached, or unhandled agent exception; loop exits immediately. Use `--reset-failed` CLI flag to clear this and resume for normal run and `review --fix` tasks; audit-only failures such as contract-gate failures before worktree creation and report-only review failures are not reset or resumed. The flag resets `review_iterations`, `security_review_iterations`, `build_iterations`, and active build-loop markers, clears `errors`/`test_errors`/`check_errors` (prevents stale error blobs from appearing in the fixer's prompt on the first resumed iteration), and auto-populates `files_changed` from `git diff` if empty. Sync, build, and check failures are NOT hard aborts — they store the error and run the fixer |
@@ -1417,7 +1431,7 @@ Sikula processes at once is still unsupported.
 ## BuildTool interface (`tools/base_tool.py`)
 
 The orchestrator loop calls a small fixed interface on the registered `"build"` tool.
-`env_files()` is a static method called by `cmd_run()` and `cmd_review --fix` in `sikula.py` when creating a worktree.
+`env_files()` is a static method called by `cmd_run()` in `sikula.py` and `cmd_review --fix` in `sikula_cli/review.py` when creating a worktree.
 Everything else (assemble, …) are platform-specific extras on the subclass. BuildTool methods
 return `ToolResult`.
 

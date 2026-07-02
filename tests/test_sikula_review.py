@@ -25,6 +25,52 @@ _run_review_agent_with_retry_history = _sikula._run_review_agent_with_retry_hist
 cmd_review = _sikula.cmd_review
 
 
+def test_review_cli_module_imports() -> None:
+    import sikula_cli.review as review_cli
+
+    assert callable(review_cli.register_parser)
+    assert callable(review_cli.cmd_review)
+
+
+def test_review_register_parser_sets_flags() -> None:
+    import sikula_cli.review as review_cli
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    review_cli.register_parser(subparsers)
+
+    args = parser.parse_args(
+        [
+            "review",
+            "--current-branch",
+            "--base-branch",
+            "develop",
+            "--description-file",
+            "pr.md",
+            "--fix",
+            "--no-security-review",
+            "--agent-model",
+            "reviewer=gpt-5.5",
+            "--agent-provider",
+            "reviewer=codex",
+            "--agent-timeout",
+            "reviewer=1200",
+        ]
+    )
+
+    assert args.command == "review"
+    assert args.branch is None
+    assert args.current_branch is True
+    assert args.base_branch == "develop"
+    assert args.description is None
+    assert args.description_file == "pr.md"
+    assert args.fix is True
+    assert args.security_review is False
+    assert args.agent_model == ["reviewer=gpt-5.5"]
+    assert args.agent_provider == ["reviewer=codex"]
+    assert args.agent_timeout == ["reviewer=1200"]
+
+
 @pytest.fixture(autouse=True)
 def mock_sikula_version():
     with patch("core.state.sikula_version", return_value="dev"):

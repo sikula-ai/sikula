@@ -21,6 +21,7 @@ _SIKULA_PY = str(Path(__file__).parent.parent / "sikula.py")
 def test_status_cli_module_imports() -> None:
     import sikula_cli.status as status_cli
 
+    assert callable(status_cli.register_parser)
     assert callable(status_cli.cmd_status)
     assert callable(status_cli.cmd_show)
 

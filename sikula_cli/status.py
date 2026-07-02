@@ -15,6 +15,45 @@ from core.state import JsonStateStore
 from sikula_cli.config import _resolve_state_dir
 
 
+def register_parser(subparsers) -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
+    status_p = subparsers.add_parser("status", help="List all tasks")
+    status_p.add_argument("--json", action="store_true", default=False, help="Print task status rows as JSON")
+    status_p.add_argument("--verbose", action="store_true", default=False, help="Include next suggested action")
+    status_p.add_argument(
+        "--active",
+        dest="status_filter",
+        action="append_const",
+        const="active",
+        default=[],
+        help="Show only active or interrupted tasks",
+    )
+    status_p.add_argument(
+        "--done",
+        dest="status_filter",
+        action="append_const",
+        const="done",
+        help="Show only completed tasks",
+    )
+    status_p.add_argument(
+        "--failed",
+        dest="status_filter",
+        action="append_const",
+        const="failed",
+        help="Show only failed tasks",
+    )
+    status_p.add_argument(
+        "--cleaned",
+        dest="status_filter",
+        action="append_const",
+        const="cleaned",
+        help="Show only cleaned audit-only tasks",
+    )
+
+    show_p = subparsers.add_parser("show", help="Show full task state as JSON")
+    show_p.add_argument("task_id")
+    return status_p, show_p
+
+
 def _pid_running(pid: int) -> bool:
     try:
         os.kill(pid, 0)
