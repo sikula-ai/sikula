@@ -25,10 +25,24 @@ cmd_run = _sikula.cmd_run
 def test_cleanup_cli_module_imports() -> None:
     import sikula_cli.cleanup as cleanup_cli
 
+    assert callable(cleanup_cli.register_parser)
     assert callable(cleanup_cli.cmd_cleanup)
 
 
 class TestCleanupCliModule:
+    def test_register_parser_sets_delete_state_defaults(self):
+        import sikula_cli.cleanup as cleanup_cli
+
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command")
+        cleanup_cli.register_parser(subparsers)
+
+        cleanup_args = parser.parse_args(["cleanup", "abc123"])
+        assert cleanup_args.delete_state is False
+
+        delete_args = parser.parse_args(["delete", "abc123"])
+        assert delete_args.delete_state is True
+
     def test_default_git_helpers(self, tmp_path: Path, monkeypatch):
         import sikula_cli.cleanup as cleanup_cli
 

@@ -86,9 +86,9 @@ cmd_run()
 
 **`--no-isolate`**: skips worktree creation; changes land as uncommitted working-tree modifications in the original project root. No branch is created. A git repository is still required — git is used to detect which files the agent changed.
 
-**Cleanup/delete commands:** `sikula cleanup` and `sikula delete` are
-implemented by `sikula_cli/cleanup.py` with compatibility wrappers in
-`sikula.py`.
+**Cleanup/delete commands:** `sikula cleanup` and `sikula delete` parser
+registration and handlers are implemented by `sikula_cli/cleanup.py` with
+compatibility wrappers in `sikula.py`.
 
 ```
 sikula cleanup <task_id>          # dry run
@@ -104,8 +104,9 @@ audit while making resume impossible; it also removes transient internal recover
 cleanup/delete also refuse to remove a worktree that contains the current process directory,
 so a user's shell is not left inside a deleted tree.
 
-**Status/show commands:** `sikula status` and `sikula show` are implemented by
-`sikula_cli/status.py` with compatibility wrappers in `sikula.py`. `sikula status`
+**Status/show commands:** `sikula status` and `sikula show` parser registration
+and handlers are implemented by `sikula_cli/status.py` with compatibility
+wrappers in `sikula.py`. `sikula status`
 derives a compact task overview from state JSON. It reports terminal states
 (`DONE`, `FAILED`, `CLEANED`), interrupted runs whose recorded PID is no longer
 alive, current pipeline phase, planner step progress, build/fix iteration count,

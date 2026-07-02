@@ -4954,71 +4954,8 @@ def main() -> None:
         help="Override agent_timeout for one agent, e.g. --agent-timeout implementer=2400",
     )
 
-    status_p = sub.add_parser("status", help="List all tasks")
-    status_p.add_argument("--json", action="store_true", default=False, help="Print task status rows as JSON")
-    status_p.add_argument("--verbose", action="store_true", default=False, help="Include next suggested action")
-    status_p.add_argument(
-        "--active",
-        dest="status_filter",
-        action="append_const",
-        const="active",
-        default=[],
-        help="Show only active or interrupted tasks",
-    )
-    status_p.add_argument(
-        "--done",
-        dest="status_filter",
-        action="append_const",
-        const="done",
-        help="Show only completed tasks",
-    )
-    status_p.add_argument(
-        "--failed",
-        dest="status_filter",
-        action="append_const",
-        const="failed",
-        help="Show only failed tasks",
-    )
-    status_p.add_argument(
-        "--cleaned",
-        dest="status_filter",
-        action="append_const",
-        const="cleaned",
-        help="Show only cleaned audit-only tasks",
-    )
-
-    show_p = sub.add_parser("show", help="Show full task state as JSON")
-    show_p.add_argument("task_id")
-
-    cleanup_p = sub.add_parser("cleanup", help="Remove a task worktree but keep its state JSON")
-    cleanup_p.add_argument("task_id")
-    cleanup_p.add_argument(
-        "--force",
-        action="store_true",
-        default=False,
-        help="Apply cleanup. Without this flag, cleanup only prints what would happen.",
-    )
-    cleanup_p.add_argument(
-        "--discard",
-        action="store_true",
-        default=False,
-        help="Allow removing a dirty worktree and discarding uncommitted changes.",
-    )
-
-    delete_p = sub.add_parser("delete", help="Delete a task worktree and its state JSON")
-    delete_p.add_argument("task_id")
-    delete_p.add_argument(
-        "--force",
-        action="store_true",
-        default=False,
-        help="Apply deletion. Without this flag, delete only prints what would happen.",
-    )
-    delete_p.add_argument(
-        "--discard",
-        action="store_true",
-        default=False,
-        help="Allow removing a dirty worktree and discarding uncommitted changes.",
-    )
+    cli_status.register_parser(sub)
+    cli_cleanup.register_parser(sub)
 
     review_p = sub.add_parser("review", help="Review an existing branch (report-only or --fix)")
     review_target = review_p.add_mutually_exclusive_group(required=True)

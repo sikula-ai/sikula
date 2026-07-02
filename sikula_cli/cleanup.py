@@ -13,6 +13,41 @@ from core.state import JsonStateStore
 from sikula_cli.config import _resolve_state_dir
 
 
+def register_parser(subparsers) -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
+    cleanup_p = subparsers.add_parser("cleanup", help="Remove a task worktree but keep its state JSON")
+    cleanup_p.set_defaults(delete_state=False)
+    cleanup_p.add_argument("task_id")
+    cleanup_p.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Apply cleanup. Without this flag, cleanup only prints what would happen.",
+    )
+    cleanup_p.add_argument(
+        "--discard",
+        action="store_true",
+        default=False,
+        help="Allow removing a dirty worktree and discarding uncommitted changes.",
+    )
+
+    delete_p = subparsers.add_parser("delete", help="Delete a task worktree and its state JSON")
+    delete_p.set_defaults(delete_state=True)
+    delete_p.add_argument("task_id")
+    delete_p.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Apply deletion. Without this flag, delete only prints what would happen.",
+    )
+    delete_p.add_argument(
+        "--discard",
+        action="store_true",
+        default=False,
+        help="Allow removing a dirty worktree and discarding uncommitted changes.",
+    )
+    return cleanup_p, delete_p
+
+
 def _default_find_git_root(path: Path) -> Path | None:
     result = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],

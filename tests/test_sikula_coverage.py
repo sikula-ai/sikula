@@ -1722,6 +1722,18 @@ class TestMain:
         mock_cleanup.assert_called_once()
         assert mock_cleanup.call_args.args[0].delete_state is False
 
+    def test_cleanup_command_passes_force_and_discard_flags(self, tmp_path: Path):
+        p1, p2, p3 = self._patch_config(tmp_path)
+        with patch("sys.argv", ["sikula", "cleanup", "abc123", "--force", "--discard"]):
+            with p1, p2, p3:
+                with patch("sikula.cmd_cleanup") as mock_cleanup:
+                    main()
+        mock_cleanup.assert_called_once()
+        args = mock_cleanup.call_args.args[0]
+        assert args.delete_state is False
+        assert args.force is True
+        assert args.discard is True
+
     def test_delete_command_dispatches_to_cmd_cleanup_with_delete_state(self, tmp_path: Path):
         p1, p2, p3 = self._patch_config(tmp_path)
         with patch("sys.argv", ["sikula", "delete", "abc123"]):
@@ -1730,6 +1742,18 @@ class TestMain:
                     main()
         mock_cleanup.assert_called_once()
         assert mock_cleanup.call_args.args[0].delete_state is True
+
+    def test_delete_command_passes_force_and_discard_flags(self, tmp_path: Path):
+        p1, p2, p3 = self._patch_config(tmp_path)
+        with patch("sys.argv", ["sikula", "delete", "abc123", "--force", "--discard"]):
+            with p1, p2, p3:
+                with patch("sikula.cmd_cleanup") as mock_cleanup:
+                    main()
+        mock_cleanup.assert_called_once()
+        args = mock_cleanup.call_args.args[0]
+        assert args.delete_state is True
+        assert args.force is True
+        assert args.discard is True
 
     @pytest.mark.parametrize(
         (
