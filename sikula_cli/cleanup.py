@@ -6,9 +6,9 @@ import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-import subprocess
 import sys
 
+from core import worktree as core_worktree
 from core.state import JsonStateStore
 from sikula_cli.config import _resolve_state_dir
 
@@ -49,42 +49,19 @@ def register_parser(subparsers) -> tuple[argparse.ArgumentParser, argparse.Argum
 
 
 def _default_find_git_root(path: Path) -> Path | None:
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-        cwd=path,
-    )
-    if result.returncode != 0:
-        return None
-    return Path(result.stdout.strip()).resolve()
+    return core_worktree.find_git_root(path)
 
 
 def _default_worktree_dirty(worktree_base: Path) -> bool:
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-        cwd=worktree_base,
-    )
-    return bool(status.stdout.strip()) if status.returncode == 0 else True
+    return core_worktree.worktree_dirty(worktree_base)
 
 
 def _default_remove_worktree(worktree_base: Path, git_root: Path, *, force: bool) -> bool:
-    cmd = ["git", "worktree", "remove"]
-    if force:
-        cmd.append("--force")
-    cmd.append(str(worktree_base))
-    result = subprocess.run(cmd, cwd=git_root, check=False)
-    return result.returncode == 0
+    return core_worktree.remove_worktree(worktree_base, git_root, force=force)
 
 
 def _default_path_is_within(path: Path, base: Path) -> bool:
-    try:
-        path.resolve().relative_to(base.resolve())
-        return True
-    except ValueError:
-        return False
+    return core_worktree.path_is_within(path, base)
 
 
 @dataclass(frozen=True)

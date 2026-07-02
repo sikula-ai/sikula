@@ -79,6 +79,7 @@ from typing import Sequence
 
 import yaml
 
+from core import worktree as core_worktree
 from core.diagnostics import diagnostic_identity_key, diagnostic_summary_lines
 from core.version import sikula_version as _sikula_version
 from sikula_cli import contract as cli_contract
@@ -322,17 +323,7 @@ def _build_tool_class(cfg: dict):
 
 
 def _worktree_error_message(branch: str, stderr: str) -> str:
-    """Return a human-readable error message for a failed `git worktree add`."""
-    if "already checked out" in stderr or "is already used by worktree" in stderr:
-        return (
-            f"Branch '{branch}' is already checked out.\n"
-            f"If you are currently on '{branch}', switch away first:\n"
-            f"  git checkout main\n"
-            "If a previous --fix run left a stale worktree, remove it:\n"
-            "  git worktree list   # find the path\n"
-            "  git worktree remove <path>"
-        )
-    return f"Failed to create worktree for branch '{branch}': {stderr}"
+    return core_worktree.worktree_error_message(branch, stderr)
 
 
 _NO_REFERENCED_FILES_SENTINEL = "NO_REFERENCED_FILES"
@@ -379,23 +370,11 @@ def _branch_stem(task_file: str) -> str:
 
 
 def _ensure_gitignore(git_root: Path) -> None:
-    entry = ".sikula/worktrees/"
-    exclude = git_root / ".git" / "info" / "exclude"
-    exclude.parent.mkdir(parents=True, exist_ok=True)
-    if exclude.exists() and any(line.strip() == entry for line in exclude.read_text().splitlines()):
-        return
-    with exclude.open("a") as f:
-        f.write(f"\n{entry}\n")
+    core_worktree.ensure_gitignore(git_root)
 
 
 def _ensure_project_gitignore_entry(project_root: Path, entry: str) -> None:
-    gitignore = project_root / ".gitignore"
-    existing = gitignore.read_text() if gitignore.exists() else ""
-    if any(line.strip() == entry for line in existing.splitlines()):
-        return
-    prefix = "" if not existing or existing.endswith("\n") else "\n"
-    with gitignore.open("a") as f:
-        f.write(f"{prefix}{entry}\n")
+    core_worktree.ensure_project_gitignore_entry(project_root, entry)
 
 
 def _ensure_sikula_gitignore(sikula_dir: Path) -> None:
@@ -423,127 +402,35 @@ def _ensure_provider_gitignore_entry(project_root: Path, provider: str | None) -
 
 
 def _find_git_root(path: Path) -> Path | None:
-    """Return the git repository root containing path, or None if not in a git repo."""
-    r = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-        cwd=path,
-    )
-    if r.returncode != 0:
-        return None
-    return Path(r.stdout.strip()).resolve()
+    return core_worktree.find_git_root(path)
 
 
 def _git_relative_path(git_root: Path, path: Path) -> str | None:
-    try:
-        return path.resolve().relative_to(git_root.resolve()).as_posix()
-    except ValueError:
-        return None
+    return core_worktree.git_relative_path(git_root, path)
 
 
 def _tracked_clean_file_status(git_root: Path, path: Path) -> tuple[bool, str]:
-    """Return whether path exists, is tracked, and matches HEAD in git_root."""
-    rel = _git_relative_path(git_root, path)
-    if rel is None:
-        return True, ""
-    if not path.exists():
-        return False, "does not exist"
-
-    tracked = subprocess.run(
-        ["git", "ls-files", "--error-unmatch", "--", rel],
-        capture_output=True,
-        text=True,
-        cwd=git_root,
-    )
-    if tracked.returncode != 0:
-        return False, "not tracked by git"
-
-    staged = subprocess.run(["git", "diff", "--cached", "--quiet", "--", rel], cwd=git_root)
-    if staged.returncode != 0:
-        return False, "has staged changes not committed to HEAD"
-
-    unstaged = subprocess.run(["git", "diff", "--quiet", "--", rel], cwd=git_root)
-    if unstaged.returncode != 0:
-        return False, "has unstaged changes"
-
-    return True, ""
+    return core_worktree.tracked_clean_file_status(git_root, path)
 
 
 def _current_branch_name(git_root: Path) -> tuple[str | None, str | None]:
-    r = subprocess.run(
-        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
-        capture_output=True,
-        text=True,
-        cwd=git_root,
-    )
-    if r.returncode == 0:
-        branch = r.stdout.strip()
-        return (branch, None) if branch else (None, "unknown")
-    if r.stderr.strip():
-        return None, "unknown"
-
-    head = subprocess.run(
-        ["git", "rev-parse", "--verify", "HEAD"],
-        capture_output=True,
-        text=True,
-        cwd=git_root,
-    )
-    if head.returncode == 0:
-        return None, "detached"
-    return None, "unknown"
+    return core_worktree.current_branch_name(git_root)
 
 
 def _resolve_git_commit(git_root: Path, ref: str) -> tuple[str | None, str]:
-    r = subprocess.run(
-        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
-        capture_output=True,
-        text=True,
-        cwd=git_root,
-    )
-    if r.returncode == 0 and r.stdout.strip():
-        return r.stdout.strip().splitlines()[0], ""
-    return None, _short_audit_line(r.stderr.strip() or r.stdout.strip() or "unknown revision")
+    return core_worktree.resolve_git_commit(git_root, ref)
 
 
 def _git_path_lines(git_root: Path, args: list[str]) -> tuple[list[str], str | None]:
-    r = subprocess.run(
-        ["git", *args],
-        capture_output=True,
-        text=True,
-        cwd=git_root,
-    )
-    if r.returncode != 0:
-        return [], _short_audit_line(r.stderr.strip() or r.stdout.strip() or "git command failed")
-    return [line.strip() for line in r.stdout.splitlines() if line.strip()], None
+    return core_worktree.git_path_lines(git_root, args)
 
 
 def _git_excluded_path_prefixes(git_root: Path, exclude_paths: Sequence[Path] | None) -> set[str]:
-    if not exclude_paths:
-        return set()
-    root = git_root.resolve()
-    prefixes: set[str] = set()
-    for path in exclude_paths:
-        try:
-            rel = Path(path).resolve().relative_to(root)
-        except ValueError:
-            continue
-        rel_text = rel.as_posix()
-        if rel_text and rel_text != ".":
-            prefixes.add(rel_text)
-    return prefixes
+    return core_worktree.git_excluded_path_prefixes(git_root, exclude_paths)
 
 
 def _filter_git_paths(paths: list[str], excluded_prefixes: set[str]) -> list[str]:
-    if not excluded_prefixes:
-        return paths
-    filtered = []
-    for path in paths:
-        normalized = path.replace("\\", "/")
-        if any(normalized == prefix or normalized.startswith(f"{prefix}/") for prefix in excluded_prefixes):
-            continue
-        filtered.append(path)
-    return filtered
+    return core_worktree.filter_git_paths(paths, excluded_prefixes)
 
 
 def _current_worktree_changes(
@@ -551,20 +438,7 @@ def _current_worktree_changes(
     *,
     exclude_paths: Sequence[Path] | None = None,
 ) -> tuple[list[str], list[str], list[str], str | None]:
-    excluded_prefixes = _git_excluded_path_prefixes(git_root, exclude_paths)
-    staged, error = _git_path_lines(git_root, ["diff", "--cached", "--name-only"])
-    if error:
-        return [], [], [], error
-    unstaged, error = _git_path_lines(git_root, ["diff", "--name-only"])
-    if error:
-        return [], [], [], error
-    untracked, error = _git_path_lines(git_root, ["ls-files", "--others", "--exclude-standard"])
-    if error:
-        return [], [], [], error
-    staged = _filter_git_paths(staged, excluded_prefixes)
-    unstaged = _filter_git_paths(unstaged, excluded_prefixes)
-    untracked = _filter_git_paths(untracked, excluded_prefixes)
-    return staged, unstaged, untracked, None
+    return core_worktree.current_worktree_changes(git_root, exclude_paths=exclude_paths)
 
 
 def _print_current_branch_clean_error(
@@ -1008,30 +882,15 @@ def _deliver_current_branch_review_fix(
 
 
 def _worktree_dirty(worktree_base: Path) -> bool:
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-        cwd=worktree_base,
-    )
-    return bool(status.stdout.strip()) if status.returncode == 0 else True
+    return core_worktree.worktree_dirty(worktree_base)
 
 
 def _remove_worktree(worktree_base: Path, git_root: Path, *, force: bool) -> bool:
-    cmd = ["git", "worktree", "remove"]
-    if force:
-        cmd.append("--force")
-    cmd.append(str(worktree_base))
-    result = subprocess.run(cmd, cwd=git_root, check=False)
-    return result.returncode == 0
+    return core_worktree.remove_worktree(worktree_base, git_root, force=force)
 
 
 def _path_is_within(path: Path, base: Path) -> bool:
-    try:
-        path.resolve().relative_to(base.resolve())
-        return True
-    except ValueError:
-        return False
+    return core_worktree.path_is_within(path, base)
 
 
 def _run_phase_flag(cfg: dict, overrides: dict, key: str) -> bool:

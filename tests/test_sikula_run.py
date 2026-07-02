@@ -29,6 +29,14 @@ def test_cleanup_cli_module_imports() -> None:
     assert callable(cleanup_cli.cmd_cleanup)
 
 
+def test_core_worktree_module_imports() -> None:
+    import core.worktree as worktree
+
+    assert callable(worktree.find_git_root)
+    assert callable(worktree.current_worktree_changes)
+    assert callable(worktree.remove_worktree)
+
+
 class TestCleanupCliModule:
     def test_register_parser_sets_delete_state_defaults(self):
         import sikula_cli.cleanup as cleanup_cli
@@ -44,6 +52,7 @@ class TestCleanupCliModule:
         assert delete_args.delete_state is True
 
     def test_default_git_helpers(self, tmp_path: Path, monkeypatch):
+        import core.worktree as worktree
         import sikula_cli.cleanup as cleanup_cli
 
         calls = []
@@ -58,7 +67,7 @@ class TestCleanupCliModule:
                 return _git_result(returncode=0)
             return _git_result(returncode=1)
 
-        monkeypatch.setattr(cleanup_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(worktree.subprocess, "run", fake_run)
 
         assert cleanup_cli._default_find_git_root(tmp_path) == tmp_path.resolve()
         assert cleanup_cli._default_worktree_dirty(tmp_path) is False
@@ -66,6 +75,7 @@ class TestCleanupCliModule:
         assert ["git", "worktree", "remove", "--force", str(tmp_path / "wt")] in [call[0] for call in calls]
 
     def test_default_git_helpers_treat_errors_as_safe_failures(self, tmp_path: Path, monkeypatch):
+        import core.worktree as worktree
         import sikula_cli.cleanup as cleanup_cli
 
         def fake_run(cmd, **_):
@@ -73,7 +83,7 @@ class TestCleanupCliModule:
                 return _git_result(returncode=1)
             return _git_result(returncode=1)
 
-        monkeypatch.setattr(cleanup_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(worktree.subprocess, "run", fake_run)
 
         assert cleanup_cli._default_find_git_root(tmp_path) is None
         assert cleanup_cli._default_worktree_dirty(tmp_path) is True

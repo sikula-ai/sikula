@@ -33,6 +33,7 @@
 | `LLMClient` | `core/llm_client.py` | Abstract interface: `generate()` for single-shot text; `run_readonly_agent()` for read-only autonomous agents; `run_agent()` for autonomous file-editing agents |
 | `ContractCheck` helpers | `core/contract_check.py` | Deterministic implementation-contract readiness checks for Markdown/plain-text task files; `sikula run` stores a warning-only state snapshot and `sikula contract check --write-report` explicitly writes report artifacts |
 | `TaskAsset` helpers | `core/task_assets.py` | Deterministic local task-asset parsing, path canonicalization, answer mapping, and asset-manifest line rendering used by contract preparation |
+| `Worktree` helpers | `core/worktree.py` | Shared low-level git/worktree operations used by run, review, cleanup/delete, and init CLI surfaces; command-specific state mutation stays in the owning command layer |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
 | `JsonStateStore` | `core/state.py` | Stores each task as `<task_id>.json` in the configured state dir; serializes same-process access and writes via temp-file replacement so heartbeat updates and audit saves cannot interleave partial JSON writes |
 | `sikula_cli` modules | `sikula_cli/*.py` | Focused CLI command wrappers, parser registration helpers, and CLI config discovery/path helpers; `sikula.py` remains the public entrypoint and compatibility surface |
@@ -102,7 +103,10 @@ Both commands refuse dirty worktrees unless `--discard` is passed. `cleanup` rec
 audit while making resume impossible; it also removes transient internal recovery snapshots.
 `delete` removes the state JSON and internal snapshots after worktree cleanup. Forced
 cleanup/delete also refuse to remove a worktree that contains the current process directory,
-so a user's shell is not left inside a deleted tree.
+so a user's shell is not left inside a deleted tree. Shared git/worktree primitives such
+as root detection, dirty checks, path containment, worktree removal, current-branch
+inspection, and commit resolution live in `core/worktree.py`; `sikula.py` keeps
+compatibility wrappers for existing tests and command contexts.
 
 **Status/show commands:** `sikula status` and `sikula show` parser registration
 and handlers are implemented by `sikula_cli/status.py` with compatibility
