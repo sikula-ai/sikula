@@ -81,6 +81,7 @@ import yaml
 
 from core.diagnostics import diagnostic_identity_key, diagnostic_summary_lines
 from core.version import sikula_version as _sikula_version
+from sikula_cli import cleanup as cli_cleanup
 from sikula_cli import config as cli_config
 from sikula_cli import status as cli_status
 from sikula_cli.delivery import (
@@ -3562,77 +3563,18 @@ def cmd_show(task_id: str, cfg: dict) -> None:
     return cli_status.cmd_show(task_id, cfg, _status_context())
 
 
+def _cleanup_context() -> cli_cleanup.CleanupContext:
+    return cli_cleanup.CleanupContext(
+        resolve_state_dir=_resolve_state_dir,
+        path_is_within=_path_is_within,
+        worktree_dirty=_worktree_dirty,
+        find_git_root=_find_git_root,
+        remove_worktree=_remove_worktree,
+    )
+
+
 def cmd_cleanup(args: argparse.Namespace, cfg: dict) -> None:
-    """Remove a task worktree, optionally deleting the persisted state as well."""
-    from core.state import JsonStateStore
-
-    state_dir = _resolve_state_dir(cfg)
-    store = JsonStateStore(state_dir)
-    state = store.load(args.task_id)
-    if not state:
-        print(f"Task {args.task_id} not found")
-        sys.exit(1)
-
-    action = "delete" if args.delete_state else "cleanup"
-    dry_run = not args.force
-    removed_worktree = False
-    clear_worktree_refs = False
-
-    print(f"Task {state.task_id}: {action.upper()}{' (dry run)' if dry_run else ''}")
-
-    if state.worktree_base or state.worktree_path:
-        worktree_base = Path(state.worktree_base or state.worktree_path)
-        if worktree_base.exists():
-            if not dry_run and _path_is_within(Path.cwd(), worktree_base):
-                print(f"Refusing to remove the current working tree: {worktree_base}")
-                print("Run this command from the original project or another directory.")
-                sys.exit(1)
-            dirty = _worktree_dirty(worktree_base)
-            if dirty and not dry_run and not args.discard:
-                print(f"Worktree has uncommitted changes: {worktree_base}")
-                print("Refusing to remove it. Re-run with --discard to delete those changes.")
-                sys.exit(1)
-            if dry_run:
-                print(f"Would remove worktree: {worktree_base}")
-                if dirty:
-                    print("Worktree has uncommitted changes; applying this cleanup requires --discard.")
-            else:
-                git_root = (
-                    _find_git_root(Path(cfg["project"]["root_path"]).resolve())
-                    or Path(cfg["project"]["root_path"]).resolve()
-                )
-                if not _remove_worktree(worktree_base, git_root, force=args.discard):
-                    print(f"Failed to remove worktree: {worktree_base}")
-                    sys.exit(1)
-                removed_worktree = True
-                clear_worktree_refs = True
-                print(f"Removed worktree: {worktree_base}")
-        else:
-            print(f"Worktree already missing: {worktree_base}")
-            clear_worktree_refs = True
-    else:
-        print("Task has no isolated worktree recorded.")
-
-    if args.delete_state:
-        if dry_run:
-            print(f"Would delete state: {state_dir / (state.task_id + '.json')}")
-        else:
-            store.delete(state.task_id)
-            print(f"Deleted state: {state.task_id}")
-    elif not dry_run:
-        store.delete_text_snapshots(state.task_id)
-        state.record(
-            "sikula",
-            "cleanup",
-            "worktree removed" if removed_worktree else "worktree already missing or not recorded",
-        )
-        if clear_worktree_refs:
-            state.worktree_path = None
-            state.worktree_base = None
-        store.save(state)
-
-    if dry_run:
-        print("No changes made. Re-run with --force to apply.")
+    return cli_cleanup.cmd_cleanup(args, cfg, _cleanup_context())
 
 
 def _print_review_summary(

@@ -86,7 +86,9 @@ cmd_run()
 
 **`--no-isolate`**: skips worktree creation; changes land as uncommitted working-tree modifications in the original project root. No branch is created. A git repository is still required — git is used to detect which files the agent changed.
 
-**Cleanup/delete commands:**
+**Cleanup/delete commands:** `sikula cleanup` and `sikula delete` are
+implemented by `sikula_cli/cleanup.py` with compatibility wrappers in
+`sikula.py`.
 
 ```
 sikula cleanup <task_id>          # dry run
