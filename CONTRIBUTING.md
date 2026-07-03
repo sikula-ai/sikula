@@ -37,6 +37,20 @@ Editable installs run directly from the checkout. `sikula --version` shows the p
 version plus a development suffix when the checkout is inside git, for example
 `sikula 0.2.0-dev+feature.example.abc1234`.
 
+After pulling or making changes that add an importable package, change package
+discovery, update console entry points, or change dependencies, refresh the
+editable install before testing CLI entry points. With `pipx`, use:
+
+```bash
+pipx reinstall sikula
+```
+
+If you develop inside a regular virtual environment instead of `pipx`, use:
+
+```bash
+python3 -m pip install -e . --force-reinstall
+```
+
 ## Running tests
 
 ```bash
