@@ -144,13 +144,13 @@ hashes, accidental overwrites, and task-description input that already contains 
 reserved `## Asset manifest` section. `--interactive` is a terminal convenience layer for
 both refine and prepare: it creates or reuses an answers YAML, prompts for answers, saves
 that file under `.sikula/contract-reports`, and then writes the clean Markdown output.
+`sikula task refine TASK_FILE --output ...` and
 `sikula task attach TASK_FILE ASSET_FILE` parser registration and handler logic live in
-`sikula_cli/task.py`; the command copies local reference or delivery assets into the
-configured task asset directory and optionally appends the generated Markdown snippet to
-the task file. `sikula task refine TASK_FILE --output ...` prepares the product brief
-side of the flow: it can normalize a product request into task-description Markdown and
-ask product-level clarifying questions, but it does not evaluate Sikula delivery
-readiness or return run guidance.
+`sikula_cli/task.py`. `task refine` prepares the product brief side of the flow: it can
+normalize a product request into task-description Markdown and ask product-level
+clarifying questions, but it does not evaluate Sikula delivery readiness or return run
+guidance. `task attach` copies local reference or delivery assets into the configured task
+asset directory and optionally appends the generated Markdown snippet to the task file.
 The core module also exposes side-effect-free in-memory helpers
 (`prepare_task_description()`, `improve_contract_text()`, and
 `prepare_implementation_contract()`) so chat/MCP adapters can reuse the same scoring,

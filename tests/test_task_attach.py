@@ -14,8 +14,47 @@ from sikula import cmd_task_attach
 def test_task_cli_module_imports() -> None:
     import sikula_cli.task as task_cli
 
+    assert callable(task_cli.register_refine_parser)
     assert callable(task_cli.register_attach_parser)
+    assert callable(task_cli.cmd_task_refine)
     assert callable(task_cli.cmd_task_attach)
+
+
+def test_task_refine_register_parser_sets_flags() -> None:
+    import sikula_cli.task as task_cli
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="task_command")
+    task_cli.register_refine_parser(subparsers)
+
+    args = parser.parse_args(
+        [
+            "refine",
+            "task.md",
+            "--answers",
+            "answers.yaml",
+            "--auto",
+            "--interactive",
+            "--output",
+            "task.refined.md",
+            "--agent-model",
+            "task_preparer=gpt-5.5",
+            "--agent-provider",
+            "task_preparer=claude",
+            "--agent-timeout",
+            "task_preparer=1200",
+        ]
+    )
+
+    assert args.task_command == "refine"
+    assert args.task_file == "task.md"
+    assert args.answers == "answers.yaml"
+    assert args.auto is True
+    assert args.interactive is True
+    assert args.output == "task.refined.md"
+    assert args.agent_model == ["task_preparer=gpt-5.5"]
+    assert args.agent_provider == ["task_preparer=claude"]
+    assert args.agent_timeout == ["task_preparer=1200"]
 
 
 def test_task_attach_register_parser_sets_flags() -> None:
