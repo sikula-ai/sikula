@@ -617,7 +617,10 @@ branch.
 
 ## Init flow (`sikula init`)
 
-`cmd_init()` in `sikula.py`. Scans the project, generates `.sikula/config.yaml`, and optionally generates `.sikula/guidelines.md` via `InitAgent`.
+`sikula init` parser registration and command flow live in `sikula_cli/init.py`.
+`sikula.py` keeps compatibility wrappers for existing imports and tests. The command
+scans the project, generates `.sikula/config.yaml`, and optionally generates
+`.sikula/guidelines.md` via `InitAgent`.
 
 ```
 cmd_init()
@@ -633,7 +636,7 @@ cmd_init()
    ├─ scanner.detect_platform(project_root)    →  platform string
    ├─ scanner.scan_source_paths(project_root)  →  allowed_write_paths
    │
-   ├─ _generate_config():
+   ├─ sikula_cli.init.generate_config():
    │     builds config dict from detected values + project name
    │     fills in appropriate build: block for detected build_tool
    │     writes .sikula/config.yaml
@@ -1747,7 +1750,7 @@ All keys live under `test_writer:` in `.sikula/config.yaml`.
    and environment files excluded from provider workspace copies.
 3. Add a branch to `_build_tool()` in `core/orchestrator.py`: check `project_config["project"]["build_tool"] == "your_build_tool"` and return an instance of your new class. Add the new build tool name to the docstring comment beside the factory.
 4. Add auto-detection to `tools/scanner.py`: add an entry to `_SIGNATURES` (trigger files, build tool name, language, platform) and implement path detection helpers (`_detect_<platform>_paths()`).
-5. Extend `_generate_config()` in `sikula.py` to emit the platform-specific `build:` block so that `sikula init` generates a correct config for the new platform.
+5. Extend `generate_config()` in `sikula_cli/init.py` to emit the platform-specific `build:` block so that `sikula init` generates a correct config for the new platform.
 6. Create `.sikula/config.yaml` in the project directory with:
    - `project.build_tool: your_build_tool` — must match the branch key added in step 3
    - `project.platform: iOS` (or `Android`, `backend`, …) — injected into agent prompts as tech stack context
