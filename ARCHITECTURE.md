@@ -42,7 +42,9 @@
 
 ## Run flow (`sikula run`)
 
-`cmd_run()` in `sikula.py`. Wraps `Orchestrator.run()` with worktree setup, finalization, and resume logic.
+`sikula run` parser registration lives in `sikula_cli/run.py`. The `cmd_run()`
+handler remains in `sikula.py`, where it wraps `Orchestrator.run()` with
+worktree setup, finalization, and resume logic.
 
 **New task (`--task-file`):**
 
