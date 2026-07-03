@@ -84,16 +84,12 @@ from core.version import sikula_version as _sikula_version
 from sikula_cli import contract as cli_contract
 from sikula_cli import cleanup as cli_cleanup
 from sikula_cli import config as cli_config
+from sikula_cli import delivery as cli_delivery
 from sikula_cli import init as cli_init
 from sikula_cli import review as cli_review
 from sikula_cli import run as cli_run
 from sikula_cli import status as cli_status
 from sikula_cli import task as cli_task
-from sikula_cli.delivery import (
-    cmd_delivery_check,
-    cmd_delivery_status,
-    register_parser as register_delivery_parser,
-)
 
 _BASE = Path(__file__).parent
 # When adding a new platform: add it here, in _build_tool() in core/orchestrator.py,
@@ -3109,6 +3105,14 @@ def cmd_init(args: argparse.Namespace) -> None:
     return cli_init.cmd_init(args, _init_context())
 
 
+def cmd_delivery_check(args: argparse.Namespace, cfg: dict) -> None:
+    return cli_delivery.cmd_delivery_check(args, cfg)
+
+
+def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
+    return cli_delivery.cmd_delivery_status(args, cfg)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -3144,7 +3148,7 @@ def main() -> None:
     cli_contract.register_check_parser(contract_sub)
     cli_contract.register_prepare_parser(contract_sub)
 
-    delivery_p = register_delivery_parser(sub)
+    delivery_p = cli_delivery.register_parser(sub)
 
     run_p = cli_run.register_parser(sub, contract_score_threshold=_contract_score_threshold)
 
