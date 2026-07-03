@@ -41,6 +41,8 @@ def test_run_cli_module_imports() -> None:
     import sikula_cli.run as run_cli
 
     assert callable(run_cli.register_parser)
+    assert callable(run_cli.cmd_run)
+    assert run_cli.RunContext.__name__ == "RunContext"
 
 
 def test_run_register_parser_sets_flags() -> None:
