@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from core.task_attach import append_task_asset_snippet, attach_task_asset
-from sikula import cmd_task_attach
+from sikula_cli.task import cmd_task_attach
 
 
 def test_task_cli_module_imports() -> None:

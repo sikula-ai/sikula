@@ -3,22 +3,24 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import os
 from pathlib import Path
 
 import pytest
 
-_sikula = importlib.import_module("sikula")
-_find_project_root = _sikula._find_project_root
-_load_project_env = _sikula._load_project_env
-_resolve_config = _sikula._resolve_config
-_resolve_root_path = _sikula._resolve_root_path
-_resolve_state_dir = _sikula._resolve_state_dir
-_generate_config = _sikula._generate_config
-_branch_stem = _sikula._branch_stem
-load_config = _sikula.load_config
-cmd_init = _sikula.cmd_init
+import sikula as sikula_module
+from sikula_cli import config as config_cli
+from sikula_cli import init as init_cli
+
+_find_project_root = config_cli._find_project_root
+_load_project_env = config_cli._load_project_env
+_resolve_config = config_cli._resolve_config
+_resolve_root_path = config_cli._resolve_root_path
+_resolve_state_dir = config_cli._resolve_state_dir
+_generate_config = init_cli.generate_config
+_branch_stem = sikula_module._branch_stem
+load_config = config_cli.load_config
+cmd_init = init_cli.cmd_init
 
 
 def test_config_cli_module_imports() -> None:
