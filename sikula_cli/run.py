@@ -158,19 +158,16 @@ def _project_scoped_task_worktree_base(cwd: Path, project_root: Path, context: R
     worktree_base = context.sikula_worktree_base_for_path(cwd)
     if not worktree_base:
         return None
+    resolved_project_root = project_root.resolve()
+    original_git_root = worktree_base.parent.parent.parent.resolve()
     try:
-        project_root.resolve().relative_to(worktree_base)
+        resolved_project_root.relative_to(worktree_base)
     except ValueError:
         pass
     else:
         return worktree_base
     try:
-        rel = cwd.resolve().relative_to(worktree_base)
-    except ValueError:
-        return None
-    original_path = (worktree_base.parent.parent.parent / rel).resolve()
-    try:
-        original_path.relative_to(project_root.resolve())
+        resolved_project_root.relative_to(original_git_root)
     except ValueError:
         return None
     else:

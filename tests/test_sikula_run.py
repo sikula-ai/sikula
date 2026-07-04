@@ -2546,6 +2546,29 @@ class TestCmdRunStateStore:
         assert "Refusing to start a new task from inside a Sikula task worktree" in out
         assert "sikula run --task-id <task-id>" in out
 
+    def test_task_file_run_refuses_current_task_worktree_above_nested_project_root(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        capsys,
+    ):
+        git_root = tmp_path / "repo"
+        project_root = git_root / "app"
+        project_root.mkdir(parents=True)
+        worktree_base = git_root / ".sikula" / "worktrees" / "oldtask"
+        task_file = worktree_base / "app" / ".sikula" / "tasks" / "task.md"
+        task_file.parent.mkdir(parents=True)
+        task_file.write_text("do something")
+        monkeypatch.chdir(worktree_base)
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_run(_run_args(task_file=str(task_file)), _run_cfg(project_root))
+
+        out = capsys.readouterr().out
+        assert exc.value.code == 1
+        assert "Refusing to start a new task from inside a Sikula task worktree" in out
+        assert "sikula run --task-id <task-id>" in out
+
     def test_task_file_run_ignores_unrelated_task_worktree_cwd(self, tmp_path: Path, monkeypatch, capsys):
         project_root = tmp_path / "project"
         project_root.mkdir()
