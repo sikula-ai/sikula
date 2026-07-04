@@ -225,6 +225,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
                 print("Refusing to start a new task from inside a Sikula task worktree.")
                 print("Run this command from the original project, or use 'sikula run --task-id <task-id>' to resume.")
                 sys.exit(1)
+            os.chdir(original_project_root)
 
         git_root = context.find_git_root(original_project_root)
         if git_root is None:

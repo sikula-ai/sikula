@@ -2607,7 +2607,10 @@ class TestCmdRunStateStore:
         current_dir.mkdir(parents=True)
         monkeypatch.chdir(current_dir)
 
+        captured: dict[str, Path] = {}
+
         def capture_orch(cfg_arg, overrides=None, state_store=None):
+            captured["cwd"] = Path.cwd()
             mock = MagicMock()
             task_id = state_store.list_tasks()[0]
             state = state_store.load(task_id)
@@ -2626,6 +2629,7 @@ class TestCmdRunStateStore:
 
         out = capsys.readouterr().out
         assert "Refusing to start a new task from inside a Sikula task worktree" not in out
+        assert captured["cwd"] == project_root
         build_orchestrator.assert_called_once()
         exit_mock.assert_called_with(0)
 
