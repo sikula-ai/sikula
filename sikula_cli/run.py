@@ -210,6 +210,14 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             sys.exit(1)
         if current_task_worktree_base:
             try:
+                original_project_root.relative_to(current_task_worktree_base)
+            except ValueError:
+                pass
+            else:
+                print("Refusing to start a new task from inside a Sikula task worktree.")
+                print("Run this command from the original project, or use 'sikula run --task-id <task-id>' to resume.")
+                sys.exit(1)
+            try:
                 task_path.resolve().relative_to(current_task_worktree_base)
             except ValueError:
                 pass
