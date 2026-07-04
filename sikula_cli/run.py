@@ -159,6 +159,12 @@ def _project_scoped_task_worktree_base(cwd: Path, project_root: Path, context: R
     if not worktree_base:
         return None
     try:
+        project_root.resolve().relative_to(worktree_base)
+    except ValueError:
+        pass
+    else:
+        return worktree_base
+    try:
         rel = cwd.resolve().relative_to(worktree_base)
     except ValueError:
         return None
