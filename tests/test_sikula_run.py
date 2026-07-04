@@ -2569,7 +2569,12 @@ class TestCmdRunStateStore:
         assert "Refusing to start a new task from inside a Sikula task worktree" in out
         assert "sikula run --task-id <task-id>" in out
 
-    def test_task_file_run_refuses_unrelated_task_worktree_cwd(self, tmp_path: Path, monkeypatch, capsys):
+    def test_task_file_run_allows_unrelated_task_worktree_cwd_when_task_file_is_outside_worktree(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        capsys,
+    ):
         project_root = tmp_path / "project"
         project_root.mkdir()
         task_file = project_root / "task.md"
@@ -2580,8 +2585,46 @@ class TestCmdRunStateStore:
         current_dir.mkdir(parents=True)
         monkeypatch.chdir(current_dir)
 
-        with pytest.raises(SystemExit) as exc:
+        def capture_orch(cfg_arg, overrides=None, state_store=None):
+            mock = MagicMock()
+            task_id = state_store.list_tasks()[0]
+            state = state_store.load(task_id)
+            state.done = True
+            state_store.save(state)
+            mock.run.return_value = state
+            return mock
+
+        with (
+            patch("sikula._find_git_root", return_value=project_root),
+            patch("sikula._build_contract_preflight_snapshot_and_assets", return_value=_contract_preflight_result()),
+            patch("sikula.build_orchestrator", side_effect=capture_orch) as build_orchestrator,
+            patch("sys.exit") as exit_mock,
+        ):
             cmd_run(_run_args(task_file=str(task_file), no_isolate=True), _run_cfg(project_root))
+
+        out = capsys.readouterr().out
+        assert "Refusing to start a new task from inside a Sikula task worktree" not in out
+        build_orchestrator.assert_called_once()
+        exit_mock.assert_called_with(0)
+
+    def test_task_file_run_refuses_unrelated_task_worktree_cwd_when_task_file_is_inside_worktree(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        capsys,
+    ):
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+
+        unrelated_root = tmp_path / "unrelated"
+        current_dir = unrelated_root / ".sikula" / "worktrees" / "oldtask"
+        current_dir.mkdir(parents=True)
+        task_file = current_dir / "task.md"
+        task_file.write_text("do something")
+        monkeypatch.chdir(current_dir)
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_run(_run_args(task_file="task.md", no_isolate=True), _run_cfg(project_root))
 
         out = capsys.readouterr().out
         assert exc.value.code == 1
