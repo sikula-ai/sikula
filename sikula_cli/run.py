@@ -154,26 +154,6 @@ def _run_context(context: RunContext | None = None) -> RunContext:
     return context
 
 
-def _project_scoped_task_worktree_base(cwd: Path, project_root: Path, context: RunContext) -> Path | None:
-    worktree_base = context.sikula_worktree_base_for_path(cwd)
-    if not worktree_base:
-        return None
-    resolved_project_root = project_root.resolve()
-    original_git_root = worktree_base.parent.parent.parent.resolve()
-    try:
-        resolved_project_root.relative_to(worktree_base)
-    except ValueError:
-        pass
-    else:
-        return worktree_base
-    try:
-        resolved_project_root.relative_to(original_git_root)
-    except ValueError:
-        return None
-    else:
-        return worktree_base
-
-
 def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = None) -> None:
     from core.state import JsonStateStore
 
@@ -205,7 +185,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
     store = JsonStateStore(state_dir)
     isolate = not args.no_isolate
     original_project_root = Path(cfg["project"]["root_path"]).resolve()
-    current_task_worktree_base = _project_scoped_task_worktree_base(Path.cwd(), original_project_root, context)
+    current_task_worktree_base = context.sikula_worktree_base_for_path(Path.cwd())
     worktree_base: Path | None = None  # git root of the worktree (for git ops)
     leave_current_worktree_before_finalize = False
     already_terminal = False
