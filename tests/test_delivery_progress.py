@@ -16,7 +16,8 @@ from core.delivery_progress import (
     get_delivery_status,
     render_delivery_status,
 )
-from sikula import cmd_delivery_status, main
+from sikula import main
+from sikula_cli.delivery import cmd_delivery_status
 
 
 def _git_init(root: Path) -> None:

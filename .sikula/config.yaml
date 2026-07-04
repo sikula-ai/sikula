@@ -25,6 +25,7 @@ sandbox:
   allowed_write_paths:
     - agents/
     - core/
+    - sikula_cli/
     - tools/
     - sikula.py
 
@@ -138,7 +139,7 @@ run_checks: true
 build:
   # Shell command run by compile_check() in the build/fix loop.
   # compileall catches syntax errors and import mistakes fast — no test run needed.
-  compile_command: "python3 -m compileall -q agents/ core/ tools/ sikula.py"
+  compile_command: "python3 -m compileall -q agents/ core/ sikula_cli/ tools/ sikula.py"
 
   # Shell command run by run_tests() (run_tests: true only).
   test_command: "python3 -m pytest tests/ -v"

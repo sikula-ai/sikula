@@ -2,22 +2,25 @@
 
 from __future__ import annotations
 
-import importlib
+import argparse
 import os
 from pathlib import Path
 
 import pytest
 
-_sikula = importlib.import_module("sikula")
-_find_project_root = _sikula._find_project_root
-_load_project_env = _sikula._load_project_env
-_resolve_config = _sikula._resolve_config
-_resolve_root_path = _sikula._resolve_root_path
-_resolve_state_dir = _sikula._resolve_state_dir
-_generate_config = _sikula._generate_config
-_branch_stem = _sikula._branch_stem
-load_config = _sikula.load_config
-cmd_init = _sikula.cmd_init
+import sikula as sikula_module
+from sikula_cli import config as config_cli
+from sikula_cli import init as init_cli
+
+_find_project_root = config_cli._find_project_root
+_load_project_env = config_cli._load_project_env
+_resolve_config = config_cli._resolve_config
+_resolve_root_path = config_cli._resolve_root_path
+_resolve_state_dir = config_cli._resolve_state_dir
+_generate_config = init_cli.generate_config
+_branch_stem = sikula_module._branch_stem
+load_config = config_cli.load_config
+cmd_init = init_cli.cmd_init
 
 
 def test_config_cli_module_imports() -> None:
@@ -25,6 +28,64 @@ def test_config_cli_module_imports() -> None:
 
     assert callable(config_cli._load_runtime_config)
     assert callable(config_cli._resolve_config)
+
+
+def test_init_cli_module_imports() -> None:
+    import sikula_cli.init as init_cli
+
+    assert callable(init_cli.register_parser)
+    assert callable(init_cli.generate_config)
+    assert callable(init_cli.cmd_init)
+
+
+def test_init_register_parser_sets_flags() -> None:
+    import sikula_cli.init as init_cli
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    init_cli.register_parser(subparsers)
+
+    args = parser.parse_args(
+        [
+            "init",
+            "--force",
+            "--guidelines",
+            "--provider",
+            "codex",
+            "--model",
+            "gpt-5.5",
+        ]
+    )
+
+    assert args.command == "init"
+    assert args.force is True
+    assert args.guidelines is True
+    assert args.provider == "codex"
+    assert args.model == "gpt-5.5"
+
+
+def test_init_cli_cmd_init_direct_writes_config(tmp_path: Path, monkeypatch) -> None:
+    from unittest.mock import patch
+
+    import sikula_cli.init as init_cli
+    from tools.scanner import ScanResult
+
+    monkeypatch.chdir(tmp_path)
+    scan_result = ScanResult(
+        build_tool="python",
+        language="Python",
+        guidelines_files=[],
+        write_paths=["src/"],
+        test_write_paths=["tests/"],
+    )
+
+    args = argparse.Namespace(force=False, guidelines=False, provider="codex", model="gpt-5.3-codex")
+    with patch("tools.scanner.scan", return_value=scan_result):
+        init_cli.cmd_init(args)
+
+    config_text = (tmp_path / ".sikula" / "config.yaml").read_text(encoding="utf-8")
+    assert "build_tool: python" in config_text
+    assert "provider: codex" in config_text
 
 
 # ---------------------------------------------------------------------------

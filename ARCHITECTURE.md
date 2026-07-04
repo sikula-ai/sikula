@@ -42,7 +42,10 @@
 
 ## Run flow (`sikula run`)
 
-`cmd_run()` in `sikula.py`. Wraps `Orchestrator.run()` with worktree setup, finalization, and resume logic.
+`sikula run` parser registration and command flow live in `sikula_cli/run.py`.
+`sikula.py` keeps a compatibility wrapper for existing imports and tests. The
+handler wraps `Orchestrator.run()` with worktree setup, finalization, contract
+preflight, asset audits, and resume logic.
 
 **New task (`--task-file`):**
 
@@ -142,13 +145,13 @@ hashes, accidental overwrites, and task-description input that already contains 
 reserved `## Asset manifest` section. `--interactive` is a terminal convenience layer for
 both refine and prepare: it creates or reuses an answers YAML, prompts for answers, saves
 that file under `.sikula/contract-reports`, and then writes the clean Markdown output.
+`sikula task refine TASK_FILE --output ...` and
 `sikula task attach TASK_FILE ASSET_FILE` parser registration and handler logic live in
-`sikula_cli/task.py`; the command copies local reference or delivery assets into the
-configured task asset directory and optionally appends the generated Markdown snippet to
-the task file. `sikula task refine TASK_FILE --output ...` prepares the product brief
-side of the flow: it can normalize a product request into task-description Markdown and
-ask product-level clarifying questions, but it does not evaluate Sikula delivery
-readiness or return run guidance.
+`sikula_cli/task.py`. `task refine` prepares the product brief side of the flow: it can
+normalize a product request into task-description Markdown and ask product-level
+clarifying questions, but it does not evaluate Sikula delivery readiness or return run
+guidance. `task attach` copies local reference or delivery assets into the configured task
+asset directory and optionally appends the generated Markdown snippet to the task file.
 The core module also exposes side-effect-free in-memory helpers
 (`prepare_task_description()`, `improve_contract_text()`, and
 `prepare_implementation_contract()`) so chat/MCP adapters can reuse the same scoring,
@@ -615,7 +618,10 @@ branch.
 
 ## Init flow (`sikula init`)
 
-`cmd_init()` in `sikula.py`. Scans the project, generates `.sikula/config.yaml`, and optionally generates `.sikula/guidelines.md` via `InitAgent`.
+`sikula init` parser registration and command flow live in `sikula_cli/init.py`.
+`sikula.py` keeps compatibility wrappers for existing imports and tests. The command
+scans the project, generates `.sikula/config.yaml`, and optionally generates
+`.sikula/guidelines.md` via `InitAgent`.
 
 ```
 cmd_init()
@@ -631,7 +637,7 @@ cmd_init()
    ├─ scanner.detect_platform(project_root)    →  platform string
    ├─ scanner.scan_source_paths(project_root)  →  allowed_write_paths
    │
-   ├─ _generate_config():
+   ├─ sikula_cli.init.generate_config():
    │     builds config dict from detected values + project name
    │     fills in appropriate build: block for detected build_tool
    │     writes .sikula/config.yaml
@@ -1347,13 +1353,13 @@ Sikula processes at once is still unsupported.
 | `task_id` | `str` | `StateStore.create()` | 32-char hex UUID (`uuid4().hex`), used to resume tasks |
 | `task_description` | `str` | caller | Original plain-text task |
 | `schema_version` | `int` | `StateStore.create()` | State file schema version; used by `JsonStateStore.load()` to run migrations before constructing `TaskState`; current value is `SCHEMA_VERSION = 2` |
-| `task_file` | `str \| None` | `cmd_run()` in `sikula.py` | Basename of the task file (e.g. `add-login.md`); set on first run via `--task-file`; used by `status` for display; `None` for tasks created before this field was added or when resuming via `--task-id` only |
+| `task_file` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` | Basename of the task file (e.g. `add-login.md`); set on first run via `--task-file`; used by `status` for display; `None` for tasks created before this field was added or when resuming via `--task-id` only |
 | `config_snapshot` | `dict` | `cmd_run()` / Orchestrator | Effective run configuration captured on first run before agents start (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `planner.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. It is also saved for contract-gate failures that exit before `Orchestrator.run()`. Visible in `show <task_id>`. |
-| `implementation_contract` | `dict` | `cmd_run()` in `sikula.py` | Implementation-contract snapshot for fresh task-file runs: task path/format/hash, readiness status/score, gap metadata, clarifying question IDs, and validation coverage counts. By default it is warning-only additive metadata. Fresh `run TASK_FILE` can opt into pre-agent gating with `--require-contract-ready` or `--min-contract-score N`; resume/review flows do not recompute or re-gate it. |
-| `implementation_asset_records` | `list[dict]` | `cmd_run()` in `sikula.py` | Sanitized, non-blocking asset metadata snapshot for fresh task-file runs, copied from the implementation-contract preflight asset references. Contains path/kind/status/project path/hash/declared hash/size/MIME/git status/requested target/provenance metadata only; no raw asset content, OCR text, binary data, internal parser fields, or source excerpts. Used for audit and terminal summary counts, not for run/resume/review control-flow decisions. |
-| `implementation_asset_drift_records` | `list[dict]` | `cmd_run()` in `sikula.py` | Sanitized, non-blocking asset drift audit entries recorded when a prepared contract's Asset manifest hash differs from the current file at fresh run start, or when resume/worktree startup sees current asset files differ from the saved `implementation_asset_records` snapshot. Contains path/kind/phase/status/expected hash/current hash/current status/git status/size/MIME metadata only. It is warning-only audit data and must not drive run/resume/review control-flow decisions. |
-| `implementation_asset_target_records` | `list[dict]` | `cmd_run()` in `sikula.py` | Sanitized, non-blocking delivery asset target audit entries recorded after successful task completion for delivery assets with explicit requested targets. Contains asset path/project path/phase/status/requested target/matched path/timestamp metadata only. It records exact target matches, existing unchanged targets, missing targets, out-of-project targets, or missing target specifications; it does not infer platform-specific conversions and must not drive run/resume/review control-flow decisions. |
-| `contract_gate_blocked` | `bool` | `cmd_run()` in `sikula.py` | True when an opt-in contract readiness gate failed before worktree creation or agent startup. Such states are kept for audit but are not reset via `--reset-failed`; users should prepare the implementation contract and start a fresh task-file run. |
+| `implementation_contract` | `dict` | `cmd_run()` in `sikula_cli/run.py` | Implementation-contract snapshot for fresh task-file runs: task path/format/hash, readiness status/score, gap metadata, clarifying question IDs, and validation coverage counts. By default it is warning-only additive metadata. Fresh `run TASK_FILE` can opt into pre-agent gating with `--require-contract-ready` or `--min-contract-score N`; resume/review flows do not recompute or re-gate it. |
+| `implementation_asset_records` | `list[dict]` | `cmd_run()` in `sikula_cli/run.py` | Sanitized, non-blocking asset metadata snapshot for fresh task-file runs, copied from the implementation-contract preflight asset references. Contains path/kind/status/project path/hash/declared hash/size/MIME/git status/requested target/provenance metadata only; no raw asset content, OCR text, binary data, internal parser fields, or source excerpts. Used for audit and terminal summary counts, not for run/resume/review control-flow decisions. |
+| `implementation_asset_drift_records` | `list[dict]` | `cmd_run()` in `sikula_cli/run.py` | Sanitized, non-blocking asset drift audit entries recorded when a prepared contract's Asset manifest hash differs from the current file at fresh run start, or when resume/worktree startup sees current asset files differ from the saved `implementation_asset_records` snapshot. Contains path/kind/phase/status/expected hash/current hash/current status/git status/size/MIME metadata only. It is warning-only audit data and must not drive run/resume/review control-flow decisions. |
+| `implementation_asset_target_records` | `list[dict]` | `cmd_run()` in `sikula_cli/run.py` | Sanitized, non-blocking delivery asset target audit entries recorded after successful task completion for delivery assets with explicit requested targets. Contains asset path/project path/phase/status/requested target/matched path/timestamp metadata only. It records exact target matches, existing unchanged targets, missing targets, out-of-project targets, or missing target specifications; it does not infer platform-specific conversions and must not drive run/resume/review control-flow decisions. |
+| `contract_gate_blocked` | `bool` | `cmd_run()` in `sikula_cli/run.py` | True when an opt-in contract readiness gate failed before worktree creation or agent startup. Such states are kept for audit but are not reset via `--reset-failed`; users should prepare the implementation contract and start a fresh task-file run. |
 | `analyst_prompt` | `str \| None` | AnalystAgent | Full assembled prompt sent to the analyst LLM (system + user sections, including inlined guidelines content); stored before the LLM call so it captures the exact input even on exception; enables post-run analysis of analyst behaviour |
 | `planner_prompt` | `str \| None` | PlannerAgent | Full assembled prompt sent to the planner LLM (system + user sections); stored before the LLM call; `None` when `run_planner: false` or planner not yet reached |
 | `implementation_prompt` | `str \| None` | AnalystAgent | Structured prompt fed to ImplementerAgent; the analyst's key output |
@@ -1380,12 +1386,12 @@ Sikula processes at once is still unsupported.
 | `review_diff` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / Orchestrator | PR-style diff passed to ReviewerAgent and SecurityReviewerAgent; initially set to `git diff base...branch` (three-dot) in `sikula review` mode; refreshed in `"review_fix"` mode before reviewer/security-reviewer calls so uncommitted fixes are included; `None` in standard `sikula run` flow (agents fall back to `GitTool.diff_head()`) |
 | `review_mode` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` | Review task kind: `"review_report"` for report-only review (not reset or resumable) or `"review_fix"` for `sikula review --fix` (resumable via `sikula run --task-id`) |
 | `review_base_branch` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` | Base branch used to refresh `review_diff` in `"review_fix"` mode. Report-only review keeps the original frozen diff; review-fix refreshes against the merge base before reviewer/security-reviewer calls so fixes are reviewed against the current branch state. |
-| `review_delivery_mode` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / `cmd_run()` in `sikula.py` | Review-fix delivery strategy metadata. `None` for report-only review, normal `--branch` review-fix, and standard task runs. `"current_branch"` for `sikula review --fix --current-branch`; this tells resume/finalization to deliver the isolated fix commit back to the originally current branch instead of treating `worktree_branch` as a checked-out delivery branch. |
+| `review_delivery_mode` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / `cmd_run()` in `sikula_cli/run.py` | Review-fix delivery strategy metadata. `None` for report-only review, normal `--branch` review-fix, and standard task runs. `"current_branch"` for `sikula review --fix --current-branch`; this tells resume/finalization to deliver the isolated fix commit back to the originally current branch instead of treating `worktree_branch` as a checked-out delivery branch. |
 | `review_target_branch` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` | Named branch that was current when `--current-branch` started. Delivery and retry require the operator's checkout to still be on this branch before fast-forwarding or declaring a no-change result. |
 | `review_target_start_commit` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` | Commit SHA for the target branch `HEAD` captured before creating the detached isolated worktree. Current-branch delivery requires the target branch to still point at this commit unless it already equals the delivered commit. |
 | `review_isolated_fix_commit` | `str \| None` | `_deliver_current_branch_review_fix()` in `sikula.py` | Commit SHA created in the detached isolated worktree for current-branch review fixes. Persisted so `sikula run --task-id` can retry delivery without rerunning agents or creating a second isolated commit. |
-| `review_delivery_status` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / `cmd_run()` in `sikula.py` | Current-branch delivery state. `None` outside current-branch review-fix. `"pending"` means agents have not produced a terminal delivery result yet; `"committed"` means an isolated fix commit exists and delivery can be retried; `"failed"` means delivery safety checks, commit creation, fast-forward, or cleanup failed and the worktree is preserved; `"delivered"` means the target branch has the isolated fix commit; `"no_changes"` means agents produced no changes after safety checks passed. `"delivered"` and `"no_changes"` are terminal delivery states. |
-| `review_delivery_result` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / `cmd_run()` in `sikula.py` | Short human-readable audit result for current-branch delivery, including failure reasons and delivered/no-change summaries. It is for status, `sikula show`, and final summary reporting only; it must not replace the explicit status field for control-flow decisions. |
+| `review_delivery_status` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / `cmd_run()` in `sikula_cli/run.py` | Current-branch delivery state. `None` outside current-branch review-fix. `"pending"` means agents have not produced a terminal delivery result yet; `"committed"` means an isolated fix commit exists and delivery can be retried; `"failed"` means delivery safety checks, commit creation, fast-forward, or cleanup failed and the worktree is preserved; `"delivered"` means the target branch has the isolated fix commit; `"no_changes"` means agents produced no changes after safety checks passed. `"delivered"` and `"no_changes"` are terminal delivery states. |
+| `review_delivery_result` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / `cmd_run()` in `sikula_cli/run.py` | Short human-readable audit result for current-branch delivery, including failure reasons and delivered/no-change summaries. It is for status, `sikula show`, and final summary reporting only; it must not replace the explicit status field for control-flow decisions. |
 | `implement_cycle_records` | `list[dict]` | ImplementerAgent | Structured observability — one entry per implementer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = review/security fix after a post-fixer validation pass), `review_iteration` (`0` = initial or security fix; `>0` = review fix pass N), `security_review_iteration` (`0` = initial or review fix; `>0` = security fix pass N), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `step_description`, `implementer_prompt`, `implementer_output` (`None` on exception), `files_written`, `timestamp`; both iteration counters `== 0` and `build_iteration == 0` means initial implementation; never read for pipeline decisions. **Correlation note:** to find the reviewer record that triggered this implementer, look for a `review_cycle_records` entry with the same `step`, `build_iteration`, and `review_iteration: N-1` |
 | `review_cycle_records` | `list[dict]` | ReviewerAgent | Structured observability — one entry per reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = after a post-fixer validation pass), `review_iteration` (fix-pass index within this step's review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, reviewer history is limited to earlier final full-task reviews, not step-scoped reviews. **Correlation note:** a reviewer record with `review_iteration: N` that found issues triggered the implementer record with `review_iteration: N+1` — the orchestrator increments the counter before calling the implementer |
 | `security_review_cycle_records` | `list[dict]` | SecurityReviewerAgent | Structured observability — one entry per security reviewer invocation: `step`, `build_iteration` (`0` = pre-build; `>0` = after a post-fixer validation pass), `security_review_iteration` (fix-pass index within this step's security review loop), `scope` (`"task"`, `"step"`, or `"final_full_task"`), `reviewer_prompt`, `reviewer_output`, `approved`, `has_warnings`, `timestamp`; also read by the security reviewer to retrieve its own prior outputs for context. In `final_full_task` scope, security history is limited to earlier final full-task security reviews. **Migration note:** state files from schema version 1 stored security reviewer entries inside `review_cycle_records` with `reviewer = "security_reviewer"`; `JsonStateStore.load()` moves them here and removes the redundant `reviewer` field. |
@@ -1405,9 +1411,9 @@ Sikula processes at once is still unsupported.
 | `test_writer_audit_gate_counts` | `dict[str, dict[str, int]]` | Orchestrator | Sanitized per-file execution-gate signature counts captured before TestWriterAgent runs. Used only to finish pending execution-gate audits on resume without exposing raw source snapshots in task state. A matching limited text restore snapshot for task-known/reported test files is stored separately as a temporary internal state-store blob for recovery and removed when the pending audit is cleared; broad roots such as `"."` do not cause Sikula to persist a full source snapshot. |
 | `fixer_changed_code` | `bool` | Orchestrator | Set True when FixerAgent writes files; used on resume to continue deterministic build/test/check validation before stale semantic gates rerun; cleared after the following compile check succeeds |
 | `tests_up_to_date` | `bool` | TestWriterAgent / Orchestrator | Set True after test write; reset to False when Fixer changes production-impacting files; preserved for test-only fixer changes on recognized test artifact paths so validation can rerun without redundant test-writer passes while security review still reruns for the executable test changes. A pending test-writer audit takes precedence over this flag on resume. |
-| `worktree_path` | `str \| None` | `cmd_run()` in `sikula.py` / `cmd_review()` in `sikula_cli/review.py` | Absolute path of the effective project root within the worktree — equals `worktree_base` when `root_path` is itself a git root, or `worktree_base/<rel>` for subdirectory projects; used as `cwd` by all agents; `None` for `--no-isolate` runs |
-| `worktree_base` | `str \| None` | `cmd_run()` in `sikula.py` / `cmd_review()` in `sikula_cli/review.py` | Absolute path of the git worktree root (where `git add/commit/worktree remove` run); equals `worktree_path` when project is its own git root; `None` for `--no-isolate` runs |
-| `worktree_branch` | `str \| None` | `cmd_run()` in `sikula.py` / `cmd_review()` in `sikula_cli/review.py` | Branch name for the worktree; `sikula/<stem>-<task_id>` for `cmd_run()`; the existing PR branch name for `cmd_review()`; `None` for `--no-isolate` runs |
+| `worktree_path` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` / `cmd_review()` in `sikula_cli/review.py` | Absolute path of the effective project root within the worktree — equals `worktree_base` when `root_path` is itself a git root, or `worktree_base/<rel>` for subdirectory projects; used as `cwd` by all agents; `None` for `--no-isolate` runs |
+| `worktree_base` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` / `cmd_review()` in `sikula_cli/review.py` | Absolute path of the git worktree root (where `git add/commit/worktree remove` run); equals `worktree_path` when project is its own git root; `None` for `--no-isolate` runs |
+| `worktree_branch` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` / `cmd_review()` in `sikula_cli/review.py` | Branch name for the worktree; `sikula/<stem>-<task_id>` for `cmd_run()`; the existing PR branch name for `cmd_review()`; `None` for `--no-isolate` runs |
 | `result_commit` | `str \| None` | `_finalize_worktree()` in `sikula.py` | Commit SHA created by Sikula when an isolated `run` or `review --fix` task finalizes with file changes; `None` for report-only review, `--no-isolate`, or runs with no commit to create |
 | `history` | `list[dict]` | `state.record()` | Append-only audit log: agent, action, result, timestamp, elapsed_s, plus action-specific entries such as `llm_retry` provider/model/attempt fields and `write_path_warning` write-scope audit messages; in step mode, `step_start` / `step_done` orchestrator entries delimit each step's events |
 | `runtime_metadata` | `dict` | `StateStore.create()` / `cmd_review()` in `sikula_cli/review.py` | Runtime snapshot captured when the task state is created: Sikula package version when available, Python version, platform, system, and machine. Used for later debugging only |
@@ -1431,7 +1437,7 @@ Sikula processes at once is still unsupported.
 ## BuildTool interface (`tools/base_tool.py`)
 
 The orchestrator loop calls a small fixed interface on the registered `"build"` tool.
-`env_files()` is a static method called by `cmd_run()` in `sikula.py` and `cmd_review --fix` in `sikula_cli/review.py` when creating a worktree.
+`env_files()` is a static method called by `cmd_run()` in `sikula_cli/run.py` and `cmd_review --fix` in `sikula_cli/review.py` when creating a worktree.
 Everything else (assemble, …) are platform-specific extras on the subclass. BuildTool methods
 return `ToolResult`.
 
@@ -1745,7 +1751,7 @@ All keys live under `test_writer:` in `.sikula/config.yaml`.
    and environment files excluded from provider workspace copies.
 3. Add a branch to `_build_tool()` in `core/orchestrator.py`: check `project_config["project"]["build_tool"] == "your_build_tool"` and return an instance of your new class. Add the new build tool name to the docstring comment beside the factory.
 4. Add auto-detection to `tools/scanner.py`: add an entry to `_SIGNATURES` (trigger files, build tool name, language, platform) and implement path detection helpers (`_detect_<platform>_paths()`).
-5. Extend `_generate_config()` in `sikula.py` to emit the platform-specific `build:` block so that `sikula init` generates a correct config for the new platform.
+5. Extend `generate_config()` in `sikula_cli/init.py` to emit the platform-specific `build:` block so that `sikula init` generates a correct config for the new platform.
 6. Create `.sikula/config.yaml` in the project directory with:
    - `project.build_tool: your_build_tool` — must match the branch key added in step 3
    - `project.platform: iOS` (or `Android`, `backend`, …) — injected into agent prompts as tech stack context

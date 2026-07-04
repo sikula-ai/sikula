@@ -37,6 +37,76 @@ def test_core_worktree_module_imports() -> None:
     assert callable(worktree.remove_worktree)
 
 
+def test_run_cli_module_imports() -> None:
+    import sikula_cli.run as run_cli
+
+    assert callable(run_cli.register_parser)
+    assert callable(run_cli.cmd_run)
+    assert run_cli.RunContext.__name__ == "RunContext"
+
+
+def test_run_register_parser_sets_flags() -> None:
+    import sikula_cli.run as run_cli
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    run_cli.register_parser(subparsers, contract_score_threshold=int)
+
+    args = parser.parse_args(
+        [
+            "run",
+            "task.md",
+            "--task-file",
+            "explicit.md",
+            "--task-id",
+            "abc123",
+            "--reset-failed",
+            "--no-isolate",
+            "--no-build",
+            "--presync",
+            "--no-presync-clean",
+            "--planner",
+            "--no-review",
+            "--security-review",
+            "--test-writing",
+            "--no-tests",
+            "--build-per-step",
+            "--no-checks",
+            "--require-contract-ready",
+            "--min-contract-score",
+            "85",
+            "--agent-model",
+            "analyst=gpt-5.5",
+            "--agent-provider",
+            "implementer=claude",
+            "--agent-timeout",
+            "implementer=2400",
+        ]
+    )
+
+    assert args.command == "run"
+    assert args.task_file_pos == "task.md"
+    assert args.task_file == "explicit.md"
+    assert args.task_id == "abc123"
+    assert args.reset_failed is True
+    assert args.no_isolate is True
+    assert args.build is False
+    assert args.presync is True
+    assert args.presync_clean is False
+    assert args.planner is True
+    assert args.review is False
+    assert args.security_review is True
+    assert args.test_writing is True
+    assert args.tests is False
+    assert args.build_per_step is True
+    assert args.checks is False
+    assert args.require_contract_ready is True
+    assert args.min_contract_score == 85
+    assert args.agent_model == ["analyst=gpt-5.5"]
+    assert args.agent_provider == ["implementer=claude"]
+    assert args.agent_timeout == ["implementer=2400"]
+
+
 class TestCleanupCliModule:
     def test_register_parser_sets_delete_state_defaults(self):
         import sikula_cli.cleanup as cleanup_cli

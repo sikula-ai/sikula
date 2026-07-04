@@ -10,7 +10,8 @@ import pytest
 import yaml
 
 from core.delivery_plan import DeliveryPlanIssue, check_delivery_plan_file, render_delivery_plan_check
-from sikula import cmd_delivery_check, main
+from sikula import main
+from sikula_cli.delivery import cmd_delivery_check
 
 
 def test_delivery_cli_module_imports() -> None:

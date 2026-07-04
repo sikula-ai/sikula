@@ -6,6 +6,7 @@ from pathlib import Path
 
 import sikula as sikula_module
 from core.orchestrator import _build_tool
+from sikula_cli.init import generate_config
 from tools.base_tool import Sandbox
 from tools.cargo_tool import CargoTool
 from tools.gradle_android_tool import AndroidGradleTool
@@ -64,7 +65,7 @@ def test_supported_build_tools_have_generated_init_build_sections():
     )
 
     for build_tool, context in BUILD_TOOL_INIT_CONTEXT.items():
-        cfg = sikula_module._generate_config(
+        cfg = generate_config(
             build_tool=build_tool,
             language=context["language"],
             platform=context["platform"],

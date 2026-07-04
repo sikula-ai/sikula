@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+import sikula_cli.status as status_cli
 
-_sikula = importlib.import_module("sikula")
-cmd_status = _sikula.cmd_status
-_pid_running = _sikula._pid_running
+cmd_status = status_cli.cmd_status
+_pid_running = status_cli._pid_running
 
 _SIKULA_PY = str(Path(__file__).parent.parent / "sikula.py")
 

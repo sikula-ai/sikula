@@ -394,11 +394,12 @@ For Gradle-based platforms, subclass `GradleBaseTool` (`tools/gradle_tool.py`) i
 
 When adding a new platform, update these core files: `tools/<platform>_tool.py` (new tool),
 `core/orchestrator.py` (`_build_tool()`), `sikula.py` (`_build_tool_class()`,
-`_generate_config()`, `_SUPPORTED_BUILD_TOOLS`), and `tools/scanner.py` (`_SIGNATURES` +
-path detection). Update `tests/test_platform_onboarding.py` so the factory, scanner, and
-generated init-config surfaces stay in sync. If the platform supports inline tests in
-source files with suffixes not already covered, update `_TEST_GATE_AUDIT_SOURCE_SUFFIXES`
-in `core/orchestrator.py`. If the platform introduces test framework
+`_SUPPORTED_BUILD_TOOLS`), `sikula_cli/init.py` (`generate_config()`), and
+`tools/scanner.py` (`_SIGNATURES` + path detection). Update
+`tests/test_platform_onboarding.py` so the factory, scanner, and generated init-config
+surfaces stay in sync. If the platform supports inline tests in source files with suffixes
+not already covered, update `_TEST_GATE_AUDIT_SOURCE_SUFFIXES` in `core/orchestrator.py`.
+If the platform introduces test framework
 skip/disable/ignore/expected-failure/assumption idioms that are not already covered, also
 update
 `core/test_execution_gate_audit.py` and `tests/test_test_execution_gate_audit.py`. If the
