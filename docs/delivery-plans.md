@@ -33,7 +33,9 @@ sikula delivery status .sikula/delivery/<slug>/plan.yaml --json
 ```
 
 These commands do not create worktrees, run agents, prepare contracts, write task
-state, or update branches.
+state, or update branches. Core delivery progress helpers can write compact
+parent progress and append privacy-safe events for future execution commands,
+but no public delivery command runs units yet.
 
 The MVP validator checks:
 

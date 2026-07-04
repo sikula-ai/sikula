@@ -219,6 +219,14 @@ blockers from the tracked plan. The JSON result is allowlisted metadata only: it
 does not embed unit task bodies, raw child `TaskState`, prompts, provider output,
 logs, diffs, or validation output.
 
+**Delivery progress mutation foundation:** `core/delivery_progress.py` also owns
+the non-agent primitives that future delivery execution uses: atomic
+`progress.json` writes, append-only `events.jsonl` records, mutation locks, unit
+progress upserts, and deterministic next-unit selection from the status model.
+These helpers are intentionally privacy-safe and allowlisted. They do not create
+worktrees, prepare contracts, start agents, update branches, or expose a public
+`run-next` CLI command by themselves.
+
 ---
 
 ## Execution flow (`Orchestrator.run()`)
