@@ -26,6 +26,12 @@ def _write_delivery_plan(root: Path, data: dict, *, name: str = "plan.yaml") -> 
     return path
 
 
+def _write_project_config(root: Path) -> None:
+    path = root / ".sikula" / "config.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("project:\n  root_path: .\n  build_tool: python\n", encoding="utf-8")
+
+
 def test_delivery_check_cli_validates_plan_without_project_config(
     git_project: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -119,6 +125,60 @@ def test_delivery_status_cli_reports_pending_units_without_project_config(
     assert payload["progress_exists"] is False
     assert payload["units"][0]["eligible"] is True
     assert payload["units"][1]["blocked_by"] == ["01-foundation"]
+
+
+def test_delivery_run_next_dry_run_reports_selected_unit_with_project_config(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    unit_1 = _write_delivery_unit(git_project, "01-foundation.md", "# Unit 01\n\nAdd foundation.\n")
+    unit_2 = _write_delivery_unit(git_project, "02-feature.md", "# Unit 02\n\nBuild on foundation.\n")
+    plan_path = _write_delivery_plan(
+        git_project,
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-run-next-smoke",
+            "title": "Delivery run-next smoke",
+            "final_branch": "sikula/delivery/delivery-run-next-smoke",
+            "streams": [{"id": "app", "label": "App"}],
+            "units": [
+                {
+                    "id": "01-foundation",
+                    "title": "Add foundation",
+                    "stream": "app",
+                    "platform": "shared",
+                    "task_path": unit_1,
+                    "depends_on": [],
+                },
+                {
+                    "id": "02-feature",
+                    "title": "Add feature",
+                    "stream": "app",
+                    "platform": "shared",
+                    "task_path": unit_2,
+                    "depends_on": ["01-foundation"],
+                },
+            ],
+        },
+    )
+    _write_project_config(git_project)
+    monkeypatch.chdir(git_project)
+
+    with patch(
+        "sys.argv",
+        ["sikula", "delivery", "run-next", plan_path.relative_to(git_project).as_posix(), "--dry-run", "--json"],
+    ):
+        main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valid"] is True
+    assert payload["ready"] is True
+    assert payload["dry_run"] is True
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["selected_unit"]["task_path"] == unit_1
+    assert payload["progress_exists"] is False
+    assert not (git_project / ".sikula" / "state" / "delivery" / "delivery-run-next-smoke" / "progress.json").exists()
 
 
 def test_delivery_commands_ignore_malformed_project_config(

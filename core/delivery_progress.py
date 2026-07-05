@@ -1,14 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import re
+import tempfile
 from typing import Any
 
 from core.delivery_plan import DeliveryPlan, DeliveryPlanIssue, check_delivery_plan_file
 
 SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION = 1
 DELIVERY_UNIT_STATUSES = {"pending", "running", "done", "failed", "canceled", "waiting"}
+_DELIVERY_EVENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
+_DELIVERY_PROGRESS_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_TERMINAL_DELIVERY_UNIT_STATUSES = {"done", "failed", "canceled"}
 
 
 @dataclass(frozen=True)
@@ -57,6 +64,94 @@ class DeliveryProgress:
             "plan_id": self.plan_id,
             "units": [unit.to_dict() for unit in self.units],
         }
+
+
+@dataclass(frozen=True)
+class DeliveryProgressEvent:
+    plan_id: str
+    event_type: str
+    timestamp: str
+    unit_id: str | None = None
+    status: str | None = None
+    child_task_id: str | None = None
+    branch: str | None = None
+    commit: str | None = None
+    waiting_reason: str | None = None
+    failure_code: str | None = None
+    schema_version: int = SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "plan_id": self.plan_id,
+            "event_type": self.event_type,
+            "timestamp": self.timestamp,
+        }
+        for key in (
+            "unit_id",
+            "status",
+            "child_task_id",
+            "branch",
+            "commit",
+            "waiting_reason",
+            "failure_code",
+        ):
+            value = getattr(self, key)
+            if value:
+                data[key] = value
+        return data
+
+
+class DeliveryProgressLockError(RuntimeError):
+    """Raised when a delivery progress mutation lock cannot be acquired."""
+
+
+@dataclass
+class DeliveryProgressLock:
+    path: Path
+    owner: str = "sikula"
+    _acquired: bool = False
+
+    def acquire(self) -> DeliveryProgressLock:
+        if self._acquired:
+            return self
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        metadata = {
+            "schema_version": SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION,
+            "owner": self.owner,
+            "pid": os.getpid(),
+            "created_at": _utc_now(),
+        }
+        try:
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as exc:
+            raise DeliveryProgressLockError(f"Delivery progress lock already exists: {self.path}") from exc
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(metadata, sort_keys=True) + "\n")
+            self._acquired = True
+        except BaseException:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        return self
+
+    def release(self) -> None:
+        if not self._acquired:
+            return
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        self._acquired = False
+
+    def __enter__(self) -> DeliveryProgressLock:
+        return self.acquire()
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
 
 
 @dataclass(frozen=True)
@@ -161,7 +256,145 @@ class DeliveryStatusResult:
 
 
 def delivery_progress_path(project_root: Path, plan_id: str) -> Path:
-    return project_root / ".sikula" / "state" / "delivery" / plan_id / "progress.json"
+    return _delivery_state_dir(project_root, plan_id) / "progress.json"
+
+
+def delivery_events_path(project_root: Path, plan_id: str) -> Path:
+    return _delivery_state_dir(project_root, plan_id) / "events.jsonl"
+
+
+def delivery_lock_path(project_root: Path, plan_id: str) -> Path:
+    return _delivery_state_dir(project_root, plan_id) / "lock"
+
+
+def acquire_delivery_progress_lock(
+    project_root: Path,
+    plan_id: str,
+    *,
+    owner: str = "sikula",
+) -> DeliveryProgressLock:
+    return DeliveryProgressLock(delivery_lock_path(project_root, plan_id), owner=owner).acquire()
+
+
+def write_delivery_progress(path: Path, progress: DeliveryProgress) -> None:
+    _validate_progress(progress)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(progress.to_dict(), indent=2, sort_keys=True) + "\n"
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def append_delivery_progress_event(path: Path, event: DeliveryProgressEvent) -> None:
+    _validate_event(event)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(path.parent)
+
+
+def upsert_delivery_unit_progress(
+    progress: DeliveryProgress,
+    unit: DeliveryUnitProgress,
+) -> DeliveryProgress:
+    _validate_progress(progress)
+    _validate_unit_progress(unit)
+    units: list[DeliveryUnitProgress] = []
+    replaced = False
+    for existing in progress.units:
+        if existing.unit_id == unit.unit_id:
+            if unit.status in _TERMINAL_DELIVERY_UNIT_STATUSES and not unit.started_at and existing.started_at:
+                unit = replace(unit, started_at=existing.started_at)
+            units.append(unit)
+            replaced = True
+        else:
+            units.append(existing)
+    if not replaced:
+        units.append(unit)
+    return DeliveryProgress(
+        schema_version=progress.schema_version,
+        plan_id=progress.plan_id,
+        units=units,
+    )
+
+
+def make_delivery_unit_progress(
+    unit_id: str,
+    status: str,
+    *,
+    child_task_id: str | None = None,
+    branch: str | None = None,
+    commit: str | None = None,
+    waiting_reason: str | None = None,
+    failure_code: str | None = None,
+    started_at: str | None = None,
+    timestamp: str | None = None,
+) -> DeliveryUnitProgress:
+    timestamp = timestamp or _utc_now()
+    started_at = timestamp if status == "running" else started_at
+    completed_at = timestamp if status in _TERMINAL_DELIVERY_UNIT_STATUSES else None
+    return DeliveryUnitProgress(
+        unit_id=unit_id,
+        status=status,
+        child_task_id=child_task_id,
+        branch=branch,
+        commit=commit,
+        waiting_reason=waiting_reason if status == "waiting" else None,
+        failure_code=failure_code if status == "failed" else None,
+        started_at=started_at,
+        completed_at=completed_at,
+        updated_at=timestamp,
+    )
+
+
+def make_delivery_progress_event(
+    plan_id: str,
+    event_type: str,
+    *,
+    unit: DeliveryUnitProgress | None = None,
+    timestamp: str | None = None,
+) -> DeliveryProgressEvent:
+    timestamp = timestamp or _utc_now()
+    return DeliveryProgressEvent(
+        plan_id=plan_id,
+        event_type=event_type,
+        timestamp=timestamp,
+        unit_id=unit.unit_id if unit else None,
+        status=unit.status if unit else None,
+        child_task_id=unit.child_task_id if unit else None,
+        branch=unit.branch if unit else None,
+        commit=unit.commit if unit else None,
+        waiting_reason=unit.waiting_reason if unit else None,
+        failure_code=unit.failure_code if unit else None,
+    )
+
+
+def select_next_delivery_unit(status: DeliveryStatusResult) -> DeliveryStatusUnit | None:
+    if not status.valid or status.status in {"failed", "running", "waiting", "canceled", "done"}:
+        return None
+    return next((unit for unit in status.units if unit.eligible), None)
 
 
 def get_delivery_status(path: str | Path, *, project_root: Path | None = None) -> DeliveryStatusResult:
@@ -207,6 +440,68 @@ def get_delivery_status(path: str | Path, *, project_root: Path | None = None) -
         units=units,
         next_action=_next_action(status, units),
     )
+
+
+def _delivery_state_dir(project_root: Path, plan_id: str) -> Path:
+    _validate_plan_id_for_path(plan_id)
+    return project_root / ".sikula" / "state" / "delivery" / plan_id
+
+
+def _validate_plan_id_for_path(plan_id: str) -> None:
+    if not isinstance(plan_id, str) or not _DELIVERY_PROGRESS_PLAN_ID_RE.fullmatch(plan_id):
+        raise ValueError("delivery plan id must be a safe path segment")
+
+
+def _validate_progress(progress: DeliveryProgress) -> None:
+    _validate_plan_id_for_path(progress.plan_id)
+    if progress.schema_version != SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION:
+        raise ValueError(
+            "unsupported delivery progress schema_version "
+            f"{progress.schema_version}; expected {SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION}"
+        )
+    seen: set[str] = set()
+    for unit in progress.units:
+        _validate_unit_progress(unit)
+        if unit.unit_id in seen:
+            raise ValueError(f"duplicate delivery progress unit id: {unit.unit_id}")
+        seen.add(unit.unit_id)
+
+
+def _validate_unit_progress(unit: DeliveryUnitProgress) -> None:
+    if not unit.unit_id.strip():
+        raise ValueError("delivery progress unit_id must be non-empty")
+    if unit.status not in DELIVERY_UNIT_STATUSES:
+        raise ValueError(f"unknown delivery progress status: {unit.status}")
+
+
+def _validate_event(event: DeliveryProgressEvent) -> None:
+    _validate_plan_id_for_path(event.plan_id)
+    if event.schema_version != SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION:
+        raise ValueError(
+            "unsupported delivery progress event schema_version "
+            f"{event.schema_version}; expected {SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION}"
+        )
+    if not _DELIVERY_EVENT_TYPE_RE.fullmatch(event.event_type):
+        raise ValueError("delivery progress event_type must be a stable code")
+    if event.status and event.status not in DELIVERY_UNIT_STATUSES:
+        raise ValueError(f"unknown delivery progress event status: {event.status}")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def render_delivery_status(result: DeliveryStatusResult) -> str:

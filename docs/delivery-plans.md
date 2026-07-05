@@ -32,8 +32,19 @@ sikula delivery status .sikula/delivery/<slug>/plan.yaml
 sikula delivery status .sikula/delivery/<slug>/plan.yaml --json
 ```
 
+Preview the next eligible unit without changing delivery progress:
+
+```bash
+sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --dry-run
+sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --dry-run --json
+```
+
 These commands do not create worktrees, run agents, prepare contracts, write task
-state, or update branches.
+state, or update branches. Core delivery progress helpers can write compact
+parent progress and append privacy-safe events for future execution commands,
+but no public delivery command runs units yet. Unlike `check` and `status`,
+`run-next --dry-run` loads project runtime config because it previews the future
+execution path.
 
 The MVP validator checks:
 

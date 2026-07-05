@@ -3113,6 +3113,10 @@ def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
     return cli_delivery.cmd_delivery_status(args, cfg)
 
 
+def cmd_delivery_run_next(args: argparse.Namespace, cfg: dict) -> None:
+    return cli_delivery.cmd_delivery_run_next(args, cfg)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -3164,7 +3168,7 @@ def main() -> None:
         cmd_init(args)
         return
 
-    if args.command == "delivery":
+    if args.command == "delivery" and args.delivery_command in {None, "check", "status"}:
         cfg = {}
     else:
         cfg = _load_runtime_config(
@@ -3198,6 +3202,8 @@ def main() -> None:
             cmd_delivery_check(args, cfg)
         elif args.delivery_command == "status":
             cmd_delivery_status(args, cfg)
+        elif args.delivery_command == "run-next":
+            cmd_delivery_run_next(args, cfg)
         else:
             delivery_p.print_help()
             sys.exit(1)
