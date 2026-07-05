@@ -691,3 +691,17 @@ def test_main_dispatches_delivery_status_without_loading_project_config(tmp_path
 
     load_config.assert_not_called()
     delivery_status.assert_called_once()
+
+
+def test_main_dispatches_delivery_run_next_through_runtime_config(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.yaml"
+    plan_path.write_text("schema_version: 1\n", encoding="utf-8")
+    cfg = {"project": {"root_path": str(tmp_path), "build_tool": "python"}}
+
+    with patch("sys.argv", ["sikula", "delivery", "run-next", str(plan_path), "--dry-run"]):
+        with patch("sikula._load_runtime_config", return_value=cfg) as load_config:
+            with patch("sikula.cmd_delivery_run_next") as delivery_run_next:
+                main()
+
+    load_config.assert_called_once()
+    delivery_run_next.assert_called_once()

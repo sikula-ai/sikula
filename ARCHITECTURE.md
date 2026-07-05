@@ -227,6 +227,13 @@ These helpers are intentionally privacy-safe and allowlisted. They do not create
 worktrees, prepare contracts, start agents, update branches, or expose a public
 `run-next` CLI command by themselves.
 
+**Delivery run-next dry run:** `sikula delivery run-next PLAN_FILE --dry-run`
+loads project runtime config, validates delivery status, and reports the first
+eligible unit that a future execution command would run. It is intentionally
+side-effect-free: it does not write parent progress, create child task state,
+prepare contracts, create worktrees, start agents, or update branches. Its JSON
+result is also allowlisted metadata only.
+
 ---
 
 ## Execution flow (`Orchestrator.run()`)
