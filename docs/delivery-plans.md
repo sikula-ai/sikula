@@ -54,10 +54,11 @@ Child task prompts, provider output, diffs, logs, and full task state remain in
 the normal child task state and are not embedded in delivery progress JSON.
 
 For dependent units, `run-next` also checks that each completed dependency's
-recorded result commit is already applied to the current checkout. The current
-execution MVP does not assemble an accumulated delivery branch, so dependent
-units are blocked until the operator has merged or otherwise applied prerequisite
-unit branches locally.
+recorded result commit, when present, is already applied to the current checkout.
+A completed dependency with no result commit is treated as a no-op prerequisite.
+The current execution MVP does not assemble an accumulated delivery branch, so
+dependent units are blocked until the operator has merged or otherwise applied
+prerequisite unit branches locally.
 
 Unlike `check` and `status`, `run-next` loads project runtime config because it
 uses the same project settings as `sikula run`.

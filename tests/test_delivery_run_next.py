@@ -430,35 +430,36 @@ def test_cmd_delivery_run_next_records_failed_child_run(tmp_path: Path, capsys: 
     assert progress["units"][0]["failure_code"] == "child_run_failed"
 
 
-def test_cmd_delivery_run_next_blocks_dependent_unit_without_dependency_commit(
+def test_cmd_delivery_run_next_allows_noop_dependency_without_result_commit(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
     _write_progress(tmp_path, [{"unit_id": "01-foundation", "status": "done"}])
     cfg = _run_next_cfg(tmp_path)
-    called = False
 
     def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
-        nonlocal called
-        called = True
-        return DeliveryChildRunResult(exit_code=0)
+        assert run_args.task_file == str((tmp_path / ".sikula/delivery/demo/units/02-feature.md").resolve())
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        state = store.create("child task")
+        state.done = True
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
 
-    with pytest.raises(SystemExit) as exc:
-        cmd_delivery_run_next(
-            _run_next_args(plan_path, json_output=True),
-            cfg,
-            _run_next_context(tmp_path, runner),
-        )
+    cmd_delivery_run_next(
+        _run_next_args(plan_path, json_output=True),
+        cfg,
+        _run_next_context(tmp_path, runner),
+    )
 
-    assert exc.value.code == 1
-    assert called is False
     payload = json.loads(capsys.readouterr().out)
-    assert payload["ran"] is False
+    assert payload["succeeded"] is True
     assert payload["selected_unit"]["id"] == "02-feature"
-    assert payload["errors"][0]["code"] == "delivery.dependency_commit_missing"
-    assert _load_delivery_progress(tmp_path)["units"] == [{"unit_id": "01-foundation", "status": "done"}]
-    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+    assert payload["selected_unit"]["status"] == "done"
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0] == {"unit_id": "01-foundation", "status": "done"}
+    assert progress["units"][1]["unit_id"] == "02-feature"
+    assert progress["units"][1]["status"] == "done"
 
 
 def test_cmd_delivery_run_next_blocks_dependent_unit_when_dependency_commit_is_unapplied(
@@ -834,13 +835,13 @@ def test_delivery_child_run_helpers_cover_exit_and_result_shapes(tmp_path: Path)
     assert _delivery_failure_code(0, argparse.Namespace()) == "child_task_incomplete"
 
 
-def test_dependency_commit_errors_ignore_unfinished_or_missing_dependency_units(tmp_path: Path) -> None:
+def test_dependency_commit_errors_ignore_noop_unfinished_or_missing_dependency_units(tmp_path: Path) -> None:
     selected = DeliveryStatusUnit(
         id="02-feature",
         status="pending",
         title="Feature",
         task_path=".sikula/delivery/demo/units/02-feature.md",
-        depends_on=["missing", "01-foundation"],
+        depends_on=["missing", "01-foundation", "noop"],
     )
     status = argparse.Namespace(
         units=[
@@ -850,7 +851,14 @@ def test_dependency_commit_errors_ignore_unfinished_or_missing_dependency_units(
                 title="Foundation",
                 task_path=".sikula/delivery/demo/units/01-foundation.md",
                 depends_on=[],
-            )
+            ),
+            DeliveryStatusUnit(
+                id="noop",
+                status="done",
+                title="No-op",
+                task_path=".sikula/delivery/demo/units/noop.md",
+                depends_on=[],
+            ),
         ]
     )
 

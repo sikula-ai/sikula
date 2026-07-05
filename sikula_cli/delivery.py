@@ -434,13 +434,6 @@ def _dependency_commit_errors(status, selected_unit, root: Path):
         if dependency_unit is None or dependency_unit.status != "done":
             continue
         if not dependency_unit.commit:
-            errors.append(
-                DeliveryPlanIssue(
-                    "error",
-                    "delivery.dependency_commit_missing",
-                    f"Dependency unit {dependency} is done but has no recorded result commit.",
-                )
-            )
             continue
         if not _git_commit_is_ancestor(root, dependency_unit.commit):
             errors.append(
