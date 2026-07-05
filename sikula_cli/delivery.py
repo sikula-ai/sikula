@@ -9,6 +9,7 @@ import copy
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 
@@ -200,6 +201,19 @@ def _run_next_delivery_unit(
                 events_path=str(events_path),
                 errors=errors,
                 message=message,
+            )
+
+        dependency_errors = _dependency_commit_errors(status, selected_unit, root)
+        if dependency_errors:
+            errors.extend(dependency_errors)
+            return _execution_result_from_status(
+                status,
+                ran=False,
+                selected_unit=selected_unit,
+                progress_path=str(progress_path),
+                events_path=str(events_path),
+                errors=errors,
+                message="Delivery unit dependencies are not applied to the current checkout.",
             )
 
         progress = _progress_for_update(status, progress_path, read_delivery_progress=read_delivery_progress)
@@ -408,6 +422,48 @@ def _progress_for_update(status, progress_path: Path, *, read_delivery_progress:
         if progress is not None and not errors:
             return progress
     return _progress_from_status(status)
+
+
+def _dependency_commit_errors(status, selected_unit, root: Path):
+    from core.delivery_plan import DeliveryPlanIssue
+
+    units_by_id = {unit.id: unit for unit in status.units}
+    errors: list[DeliveryPlanIssue] = []
+    for dependency in selected_unit.depends_on:
+        dependency_unit = units_by_id.get(dependency)
+        if dependency_unit is None or dependency_unit.status != "done":
+            continue
+        if not dependency_unit.commit:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery.dependency_commit_missing",
+                    f"Dependency unit {dependency} is done but has no recorded result commit.",
+                )
+            )
+            continue
+        if not _git_commit_is_ancestor(root, dependency_unit.commit):
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery.dependency_commit_unapplied",
+                    f"Dependency unit {dependency} result commit is not applied to the current checkout.",
+                )
+            )
+    return errors
+
+
+def _git_commit_is_ancestor(root: Path, commit: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
 
 
 def _restore_delivery_progress(progress_path: Path, progress, *, existed: bool) -> None:

@@ -29,8 +29,10 @@ from sikula_cli.delivery import (
     DeliveryChildRunResult,
     DeliveryRunNextContext,
     _coerce_child_run_result,
+    _dependency_commit_errors,
     _delivery_child_run_args,
     _delivery_failure_code,
+    _git_commit_is_ancestor,
     _invoke_delivery_child_run,
     _system_exit_code,
     cmd_delivery_run_next,
@@ -39,6 +41,30 @@ from sikula_cli.delivery import (
 
 def _git_init(root: Path) -> None:
     subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+
+
+def _git_commit(root: Path, name: str = "tracked.txt", body: str = "tracked\n") -> str:
+    path = root / name
+    path.write_text(body, encoding="utf-8")
+    subprocess.run(["git", "add", name], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Sikula Test",
+            "-c",
+            "user.email=sikula@example.test",
+            "commit",
+            "-m",
+            f"add {name}",
+        ],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+    ).stdout.strip()
 
 
 def _write_unit(root: Path, name: str, body: str) -> str:
@@ -404,6 +430,108 @@ def test_cmd_delivery_run_next_records_failed_child_run(tmp_path: Path, capsys: 
     assert progress["units"][0]["failure_code"] == "child_run_failed"
 
 
+def test_cmd_delivery_run_next_blocks_dependent_unit_without_dependency_commit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(tmp_path, [{"unit_id": "01-foundation", "status": "done"}])
+    cfg = _run_next_cfg(tmp_path)
+    called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal called
+        called = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert called is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is False
+    assert payload["selected_unit"]["id"] == "02-feature"
+    assert payload["errors"][0]["code"] == "delivery.dependency_commit_missing"
+    assert _load_delivery_progress(tmp_path)["units"] == [{"unit_id": "01-foundation", "status": "done"}]
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_blocks_dependent_unit_when_dependency_commit_is_unapplied(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-foundation", "status": "done", "commit": "deadbeef", "branch": "sikula/unit-01"}],
+    )
+    cfg = _run_next_cfg(tmp_path)
+    called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal called
+        called = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert called is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is False
+    assert payload["selected_unit"]["id"] == "02-feature"
+    assert payload["errors"][0]["code"] == "delivery.dependency_commit_unapplied"
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["commit"] == "deadbeef"
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_runs_dependent_unit_when_dependency_commit_is_applied(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    dependency_commit = _git_commit(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-foundation", "status": "done", "commit": dependency_commit, "branch": "sikula/unit-01"}],
+    )
+    cfg = _run_next_cfg(tmp_path)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        assert run_args.task_file == str((tmp_path / ".sikula/delivery/demo/units/02-feature.md").resolve())
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        state = store.create("child task")
+        state.done = True
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
+
+    cmd_delivery_run_next(
+        _run_next_args(plan_path, json_output=True),
+        cfg,
+        _run_next_context(tmp_path, runner),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["succeeded"] is True
+    assert payload["selected_unit"]["id"] == "02-feature"
+    assert payload["selected_unit"]["status"] == "done"
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["unit_id"] == "01-foundation"
+    assert progress["units"][1]["unit_id"] == "02-feature"
+    assert progress["units"][1]["status"] == "done"
+
+
 def test_cmd_delivery_run_next_keeps_unit_retryable_when_child_run_does_not_start(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -704,6 +832,38 @@ def test_delivery_child_run_helpers_cover_exit_and_result_shapes(tmp_path: Path)
     assert _system_exit_code(SystemExit(3)) == 3
     assert _delivery_child_run_args(root=root, task_path=task_path).task_file == str((root / task_path).resolve())
     assert _delivery_failure_code(0, argparse.Namespace()) == "child_task_incomplete"
+
+
+def test_dependency_commit_errors_ignore_unfinished_or_missing_dependency_units(tmp_path: Path) -> None:
+    selected = DeliveryStatusUnit(
+        id="02-feature",
+        status="pending",
+        title="Feature",
+        task_path=".sikula/delivery/demo/units/02-feature.md",
+        depends_on=["missing", "01-foundation"],
+    )
+    status = argparse.Namespace(
+        units=[
+            DeliveryStatusUnit(
+                id="01-foundation",
+                status="pending",
+                title="Foundation",
+                task_path=".sikula/delivery/demo/units/01-foundation.md",
+                depends_on=[],
+            )
+        ]
+    )
+
+    assert _dependency_commit_errors(status, selected, tmp_path) == []
+
+
+def test_git_commit_is_ancestor_handles_git_execution_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_run(*args, **kwargs):
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr("sikula_cli.delivery.subprocess.run", fail_run)
+
+    assert _git_commit_is_ancestor(tmp_path, "abc123") is False
 
 
 def test_cmd_delivery_run_next_uses_configured_project_root(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
