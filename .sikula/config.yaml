@@ -1,11 +1,16 @@
 # Sikula — orchestrator configuration for running Sikula on itself.
 #
 # This config is used when Sikula runs tasks against its own codebase.
-# It also serves as a reference Python/PythonTool config.
+# It also serves as a reference Python/PythonTool config. The common
+# development install is editable (`pipx install --editable .` or `pip install
+# -e .`), so prefer isolated worktree runs for changes to Sikula's own CLI,
+# orchestrator, providers, state, worktree, and delivery code.
 #
-# 1. Refine task: sikula task refine .sikula/tasks/<task-file> --auto
-# 2. Prepare contract: sikula contract prepare .sikula/tasks/<refined-task-file> --auto
-# 3. Run the contract: sikula run .sikula/contracts/<contract-file>
+# Use Sikula's contract-first flow from the repo root:
+#   sikula contract check .sikula/tasks/<task-file>
+#   sikula task refine .sikula/tasks/<task-file> --output .sikula/tasks/<task-file>.refined.md
+#   sikula contract prepare .sikula/tasks/<task-file>.refined.md --output .sikula/contracts/<task-file>.contract.md
+#   sikula run .sikula/contracts/<task-file>.contract.md --require-contract-ready
 
 project:
   name: sikula
@@ -21,12 +26,27 @@ sandbox:
   # These paths are prompt constraints, not a provider-independent hard sandbox.
   # Sikula audits detected file changes after write-capable agent calls and records
   # write_path_warning if a change is outside the active write scope.
-  # Tighten this list to keep generated changes focused.
+  # Governance docs/config paths are included so explicit Sikula self-hosting
+  # tasks can update documentation, architecture notes, and config. They should
+  # not change as incidental implementation output.
+  # Role-specific .sikula/*_rules.md prompt overlays are intentionally omitted
+  # from write scope; update them as explicit maintainer changes and commit them
+  # before the next isolated run.
+  # GitHub Actions workflows are security-sensitive and intentionally omitted;
+  # add .github/workflows/ only for explicit maintainer-approved CI tasks.
   allowed_write_paths:
     - agents/
     - core/
+    - docs/
     - sikula_cli/
     - tools/
+    - .sikula/config.yaml
+    - AGENTS.md
+    - ARCHITECTURE.md
+    - CONTRIBUTING.md
+    - README.md
+    - guidelines.md
+    - pyproject.toml
     - sikula.py
 
   # Directories the TestWriterAgent may write to.
@@ -166,11 +186,27 @@ build:
       command: "python3 -m ruff format --check ."
       fix_command: "python3 -m ruff format ."
       timeout: 60
+    - name: whitespace
+      # Covers tracked diffs and untracked text files without mutating the git index.
+      command: "python3 tools/check_whitespace.py"
+      timeout: 60
 
 # Security context — injected into the security reviewer's prompt to focus the audit on
 # threats relevant to this project.
 security:
-  context: Developer tool. Orchestrates LLM agents that read and write local source files, run shell commands (build, test, lint), and create git worktrees. LLM API keys come from environment variables only. Main concerns are path traversal (sandbox enforcement), shell command construction, and ensuring agent-written code does not introduce vulnerabilities into the projects it modifies.
+  context: >-
+    Local developer tool that orchestrates LLM agents reading and writing local
+    source files, running shell commands for build/test/check validation, and
+    creating git worktrees and result branches. LLM API keys and provider
+    credentials come from environment variables or provider CLIs only. Raw
+    `.sikula/state`, prompts, provider output, logs, source snippets, diffs,
+    and local filesystem paths are local audit/debug evidence by default, not
+    public JSON/protocol output. Main concerns are path traversal, symlink and
+    gitfile escape, sandbox enforcement, unsafe shell command construction,
+    provider diagnostic leakage, prompt/state privacy, worktree cleanup/delete
+    safety, current-branch review-fix delivery safety, and editable-install
+    self-hosting mistakes where the invoking `sikula` process loads code from
+    the checkout being changed.
 
 # Project guidelines — injected into all agent prompts (analyst, reviewer, and security reviewer
 # receive file content directly; implementer, fixer, and test writer receive the file list
@@ -182,12 +218,25 @@ guidelines:
   context_files:
     - guidelines.md
     - ARCHITECTURE.md
+    - AGENTS.md
+    - CONTRIBUTING.md
+    - README.md
   max_file_chars: 50000
 
 # Planner configuration.
 planner:
   # Maximum number of steps the planner may produce.
   max_steps: 6
+
+# Reviewer configuration.
+reviewer:
+  # This prompt overlay must be committed/clean before isolated worktree creation.
+  extra_rules: .sikula/reviewer_rules.md
+
+# Security reviewer configuration.
+security_reviewer:
+  # This prompt overlay must be committed/clean before isolated worktree creation.
+  extra_rules: .sikula/security_rules.md
 
 # Test writer configuration.
 test_writer:
@@ -202,3 +251,5 @@ test_writer:
   # What to do when safe tests require missing project seams/infrastructure:
   # warn = record a visible audit warning; fail = fail the task.
   testability_gap_policy: warn
+  # This prompt overlay must be committed/clean before isolated worktree creation.
+  extra_rules: .sikula/test_writer_rules.md

@@ -17,7 +17,8 @@ _GUIDELINES_HEADING = "# Development Guidelines"
 _SYSTEM = """\
 You are analyzing a {tech_stack} codebase to write concise development guidelines for an AI coding agent.
 
-Extract only conventions actually present in the code — do not invent rules not evidenced by the codebase.
+Extract only conventions actually present in the code or existing project guidance docs — do not invent rules not evidenced by the codebase.
+Prefer durable coding, testing, architecture, and agent guardrails over one-off setup or operator workflow instructions.
 
 Focus on:
 - Module and file organization patterns
@@ -39,7 +40,8 @@ Analyze the codebase in the current directory and produce guidelines.md content.
 Steps:
 1. List the top-level directory structure to understand the project layout.
 2. Read 3-5 source files from different modules to identify coding patterns.
-3. Read any existing documentation (README, CONTRIBUTING).
+3. Read existing project guidance docs when present (guidelines.md, AGENTS.md,
+   ARCHITECTURE.md, README, CONTRIBUTING, docs/guidelines.md, docs/architecture.md).
 4. Output ONLY the raw markdown — your entire response is the file content.
    Do not include any surrounding text, commentary, or summary.
 5. The first line of your response must be exactly: # Development Guidelines\

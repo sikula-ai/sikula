@@ -462,12 +462,20 @@ def _print_current_branch_clean_error(
     print("Commit, stash, or remove these changes and rerun the command.")
 
 
-def _isolation_context_files(cfg: dict) -> list[tuple[str, Path]]:
-    """Return files that must be present unchanged in isolated task worktrees."""
+_WORKTREE_CONTEXT_AGENT_NAMES = ("planner", "reviewer", "security_reviewer", "test_writer")
+
+
+def _worktree_context_files(
+    cfg: dict,
+    *,
+    include_config: bool,
+    agent_names: Sequence[str],
+) -> list[tuple[str, Path]]:
+    """Return files that must be present unchanged in an isolated worktree."""
     result: list[tuple[str, Path]] = []
 
     raw_config_path = cfg.get("_config_path")
-    if raw_config_path:
+    if include_config and raw_config_path:
         result.append(("config", Path(raw_config_path).resolve()))
 
     project_root_raw = cfg.get("project", {}).get("root_path")
@@ -481,6 +489,14 @@ def _isolation_context_files(cfg: dict) -> list[tuple[str, Path]]:
             abs_path = path if path.is_absolute() else project_root / path
             result.append(("guidelines", abs_path.resolve()))
 
+    for agent_name in agent_names:
+        raw = cfg.get(agent_name, {}).get("extra_rules")
+        if not raw:
+            continue
+        path = Path(str(raw))
+        abs_path = path if path.is_absolute() else project_root / path
+        result.append((f"{agent_name}.extra_rules", abs_path.resolve()))
+
     deduped: list[tuple[str, Path]] = []
     seen: set[Path] = set()
     for kind, path in result:
@@ -491,10 +507,41 @@ def _isolation_context_files(cfg: dict) -> list[tuple[str, Path]]:
     return deduped
 
 
-def _require_committed_config_for_isolated_run(cfg: dict, git_root: Path) -> None:
-    """Fail fast when config/guidelines context will not exist unchanged in a new worktree."""
+def _isolation_context_files(cfg: dict) -> list[tuple[str, Path]]:
+    """Return files that must be present unchanged in isolated task worktrees."""
+    return _worktree_context_files(
+        cfg,
+        include_config=True,
+        agent_names=_WORKTREE_CONTEXT_AGENT_NAMES,
+    )
+
+
+def _git_file_exists_at_ref(git_root: Path, ref: str, rel_path: str) -> tuple[bool, str]:
+    result = subprocess.run(
+        ["git", "cat-file", "-e", f"{ref}:{rel_path}"],
+        capture_output=True,
+        text=True,
+        cwd=git_root,
+    )
+    if result.returncode == 0:
+        return True, ""
+    return False, f"not present in worktree start ref '{ref}'"
+
+
+def _require_worktree_context_files(
+    cfg: dict,
+    git_root: Path,
+    *,
+    start_ref: str,
+    include_config: bool,
+    agent_names: Sequence[str],
+    command_label: str,
+    worktree_label: str,
+    show_no_isolate_hint: bool = False,
+) -> None:
+    """Fail fast when files read from a new worktree would be missing or stale."""
     problems: list[tuple[str, str, str]] = []
-    for kind, path in _isolation_context_files(cfg):
+    for kind, path in _worktree_context_files(cfg, include_config=include_config, agent_names=agent_names):
         rel = _git_relative_path(git_root, path)
         if rel is None:
             continue
@@ -502,19 +549,61 @@ def _require_committed_config_for_isolated_run(cfg: dict, git_root: Path) -> Non
         ok, reason = _tracked_clean_file_status(git_root, path)
         if not ok:
             problems.append((kind, rel, reason))
+            continue
+
+        ok, reason = _git_file_exists_at_ref(git_root, start_ref, rel)
+        if not ok:
+            problems.append((kind, rel, reason))
 
     if not problems:
         return
 
-    print("Error: isolated run requires Sikula config/context files to be committed before creating a worktree.")
-    print("The task worktree starts from HEAD, so untracked or uncommitted config/guidelines are not visible there.")
+    context_label = "config/prompt-context files" if include_config else "prompt-context files"
+    print(f"Error: {command_label} requires Sikula {context_label} to be committed before creating a worktree.")
+    print(f"The {worktree_label} starts from {start_ref}, so untracked, uncommitted, or absent context files are not visible there.")
     print("Problem files:")
     for kind, rel, reason in problems:
         print(f"  - {rel} ({kind}): {reason}")
-    add_paths = " ".join(rel for _, rel, _ in problems)
-    print(f"Run: git add {add_paths} && git commit -m 'Add Sikula config'")
-    print("Or use --no-isolate for a local experiment.")
+    if include_config:
+        add_paths = " ".join(rel for _, rel, _ in problems)
+        print(f"Run: git add {add_paths} && git commit -m 'Add Sikula config'")
+    else:
+        print("Commit local context changes, then ensure the reviewed branch contains those commits before retrying.")
+    if show_no_isolate_hint:
+        print("Or use --no-isolate for a local experiment.")
     sys.exit(1)
+
+
+def _require_committed_config_for_isolated_run(cfg: dict, git_root: Path) -> None:
+    """Fail fast when config/prompt context will not exist unchanged in a new worktree."""
+    _require_worktree_context_files(
+        cfg,
+        git_root,
+        start_ref="HEAD",
+        include_config=True,
+        agent_names=_WORKTREE_CONTEXT_AGENT_NAMES,
+        command_label="isolated run",
+        worktree_label="task worktree",
+        show_no_isolate_hint=True,
+    )
+
+
+def _require_worktree_context_for_review(
+    cfg: dict,
+    git_root: Path,
+    start_ref: str,
+    agent_names: Sequence[str],
+) -> None:
+    """Fail fast when review prompt context will not exist unchanged in the review worktree."""
+    _require_worktree_context_files(
+        cfg,
+        git_root,
+        start_ref=start_ref,
+        include_config=False,
+        agent_names=agent_names,
+        command_label="review",
+        worktree_label="review worktree",
+    )
 
 
 def _create_worktree(git_root: Path, worktree_base: Path, branch: str) -> tuple[bool, str]:
@@ -3007,6 +3096,7 @@ def _review_context() -> cli_review.ReviewContext:
         finalize_worktree=_finalize_worktree,
         run_report_only_review=_run_report_only_review,
         current_branch_delivery_needs_finalization=_current_branch_delivery_needs_finalization,
+        require_worktree_context_for_review=_require_worktree_context_for_review,
         print_review_summary=_print_review_summary,
         logger=log,
     )

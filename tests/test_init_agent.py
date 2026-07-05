@@ -39,6 +39,8 @@ class TestInitAgent:
         prompt_sent = llm.run_readonly_agent.call_args[0][0]
         assert "conventions" in prompt_sent.lower()
         assert "guidelines.md" in prompt_sent
+        assert "AGENTS.md" in prompt_sent
+        assert "ARCHITECTURE.md" in prompt_sent
 
     def test_prompt_requires_stable_first_heading(self, tmp_path: Path):
         agent, llm = self._make_agent()

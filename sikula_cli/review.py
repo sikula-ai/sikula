@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import logging
 import os
@@ -92,6 +92,7 @@ class ReviewContext:
     finalize_worktree: Callable[..., tuple[bool, bool, str | None]]
     run_report_only_review: Callable[..., float]
     current_branch_delivery_needs_finalization: Callable[[object], bool]
+    require_worktree_context_for_review: Callable[[dict, Path, str, Sequence[str]], None]
     print_review_summary: Callable[..., None]
     logger: logging.Logger
 
@@ -147,6 +148,8 @@ def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | Non
     base_branch = args.base_branch
     target_start_commit: str | None = None
     original_project_root = Path(cfg["project"]["root_path"]).resolve()
+    cli_security_review = getattr(args, "security_review", None)
+    run_security_review = cfg.get("run_security_review", True) if cli_security_review is None else cli_security_review
 
     git_root = context.find_git_root(original_project_root)
     if git_root is None:
@@ -180,6 +183,14 @@ def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | Non
         if target_start_commit is None:
             print(f"Error: could not resolve HEAD for --current-branch: {head_error}")
             sys.exit(1)
+
+    review_start_ref = target_start_commit if current_branch_mode else str(branch)
+    review_context_agents = ["reviewer"]
+    if run_security_review:
+        review_context_agents.append("security_reviewer")
+    if args.fix:
+        review_context_agents.append("test_writer")
+    context.require_worktree_context_for_review(cfg, git_root, review_start_ref, tuple(review_context_agents))
 
     task_id = uuid.uuid4().hex
     worktree_base = git_root / ".sikula" / "worktrees" / task_id
@@ -295,8 +306,6 @@ def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | Non
     task_label = Path(args.description_file).name if args.description_file else description.splitlines()[0][:60]
 
     t_start = time.time()
-    cli_security_review = getattr(args, "security_review", None)
-    run_security_review = cfg.get("run_security_review", True) if cli_security_review is None else cli_security_review
     heartbeat_interval_seconds = context.heartbeat_interval_seconds(cfg)
 
     base_llm_cfg = cfg.get("llm", {})

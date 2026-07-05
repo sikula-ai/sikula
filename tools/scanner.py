@@ -44,15 +44,15 @@ _SIGNATURES: list[tuple[list[str], str, str, str | None]] = [
 ]
 
 _GUIDELINE_CANDIDATES = [
-    "AGENTS.md",
-    "agents.md",
-    ".github/copilot-instructions.md",
     "guidelines.md",
-    "ARCHITECTURE.md",
-    "docs/architecture.md",
     "docs/guidelines.md",
     "docs/coding-standards.md",
     "docs/development.md",
+    "ARCHITECTURE.md",
+    "docs/architecture.md",
+    "AGENTS.md",
+    "agents.md",
+    ".github/copilot-instructions.md",
     "README.md",
     "CONTRIBUTING.md",
     ".github/CONTRIBUTING.md",
