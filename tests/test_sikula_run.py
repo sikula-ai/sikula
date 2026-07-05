@@ -1898,12 +1898,14 @@ class TestCmdRunStateStore:
             patch("sikula._finalize_worktree", return_value=(True, False, None)),
             patch("sys.exit"),
         ):
-            cmd_run(_run_args(task_file=str(task_file)), _run_cfg(tmp_path))
+            args = _run_args(task_file=str(task_file))
+            cmd_run(args, _run_cfg(tmp_path))
 
         assert captured.get("state_store") is not None, "state_store was not passed to build_orchestrator"
         # The store must already contain the task saved before root_path was changed to worktree.
         tasks = captured["state_store"].list_tasks()
         assert len(tasks) == 1
+        assert args.created_task_id == tasks[0]
         state = captured["state_store"].load(tasks[0])
         assert state.implementation_contract["schema_version"] == 1
         assert state.implementation_contract["source"]["path"] == "task.md"

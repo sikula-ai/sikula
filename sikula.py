@@ -3113,8 +3113,28 @@ def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
     return cli_delivery.cmd_delivery_status(args, cfg)
 
 
+def _run_delivery_child_task(args: argparse.Namespace, cfg: dict) -> cli_delivery.DeliveryChildRunResult:
+    try:
+        cmd_run(args, cfg)
+    except SystemExit as exc:
+        child_task_id = getattr(args, "created_task_id", None)
+        if isinstance(exc.code, int):
+            return cli_delivery.DeliveryChildRunResult(exit_code=exc.code, child_task_id=child_task_id)
+        if exc.code is None:
+            return cli_delivery.DeliveryChildRunResult(exit_code=0, child_task_id=child_task_id)
+        return cli_delivery.DeliveryChildRunResult(exit_code=1, child_task_id=child_task_id)
+    return cli_delivery.DeliveryChildRunResult(exit_code=0, child_task_id=getattr(args, "created_task_id", None))
+
+
+def _delivery_run_next_context() -> cli_delivery.DeliveryRunNextContext:
+    return cli_delivery.DeliveryRunNextContext(
+        run_task=_run_delivery_child_task,
+        resolve_state_dir=_resolve_state_dir,
+    )
+
+
 def cmd_delivery_run_next(args: argparse.Namespace, cfg: dict) -> None:
-    return cli_delivery.cmd_delivery_run_next(args, cfg)
+    return cli_delivery.cmd_delivery_run_next(args, cfg, _delivery_run_next_context())
 
 
 # ---------------------------------------------------------------------------

@@ -224,8 +224,7 @@ the non-agent primitives that future delivery execution uses: atomic
 `progress.json` writes, append-only `events.jsonl` records, mutation locks, unit
 progress upserts, and deterministic next-unit selection from the status model.
 These helpers are intentionally privacy-safe and allowlisted. They do not create
-worktrees, prepare contracts, start agents, update branches, or expose a public
-`run-next` CLI command by themselves.
+worktrees, prepare contracts, start agents, or update branches by themselves.
 
 **Delivery run-next dry run:** `sikula delivery run-next PLAN_FILE --dry-run`
 loads project runtime config, validates delivery status, and reports the first
@@ -233,6 +232,18 @@ eligible unit that a future execution command would run. It is intentionally
 side-effect-free: it does not write parent progress, create child task state,
 prepare contracts, create worktrees, start agents, or update branches. Its JSON
 result is also allowlisted metadata only.
+
+**Delivery run-next execution:** `sikula delivery run-next PLAN_FILE` acquires
+the delivery progress lock, selects one eligible pending unit, records it as
+`running`, and invokes the existing `sikula run` command path for the unit task
+file. The child run keeps all normal Sikula behavior: contract preflight,
+worktree isolation, provider execution, validation, review, state persistence,
+and task audit reporting. When the child run exits, delivery progress stores
+only compact parent metadata: unit status, child task id, branch, result commit
+when available, timestamps, and a failure code. Full prompts, provider output,
+diffs, logs, validation records, and task state remain in the child task state.
+The execution MVP runs one unit at a time and does not assemble the plan's final
+delivery branch yet.
 
 ---
 
