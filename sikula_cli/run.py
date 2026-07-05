@@ -237,6 +237,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
 
         description = task_path.read_text().strip()
         state = store.create(description)
+        args.created_task_id = state.task_id
         state.task_file = Path(args.task_file).name
         state.config_snapshot = context.run_config_snapshot(cfg, overrides)
         preflight_cfg = context.contract_preflight_config(cfg, overrides)

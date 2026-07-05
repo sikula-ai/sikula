@@ -315,6 +315,12 @@ def append_delivery_progress_event(path: Path, event: DeliveryProgressEvent) -> 
     _fsync_directory(path.parent)
 
 
+def read_delivery_progress(path: Path, *, plan_id: str) -> tuple[DeliveryProgress | None, list[DeliveryPlanIssue]]:
+    errors: list[DeliveryPlanIssue] = []
+    progress = _load_delivery_progress(path, plan_id=plan_id, errors=errors)
+    return progress, errors
+
+
 def upsert_delivery_unit_progress(
     progress: DeliveryProgress,
     unit: DeliveryUnitProgress,
