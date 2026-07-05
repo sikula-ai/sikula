@@ -1552,6 +1552,28 @@ class TestIsolatedRunConfigGuard:
         out = capsys.readouterr().out
         assert ".sikula/guidelines.md (guidelines): has unstaged changes" in out
 
+    def test_guidelines_context_directory_exits_before_worktree(self, tmp_path: Path, capsys):
+        config_path = self._init_repo_with_config(tmp_path, commit_config=True)
+        guidelines_path = tmp_path / ".sikula" / "guidelines.md"
+        guidelines_path.mkdir()
+        (guidelines_path / "index.md").write_text("# Guidelines\n")
+        _git_commit_all(tmp_path, "Add guidelines directory")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _require_committed_config_for_isolated_run(
+                {
+                    "_config_path": str(config_path),
+                    "project": {"root_path": str(tmp_path)},
+                    "guidelines": {"context_files": [".sikula/guidelines.md"]},
+                },
+                tmp_path,
+            )
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert ".sikula/guidelines.md (guidelines): is a directory in worktree start ref 'HEAD'" in out
+        assert "expected a file" in out
+
     def test_untracked_extra_rules_exits_before_worktree(self, tmp_path: Path, capsys):
         config_path = self._init_repo_with_config(tmp_path, commit_config=True)
         rules_path = tmp_path / ".sikula" / "reviewer_rules.md"

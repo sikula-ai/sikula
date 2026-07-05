@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -239,6 +240,33 @@ class TestReviewWorktreeContextGuard:
         out = capsys.readouterr().out
         assert ".sikula/reviewer_rules.md (reviewer.extra_rules): not present in worktree start ref" in out
         assert "ensure the reviewed branch contains those commits" in out
+
+    def test_review_extra_rules_must_be_file_in_review_start_ref(self, tmp_path: Path, capsys):
+        self._init_repo(tmp_path)
+        rules_path = tmp_path / ".sikula" / "reviewer_rules.md"
+        rules_path.mkdir(parents=True)
+        (rules_path / "index.md").write_text("# Reviewer Rules\n")
+        _git_commit_all(tmp_path, "Add reviewer rules directory")
+        start_ref = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        shutil.rmtree(rules_path)
+        rules_path.write_text("# Reviewer Rules\n")
+        _git_commit_all(tmp_path, "Replace reviewer rules with file")
+        cfg = _cfg(tmp_path)
+        cfg["reviewer"] = {"extra_rules": ".sikula/reviewer_rules.md"}
+
+        with pytest.raises(SystemExit) as exc_info:
+            _require_worktree_context_for_review(cfg, tmp_path, start_ref, ("reviewer",))
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert ".sikula/reviewer_rules.md (reviewer.extra_rules): is a directory in worktree start ref" in out
+        assert "expected a file" in out
 
     @pytest.mark.parametrize(
         ("fix", "security_review", "run_test_writing", "expected_agents"),

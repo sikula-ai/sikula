@@ -97,6 +97,28 @@ def tracked_clean_file_status(git_root: Path, path: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def file_blob_status_at_ref(git_root: Path, ref: str, rel_path: str) -> tuple[bool, str]:
+    """Return whether rel_path resolves to a file blob at ref."""
+    result = subprocess.run(
+        ["git", "cat-file", "-t", f"{ref}:{rel_path}"],
+        capture_output=True,
+        text=True,
+        cwd=git_root,
+    )
+    if result.returncode != 0:
+        return False, f"not present in worktree start ref '{ref}'"
+
+    object_type = result.stdout.strip()
+    if object_type == "blob":
+        return True, ""
+
+    type_label = {
+        "tree": "directory",
+        "commit": "submodule/gitlink",
+    }.get(object_type, f"{object_type or 'non-file'} object")
+    return False, f"is a {type_label} in worktree start ref '{ref}', expected a file"
+
+
 def current_branch_name(git_root: Path) -> tuple[str | None, str | None]:
     r = subprocess.run(
         ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],

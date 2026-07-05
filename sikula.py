@@ -530,16 +530,8 @@ def _isolation_context_files(cfg: dict, overrides: dict | None = None) -> list[t
     )
 
 
-def _git_file_exists_at_ref(git_root: Path, ref: str, rel_path: str) -> tuple[bool, str]:
-    result = subprocess.run(
-        ["git", "cat-file", "-e", f"{ref}:{rel_path}"],
-        capture_output=True,
-        text=True,
-        cwd=git_root,
-    )
-    if result.returncode == 0:
-        return True, ""
-    return False, f"not present in worktree start ref '{ref}'"
+def _git_file_blob_status_at_ref(git_root: Path, ref: str, rel_path: str) -> tuple[bool, str]:
+    return core_worktree.file_blob_status_at_ref(git_root, ref, rel_path)
 
 
 def _require_worktree_context_files(
@@ -565,7 +557,7 @@ def _require_worktree_context_files(
             problems.append((kind, rel, reason))
             continue
 
-        ok, reason = _git_file_exists_at_ref(git_root, start_ref, rel)
+        ok, reason = _git_file_blob_status_at_ref(git_root, start_ref, rel)
         if not ok:
             problems.append((kind, rel, reason))
 

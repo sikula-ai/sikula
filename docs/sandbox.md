@@ -32,7 +32,7 @@ Use `--no-isolate` only for local experiments where you want changes directly in
 
 ## Config Files Must Be Committed
 
-Isolated task worktrees start from `HEAD`. Before the first isolated run, commit `.sikula/config.yaml`, any files listed under `guidelines.context_files`, and any `extra_rules` files used by enabled agent phases. Review worktrees start from the reviewed branch or captured start commit, so review prompt context must also be present there.
+Isolated task worktrees start from `HEAD`. Before the first isolated run, commit `.sikula/config.yaml`, any files listed under `guidelines.context_files`, and any `extra_rules` files used by enabled agent phases. Those prompt-context paths must be files in the worktree start ref. Review worktrees start from the reviewed branch or captured start commit, so review prompt context must also be present there as files.
 
 ```bash
 git add .sikula/
