@@ -560,7 +560,9 @@ def _require_worktree_context_files(
 
     context_label = "config/prompt-context files" if include_config else "prompt-context files"
     print(f"Error: {command_label} requires Sikula {context_label} to be committed before creating a worktree.")
-    print(f"The {worktree_label} starts from {start_ref}, so untracked, uncommitted, or absent context files are not visible there.")
+    print(
+        f"The {worktree_label} starts from {start_ref}, so untracked, uncommitted, or absent context files are not visible there."
+    )
     print("Problem files:")
     for kind, rel, reason in problems:
         print(f"  - {rel} ({kind}): {reason}")
