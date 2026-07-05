@@ -26,12 +26,11 @@ sandbox:
   # These paths are prompt constraints, not a provider-independent hard sandbox.
   # Sikula audits detected file changes after write-capable agent calls and records
   # write_path_warning if a change is outside the active write scope.
-  # Governance docs/config paths are included so explicit Sikula self-hosting
-  # tasks can update documentation, architecture notes, and config. They should
-  # not change as incidental implementation output.
-  # Role-specific .sikula/*_rules.md prompt overlays are intentionally omitted
-  # from write scope; update them as explicit maintainer changes and commit them
-  # before the next isolated run.
+  # Keep prompt-governing files, package metadata, and self-hosting config out
+  # of normal write scope; update them as explicit maintainer changes and
+  # commit them before the next isolated run. User-facing docs, architecture
+  # notes, and changelog entries are allowed so task changes can keep public
+  # documentation current without weakening active prompt policy.
   # GitHub Actions workflows are security-sensitive and intentionally omitted;
   # add .github/workflows/ only for explicit maintainer-approved CI tasks.
   allowed_write_paths:
@@ -40,13 +39,9 @@ sandbox:
     - docs/
     - sikula_cli/
     - tools/
-    - .sikula/config.yaml
-    - AGENTS.md
     - ARCHITECTURE.md
-    - CONTRIBUTING.md
+    - CHANGELOG.md
     - README.md
-    - guidelines.md
-    - pyproject.toml
     - sikula.py
 
   # Directories the TestWriterAgent may write to.

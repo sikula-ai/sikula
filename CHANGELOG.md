@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 - **Worktree Prompt Context**: Isolated run and review guards now require committed `extra_rules` files only for enabled agent phases, while still failing fast when consumed prompt-context files would be missing, stale, or non-file paths in the worktree start ref.
+- **Self-hosting Write Scope**: Allowed `CHANGELOG.md` updates while keeping Sikula self-hosting config, agent guidance, contributing docs, generated guidelines, and package metadata outside ordinary agent write scope.
 
 ## [0.3.0] - 2026-06-29
 
