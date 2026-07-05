@@ -11,6 +11,7 @@ import yaml
 
 from core.delivery_progress import (
     DeliveryProgress,
+    DeliveryProgressEvent,
     DeliveryProgressLockError,
     DeliveryUnitProgress,
     acquire_delivery_progress_lock,
@@ -601,6 +602,112 @@ def test_upsert_delivery_unit_progress_replaces_existing_unit() -> None:
     assert updated.units[0].child_task_id == "task-1"
     assert updated.units[1].status == "waiting"
     assert updated.units[1].waiting_reason == "needs_human"
+
+
+def test_terminal_delivery_progress_preserves_started_at_from_running_unit() -> None:
+    started_at = "2026-07-04T12:00:00+00:00"
+    completed_at = "2026-07-04T12:03:00+00:00"
+    progress = DeliveryProgress(
+        schema_version=1,
+        plan_id="plan",
+        units=[
+            make_delivery_unit_progress(
+                "unit-1",
+                "running",
+                child_task_id="task-1",
+                timestamp=started_at,
+            )
+        ],
+    )
+
+    updated = upsert_delivery_unit_progress(
+        progress,
+        make_delivery_unit_progress(
+            "unit-1",
+            "done",
+            child_task_id="task-1",
+            commit="abc123",
+            timestamp=completed_at,
+        ),
+    )
+
+    assert updated.units[0].status == "done"
+    assert updated.units[0].started_at == started_at
+    assert updated.units[0].completed_at == completed_at
+    assert updated.units[0].updated_at == completed_at
+
+
+def test_terminal_delivery_progress_accepts_explicit_started_at() -> None:
+    unit = make_delivery_unit_progress(
+        "unit-1",
+        "failed",
+        child_task_id="task-1",
+        failure_code="tests_failed",
+        started_at="2026-07-04T12:00:00+00:00",
+        timestamp="2026-07-04T12:04:00+00:00",
+    )
+
+    assert unit.started_at == "2026-07-04T12:00:00+00:00"
+    assert unit.completed_at == "2026-07-04T12:04:00+00:00"
+    assert unit.failure_code == "tests_failed"
+
+
+def test_delivery_progress_validation_rejects_duplicate_and_invalid_units(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="duplicate"):
+        write_delivery_progress(
+            tmp_path / "progress.json",
+            DeliveryProgress(
+                schema_version=1,
+                plan_id="plan",
+                units=[
+                    DeliveryUnitProgress(unit_id="unit-1", status="pending"),
+                    DeliveryUnitProgress(unit_id="unit-1", status="done"),
+                ],
+            ),
+        )
+
+    with pytest.raises(ValueError, match="unit_id"):
+        upsert_delivery_unit_progress(
+            DeliveryProgress(schema_version=1, plan_id="plan", units=[]),
+            DeliveryUnitProgress(unit_id="", status="pending"),
+        )
+
+    with pytest.raises(ValueError, match="unknown"):
+        upsert_delivery_unit_progress(
+            DeliveryProgress(schema_version=1, plan_id="plan", units=[]),
+            DeliveryUnitProgress(unit_id="unit-1", status="mystery"),
+        )
+
+
+def test_delivery_progress_validation_rejects_unsupported_schemas(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unsupported delivery progress schema_version"):
+        write_delivery_progress(
+            tmp_path / "progress.json",
+            DeliveryProgress(schema_version=2, plan_id="plan", units=[]),
+        )
+
+    with pytest.raises(ValueError, match="unsupported delivery progress event schema_version"):
+        append_delivery_progress_event(
+            tmp_path / "events.jsonl",
+            DeliveryProgressEvent(
+                plan_id="plan",
+                event_type="unit.done",
+                timestamp="2026-07-04T12:00:00+00:00",
+                schema_version=2,
+            ),
+        )
+
+
+def test_delivery_progress_validation_rejects_invalid_event_status(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unknown"):
+        append_delivery_progress_event(
+            tmp_path / "events.jsonl",
+            make_delivery_progress_event(
+                "plan",
+                "unit.done",
+                unit=DeliveryUnitProgress(unit_id="unit-1", status="mystery"),
+            ),
+        )
 
 
 def test_select_next_delivery_unit_respects_dependencies_and_terminal_status(tmp_path: Path) -> None:

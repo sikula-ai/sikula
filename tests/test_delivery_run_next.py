@@ -8,8 +8,10 @@ import subprocess
 import pytest
 import yaml
 
+from core.delivery_plan import DeliveryPlanIssue
 from core.delivery_progress import delivery_progress_path
-from core.delivery_run_next import preview_delivery_run_next, render_delivery_run_next_preview
+from core.delivery_run_next import DeliveryRunNextPreview, preview_delivery_run_next, render_delivery_run_next_preview
+from core.delivery_run_next import _blocked_run_next_reason
 from sikula_cli.delivery import cmd_delivery_run_next
 
 
@@ -141,6 +143,36 @@ def test_render_delivery_run_next_preview_is_safe_and_actionable(tmp_path: Path)
     assert "Selected unit: 01-foundation - Add foundation" in output
     assert "Dry run: yes" in output
     assert "Private task body" not in output
+
+
+def test_render_delivery_run_next_preview_includes_errors_and_warnings() -> None:
+    result = DeliveryRunNextPreview(
+        plan_path="/tmp/plan.yaml",
+        project_root="/tmp/project",
+        valid=False,
+        ready=False,
+        dry_run=True,
+        status="pending",
+        progress_exists=True,
+        selected_unit=None,
+        errors=[DeliveryPlanIssue("error", "delivery.no_eligible_unit", "No unit is eligible.", "units")],
+        warnings=[DeliveryPlanIssue("warning", "progress.unit_unknown", "Progress references an unknown unit.")],
+        message="Delivery plan is not ready to run.",
+    )
+
+    output = render_delivery_run_next_preview(result)
+
+    assert "Errors:" in output
+    assert "- delivery.no_eligible_unit [units]: No unit is eligible." in output
+    assert "Warnings:" in output
+    assert "- progress.unit_unknown: Progress references an unknown unit." in output
+
+
+def test_blocked_run_next_reason_falls_back_for_no_eligible_unit() -> None:
+    assert _blocked_run_next_reason("pending") == (
+        "delivery.no_eligible_unit",
+        "Delivery plan has no eligible pending unit.",
+    )
 
 
 def test_cmd_delivery_run_next_requires_dry_run_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

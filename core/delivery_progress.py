@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import json
 import os
@@ -325,6 +325,8 @@ def upsert_delivery_unit_progress(
     replaced = False
     for existing in progress.units:
         if existing.unit_id == unit.unit_id:
+            if unit.status in _TERMINAL_DELIVERY_UNIT_STATUSES and not unit.started_at and existing.started_at:
+                unit = replace(unit, started_at=existing.started_at)
             units.append(unit)
             replaced = True
         else:
@@ -347,10 +349,11 @@ def make_delivery_unit_progress(
     commit: str | None = None,
     waiting_reason: str | None = None,
     failure_code: str | None = None,
+    started_at: str | None = None,
     timestamp: str | None = None,
 ) -> DeliveryUnitProgress:
     timestamp = timestamp or _utc_now()
-    started_at = timestamp if status == "running" else None
+    started_at = timestamp if status == "running" else started_at
     completed_at = timestamp if status in _TERMINAL_DELIVERY_UNIT_STATUSES else None
     return DeliveryUnitProgress(
         unit_id=unit_id,
