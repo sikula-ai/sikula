@@ -39,6 +39,47 @@ class DeliveryRunNextPreview:
         return data
 
 
+@dataclass(frozen=True)
+class DeliveryRunNextExecutionResult:
+    plan_path: str
+    project_root: str | None
+    valid: bool
+    ran: bool
+    succeeded: bool
+    status: str | None
+    progress_exists: bool
+    selected_unit: DeliveryStatusUnit | None
+    child_task_id: str | None
+    unit_status: str | None
+    run_exit_code: int | None
+    progress_path: str | None
+    events_path: str | None
+    errors: list[DeliveryPlanIssue]
+    warnings: list[DeliveryPlanIssue]
+    message: str
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "plan_path": self.plan_path,
+            "project_root": self.project_root,
+            "valid": self.valid,
+            "ran": self.ran,
+            "succeeded": self.succeeded,
+            "status": self.status,
+            "progress_exists": self.progress_exists,
+            "selected_unit": self.selected_unit.to_dict() if self.selected_unit else None,
+            "child_task_id": self.child_task_id,
+            "unit_status": self.unit_status,
+            "run_exit_code": self.run_exit_code,
+            "progress_path": self.progress_path,
+            "events_path": self.events_path,
+            "errors": [issue.to_dict() for issue in self.errors],
+            "warnings": [issue.to_dict() for issue in self.warnings],
+            "message": self.message,
+        }
+        return data
+
+
 def preview_delivery_run_next(path: str | Path, *, project_root: Path | None = None) -> DeliveryRunNextPreview:
     git_root_error: DeliveryPlanIssue | None = None
     if project_root is not None and _find_delivery_git_root(project_root.resolve()) is None:
@@ -96,6 +137,44 @@ def render_delivery_run_next_preview(result: DeliveryRunNextPreview) -> str:
         lines.append(f"Selected unit: {result.selected_unit.id}{title}")
         lines.append(f"Task path: {result.selected_unit.task_path}")
     lines.append(f"Dry run: {'yes' if result.dry_run else 'no'}")
+    lines.append(result.message)
+    if result.errors:
+        lines.append("")
+        lines.append("Errors:")
+        for issue in result.errors:
+            lines.append(_format_issue(issue))
+    if result.warnings:
+        lines.append("")
+        lines.append("Warnings:")
+        for issue in result.warnings:
+            lines.append(_format_issue(issue))
+    return "\n".join(lines) + "\n"
+
+
+def render_delivery_run_next_execution(result: DeliveryRunNextExecutionResult) -> str:
+    lines = [
+        f"Delivery run-next: {result.plan_path}",
+        f"Status: {'done' if result.succeeded else 'failed' if result.ran else 'blocked'}",
+    ]
+    if result.project_root:
+        lines.append(f"Project root: {result.project_root}")
+    if result.status:
+        lines.append(f"Plan status: {result.status}")
+    lines.append(f"Progress exists: {'yes' if result.progress_exists else 'no'}")
+    if result.selected_unit:
+        title = f" - {result.selected_unit.title}" if result.selected_unit.title else ""
+        lines.append(f"Selected unit: {result.selected_unit.id}{title}")
+        lines.append(f"Task path: {result.selected_unit.task_path}")
+    if result.child_task_id:
+        lines.append(f"Child task: {result.child_task_id}")
+    if result.unit_status:
+        lines.append(f"Unit status: {result.unit_status}")
+    if result.run_exit_code is not None:
+        lines.append(f"Run exit code: {result.run_exit_code}")
+    if result.progress_path:
+        lines.append(f"Progress: {result.progress_path}")
+    if result.events_path:
+        lines.append(f"Events: {result.events_path}")
     lines.append(result.message)
     if result.errors:
         lines.append("")
