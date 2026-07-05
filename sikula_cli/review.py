@@ -188,7 +188,7 @@ def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | Non
     review_context_agents = ["reviewer"]
     if run_security_review:
         review_context_agents.append("security_reviewer")
-    if args.fix:
+    if args.fix and cfg.get("run_test_writing", False):
         review_context_agents.append("test_writer")
     context.require_worktree_context_for_review(cfg, git_root, review_start_ref, tuple(review_context_agents))
 

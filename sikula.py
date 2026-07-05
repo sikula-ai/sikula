@@ -462,7 +462,12 @@ def _print_current_branch_clean_error(
     print("Commit, stash, or remove these changes and rerun the command.")
 
 
-_WORKTREE_CONTEXT_AGENT_NAMES = ("planner", "reviewer", "security_reviewer", "test_writer")
+_RUN_PHASE_CONTEXT_AGENTS = (
+    ("run_planner", "planner"),
+    ("run_review", "reviewer"),
+    ("run_security_review", "security_reviewer"),
+    ("run_test_writing", "test_writer"),
+)
 
 
 def _worktree_context_files(
@@ -507,12 +512,21 @@ def _worktree_context_files(
     return deduped
 
 
-def _isolation_context_files(cfg: dict) -> list[tuple[str, Path]]:
+def _run_context_agent_names(cfg: dict, overrides: dict | None = None) -> tuple[str, ...]:
+    overrides = overrides or {}
+    return tuple(
+        agent_name
+        for phase_name, agent_name in _RUN_PHASE_CONTEXT_AGENTS
+        if _run_phase_flag(cfg, overrides, phase_name)
+    )
+
+
+def _isolation_context_files(cfg: dict, overrides: dict | None = None) -> list[tuple[str, Path]]:
     """Return files that must be present unchanged in isolated task worktrees."""
     return _worktree_context_files(
         cfg,
         include_config=True,
-        agent_names=_WORKTREE_CONTEXT_AGENT_NAMES,
+        agent_names=_run_context_agent_names(cfg, overrides),
     )
 
 
@@ -576,14 +590,14 @@ def _require_worktree_context_files(
     sys.exit(1)
 
 
-def _require_committed_config_for_isolated_run(cfg: dict, git_root: Path) -> None:
+def _require_committed_config_for_isolated_run(cfg: dict, git_root: Path, overrides: dict | None = None) -> None:
     """Fail fast when config/prompt context will not exist unchanged in a new worktree."""
     _require_worktree_context_files(
         cfg,
         git_root,
         start_ref="HEAD",
         include_config=True,
-        agent_names=_WORKTREE_CONTEXT_AGENT_NAMES,
+        agent_names=_run_context_agent_names(cfg, overrides),
         command_label="isolated run",
         worktree_label="task worktree",
         show_no_isolate_hint=True,

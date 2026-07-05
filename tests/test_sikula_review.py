@@ -241,10 +241,11 @@ class TestReviewWorktreeContextGuard:
         assert "ensure the reviewed branch contains those commits" in out
 
     @pytest.mark.parametrize(
-        ("fix", "security_review", "expected_agents"),
+        ("fix", "security_review", "run_test_writing", "expected_agents"),
         [
-            (False, None, ("reviewer", "security_reviewer")),
-            (True, False, ("reviewer", "test_writer")),
+            (False, None, False, ("reviewer", "security_reviewer")),
+            (True, False, True, ("reviewer", "test_writer")),
+            (True, False, False, ("reviewer",)),
         ],
     )
     def test_review_calls_context_guard_before_worktree(
@@ -252,6 +253,7 @@ class TestReviewWorktreeContextGuard:
         tmp_path: Path,
         fix: bool,
         security_review: bool | None,
+        run_test_writing: bool,
         expected_agents: tuple[str, ...],
     ):
         calls = []
@@ -268,6 +270,9 @@ class TestReviewWorktreeContextGuard:
             seen["agent_names"] = agent_names
             raise SystemExit(1)
 
+        cfg = _cfg(tmp_path)
+        cfg["run_test_writing"] = run_test_writing
+
         with (
             patch("sikula._find_git_root", return_value=tmp_path),
             patch("sikula._ensure_gitignore"),
@@ -275,7 +280,7 @@ class TestReviewWorktreeContextGuard:
             patch("subprocess.run", side_effect=capture),
             pytest.raises(SystemExit) as exc_info,
         ):
-            cmd_review(_args(fix=fix, security_review=security_review), _cfg(tmp_path))
+            cmd_review(_args(fix=fix, security_review=security_review), cfg)
 
         assert exc_info.value.code == 1
         assert seen["git_root"] == tmp_path

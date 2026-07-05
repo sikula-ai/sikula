@@ -124,7 +124,7 @@ planner:
 ```
 
 `extra_rules` files are plain Markdown paths relative to the project root. Sikula appends the file content to the selected agent prompt under `## Project-specific rules`.
-For isolated worktrees, configured `extra_rules` files must exist in the worktree start ref, be tracked by git, and be clean before Sikula creates the worktree. Otherwise the agent would run with stale or missing rules. For `sikula review`, this means the reviewed branch must already contain the rule files it is configured to use.
+For isolated worktrees, `extra_rules` files used by enabled agent phases must exist in the worktree start ref, be tracked by git, and be clean before Sikula creates the worktree. Otherwise the agent would run with stale or missing rules. For `sikula review`, this means the reviewed branch must already contain the rule files it is configured to use.
 
 Use them for:
 

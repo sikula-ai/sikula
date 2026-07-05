@@ -326,17 +326,17 @@ guidelines:
 planner:
   max_steps: 6
   # Optional project-specific prompt overlay for the planner.
-  # If enabled, commit the file before isolated worktrees use it.
+  # If enabled for planner runs, commit the file before isolated worktrees use it.
   # extra_rules: .sikula/planner_rules.md
 
 # reviewer:
 #   # Optional project-specific prompt overlay for correctness, architecture, and invariants.
-#   # If enabled, commit the file before isolated worktrees use it.
+#   # If enabled for review runs, commit the file before isolated worktrees use it.
 #   extra_rules: .sikula/reviewer_rules.md
 
 # security_reviewer:
 #   # Optional project-specific prompt overlay for threat model and data handling.
-#   # If enabled, commit the file before isolated worktrees use it.
+#   # If enabled for security review runs, commit the file before isolated worktrees use it.
 #   extra_rules: .sikula/security_rules.md
 
 test_writer:
@@ -352,7 +352,7 @@ test_writer:
   # warn = record a visible audit warning; fail = fail the task.
   testability_gap_policy: warn
   # Optional project-specific prompt overlay for testing conventions and required doubles.
-  # If enabled, commit the file before isolated worktrees use it.
+  # If enabled for test-writing runs, commit the file before isolated worktrees use it.
   # extra_rules: .sikula/test_writer_rules.md
 """
 

@@ -133,7 +133,7 @@ sikula review \
   --no-security-review
 ```
 
-Review mode honors `reviewer.extra_rules` and `security_reviewer.extra_rules`. In `--fix` mode, `test_writer.extra_rules` is also used when the test writer runs. These files, and any `guidelines.context_files`, must be tracked, clean, and present in the reviewed branch before Sikula creates the review worktree. See [Project-Specific Agent Rules](configuration.md#project-specific-agent-rules).
+Review mode honors `reviewer.extra_rules` and `security_reviewer.extra_rules`. In `--fix` mode, `test_writer.extra_rules` is also used when the test writer runs. Rule files for agents that run, and any `guidelines.context_files`, must be tracked, clean, and present in the reviewed branch before Sikula creates the review worktree. See [Project-Specific Agent Rules](configuration.md#project-specific-agent-rules).
 
 ## CI Use
 

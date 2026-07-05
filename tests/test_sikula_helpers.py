@@ -402,6 +402,7 @@ class TestGenerateConfig:
         assert "#   extra_rules: .sikula/security_rules.md" in cfg
         assert "# extra_rules: .sikula/test_writer_rules.md" in cfg
         assert "commit the file before isolated worktrees use it" in cfg
+        assert "If enabled for review runs" in cfg
         assert "\nreviewer:\n  extra_rules:" not in cfg
         assert "\nsecurity_reviewer:\n  extra_rules:" not in cfg
 

@@ -116,7 +116,7 @@ class RunContext:
     reset_failed_state: Callable[..., None]
     resolve_task_path: Callable[[str, Path], Path | None]
     find_git_root: Callable[[Path], Path | None]
-    require_committed_config_for_isolated_run: Callable[[dict, Path], None]
+    require_committed_config_for_isolated_run: Callable[[dict, Path, dict | None], None]
     run_config_snapshot: Callable[..., dict]
     contract_preflight_config: Callable[[dict, dict], dict]
     build_contract_preflight_snapshot_and_assets: Callable[..., tuple[dict, list[dict]]]
@@ -233,7 +233,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             print("  Run 'git init && git add -A && git commit -m init' to initialize a repository.")
             sys.exit(1)
         if isolate:
-            context.require_committed_config_for_isolated_run(cfg, git_root)
+            context.require_committed_config_for_isolated_run(cfg, git_root, overrides)
 
         description = task_path.read_text().strip()
         state = store.create(description)

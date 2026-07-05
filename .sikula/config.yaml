@@ -230,12 +230,12 @@ planner:
 
 # Reviewer configuration.
 reviewer:
-  # This prompt overlay must be committed/clean before isolated worktree creation.
+  # When review runs, this prompt overlay must be committed/clean before isolated worktree creation.
   extra_rules: .sikula/reviewer_rules.md
 
 # Security reviewer configuration.
 security_reviewer:
-  # This prompt overlay must be committed/clean before isolated worktree creation.
+  # When security review runs, this prompt overlay must be committed/clean before isolated worktree creation.
   extra_rules: .sikula/security_rules.md
 
 # Test writer configuration.
@@ -251,5 +251,5 @@ test_writer:
   # What to do when safe tests require missing project seams/infrastructure:
   # warn = record a visible audit warning; fail = fail the task.
   testability_gap_policy: warn
-  # This prompt overlay must be committed/clean before isolated worktree creation.
+  # When test writing runs, this prompt overlay must be committed/clean before isolated worktree creation.
   extra_rules: .sikula/test_writer_rules.md
