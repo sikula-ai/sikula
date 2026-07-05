@@ -182,7 +182,7 @@ delivery safety checks pass.
 ## Common First-Run Issues
 
 - **`pipx: command not found`** - install `pipx` from <https://pipx.pypa.io/stable/installation/>.
-- **Config or guidelines missing in the task worktree** - commit `.sikula/config.yaml` and any generated `.sikula/guidelines.md` before the first isolated run.
+- **Config, guidelines, or rules missing in the worktree** - commit `.sikula/config.yaml`, any generated `.sikula/guidelines.md`, and any `extra_rules` files used by enabled phases before the first isolated run. These prompt-context paths must be files in the worktree start ref. For `sikula review`, make sure the reviewed branch contains its configured guidelines/rules files.
 - **Provider is not authenticated** - run `codex login` or see [Providers](docs/providers.md) for Claude, Gemini, OpenCode, and Antigravity.
 - **Task is too vague** - run `sikula contract check .sikula/tasks/my-task.md` and see [Writing Sikula Tasks](docs/writing-tasks.md).
 - **Run failed after creating a worktree** - inspect `sikula show <task-id>` and `.sikula/worktrees/<task-id>/`; retry with `sikula run --task-id <task-id> --reset-failed`.

@@ -192,10 +192,14 @@ class TestScanGuidelineFiles:
         assert result.guidelines_files == []
 
     def test_detects_multiple_guideline_files(self, tmp_path: Path):
+        (tmp_path / "guidelines.md").write_text("")
+        (tmp_path / "ARCHITECTURE.md").write_text("")
         (tmp_path / "AGENTS.md").write_text("")
         (tmp_path / "README.md").write_text("")
         (tmp_path / "CONTRIBUTING.md").write_text("")
         result = scan(tmp_path)
+        assert result.guidelines_files.index("guidelines.md") < result.guidelines_files.index("ARCHITECTURE.md")
+        assert result.guidelines_files.index("ARCHITECTURE.md") < result.guidelines_files.index("AGENTS.md")
         assert result.guidelines_files.index("AGENTS.md") < result.guidelines_files.index("README.md")
         assert "README.md" in result.guidelines_files
         assert "CONTRIBUTING.md" in result.guidelines_files

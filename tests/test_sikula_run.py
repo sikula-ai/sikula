@@ -1467,7 +1467,7 @@ class TestIsolatedRunConfigGuard:
 
         assert exc_info.value.code == 1
         out = capsys.readouterr().out
-        assert "requires Sikula config/context files to be committed" in out
+        assert "requires Sikula config/prompt-context files to be committed" in out
         assert "not tracked by git" in out
         assert "git add .sikula/config.yaml" in out
 
@@ -1552,6 +1552,134 @@ class TestIsolatedRunConfigGuard:
         out = capsys.readouterr().out
         assert ".sikula/guidelines.md (guidelines): has unstaged changes" in out
 
+    def test_guidelines_context_directory_exits_before_worktree(self, tmp_path: Path, capsys):
+        config_path = self._init_repo_with_config(tmp_path, commit_config=True)
+        guidelines_path = tmp_path / ".sikula" / "guidelines.md"
+        guidelines_path.mkdir()
+        (guidelines_path / "index.md").write_text("# Guidelines\n")
+        _git_commit_all(tmp_path, "Add guidelines directory")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _require_committed_config_for_isolated_run(
+                {
+                    "_config_path": str(config_path),
+                    "project": {"root_path": str(tmp_path)},
+                    "guidelines": {"context_files": [".sikula/guidelines.md"]},
+                },
+                tmp_path,
+            )
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert ".sikula/guidelines.md (guidelines): is a directory in worktree start ref 'HEAD'" in out
+        assert "expected a file" in out
+
+    def test_untracked_extra_rules_exits_before_worktree(self, tmp_path: Path, capsys):
+        config_path = self._init_repo_with_config(tmp_path, commit_config=True)
+        rules_path = tmp_path / ".sikula" / "reviewer_rules.md"
+        rules_path.write_text("# Reviewer Rules\n")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _require_committed_config_for_isolated_run(
+                {
+                    "_config_path": str(config_path),
+                    "project": {"root_path": str(tmp_path)},
+                    "run_review": True,
+                    "reviewer": {"extra_rules": ".sikula/reviewer_rules.md"},
+                },
+                tmp_path,
+            )
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert ".sikula/reviewer_rules.md (reviewer.extra_rules): not tracked by git" in out
+
+    def test_missing_extra_rules_exits_before_worktree(self, tmp_path: Path, capsys):
+        config_path = self._init_repo_with_config(tmp_path, commit_config=True)
+
+        with pytest.raises(SystemExit) as exc_info:
+            _require_committed_config_for_isolated_run(
+                {
+                    "_config_path": str(config_path),
+                    "project": {"root_path": str(tmp_path)},
+                    "run_security_review": True,
+                    "security_reviewer": {"extra_rules": ".sikula/missing-security-rules.md"},
+                },
+                tmp_path,
+            )
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert ".sikula/missing-security-rules.md (security_reviewer.extra_rules): does not exist" in out
+
+    def test_modified_extra_rules_exits_before_worktree(self, tmp_path: Path, capsys):
+        config_path = self._init_repo_with_config(tmp_path, commit_config=True)
+        rules_path = tmp_path / ".sikula" / "test_writer_rules.md"
+        rules_path.write_text("# Test Writer Rules\n")
+        _git_commit_all(tmp_path, "Add test writer rules")
+        rules_path.write_text("# Changed Test Writer Rules\n")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _require_committed_config_for_isolated_run(
+                {
+                    "_config_path": str(config_path),
+                    "project": {"root_path": str(tmp_path)},
+                    "run_test_writing": True,
+                    "test_writer": {"extra_rules": ".sikula/test_writer_rules.md"},
+                },
+                tmp_path,
+            )
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert ".sikula/test_writer_rules.md (test_writer.extra_rules): has unstaged changes" in out
+
+    def test_disabled_extra_rules_do_not_block_isolated_run(self, tmp_path: Path):
+        config_path = self._init_repo_with_config(tmp_path, commit_config=True)
+
+        _require_committed_config_for_isolated_run(
+            {
+                "_config_path": str(config_path),
+                "project": {"root_path": str(tmp_path)},
+                "run_security_review": False,
+                "security_reviewer": {"extra_rules": ".sikula/missing-security-rules.md"},
+            },
+            tmp_path,
+        )
+
+    def test_cli_disabled_extra_rules_do_not_block_isolated_run(self, tmp_path: Path):
+        config_path = self._init_repo_with_config(tmp_path, commit_config=True)
+
+        _require_committed_config_for_isolated_run(
+            {
+                "_config_path": str(config_path),
+                "project": {"root_path": str(tmp_path)},
+                "run_security_review": True,
+                "security_reviewer": {"extra_rules": ".sikula/missing-security-rules.md"},
+            },
+            tmp_path,
+            {"run_security_review": False},
+        )
+
+    def test_cli_enabled_extra_rules_exits_before_worktree(self, tmp_path: Path, capsys):
+        config_path = self._init_repo_with_config(tmp_path, commit_config=True)
+
+        with pytest.raises(SystemExit) as exc_info:
+            _require_committed_config_for_isolated_run(
+                {
+                    "_config_path": str(config_path),
+                    "project": {"root_path": str(tmp_path)},
+                    "run_security_review": False,
+                    "security_reviewer": {"extra_rules": ".sikula/missing-security-rules.md"},
+                },
+                tmp_path,
+                {"run_security_review": True},
+            )
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert ".sikula/missing-security-rules.md (security_reviewer.extra_rules): does not exist" in out
+
     def test_dirty_source_file_does_not_block_isolated_run(self, tmp_path: Path):
         config_path = self._init_repo_with_config(tmp_path, commit_config=True)
         src = tmp_path / "src" / "app.py"
@@ -1575,8 +1703,35 @@ class TestIsolatedRunConfigGuard:
 
         assert exc_info.value.code == 1
         out = capsys.readouterr().out
-        assert "requires Sikula config/context files to be committed" in out
+        assert "requires Sikula config/prompt-context files to be committed" in out
         assert not (tmp_path / ".sikula" / "state").exists()
+
+    def test_isolated_cmd_run_passes_phase_overrides_to_context_guard(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        task_file = tmp_path / "task.md"
+        task_file.write_text("do something")
+        cfg = _run_cfg(tmp_path)
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._require_committed_config_for_isolated_run", side_effect=SystemExit(1)) as guard,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_run(
+                _run_args(task_file=str(task_file), review=False, security_review=False, test_writing=False),
+                cfg,
+            )
+
+        assert exc_info.value.code == 1
+        guard.assert_called_once()
+        assert guard.call_args.args[0] is cfg
+        assert guard.call_args.args[1] == tmp_path
+        passed_overrides = guard.call_args.args[2]
+        assert passed_overrides["run_review"] is False
+        assert passed_overrides["run_security_review"] is False
+        assert passed_overrides["run_test_writing"] is False
 
     def test_no_isolate_allows_untracked_config(self, tmp_path: Path):
         config_path = self._init_repo_with_config(tmp_path, commit_config=False)

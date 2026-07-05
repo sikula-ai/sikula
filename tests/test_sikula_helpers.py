@@ -395,6 +395,17 @@ class TestGenerateConfig:
         assert "context_files: []" in cfg
         assert "- README.md" not in cfg
 
+    def test_extra_rules_examples_are_commented_and_warn_about_committing_files(self):
+        cfg = self._cfg()
+        assert "# extra_rules: .sikula/planner_rules.md" in cfg
+        assert "#   extra_rules: .sikula/reviewer_rules.md" in cfg
+        assert "#   extra_rules: .sikula/security_rules.md" in cfg
+        assert "# extra_rules: .sikula/test_writer_rules.md" in cfg
+        assert "commit the file before isolated worktrees use it" in cfg
+        assert "If enabled for review runs" in cfg
+        assert "\nreviewer:\n  extra_rules:" not in cfg
+        assert "\nsecurity_reviewer:\n  extra_rules:" not in cfg
+
     def test_gradle_jvm_has_presync_true(self):
         cfg = self._cfg(build_tool="gradle-jvm", language="Kotlin")
         assert "run_presync: true" in cfg

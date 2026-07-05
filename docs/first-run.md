@@ -78,7 +78,7 @@ If `.sikula/config.yaml` already contains `llm.provider` and `llm.model`, you ca
 
 ## Commit Config Before The First Isolated Run
 
-Default Sikula runs create a git worktree from `HEAD`. Config and guideline files must be tracked and clean, otherwise the task worktree cannot see them.
+Default Sikula runs create a git worktree from `HEAD`. Config and guideline paths must be tracked, clean files; otherwise the task worktree cannot read them. Review worktrees start from the reviewed branch or captured start commit, so that branch must also contain any configured guidelines or rule files used by review.
 
 ```bash
 git add .sikula/

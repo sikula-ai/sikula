@@ -23,6 +23,120 @@ Dependency direction: `orchestrator → agents → llm_client`, `orchestrator �
 
 ---
 
+## Self-Hosting Sikula With Sikula
+
+Sikula is expected to run against its own repository for meaningful feature
+work. Treat this as a first-class development workflow, not as a demo.
+
+### Contract-first workflow
+
+Fresh Sikula implementation work should start from a source task, then move
+through refinement, contract preparation, contract readiness, and `sikula run
+--require-contract-ready`. Direct manual edits are appropriate for small
+bootstrap fixes, repository maintenance, documentation, configuration, and
+explicit review work, but product behavior changes should be expressible as
+Sikula tasks and prepared implementation contracts.
+
+Write source tasks as product/behavior descriptions. Do not hand-author
+file-by-file implementation plans unless the exact file, command, serialized
+field, or migration behavior is itself a stable contract.
+
+Good Sikula core tasks include:
+
+- CLI command behavior, flags, exit/status semantics, and JSON output contracts;
+- state, resume, cleanup/delete, worktree, review, review-fix, and delivery
+  behavior when those surfaces are touched;
+- provider, sandbox, privacy, prompt/audit, diagnostic, and local evidence
+  boundaries when they are relevant;
+- compatibility expectations for existing `TaskState` files and existing CLI
+  workflows;
+- documentation acceptance criteria for changes that alter public behavior,
+  architecture, state fields, provider setup, task/contract preparation, or
+  project governance;
+- exact validation commands in backticks, shell code fences, or under a clear
+  `Verification:` heading when they are acceptance criteria.
+
+Do not optimize a source task for a better contract-check score by pasting
+prepared-contract scaffolding or generated validation snapshots back into the
+task. Answer delivery mechanics, reviewer focus, and validation coverage gaps
+through the answers file or prepared contract.
+
+### Editable install caveats
+
+In development, the `sikula` command is commonly installed with `pipx install
+--editable .` or a virtualenv editable install. The process that starts a run
+may therefore import code from the same checkout that a task is changing.
+
+Rules:
+
+- Prefer the default isolated worktree flow for changes to `sikula.py`,
+  `sikula_cli/`, `core/`, `agents/`, `tools/`, provider wrappers, state
+  handling, worktree handling, or delivery finalization.
+- Avoid `--no-isolate` for Sikula self-development unless the user explicitly
+  requests it and understands that the running process and edited checkout are
+  the same filesystem tree.
+- Do not rely on the currently running `sikula` process to reload modified
+  Python modules from a task worktree. Validation subprocesses and tests prove
+  the modified files; manual end-to-end CLI verification should start a fresh
+  `sikula` command after the change lands.
+- Do not add validation commands that launch nested real `sikula run` or
+  `sikula review --fix` delivery flows. Tests that exercise Sikula command
+  paths must use fake LLM clients, temporary repositories, and isolated state.
+- If package metadata, entrypoints, process-startup imports, or provider CLI
+  setup changes, follow `CONTRIBUTING.md` and reinstall or restart the editable
+  CLI before manual verification.
+- `.sikula/config.yaml` is captured into task state when a run starts. A task
+  that changes this config does not repair the active run's loaded validation
+  coverage or sandbox policy; complete the config change and start a fresh run.
+
+### Governance and runtime artifacts
+
+`guidelines.md`, `AGENTS.md`, `.sikula/config.yaml`, `.sikula/*_rules.md`,
+`ARCHITECTURE.md`, `CONTRIBUTING.md`, and public docs are governance surfaces.
+They may be changed by explicit governance/documentation/configuration tasks.
+Do not change them as incidental implementation output.
+
+Prompt-governing files (`guidelines.md`, `AGENTS.md`, `ARCHITECTURE.md`,
+`.sikula/config.yaml`, and `.sikula/*_rules.md`) can affect agent prompts and
+policy for later runs. Until Sikula snapshots all prompt context for active
+runs, a task that changes these files must be followed by a fresh Sikula review
+or run from the committed updated context before treating the governance change
+as fully approved. Role-specific `.sikula/*_rules.md` files are maintained
+outside normal agent write scope.
+
+`.sikula/state/`, `.sikula/worktrees/`, `.sikula/contract-reports/`, caches,
+coverage files, virtualenvs, and build outputs are runtime/debug artifacts. Do
+not treat them as source files and do not make contracts depend on their current
+contents unless the task explicitly targets state compatibility or runtime
+artifact policy.
+
+### Self-hosting review and testing expectations
+
+Changes to Sikula's own workflow must preserve the task's prepared
+implementation contract when one exists and keep public docs, architecture
+notes, agent guidance, and `.sikula/config.yaml` consistent when they alter
+behavior, state semantics, validation policy, provider setup, or task/contract
+expectations.
+
+Treat these as stable contracts when they are touched:
+
+- CLI flags, exit codes, status semantics, and JSON/status/result fields;
+- `TaskState` compatibility, schema migrations, status/show output, and resume;
+- worktree creation, cleanup/delete, review-fix, current-branch delivery, and
+  finalization;
+- sandbox/write-scope behavior and provider workspace boundaries;
+- provider diagnostics, prompt/state privacy, redaction, and local evidence
+  handling.
+
+Tests for Sikula command paths must use fake LLM clients, temporary
+repositories, temporary `.sikula/state` directories, and explicit config files.
+Do not require real provider credentials, git remotes, network access, package
+publishing, deployment targets, or machine-specific absolute paths. Test stable
+Sikula-owned fields, statuses, and error categories rather than incidental
+provider or third-party diagnostic wording.
+
+---
+
 ## Python Conventions
 
 ### Imports
@@ -442,8 +556,20 @@ return ToolResult(success=True, output=output)
 
 ## State Conventions
 
-`TaskState` is the single source of truth. The orchestrator persists it to JSON after every
-agent operation — do not cache state values in local variables across agent calls.
+`TaskState` is the current persisted workflow state and the resume/audit source
+of truth. The orchestrator persists it to JSON after every agent operation —
+do not cache state values in local variables across agent calls.
+
+`TaskState` JSON is local execution state and audit/debug storage. It is not a public
+protocol for runner, console, or other external consumers. Public machine-readable output
+must come from explicit projection code with stable fields, privacy rules, and tests.
+Do not implement `--json`, status/result, or future runner/console output by serializing
+raw `TaskState`, `sikula show`, prompt text, logs, or terminal output and trimming fields
+after the fact.
+
+When adding a new domain/result layer over the current state model, keep one decision
+source of truth. Legacy state fields may be derived compatibility projections, but old and
+new fields must not independently drive workflow decisions.
 
 Runtime metadata, CLI version output, and other user-facing Sikula version labels must use
 `core.version.sikula_version()` rather than calling `importlib.metadata.version("sikula")`
@@ -511,8 +637,13 @@ Framework: **pytest**. Test files live under `tests/` (the only allowed test wri
 
 ### Structure
 
-One test file per source module, flat under `tests/`: `agents/analyst_agent.py` → `tests/test_analyst_agent.py`.
-Do not create subdirectories inside `tests/`.
+Default unit-test structure is one test file per source module, flat under
+`tests/`: `agents/analyst_agent.py` -> `tests/test_analyst_agent.py`.
+Use subdirectories only for established suites such as `tests/e2e/` or when a
+task explicitly introduces a new suite boundary. E2E tests live in
+`tests/e2e/` and must use fake LLM clients, temporary repositories, and
+isolated state; they must not require provider credentials, network access, git
+remotes, or machine-specific absolute paths.
 
 ### Fixtures
 
@@ -584,6 +715,8 @@ python3 -m ruff format .
 - **Never** set `state.done` or `state.failed` in an agent — these are orchestrator-only fields.
 - **Never** clear or modify past entries in `state.history` — it is a permanent audit log.
 - **Never** use `state.implement_cycle_records`, `state.fix_cycle_records`, `state.review_cycle_records`, `state.security_review_cycle_records`, `state.test_write_records`, or `state.validation_artifact_records` to drive pipeline control flow — they are observability records only.
+- **Never** expose raw `TaskState`, prompts, provider output, logs, source snippets, or terminal text through public JSON/status/result output. Add an explicit projection instead.
+- **Never** use real provider-backed nested `sikula run` or `sikula review --fix` delivery flows as tests or validation commands unless a task explicitly targets that behavior and isolates all state and providers.
 - **Always** add `from __future__ import annotations` immediately after the optional
   module docstring and before all other imports.
 - **Always** add type hints to every function signature.
@@ -594,5 +727,6 @@ python3 -m ruff format .
 - **Always** return `AgentResult(success=False, message=...)` on failure — never raise from `run()`.
 - **Always** write all code comments in English.
 - **Always** run `ruff check .` after any code change; fix all reported issues before finishing.
+- **Always** update `ARCHITECTURE.md`, `guidelines.md`, `AGENTS.md`, `.sikula/config.yaml`, or public docs when a change alters workflow behavior, state semantics, CLI behavior, provider setup, or task/contract expectations.
 - **Always** follow the naming conventions table above for new agents, tools, constants, and methods.
 - **Always** ensure LLM output parsers degrade safely and do not crash the orchestrator on hallucinated formatting.

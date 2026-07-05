@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -22,6 +24,7 @@ _ensure_gitignore = _sikula._ensure_gitignore
 _ensure_project_gitignore_entry = _sikula._ensure_project_gitignore_entry
 _enrich_prompt_with_referenced_files = _sikula._enrich_prompt_with_referenced_files
 _run_review_agent_with_retry_history = _sikula._run_review_agent_with_retry_history
+_require_worktree_context_for_review = _sikula._require_worktree_context_for_review
 cmd_review = _sikula.cmd_review
 
 
@@ -101,6 +104,16 @@ def _subprocess_sequence(*results):
     return run
 
 
+def _git_commit_all(repo: Path, message: str = "init") -> None:
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", message],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+
 def _args(**kwargs):
     defaults = dict(
         branch="feat/x",
@@ -174,6 +187,134 @@ def _run_review(
     tasks = store.list_tasks()
     assert tasks, "no task state was saved"
     return store.load(tasks[0])
+
+
+# ---------------------------------------------------------------------------
+# Review worktree prompt context guard
+# ---------------------------------------------------------------------------
+
+
+class TestReviewWorktreeContextGuard:
+    def _init_repo(self, tmp_path: Path) -> None:
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        (tmp_path / "README.md").write_text("# Project\n")
+        _git_commit_all(tmp_path)
+
+    def test_untracked_review_extra_rules_exit_before_worktree(self, tmp_path: Path, capsys):
+        self._init_repo(tmp_path)
+        rules_path = tmp_path / ".sikula" / "reviewer_rules.md"
+        rules_path.parent.mkdir()
+        rules_path.write_text("# Reviewer Rules\n")
+        cfg = _cfg(tmp_path)
+        cfg["reviewer"] = {"extra_rules": ".sikula/reviewer_rules.md"}
+
+        with pytest.raises(SystemExit) as exc_info:
+            _require_worktree_context_for_review(cfg, tmp_path, "HEAD", ("reviewer",))
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "review requires Sikula prompt-context files to be committed" in out
+        assert ".sikula/reviewer_rules.md (reviewer.extra_rules): not tracked by git" in out
+        assert "review worktree starts from HEAD" in out
+
+    def test_review_extra_rules_must_exist_in_review_start_ref(self, tmp_path: Path, capsys):
+        self._init_repo(tmp_path)
+        start_ref = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        rules_path = tmp_path / ".sikula" / "reviewer_rules.md"
+        rules_path.parent.mkdir()
+        rules_path.write_text("# Reviewer Rules\n")
+        _git_commit_all(tmp_path, "Add reviewer rules")
+        cfg = _cfg(tmp_path)
+        cfg["reviewer"] = {"extra_rules": ".sikula/reviewer_rules.md"}
+
+        with pytest.raises(SystemExit) as exc_info:
+            _require_worktree_context_for_review(cfg, tmp_path, start_ref, ("reviewer",))
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert ".sikula/reviewer_rules.md (reviewer.extra_rules): not present in worktree start ref" in out
+        assert "ensure the reviewed branch contains those commits" in out
+
+    def test_review_extra_rules_must_be_file_in_review_start_ref(self, tmp_path: Path, capsys):
+        self._init_repo(tmp_path)
+        rules_path = tmp_path / ".sikula" / "reviewer_rules.md"
+        rules_path.mkdir(parents=True)
+        (rules_path / "index.md").write_text("# Reviewer Rules\n")
+        _git_commit_all(tmp_path, "Add reviewer rules directory")
+        start_ref = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        shutil.rmtree(rules_path)
+        rules_path.write_text("# Reviewer Rules\n")
+        _git_commit_all(tmp_path, "Replace reviewer rules with file")
+        cfg = _cfg(tmp_path)
+        cfg["reviewer"] = {"extra_rules": ".sikula/reviewer_rules.md"}
+
+        with pytest.raises(SystemExit) as exc_info:
+            _require_worktree_context_for_review(cfg, tmp_path, start_ref, ("reviewer",))
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert ".sikula/reviewer_rules.md (reviewer.extra_rules): is a directory in worktree start ref" in out
+        assert "expected a file" in out
+
+    @pytest.mark.parametrize(
+        ("fix", "security_review", "run_test_writing", "expected_agents"),
+        [
+            (False, None, False, ("reviewer", "security_reviewer")),
+            (True, False, True, ("reviewer", "test_writer")),
+            (True, False, False, ("reviewer",)),
+        ],
+    )
+    def test_review_calls_context_guard_before_worktree(
+        self,
+        tmp_path: Path,
+        fix: bool,
+        security_review: bool | None,
+        run_test_writing: bool,
+        expected_agents: tuple[str, ...],
+    ):
+        calls = []
+        seen: dict[str, object] = {}
+
+        def capture(cmd, **kwargs):
+            calls.append(cmd)
+            return _sub()
+
+        def guard(cfg_arg, git_root, start_ref, agent_names):
+            seen["cfg"] = cfg_arg
+            seen["git_root"] = git_root
+            seen["start_ref"] = start_ref
+            seen["agent_names"] = agent_names
+            raise SystemExit(1)
+
+        cfg = _cfg(tmp_path)
+        cfg["run_test_writing"] = run_test_writing
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("sikula._require_worktree_context_for_review", side_effect=guard),
+            patch("subprocess.run", side_effect=capture),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(_args(fix=fix, security_review=security_review), cfg)
+
+        assert exc_info.value.code == 1
+        assert seen["git_root"] == tmp_path
+        assert seen["start_ref"] == "feat/x"
+        assert seen["agent_names"] == expected_agents
+        assert not any(cmd[0:3] == ["git", "worktree", "add"] for cmd in calls)
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +503,7 @@ class TestCmdReviewReportOnlyState:
         with (
             patch("sikula._find_git_root", return_value=tmp_path),
             patch("sikula._ensure_gitignore"),
+            patch("sikula._require_worktree_context_for_review"),
             patch("subprocess.run", side_effect=subprocess_results),
             patch("sikula._enrich_prompt_with_referenced_files", return_value=""),
             patch("agents.reviewer_agent.ReviewerAgent", return_value=mock_reviewer),

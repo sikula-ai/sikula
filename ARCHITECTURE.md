@@ -52,8 +52,10 @@ preflight, asset audits, and resume logic.
 ```
 cmd_run()
    │
-   ├─ guard: for isolated runs, loaded config and guidelines.context_files
-   │     must exist, be tracked, and be clean relative to HEAD; otherwise
+   ├─ guard: for isolated runs, loaded config, guidelines.context_files,
+   │     and extra_rules for enabled planner/reviewer/security_reviewer/test_writer phases
+   │     files must exist as file blobs at the worktree start ref, be tracked,
+   │     and be clean relative to HEAD; otherwise
    │     fail before creating TaskState/worktree
    │
    ├─ read task file  →  TaskState created (state.task_id = uuid4().hex)
@@ -512,6 +514,12 @@ cmd_review()
    ├─ guard: --description or --description-file is required
    │     (review scope must be explicit; no generated fallback)
    │
+   ├─ guard: guidelines.context_files and configured review prompt overlays
+   │     must exist as file blobs at the review worktree start ref, be tracked,
+   │     and be clean before worktree creation. Report-only review checks reviewer rules
+   │     plus security reviewer rules when security review is enabled;
+   │     review-fix also checks test_writer.extra_rules when test writing is enabled.
+   │
    ├─ worktree creation (differs by mode):
    │    report-only: git worktree add --detach .sikula/worktrees/<task_id> <sha>
    │                 (detached HEAD — works even when caller is on the reviewed branch)
@@ -689,8 +697,12 @@ cmd_init()
 
 The final output reminds the user to commit `.sikula/config.yaml` and `.sikula/.gitignore`
 before the first isolated run. If guidelines were generated, `.sikula/guidelines.md` is
-listed as part of the suggested commit too. The first isolated run enforces the loaded
-config and every file referenced by `guidelines.context_files`.
+listed as part of the suggested commit too. Isolated worktree creation enforces the loaded
+config for task runs, every file referenced by `guidelines.context_files`, and every
+`planner.extra_rules`, `reviewer.extra_rules`, `security_reviewer.extra_rules`, or
+`test_writer.extra_rules` file consumed by an enabled phase in that workflow so worktrees
+cannot silently run with stale or missing prompt policy. Review worktrees also require the
+prompt context to be present as files in the reviewed branch or captured start commit.
 
 **CLI flags:**
 - `--guidelines` — trigger guidelines generation via `InitAgent`
@@ -1721,7 +1733,7 @@ All keys live under `planner:` in `.sikula/config.yaml`.
 | Key | Default | Description |
 |---|---|---|
 | `max_steps` | `8` | Maximum number of steps the planner may produce; injected into the prompt as an upper bound and enforced before implementation starts |
-| `extra_rules` | — | Path (relative to project root) to a Markdown file appended to the planner's system prompt as `## Project-specific rules` with an explicit override statement. Scope: task-splitting decisions only — which concerns to split, which to keep atomic. Has no effect on what individual agents do. |
+| `extra_rules` | — | Path (relative to project root) to a Markdown file appended to the planner's system prompt as `## Project-specific rules` with an explicit override statement. Scope: task-splitting decisions only — which concerns to split, which to keep atomic. Has no effect on what individual agents do. When the planner runs in an isolated worktree, the file must exist as a file blob in the worktree start ref, be tracked by git, and be clean before worktree creation. |
 
 #### `reviewer` config keys
 
@@ -1729,7 +1741,7 @@ All keys live under `reviewer:` in `.sikula/config.yaml`.
 
 | Key | Default | Description |
 |---|---|---|
-| `extra_rules` | — | Path (relative to project root) to a Markdown file appended to the reviewer's system prompt as `## Project-specific rules`. Use for project-specific correctness checks: invariants, architecture constraints, thread safety requirements. The reviewer is read-only — these rules cannot trigger file writes. |
+| `extra_rules` | — | Path (relative to project root) to a Markdown file appended to the reviewer's system prompt as `## Project-specific rules`. Use for project-specific correctness checks: invariants, architecture constraints, thread safety requirements. The reviewer is read-only — these rules cannot trigger file writes. When the reviewer runs in an isolated worktree, the file must exist as a file blob in the worktree start ref, be tracked by git, and be clean before worktree creation. |
 
 #### `security_reviewer` config keys
 
@@ -1737,7 +1749,7 @@ All keys live under `security_reviewer:` in `.sikula/config.yaml`.
 
 | Key | Default | Description |
 |---|---|---|
-| `extra_rules` | — | Path (relative to project root) to a Markdown file appended to the security reviewer's system prompt as `## Project-specific rules`. Use for project-specific security requirements: compliance rules (GDPR, PCI), data classification, threat model specifics. Appended before the BLOCKING/WARNING output format — project rules take priority over the defaults. |
+| `extra_rules` | — | Path (relative to project root) to a Markdown file appended to the security reviewer's system prompt as `## Project-specific rules`. Use for project-specific security requirements: compliance rules (GDPR, PCI), data classification, threat model specifics. Appended before the BLOCKING/WARNING output format — project rules take priority over the defaults. When the security reviewer runs in an isolated worktree, the file must exist as a file blob in the worktree start ref, be tracked by git, and be clean before worktree creation. |
 
 #### `test_writer` config keys
 
@@ -1748,7 +1760,7 @@ All keys live under `test_writer:` in `.sikula/config.yaml`.
 | `coverage_target` | `90` | Minimum branch+line coverage % the agent must aim for on new/changed code within the configured test surface |
 | `test_surface_policy` | `existing_infrastructure` | `existing_infrastructure` stays within existing project test infra and does not treat missing heavy UI/browser/device/runtime harnesses as gaps by themselves; `complete` opts in to `TESTABILITY GAP` reports when important behaviour needs missing test infra outside the existing surface. The test writer prefers behavioural seams and should not replace missing UI/browser/device/runtime harnesses with broad source-inspection tests, synthetic runtime/framework harnesses, or skipped/disabled tests that the configured validation will not execute. |
 | `testability_gap_policy` | `warn` | `warn` records visible test-writer `TESTABILITY GAP` entries and allows the task to continue; `fail` records the same entries and fails the task |
-| `extra_rules` | — | Path (relative to project root) to a Markdown file appended to the test writer's prompt as `## Project-specific rules`. Use for project-specific testing conventions: required test doubles, naming patterns, mandatory parametric table rules. Note: unlike the analyst, reviewer, and security reviewer, the test writer does not have guidelines content pre-loaded — it reads `guidelines.context_files` via its file tools. `extra_rules` is the correct configuration point for test-specific conventions that the test writer should apply without needing to read the full guidelines. |
+| `extra_rules` | — | Path (relative to project root) to a Markdown file appended to the test writer's prompt as `## Project-specific rules`. Use for project-specific testing conventions: required test doubles, naming patterns, mandatory parametric table rules. Note: unlike the analyst, reviewer, and security reviewer, the test writer does not have guidelines content pre-loaded — it reads `guidelines.context_files` via its file tools. `extra_rules` is the correct configuration point for test-specific conventions that the test writer should apply without needing to read the full guidelines. When the test writer runs in an isolated worktree, the file must exist as a file blob in the worktree start ref, be tracked by git, and be clean before worktree creation. |
 
 ---
 
