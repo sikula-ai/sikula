@@ -207,6 +207,26 @@ def test_preview_delivery_run_next_selects_first_eligible_unit(tmp_path: Path) -
     assert "Private task body" not in json.dumps(result.to_dict())
 
 
+def test_preview_delivery_run_next_preserves_component_metadata(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan["components"] = [{"id": "api", "path": "packages/api", "stream": "app"}]
+    plan["units"][0]["component"] = "api"
+    plan["units"][0]["scope_paths"] = ["packages/api/src"]
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+
+    result = preview_delivery_run_next(plan_path)
+    payload = result.to_dict()
+
+    assert result.ready is True
+    assert result.selected_unit is not None
+    assert result.selected_unit.component == "api"
+    assert result.selected_unit.scope_paths == ["packages/api/src"]
+    assert payload["selected_unit"]["component"] == "api"
+    assert payload["selected_unit"]["scope_paths"] == ["packages/api/src"]
+
+
 def test_preview_delivery_run_next_respects_completed_dependencies(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)

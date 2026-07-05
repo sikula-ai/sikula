@@ -94,11 +94,14 @@ def test_delivery_status_cli_reports_pending_units_without_project_config(
             "title": "Delivery status smoke",
             "final_branch": "sikula/delivery/delivery-status-smoke",
             "streams": [{"id": "app", "label": "App"}],
+            "components": [{"id": "web", "path": "apps/web", "stream": "app"}],
             "units": [
                 {
                     "id": "01-foundation",
                     "title": "Add foundation",
                     "stream": "app",
+                    "component": "web",
+                    "scope_paths": ["apps/web/src"],
                     "platform": "shared",
                     "task_path": unit_1,
                     "depends_on": [],
@@ -124,7 +127,10 @@ def test_delivery_status_cli_reports_pending_units_without_project_config(
     assert payload["status"] == "pending"
     assert payload["progress_exists"] is False
     assert payload["units"][0]["eligible"] is True
+    assert payload["units"][0]["component"] == "web"
+    assert payload["units"][0]["scope_paths"] == ["apps/web/src"]
     assert payload["units"][1]["blocked_by"] == ["01-foundation"]
+    assert payload["plan"]["components"] == [{"id": "web", "path": "apps/web", "stream": "app"}]
 
 
 def test_delivery_run_next_dry_run_reports_selected_unit_with_project_config(
@@ -142,11 +148,14 @@ def test_delivery_run_next_dry_run_reports_selected_unit_with_project_config(
             "title": "Delivery run-next smoke",
             "final_branch": "sikula/delivery/delivery-run-next-smoke",
             "streams": [{"id": "app", "label": "App"}],
+            "components": [{"id": "web", "path": "apps/web", "stream": "app"}],
             "units": [
                 {
                     "id": "01-foundation",
                     "title": "Add foundation",
                     "stream": "app",
+                    "component": "web",
+                    "scope_paths": ["apps/web/src"],
                     "platform": "shared",
                     "task_path": unit_1,
                     "depends_on": [],
@@ -177,6 +186,8 @@ def test_delivery_run_next_dry_run_reports_selected_unit_with_project_config(
     assert payload["dry_run"] is True
     assert payload["selected_unit"]["id"] == "01-foundation"
     assert payload["selected_unit"]["task_path"] == unit_1
+    assert payload["selected_unit"]["component"] == "web"
+    assert payload["selected_unit"]["scope_paths"] == ["apps/web/src"]
     assert payload["progress_exists"] is False
     assert not (git_project / ".sikula" / "state" / "delivery" / "delivery-run-next-smoke" / "progress.json").exists()
 

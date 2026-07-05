@@ -82,6 +82,7 @@ The MVP validator checks:
 - unit task paths,
 - unit dependency references and cycles,
 - optional stream references,
+- optional monorepo component references and project-relative scope paths,
 - single-repository scope.
 
 `delivery status` first runs the same plan validation, then reads ignored parent
@@ -106,10 +107,19 @@ final_branch: sikula/delivery/checkout-redesign
 streams:
   - id: backend
     label: Backend
+components:
+  - id: api
+    label: API package
+    path: packages/api
+    stream: backend
 units:
   - id: 01-domain-model
     title: Add checkout domain model
     stream: backend
+    component: api
+    scope_paths:
+      - packages/api/src
+      - packages/api/tests
     platform: shared
     task_path: .sikula/delivery/checkout-redesign/units/01-domain-model.md
     depends_on: []
@@ -125,6 +135,33 @@ units:
 Unit task files are ordinary Markdown task descriptions for future Sikula runs.
 The parent plan stores structure and ordering; it should not duplicate raw task
 content.
+
+## Monorepo Components
+
+Plans may define `components` to describe project-local parts of a monorepo, then
+tag individual units with `component` and optional `scope_paths`:
+
+```yaml
+components:
+  - id: android
+    label: Android app
+    path: apps/android
+    stream: mobile
+units:
+  - id: 03-android-login
+    component: android
+    scope_paths:
+      - apps/android/app/src/main
+    task_path: .sikula/delivery/product/units/03-android-login.md
+    depends_on: []
+```
+
+The MVP validates that component paths and unit scope paths are portable
+project-relative paths inside the current Git repository, and that unit
+`component` references point to declared components. These fields are metadata
+for planning, status, JSON consumers, and future delivery-console grouping. They
+do not change `sikula run` behavior, restrict provider filesystem access, filter
+validation commands, infer dependencies, or create separate worktrees.
 
 ## Repository Scope
 

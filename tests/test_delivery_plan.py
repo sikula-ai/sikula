@@ -90,6 +90,44 @@ def test_delivery_plan_check_accepts_valid_single_repo_plan(tmp_path: Path) -> N
     assert "Units: 2" in rendered
 
 
+def test_delivery_plan_check_preserves_monorepo_component_metadata(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["components"] = [
+        {
+            "id": "api",
+            "label": "API package",
+            "path": "packages/api",
+            "stream": "backend",
+        }
+    ]
+    data["units"][0]["component"] = "api"
+    data["units"][0]["scope_paths"] = ["packages/api/src", "packages/api/package.json"]
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is True
+    assert result.plan is not None
+    assert result.plan.components[0].to_dict() == {
+        "id": "api",
+        "path": "packages/api",
+        "label": "API package",
+        "stream": "backend",
+    }
+    payload = result.to_dict()
+    assert payload["plan"]["components"] == [
+        {
+            "id": "api",
+            "path": "packages/api",
+            "label": "API package",
+            "stream": "backend",
+        }
+    ]
+    assert payload["plan"]["units"][0]["component"] == "api"
+    assert payload["plan"]["units"][0]["scope_paths"] == ["packages/api/src", "packages/api/package.json"]
+
+
 def test_delivery_plan_check_rejects_unsupported_schema_version(tmp_path: Path) -> None:
     _git_init(tmp_path)
     data = _base_plan(tmp_path)
@@ -242,6 +280,34 @@ def test_delivery_plan_check_warns_when_unit_stream_is_missing(tmp_path: Path) -
     rendered = render_delivery_plan_check(result)
     assert "Warnings:" in rendered
     assert "units.stream_missing" in rendered
+
+
+def test_delivery_plan_check_reports_invalid_component_shapes_and_references(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["components"] = [
+        {"id": "api", "path": "packages/api", "stream": "backend"},
+        "bad component",
+        {"id": "api", "path": "../outside", "stream": "web"},
+        {"label": "No id"},
+    ]
+    data["units"][0]["component"] = "missing"
+    data["units"][1]["scope_paths"] = [str(tmp_path / "absolute"), "../outside", "bad\0"]
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is False
+    assert "components.item_invalid" in _codes(result)
+    assert "components.duplicate_id" in _codes(result)
+    assert "components.path_outside_project" in _codes(result)
+    assert "components.stream_unknown" in _codes(result)
+    assert "components[3].id.missing" in _codes(result)
+    assert "components[3].path.missing" in _codes(result)
+    assert "units.component_unknown" in _codes(result)
+    assert "units.scope_path_absolute" in _codes(result)
+    assert "units.scope_path_outside_project" in _codes(result)
+    assert "units.scope_path_invalid" in _codes(result)
 
 
 def test_delivery_plan_check_resolves_relative_plan_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -451,6 +517,8 @@ def test_delivery_plan_check_reports_invalid_unit_entry_and_fields(tmp_path: Pat
             "phase": 123,
             "kind": 123,
             "repo_id": 123,
+            "component": 123,
+            "scope_paths": "packages/api",
         },
     ]
     plan_path = _write_plan(tmp_path, data)
@@ -468,6 +536,8 @@ def test_delivery_plan_check_reports_invalid_unit_entry_and_fields(tmp_path: Pat
     assert "units[1].phase.invalid_type" in _codes(result)
     assert "units[1].kind.invalid_type" in _codes(result)
     assert "units[1].repo_id.invalid_type" in _codes(result)
+    assert "units[1].component.invalid_type" in _codes(result)
+    assert "units[1].scope_paths.invalid_type" in _codes(result)
 
 
 def test_delivery_plan_check_reports_invalid_dependency_entries(tmp_path: Path) -> None:

@@ -47,6 +47,25 @@ class DeliveryRepository:
 
 
 @dataclass(frozen=True)
+class DeliveryComponent:
+    id: str
+    path: str
+    label: str | None = None
+    stream: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "id": self.id,
+            "path": self.path,
+        }
+        for key in ("label", "stream"):
+            value = getattr(self, key)
+            if value:
+                data[key] = value
+        return data
+
+
+@dataclass(frozen=True)
 class DeliveryPlanUnit:
     id: str
     title: str | None
@@ -57,6 +76,8 @@ class DeliveryPlanUnit:
     phase: str | None = None
     kind: str | None = None
     repo_id: str | None = None
+    component: str | None = None
+    scope_paths: list[str] = field(default_factory=list)
     source_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -65,10 +86,12 @@ class DeliveryPlanUnit:
             "task_path": self.task_path,
             "depends_on": list(self.depends_on),
         }
-        for key in ("title", "stream", "platform", "phase", "kind", "repo_id"):
+        for key in ("title", "stream", "platform", "phase", "kind", "repo_id", "component"):
             value = getattr(self, key)
             if value:
                 data[key] = value
+        if self.scope_paths:
+            data["scope_paths"] = list(self.scope_paths)
         return data
 
 
@@ -81,6 +104,7 @@ class DeliveryPlan:
     units: list[DeliveryPlanUnit]
     repositories: list[DeliveryRepository]
     stream_ids: list[str] = field(default_factory=list)
+    components: list[DeliveryComponent] = field(default_factory=list)
     planning_mode: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -94,6 +118,8 @@ class DeliveryPlan:
         }
         if self.stream_ids:
             data["streams"] = list(self.stream_ids)
+        if self.components:
+            data["components"] = [component.to_dict() for component in self.components]
         if self.planning_mode:
             data["planning_mode"] = self.planning_mode
         return data
@@ -275,11 +301,18 @@ def _parse_delivery_plan(
     repositories = _parse_repositories(data.get("repositories"), errors)
     repo_ids = {repo.id for repo in repositories}
     stream_ids = _parse_streams(data.get("streams"), errors)
+    components = _parse_components(
+        data.get("components"),
+        project_root=project_root,
+        stream_ids=set(stream_ids),
+        errors=errors,
+    )
     units = _parse_units(
         data.get("units"),
         project_root=project_root,
         repo_ids=repo_ids,
         stream_ids=set(stream_ids),
+        component_ids={component.id for component in components},
         errors=errors,
         warnings=warnings,
     )
@@ -297,6 +330,7 @@ def _parse_delivery_plan(
         units=units,
         repositories=repositories,
         stream_ids=stream_ids,
+        components=components,
         planning_mode=planning_mode,
     )
 
@@ -381,12 +415,79 @@ def _parse_streams(value: Any, errors: list[DeliveryPlanIssue]) -> list[str]:
     return stream_ids
 
 
+def _parse_components(
+    value: Any,
+    *,
+    project_root: Path,
+    stream_ids: set[str],
+    errors: list[DeliveryPlanIssue],
+) -> list[DeliveryComponent]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        errors.append(DeliveryPlanIssue("error", "components.invalid_type", "components must be a list.", "components"))
+        return []
+
+    seen: set[str] = set()
+    components: list[DeliveryComponent] = []
+    for idx, item in enumerate(value):
+        component_path = f"components[{idx}]"
+        if not isinstance(item, dict):
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "components.item_invalid",
+                    "component entries must be mappings.",
+                    component_path,
+                )
+            )
+            continue
+        component_id = _require_string(item, "id", f"{component_path}.id", errors)
+        path = _require_string(item, "path", f"{component_path}.path", errors)
+        label = _optional_string(item, "label", f"{component_path}.label", errors)
+        stream = _optional_string(item, "stream", f"{component_path}.stream", errors)
+
+        if component_id:
+            if component_id in seen:
+                errors.append(
+                    DeliveryPlanIssue(
+                        "error",
+                        "components.duplicate_id",
+                        f"Duplicate component id: {component_id}",
+                        f"{component_path}.id",
+                    )
+                )
+            seen.add(component_id)
+        if path:
+            _validate_project_relative_metadata_path(
+                path,
+                project_root=project_root,
+                errors=errors,
+                path=f"{component_path}.path",
+                code_prefix="components.path",
+                subject="Component path",
+            )
+        if stream_ids and stream and stream not in stream_ids:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "components.stream_unknown",
+                    f"Component references unknown stream: {stream}",
+                    f"{component_path}.stream",
+                )
+            )
+        if component_id and path:
+            components.append(DeliveryComponent(id=component_id, path=path, label=label, stream=stream))
+    return components
+
+
 def _parse_units(
     value: Any,
     *,
     project_root: Path,
     repo_ids: set[str],
     stream_ids: set[str],
+    component_ids: set[str],
     errors: list[DeliveryPlanIssue],
     warnings: list[DeliveryPlanIssue],
 ) -> list[DeliveryPlanUnit]:
@@ -415,6 +516,8 @@ def _parse_units(
         phase = _optional_string(item, "phase", f"{unit_path}.phase", errors)
         kind = _optional_string(item, "kind", f"{unit_path}.kind", errors)
         repo_id = _optional_string(item, "repo_id", f"{unit_path}.repo_id", errors)
+        component = _optional_string(item, "component", f"{unit_path}.component", errors)
+        scope_paths = _optional_string_list(item, "scope_paths", f"{unit_path}.scope_paths", errors)
 
         if unit_id:
             if unit_id in seen:
@@ -451,6 +554,24 @@ def _parse_units(
                     f"{unit_path}.stream",
                 )
             )
+        if component and component not in component_ids:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "units.component_unknown",
+                    f"Unit references unknown component: {component}",
+                    f"{unit_path}.component",
+                )
+            )
+        for scope_idx, scope_path in enumerate(scope_paths):
+            _validate_project_relative_metadata_path(
+                scope_path,
+                project_root=project_root,
+                errors=errors,
+                path=f"{unit_path}.scope_paths[{scope_idx}]",
+                code_prefix="units.scope_path",
+                subject="Unit scope path",
+            )
         if unit_id and task_path:
             units.append(
                 DeliveryPlanUnit(
@@ -463,6 +584,8 @@ def _parse_units(
                     phase=phase,
                     kind=kind,
                     repo_id=repo_id,
+                    component=component,
+                    scope_paths=scope_paths,
                     source_path=unit_path,
                 )
             )
@@ -514,6 +637,62 @@ def _add_invalid_task_path_error(errors: list[DeliveryPlanIssue], path: str) -> 
             "error",
             "units.task_path_invalid",
             "Unit task_path is not a valid project-relative filesystem path.",
+            path,
+        )
+    )
+
+
+def _validate_project_relative_metadata_path(
+    path_value: str,
+    *,
+    project_root: Path,
+    errors: list[DeliveryPlanIssue],
+    path: str,
+    code_prefix: str,
+    subject: str,
+) -> None:
+    try:
+        raw_path = Path(path_value)
+    except (OSError, ValueError):
+        _add_invalid_metadata_path_error(errors, path, code_prefix, subject)
+        return
+    if raw_path.is_absolute():
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                f"{code_prefix}_absolute",
+                f"{subject} must be project-relative so the plan remains portable.",
+                path,
+            )
+        )
+        return
+    try:
+        resolved = (project_root / raw_path).resolve()
+    except (OSError, ValueError):
+        _add_invalid_metadata_path_error(errors, path, code_prefix, subject)
+        return
+    if not _path_is_within(resolved, project_root):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                f"{code_prefix}_outside_project",
+                f"{subject} escapes the project root.",
+                path,
+            )
+        )
+
+
+def _add_invalid_metadata_path_error(
+    errors: list[DeliveryPlanIssue],
+    path: str,
+    code_prefix: str,
+    subject: str,
+) -> None:
+    errors.append(
+        DeliveryPlanIssue(
+            "error",
+            f"{code_prefix}_invalid",
+            f"{subject} is not a valid project-relative filesystem path.",
             path,
         )
     )
