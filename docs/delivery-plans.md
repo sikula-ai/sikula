@@ -40,6 +40,10 @@ sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --dry-run
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --dry-run --json
 ```
 
+The dry run mirrors execution preflight, including dependency result-commit
+checks, but does not acquire the progress lock, write parent progress, create
+child task state, or start agents.
+
 Run the next eligible unit:
 
 ```bash
@@ -52,13 +56,20 @@ the selected unit as `running`, starts one ordinary child `sikula run` for that
 unit task file, then records the terminal unit status as `done` or `failed`.
 Child task prompts, provider output, diffs, logs, and full task state remain in
 the normal child task state and are not embedded in delivery progress JSON.
+The parent unit is marked `done` only when the child run exits successfully, the
+child task state is done, and the child result is finalized. A finalized result
+has either a recorded result commit or no preserved task worktree left to
+deliver, which represents a no-op unit. If a child task is done but still keeps a
+worktree without a result commit, the parent unit is recorded as failed with
+`child_run_unfinalized`.
 
-For dependent units, `run-next` also checks that each completed dependency's
-recorded result commit, when present, is already applied to the current checkout.
-A completed dependency with no result commit is treated as a no-op prerequisite.
-The current execution MVP does not assemble an accumulated delivery branch, so
-dependent units are blocked until the operator has merged or otherwise applied
-prerequisite unit branches locally.
+For dependent units, `run-next` also walks the selected unit's dependency
+closure and checks that each completed prerequisite's recorded result commit,
+when present, is already applied to the current checkout. A completed
+prerequisite with no result commit is treated as a no-op prerequisite, but its
+own prerequisites are still checked. The current execution MVP does not assemble
+an accumulated delivery branch, so dependent units are blocked until the
+operator has merged or otherwise applied prerequisite unit branches locally.
 
 Unlike `check` and `status`, `run-next` loads project runtime config because it
 uses the same project settings as `sikula run`.

@@ -6,7 +6,7 @@ import argparse
 from collections.abc import Callable
 import contextlib
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import subprocess
@@ -76,6 +76,12 @@ class DeliveryRunNextContext:
     resolve_state_dir: Callable[[dict], Path]
 
 
+@dataclass(frozen=True)
+class DeliveryChildRunClassification:
+    unit_status: str
+    failure_code: str | None
+
+
 def cmd_delivery_run_next(
     args: argparse.Namespace,
     cfg: dict,
@@ -91,6 +97,7 @@ def cmd_delivery_run_next(
     project_root = Path(project_root_raw).resolve() if project_root_raw else None
     if getattr(args, "dry_run", False):
         result = preview_delivery_run_next(args.plan_file, project_root=project_root)
+        result = _apply_delivery_preview_execution_guards(result, args.plan_file, project_root=project_root)
         _print_delivery_result(result, json_output=args.json, render=render_delivery_run_next_preview)
         if not result.ready:
             sys.exit(1)
@@ -277,20 +284,9 @@ def _run_next_delivery_unit(
                 message=f"Delivery unit {selected_unit.id} did not start; fix setup and retry.",
             )
         child_state = store.load(child_task_id) if child_task_id else None
-        child_done = bool(child_state and child_state.done)
-        unit_status = (
-            "done" if child_result.exit_code == 0 and child_done and not child_result.interrupted else "failed"
-        )
-        failure_code = (
-            None
-            if unit_status == "done"
-            else _delivery_failure_code(
-                child_result.exit_code,
-                child_state,
-                interrupted=child_result.interrupted,
-                exception=child_result.exception is not None,
-            )
-        )
+        classification = _classify_delivery_child_run(child_result, child_state)
+        unit_status = classification.unit_status
+        failure_code = classification.failure_code
         terminal_unit = make_delivery_unit_progress(
             selected_unit.id,
             unit_status,
@@ -424,14 +420,55 @@ def _progress_for_update(status, progress_path: Path, *, read_delivery_progress:
     return _progress_from_status(status)
 
 
+def _apply_delivery_preview_execution_guards(preview, plan_file: str | Path, *, project_root: Path | None):
+    if not preview.ready or preview.selected_unit is None or preview.project_root is None:
+        return preview
+
+    from core.delivery_progress import get_delivery_status
+
+    status = get_delivery_status(plan_file, project_root=project_root)
+    selected_unit = _status_unit_by_id(status, preview.selected_unit.id) or preview.selected_unit
+    if not status.valid or status.project_root is None:
+        return replace(
+            preview,
+            valid=False,
+            ready=False,
+            selected_unit=selected_unit,
+            errors=list(status.errors) or list(preview.errors),
+            warnings=list(status.warnings) or list(preview.warnings),
+            message="Delivery plan is not ready to run.",
+        )
+
+    dependency_errors = _dependency_commit_errors(status, selected_unit, Path(status.project_root).resolve())
+    if not dependency_errors:
+        return preview
+    return replace(
+        preview,
+        valid=False,
+        ready=False,
+        selected_unit=selected_unit,
+        errors=[*preview.errors, *dependency_errors],
+        message="Delivery unit dependencies are not applied to the current checkout.",
+    )
+
+
 def _dependency_commit_errors(status, selected_unit, root: Path):
     from core.delivery_plan import DeliveryPlanIssue
 
     units_by_id = {unit.id: unit for unit in status.units}
     errors: list[DeliveryPlanIssue] = []
-    for dependency in selected_unit.depends_on:
+    pending = list(selected_unit.depends_on)
+    visited: set[str] = set()
+    while pending:
+        dependency = pending.pop(0)
+        if dependency in visited:
+            continue
+        visited.add(dependency)
         dependency_unit = units_by_id.get(dependency)
-        if dependency_unit is None or dependency_unit.status != "done":
+        if dependency_unit is None:
+            continue
+        pending.extend(dependency_unit.depends_on)
+        if dependency_unit.status != "done":
             continue
         if not dependency_unit.commit:
             continue
@@ -444,6 +481,31 @@ def _dependency_commit_errors(status, selected_unit, root: Path):
                 )
             )
     return errors
+
+
+def _child_delivery_result_finalized(child_state) -> bool:
+    if getattr(child_state, "result_commit", None):
+        return True
+    return not (getattr(child_state, "worktree_path", None) or getattr(child_state, "worktree_base", None))
+
+
+def _classify_delivery_child_run(
+    child_result: DeliveryChildRunResult,
+    child_state,
+) -> DeliveryChildRunClassification:
+    if child_result.interrupted:
+        return DeliveryChildRunClassification("failed", "child_run_interrupted")
+    if child_result.exception is not None:
+        return DeliveryChildRunClassification("failed", "child_run_exception")
+    if child_state is None:
+        return DeliveryChildRunClassification("failed", "child_task_missing")
+    if child_result.exit_code != 0:
+        return DeliveryChildRunClassification("failed", "child_run_failed")
+    if not getattr(child_state, "done", False):
+        return DeliveryChildRunClassification("failed", "child_task_incomplete")
+    if not _child_delivery_result_finalized(child_state):
+        return DeliveryChildRunClassification("failed", "child_run_unfinalized")
+    return DeliveryChildRunClassification("done", None)
 
 
 def _git_commit_is_ancestor(root: Path, commit: str) -> bool:
@@ -562,24 +624,6 @@ def _system_exit_code(exc: SystemExit) -> int:
     if exc.code is None:
         return 0
     return 1
-
-
-def _delivery_failure_code(
-    exit_code: int,
-    child_state,
-    *,
-    interrupted: bool = False,
-    exception: bool = False,
-) -> str:
-    if interrupted:
-        return "child_run_interrupted"
-    if exception:
-        return "child_run_exception"
-    if child_state is None:
-        return "child_task_missing"
-    if exit_code != 0:
-        return "child_run_failed"
-    return "child_task_incomplete"
 
 
 def _status_unit_by_id(status, unit_id: str):

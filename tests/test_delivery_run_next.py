@@ -28,10 +28,11 @@ from core.state import JsonStateStore
 from sikula_cli.delivery import (
     DeliveryChildRunResult,
     DeliveryRunNextContext,
+    _child_delivery_result_finalized,
+    _classify_delivery_child_run,
     _coerce_child_run_result,
     _dependency_commit_errors,
     _delivery_child_run_args,
-    _delivery_failure_code,
     _git_commit_is_ancestor,
     _invoke_delivery_child_run,
     _system_exit_code,
@@ -100,6 +101,50 @@ def _write_plan(root: Path) -> Path:
                 "platform": "shared",
                 "task_path": unit_2,
                 "depends_on": ["01-foundation"],
+            },
+        ],
+    }
+    path = root / ".sikula" / "delivery" / "demo" / "plan.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+    return path
+
+
+def _write_transitive_plan(root: Path) -> Path:
+    unit_1 = _write_unit(root, "01-foundation.md", "# Unit 01\n\nPrivate task body.\n")
+    unit_2 = _write_unit(root, "02-noop.md", "# Unit 02\n\nNo-op follow-up.\n")
+    unit_3 = _write_unit(root, "03-feature.md", "# Unit 03\n\nFeature body.\n")
+    plan = {
+        "schema_version": 1,
+        "plan_id": "delivery-run-next-demo",
+        "title": "Delivery run-next demo",
+        "planning_mode": "fixed_window",
+        "final_branch": "sikula/delivery/run-next-demo",
+        "streams": [{"id": "app", "label": "App"}],
+        "units": [
+            {
+                "id": "01-foundation",
+                "title": "Add foundation",
+                "stream": "app",
+                "platform": "shared",
+                "task_path": unit_1,
+                "depends_on": [],
+            },
+            {
+                "id": "02-noop",
+                "title": "No-op bridge",
+                "stream": "app",
+                "platform": "shared",
+                "task_path": unit_2,
+                "depends_on": ["01-foundation"],
+            },
+            {
+                "id": "03-feature",
+                "title": "Add feature",
+                "stream": "app",
+                "platform": "shared",
+                "task_path": unit_3,
+                "depends_on": ["02-noop"],
             },
         ],
     }
@@ -430,6 +475,46 @@ def test_cmd_delivery_run_next_records_failed_child_run(tmp_path: Path, capsys: 
     assert progress["units"][0]["failure_code"] == "child_run_failed"
 
 
+def test_cmd_delivery_run_next_does_not_mark_unfinalized_child_run_done(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    unfinalized_worktree = tmp_path / ".sikula" / "worktrees" / "child"
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        state = store.create("child task")
+        state.done = True
+        state.worktree_path = str(unfinalized_worktree)
+        state.worktree_base = str(unfinalized_worktree)
+        state.worktree_branch = "sikula/01-foundation-child"
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is True
+    assert payload["succeeded"] is False
+    assert payload["unit_status"] == "failed"
+    assert payload["run_exit_code"] == 0
+    assert payload["selected_unit"]["status"] == "failed"
+    assert payload["selected_unit"]["failure_code"] == "child_run_unfinalized"
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["status"] == "failed"
+    assert progress["units"][0]["failure_code"] == "child_run_unfinalized"
+    assert progress["units"][0]["branch"] == "sikula/01-foundation-child"
+    assert "commit" not in progress["units"][0]
+
+
 def test_cmd_delivery_run_next_allows_noop_dependency_without_result_commit(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -494,6 +579,109 @@ def test_cmd_delivery_run_next_blocks_dependent_unit_when_dependency_commit_is_u
     assert payload["errors"][0]["code"] == "delivery.dependency_commit_unapplied"
     progress = _load_delivery_progress(tmp_path)
     assert progress["units"][0]["commit"] == "deadbeef"
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_dry_run_blocks_dependent_unit_when_dependency_commit_is_unapplied(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-foundation", "status": "done", "commit": "deadbeef", "branch": "sikula/unit-01"}],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, dry_run=True, json_output=True),
+            _run_next_cfg(tmp_path),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is False
+    assert payload["selected_unit"]["id"] == "02-feature"
+    assert payload["errors"][0]["code"] == "delivery.dependency_commit_unapplied"
+    assert "01-foundation" in payload["errors"][0]["message"]
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_blocks_transitive_dependency_commit_when_noop_bridge_is_applied(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_transitive_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "done",
+                "commit": "deadbeef",
+                "branch": "sikula/unit-01",
+            },
+            {"unit_id": "02-noop", "status": "done"},
+        ],
+    )
+    cfg = _run_next_cfg(tmp_path)
+    called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal called
+        called = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert called is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is False
+    assert payload["selected_unit"]["id"] == "03-feature"
+    assert payload["errors"][0]["code"] == "delivery.dependency_commit_unapplied"
+    assert "01-foundation" in payload["errors"][0]["message"]
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["commit"] == "deadbeef"
+    assert progress["units"][1] == {"unit_id": "02-noop", "status": "done"}
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_dry_run_blocks_transitive_dependency_commit_when_noop_bridge_is_applied(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_transitive_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "done",
+                "commit": "deadbeef",
+                "branch": "sikula/unit-01",
+            },
+            {"unit_id": "02-noop", "status": "done"},
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, dry_run=True, json_output=True),
+            _run_next_cfg(tmp_path),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is False
+    assert payload["selected_unit"]["id"] == "03-feature"
+    assert payload["errors"][0]["code"] == "delivery.dependency_commit_unapplied"
+    assert "01-foundation" in payload["errors"][0]["message"]
     assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
 
 
@@ -832,7 +1020,88 @@ def test_delivery_child_run_helpers_cover_exit_and_result_shapes(tmp_path: Path)
     assert _coerce_child_run_result(None).exit_code == 0
     assert _system_exit_code(SystemExit(3)) == 3
     assert _delivery_child_run_args(root=root, task_path=task_path).task_file == str((root / task_path).resolve())
-    assert _delivery_failure_code(0, argparse.Namespace()) == "child_task_incomplete"
+
+
+def test_child_delivery_result_finalized_distinguishes_commits_noops_and_preserved_worktrees(tmp_path: Path) -> None:
+    assert _child_delivery_result_finalized(argparse.Namespace(result_commit="abc123", worktree_path="wt")) is True
+    assert _child_delivery_result_finalized(argparse.Namespace(result_commit=None, worktree_path=None)) is True
+    assert (
+        _child_delivery_result_finalized(
+            argparse.Namespace(result_commit=None, worktree_path=str(tmp_path / "wt"), worktree_base=None)
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("child_result", "child_state", "unit_status", "failure_code"),
+    [
+        (
+            DeliveryChildRunResult(exit_code=130, interrupted=True),
+            None,
+            "failed",
+            "child_run_interrupted",
+        ),
+        (
+            DeliveryChildRunResult(exit_code=1, exception=RuntimeError("boom")),
+            None,
+            "failed",
+            "child_run_exception",
+        ),
+        (
+            DeliveryChildRunResult(exit_code=0),
+            None,
+            "failed",
+            "child_task_missing",
+        ),
+        (
+            DeliveryChildRunResult(exit_code=1),
+            argparse.Namespace(done=True, result_commit="abc123", worktree_path=None, worktree_base=None),
+            "failed",
+            "child_run_failed",
+        ),
+        (
+            DeliveryChildRunResult(exit_code=1),
+            argparse.Namespace(done=True, result_commit=None, worktree_path="wt", worktree_base=None),
+            "failed",
+            "child_run_failed",
+        ),
+        (
+            DeliveryChildRunResult(exit_code=0),
+            argparse.Namespace(done=False, result_commit=None, worktree_path=None, worktree_base=None),
+            "failed",
+            "child_task_incomplete",
+        ),
+        (
+            DeliveryChildRunResult(exit_code=0),
+            argparse.Namespace(done=True, result_commit=None, worktree_path="wt", worktree_base=None),
+            "failed",
+            "child_run_unfinalized",
+        ),
+        (
+            DeliveryChildRunResult(exit_code=0),
+            argparse.Namespace(done=True, result_commit="abc123", worktree_path="wt", worktree_base=None),
+            "done",
+            None,
+        ),
+        (
+            DeliveryChildRunResult(exit_code=0),
+            argparse.Namespace(done=True, result_commit=None, worktree_path=None, worktree_base=None),
+            "done",
+            None,
+        ),
+    ],
+)
+def test_classify_delivery_child_run_state_matrix(
+    child_result: DeliveryChildRunResult,
+    child_state: argparse.Namespace | None,
+    unit_status: str,
+    failure_code: str | None,
+) -> None:
+    classification = _classify_delivery_child_run(child_result, child_state)
+
+    assert classification.unit_status == unit_status
+    assert classification.failure_code == failure_code
 
 
 def test_dependency_commit_errors_ignore_noop_unfinished_or_missing_dependency_units(tmp_path: Path) -> None:
