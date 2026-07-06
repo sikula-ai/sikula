@@ -122,11 +122,11 @@ Rules for using Sikula on Sikula:
   changes this config does not fix the active run's validation coverage or
   sandbox policy; finish the explicit config change, then start a fresh run.
 - Prompt-governing files (`guidelines.md`, `AGENTS.md`, `ARCHITECTURE.md`,
-  `.sikula/config.yaml`, and `.sikula/*_rules.md`) affect future agent
-  behavior. Until Sikula snapshots all prompt context for active runs, do not
-  treat a run that changes these files as final approval of its own governance
-  changes; commit the change and run a fresh Sikula review or run from the
-  updated context.
+  `.sikula/CONVENTIONS.md`, `.sikula/config.yaml`, and
+  `.sikula/*_rules.md`) affect future agent behavior. Until Sikula snapshots
+  all prompt context for active runs, do not treat a run that changes these
+  files as final approval of its own governance changes; commit the change and
+  run a fresh Sikula review or run from the updated context.
 - `.sikula/*_rules.md` files are intentionally outside agent write scope. Update
   them as explicit maintainer changes, not as ordinary self-hosted task output.
 

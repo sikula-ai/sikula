@@ -91,18 +91,19 @@ Rules:
 
 ### Governance and runtime artifacts
 
-`guidelines.md`, `AGENTS.md`, `.sikula/config.yaml`, `.sikula/*_rules.md`,
-`ARCHITECTURE.md`, `CONTRIBUTING.md`, and public docs are governance surfaces.
-They may be changed by explicit governance/documentation/configuration tasks.
-Do not change them as incidental implementation output.
+`guidelines.md`, `AGENTS.md`, `.sikula/CONVENTIONS.md`,
+`.sikula/config.yaml`, `.sikula/*_rules.md`, `ARCHITECTURE.md`,
+`CONTRIBUTING.md`, and public docs are governance surfaces. They may be changed
+by explicit governance/documentation/configuration tasks. Do not change them as
+incidental implementation output.
 
 Prompt-governing files (`guidelines.md`, `AGENTS.md`, `ARCHITECTURE.md`,
-`.sikula/config.yaml`, and `.sikula/*_rules.md`) can affect agent prompts and
-policy for later runs. Until Sikula snapshots all prompt context for active
-runs, a task that changes these files must be followed by a fresh Sikula review
-or run from the committed updated context before treating the governance change
-as fully approved. Role-specific `.sikula/*_rules.md` files are maintained
-outside normal agent write scope.
+`.sikula/CONVENTIONS.md`, `.sikula/config.yaml`, and `.sikula/*_rules.md`) can
+affect agent prompts and policy for later runs. Until Sikula snapshots all
+prompt context for active runs, a task that changes these files must be
+followed by a fresh Sikula review or run from the committed updated context
+before treating the governance change as fully approved. Role-specific
+`.sikula/*_rules.md` files are maintained outside normal agent write scope.
 
 `.sikula/state/`, `.sikula/worktrees/`, `.sikula/contract-reports/`, caches,
 coverage files, virtualenvs, and build outputs are runtime/debug artifacts. Do
