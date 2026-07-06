@@ -236,6 +236,52 @@ def _load_delivery_progress(root: Path) -> dict:
     return json.loads(delivery_progress_path(root, "delivery-run-next-demo").read_text(encoding="utf-8"))
 
 
+def test_cmd_delivery_run_next_dry_run_rejects_invalid_agent_override_before_preview(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, dry_run=True, agent_model=["bogus=x"]),
+            _run_next_cfg(tmp_path),
+        )
+
+    assert exc.value.code == 1
+    assert "Unknown agent 'bogus'" in capsys.readouterr().out
+    assert not delivery_progress_path(tmp_path, "delivery-run-next-demo").exists()
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_rejects_invalid_agent_timeout_before_progress(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    child_called = False
+
+    def runner(args: argparse.Namespace, cfg: dict) -> DeliveryChildRunResult:
+        nonlocal child_called
+        child_called = True
+        return DeliveryChildRunResult(exit_code=0, child_task_id="child")
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, agent_timeout=["implementer=abc"]),
+            _run_next_cfg(tmp_path),
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert child_called is False
+    assert "Invalid --agent-timeout value 'abc' for agent 'implementer': expected int" in capsys.readouterr().out
+    assert not delivery_progress_path(tmp_path, "delivery-run-next-demo").exists()
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
 def test_preview_delivery_run_next_selects_first_eligible_unit(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)

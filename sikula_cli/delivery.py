@@ -12,6 +12,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from sikula_cli.agent_overrides import parse_agent_llm_overrides
+
 
 def register_parser(subparsers) -> argparse.ArgumentParser:
     delivery_p = subparsers.add_parser("delivery", help="Inspect and run delivery plans")
@@ -142,6 +144,7 @@ def cmd_delivery_run_next(
         render_delivery_run_next_preview,
     )
 
+    _validate_delivery_run_next_agent_overrides(args)
     project_root_raw = cfg.get("project", {}).get("root_path") if isinstance(cfg, dict) else None
     project_root = Path(project_root_raw).resolve() if project_root_raw else None
     if getattr(args, "dry_run", False):
@@ -160,6 +163,14 @@ def cmd_delivery_run_next(
     _print_delivery_result(result, json_output=args.json, render=render_delivery_run_next_execution)
     if not result.succeeded:
         sys.exit(1)
+
+
+def _validate_delivery_run_next_agent_overrides(args: argparse.Namespace) -> None:
+    parse_agent_llm_overrides(
+        getattr(args, "agent_model", None),
+        getattr(args, "agent_provider", None),
+        getattr(args, "agent_timeout", None),
+    )
 
 
 def _run_next_delivery_unit(

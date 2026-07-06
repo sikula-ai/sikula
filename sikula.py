@@ -91,6 +91,9 @@ from sikula_cli import review as cli_review
 from sikula_cli import run as cli_run
 from sikula_cli import status as cli_status
 from sikula_cli import task as cli_task
+from sikula_cli.agent_overrides import PREPARATION_AGENT_NAMES as _VALID_PREPARATION_AGENTS
+from sikula_cli.agent_overrides import RUNTIME_AGENT_NAMES as _VALID_AGENTS
+from sikula_cli.agent_overrides import parse_agent_llm_overrides as _parse_agent_llm_overrides
 
 _BASE = Path(__file__).parent
 # When adding a new platform: add it here, in _build_tool() in core/orchestrator.py,
@@ -115,17 +118,6 @@ def _resolve_task_path(task_file: str, project_root: Path) -> Path | None:
     cwd_path = Path.cwd() / p
     return cwd_path if cwd_path.exists() else None
 
-
-_VALID_AGENTS = {
-    "analyst",
-    "planner",
-    "implementer",
-    "reviewer",
-    "security_reviewer",
-    "test_writer",
-    "fixer",
-}
-_VALID_PREPARATION_AGENTS = {"task_preparer"}
 
 log = logging.getLogger(__name__)
 
@@ -225,40 +217,6 @@ def _make_llm_config(base: dict, override: dict):
         temperature=float(override.get("temperature", base.get("temperature", 0.0))),
         agent_timeout=int(override.get("agent_timeout", base.get("agent_timeout", 1800))),
     )
-
-
-def _parse_agent_llm_overrides(
-    agent_models: list[str] | None,
-    agent_providers: list[str] | None,
-    agent_timeouts: list[str] | None,
-    *,
-    valid_agents: set[str] | None = None,
-) -> dict[str, dict]:
-    """Parse --agent-model / --agent-provider / --agent-timeout into per-agent override dicts."""
-    result: dict[str, dict] = {}
-    allowed_agents = valid_agents or _VALID_AGENTS
-
-    def _add(entries: list[str] | None, field: str, cast=str, flag: str | None = None) -> None:
-        flag_name = f"--agent-{flag or field}"
-        for entry in entries or []:
-            raw_agent, sep, val = entry.partition("=")
-            agent = raw_agent.strip().replace("-", "_")
-            if agent not in allowed_agents:
-                print(f"Unknown agent '{agent}'. Valid agents: {', '.join(sorted(allowed_agents))}")
-                sys.exit(1)
-            if not sep or not val.strip():
-                print(f"Invalid {flag_name} value '{entry}'. Expected format: AGENT=VALUE")
-                sys.exit(1)
-            try:
-                result.setdefault(agent, {})[field] = cast(val.strip())
-            except (ValueError, TypeError):
-                print(f"Invalid {flag_name} value '{val.strip()}' for agent '{agent}': expected {cast.__name__}")
-                sys.exit(1)
-
-    _add(agent_models, "model")
-    _add(agent_providers, "provider")
-    _add(agent_timeouts, "agent_timeout", cast=int, flag="timeout")
-    return result
 
 
 def _contract_score_threshold(value: str) -> int:
