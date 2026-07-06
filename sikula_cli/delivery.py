@@ -6,13 +6,18 @@ import argparse
 from collections.abc import Callable
 import contextlib
 import copy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+import io
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
+from typing import Any
 
-from sikula_cli.agent_overrides import parse_agent_llm_overrides
+from sikula_cli.agent_overrides import DELIVERY_PREPARATION_AGENT_NAMES, parse_agent_llm_overrides
+
+_DELIVERY_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def register_parser(subparsers) -> argparse.ArgumentParser:
@@ -22,6 +27,42 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
     delivery_check_p = delivery_sub.add_parser("check", help="Check a delivery plan file")
     delivery_check_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
     delivery_check_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
+
+    delivery_prepare_p = delivery_sub.add_parser("prepare", help="Prepare delivery plan artifacts from a task file")
+    delivery_prepare_p.add_argument("task_file", metavar="TASK_FILE", help="Path to source task .txt/.md file")
+    delivery_prepare_p.add_argument(
+        "--output",
+        metavar="DIR",
+        help="Delivery plan output directory; defaults to .sikula/delivery/<task-stem>/",
+    )
+    delivery_prepare_p.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Allow replacing existing delivery plan artifacts in the output directory",
+    )
+    delivery_prepare_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
+    delivery_prepare_p.add_argument(
+        "--agent-model",
+        action="append",
+        default=None,
+        metavar="AGENT=MODEL",
+        help="Override model for delivery_preparer, e.g. --agent-model delivery_preparer=gpt-5.5",
+    )
+    delivery_prepare_p.add_argument(
+        "--agent-provider",
+        action="append",
+        default=None,
+        metavar="AGENT=PROVIDER",
+        help="Override provider for delivery_preparer, e.g. --agent-provider delivery_preparer=claude",
+    )
+    delivery_prepare_p.add_argument(
+        "--agent-timeout",
+        action="append",
+        default=None,
+        metavar="AGENT=SECONDS",
+        help="Override timeout for delivery_preparer, e.g. --agent-timeout delivery_preparer=1200",
+    )
 
     delivery_status_p = delivery_sub.add_parser("status", help="Show delivery plan progress")
     delivery_status_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
@@ -93,6 +134,361 @@ def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
         print(render_delivery_status(result), end="")
     if not result.valid:
         sys.exit(1)
+
+
+@dataclass(frozen=True)
+class DeliveryPrepareIssue:
+    severity: str
+    code: str
+    message: str
+    path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data = {
+            "severity": self.severity,
+            "code": self.code,
+            "message": self.message,
+        }
+        if self.path:
+            data["path"] = self.path
+        return data
+
+
+@dataclass(frozen=True)
+class DeliveryPrepareArtifact:
+    kind: str
+    path: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"kind": self.kind, "path": self.path}
+
+
+@dataclass(frozen=True)
+class DeliveryPrepareResult:
+    status: str
+    ready: bool
+    prepared: bool
+    force: bool
+    overwrite_allowed: bool
+    selected_plan_id: str | None
+    unit_ids: list[str]
+    paths: dict[str, str | None]
+    existing_artifacts: list[DeliveryPrepareArtifact]
+    errors: list[DeliveryPrepareIssue]
+    warnings: list[DeliveryPrepareIssue] = field(default_factory=list)
+    message: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "ready": self.ready,
+            "prepared": self.prepared,
+            "force": self.force,
+            "overwrite_allowed": self.overwrite_allowed,
+            "selected_plan_id": self.selected_plan_id,
+            "unit_ids": list(self.unit_ids),
+            "paths": dict(self.paths),
+            "existing_artifacts": [artifact.to_dict() for artifact in self.existing_artifacts],
+            "errors": [issue.to_dict() for issue in self.errors],
+            "warnings": [issue.to_dict() for issue in self.warnings],
+            "message": self.message,
+        }
+
+
+def cmd_delivery_prepare(args: argparse.Namespace, cfg: dict) -> None:
+    override_errors = _validate_delivery_prepare_agent_overrides(args)
+    result = _prepare_delivery_preflight(args, cfg, extra_errors=override_errors)
+    _print_delivery_result(result, json_output=args.json, render=render_delivery_prepare)
+    if not result.ready:
+        sys.exit(1)
+
+
+def render_delivery_prepare(result: DeliveryPrepareResult) -> str:
+    task_path = result.paths.get("task_file") or "<unknown>"
+    lines = [
+        f"Delivery prepare: {task_path}",
+        f"Status: {result.status}",
+    ]
+    if result.selected_plan_id:
+        lines.append(f"Selected plan: {result.selected_plan_id}")
+    if result.paths.get("output_dir"):
+        lines.append(f"Output: {result.paths['output_dir']}")
+    if result.paths.get("plan_file"):
+        lines.append(f"Plan file: {result.paths['plan_file']}")
+    if result.paths.get("units_dir"):
+        lines.append(f"Units dir: {result.paths['units_dir']}")
+    lines.append(f"Overwrite allowed: {'yes' if result.overwrite_allowed else 'no'}")
+    if result.existing_artifacts:
+        lines.append("Existing artifacts:")
+        for artifact in result.existing_artifacts:
+            lines.append(f"- {artifact.kind}: {artifact.path}")
+    lines.append(result.message)
+    if result.errors:
+        lines.append("")
+        lines.append("Errors:")
+        for issue in result.errors:
+            lines.append(_format_prepare_issue(issue))
+    if result.warnings:
+        lines.append("")
+        lines.append("Warnings:")
+        for issue in result.warnings:
+            lines.append(_format_prepare_issue(issue))
+    return "\n".join(lines) + "\n"
+
+
+def _validate_delivery_prepare_agent_overrides(args: argparse.Namespace) -> list[DeliveryPrepareIssue]:
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            parse_agent_llm_overrides(
+                getattr(args, "agent_model", None),
+                getattr(args, "agent_provider", None),
+                getattr(args, "agent_timeout", None),
+                valid_agents=DELIVERY_PREPARATION_AGENT_NAMES,
+            )
+    except SystemExit as exc:
+        if _system_exit_code(exc) == 0:
+            return []
+        message = output.getvalue().strip() or "Invalid delivery_preparer override."
+        return [
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.agent_override_invalid",
+                message,
+            )
+        ]
+    return []
+
+
+def _prepare_delivery_preflight(
+    args: argparse.Namespace,
+    cfg: dict,
+    *,
+    extra_errors: list[DeliveryPrepareIssue] | None = None,
+) -> DeliveryPrepareResult:
+    project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
+    force = bool(getattr(args, "force", False))
+    errors: list[DeliveryPrepareIssue] = list(extra_errors or [])
+    warnings: list[DeliveryPrepareIssue] = []
+
+    task_path = _resolve_from_cwd(args.task_file)
+    task_rel = _project_relative_path(task_path, project_root) if _path_is_within(task_path, project_root) else None
+    _validate_delivery_prepare_task_path(task_path, task_rel, project_root, errors)
+
+    output_path = _resolve_delivery_prepare_output_path(args, task_path, project_root)
+    output_rel = (
+        _project_relative_path(output_path, project_root) if _path_is_within(output_path, project_root) else None
+    )
+    if output_rel is None:
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.output_outside_project",
+                "Output path must be inside the project root.",
+            )
+        )
+
+    plan_id = output_path.name
+    if not _DELIVERY_PLAN_ID_RE.fullmatch(plan_id):
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.plan_id_invalid",
+                "plan_id may contain only letters, numbers, dots, underscores, and hyphens.",
+                output_rel,
+            )
+        )
+
+    plan_file = output_path / "plan.yaml"
+    units_dir = output_path / "units"
+    plan_rel = _project_relative_path(plan_file, project_root) if output_rel is not None else None
+    units_rel = _project_relative_path(units_dir, project_root) if output_rel is not None else None
+
+    if output_rel is not None and output_path.exists() and not output_path.is_dir():
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.output_not_directory",
+                "Output path already exists and is not a directory.",
+                output_rel,
+            )
+        )
+
+    existing_artifacts = (
+        _find_delivery_prepare_existing_artifacts(plan_file, units_dir, project_root) if output_rel is not None else []
+    )
+    if existing_artifacts and not force:
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.existing_artifacts",
+                "Existing delivery plan artifacts require --force to replace.",
+                output_rel,
+            )
+        )
+
+    ready = not errors
+    status = "ready" if ready else "blocked"
+    return DeliveryPrepareResult(
+        status=status,
+        ready=ready,
+        prepared=False,
+        force=force,
+        overwrite_allowed=force,
+        selected_plan_id=plan_id if _DELIVERY_PLAN_ID_RE.fullmatch(plan_id) else None,
+        unit_ids=[],
+        paths={
+            "task_file": task_rel,
+            "output_dir": output_rel,
+            "plan_file": plan_rel,
+            "units_dir": units_rel,
+        },
+        existing_artifacts=existing_artifacts,
+        errors=errors,
+        warnings=warnings,
+        message=(
+            "Delivery prepare command surface is ready; no delivery artifacts were written in this unit."
+            if ready
+            else "Delivery prepare is blocked; fix the reported errors and retry."
+        ),
+    )
+
+
+def _resolve_delivery_prepare_output_path(args: argparse.Namespace, task_path: Path, project_root: Path) -> Path:
+    output = getattr(args, "output", None)
+    if output:
+        return _resolve_from_cwd(output)
+    return (project_root / ".sikula" / "delivery" / _kebab_case_slug(task_path.stem)).resolve()
+
+
+def _validate_delivery_prepare_task_path(
+    task_path: Path,
+    task_rel: str | None,
+    project_root: Path,
+    errors: list[DeliveryPrepareIssue],
+) -> None:
+    if not _path_is_within(task_path, project_root):
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.task_outside_project",
+                "Task path must be inside the project root.",
+            )
+        )
+        return
+    if not task_path.exists():
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.task_missing",
+                "Task file does not exist.",
+                task_rel,
+            )
+        )
+        return
+    if not task_path.is_file():
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.task_not_file",
+                "Task path is not a file.",
+                task_rel,
+            )
+        )
+        return
+    try:
+        task_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.task_not_utf8",
+                "Task file is not readable as UTF-8 text.",
+                task_rel,
+            )
+        )
+    except OSError:
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.task_unreadable",
+                "Task file could not be read.",
+                task_rel,
+            )
+        )
+
+
+def _find_delivery_prepare_existing_artifacts(
+    plan_file: Path,
+    units_dir: Path,
+    project_root: Path,
+) -> list[DeliveryPrepareArtifact]:
+    artifacts: list[DeliveryPrepareArtifact] = []
+    if plan_file.exists() or plan_file.is_symlink():
+        artifacts.append(DeliveryPrepareArtifact("plan", _project_relative_path(plan_file, project_root)))
+    if units_dir.is_symlink():
+        artifacts.append(DeliveryPrepareArtifact("unit_task", _project_relative_path(units_dir, project_root)))
+        return artifacts
+    if units_dir.exists() and not units_dir.is_dir():
+        artifacts.append(DeliveryPrepareArtifact("unit_task", _project_relative_path(units_dir, project_root)))
+        return artifacts
+    if units_dir.is_dir():
+        resolved_units_dir = units_dir.resolve()
+        for unit_path in _iter_delivery_prepare_unit_artifacts(units_dir):
+            if not unit_path.is_symlink() and not _path_is_within(unit_path, resolved_units_dir):
+                continue
+            artifacts.append(DeliveryPrepareArtifact("unit_task", _project_relative_path(unit_path, project_root)))
+    return artifacts
+
+
+def _iter_delivery_prepare_unit_artifacts(units_dir: Path) -> list[Path]:
+    artifacts: list[Path] = []
+    pending = [units_dir]
+    while pending:
+        current = pending.pop()
+        try:
+            children = sorted(current.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if child.is_symlink():
+                artifacts.append(child)
+            elif child.is_file():
+                artifacts.append(child)
+            elif child.is_dir():
+                pending.append(child)
+    return sorted(artifacts)
+
+
+def _resolve_from_cwd(path: str | Path) -> Path:
+    raw_path = Path(path)
+    if raw_path.is_absolute():
+        return raw_path.resolve()
+    return (Path.cwd() / raw_path).resolve()
+
+
+def _project_relative_path(path: Path, project_root: Path) -> str:
+    try:
+        return path.relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _kebab_case_slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").lower()
+    return slug or "delivery-plan"
+
+
+def _format_prepare_issue(issue: DeliveryPrepareIssue) -> str:
+    location = f" [{issue.path}]" if issue.path else ""
+    return f"- {issue.code}{location}: {issue.message}"
 
 
 def cmd_delivery_finalize(args: argparse.Namespace, cfg: dict) -> None:

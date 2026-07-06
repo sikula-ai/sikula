@@ -8,6 +8,7 @@ Usage (project-centric, run from project root):
   sikula task refine task.md --auto --output task.refined.md
   sikula contract prepare task.refined.md --output .sikula/contracts/task.contract.md
   sikula delivery check .sikula/delivery/my-plan/plan.yaml
+  sikula delivery prepare .sikula/tasks/my-task.md --output .sikula/delivery/my-plan/
   sikula delivery status .sikula/delivery/my-plan/plan.yaml
   sikula delivery finalize .sikula/delivery/my-plan/plan.yaml --dry-run
   sikula run task.md                 # auto-discovers .sikula/config.yaml
@@ -3170,6 +3171,10 @@ def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
     return cli_delivery.cmd_delivery_status(args, cfg)
 
 
+def cmd_delivery_prepare(args: argparse.Namespace, cfg: dict) -> None:
+    return cli_delivery.cmd_delivery_prepare(args, cfg)
+
+
 def cmd_delivery_finalize(args: argparse.Namespace, cfg: dict) -> None:
     return cli_delivery.cmd_delivery_finalize(args, cfg)
 
@@ -3283,6 +3288,8 @@ def main() -> None:
             cmd_delivery_check(args, cfg)
         elif args.delivery_command == "status":
             cmd_delivery_status(args, cfg)
+        elif args.delivery_command == "prepare":
+            cmd_delivery_prepare(args, cfg)
         elif args.delivery_command == "run-next":
             cmd_delivery_run_next(args, cfg)
         elif args.delivery_command == "finalize":

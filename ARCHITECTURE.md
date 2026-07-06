@@ -199,6 +199,14 @@ task-hash scoped: when the task content hash changes, existing filled answers ar
 only under `previous_answers`, while active `answers` are reset for the new hash so future
 `contract prepare` or run preflight logic does not treat stale answers as authoritative.
 
+**Delivery plan prepare command:** `sikula delivery prepare TASK_FILE` is a
+CLI-surface preflight for future delivery plan authoring. Its CLI wrapper lives
+in `sikula_cli/delivery.py`. It validates the source task and output paths,
+derives the selected plan ID, reserves a privacy-safe JSON result shape, and
+validates `delivery_preparer` model/provider/timeout overrides. It currently
+does not create `TaskState`, delivery progress, worktrees, branches, provider
+calls, plan files, unit task files, or any other artifacts.
+
 **Delivery plan check command:** `sikula delivery check PLAN_FILE` is the first
 delivery-plan MVP primitive. Its CLI wrapper lives in `sikula_cli/delivery.py`;
 deterministic validation is implemented by `core/delivery_plan.py`. It validates
