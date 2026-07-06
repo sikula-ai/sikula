@@ -259,8 +259,23 @@ Before starting a selected unit, execution walks the selected unit's dependency
 closure and verifies that every completed prerequisite result commit is already
 an ancestor of the current checkout. Completed no-op prerequisites have no
 commit to verify, but their own prerequisites are still checked.
-The execution MVP runs one unit at a time and does not assemble the plan's final
-delivery branch yet.
+The execution MVP runs one unit at a time. It intentionally does not assemble
+the plan's final delivery branch automatically.
+
+**Delivery final branch command:** `sikula delivery finalize PLAN_FILE` is the
+explicit final branch assembly step for a completed delivery plan. Its CLI
+wrapper lives in `sikula_cli/delivery.py`; deterministic preflight and Git ref
+updates are implemented by `core/delivery_finalize.py`. Finalize requires the
+plan status to be `done`, verifies that each completed unit result commit is
+applied to the current checkout, then uses the current `HEAD` as the final
+commit candidate and creates or fast-forwards `final_branch`. Existing diverged
+final branches are rejected; Sikula does not force-update them. The command
+records only compact parent metadata in delivery progress: final branch, final
+commit, finalized timestamp, and an append-only `plan.finalized` event. It does
+not embed child task state, prompts, provider output, diffs, logs, or validation
+records. Any later unit progress update clears finalization metadata because the
+recorded final branch is a snapshot of a specific completed unit set.
+`--dry-run` performs the same preflight without mutating Git refs or progress.
 
 ---
 

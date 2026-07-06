@@ -74,6 +74,32 @@ operator has merged or otherwise applied prerequisite unit branches locally.
 Unlike `check` and `status`, `run-next` loads project runtime config because it
 uses the same project settings as `sikula run`.
 
+Preview final delivery branch creation after every unit is done:
+
+```bash
+sikula delivery finalize .sikula/delivery/<slug>/plan.yaml --dry-run
+sikula delivery finalize .sikula/delivery/<slug>/plan.yaml --dry-run --json
+```
+
+Create or fast-forward the plan's final branch:
+
+```bash
+sikula delivery finalize .sikula/delivery/<slug>/plan.yaml
+sikula delivery finalize .sikula/delivery/<slug>/plan.yaml --json
+```
+
+`finalize` requires the delivery plan status to be `done`. It verifies that each
+completed unit result commit, when present, is applied to the current checkout.
+The current `HEAD` is the final commit candidate, so YAML unit ordering does not
+affect final branch selection. It then creates `final_branch` or fast-forwards
+it. Existing diverged branches are rejected; Sikula does not force-update a
+final branch. No-op plans with no unit result commits also finalize to the
+current `HEAD`. Like `run-next`, `finalize` loads project runtime config because
+it mutates Git refs and parent delivery progress.
+Any later unit progress update clears the recorded final branch metadata, so an
+extended or rerun delivery plan must be finalized again after it returns to
+`done`.
+
 The MVP validator checks:
 
 - `schema_version: 1`,
@@ -88,11 +114,9 @@ The MVP validator checks:
 `delivery status` first runs the same plan validation, then reads ignored parent
 progress from `.sikula/state/delivery/<plan-id>/progress.json` when present. If
 that progress file does not exist yet, all delivery units are reported from the
-plan as `pending`, with dependency blockers derived from `depends_on`.
-
-The current execution MVP does not create or update the plan's `final_branch`.
-Final delivery branch assembly and multi-unit orchestration are reserved for a
-later delivery-plan phase.
+plan as `pending`, with dependency blockers derived from `depends_on`. After
+`delivery finalize` succeeds, status includes the final branch, final commit,
+and finalization timestamp.
 
 ## Plan Shape
 
@@ -180,8 +204,8 @@ can coordinate cross-repo branches, locks, validation, and result sets.
 
 ## Privacy
 
-`delivery check --json`, `delivery status --json`, and `delivery run-next
---json` return plan metadata, validation issues, unit paths, compact progress
-fields, selected child task IDs, and branch/commit pointers when available. They
-do not embed unit task file bodies, prompts, provider output, diffs, logs, or
-task state.
+`delivery check --json`, `delivery status --json`, `delivery run-next --json`,
+and `delivery finalize --json` return plan metadata, validation issues, unit
+paths, compact progress fields, selected child task IDs, final branch metadata,
+and branch/commit pointers when available. They do not embed unit task file
+bodies, prompts, provider output, diffs, logs, or task state.

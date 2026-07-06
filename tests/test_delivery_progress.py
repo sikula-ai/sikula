@@ -316,7 +316,106 @@ def test_delivery_status_reports_done_when_all_units_are_done(tmp_path: Path) ->
 
     assert result.valid is True
     assert result.status == "done"
-    assert result.next_action == "review final delivery branch"
+    assert result.next_action == "finalize delivery branch"
+
+
+def test_delivery_status_reports_finalized_branch_metadata(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "final_branch": "sikula/delivery/status-demo",
+            "final_commit": "abc123",
+            "finalized_at": "2026-07-04T12:00:00+00:00",
+            "units": [
+                {"unit_id": "01-foundation", "status": "done"},
+                {"unit_id": "02-feature", "status": "done"},
+            ],
+        },
+    )
+
+    result = get_delivery_status(plan_path)
+    payload = result.to_dict()
+
+    assert result.valid is True
+    assert result.status == "done"
+    assert result.final_branch == "sikula/delivery/status-demo"
+    assert result.final_commit == "abc123"
+    assert result.finalized_at == "2026-07-04T12:00:00+00:00"
+    assert result.next_action == "review finalized delivery branch"
+    assert payload["final_branch"] == "sikula/delivery/status-demo"
+    assert payload["final_commit"] == "abc123"
+    assert payload["finalized_at"] == "2026-07-04T12:00:00+00:00"
+    rendered = render_delivery_status(result)
+    assert "Finalized: sikula/delivery/status-demo @ abc123" in rendered
+    assert "Next action: review finalized delivery branch" in rendered
+
+
+def test_unit_progress_update_clears_stale_finalization_metadata(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    unit_1 = _write_unit(tmp_path, "01-foundation.md")
+    unit_2 = _write_unit(tmp_path, "02-feature.md")
+    unit_3 = _write_unit(tmp_path, "03-followup.md")
+    plan_path = _write_plan(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "title": "Delivery status demo",
+            "final_branch": "sikula/delivery/status-demo",
+            "units": [
+                {
+                    "id": "01-foundation",
+                    "title": "Add foundation",
+                    "task_path": unit_1,
+                    "depends_on": [],
+                },
+                {
+                    "id": "02-feature",
+                    "title": "Add feature",
+                    "task_path": unit_2,
+                    "depends_on": ["01-foundation"],
+                },
+                {
+                    "id": "03-followup",
+                    "title": "Add follow-up",
+                    "task_path": unit_3,
+                    "depends_on": ["02-feature"],
+                },
+            ],
+        },
+    )
+    progress = DeliveryProgress(
+        schema_version=1,
+        plan_id="delivery-status-demo",
+        units=[
+            DeliveryUnitProgress(unit_id="01-foundation", status="done", commit="commit-1"),
+            DeliveryUnitProgress(unit_id="02-feature", status="done", commit="commit-2"),
+        ],
+        final_branch="sikula/delivery/status-demo",
+        final_commit="commit-2",
+        finalized_at="2026-07-04T12:00:00+00:00",
+    )
+
+    updated = upsert_delivery_unit_progress(
+        progress,
+        DeliveryUnitProgress(unit_id="03-followup", status="done", commit="commit-3"),
+    )
+    write_delivery_progress(delivery_progress_path(tmp_path, "delivery-status-demo"), updated)
+    result = get_delivery_status(plan_path)
+
+    assert updated.final_branch is None
+    assert updated.final_commit is None
+    assert updated.finalized_at is None
+    assert result.status == "done"
+    assert result.final_branch is None
+    assert result.final_commit is None
+    assert result.finalized_at is None
+    assert result.next_action == "finalize delivery branch"
 
 
 def test_delivery_status_reports_invalid_plan_without_progress_path(tmp_path: Path) -> None:

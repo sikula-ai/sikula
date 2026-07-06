@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -30,6 +31,30 @@ def _write_project_config(root: Path) -> None:
     path = root / ".sikula" / "config.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("project:\n  root_path: .\n  build_tool: python\n", encoding="utf-8")
+
+
+def _git_commit_file(root: Path, name: str, body: str) -> str:
+    path = root / name
+    path.write_text(body, encoding="utf-8")
+    subprocess.run(["git", "add", name], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Sikula Test",
+            "-c",
+            "user.email=sikula@example.test",
+            "commit",
+            "-m",
+            f"add {name}",
+        ],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+    ).stdout.strip()
 
 
 def test_delivery_check_cli_validates_plan_without_project_config(
@@ -190,6 +215,60 @@ def test_delivery_run_next_dry_run_reports_selected_unit_with_project_config(
     assert payload["selected_unit"]["scope_paths"] == ["apps/web/src"]
     assert payload["progress_exists"] is False
     assert not (git_project / ".sikula" / "state" / "delivery" / "delivery-run-next-smoke" / "progress.json").exists()
+
+
+def test_delivery_finalize_dry_run_reports_final_branch_with_project_config(
+    git_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    commit = _git_commit_file(git_project, "feature.txt", "feature\n")
+    unit_1 = _write_delivery_unit(git_project, "01-foundation.md", "# Unit 01\n\nAdd foundation.\n")
+    plan_path = _write_delivery_plan(
+        git_project,
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-finalize-smoke",
+            "title": "Delivery finalize smoke",
+            "final_branch": "sikula/delivery/delivery-finalize-smoke",
+            "units": [
+                {
+                    "id": "01-foundation",
+                    "title": "Add foundation",
+                    "task_path": unit_1,
+                    "depends_on": [],
+                }
+            ],
+        },
+    )
+    progress_path = git_project / ".sikula" / "state" / "delivery" / "delivery-finalize-smoke" / "progress.json"
+    progress_path.parent.mkdir(parents=True)
+    progress_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "plan_id": "delivery-finalize-smoke",
+                "units": [{"unit_id": "01-foundation", "status": "done", "commit": commit}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_project_config(git_project)
+    monkeypatch.chdir(git_project)
+
+    with patch(
+        "sys.argv",
+        ["sikula", "delivery", "finalize", plan_path.relative_to(git_project).as_posix(), "--dry-run", "--json"],
+    ):
+        main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
+    assert payload["dry_run"] is True
+    assert payload["finalized"] is False
+    assert payload["final_branch"] == "sikula/delivery/delivery-finalize-smoke"
+    assert payload["final_commit"] == commit
+    assert not (git_project / ".git" / "refs" / "heads" / "sikula" / "delivery" / "delivery-finalize-smoke").exists()
 
 
 def test_delivery_commands_ignore_malformed_project_config(

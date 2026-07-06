@@ -35,6 +35,16 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
     )
     delivery_run_next_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
 
+    delivery_finalize_p = delivery_sub.add_parser("finalize", help="Create or update a delivery plan final branch")
+    delivery_finalize_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
+    delivery_finalize_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Preview final branch updates without writing delivery progress or Git refs",
+    )
+    delivery_finalize_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
+
     return delivery_p
 
 
@@ -59,6 +69,24 @@ def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
     else:
         print(render_delivery_status(result), end="")
     if not result.valid:
+        sys.exit(1)
+
+
+def cmd_delivery_finalize(args: argparse.Namespace, cfg: dict) -> None:
+    from core.delivery_finalize import finalize_delivery_plan, preview_delivery_finalize, render_delivery_finalize
+
+    project_root_raw = cfg.get("project", {}).get("root_path") if isinstance(cfg, dict) else None
+    project_root = Path(project_root_raw).resolve() if project_root_raw else None
+    if getattr(args, "dry_run", False):
+        result = preview_delivery_finalize(args.plan_file, project_root=project_root)
+        _print_delivery_result(result, json_output=args.json, render=render_delivery_finalize)
+        if not result.ready:
+            sys.exit(1)
+        return
+
+    result = finalize_delivery_plan(args.plan_file, project_root=project_root)
+    _print_delivery_result(result, json_output=args.json, render=render_delivery_finalize)
+    if not result.finalized:
         sys.exit(1)
 
 
@@ -409,7 +437,14 @@ def _progress_from_status(status):
                 updated_at=unit.updated_at,
             )
         )
-    return DeliveryProgress(schema_version=1, plan_id=status.plan.plan_id, units=units)
+    return DeliveryProgress(
+        schema_version=1,
+        plan_id=status.plan.plan_id,
+        units=units,
+        final_branch=status.final_branch,
+        final_commit=status.final_commit,
+        finalized_at=status.finalized_at,
+    )
 
 
 def _progress_for_update(status, progress_path: Path, *, read_delivery_progress: Callable):

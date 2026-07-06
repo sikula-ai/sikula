@@ -57,13 +57,21 @@ class DeliveryProgress:
     schema_version: int
     plan_id: str
     units: list[DeliveryUnitProgress] = field(default_factory=list)
+    final_branch: str | None = None
+    final_commit: str | None = None
+    finalized_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "schema_version": self.schema_version,
             "plan_id": self.plan_id,
             "units": [unit.to_dict() for unit in self.units],
         }
+        for key in ("final_branch", "final_commit", "finalized_at"):
+            value = getattr(self, key)
+            if value:
+                data[key] = value
+        return data
 
 
 @dataclass(frozen=True)
@@ -228,6 +236,9 @@ class DeliveryStatusResult:
     plan: DeliveryPlan | None = None
     units: list[DeliveryStatusUnit] = field(default_factory=list)
     next_action: str | None = None
+    final_branch: str | None = None
+    final_commit: str | None = None
+    finalized_at: str | None = None
 
     @property
     def valid(self) -> bool:
@@ -247,6 +258,10 @@ class DeliveryStatusResult:
         }
         if self.next_action:
             data["next_action"] = self.next_action
+        for key in ("final_branch", "final_commit", "finalized_at"):
+            value = getattr(self, key)
+            if value:
+                data[key] = value
         if self.plan:
             data["plan"] = {
                 "schema_version": self.plan.schema_version,
@@ -346,10 +361,21 @@ def upsert_delivery_unit_progress(
             units.append(existing)
     if not replaced:
         units.append(unit)
+    if units == progress.units:
+        final_branch = progress.final_branch
+        final_commit = progress.final_commit
+        finalized_at = progress.finalized_at
+    else:
+        final_branch = None
+        final_commit = None
+        finalized_at = None
     return DeliveryProgress(
         schema_version=progress.schema_version,
         plan_id=progress.plan_id,
         units=units,
+        final_branch=final_branch,
+        final_commit=final_commit,
+        finalized_at=finalized_at,
     )
 
 
@@ -387,6 +413,8 @@ def make_delivery_progress_event(
     event_type: str,
     *,
     unit: DeliveryUnitProgress | None = None,
+    branch: str | None = None,
+    commit: str | None = None,
     timestamp: str | None = None,
 ) -> DeliveryProgressEvent:
     timestamp = timestamp or _utc_now()
@@ -397,10 +425,29 @@ def make_delivery_progress_event(
         unit_id=unit.unit_id if unit else None,
         status=unit.status if unit else None,
         child_task_id=unit.child_task_id if unit else None,
-        branch=unit.branch if unit else None,
-        commit=unit.commit if unit else None,
+        branch=unit.branch if unit else branch,
+        commit=unit.commit if unit else commit,
         waiting_reason=unit.waiting_reason if unit else None,
         failure_code=unit.failure_code if unit else None,
+    )
+
+
+def mark_delivery_finalized(
+    progress: DeliveryProgress,
+    *,
+    final_branch: str,
+    final_commit: str,
+    timestamp: str | None = None,
+) -> DeliveryProgress:
+    _validate_progress(progress)
+    timestamp = timestamp or _utc_now()
+    return DeliveryProgress(
+        schema_version=progress.schema_version,
+        plan_id=progress.plan_id,
+        units=list(progress.units),
+        final_branch=final_branch,
+        final_commit=final_commit,
+        finalized_at=timestamp,
     )
 
 
@@ -441,6 +488,9 @@ def get_delivery_status(path: str | Path, *, project_root: Path | None = None) -
 
     units = _build_status_units(plan, progress, warnings)
     status = "invalid" if errors else _overall_status(units)
+    final_branch = progress.final_branch if progress else None
+    final_commit = progress.final_commit if progress else None
+    finalized_at = progress.finalized_at if progress else None
     return DeliveryStatusResult(
         plan_path=check_result.plan_path,
         project_root=check_result.project_root,
@@ -451,7 +501,10 @@ def get_delivery_status(path: str | Path, *, project_root: Path | None = None) -
         warnings=warnings,
         plan=plan,
         units=units,
-        next_action=_next_action(status, units),
+        next_action=_next_action(status, units, final_commit=final_commit),
+        final_branch=final_branch,
+        final_commit=final_commit,
+        finalized_at=finalized_at,
     )
 
 
@@ -535,6 +588,12 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
                 f"Final branch: {result.plan.final_branch}",
             ]
         )
+    if result.final_commit:
+        final_branch = result.final_branch or (result.plan.final_branch if result.plan else None)
+        final_ref = f"{final_branch} @ {result.final_commit}" if final_branch else result.final_commit
+        lines.append(f"Finalized: {final_ref}")
+        if result.finalized_at:
+            lines.append(f"Finalized at: {result.finalized_at}")
 
     if result.units:
         lines.append("")
@@ -627,6 +686,15 @@ def _load_delivery_progress(path: Path, *, plan_id: str, errors: list[DeliveryPl
         )
         return None
 
+    progress_metadata = {
+        key: _optional_string(data, key, key, errors)
+        for key in (
+            "final_branch",
+            "final_commit",
+            "finalized_at",
+        )
+    }
+
     units: list[DeliveryUnitProgress] = []
     seen: set[str] = set()
     for idx, item in enumerate(raw_units):
@@ -647,7 +715,7 @@ def _load_delivery_progress(path: Path, *, plan_id: str, errors: list[DeliveryPl
         units.append(unit)
     if errors:
         return None
-    return DeliveryProgress(schema_version=schema_version, plan_id=plan_id, units=units)
+    return DeliveryProgress(schema_version=schema_version, plan_id=plan_id, units=units, **progress_metadata)
 
 
 def _parse_progress_unit(
@@ -780,7 +848,7 @@ def _overall_status(units: list[DeliveryStatusUnit]) -> str:
     return "pending"
 
 
-def _next_action(status: str, units: list[DeliveryStatusUnit]) -> str:
+def _next_action(status: str, units: list[DeliveryStatusUnit], *, final_commit: str | None = None) -> str:
     if status == "invalid":
         return "fix delivery plan status errors"
     if status == "running":
@@ -792,7 +860,7 @@ def _next_action(status: str, units: list[DeliveryStatusUnit]) -> str:
     if status == "canceled":
         return "inspect canceled delivery progress"
     if status == "done":
-        return "review final delivery branch"
+        return "review finalized delivery branch" if final_commit else "finalize delivery branch"
     if any(unit.eligible for unit in units):
         return "prepare or run an eligible delivery unit with the existing task workflow"
     return "complete prerequisite delivery units"
