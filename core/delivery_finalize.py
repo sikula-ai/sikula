@@ -388,7 +388,12 @@ def _final_branch_move_error(root: Path, branch: str, existing: str | None, targ
 
 
 def _valid_branch_name(root: Path, branch: str) -> bool:
-    result = subprocess.run(["git", "check-ref-format", "--branch", branch], cwd=root, capture_output=True, text=True)
+    result = subprocess.run(
+        ["git", "check-ref-format", f"refs/heads/{branch}"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
     return result.returncode == 0
 
 

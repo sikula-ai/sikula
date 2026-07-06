@@ -274,6 +274,44 @@ def test_finalize_delivery_plan_does_not_update_branch_when_progress_reread_fail
     assert not (tmp_path / ".git" / "refs" / "heads" / "sikula" / "delivery" / "final").exists()
 
 
+def test_finalize_delivery_plan_reports_existing_progress_lock(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    commit = _git_commit(tmp_path, "unit.txt", "unit\n")
+    plan_path = _write_plan(tmp_path, unit_count=1)
+    _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": commit}])
+    lock = delivery_finalize_module.acquire_delivery_progress_lock(
+        tmp_path,
+        "delivery-finalize-demo",
+        owner="test",
+    )
+
+    try:
+        result = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    finally:
+        lock.release()
+
+    assert result.finalized is False
+    assert result.ready is False
+    assert [issue.code for issue in result.errors] == ["delivery.locked"]
+    assert not (tmp_path / ".git" / "refs" / "heads" / "sikula" / "delivery" / "final").exists()
+
+
+def test_preview_delivery_finalize_reports_missing_final_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _git_init(tmp_path)
+    commit = _git_commit(tmp_path, "unit.txt", "unit\n")
+    plan_path = _write_plan(tmp_path, unit_count=1)
+    _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": commit}])
+    monkeypatch.setattr(delivery_finalize_module, "_final_commit_candidate", lambda root: None)
+
+    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
+
+    assert result.ready is False
+    assert result.final_commit is None
+    assert [issue.code for issue in result.errors] == ["delivery.final_commit_missing"]
+
+
 def test_finalize_delivery_plan_uses_head_for_all_noop_units(tmp_path: Path) -> None:
     _git_init(tmp_path)
     head = _git_commit(tmp_path, "base.txt", "base\n")
@@ -285,6 +323,37 @@ def test_finalize_delivery_plan_uses_head_for_all_noop_units(tmp_path: Path) -> 
     assert result.finalized is True
     assert result.final_commit == head
     assert _rev_parse(tmp_path, "refs/heads/sikula/delivery/final") == head
+
+
+def test_preview_delivery_finalize_reports_missing_unit_commit(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    _git_commit(tmp_path, "unit.txt", "unit\n")
+    plan_path = _write_plan(tmp_path, unit_count=1)
+    _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": "missing-ref"}])
+
+    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
+
+    assert result.ready is False
+    assert result.finalized is False
+    assert [issue.code for issue in result.errors] == ["delivery.unit_commit_missing"]
+
+
+def test_preview_delivery_finalize_rejects_checked_out_final_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _git_init(tmp_path)
+    base = _git_commit(tmp_path, "base.txt", "base\n")
+    subprocess.run(["git", "branch", "sikula/delivery/final", base], cwd=tmp_path, check=True)
+    unit_commit = _git_commit(tmp_path, "unit.txt", "unit\n")
+    plan_path = _write_plan(tmp_path, unit_count=1)
+    _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": unit_commit}])
+    monkeypatch.setattr(delivery_finalize_module, "_branch_checked_out", lambda root, branch: True)
+
+    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
+
+    assert result.ready is False
+    assert result.finalized is False
+    assert [issue.code for issue in result.errors] == ["delivery.final_branch_checked_out"]
 
 
 def test_finalize_delivery_plan_rejects_diverged_final_branch(tmp_path: Path) -> None:
@@ -305,6 +374,85 @@ def test_finalize_delivery_plan_rejects_diverged_final_branch(tmp_path: Path) ->
     assert result.ready is False
     assert [issue.code for issue in result.errors] == ["delivery.final_branch_diverged"]
     assert _rev_parse(tmp_path, "refs/heads/sikula/delivery/final") == other_commit
+
+
+def test_update_final_branch_noops_when_branch_already_at_commit(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    commit = _git_commit(tmp_path, "unit.txt", "unit\n")
+    subprocess.run(["git", "branch", "sikula/delivery/final", commit], cwd=tmp_path, check=True)
+
+    error = delivery_finalize_module._update_final_branch(tmp_path, "sikula/delivery/final", commit)
+
+    assert error is None
+    assert _rev_parse(tmp_path, "refs/heads/sikula/delivery/final") == commit
+
+
+def test_update_final_branch_reports_update_ref_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _git_init(tmp_path)
+    commit = _git_commit(tmp_path, "unit.txt", "unit\n")
+    original_run = delivery_finalize_module.subprocess.run
+
+    def fail_update_ref(args, *positional, **kwargs):
+        if args[:2] == ["git", "update-ref"]:
+            return subprocess.CompletedProcess(args, 1, "", "bad ref")
+        return original_run(args, *positional, **kwargs)
+
+    monkeypatch.setattr(delivery_finalize_module.subprocess, "run", fail_update_ref)
+
+    error = delivery_finalize_module._update_final_branch(tmp_path, "sikula/delivery/final", commit)
+
+    assert error is not None
+    assert error.code == "delivery.final_branch_update_failed"
+
+
+def test_preview_delivery_finalize_rejects_branch_checkout_shorthand(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    base = _git_commit(tmp_path, "base.txt", "base\n")
+    main_branch = _current_branch(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "other", base], cwd=tmp_path, check=True)
+    subprocess.run(["git", "checkout", "-q", main_branch], cwd=tmp_path, check=True)
+    unit_commit = _git_commit(tmp_path, "unit.txt", "unit\n")
+    plan_path = _write_plan(tmp_path, unit_count=1, final_branch="@{-1}")
+    _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": unit_commit}])
+
+    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
+
+    assert result.ready is False
+    assert result.finalized is False
+    assert [issue.code for issue in result.errors] == ["delivery.final_branch_invalid"]
+    assert result.final_commit is None
+
+
+def test_render_delivery_finalize_outputs_errors_and_warnings(tmp_path: Path) -> None:
+    result = delivery_finalize_module.DeliveryFinalizeResult(
+        plan_path=str(tmp_path / "plan.yaml"),
+        project_root=str(tmp_path),
+        valid=False,
+        ready=False,
+        dry_run=False,
+        finalized=False,
+        status="done",
+        progress_exists=True,
+        final_branch="sikula/delivery/final",
+        final_commit="abc123",
+        progress_path=str(tmp_path / "progress.json"),
+        events_path=str(tmp_path / "events.jsonl"),
+        errors=[DeliveryPlanIssue("error", "delivery.example", "Example error.")],
+        warnings=[DeliveryPlanIssue("warning", "delivery.warning", "Example warning.")],
+        message="Blocked.",
+    )
+
+    output = render_delivery_finalize(result)
+
+    assert "Status: blocked" in output
+    assert "Project root:" in output
+    assert "Plan status: done" in output
+    assert "Final branch: sikula/delivery/final" in output
+    assert "Final commit: abc123" in output
+    assert "Progress:" in output
+    assert "Events:" in output
+    assert "- delivery.example: Example error." in output
+    assert "- delivery.warning: Example warning." in output
 
 
 def test_finalize_delivery_plan_rechecks_branch_before_update(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
