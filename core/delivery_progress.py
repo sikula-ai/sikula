@@ -167,6 +167,8 @@ class DeliveryStatusUnit:
     phase: str | None = None
     kind: str | None = None
     repo_id: str | None = None
+    component: str | None = None
+    scope_paths: list[str] = field(default_factory=list)
     child_task_id: str | None = None
     branch: str | None = None
     commit: str | None = None
@@ -196,6 +198,7 @@ class DeliveryStatusUnit:
             "phase",
             "kind",
             "repo_id",
+            "component",
             "child_task_id",
             "branch",
             "commit",
@@ -208,6 +211,8 @@ class DeliveryStatusUnit:
             value = getattr(self, key)
             if value:
                 data[key] = value
+        if self.scope_paths:
+            data["scope_paths"] = list(self.scope_paths)
         return data
 
 
@@ -252,6 +257,8 @@ class DeliveryStatusResult:
                 "repositories": [repo.to_dict() for repo in self.plan.repositories],
                 "streams": list(self.plan.stream_ids),
             }
+            if self.plan.components:
+                data["plan"]["components"] = [component.to_dict() for component in self.plan.components]
         return data
 
 
@@ -741,6 +748,8 @@ def _build_status_units(
                 phase=plan_unit.phase,
                 kind=plan_unit.kind,
                 repo_id=plan_unit.repo_id,
+                component=plan_unit.component,
+                scope_paths=list(plan_unit.scope_paths),
                 child_task_id=progress_unit.child_task_id if progress_unit else None,
                 branch=progress_unit.branch if progress_unit else None,
                 commit=progress_unit.commit if progress_unit else None,

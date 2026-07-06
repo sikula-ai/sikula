@@ -139,7 +139,7 @@ sikula delivery run-next .sikula/delivery/my-plan/plan.yaml --dry-run
 sikula delivery run-next .sikula/delivery/my-plan/plan.yaml
 ```
 
-Use this to validate and inspect the tracked parent plan for larger work split into delivery units. The current MVP checks plan structure, unit dependencies, task paths, stream references, single-repository scope, and privacy-safe parent progress, and can run one eligible unit at a time through the normal `sikula run` pipeline. See [Delivery Plans](docs/delivery-plans.md).
+Use this to validate and inspect the tracked parent plan for larger work split into delivery units. The current MVP checks plan structure, unit dependencies, task paths, stream/component metadata, single-repository scope, and privacy-safe parent progress, and can run one eligible unit at a time through the normal `sikula run` pipeline. See [Delivery Plans](docs/delivery-plans.md).
 
 **Run a task into a branch**
 

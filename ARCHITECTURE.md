@@ -206,9 +206,13 @@ tracked `.sikula/delivery/<slug>/plan.yaml` files without creating
 `TaskState`, starting agents, creating worktrees, preparing contracts, or
 updating branches. The validator checks schema version, required plan metadata,
 delivery unit IDs, unit task paths, dependency references/cycles, optional stream
-references, and the MVP single-repository boundary. If `repositories` is omitted,
-the plan is treated as one implicit repository with `id: main` and `root: .`;
-multi-repo plans are rejected until cross-repo execution semantics are added.
+references, optional monorepo component metadata, unit scope paths, and the MVP
+single-repository boundary. Component and scope fields are metadata only: they
+are preserved for JSON consumers and delivery-console grouping, but they do not
+change `sikula run` behavior, provider access, validation command scope, or
+worktree creation. If `repositories` is omitted, the plan is treated as one
+implicit repository with `id: main` and `root: .`; multi-repo plans are rejected
+until cross-repo execution semantics are added.
 
 **Delivery plan status command:** `sikula delivery status PLAN_FILE` is a
 read-only parent-progress view. Its CLI wrapper lives in

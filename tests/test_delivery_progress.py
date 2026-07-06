@@ -112,6 +112,57 @@ def test_delivery_status_defaults_to_pending_when_progress_is_missing(tmp_path: 
     assert "01-foundation: pending (eligible)" in rendered
 
 
+def test_delivery_status_preserves_monorepo_component_metadata(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    unit_1 = _write_unit(tmp_path, "01-foundation.md")
+    plan_path = _write_plan(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "title": "Delivery status demo",
+            "final_branch": "sikula/delivery/status-demo",
+            "streams": [{"id": "app", "label": "App"}],
+            "components": [
+                {
+                    "id": "android",
+                    "label": "Android app",
+                    "path": "apps/android",
+                    "stream": "app",
+                }
+            ],
+            "units": [
+                {
+                    "id": "01-foundation",
+                    "title": "Add foundation",
+                    "stream": "app",
+                    "component": "android",
+                    "scope_paths": ["apps/android/app", "apps/android/gradle.properties"],
+                    "task_path": unit_1,
+                    "depends_on": [],
+                }
+            ],
+        },
+    )
+
+    result = get_delivery_status(plan_path)
+    payload = result.to_dict()
+
+    assert result.valid is True
+    assert result.units[0].component == "android"
+    assert result.units[0].scope_paths == ["apps/android/app", "apps/android/gradle.properties"]
+    assert payload["plan"]["components"] == [
+        {
+            "id": "android",
+            "path": "apps/android",
+            "label": "Android app",
+            "stream": "app",
+        }
+    ]
+    assert payload["units"][0]["component"] == "android"
+    assert payload["units"][0]["scope_paths"] == ["apps/android/app", "apps/android/gradle.properties"]
+
+
 def test_delivery_status_reads_progress_file(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
