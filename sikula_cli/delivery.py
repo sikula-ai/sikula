@@ -12,6 +12,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from sikula_cli.agent_overrides import parse_agent_llm_overrides
+
 
 def register_parser(subparsers) -> argparse.ArgumentParser:
     delivery_p = subparsers.add_parser("delivery", help="Inspect and run delivery plans")
@@ -34,6 +36,27 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
         help="Preview the next eligible unit without running agents or writing delivery progress",
     )
     delivery_run_next_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
+    delivery_run_next_p.add_argument(
+        "--agent-model",
+        action="append",
+        default=None,
+        metavar="AGENT=MODEL",
+        help="Override model for one child run agent, e.g. --agent-model analyst=gpt-5.5",
+    )
+    delivery_run_next_p.add_argument(
+        "--agent-provider",
+        action="append",
+        default=None,
+        metavar="AGENT=PROVIDER",
+        help="Override provider for one child run agent, e.g. --agent-provider implementer=claude",
+    )
+    delivery_run_next_p.add_argument(
+        "--agent-timeout",
+        action="append",
+        default=None,
+        metavar="AGENT=SECONDS",
+        help="Override timeout for one child run agent, e.g. --agent-timeout implementer=2400",
+    )
 
     delivery_finalize_p = delivery_sub.add_parser("finalize", help="Create or update a delivery plan final branch")
     delivery_finalize_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
@@ -121,6 +144,7 @@ def cmd_delivery_run_next(
         render_delivery_run_next_preview,
     )
 
+    _validate_delivery_run_next_agent_overrides(args)
     project_root_raw = cfg.get("project", {}).get("root_path") if isinstance(cfg, dict) else None
     project_root = Path(project_root_raw).resolve() if project_root_raw else None
     if getattr(args, "dry_run", False):
@@ -139,6 +163,14 @@ def cmd_delivery_run_next(
     _print_delivery_result(result, json_output=args.json, render=render_delivery_run_next_execution)
     if not result.succeeded:
         sys.exit(1)
+
+
+def _validate_delivery_run_next_agent_overrides(args: argparse.Namespace) -> None:
+    parse_agent_llm_overrides(
+        getattr(args, "agent_model", None),
+        getattr(args, "agent_provider", None),
+        getattr(args, "agent_timeout", None),
+    )
 
 
 def _run_next_delivery_unit(
@@ -591,7 +623,13 @@ def _invoke_delivery_child_run(
     root: Path,
     task_path: str,
 ) -> DeliveryChildRunResult:
-    run_args = _delivery_child_run_args(root=root, task_path=task_path)
+    run_args = _delivery_child_run_args(
+        root=root,
+        task_path=task_path,
+        agent_model=getattr(args, "agent_model", None),
+        agent_provider=getattr(args, "agent_provider", None),
+        agent_timeout=getattr(args, "agent_timeout", None),
+    )
     run_cfg = copy.deepcopy(cfg)
     try:
         if getattr(args, "json", False):
@@ -619,7 +657,14 @@ def _invoke_delivery_child_run(
     return _coerce_child_run_result(raw_result)
 
 
-def _delivery_child_run_args(*, root: Path, task_path: str) -> argparse.Namespace:
+def _delivery_child_run_args(
+    *,
+    root: Path,
+    task_path: str,
+    agent_model: list[str] | None = None,
+    agent_provider: list[str] | None = None,
+    agent_timeout: list[str] | None = None,
+) -> argparse.Namespace:
     absolute_task_path = (root / task_path).resolve()
     return argparse.Namespace(
         task_file=str(absolute_task_path),
@@ -639,9 +684,9 @@ def _delivery_child_run_args(*, root: Path, task_path: str) -> argparse.Namespac
         checks=None,
         require_contract_ready=False,
         min_contract_score=None,
-        agent_model=None,
-        agent_provider=None,
-        agent_timeout=None,
+        agent_model=agent_model,
+        agent_provider=agent_provider,
+        agent_timeout=agent_timeout,
     )
 
 

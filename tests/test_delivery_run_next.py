@@ -40,6 +40,35 @@ from sikula_cli.delivery import (
 )
 
 
+def test_delivery_run_next_register_parser_sets_agent_overrides() -> None:
+    import sikula_cli.delivery as delivery_cli
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    delivery_cli.register_parser(subparsers)
+
+    args = parser.parse_args(
+        [
+            "delivery",
+            "run-next",
+            ".sikula/delivery/demo/plan.yaml",
+            "--agent-model",
+            "analyst=gpt-5.5",
+            "--agent-provider",
+            "implementer=antigravity",
+            "--agent-timeout",
+            "implementer=2400",
+        ]
+    )
+
+    assert args.command == "delivery"
+    assert args.delivery_command == "run-next"
+    assert args.plan_file == ".sikula/delivery/demo/plan.yaml"
+    assert args.agent_model == ["analyst=gpt-5.5"]
+    assert args.agent_provider == ["implementer=antigravity"]
+    assert args.agent_timeout == ["implementer=2400"]
+
+
 def _git_init(root: Path) -> None:
     subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
 
@@ -170,8 +199,23 @@ def _write_progress(root: Path, units: list[dict]) -> None:
     )
 
 
-def _run_next_args(plan_path: Path, *, dry_run: bool = False, json_output: bool = False) -> argparse.Namespace:
-    return argparse.Namespace(plan_file=str(plan_path), dry_run=dry_run, json=json_output)
+def _run_next_args(
+    plan_path: Path,
+    *,
+    dry_run: bool = False,
+    json_output: bool = False,
+    agent_model: list[str] | None = None,
+    agent_provider: list[str] | None = None,
+    agent_timeout: list[str] | None = None,
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        plan_file=str(plan_path),
+        dry_run=dry_run,
+        json=json_output,
+        agent_model=agent_model,
+        agent_provider=agent_provider,
+        agent_timeout=agent_timeout,
+    )
 
 
 def _run_next_cfg(root: Path) -> dict:
@@ -190,6 +234,52 @@ def _run_next_context(root: Path, runner) -> DeliveryRunNextContext:
 
 def _load_delivery_progress(root: Path) -> dict:
     return json.loads(delivery_progress_path(root, "delivery-run-next-demo").read_text(encoding="utf-8"))
+
+
+def test_cmd_delivery_run_next_dry_run_rejects_invalid_agent_override_before_preview(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, dry_run=True, agent_model=["bogus=x"]),
+            _run_next_cfg(tmp_path),
+        )
+
+    assert exc.value.code == 1
+    assert "Unknown agent 'bogus'" in capsys.readouterr().out
+    assert not delivery_progress_path(tmp_path, "delivery-run-next-demo").exists()
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_rejects_invalid_agent_timeout_before_progress(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    child_called = False
+
+    def runner(args: argparse.Namespace, cfg: dict) -> DeliveryChildRunResult:
+        nonlocal child_called
+        child_called = True
+        return DeliveryChildRunResult(exit_code=0, child_task_id="child")
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, agent_timeout=["implementer=abc"]),
+            _run_next_cfg(tmp_path),
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert child_called is False
+    assert "Invalid --agent-timeout value 'abc' for agent 'implementer': expected int" in capsys.readouterr().out
+    assert not delivery_progress_path(tmp_path, "delivery-run-next-demo").exists()
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
 
 
 def test_preview_delivery_run_next_selects_first_eligible_unit(tmp_path: Path) -> None:
@@ -362,6 +452,9 @@ def test_cmd_delivery_run_next_runs_selected_unit_and_records_progress(
         print("child run stdout")
         assert run_args.task_file == str((tmp_path / ".sikula/delivery/demo/units/01-foundation.md").resolve())
         assert run_args.no_isolate is False
+        assert run_args.agent_model == ["analyst=gpt-5.5"]
+        assert run_args.agent_provider == ["implementer=antigravity", "fixer=antigravity"]
+        assert run_args.agent_timeout == ["implementer=2400"]
         store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
         state = store.create("child task")
         state.done = True
@@ -371,7 +464,13 @@ def test_cmd_delivery_run_next_runs_selected_unit_and_records_progress(
         return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
 
     cmd_delivery_run_next(
-        _run_next_args(plan_path, json_output=True),
+        _run_next_args(
+            plan_path,
+            json_output=True,
+            agent_model=["analyst=gpt-5.5"],
+            agent_provider=["implementer=antigravity", "fixer=antigravity"],
+            agent_timeout=["implementer=2400"],
+        ),
         cfg,
         _run_next_context(tmp_path, runner),
     )

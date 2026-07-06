@@ -1706,7 +1706,7 @@ class TestIsolatedRunConfigGuard:
         assert "requires Sikula config/prompt-context files to be committed" in out
         assert not (tmp_path / ".sikula" / "state").exists()
 
-    def test_isolated_cmd_run_passes_phase_overrides_to_context_guard(
+    def test_isolated_cmd_run_passes_phase_and_agent_overrides_to_context_guard(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         monkeypatch.chdir(tmp_path)
@@ -1720,7 +1720,15 @@ class TestIsolatedRunConfigGuard:
             pytest.raises(SystemExit) as exc_info,
         ):
             cmd_run(
-                _run_args(task_file=str(task_file), review=False, security_review=False, test_writing=False),
+                _run_args(
+                    task_file=str(task_file),
+                    review=False,
+                    security_review=False,
+                    test_writing=False,
+                    agent_model=["analyst=gpt-5.5"],
+                    agent_provider=["implementer=claude"],
+                    agent_timeout=["implementer=2400"],
+                ),
                 cfg,
             )
 
@@ -1732,6 +1740,10 @@ class TestIsolatedRunConfigGuard:
         assert passed_overrides["run_review"] is False
         assert passed_overrides["run_security_review"] is False
         assert passed_overrides["run_test_writing"] is False
+        assert passed_overrides["agent_llms"] == {
+            "analyst": {"model": "gpt-5.5"},
+            "implementer": {"provider": "claude", "agent_timeout": 2400},
+        }
 
     def test_no_isolate_allows_untracked_config(self, tmp_path: Path):
         config_path = self._init_repo_with_config(tmp_path, commit_config=False)

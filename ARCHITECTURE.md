@@ -246,10 +246,14 @@ the delivery progress lock, selects one eligible pending unit, records it as
 `running`, and invokes the existing `sikula run` command path for the unit task
 file. The child run keeps all normal Sikula behavior: contract preflight,
 worktree isolation, provider execution, validation, review, state persistence,
-and task audit reporting. When the child run exits, delivery progress stores
-only compact parent metadata: unit status, child task id, branch, result commit
-when available, timestamps, and a failure code. Full prompts, provider output,
-diffs, logs, validation records, and task state remain in the child task state.
+and task audit reporting. `run-next` accepts the same per-agent
+`--agent-model`, `--agent-provider`, and `--agent-timeout` overrides as
+`sikula run` and forwards them to this child run; the parent delivery progress
+model does not store those prompt/provider settings. When the child run exits,
+delivery progress stores only compact parent metadata: unit status, child task
+id, branch, result commit when available, timestamps, and a failure code. Full
+prompts, provider output, diffs, logs, validation records, and task state remain
+in the child task state.
 The parent delivery unit is `done` only when the child exits successfully, the
 child `TaskState` is done, and the child result is finalized. Finalization means
 either a `result_commit` exists or the child left no preserved worktree to
