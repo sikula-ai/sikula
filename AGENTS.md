@@ -9,6 +9,7 @@ Before making non-trivial changes, read:
 - `CONTRIBUTING.md`
 - `README.md`
 - `.sikula/config.yaml`
+- `.sikula/CONVENTIONS.md`
 
 Use the document that owns the topic:
 
