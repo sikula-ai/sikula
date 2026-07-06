@@ -214,6 +214,7 @@ guidelines:
     - guidelines.md
     - ARCHITECTURE.md
     - AGENTS.md
+    - .sikula/CONVENTIONS.md
     - CONTRIBUTING.md
     - README.md
   max_file_chars: 50000

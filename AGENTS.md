@@ -9,6 +9,7 @@ Before making non-trivial changes, read:
 - `CONTRIBUTING.md`
 - `README.md`
 - `.sikula/config.yaml`
+- `.sikula/CONVENTIONS.md`
 
 Use the document that owns the topic:
 
@@ -18,6 +19,8 @@ Use the document that owns the topic:
   invariants, and testing conventions.
 - `.sikula/config.yaml` owns the Sikula self-hosting pipeline, sandbox, context
   files, and validation commands.
+- `.sikula/CONVENTIONS.md` owns self-hosted Sikula task and delivery plan
+  conventions for this repository.
 - `CONTRIBUTING.md` owns human development setup, editable install, test, lint,
   and release workflow.
 - `AGENTS.md` owns agent workflow and Sikula artifact handling.
@@ -36,6 +39,9 @@ When instructions conflict, follow this order:
 Normal Sikula product work should use Sikula's contract-first flow. Use direct
 manual edits only when the user explicitly asks for repository maintenance,
 documentation, configuration, review, or workflow changes.
+
+When using Sikula to develop this repository, follow `.sikula/CONVENTIONS.md`
+for task files, delivery plans, branches, and related PR titles.
 
 For fresh implementation work, refine the source task first, prepare a runnable
 implementation contract, then run the prepared contract through the readiness
@@ -70,6 +76,9 @@ Artifact ownership:
 - `.sikula/tasks/*.md` are source task descriptions or refined task drafts.
   Keep them focused on product intent, current and desired behavior,
   compatibility expectations, constraints, and observable acceptance decisions.
+- `.sikula/delivery/<slug>/plan.yaml` and
+  `.sikula/delivery/<slug>/units/*.md` are tracked source artifacts for
+  delivery plans and their unit task descriptions.
 - `.sikula/contracts/*.contract.md` are prepared runnable implementation
   contracts. Run these with `sikula run`. Regenerate them when the source task,
   repository context, or preparation answers change.
@@ -113,11 +122,11 @@ Rules for using Sikula on Sikula:
   changes this config does not fix the active run's validation coverage or
   sandbox policy; finish the explicit config change, then start a fresh run.
 - Prompt-governing files (`guidelines.md`, `AGENTS.md`, `ARCHITECTURE.md`,
-  `.sikula/config.yaml`, and `.sikula/*_rules.md`) affect future agent
-  behavior. Until Sikula snapshots all prompt context for active runs, do not
-  treat a run that changes these files as final approval of its own governance
-  changes; commit the change and run a fresh Sikula review or run from the
-  updated context.
+  `.sikula/CONVENTIONS.md`, `.sikula/config.yaml`, and
+  `.sikula/*_rules.md`) affect future agent behavior. Until Sikula snapshots
+  all prompt context for active runs, do not treat a run that changes these
+  files as final approval of its own governance changes; commit the change and
+  run a fresh Sikula review or run from the updated context.
 - `.sikula/*_rules.md` files are intentionally outside agent write scope. Update
   them as explicit maintainer changes, not as ordinary self-hosted task output.
 
