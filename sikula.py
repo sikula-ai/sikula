@@ -9,6 +9,7 @@ Usage (project-centric, run from project root):
   sikula contract prepare task.refined.md --output .sikula/contracts/task.contract.md
   sikula delivery check .sikula/delivery/my-plan/plan.yaml
   sikula delivery status .sikula/delivery/my-plan/plan.yaml
+  sikula delivery finalize .sikula/delivery/my-plan/plan.yaml --dry-run
   sikula run task.md                 # auto-discovers .sikula/config.yaml
   sikula run --task-id <task-id>     # resume existing task
   sikula status
@@ -3211,6 +3212,10 @@ def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
     return cli_delivery.cmd_delivery_status(args, cfg)
 
 
+def cmd_delivery_finalize(args: argparse.Namespace, cfg: dict) -> None:
+    return cli_delivery.cmd_delivery_finalize(args, cfg)
+
+
 def _run_delivery_child_task(args: argparse.Namespace, cfg: dict) -> cli_delivery.DeliveryChildRunResult:
     try:
         cmd_run(args, cfg)
@@ -3322,6 +3327,8 @@ def main() -> None:
             cmd_delivery_status(args, cfg)
         elif args.delivery_command == "run-next":
             cmd_delivery_run_next(args, cfg)
+        elif args.delivery_command == "finalize":
+            cmd_delivery_finalize(args, cfg)
         else:
             delivery_p.print_help()
             sys.exit(1)
