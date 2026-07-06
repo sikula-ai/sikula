@@ -137,6 +137,8 @@ sikula delivery status .sikula/delivery/my-plan/plan.yaml
 sikula delivery status .sikula/delivery/my-plan/plan.yaml --json
 sikula delivery run-next .sikula/delivery/my-plan/plan.yaml --dry-run
 sikula delivery run-next .sikula/delivery/my-plan/plan.yaml
+sikula delivery run-next .sikula/delivery/my-plan/plan.yaml \
+  --agent-provider implementer=antigravity
 sikula delivery finalize .sikula/delivery/my-plan/plan.yaml --dry-run
 sikula delivery finalize .sikula/delivery/my-plan/plan.yaml
 ```

@@ -49,11 +49,16 @@ Run the next eligible unit:
 ```bash
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --json
+sikula delivery run-next .sikula/delivery/<slug>/plan.yaml \
+  --agent-provider implementer=antigravity \
+  --agent-provider fixer=antigravity
 ```
 
 `run-next` without `--dry-run` acquires a parent delivery progress lock, marks
 the selected unit as `running`, starts one ordinary child `sikula run` for that
 unit task file, then records the terminal unit status as `done` or `failed`.
+It accepts the same per-agent `--agent-model`, `--agent-provider`, and
+`--agent-timeout` overrides as `sikula run` and passes them to the child run.
 Child task prompts, provider output, diffs, logs, and full task state remain in
 the normal child task state and are not embedded in delivery progress JSON.
 The parent unit is marked `done` only when the child run exits successfully, the
