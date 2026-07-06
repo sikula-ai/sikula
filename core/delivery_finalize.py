@@ -388,13 +388,19 @@ def _final_branch_move_error(root: Path, branch: str, existing: str | None, targ
 
 
 def _valid_branch_name(root: Path, branch: str) -> bool:
-    result = subprocess.run(
+    branch_result = subprocess.run(
+        ["git", "check-ref-format", "--branch", branch],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    literal_result = subprocess.run(
         ["git", "check-ref-format", f"refs/heads/{branch}"],
         cwd=root,
         capture_output=True,
         text=True,
     )
-    return result.returncode == 0
+    return branch_result.returncode == 0 and literal_result.returncode == 0
 
 
 def _branch_commit(root: Path, branch: str) -> str | None:

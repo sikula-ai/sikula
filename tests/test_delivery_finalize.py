@@ -423,6 +423,21 @@ def test_preview_delivery_finalize_rejects_branch_checkout_shorthand(tmp_path: P
     assert result.final_commit is None
 
 
+@pytest.mark.parametrize("final_branch", ["HEAD", "-foo"])
+def test_preview_delivery_finalize_rejects_refs_that_are_not_branch_names(tmp_path: Path, final_branch: str) -> None:
+    _git_init(tmp_path)
+    unit_commit = _git_commit(tmp_path, "unit.txt", "unit\n")
+    plan_path = _write_plan(tmp_path, unit_count=1, final_branch=final_branch)
+    _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": unit_commit}])
+
+    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
+
+    assert result.ready is False
+    assert result.finalized is False
+    assert [issue.code for issue in result.errors] == ["delivery.final_branch_invalid"]
+    assert result.final_commit is None
+
+
 def test_render_delivery_finalize_outputs_errors_and_warnings(tmp_path: Path) -> None:
     result = delivery_finalize_module.DeliveryFinalizeResult(
         plan_path=str(tmp_path / "plan.yaml"),
