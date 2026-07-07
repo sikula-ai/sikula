@@ -62,6 +62,7 @@ from core.llm_client import (
     _opencode_parse_text,
     _run_opencode_streaming,
     _terminate_process,
+    _with_readonly_no_commands_prefix,
     create_llm_client,
 )
 from core.llm_client import AntigravityClient, ClaudeClient, CodexClient, GeminiClient, OpenCodeClient
@@ -268,6 +269,21 @@ class TestAgentTextOrEmpty:
 
         with pytest.raises(LLMTransientError, match="temporary provider failure"):
             _agent_text_or_empty(parse, "")
+
+
+class TestReadonlyNoCommandsPrompt:
+    def test_inserts_no_commands_instruction_after_security_prefix(self):
+        prompt = "Do not make any network requests.\n\nOriginal prompt"
+
+        result = _with_readonly_no_commands_prefix(prompt)
+
+        assert result.startswith("Do not make any network requests.\n\nThis read-only agent pass must not run")
+        assert result.endswith("Original prompt")
+
+    def test_leaves_explicit_no_command_prompt_unchanged(self):
+        prompt = "Do not run commands at all.\n\nReturn JSON."
+
+        assert _with_readonly_no_commands_prefix(prompt) == prompt
 
 
 class TestOpencodeParsText:
@@ -869,6 +885,18 @@ class TestOpenCodeClientCommands:
         assert mock_run.call_args.kwargs["input"] == "prompt"
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
         assert "OPENCODE_CONFIG_DIR" in mock_run.call_args.kwargs["env"]
+
+    def test_run_readonly_agent_without_commands_prefixes_prompt(self, tmp_path: Path):
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        prompt = "Do not make any network requests.\n\nReturn JSON."
+
+        with patch("core.llm_client.subprocess.run", return_value=self._run_result()) as mock_run:
+            assert client.run_readonly_agent(prompt, tmp_path, allow_commands=False) == "ok"
+
+        sent_prompt = mock_run.call_args.kwargs["input"]
+        assert sent_prompt.startswith("Do not make any network requests.\n\nThis read-only agent pass must not run")
+        assert sent_prompt.endswith("Return JSON.")
+        assert mock_run.call_args.kwargs["cwd"] == tmp_path
 
     def test_run_agent_passes_prompt_via_stdin(self, tmp_path: Path):
         client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
@@ -2136,6 +2164,20 @@ class TestClaudeWriteSettings:
         assert mock_run.call_args.kwargs["input"] == "review this"
         mock_setup.assert_called_once_with(tmp_path)
 
+    def test_run_readonly_agent_without_commands_fails_closed(self, tmp_path: Path):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+
+        with (
+            patch("core.llm_client.subprocess.run") as mock_run,
+            patch("core.llm_client._claude_write_settings") as mock_setup,
+            pytest.raises(LLMConfigurationError, match="cannot enforce command-free"),
+        ):
+            client.run_readonly_agent("review this", tmp_path, allow_commands=False)
+
+        mock_run.assert_not_called()
+        mock_setup.assert_not_called()
+
     def test_generate_failure_is_classified(self):
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
         client = ClaudeClient(cfg)
@@ -2502,6 +2544,17 @@ class TestCodexClientCommands:
         assert mock_run.call_args.kwargs["input"] == "prompt"
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
 
+    def test_run_readonly_agent_without_commands_fails_closed(self, tmp_path: Path):
+        client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
+
+        with (
+            patch("core.llm_client.subprocess.run") as mock_run,
+            pytest.raises(LLMConfigurationError, match="cannot enforce command-free"),
+        ):
+            client.run_readonly_agent("prompt", tmp_path, allow_commands=False)
+
+        mock_run.assert_not_called()
+
     def test_run_readonly_agent_failure_reports_stdout_json_error(self, tmp_path: Path):
         client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
         failure = MagicMock(
@@ -2792,6 +2845,19 @@ class TestGeminiClientCommands:
         assert "input" not in mock_run.call_args.kwargs
         assert cmd[cmd.index("--approval-mode") + 1] == "yolo"
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
+
+    def test_run_readonly_agent_without_commands_fails_closed(self, tmp_path: Path):
+        client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro"))
+
+        with (
+            patch("core.llm_client._gemini_write_settings") as write_settings,
+            patch("core.llm_client.subprocess.run") as mock_run,
+            pytest.raises(LLMConfigurationError, match="cannot enforce command-free"),
+        ):
+            client.run_readonly_agent("prompt", tmp_path, allow_commands=False)
+
+        write_settings.assert_not_called()
+        mock_run.assert_not_called()
 
     def test_run_readonly_agent_failure_is_classified(self, tmp_path: Path):
         client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro"))
@@ -3237,6 +3303,22 @@ class TestAntigravityClientCommands:
         assert cmd.index("--model") < cmd.index("--print")
         assert mock_run.call_args.kwargs["input"] == "system\n\nuser"
         assert "system\n\nuser" not in cmd
+
+    def test_run_readonly_agent_without_commands_uses_prompt_only_temp_cwd(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        prompt = "Do not make any network requests.\n\nReturn JSON."
+
+        with patch("core.llm_client.subprocess.run", return_value=self._run_result("answer")) as mock_run:
+            assert client.run_readonly_agent(prompt, tmp_path, allow_commands=False) == "answer"
+
+        cmd = mock_run.call_args.args[0]
+        assert cmd[:2] == ["agy", "--new-project"]
+        assert "--add-dir" not in cmd
+        assert "--dangerously-skip-permissions" not in cmd
+        assert mock_run.call_args.kwargs["cwd"] != tmp_path
+        sent_prompt = mock_run.call_args.kwargs["input"]
+        assert sent_prompt.startswith("Do not make any network requests.\n\nThis read-only agent pass must not run")
+        assert sent_prompt.endswith("Return JSON.")
 
     def test_run_readonly_agent_uses_disposable_workspace(self, tmp_path: Path):
         (tmp_path / "repo.txt").write_text("source")

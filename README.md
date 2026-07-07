@@ -131,6 +131,7 @@ These commands also support interactive modes (`--interactive`) and answers-file
 **Check a delivery plan**
 
 ```bash
+sikula delivery prepare .sikula/tasks/my-task.md --output .sikula/delivery/my-plan
 sikula delivery check .sikula/delivery/my-plan/plan.yaml
 sikula delivery check .sikula/delivery/my-plan/plan.yaml --json
 sikula delivery status .sikula/delivery/my-plan/plan.yaml
@@ -143,7 +144,7 @@ sikula delivery finalize .sikula/delivery/my-plan/plan.yaml --dry-run
 sikula delivery finalize .sikula/delivery/my-plan/plan.yaml
 ```
 
-Use this to validate and inspect the tracked parent plan for larger work split into delivery units. The current MVP checks plan structure, unit dependencies, task paths, stream/component metadata, single-repository scope, and privacy-safe parent progress, can run one eligible unit at a time through the normal `sikula run` pipeline, and can finalize a completed plan into its final branch. See [Delivery Plans](docs/delivery-plans.md).
+Use this to author, validate, and inspect the tracked parent plan for larger work split into delivery units. `delivery prepare` is read-only authoring assistance: it parses a structured draft summary and records a local audit artifact, but this unit does not write `plan.yaml` or unit task files. The current MVP checks plan structure, unit dependencies, task paths, stream/component metadata, single-repository scope, and privacy-safe parent progress, can run one eligible unit at a time through the normal `sikula run` pipeline, and can finalize a completed plan into its final branch. See [Delivery Plans](docs/delivery-plans.md).
 
 **Run a task into a branch**
 

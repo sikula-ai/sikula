@@ -1,9 +1,10 @@
 # Delivery Plans
 
 Delivery plans are the planned parent layer for large work that should be split
-into small Sikula delivery units. The current MVP validates a tracked plan file,
-reports privacy-safe parent progress, and can run one eligible unit at a time
-through the normal `sikula run` pipeline.
+into small Sikula delivery units. The current MVP offers read-only authoring
+assistance, validates a tracked plan file, reports privacy-safe parent progress,
+and can run one eligible unit at a time through the normal `sikula run`
+pipeline.
 
 Use delivery plans when a request is too large for one implementation contract or
 when the work spans multiple streams such as backend, web, Android, iOS, docs, or
@@ -16,6 +17,29 @@ large request
   -> one normal Sikula run per unit
   -> final delivery branch
 ```
+
+## Authoring Assistance
+
+Ask Sikula to draft a delivery plan structure from a task file:
+
+```bash
+sikula delivery prepare .sikula/tasks/my-task.md --output .sikula/delivery/<slug>
+```
+
+`delivery prepare` is a read-only authoring assistant. It validates the task and
+output paths, calls the `delivery_preparer` assistant without command tools, and
+parses one strict structured draft for later writer code. This unit does not
+write `plan.yaml` or unit task files.
+
+Draft unit tasks should remain product and behavior descriptions with acceptance
+criteria, reviewer focus, security/privacy notes, out-of-scope notes, and
+verification expectations. They should not become file-by-file implementation
+scripts.
+
+Sikula derives writer-facing paths from the output directory and unit IDs. Path
+fields from LLM output are rejected instead of trusted. Raw prompts and raw
+provider output live only in local preparation audit artifacts; ordinary text
+and JSON output expose a privacy-safe draft summary.
 
 ## Current MVP Commands
 

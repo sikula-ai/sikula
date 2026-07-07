@@ -7,6 +7,11 @@ from unittest.mock import patch
 
 import pytest
 
+from core.delivery_authoring import (
+    DeliveryAuthoringDraft,
+    DeliveryAuthoringParseError,
+    DeliveryAuthoringUnitDraft,
+)
 import sikula
 from sikula_cli.agent_overrides import (
     DELIVERY_PREPARATION_AGENT_NAMES,
@@ -15,6 +20,7 @@ from sikula_cli.agent_overrides import (
 )
 from sikula_cli.delivery import (
     DeliveryPrepareArtifact,
+    DeliveryPrepareContext,
     DeliveryPrepareIssue,
     DeliveryPrepareResult,
     cmd_delivery_prepare,
@@ -55,9 +61,61 @@ def _write_task(root: Path, rel_path: str = "tasks/team-invites.md", body: str =
     return path
 
 
-def _blocked_payload(args: argparse.Namespace, cfg: dict, capsys: pytest.CaptureFixture[str]) -> dict:
+def _authoring_draft(
+    *,
+    plan_id: str = "team-invites",
+    unit_ids: list[str] | None = None,
+    planning_mode: str | None = "fixed_window",
+    audit_path: str | Path | None = None,
+) -> DeliveryAuthoringDraft:
+    units = [
+        DeliveryAuthoringUnitDraft(
+            id=unit_id,
+            title=f"{unit_id} title",
+            depends_on=[],
+            task_markdown=f"# {unit_id}\n\nPRIVATE UNIT MARKDOWN",
+        )
+        for unit_id in (unit_ids or ["foundation", "cli"])
+    ]
+    draft = DeliveryAuthoringDraft(
+        plan_id=plan_id,
+        title="Team invites delivery",
+        units=units,
+        planning_mode=planning_mode,
+    )
+    if audit_path is not None:
+        setattr(draft, "audit_path", str(audit_path))
+    return draft
+
+
+def _authoring_context(
+    *,
+    calls: list[dict] | None = None,
+    draft: DeliveryAuthoringDraft | None = None,
+    failure: Exception | None = None,
+    invalid_result: bool = False,
+) -> DeliveryPrepareContext:
+    def run_authoring_assistant(**kwargs):
+        if calls is not None:
+            calls.append(kwargs)
+        if failure is not None:
+            raise failure
+        if invalid_result:
+            return object()
+        return draft or _authoring_draft(plan_id=kwargs["selected_plan_id"])
+
+    return DeliveryPrepareContext(run_authoring_assistant=run_authoring_assistant)
+
+
+def _blocked_payload(
+    args: argparse.Namespace,
+    cfg: dict,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    context: DeliveryPrepareContext | None = None,
+) -> dict:
     with pytest.raises(SystemExit) as exc:
-        cmd_delivery_prepare(args, cfg)
+        cmd_delivery_prepare(args, cfg, context=context)
 
     assert exc.value.code == 1
     return json.loads(capsys.readouterr().out)
@@ -146,7 +204,7 @@ def test_delivery_prepare_register_parser_sets_flags() -> None:
     assert args.agent_timeout == ["delivery_preparer=1200"]
 
 
-def test_cmd_delivery_prepare_ready_text_uses_default_output_and_writes_no_artifacts(
+def test_cmd_delivery_prepare_blocks_without_context_after_successful_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -154,19 +212,56 @@ def test_cmd_delivery_prepare_ready_text_uses_default_output_and_writes_no_artif
     _write_task(tmp_path, "tasks/Team Invites.md", "# Team invites\n\nDo not echo this raw task body.\n")
     monkeypatch.chdir(tmp_path)
 
-    cmd_delivery_prepare(_args("tasks/Team Invites.md"), _cfg(tmp_path))
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_prepare(_args("tasks/Team Invites.md"), _cfg(tmp_path))
 
+    assert exc.value.code == 1
     out = capsys.readouterr().out
     assert "Delivery prepare: tasks/Team Invites.md" in out
-    assert "Status: ready" in out
+    assert "Status: blocked" in out
     assert "Selected plan: team-invites" in out
     assert "Output: .sikula/delivery/team-invites" in out
     assert "Plan file: .sikula/delivery/team-invites/plan.yaml" in out
     assert "Units dir: .sikula/delivery/team-invites/units" in out
     assert "Overwrite allowed: no" in out
-    assert "Delivery prepare command surface is ready; no delivery artifacts were written in this unit." in out
+    assert "Draft units: 0" in out
+    assert "Delivery prepare authoring requires the main Sikula command context." in out
     assert "Do not echo this raw task body" not in out
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+def test_cmd_delivery_prepare_authors_draft_summary_after_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_task(tmp_path, "tasks/Team Invites.md", "# Team invites\n\nDo not echo this raw task body.\n")
+    audit_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.audit.json"
+    calls: list[dict] = []
+    monkeypatch.chdir(tmp_path)
+
+    cmd_delivery_prepare(
+        _args("tasks/Team Invites.md"),
+        _cfg(tmp_path),
+        context=_authoring_context(calls=calls, draft=_authoring_draft(audit_path=audit_path)),
+    )
+
+    out = capsys.readouterr().out
+    assert "Delivery prepare: tasks/Team Invites.md" in out
+    assert "Status: ready" in out
+    assert "Selected plan: team-invites" in out
+    assert "Draft units: 2" in out
+    assert "Authoring audit: .sikula/contract-reports/team-invites.audit.json" in out
+    assert "Delivery plan draft authored; no delivery artifacts were written." in out
+    assert "Do not echo this raw task body" not in out
+    assert "PRIVATE UNIT MARKDOWN" not in out
+    assert str(tmp_path) not in out
+    assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+    assert len(calls) == 1
+    assert calls[0]["task_path"] == (tmp_path / "tasks" / "Team Invites.md").resolve()
+    assert calls[0]["output_dir"] == (tmp_path / ".sikula" / "delivery" / "team-invites").resolve()
+    assert calls[0]["selected_plan_id"] == "team-invites"
+    assert calls[0]["project_root"] == tmp_path.resolve()
 
 
 def test_sikula_cmd_delivery_prepare_wrapper_delegates_to_cli(tmp_path: Path) -> None:
@@ -177,7 +272,154 @@ def test_sikula_cmd_delivery_prepare_wrapper_delegates_to_cli(tmp_path: Path) ->
         result = sikula.cmd_delivery_prepare(args, cfg)
 
     assert result == "prepared"
-    prepare.assert_called_once_with(args, cfg)
+    prepare.assert_called_once()
+    called_args = prepare.call_args.args
+    assert called_args[:2] == (args, cfg)
+    context = called_args[2]
+    assert isinstance(context, DeliveryPrepareContext)
+    assert context.run_authoring_assistant is sikula._run_delivery_prepare_authoring
+
+
+@pytest.mark.parametrize(
+    ("cfg", "args_kwargs", "expected"),
+    [
+        pytest.param(
+            {
+                "llm": {"provider": "codex", "model": "global-model", "agent_timeout": 111},
+                "agents": {"task_preparer": {"llm": {"model": "task-preparer-model"}}},
+            },
+            {},
+            ("codex", "global-model", 111),
+            id="global_fallback",
+        ),
+        pytest.param(
+            {
+                "llm": {"provider": "codex", "model": "global-model", "agent_timeout": 111},
+                "agents": {
+                    "task_preparer": {"llm": {"model": "task-preparer-model"}},
+                    "delivery_preparer": {
+                        "llm": {"provider": "claude", "model": "delivery-yaml-model", "agent_timeout": 222}
+                    },
+                },
+            },
+            {},
+            ("claude", "delivery-yaml-model", 222),
+            id="delivery_preparer_yaml",
+        ),
+        pytest.param(
+            {
+                "llm": {"provider": "codex", "model": "global-model", "agent_timeout": 111},
+                "agents": {"delivery_preparer": {"llm": {"model": "delivery-yaml-model"}}},
+            },
+            {},
+            ("codex", "delivery-yaml-model", 111),
+            id="delivery_preparer_yaml_field_fallback",
+        ),
+        pytest.param(
+            {
+                "llm": {"provider": "codex", "model": "global-model", "agent_timeout": 111},
+                "agents": {
+                    "delivery_preparer": {
+                        "llm": {"provider": "claude", "model": "delivery-yaml-model", "agent_timeout": 222}
+                    }
+                },
+            },
+            {
+                "agent_model": ["delivery_preparer=delivery-cli-model"],
+                "agent_provider": ["delivery_preparer=gemini"],
+                "agent_timeout": ["delivery_preparer=333"],
+            },
+            ("gemini", "delivery-cli-model", 333),
+            id="delivery_preparer_cli_overrides",
+        ),
+    ],
+)
+def test_create_delivery_preparation_agent_resolves_delivery_preparer_llm_config(
+    cfg: dict,
+    args_kwargs: dict,
+    expected: tuple[str, str, int],
+) -> None:
+    args = _args("tasks/team-invites.md", **args_kwargs)
+    llm = object()
+    agent = object()
+
+    with (
+        patch("core.llm_client.create_llm_client", return_value=llm) as create_llm_client,
+        patch("agents.delivery_preparation_agent.DeliveryPreparationAgent", return_value=agent) as agent_cls,
+    ):
+        result = sikula._create_delivery_preparation_agent(args, cfg)
+
+    assert result is agent
+    llm_config = create_llm_client.call_args.args[0]
+    assert (llm_config.provider, llm_config.model, llm_config.agent_timeout) == expected
+    agent_cls.assert_called_once_with(llm=llm, project_config=cfg)
+
+
+def test_run_delivery_prepare_authoring_records_audit_and_forwards_context(tmp_path: Path) -> None:
+    task_path = _write_task(
+        tmp_path,
+        ".sikula/tasks/team-invites.md",
+        "# Team invites\n\nPRIVATE TASK BODY\n",
+    )
+    output_dir = tmp_path / ".sikula" / "delivery" / "team-invites"
+    args = _args(".sikula/tasks/team-invites.md")
+    cfg = _cfg(tmp_path)
+    project_context = {"validation_commands": ["python3 -m pytest tests/"]}
+    calls: list[dict] = []
+
+    class FakeDeliveryPreparationAgent:
+        def author_delivery_plan(self, **kwargs):
+            calls.append(kwargs)
+            kwargs["audit_recorder"](
+                {
+                    "phase": "delivery_prepare_authoring",
+                    "raw_output": "PRIVATE_PROVIDER_OUTPUT",
+                    "parsed": {"status": "parsed", "unit_ids": ["foundation"]},
+                }
+            )
+            return _authoring_draft(plan_id=kwargs["plan_id"], unit_ids=["foundation"])
+
+    fake_agent = FakeDeliveryPreparationAgent()
+
+    with (
+        patch("sikula._create_delivery_preparation_agent", return_value=fake_agent) as create_agent,
+        patch("sikula._prepare_project_context_from_config", return_value=project_context) as prepare_context,
+    ):
+        draft = sikula._run_delivery_prepare_authoring(
+            args=args,
+            cfg=cfg,
+            task_path=task_path.resolve(),
+            output_dir=output_dir.resolve(),
+            selected_plan_id="team-invites",
+            project_root=tmp_path.resolve(),
+        )
+
+    create_agent.assert_called_once_with(args, cfg)
+    prepare_context.assert_called_once_with(cfg)
+    assert [unit.id for unit in draft.units] == ["foundation"]
+    assert draft.audit_path == ".sikula/contract-reports/team-invites.delivery-prepare.auto-llm.jsonl"
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["task_description"] == "# Team invites\n\nPRIVATE TASK BODY\n"
+    assert call["task_path"] == task_path.resolve()
+    assert call["plan_id"] == "team-invites"
+    assert call["project_root"] == tmp_path.resolve()
+    assert call["output_dir"] == output_dir.resolve()
+    assert call["project_context"] is project_context
+    assert callable(call["audit_recorder"])
+
+    audit_path = tmp_path / ".sikula" / "contract-reports" / "team-invites.delivery-prepare.auto-llm.jsonl"
+    audit_record = json.loads(audit_path.read_text(encoding="utf-8").splitlines()[0])
+    assert audit_record["generated_by"] == "sikula.delivery_prepare"
+    assert audit_record["task"]["path"] == ".sikula/tasks/team-invites.md"
+    assert audit_record["task"]["sha256"].startswith("sha256:")
+    assert audit_record["output"]["path"] == ".sikula/delivery/team-invites"
+    assert audit_record["record"] == {
+        "phase": "delivery_prepare_authoring",
+        "parsed": {"status": "parsed", "unit_ids": ["foundation"]},
+        "raw_output": "PRIVATE_PROVIDER_OUTPUT",
+    }
+    assert not output_dir.exists()
 
 
 def test_main_dispatches_delivery_prepare_through_runtime_config(tmp_path: Path) -> None:
@@ -234,6 +476,7 @@ def test_cmd_delivery_prepare_json_is_allowlisted_project_relative_projection(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _write_task(tmp_path, body="# Team invites\n\nPRIVATE TASK BODY\n")
+    draft = _authoring_draft(audit_path=".sikula/contract-reports/team-invites.audit.json")
     monkeypatch.chdir(tmp_path)
 
     cmd_delivery_prepare(
@@ -246,15 +489,22 @@ def test_cmd_delivery_prepare_json_is_allowlisted_project_relative_projection(
             agent_timeout=["delivery_preparer=1200"],
         ),
         _cfg(tmp_path),
+        context=_authoring_context(draft=draft),
     )
 
     out = capsys.readouterr().out
     payload = json.loads(out)
     assert payload == {
+        "authoring": {
+            "audit_path": ".sikula/contract-reports/team-invites.audit.json",
+            "drafted": True,
+            "planning_mode": "fixed_window",
+            "unit_count": 2,
+        },
         "errors": [],
         "existing_artifacts": [],
         "force": False,
-        "message": "Delivery prepare command surface is ready; no delivery artifacts were written in this unit.",
+        "message": "Delivery plan draft authored; no delivery artifacts were written.",
         "overwrite_allowed": False,
         "paths": {
             "output_dir": ".sikula/delivery/team-invites",
@@ -266,12 +516,147 @@ def test_cmd_delivery_prepare_json_is_allowlisted_project_relative_projection(
         "ready": True,
         "selected_plan_id": "team-invites",
         "status": "ready",
-        "unit_ids": [],
+        "unit_ids": ["foundation", "cli"],
         "warnings": [],
     }
     assert str(tmp_path) not in out
     assert "PRIVATE TASK BODY" not in out
+    assert "PRIVATE UNIT MARKDOWN" not in out
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+def test_cmd_delivery_prepare_does_not_call_authoring_when_preflight_is_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[dict] = []
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args("tasks/missing.md", json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(calls=calls),
+    )
+
+    assert payload["errors"][0]["code"] == "delivery_prepare.task_missing"
+    assert calls == []
+    assert not (tmp_path / ".sikula" / "delivery" / "missing").exists()
+
+
+def test_cmd_delivery_prepare_blocks_provider_failure_with_safe_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_task(tmp_path, body="# Team invites\n\nPRIVATE TASK BODY\n")
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_prepare(
+            _args("tasks/team-invites.md"),
+            _cfg(tmp_path),
+            context=_authoring_context(failure=RuntimeError("SECRET_PROVIDER_OUTPUT from prompt")),
+        )
+
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "Status: blocked" in out
+    assert "delivery_prepare.authoring_failed" in out
+    assert "Delivery authoring assistant failed; see local audit artifacts for details." in out
+    assert "Delivery prepare authoring failed; inspect the local audit artifact and retry." in out
+    assert "SECRET_PROVIDER_OUTPUT" not in out
+    assert "PRIVATE TASK BODY" not in out
+    assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+def test_cmd_delivery_prepare_blocks_parse_failure_with_safe_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_task(tmp_path, body="# Team invites\n\nPRIVATE TASK BODY\n")
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args("tasks/team-invites.md", json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(
+            failure=DeliveryAuthoringParseError(
+                "delivery_authoring.json_invalid",
+                "SECRET_PROVIDER_OUTPUT and raw prompt details",
+            )
+        ),
+    )
+
+    payload_text = json.dumps(payload)
+    assert payload["ready"] is False
+    assert payload["prepared"] is False
+    assert payload["status"] == "blocked"
+    assert payload["authoring"] == {
+        "audit_path": None,
+        "drafted": False,
+        "planning_mode": None,
+        "unit_count": 0,
+    }
+    assert payload["errors"] == [
+        {
+            "code": "delivery_prepare.authoring_invalid",
+            "message": "Delivery authoring assistant returned an invalid draft; see local audit artifacts for details.",
+            "path": None,
+            "severity": "error",
+        }
+    ]
+    assert (
+        payload["message"]
+        == "Delivery authoring assistant returned an invalid draft; see local audit artifacts for details."
+    )
+    assert "SECRET_PROVIDER_OUTPUT" not in payload_text
+    assert "PRIVATE TASK BODY" not in payload_text
+
+
+def test_cmd_delivery_prepare_blocks_invalid_context_return_as_invalid_draft(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_task(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args("tasks/team-invites.md", json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(invalid_result=True),
+    )
+
+    assert payload["errors"][0]["code"] == "delivery_prepare.authoring_invalid"
+    assert payload["authoring"]["drafted"] is False
+    assert payload["unit_ids"] == []
+
+
+def test_cmd_delivery_prepare_omits_authoring_audit_path_outside_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_task(tmp_path)
+    outside_audit = tmp_path.parent / "secret-audit.json"
+    monkeypatch.chdir(tmp_path)
+
+    cmd_delivery_prepare(
+        _args("tasks/team-invites.md", json_output=True),
+        _cfg(tmp_path),
+        context=_authoring_context(draft=_authoring_draft(audit_path=outside_audit)),
+    )
+
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["ready"] is True
+    assert payload["authoring"]["audit_path"] is None
+    assert str(outside_audit) not in out
 
 
 def test_cmd_delivery_prepare_resolves_relative_paths_from_current_directory(
@@ -287,6 +672,7 @@ def test_cmd_delivery_prepare_resolves_relative_paths_from_current_directory(
     cmd_delivery_prepare(
         _args("../tasks/team-invites.md", output="../.sikula/delivery/custom.plan", json_output=True),
         _cfg(tmp_path),
+        context=_authoring_context(),
     )
 
     payload = json.loads(capsys.readouterr().out)
@@ -309,7 +695,7 @@ def test_cmd_delivery_prepare_uses_cwd_when_config_root_is_absent(
     _write_task(tmp_path)
     monkeypatch.chdir(tmp_path)
 
-    cmd_delivery_prepare(_args("tasks/team-invites.md", json_output=True), {})
+    cmd_delivery_prepare(_args("tasks/team-invites.md", json_output=True), {}, context=_authoring_context())
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["ready"] is True
@@ -331,6 +717,7 @@ def test_cmd_delivery_prepare_accepts_plan_id_character_contract(
     cmd_delivery_prepare(
         _args("tasks/team-invites.md", output=f".sikula/delivery/{plan_id}", json_output=True),
         _cfg(tmp_path),
+        context=_authoring_context(),
     )
 
     payload = json.loads(capsys.readouterr().out)
@@ -347,7 +734,7 @@ def test_cmd_delivery_prepare_uses_fallback_slug_for_empty_task_stem(
     _write_task(tmp_path, "tasks/---.md")
     monkeypatch.chdir(tmp_path)
 
-    cmd_delivery_prepare(_args("tasks/---.md", json_output=True), _cfg(tmp_path))
+    cmd_delivery_prepare(_args("tasks/---.md", json_output=True), _cfg(tmp_path), context=_authoring_context())
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["selected_plan_id"] == "delivery-plan"
@@ -500,6 +887,7 @@ def test_cmd_delivery_prepare_blocks_existing_artifacts_without_force_and_allows
     cmd_delivery_prepare(
         _args("tasks/team-invites.md", output=".sikula/delivery/team-invites", force=True, json_output=True),
         _cfg(tmp_path),
+        context=_authoring_context(),
     )
     ready = json.loads(capsys.readouterr().out)
 
@@ -621,6 +1009,7 @@ def test_cmd_delivery_prepare_rejects_invalid_agent_overrides(
     message: str,
 ) -> None:
     _write_task(tmp_path)
+    calls: list[dict] = []
     monkeypatch.chdir(tmp_path)
 
     payload = _blocked_payload(
@@ -633,13 +1022,16 @@ def test_cmd_delivery_prepare_rejects_invalid_agent_overrides(
         ),
         _cfg(tmp_path),
         capsys,
+        context=_authoring_context(calls=calls),
     )
 
     assert payload["errors"][0] == {
         "code": "delivery_prepare.agent_override_invalid",
         "message": message,
+        "path": None,
         "severity": "error",
     }
+    assert calls == []
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
 
 
@@ -708,6 +1100,7 @@ def test_render_delivery_prepare_includes_errors_and_warnings() -> None:
 
     assert "Delivery prepare: <unknown>" in output
     assert "Overwrite allowed: yes" in output
+    assert "Draft units: 0" in output
     assert "Existing artifacts:" in output
     assert "- plan: .sikula/delivery/demo/plan.yaml" in output
     assert "Errors:" in output

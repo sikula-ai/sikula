@@ -76,7 +76,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import yaml
 
@@ -92,9 +92,14 @@ from sikula_cli import review as cli_review
 from sikula_cli import run as cli_run
 from sikula_cli import status as cli_status
 from sikula_cli import task as cli_task
+from sikula_cli.agent_overrides import DELIVERY_PREPARATION_AGENT_NAMES as _VALID_DELIVERY_PREPARATION_AGENTS
 from sikula_cli.agent_overrides import PREPARATION_AGENT_NAMES as _VALID_PREPARATION_AGENTS
 from sikula_cli.agent_overrides import RUNTIME_AGENT_NAMES as _VALID_AGENTS
 from sikula_cli.agent_overrides import parse_agent_llm_overrides as _parse_agent_llm_overrides
+
+if TYPE_CHECKING:
+    from agents.delivery_preparation_agent import DeliveryPreparationAgent
+    from core.delivery_authoring import DeliveryAuthoringDraft
 
 _BASE = Path(__file__).parent
 # When adding a new platform: add it here, in _build_tool() in core/orchestrator.py,
@@ -1186,6 +1191,25 @@ def _create_task_preparation_agent(args: argparse.Namespace, cfg: dict):
     base_llm_cfg = cfg.get("llm", {}) if isinstance(cfg.get("llm"), dict) else {}
     llm = create_llm_client(_make_llm_config(base_llm_cfg, _effective_agent_llm_cfg(cfg, overrides, "task_preparer")))
     return TaskPreparationAgent(llm=llm, project_config=cfg)
+
+
+def _create_delivery_preparation_agent(args: argparse.Namespace, cfg: dict) -> DeliveryPreparationAgent:
+    from agents.delivery_preparation_agent import DeliveryPreparationAgent
+    from core.llm_client import create_llm_client
+
+    overrides = {
+        "agent_llms": _parse_agent_llm_overrides(
+            getattr(args, "agent_model", None),
+            getattr(args, "agent_provider", None),
+            getattr(args, "agent_timeout", None),
+            valid_agents=_VALID_DELIVERY_PREPARATION_AGENTS,
+        )
+    }
+    base_llm_cfg = cfg.get("llm", {}) if isinstance(cfg.get("llm"), dict) else {}
+    llm = create_llm_client(
+        _make_llm_config(base_llm_cfg, _effective_agent_llm_cfg(cfg, overrides, "delivery_preparer"))
+    )
+    return DeliveryPreparationAgent(llm=llm, project_config=cfg)
 
 
 def _run_task_refine_auto(
@@ -3171,8 +3195,40 @@ def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
     return cli_delivery.cmd_delivery_status(args, cfg)
 
 
+def _run_delivery_prepare_authoring(
+    *,
+    args: argparse.Namespace,
+    cfg: dict,
+    task_path: Path,
+    output_dir: Path,
+    selected_plan_id: str,
+    project_root: Path,
+) -> DeliveryAuthoringDraft:
+    task_text = task_path.read_text(encoding="utf-8")
+    audit_recorder, audit_path = _make_auto_preparation_audit_recorder(
+        generated_by="sikula.delivery_prepare",
+        source_path=task_path,
+        source_text=task_text,
+        output_path=output_dir,
+        cfg=cfg,
+    )
+    agent = _create_delivery_preparation_agent(args, cfg)
+    draft = agent.author_delivery_plan(
+        task_description=task_text,
+        task_path=task_path,
+        plan_id=selected_plan_id,
+        project_root=project_root,
+        output_dir=output_dir,
+        project_context=_prepare_project_context_from_config(cfg),
+        audit_recorder=audit_recorder,
+    )
+    setattr(draft, "audit_path", _contract_preflight_path(audit_path, project_root))
+    return draft
+
+
 def cmd_delivery_prepare(args: argparse.Namespace, cfg: dict) -> None:
-    return cli_delivery.cmd_delivery_prepare(args, cfg)
+    context = cli_delivery.DeliveryPrepareContext(run_authoring_assistant=_run_delivery_prepare_authoring)
+    return cli_delivery.cmd_delivery_prepare(args, cfg, context)
 
 
 def cmd_delivery_finalize(args: argparse.Namespace, cfg: dict) -> None:

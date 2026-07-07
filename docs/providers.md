@@ -44,6 +44,10 @@ agents:
   security_reviewer:
     llm:
       model: stronger-model
+  delivery_preparer:
+    llm:
+      model: gpt-5.5
+      agent_timeout: 1800
 ```
 
 CLI overrides:
@@ -57,7 +61,7 @@ sikula run .sikula/tasks/my-task.md \
 
 The analyst, reviewer, and security reviewer usually benefit most from stronger reasoning. The implementer, test writer, and fixer often need enough timeout for large codebases.
 
-Valid `run` and `review` agent names are `analyst`, `planner`, `implementer`, `reviewer`, `security_reviewer`, `test_writer`, and `fixer`. `sikula task refine --auto` and `sikula contract prepare --auto` also accept `task_preparer` overrides. `sikula delivery prepare` accepts `delivery_preparer` overrides, distinct from `task_preparer`.
+Valid `run` and `review` agent names are `analyst`, `planner`, `implementer`, `reviewer`, `security_reviewer`, `test_writer`, and `fixer`. `sikula task refine --auto` and `sikula contract prepare --auto` also accept `task_preparer` overrides. `sikula delivery prepare` accepts `delivery_preparer` overrides, distinct from `task_preparer`. `agents.delivery_preparer.llm` falls back to the top-level `llm` settings for omitted fields. Delivery prepare uses command-free read-only authoring; providers that cannot enforce that mode fail closed.
 
 ## Authentication
 
@@ -84,7 +88,7 @@ Antigravity calls that attach a project first reject absolute symlinks and relat
 Provider integrations implement `LLMClient` in `core/llm_client.py`:
 
 - `generate(system, user) -> str`
-- `run_readonly_agent(prompt, cwd) -> str`
+- `run_readonly_agent(prompt, cwd, allow_commands=True) -> str`
 - `run_agent(prompt, cwd) -> tuple[list[str], str]`
 
 Register the new provider in `create_llm_client()`. See [ARCHITECTURE.md](../ARCHITECTURE.md) for the full interface contract.

@@ -2,7 +2,9 @@
 
 LLMClient defines three operations:
   generate(system, user) -> str           — single-shot text generation; used by PlannerAgent
-  run_readonly_agent(prompt, cwd) -> str  — autonomous agent with read-only tools; returns text output
+  run_readonly_agent(prompt, cwd, allow_commands=True) -> str
+                                      — autonomous read-only agent; can optionally disable command tools
+                                        or fail closed when the provider cannot enforce that
   run_agent(prompt, cwd) -> tuple[list[str], str] — autonomous agent with file tools;
                                               returns (changed file paths, agent text output)
 
@@ -57,8 +59,28 @@ _LOCAL_ENVIRONMENT_ERRNOS = frozenset(
     )
     if err is not None
 )
+_READONLY_NO_COMMANDS_PREFIX = (
+    "This read-only agent pass must not run any shell commands or command tools, including grep, find, "
+    "ls, git, package-manager, build, test, or language-runtime commands. Use only the project context "
+    "included in the prompt and return the final response.\n\n"
+)
+_SECURITY_PREFIX_LEAD = "Do not make any network requests."
+_EXPLICIT_NO_COMMAND_INSTRUCTION = "Do not run commands at all"
 
 RetryObserver = Callable[[dict[str, object]], None]
+
+
+def _with_readonly_no_commands_prefix(prompt: str) -> str:
+    if prompt.startswith(_READONLY_NO_COMMANDS_PREFIX):
+        return prompt
+    if _EXPLICIT_NO_COMMAND_INSTRUCTION in prompt:
+        return prompt
+    if prompt.startswith(_SECURITY_PREFIX_LEAD):
+        security_prefix_end = prompt.find("\n\n")
+        if security_prefix_end >= 0:
+            insert_at = security_prefix_end + 2
+            return prompt[:insert_at] + _READONLY_NO_COMMANDS_PREFIX + prompt[insert_at:]
+    return _READONLY_NO_COMMANDS_PREFIX + prompt
 
 
 class LLMProviderError(RuntimeError):
@@ -333,8 +355,11 @@ class LLMClient:
         """
         return prompt
 
-    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
-        """Run as an autonomous agent with read-only tools in `cwd`. Returns text output."""
+    def run_readonly_agent(self, prompt: str, cwd: Path, *, allow_commands: bool = True) -> str:
+        """Run as an autonomous read-only agent. Returns text output.
+
+        Providers that cannot enforce `allow_commands=False` must fail closed.
+        """
         raise NotImplementedError
 
     def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
@@ -421,9 +446,12 @@ class ClaudeClient(LLMClient):
 
         return _call_with_retry("generate", _call, self._config, "generate")
 
-    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+    def run_readonly_agent(self, prompt: str, cwd: Path, *, allow_commands: bool = True) -> str:
         """Run Claude with read-only tools as an autonomous agent. Returns text output."""
+        if not allow_commands:
+            raise LLMConfigurationError("claude provider cannot enforce command-free read-only agent mode")
         settings_path = _claude_write_settings(cwd)
+        allowed_tools = "Read,Bash(grep *),Bash(find *),Bash(ls *),LS,Glob"
         log.info(f"Running Claude read-only agent ({self._config.model}) — waiting for completion...")
 
         def _call():
@@ -438,7 +466,7 @@ class ClaudeClient(LLMClient):
                     "--settings",
                     str(settings_path),
                     "--allowedTools",
-                    "Read,Bash(grep *),Bash(find *),Bash(ls *),LS,Glob",
+                    allowed_tools,
                 ],
                 capture_output=True,
                 input=prompt,
@@ -1195,8 +1223,10 @@ class OpenCodeClient(LLMClient):
 
         return _call_with_retry("generate", _call, self._config, "generate")
 
-    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+    def run_readonly_agent(self, prompt: str, cwd: Path, *, allow_commands: bool = True) -> str:
         log.info(f"Running opencode read-only agent ({self._config.model}) — waiting for completion...")
+        if not allow_commands:
+            prompt = _with_readonly_no_commands_prefix(prompt)
 
         def _call():
             with _opencode_agent_env() as env:
@@ -1433,7 +1463,10 @@ class GeminiClient(LLMClient):
 
         return _call_with_retry("generate", _call, self._config, "generate")
 
-    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+    def run_readonly_agent(self, prompt: str, cwd: Path, *, allow_commands: bool = True) -> str:
+        if not allow_commands:
+            raise LLMConfigurationError("gemini provider cannot enforce command-free read-only agent mode")
+
         _gemini_write_settings(cwd, _GEMINI_SETTINGS_READONLY)
         log.info(f"Running Gemini read-only agent ({self._config.model}) — waiting for completion...")
 
@@ -1713,7 +1746,9 @@ class CodexClient(LLMClient):
 
         return _call_with_retry("generate", _call, self._config, "generate")
 
-    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+    def run_readonly_agent(self, prompt: str, cwd: Path, *, allow_commands: bool = True) -> str:
+        if not allow_commands:
+            raise LLMConfigurationError("codex provider cannot enforce command-free read-only agent mode")
         log.info(f"Running Codex read-only agent ({self._config.model}) — waiting for completion...")
 
         def _call():
@@ -2552,8 +2587,38 @@ class AntigravityClient(LLMClient):
 
         return _call_with_retry("generate", _call, self._config, "generate")
 
-    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+    def run_readonly_agent(self, prompt: str, cwd: Path, *, allow_commands: bool = True) -> str:
         self._ensure_supported_version()
+        if not allow_commands:
+            prompt = _with_readonly_no_commands_prefix(prompt)
+            log.info(
+                "Running Antigravity command-free read-only generation (%s) — waiting for completion...",
+                self._config.model,
+            )
+
+            def _call_no_commands():
+                with tempfile.TemporaryDirectory(prefix="sikula-antigravity-no-commands-") as tmp:
+                    with _antigravity_log_file() as log_file:
+                        result = subprocess.run(
+                            self._cmd(
+                                cwd=None,
+                                timeout=self._config.agent_timeout,
+                                log_file=log_file,
+                                auto_approve_tools=False,
+                            ),
+                            capture_output=True,
+                            input=prompt,
+                            text=True,
+                            cwd=tmp,
+                            timeout=self._config.agent_timeout,
+                        )
+                        log_diagnostic = _antigravity_log_diagnostic(log_file)
+                if result.returncode != 0:
+                    raise _antigravity_result_error(result, "agent", log_diagnostic)
+                return _antigravity_parse_text(result.stdout, "agent")
+
+            return _call_with_retry("read-only agent", _call_no_commands, self._config, "run_readonly_agent")
+
         log.info("Running Antigravity read-only agent (%s) — waiting for completion...", self._config.model)
 
         def _call():

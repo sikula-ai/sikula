@@ -15,9 +15,20 @@ import subprocess
 import sys
 from typing import Any
 
+from core.delivery_authoring import DeliveryAuthoringDraft, DeliveryAuthoringParseError
 from sikula_cli.agent_overrides import DELIVERY_PREPARATION_AGENT_NAMES, parse_agent_llm_overrides
 
 _DELIVERY_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_DELIVERY_PREPARE_CONTEXT_MISSING_MESSAGE = "Delivery prepare authoring requires the main Sikula command context."
+_DELIVERY_PREPARE_AUTHORING_FAILED_MESSAGE = (
+    "Delivery authoring assistant failed; see local audit artifacts for details."
+)
+_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE = (
+    "Delivery authoring assistant returned an invalid draft; see local audit artifacts for details."
+)
+_DELIVERY_PREPARE_AUTHORING_FAILED_HINT = (
+    "Delivery prepare authoring failed; inspect the local audit artifact and retry."
+)
 
 
 def register_parser(subparsers) -> argparse.ArgumentParser:
@@ -144,14 +155,12 @@ class DeliveryPrepareIssue:
     path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        data = {
+        return {
             "severity": self.severity,
             "code": self.code,
             "message": self.message,
+            "path": self.path,
         }
-        if self.path:
-            data["path"] = self.path
-        return data
 
 
 @dataclass(frozen=True)
@@ -161,6 +170,22 @@ class DeliveryPrepareArtifact:
 
     def to_dict(self) -> dict[str, str]:
         return {"kind": self.kind, "path": self.path}
+
+
+@dataclass(frozen=True)
+class DeliveryPrepareAuthoringSummary:
+    drafted: bool = False
+    unit_count: int = 0
+    planning_mode: str | None = None
+    audit_path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "drafted": self.drafted,
+            "unit_count": self.unit_count,
+            "planning_mode": self.planning_mode,
+            "audit_path": self.audit_path,
+        }
 
 
 @dataclass(frozen=True)
@@ -175,6 +200,8 @@ class DeliveryPrepareResult:
     paths: dict[str, str | None]
     existing_artifacts: list[DeliveryPrepareArtifact]
     errors: list[DeliveryPrepareIssue]
+    authoring: DeliveryPrepareAuthoringSummary = field(default_factory=DeliveryPrepareAuthoringSummary)
+    authoring_draft: DeliveryAuthoringDraft | None = field(default=None, repr=False, compare=False)
     warnings: list[DeliveryPrepareIssue] = field(default_factory=list)
     message: str = ""
 
@@ -189,15 +216,35 @@ class DeliveryPrepareResult:
             "unit_ids": list(self.unit_ids),
             "paths": dict(self.paths),
             "existing_artifacts": [artifact.to_dict() for artifact in self.existing_artifacts],
+            "authoring": self.authoring.to_dict(),
             "errors": [issue.to_dict() for issue in self.errors],
             "warnings": [issue.to_dict() for issue in self.warnings],
             "message": self.message,
         }
 
 
-def cmd_delivery_prepare(args: argparse.Namespace, cfg: dict) -> None:
+@dataclass(frozen=True)
+class DeliveryPrepareContext:
+    run_authoring_assistant: Callable[..., DeliveryAuthoringDraft]
+
+
+def cmd_delivery_prepare(
+    args: argparse.Namespace,
+    cfg: dict,
+    context: DeliveryPrepareContext | None = None,
+) -> None:
     override_errors = _validate_delivery_prepare_agent_overrides(args)
     result = _prepare_delivery_preflight(args, cfg, extra_errors=override_errors)
+    if result.ready:
+        if context is None:
+            result = _delivery_prepare_blocked_result(
+                result,
+                code="delivery_prepare.authoring_context_missing",
+                issue_message=_DELIVERY_PREPARE_CONTEXT_MISSING_MESSAGE,
+                result_message=_DELIVERY_PREPARE_CONTEXT_MISSING_MESSAGE,
+            )
+        else:
+            result = _run_delivery_prepare_authoring(args, cfg, result, context)
     _print_delivery_result(result, json_output=args.json, render=render_delivery_prepare)
     if not result.ready:
         sys.exit(1)
@@ -218,11 +265,16 @@ def render_delivery_prepare(result: DeliveryPrepareResult) -> str:
     if result.paths.get("units_dir"):
         lines.append(f"Units dir: {result.paths['units_dir']}")
     lines.append(f"Overwrite allowed: {'yes' if result.overwrite_allowed else 'no'}")
+    lines.append(f"Draft units: {len(result.unit_ids)}")
+    if result.authoring.audit_path:
+        lines.append(f"Authoring audit: {result.authoring.audit_path}")
     if result.existing_artifacts:
         lines.append("Existing artifacts:")
         for artifact in result.existing_artifacts:
             lines.append(f"- {artifact.kind}: {artifact.path}")
     lines.append(result.message)
+    if _delivery_prepare_authoring_failed(result):
+        lines.append(_DELIVERY_PREPARE_AUTHORING_FAILED_HINT)
     if result.errors:
         lines.append("")
         lines.append("Errors:")
@@ -234,6 +286,120 @@ def render_delivery_prepare(result: DeliveryPrepareResult) -> str:
         for issue in result.warnings:
             lines.append(_format_prepare_issue(issue))
     return "\n".join(lines) + "\n"
+
+
+def _run_delivery_prepare_authoring(
+    args: argparse.Namespace,
+    cfg: dict,
+    preflight: DeliveryPrepareResult,
+    context: DeliveryPrepareContext,
+) -> DeliveryPrepareResult:
+    project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
+    task_path = _resolve_from_cwd(args.task_file)
+    output_path = _resolve_delivery_prepare_output_path(args, task_path, project_root)
+    selected_plan_id = preflight.selected_plan_id
+    if selected_plan_id is None:
+        return _delivery_prepare_blocked_result(
+            preflight,
+            code="delivery_prepare.authoring_invalid",
+            issue_message=_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE,
+            result_message=_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE,
+        )
+
+    try:
+        draft = context.run_authoring_assistant(
+            args=args,
+            cfg=cfg,
+            task_path=task_path,
+            output_dir=output_path,
+            selected_plan_id=selected_plan_id,
+            project_root=project_root,
+        )
+    except DeliveryAuthoringParseError:
+        return _delivery_prepare_blocked_result(
+            preflight,
+            code="delivery_prepare.authoring_invalid",
+            issue_message=_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE,
+            result_message=_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE,
+        )
+    except Exception:
+        return _delivery_prepare_blocked_result(
+            preflight,
+            code="delivery_prepare.authoring_failed",
+            issue_message=_DELIVERY_PREPARE_AUTHORING_FAILED_MESSAGE,
+            result_message=_DELIVERY_PREPARE_AUTHORING_FAILED_MESSAGE,
+        )
+    if not isinstance(draft, DeliveryAuthoringDraft):
+        return _delivery_prepare_blocked_result(
+            preflight,
+            code="delivery_prepare.authoring_invalid",
+            issue_message=_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE,
+            result_message=_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE,
+        )
+
+    audit_path = _delivery_prepare_authoring_audit_path(draft, project_root)
+    return replace(
+        preflight,
+        status="ready",
+        ready=True,
+        prepared=False,
+        unit_ids=[unit.id for unit in draft.units],
+        authoring=DeliveryPrepareAuthoringSummary(
+            drafted=True,
+            unit_count=len(draft.units),
+            planning_mode=draft.planning_mode,
+            audit_path=audit_path,
+        ),
+        authoring_draft=draft,
+        message="Delivery plan draft authored; no delivery artifacts were written.",
+    )
+
+
+def _delivery_prepare_blocked_result(
+    result: DeliveryPrepareResult,
+    *,
+    code: str,
+    issue_message: str,
+    result_message: str,
+    audit_path: str | None = None,
+) -> DeliveryPrepareResult:
+    return replace(
+        result,
+        status="blocked",
+        ready=False,
+        prepared=False,
+        authoring=replace(result.authoring, audit_path=audit_path),
+        errors=[
+            *result.errors,
+            DeliveryPrepareIssue(
+                "error",
+                code,
+                issue_message,
+            ),
+        ],
+        message=result_message,
+    )
+
+
+def _delivery_prepare_authoring_audit_path(draft: DeliveryAuthoringDraft, project_root: Path) -> str | None:
+    raw_path = getattr(draft, "audit_path", None)
+    if not raw_path:
+        return None
+    try:
+        audit_path = Path(raw_path)
+        resolved = audit_path.resolve() if audit_path.is_absolute() else (project_root / audit_path).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if not _path_is_within(resolved, project_root):
+        return None
+    return _project_relative_path(resolved, project_root)
+
+
+def _delivery_prepare_authoring_failed(result: DeliveryPrepareResult) -> bool:
+    return any(
+        issue.code in {"delivery_prepare.authoring_failed", "delivery_prepare.authoring_invalid"}
+        for issue in result.errors
+    )
 
 
 def _validate_delivery_prepare_agent_overrides(args: argparse.Namespace) -> list[DeliveryPrepareIssue]:
