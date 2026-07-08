@@ -1298,3 +1298,130 @@ def test_cmd_delivery_run_next_rejects_configured_root_without_git(
     payload = json.loads(capsys.readouterr().out)
     assert payload["ready"] is False
     assert payload["errors"][0]["code"] == "project.git_root_missing"
+
+
+@pytest.mark.parametrize(
+    ("plan_id", "unit_id", "plan_path"),
+    [
+        ("p123", "u456", "relative/path/plan.yaml"),
+        (None, None, None),
+        ("p123", None, None),
+        (None, "u456", None),
+        (None, None, "relative/path/plan.yaml"),
+    ],
+)
+def test_delivery_child_run_args_metadata(plan_id: str | None, unit_id: str | None, plan_path: str | None) -> None:
+    args = _delivery_child_run_args(
+        root=Path("/fake/root"),
+        task_path="tasks/unit.md",
+        delivery_plan_id=plan_id,
+        delivery_unit_id=unit_id,
+        delivery_plan_path=plan_path,
+    )
+    assert args.delivery_plan_id == plan_id
+    assert args.delivery_unit_id == unit_id
+    assert args.delivery_plan_path == plan_path
+
+
+def test_invoke_delivery_child_run_forwards_metadata(tmp_path: Path) -> None:
+    captured_args = None
+
+    def dummy_runner(args: argparse.Namespace, cfg: dict) -> DeliveryChildRunResult:
+        nonlocal captured_args
+        captured_args = args
+        return DeliveryChildRunResult(exit_code=0)
+
+    args = argparse.Namespace(
+        agent_model=["analyst=gpt-5"],
+        agent_provider=None,
+        agent_timeout=None,
+    )
+
+    _invoke_delivery_child_run(
+        args,
+        cfg={},
+        context=_run_next_context(tmp_path, dummy_runner),
+        root=tmp_path,
+        task_path="task.md",
+        delivery_plan_id="my-plan-id",
+        delivery_unit_id="my-unit-id",
+        delivery_plan_path="my-plan-path",
+    )
+
+    assert captured_args is not None
+    assert captured_args.delivery_plan_id == "my-plan-id"
+    assert captured_args.delivery_unit_id == "my-unit-id"
+    assert captured_args.delivery_plan_path == "my-plan-path"
+
+
+def test_cmd_delivery_run_next_computes_and_forwards_metadata(
+    tmp_path: Path,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+
+    captured_args = None
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal captured_args
+        captured_args = run_args
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        state = store.create("child task")
+        state.done = True
+        state.worktree_branch = "branch"
+        state.result_commit = "commit"
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
+
+    cmd_delivery_run_next(
+        _run_next_args(plan_path),
+        cfg,
+        _run_next_context(tmp_path, runner),
+    )
+
+    assert captured_args is not None
+    assert captured_args.delivery_plan_id == "delivery-run-next-demo"
+    assert captured_args.delivery_unit_id == "01-foundation"
+    expected_path = plan_path.resolve().relative_to(tmp_path.resolve()).as_posix()
+    assert captured_args.delivery_plan_path == expected_path
+
+
+def test_cmd_delivery_run_next_omits_unsafe_metadata_plan_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+
+    captured_args = None
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal captured_args
+        captured_args = run_args
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        state = store.create("child task")
+        state.done = True
+        state.worktree_branch = "branch"
+        state.result_commit = "commit"
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
+
+    from dataclasses import replace
+
+    orig_get_delivery_status = get_delivery_status
+
+    def mock_get_status(*args, **kwargs):
+        status = orig_get_delivery_status(*args, **kwargs)
+        return replace(status, plan_path="/outside/project/root/plan.yaml")
+
+    monkeypatch.setattr("core.delivery_progress.get_delivery_status", mock_get_status)
+
+    cmd_delivery_run_next(
+        _run_next_args(plan_path),
+        cfg,
+        _run_next_context(tmp_path, runner),
+    )
+
+    assert captured_args is not None
+    assert captured_args.delivery_plan_id == "delivery-run-next-demo"
+    assert captured_args.delivery_unit_id == "01-foundation"
+    assert captured_args.delivery_plan_path is None

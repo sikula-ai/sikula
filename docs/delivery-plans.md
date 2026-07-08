@@ -232,6 +232,7 @@ the selected unit as `running`, starts one ordinary child `sikula run` for that
 unit task file, then records the terminal unit status as `done` or `failed`.
 It accepts the same per-agent `--agent-model`, `--agent-provider`, and
 `--agent-timeout` overrides as `sikula run` and passes them to the child run.
+When starting the child run, Sikula automatically configures and persists the parent delivery metadata in the child's `TaskState` (specifically the parent `delivery_plan_id`, `delivery_unit_id`, and a project-relative `delivery_plan_path`). This allows the parent plan relationship to be fully recovered from the configured state directory, while keeping ordinary delivery progress records compact.
 Child task prompts, provider output, diffs, logs, and full task state remain in
 the normal child task state and are not embedded in delivery progress JSON.
 The parent unit is marked `done` only when the child run exits successfully, the
@@ -393,4 +394,4 @@ metadata such as written artifact paths, plan validation status, unit readiness,
 plan metadata, validation issues, unit paths, compact progress fields, selected
 child task IDs, final branch metadata, and branch/commit pointers when
 available. They do not embed source task bodies, unit task file bodies, prompts,
-provider output, diffs, logs, or task state.
+provider output, diffs, logs, or task state. Additionally, the parent plan path stored in the child task state is saved as a project-relative path (`delivery_plan_path`) rather than an absolute local path. This metadata is strictly allowlisted state metadata and does not expose raw prompts, provider output, diffs, logs, source excerpts, or absolute local paths.

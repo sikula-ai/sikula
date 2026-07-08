@@ -1236,12 +1236,20 @@ def _run_next_delivery_unit(
             make_delivery_progress_event(plan_id, "unit.running", unit=running_unit),
         )
 
+        try:
+            delivery_plan_path = Path(status.plan_path).resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            delivery_plan_path = None
+
         child_result = _invoke_delivery_child_run(
             args,
             cfg,
             context,
             root=root,
             task_path=selected_unit.task_path,
+            delivery_plan_id=plan_id,
+            delivery_unit_id=selected_unit.id,
+            delivery_plan_path=delivery_plan_path,
         )
         state_dir = context.resolve_state_dir(cfg)
         store = JsonStateStore(state_dir)
@@ -1564,6 +1572,9 @@ def _invoke_delivery_child_run(
     *,
     root: Path,
     task_path: str,
+    delivery_plan_id: str | None = None,
+    delivery_unit_id: str | None = None,
+    delivery_plan_path: str | None = None,
 ) -> DeliveryChildRunResult:
     run_args = _delivery_child_run_args(
         root=root,
@@ -1571,6 +1582,9 @@ def _invoke_delivery_child_run(
         agent_model=getattr(args, "agent_model", None),
         agent_provider=getattr(args, "agent_provider", None),
         agent_timeout=getattr(args, "agent_timeout", None),
+        delivery_plan_id=delivery_plan_id,
+        delivery_unit_id=delivery_unit_id,
+        delivery_plan_path=delivery_plan_path,
     )
     run_cfg = copy.deepcopy(cfg)
     try:
@@ -1606,6 +1620,9 @@ def _delivery_child_run_args(
     agent_model: list[str] | None = None,
     agent_provider: list[str] | None = None,
     agent_timeout: list[str] | None = None,
+    delivery_plan_id: str | None = None,
+    delivery_unit_id: str | None = None,
+    delivery_plan_path: str | None = None,
 ) -> argparse.Namespace:
     absolute_task_path = (root / task_path).resolve()
     return argparse.Namespace(
@@ -1629,6 +1646,9 @@ def _delivery_child_run_args(
         agent_model=agent_model,
         agent_provider=agent_provider,
         agent_timeout=agent_timeout,
+        delivery_plan_id=delivery_plan_id,
+        delivery_unit_id=delivery_unit_id,
+        delivery_plan_path=delivery_plan_path,
     )
 
 

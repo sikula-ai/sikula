@@ -236,7 +236,12 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             context.require_committed_config_for_isolated_run(cfg, git_root, overrides)
 
         description = task_path.read_text().strip()
-        state = store.create(description)
+        state = store.create(
+            description,
+            delivery_plan_id=getattr(args, "delivery_plan_id", None),
+            delivery_unit_id=getattr(args, "delivery_unit_id", None),
+            delivery_plan_path=getattr(args, "delivery_plan_path", None),
+        )
         args.created_task_id = state.task_id
         state.task_file = Path(args.task_file).name
         state.config_snapshot = context.run_config_snapshot(cfg, overrides)

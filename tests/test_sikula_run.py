@@ -3724,3 +3724,134 @@ class TestCmdRunNoIsolateWarnings:
 
         out = capsys.readouterr().out
         assert "not inside a git repository" not in out
+
+
+class TestCmdRunChildDeliveryMetadata:
+    def test_cmd_run_forwards_delivery_metadata(self, tmp_path: Path) -> None:
+        task_file = tmp_path / "task.md"
+        task_file.write_text("do something")
+
+        def capture_orch(
+            cfg_arg: dict, overrides: dict | None = None, state_store: JsonStateStore | None = None
+        ) -> MagicMock:
+            mock = MagicMock()
+            assert state_store is not None
+            task_id = state_store.list_tasks()[0]
+            state = state_store.load(task_id)
+            assert state is not None
+            state.done = True
+            mock.run.return_value = state
+            return mock
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            args = _run_args(
+                task_file=str(task_file),
+                no_isolate=True,
+                delivery_plan_id="my-plan-123",
+                delivery_unit_id="unit-456",
+                delivery_plan_path=".sikula/delivery/plan.yaml",
+            )
+            cmd_run(args, _run_cfg(tmp_path))
+
+        exit_mock.assert_called_with(0)
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        tasks = store.list_tasks()
+        assert len(tasks) == 1
+        state = store.load(tasks[0])
+        assert state is not None
+        assert state.delivery_plan_id == "my-plan-123"
+        assert state.delivery_unit_id == "unit-456"
+        assert state.delivery_plan_path == ".sikula/delivery/plan.yaml"
+
+    def test_cmd_run_defaults_delivery_metadata_to_none(self, tmp_path: Path) -> None:
+        task_file = tmp_path / "task.md"
+        task_file.write_text("do something else")
+
+        def capture_orch(
+            cfg_arg: dict, overrides: dict | None = None, state_store: JsonStateStore | None = None
+        ) -> MagicMock:
+            mock = MagicMock()
+            assert state_store is not None
+            task_id = state_store.list_tasks()[0]
+            state = state_store.load(task_id)
+            assert state is not None
+            state.done = True
+            mock.run.return_value = state
+            return mock
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            args = _run_args(task_file=str(task_file), no_isolate=True)
+            # Remove keys if they are somehow present (ensuring getattr fallback is tested)
+            if hasattr(args, "delivery_plan_id"):
+                delattr(args, "delivery_plan_id")
+            if hasattr(args, "delivery_unit_id"):
+                delattr(args, "delivery_unit_id")
+            if hasattr(args, "delivery_plan_path"):
+                delattr(args, "delivery_plan_path")
+            cmd_run(args, _run_cfg(tmp_path))
+
+        exit_mock.assert_called_with(0)
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        tasks = store.list_tasks()
+        assert len(tasks) == 1
+        state = store.load(tasks[0])
+        assert state is not None
+        assert state.delivery_plan_id is None
+        assert state.delivery_unit_id is None
+        assert state.delivery_plan_path is None
+
+    def test_cmd_run_resume_preserves_existing_delivery_metadata(self, tmp_path: Path) -> None:
+        from core.state import TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        state = TaskState(
+            task_id="abc123",
+            task_description="resume me",
+            delivery_plan_id="preserved-plan",
+            delivery_unit_id="preserved-unit",
+            delivery_plan_path=".sikula/delivery/preserved.yaml",
+        )
+        store.save(state)
+
+        def capture_orch(
+            cfg_arg: dict, overrides: dict | None = None, state_store: JsonStateStore | None = None
+        ) -> MagicMock:
+            mock = MagicMock()
+            mock.run.return_value = MagicMock(
+                done=True,
+                failed=False,
+                task_id="abc123",
+                worktree_branch=None,
+                files_changed=[],
+                errors=[],
+                history=[],
+                build_iterations=0,
+            )
+            return mock
+
+        with (
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit"),
+        ):
+            args = _run_args(
+                task_id="abc123",
+                delivery_plan_id="overwriting-plan",
+                delivery_unit_id="overwriting-unit",
+                delivery_plan_path="overwriting-path",
+            )
+            cmd_run(args, _run_cfg(tmp_path))
+
+        loaded = store.load("abc123")
+        assert loaded is not None
+        assert loaded.delivery_plan_id == "preserved-plan"
+        assert loaded.delivery_unit_id == "preserved-unit"
+        assert loaded.delivery_plan_path == ".sikula/delivery/preserved.yaml"

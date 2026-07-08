@@ -407,6 +407,9 @@ class TaskState:
     validation_cycle_records: list[dict] = field(default_factory=list)
     validation_artifact_records: list[dict] = field(default_factory=list)
     task_file: Optional[str] = None
+    delivery_plan_id: Optional[str] = None
+    delivery_unit_id: Optional[str] = None
+    delivery_plan_path: Optional[str] = None
     worktree_path: Optional[str] = None
     worktree_branch: Optional[str] = None
     worktree_base: Optional[str] = None
@@ -727,9 +730,22 @@ class StateStore:
     def update_active_operation(self, task_id: str, active_operation: dict | None) -> None:
         raise NotImplementedError
 
-    def create(self, task_description: str) -> TaskState:
+    def create(
+        self,
+        task_description: str,
+        *,
+        delivery_plan_id: str | None = None,
+        delivery_unit_id: str | None = None,
+        delivery_plan_path: str | None = None,
+    ) -> TaskState:
         task_id = uuid.uuid4().hex
-        state = TaskState(task_id=task_id, task_description=task_description)
+        state = TaskState(
+            task_id=task_id,
+            task_description=task_description,
+            delivery_plan_id=delivery_plan_id,
+            delivery_unit_id=delivery_unit_id,
+            delivery_plan_path=delivery_plan_path,
+        )
         state.runtime_metadata = runtime_metadata_snapshot()
         self.save(state)
         return state
