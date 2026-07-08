@@ -21,7 +21,8 @@ def is_valid_delivery_branch_name(branch: str) -> bool:
     if not branch or branch == "@" or branch == "HEAD":
         return False
     if (
-        branch.startswith("/")
+        branch.startswith("-")
+        or branch.startswith("/")
         or branch.endswith("/")
         or branch.endswith(".")
         or "//" in branch
@@ -31,7 +32,7 @@ def is_valid_delivery_branch_name(branch: str) -> bool:
     ):
         return False
     for part in branch.split("/"):
-        if not part or part.startswith(".") or part.startswith("-") or part.casefold().endswith(".lock"):
+        if not part or part.startswith(".") or part.casefold().endswith(".lock"):
             return False
     return True
 
