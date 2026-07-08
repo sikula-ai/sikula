@@ -1,0 +1,86 @@
+schema_version: 1
+plan_id: delivery-plan-authoring
+title: Delivery plan authoring
+planning_mode: fixed_window
+final_branch: sikula/delivery/delivery-plan-authoring
+streams:
+  - id: cli
+    label: CLI
+  - id: authoring
+    label: Authoring
+  - id: docs
+    label: Documentation
+components:
+  - id: cli
+    label: CLI package
+    path: sikula_cli
+    stream: cli
+  - id: core
+    label: Core delivery logic
+    path: core
+    stream: authoring
+  - id: agents
+    label: Agent prompts and parsing
+    path: agents
+    stream: authoring
+  - id: docs
+    label: Documentation
+    path: docs
+    stream: docs
+units:
+  - id: prepare-command
+    title: Add the delivery prepare command surface
+    stream: cli
+    component: cli
+    platform: shared
+    phase: foundation
+    kind: implementation
+    scope_paths:
+      - sikula.py
+      - sikula_cli
+      - tests
+    task_path: .sikula/delivery/delivery-plan-authoring/units/prepare-command.md
+    depends_on: []
+  - id: authoring-assistant
+    title: Add read-only delivery plan authoring assistance
+    stream: authoring
+    component: agents
+    platform: shared
+    phase: generation
+    kind: implementation
+    scope_paths:
+      - agents
+      - core
+      - tests
+    task_path: .sikula/delivery/delivery-plan-authoring/units/authoring-assistant.md
+    depends_on:
+      - prepare-command
+  - id: artifact-writer
+    title: Write generated delivery plan artifacts safely
+    stream: authoring
+    component: core
+    platform: shared
+    phase: generation
+    kind: implementation
+    scope_paths:
+      - core
+      - sikula_cli
+      - tests
+    task_path: .sikula/delivery/delivery-plan-authoring/units/artifact-writer.md
+    depends_on:
+      - authoring-assistant
+  - id: docs-and-coverage
+    title: Document and cover delivery plan authoring
+    stream: docs
+    component: docs
+    platform: shared
+    phase: hardening
+    kind: documentation
+    scope_paths:
+      - README.md
+      - ARCHITECTURE.md
+      - docs
+      - tests
+    task_path: .sikula/delivery/delivery-plan-authoring/units/docs-and-coverage.md
+    depends_on:
+      - artifact-writer

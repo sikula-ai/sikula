@@ -17,6 +17,7 @@
 | `ReviewerAgent` | `agents/reviewer_agent.py` | Read-only review of implementation; checks completeness, logical correctness, semantic consistency, dead members, and shared function scope |
 | `SecurityReviewerAgent` | `agents/security_reviewer_agent.py` | Read-only security review after the review phase; independent of `run_review`; blocking issues feed back to implementer; warnings logged non-blocking |
 | `TestWriterAgent` | `agents/test_writer_agent.py` | Writes and updates unit tests after review/security phases complete; configured to target test source directories |
+| `DeliveryPreparationAgent` | `agents/delivery_preparation_agent.py` | Read-only delivery-plan authoring assistant for `sikula delivery prepare`; returns one structured draft for deterministic parsing |
 | `FixerAgent` | `agents/fixer_agent.py` | Runs the configured LLM as an autonomous agent to fix build or test errors |
 | `FileTool` | `tools/file_tool.py` | Read / write files; enforces sandbox whitelist for direct file-tool calls |
 | `GitTool` | `tools/git_tool.py` | `diff_head()` — called by reviewer, security_reviewer, and test_writer agents to obtain the live diff when `state.review_diff` is not set |
@@ -32,6 +33,8 @@
 | `InitAgent` | `agents/init_agent.py` | Generates `.sikula/guidelines.md` from codebase analysis; called by `cmd_init()` only — not part of the orchestrator loop |
 | `LLMClient` | `core/llm_client.py` | Abstract interface: `generate()` for single-shot text; `run_readonly_agent()` for read-only autonomous agents; `run_agent()` for autonomous file-editing agents |
 | `ContractCheck` helpers | `core/contract_check.py` | Deterministic implementation-contract readiness checks for Markdown/plain-text task files; `sikula run` stores a warning-only state snapshot and `sikula contract check --write-report` explicitly writes report artifacts |
+| `DeliveryAuthoring` helpers | `core/delivery_authoring.py` | Side-effect-free parser and derived-path helpers for delivery prepare authoring drafts |
+| `DeliveryPrepareWriter` helpers | `core/delivery_prepare_writer.py` | Deterministic source-artifact writer for parsed delivery authoring drafts; renders `plan.yaml` and unit task files with readiness checks, plan validation, overwrite guards, and rollback |
 | `TaskAsset` helpers | `core/task_assets.py` | Deterministic local task-asset parsing, path canonicalization, answer mapping, and asset-manifest line rendering used by contract preparation |
 | `Worktree` helpers | `core/worktree.py` | Shared low-level git/worktree operations used by run, review, cleanup/delete, and init CLI surfaces; command-specific state mutation stays in the owning command layer |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
@@ -198,6 +201,35 @@ the task-content checks and leaves validation coverage empty. Answers templates 
 task-hash scoped: when the task content hash changes, existing filled answers are retained
 only under `previous_answers`, while active `answers` are reset for the new hash so future
 `contract prepare` or run preflight logic does not treat stale answers as authoritative.
+
+**Delivery plan prepare command:** `sikula delivery prepare TASK_FILE` is an
+authoring and deterministic source-artifact writing command. Ownership is split
+between the CLI wrapper in `sikula_cli/delivery.py`, the assistant in
+`agents/delivery_preparation_agent.py`, parser and path derivation helpers in
+`core/delivery_authoring.py`, and writer, rollback, readiness, and generated-plan
+validation helpers in `core/delivery_prepare_writer.py`. The CLI validates the
+source task and output paths, derives the selected plan ID, validates
+`delivery_preparer` model/provider/timeout overrides, then calls
+`DeliveryPreparationAgent`, which uses `LLMClient.generate()` with a
+command-free prompt assembled from the task and checked-in project context.
+The assistant must return one strict structured draft, which
+`core/delivery_authoring.py` parses without side effects.
+`core/delivery_prepare_writer.py` then derives artifact
+paths, checks unit task readiness in memory, writes `plan.yaml` and
+`units/<unit-id>.md` transactionally, validates the generated plan, and rolls
+back on readiness, validation, write, or filesystem failure. Existing artifacts
+are refused by default; `--force` may replace ordinary plan/unit files inside
+the selected output directory, while absolute output paths, parent traversal,
+symlink artifacts, symlink escapes, path collisions, outside-project writes,
+Git metadata, and Sikula runtime/debug artifact directories are rejected. `delivery prepare`
+is source-artifact-only: it does not create `TaskState`, worktrees, child runs,
+nested Sikula commands, command tools, delivery progress, branches, or progress
+mutations. Raw prompts and provider output are stored only in local preparation
+audit artifacts at
+`.sikula/contract-reports/<task-stem>.delivery-prepare.auto-llm.jsonl`.
+Ordinary text and JSON output is an explicit allowlisted projection and must not
+embed source task bodies, unit Markdown bodies, prompts, raw provider output,
+diffs, logs, or task state.
 
 **Delivery plan check command:** `sikula delivery check PLAN_FILE` is the first
 delivery-plan MVP primitive. Its CLI wrapper lives in `sikula_cli/delivery.py`;
@@ -1895,11 +1927,12 @@ See [Providers](docs/providers.md) for provider setup and the extension entry po
 
 | Method | Used by | Contract |
 |---|---|---|
-| `generate(system, user) -> str` | PlannerAgent | Single-shot text generation; returns the model's text response |
-| `run_readonly_agent(prompt, cwd) -> str` | AnalystAgent, ReviewerAgent, SecurityReviewerAgent | Runs the model as an autonomous agent with read-only tools in `cwd`; returns text output (stdout) |
+| `generate(system, user) -> str` | PlannerAgent, DeliveryPreparationAgent | Single-shot text generation; returns the model's text response |
+| `run_readonly_agent(prompt, cwd) -> str` | AnalystAgent, ReviewerAgent, SecurityReviewerAgent | Runs the model as an autonomous read-only agent in `cwd`; returns text output (stdout) |
 | `run_agent(prompt, cwd) -> tuple[list[str], str]` | ImplementerAgent, TestWriterAgent, FixerAgent | Runs the model as an autonomous agent with file read/write tools in `cwd`; returns `(changed_file_paths, agent_text_output)` — paths via git diff, text best-effort |
 
 The `system` argument passed to `generate` and the `prompt` argument passed to `run_readonly_agent` and `run_agent` already contain `AGENT_SECURITY_PREFIX` (defined in `agents/base_agent.py`) — the network and filesystem constraint is injected by each agent before calling the provider. Provider implementations do not need to add it.
+For CLI-backed providers, `LLMConfig.agent_timeout` applies to provider subprocess calls for `generate`, `run_readonly_agent`, and `run_agent`; `delivery_preparer` timeout overrides therefore apply to delivery prepare authoring even though it uses `generate()`.
 
 CLI-backed providers should pass large prompts through stdin or another non-argv input channel
 when the provider CLI supports that mode. Reviewer, analyst, and implementation prompts can

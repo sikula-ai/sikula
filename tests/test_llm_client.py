@@ -806,7 +806,7 @@ class TestOpenCodeClientCommands:
         assert not (repo_root / ".opencode").exists()
 
     def test_generate_passes_prompt_via_stdin(self):
-        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex", agent_timeout=123))
         with patch("core.llm_client.subprocess.run", return_value=self._run_result()) as mock_run:
             assert client.generate("system", "user") == "ok"
 
@@ -816,6 +816,7 @@ class TestOpenCodeClientCommands:
         assert cmd[cmd.index("--title") + 1] == "sikula-generate"
         assert "--print-logs" in cmd
         assert cmd[cmd.index("--log-level") + 1] == "ERROR"
+        assert mock_run.call_args.kwargs["timeout"] == 123
         assert mock_run.call_args.kwargs["input"] == "system\n\nuser"
 
     def test_generate_uses_sanitized_session_title_when_set(self):
@@ -2136,6 +2137,16 @@ class TestClaudeWriteSettings:
         assert mock_run.call_args.kwargs["input"] == "review this"
         mock_setup.assert_called_once_with(tmp_path)
 
+    def test_generate_uses_agent_timeout(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6", agent_timeout=123)
+        client = ClaudeClient(cfg)
+        result = MagicMock(returncode=0, stdout="ok\n", stderr="")
+
+        with patch("core.llm_client.subprocess.run", return_value=result) as mock_run:
+            assert client.generate("system", "user") == "ok"
+
+        assert mock_run.call_args.kwargs["timeout"] == 123
+
     def test_generate_failure_is_classified(self):
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
         client = ClaudeClient(cfg)
@@ -2420,7 +2431,7 @@ class TestCodexClientCommands:
         )
 
     def test_generate_uses_read_only_sandbox(self):
-        client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
+        client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex", agent_timeout=123))
         with patch("core.llm_client.subprocess.run", return_value=self._run_result()) as mock_run:
             assert client.generate("system", "user") == "ok"
 
@@ -2430,6 +2441,7 @@ class TestCodexClientCommands:
         assert cmd[-1] == "-"
         assert "system\n\nuser" not in cmd
         assert mock_run.call_args.kwargs["input"] == "system\n\nuser"
+        assert mock_run.call_args.kwargs["timeout"] == 123
 
     def test_generate_failure_reports_stdout_json_error(self):
         client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
@@ -2734,7 +2746,7 @@ class TestGeminiClientCommands:
         return MagicMock(returncode=0, stdout=json.dumps({"response": text}), stderr="")
 
     def test_generate_skips_workspace_trust_check(self):
-        client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro"))
+        client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro", agent_timeout=123))
         with patch("core.llm_client.subprocess.run", return_value=self._run_result()) as mock_run:
             assert client.generate("system", "user") == "ok"
 
@@ -2742,6 +2754,7 @@ class TestGeminiClientCommands:
         assert cmd[:3] == ["gemini", "--skip-trust", "--model"]
         assert "-p" in cmd
         assert cmd[cmd.index("-p") + 1] == "system\n\nuser"
+        assert mock_run.call_args.kwargs["timeout"] == 123
         assert "input" not in mock_run.call_args.kwargs
         assert "--approval-mode" not in cmd
 
@@ -3222,7 +3235,9 @@ class TestAntigravityClientCommands:
         assert _antigravity_write_agent_prompt(prompt, tmp_path) == prompt
 
     def test_generate_uses_stdin_print_mode(self):
-        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        client = AntigravityClient(
+            LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)", agent_timeout=123)
+        )
 
         with patch("core.llm_client.subprocess.run", return_value=self._run_result("answer")) as mock_run:
             assert client.generate("system", "user") == "answer"
@@ -3233,9 +3248,11 @@ class TestAntigravityClientCommands:
         assert cmd[cmd.index("--model") + 1] == "Gemini 3.5 Flash (High)"
         assert "--sandbox" in cmd
         assert "--dangerously-skip-permissions" not in cmd
+        assert cmd[cmd.index("--print-timeout") + 1] == "123s"
         assert cmd[cmd.index("--print") + 1] == "-"
         assert cmd.index("--model") < cmd.index("--print")
         assert mock_run.call_args.kwargs["input"] == "system\n\nuser"
+        assert mock_run.call_args.kwargs["timeout"] == 123
         assert "system\n\nuser" not in cmd
 
     def test_run_readonly_agent_uses_disposable_workspace(self, tmp_path: Path):

@@ -102,7 +102,7 @@ class LLMConfig:
     model: str = "gpt-5.3-codex"
     max_tokens: int = 16000  # used by API-based providers; CLI-backed providers may ignore this
     temperature: float = 0.0
-    agent_timeout: int = 1800  # seconds; applies to run_agent and run_readonly_agent
+    agent_timeout: int = 1800  # seconds; applies to CLI-backed provider subprocess calls
     retry_observer: RetryObserver | None = None
     session_title: str | None = None
 
@@ -413,7 +413,7 @@ class ClaudeClient(LLMClient):
                 capture_output=True,
                 input=prompt,
                 text=True,
-                timeout=300,
+                timeout=self._config.agent_timeout,
             )
             if result.returncode != 0:
                 raise _provider_error("claude", "CLI", result.stderr.strip() or "non-zero exit")
@@ -1183,7 +1183,7 @@ class OpenCodeClient(LLMClient):
                 capture_output=True,
                 input=prompt,
                 text=True,
-                timeout=300,
+                timeout=self._config.agent_timeout,
             )
             if result.returncode != 0:
                 raise _opencode_result_error(result, "CLI")
@@ -1425,7 +1425,7 @@ class GeminiClient(LLMClient):
                 self._cmd(prompt),
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=self._config.agent_timeout,
             )
             if result.returncode != 0:
                 raise _gemini_result_error(result, "CLI")
@@ -1705,7 +1705,7 @@ class CodexClient(LLMClient):
                 capture_output=True,
                 input=prompt,
                 text=True,
-                timeout=300,
+                timeout=self._config.agent_timeout,
             )
             if result.returncode != 0:
                 raise _provider_error("codex", "CLI", _codex_subprocess_error(result))
@@ -1793,7 +1793,6 @@ class CodexClient(LLMClient):
 # AntigravityClient
 # ---------------------------------------------------------------------------
 
-_ANTIGRAVITY_GENERATE_TIMEOUT = 300
 _ANTIGRAVITY_HARD_IGNORED_COPY_DIRS = {
     ".git",
     ".hg",
@@ -2536,14 +2535,14 @@ class AntigravityClient(LLMClient):
                 result = subprocess.run(
                     self._cmd(
                         cwd=None,
-                        timeout=_ANTIGRAVITY_GENERATE_TIMEOUT,
+                        timeout=self._config.agent_timeout,
                         log_file=log_file,
                         auto_approve_tools=False,
                     ),
                     capture_output=True,
                     input=prompt,
                     text=True,
-                    timeout=_ANTIGRAVITY_GENERATE_TIMEOUT,
+                    timeout=self._config.agent_timeout,
                 )
                 log_diagnostic = _antigravity_log_diagnostic(log_file)
             if result.returncode != 0:

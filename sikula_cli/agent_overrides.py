@@ -14,6 +14,7 @@ RUNTIME_AGENT_NAMES = {
     "fixer",
 }
 PREPARATION_AGENT_NAMES = {"task_preparer"}
+DELIVERY_PREPARATION_AGENT_NAMES = {"delivery_preparer"}
 
 
 def parse_agent_llm_overrides(

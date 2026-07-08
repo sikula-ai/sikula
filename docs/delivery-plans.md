@@ -1,9 +1,10 @@
 # Delivery Plans
 
 Delivery plans are the planned parent layer for large work that should be split
-into small Sikula delivery units. The current MVP validates a tracked plan file,
-reports privacy-safe parent progress, and can run one eligible unit at a time
-through the normal `sikula run` pipeline.
+into small Sikula delivery units. The current MVP offers artifact authoring with
+deterministic writing, validates tracked plan files, reports privacy-safe parent
+progress, and can run one eligible unit at a time through the normal
+`sikula run` pipeline.
 
 Use delivery plans when a request is too large for one implementation contract or
 when the work spans multiple streams such as backend, web, Android, iOS, docs, or
@@ -15,6 +16,143 @@ large request
   -> delivery units
   -> one normal Sikula run per unit
   -> final delivery branch
+```
+
+## Authoring Assistance
+
+Ask Sikula to author reviewable delivery plan source artifacts from one
+high-level task file:
+
+```bash
+sikula delivery prepare .sikula/tasks/my-task.md
+sikula delivery prepare .sikula/tasks/my-task.md --json
+```
+
+When `--output` is omitted, Sikula derives the delivery slug from the task
+filename and writes:
+
+- `.sikula/delivery/<slug>/plan.yaml`
+- `.sikula/delivery/<slug>/units/<unit-slug>.md`
+
+You can select a different tracked delivery-plan directory explicitly:
+
+```bash
+sikula delivery prepare .sikula/tasks/my-task.md --output .sikula/delivery/<slug>
+```
+
+`delivery prepare` validates the task and output paths, calls the
+`delivery_preparer` assistant through plain text generation with no provider
+agent/tool mode, parses one strict structured draft, then deterministically
+writes `plan.yaml` and `units/<unit>.md` source artifacts. It is an authoring step only: it does not
+start implementation, create `TaskState`, run delivery units, mutate
+`.sikula/state/delivery/<plan-id>/`, create worktrees, update branches, launch
+nested Sikula commands, or record delivery progress.
+
+Existing plan or unit artifacts are refused by default. `--force` may replace
+ordinary existing artifacts inside the selected output directory, but symlinks,
+path traversal, absolute output paths, path collisions, outside-project writes,
+`.git`, `.sikula/state`, `.sikula/worktrees`, or `.sikula/contract-reports`
+targets remain rejected.
+
+Generated unit task files should remain product and behavior descriptions with
+acceptance criteria, reviewer focus, security/privacy notes, out-of-scope notes,
+and verification expectations. They should not become file-by-file
+implementation scripts.
+
+Sikula derives writer-facing paths from the output directory and unit IDs. Path
+fields from LLM output are rejected instead of trusted. Unit task contracts are
+checked for readiness before source artifacts are finalized, and the generated
+plan is validated after writing. If readiness, validation, or filesystem writing
+fails, Sikula rolls back so half-valid source artifacts are not left behind. Raw
+prompts and raw provider output are written to local
+`.sikula/contract-reports/<task-stem>.delivery-prepare.auto-llm.jsonl` audit
+records; ordinary text and JSON output expose only project-relative,
+allowlisted metadata such as written paths, plan validation status, and unit
+readiness status.
+
+The assistant output accepted by `delivery prepare` is exactly one JSON object,
+optionally wrapped in one fenced `json` block. Top-level fields are `plan_id`,
+`title`, `planning_mode`, `warnings`, and `units`; unknown fields are rejected.
+`planning_mode`, when present, must be `fixed_window`. `units` must be a
+non-empty list of objects with `id`, `title`, `depends_on`, `task_markdown`,
+and optional `stream`, `component`, `phase`, `kind`, `platform`, and
+`scope_paths`. Writer-facing path fields such as `task_path`, `path`,
+`unit_path`, `output_path`, `plan_path`, `units_dir`, and `output_dir` are
+rejected because paths are derived deterministically. IDs must be path-safe and
+unique. Dependencies must reference known units, contain no duplicates or
+self-dependencies, and be acyclic. Scope paths must be project-relative and stay
+inside the project. Unit Markdown must include non-empty Goal, Current behavior,
+Desired behavior, Acceptance criteria, Security/privacy, Reviewer focus, Out of
+scope, and Verification sections; Verification must include explicit validation
+commands. `## Asset manifest` and `sikula:generated-*` markers are rejected
+before writing.
+
+## After Preparing
+
+After `delivery prepare`, check the tracked plan and preview execution before
+running the first unit:
+
+```bash
+sikula delivery check .sikula/delivery/<slug>/plan.yaml
+sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --dry-run
+sikula delivery run-next .sikula/delivery/<slug>/plan.yaml
+```
+
+The tracked source artifacts live under `.sikula/delivery/<slug>/`. Runtime
+parent progress, created only by execution commands such as `run-next`, lives
+under `.sikula/state/delivery/<plan-id>/`.
+
+## Prepare JSON Output
+
+`sikula delivery prepare --json` returns one allowlisted object, not raw state:
+
+```text
+{
+  status: str,
+  ready: bool,
+  prepared: bool,
+  force: bool,
+  overwrite_allowed: bool,
+  selected_plan_id: str | null,
+  unit_ids: list[str],
+  paths: {
+    task_file: str | null,
+    output_dir: str | null,
+    plan_file: str | null,
+    units_dir: str | null
+  },
+  unit_task_paths: object[str, str],
+  written_artifacts: list[{kind: str, path: str}],
+  existing_artifacts: list[{kind: str, path: str}],
+  plan_validation: {
+    status: str,
+    valid: bool | null,
+    errors: list[issue],
+    warnings: list[issue]
+  },
+  unit_readiness: {
+    status: str,
+    units: list[{
+      unit_id: str,
+      path: str,
+      readiness_score: int,
+      status: str,
+      ready_for_autonomous_delivery: bool,
+      blocking_gap_count: int,
+      warning_gap_count: int,
+      blocking_gap_ids: list[str]
+    }]
+  },
+  authoring: {
+    drafted: bool,
+    unit_count: int,
+    planning_mode: str | null,
+    audit_path: str | null
+  },
+  errors: list[{severity: str, code: str, message: str, path: str | null}],
+  warnings: list[{severity: str, code: str, message: str, path: str | null}],
+  message: str
+}
 ```
 
 ## Current MVP Commands
@@ -108,7 +246,8 @@ extended or rerun delivery plan must be finalized again after it returns to
 The MVP validator checks:
 
 - `schema_version: 1`,
-- required plan metadata such as `plan_id`, `title`, and `final_branch`,
+- required plan metadata such as `plan_id`, `title`, and a valid local-branch
+  `final_branch`,
 - delivery unit IDs,
 - unit task paths,
 - unit dependency references and cycles,
@@ -163,7 +302,11 @@ units:
 
 Unit task files are ordinary Markdown task descriptions for future Sikula runs.
 The parent plan stores structure and ordering; it should not duplicate raw task
-content.
+content. Current `delivery prepare` output emits the selected plan metadata,
+final branch, implicit single-repository entry, streams derived from unit
+streams, and unit entries with deterministic task paths, dependencies, and
+rendered unit metadata (`stream`, `platform`, `phase`, `kind`, and
+`scope_paths`). It does not synthesize top-level `components` metadata.
 
 ## Monorepo Components
 
@@ -209,8 +352,10 @@ can coordinate cross-repo branches, locks, validation, and result sets.
 
 ## Privacy
 
-`delivery check --json`, `delivery status --json`, `delivery run-next --json`,
-and `delivery finalize --json` return plan metadata, validation issues, unit
-paths, compact progress fields, selected child task IDs, final branch metadata,
-and branch/commit pointers when available. They do not embed unit task file
-bodies, prompts, provider output, diffs, logs, or task state.
+`delivery prepare --json`, `delivery check --json`, `delivery status --json`,
+`delivery run-next --json`, and `delivery finalize --json` return allowlisted
+metadata such as written artifact paths, plan validation status, unit readiness,
+plan metadata, validation issues, unit paths, compact progress fields, selected
+child task IDs, final branch metadata, and branch/commit pointers when
+available. They do not embed source task bodies, unit task file bodies, prompts,
+provider output, diffs, logs, or task state.

@@ -9,7 +9,12 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-from core.delivery_plan import DeliveryPlanIssue, check_delivery_plan_file, render_delivery_plan_check
+from core.delivery_plan import (
+    DeliveryPlanIssue,
+    check_delivery_plan_file,
+    is_valid_delivery_branch_name,
+    render_delivery_plan_check,
+)
 from sikula import main
 from sikula_cli.delivery import cmd_delivery_check
 
@@ -150,6 +155,40 @@ def test_delivery_plan_check_rejects_plan_id_that_cannot_be_used_for_state_path(
 
     assert result.valid is False
     assert "plan_id.invalid" in _codes(result)
+
+
+def test_delivery_branch_name_allows_hyphen_prefixed_later_path_component(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["final_branch"] = "sikula/delivery/team/-hotfix"
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert is_valid_delivery_branch_name("sikula/delivery/team/-hotfix") is True
+    assert result.valid is True
+    assert "final_branch.invalid" not in _codes(result)
+
+
+@pytest.mark.parametrize(
+    "final_branch",
+    [
+        "-foo",
+        "sikula/delivery/foo..bar",
+        "sikula/delivery/foo.",
+        "sikula/delivery/foo.lock",
+    ],
+)
+def test_delivery_plan_check_rejects_invalid_final_branch(tmp_path: Path, final_branch: str) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["final_branch"] = final_branch
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is False
+    assert "final_branch.invalid" in _codes(result)
 
 
 def test_delivery_plan_check_reports_duplicate_and_unknown_dependencies(tmp_path: Path) -> None:

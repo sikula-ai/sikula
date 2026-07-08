@@ -6,13 +6,48 @@ import argparse
 from collections.abc import Callable
 import contextlib
 import copy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+import io
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+import re
 import subprocess
 import sys
+from typing import Any
 
-from sikula_cli.agent_overrides import parse_agent_llm_overrides
+from core.delivery_authoring import DeliveryAuthoringDraft, DeliveryAuthoringParseError
+from core.delivery_plan import delivery_final_branch_for_plan_id, is_valid_delivery_branch_name
+from core.delivery_prepare_writer import DeliveryPrepareWriteResult, write_delivery_prepare_artifacts
+from sikula_cli.agent_overrides import DELIVERY_PREPARATION_AGENT_NAMES, parse_agent_llm_overrides
+
+_DELIVERY_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_DELIVERY_PREPARE_CONTEXT_MISSING_MESSAGE = "Delivery prepare authoring requires the main Sikula command context."
+_DELIVERY_PREPARE_AUTHORING_FAILED_MESSAGE = (
+    "Delivery authoring assistant failed; see local audit artifacts for details."
+)
+_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE = (
+    "Delivery authoring assistant returned an invalid draft; see local audit artifacts for details."
+)
+_DELIVERY_PREPARE_AUTHORING_FAILED_HINT = (
+    "Delivery prepare authoring failed; inspect the local audit artifact and retry."
+)
+_DELIVERY_PREPARE_WRITE_FAILED_MESSAGE = (
+    "Delivery prepare failed while writing artifacts; no source artifacts were finalized."
+)
+_DELIVERY_PREPARE_VALIDATION_FAILED_MESSAGE = (
+    "Generated delivery plan artifacts failed validation; no source artifacts were finalized."
+)
+_DELIVERY_PREPARE_UNIT_READINESS_FAILED_MESSAGE = (
+    "Generated unit task contracts have blocking readiness gaps; no source artifacts were finalized."
+)
+_DELIVERY_PREPARE_UNIT_READINESS_FAILURE = "unit_readiness_blocked"
+_DELIVERY_PREPARE_PLAN_VALIDATION_FAILURE = "plan_validation_failed"
+_DELIVERY_PREPARE_FORBIDDEN_OUTPUT_ROOTS = (
+    (".git",),
+    (".sikula", "state"),
+    (".sikula", "worktrees"),
+    (".sikula", "contract-reports"),
+)
 
 
 def register_parser(subparsers) -> argparse.ArgumentParser:
@@ -22,6 +57,42 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
     delivery_check_p = delivery_sub.add_parser("check", help="Check a delivery plan file")
     delivery_check_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
     delivery_check_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
+
+    delivery_prepare_p = delivery_sub.add_parser("prepare", help="Prepare delivery plan artifacts from a task file")
+    delivery_prepare_p.add_argument("task_file", metavar="TASK_FILE", help="Path to source task .txt/.md file")
+    delivery_prepare_p.add_argument(
+        "--output",
+        metavar="DIR",
+        help="Delivery plan output directory; defaults to .sikula/delivery/<task-stem>/",
+    )
+    delivery_prepare_p.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Allow replacing existing delivery plan artifacts in the output directory",
+    )
+    delivery_prepare_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
+    delivery_prepare_p.add_argument(
+        "--agent-model",
+        action="append",
+        default=None,
+        metavar="AGENT=MODEL",
+        help="Override model for delivery_preparer, e.g. --agent-model delivery_preparer=gpt-5.5",
+    )
+    delivery_prepare_p.add_argument(
+        "--agent-provider",
+        action="append",
+        default=None,
+        metavar="AGENT=PROVIDER",
+        help="Override provider for delivery_preparer, e.g. --agent-provider delivery_preparer=claude",
+    )
+    delivery_prepare_p.add_argument(
+        "--agent-timeout",
+        action="append",
+        default=None,
+        metavar="AGENT=SECONDS",
+        help="Override timeout for delivery_preparer, e.g. --agent-timeout delivery_preparer=1200",
+    )
 
     delivery_status_p = delivery_sub.add_parser("status", help="Show delivery plan progress")
     delivery_status_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
@@ -93,6 +164,877 @@ def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
         print(render_delivery_status(result), end="")
     if not result.valid:
         sys.exit(1)
+
+
+@dataclass(frozen=True)
+class DeliveryPrepareIssue:
+    severity: str
+    code: str
+    message: str
+    path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "severity": self.severity,
+            "code": self.code,
+            "message": self.message,
+            "path": self.path,
+        }
+
+
+@dataclass(frozen=True)
+class DeliveryPrepareArtifact:
+    kind: str
+    path: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"kind": self.kind, "path": self.path}
+
+
+@dataclass(frozen=True)
+class DeliveryPrepareAuthoringSummary:
+    drafted: bool = False
+    unit_count: int = 0
+    planning_mode: str | None = None
+    audit_path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "drafted": self.drafted,
+            "unit_count": self.unit_count,
+            "planning_mode": self.planning_mode,
+            "audit_path": self.audit_path,
+        }
+
+
+def _delivery_prepare_plan_validation_not_run() -> dict[str, Any]:
+    return {"status": "not_run", "valid": None, "errors": [], "warnings": []}
+
+
+def _delivery_prepare_unit_readiness_not_run() -> dict[str, Any]:
+    return {"status": "not_run", "units": []}
+
+
+@dataclass(frozen=True)
+class DeliveryPrepareResult:
+    status: str
+    ready: bool
+    prepared: bool
+    force: bool
+    overwrite_allowed: bool
+    selected_plan_id: str | None
+    unit_ids: list[str]
+    paths: dict[str, str | None]
+    existing_artifacts: list[DeliveryPrepareArtifact]
+    errors: list[DeliveryPrepareIssue]
+    unit_task_paths: dict[str, str] = field(default_factory=dict)
+    written_artifacts: list[DeliveryPrepareArtifact] = field(default_factory=list)
+    plan_validation: dict[str, Any] = field(default_factory=_delivery_prepare_plan_validation_not_run)
+    unit_readiness: dict[str, Any] = field(default_factory=_delivery_prepare_unit_readiness_not_run)
+    authoring: DeliveryPrepareAuthoringSummary = field(default_factory=DeliveryPrepareAuthoringSummary)
+    authoring_draft: DeliveryAuthoringDraft | None = field(default=None, repr=False, compare=False)
+    warnings: list[DeliveryPrepareIssue] = field(default_factory=list)
+    message: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "ready": self.ready,
+            "prepared": self.prepared,
+            "force": self.force,
+            "overwrite_allowed": self.overwrite_allowed,
+            "selected_plan_id": self.selected_plan_id,
+            "unit_ids": list(self.unit_ids),
+            "paths": dict(self.paths),
+            "unit_task_paths": dict(self.unit_task_paths),
+            "written_artifacts": [artifact.to_dict() for artifact in self.written_artifacts],
+            "existing_artifacts": [artifact.to_dict() for artifact in self.existing_artifacts],
+            "plan_validation": copy.deepcopy(self.plan_validation),
+            "unit_readiness": copy.deepcopy(self.unit_readiness),
+            "authoring": self.authoring.to_dict(),
+            "errors": [issue.to_dict() for issue in self.errors],
+            "warnings": [issue.to_dict() for issue in self.warnings],
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True)
+class DeliveryPrepareContext:
+    run_authoring_assistant: Callable[..., DeliveryAuthoringDraft]
+
+
+def cmd_delivery_prepare(
+    args: argparse.Namespace,
+    cfg: dict,
+    context: DeliveryPrepareContext | None = None,
+) -> None:
+    override_errors = _validate_delivery_prepare_agent_overrides(args)
+    result = _prepare_delivery_preflight(args, cfg, extra_errors=override_errors)
+    if result.ready:
+        if context is None:
+            result = _delivery_prepare_blocked_result(
+                result,
+                code="delivery_prepare.authoring_context_missing",
+                issue_message=_DELIVERY_PREPARE_CONTEXT_MISSING_MESSAGE,
+                result_message=_DELIVERY_PREPARE_CONTEXT_MISSING_MESSAGE,
+            )
+        else:
+            result = _run_delivery_prepare_authoring(args, cfg, result, context)
+    _print_delivery_result(result, json_output=args.json, render=render_delivery_prepare)
+    if not result.ready:
+        sys.exit(1)
+
+
+def render_delivery_prepare(result: DeliveryPrepareResult) -> str:
+    task_path = result.paths.get("task_file") or "<unknown>"
+    lines = [
+        f"Delivery prepare: {task_path}",
+        f"Status: {result.status}",
+    ]
+    if result.selected_plan_id:
+        lines.append(f"Selected plan: {result.selected_plan_id}")
+    if result.paths.get("output_dir"):
+        lines.append(f"Output: {result.paths['output_dir']}")
+    if result.paths.get("plan_file"):
+        lines.append(f"Plan file: {result.paths['plan_file']}")
+    if result.paths.get("units_dir"):
+        lines.append(f"Units dir: {result.paths['units_dir']}")
+    lines.append(f"Overwrite allowed: {'yes' if result.overwrite_allowed else 'no'}")
+    lines.append(f"Draft units: {len(result.unit_ids)}")
+    if result.authoring.audit_path:
+        lines.append(f"Authoring audit: {result.authoring.audit_path}")
+    if result.existing_artifacts:
+        lines.append("Existing artifacts:")
+        for artifact in result.existing_artifacts:
+            lines.append(f"- {artifact.kind}: {artifact.path}")
+    if result.written_artifacts:
+        lines.append("Written artifacts:")
+        for artifact in result.written_artifacts:
+            lines.append(f"- {artifact.kind}: {artifact.path}")
+    if result.unit_task_paths:
+        lines.append("Unit task paths:")
+        for unit_id, task_path in result.unit_task_paths.items():
+            lines.append(f"- {unit_id}: {task_path}")
+    plan_validation_status = result.plan_validation.get("status", "not_run")
+    if plan_validation_status != "not_run":
+        lines.append("Plan validation:")
+        lines.append(f"- status: {plan_validation_status}")
+        if result.plan_validation.get("valid") is not None:
+            lines.append(f"- valid: {'yes' if result.plan_validation.get('valid') else 'no'}")
+        lines.append(f"- errors: {len(result.plan_validation.get('errors') or [])}")
+        lines.append(f"- warnings: {len(result.plan_validation.get('warnings') or [])}")
+    unit_readiness_status = result.unit_readiness.get("status", "not_run")
+    if unit_readiness_status != "not_run":
+        lines.append("Unit readiness:")
+        lines.append(f"- status: {unit_readiness_status}")
+        for unit in result.unit_readiness.get("units") or []:
+            if not isinstance(unit, dict):
+                continue
+            unit_id = unit.get("unit_id") or "<unknown>"
+            unit_status = unit.get("status") or "<unknown>"
+            readiness_score = unit.get("readiness_score")
+            blocking_count = unit.get("blocking_gap_count")
+            warning_count = unit.get("warning_gap_count")
+            lines.append(
+                f"- {unit_id}: {unit_status}, score {readiness_score}, "
+                f"blocking {blocking_count}, warnings {warning_count}"
+            )
+    lines.append(result.message)
+    if _delivery_prepare_authoring_failed(result):
+        lines.append(_DELIVERY_PREPARE_AUTHORING_FAILED_HINT)
+    if result.errors:
+        lines.append("")
+        lines.append("Errors:")
+        for issue in result.errors:
+            lines.append(_format_prepare_issue(issue))
+    if result.warnings:
+        lines.append("")
+        lines.append("Warnings:")
+        for issue in result.warnings:
+            lines.append(_format_prepare_issue(issue))
+    return "\n".join(lines) + "\n"
+
+
+def _run_delivery_prepare_authoring(
+    args: argparse.Namespace,
+    cfg: dict,
+    preflight: DeliveryPrepareResult,
+    context: DeliveryPrepareContext,
+) -> DeliveryPrepareResult:
+    project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
+    task_path = _resolve_from_cwd(args.task_file)
+    output_dir = preflight.paths.get("output_dir")
+    selected_plan_id = preflight.selected_plan_id
+    if selected_plan_id is None:
+        return _delivery_prepare_blocked_result(
+            preflight,
+            code="delivery_prepare.authoring_invalid",
+            issue_message=_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE,
+            result_message=_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE,
+        )
+    if output_dir is None:
+        return _delivery_prepare_blocked_result(
+            preflight,
+            code="delivery_prepare.output_outside_project",
+            issue_message="Output path must be inside the project root.",
+            result_message=_DELIVERY_PREPARE_WRITE_FAILED_MESSAGE,
+        )
+    output_path = project_root / output_dir
+
+    try:
+        draft = context.run_authoring_assistant(
+            args=args,
+            cfg=cfg,
+            task_path=task_path,
+            output_dir=output_path,
+            selected_plan_id=selected_plan_id,
+            project_root=project_root,
+        )
+    except DeliveryAuthoringParseError as exc:
+        return _delivery_prepare_blocked_result(
+            preflight,
+            code="delivery_prepare.authoring_invalid",
+            issue_message=_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE,
+            result_message=_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE,
+            audit_path=_delivery_prepare_exception_audit_path(exc, project_root),
+        )
+    except Exception as exc:
+        return _delivery_prepare_blocked_result(
+            preflight,
+            code="delivery_prepare.authoring_failed",
+            issue_message=_DELIVERY_PREPARE_AUTHORING_FAILED_MESSAGE,
+            result_message=_DELIVERY_PREPARE_AUTHORING_FAILED_MESSAGE,
+            audit_path=_delivery_prepare_exception_audit_path(exc, project_root),
+        )
+    if not isinstance(draft, DeliveryAuthoringDraft):
+        return _delivery_prepare_blocked_result(
+            preflight,
+            code="delivery_prepare.authoring_invalid",
+            issue_message=_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE,
+            result_message=_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE,
+        )
+
+    audit_path = _delivery_prepare_authoring_audit_path(draft, project_root)
+    authoring_result = replace(
+        preflight,
+        unit_ids=[unit.id for unit in draft.units],
+        authoring=DeliveryPrepareAuthoringSummary(
+            drafted=True,
+            unit_count=len(draft.units),
+            planning_mode=draft.planning_mode,
+            audit_path=audit_path,
+        ),
+        authoring_draft=draft,
+        warnings=[
+            *preflight.warnings,
+            *_delivery_prepare_authoring_warnings(draft.warnings, audit_path=audit_path),
+        ],
+    )
+    write_result = write_delivery_prepare_artifacts(
+        draft,
+        output_dir=output_dir,
+        project_root=project_root,
+        project_config=cfg,
+        force=bool(getattr(args, "force", False)),
+    )
+    return _delivery_prepare_result_from_write_result(authoring_result, write_result)
+
+
+def _delivery_prepare_result_from_write_result(
+    result: DeliveryPrepareResult,
+    write_result: DeliveryPrepareWriteResult,
+) -> DeliveryPrepareResult:
+    paths = dict(result.paths)
+    if write_result.paths.plan_file:
+        paths["plan_file"] = write_result.paths.plan_file
+    if write_result.paths.units_dir:
+        paths["units_dir"] = write_result.paths.units_dir
+
+    if write_result.prepared:
+        return replace(
+            result,
+            status="ready",
+            ready=True,
+            prepared=True,
+            paths=paths,
+            unit_task_paths=dict(write_result.unit_task_paths),
+            written_artifacts=_delivery_prepare_artifacts_from_writer(write_result),
+            plan_validation=write_result.plan_validation.to_dict(),
+            unit_readiness=write_result.unit_readiness.to_dict(),
+            errors=[*result.errors, *_delivery_prepare_issues_from_writer(write_result.errors)],
+            warnings=[*result.warnings, *_delivery_prepare_issues_from_writer(write_result.warnings)],
+            message="Delivery plan artifacts written.",
+        )
+
+    code, message = _delivery_prepare_writer_failure(write_result.failure_reason)
+    writer_errors = _delivery_prepare_issues_from_writer(write_result.errors)
+    return replace(
+        result,
+        status="blocked",
+        ready=False,
+        prepared=False,
+        paths=paths,
+        unit_task_paths=dict(write_result.unit_task_paths),
+        written_artifacts=_delivery_prepare_artifacts_from_writer(write_result),
+        plan_validation=write_result.plan_validation.to_dict(),
+        unit_readiness=write_result.unit_readiness.to_dict(),
+        errors=[
+            *result.errors,
+            DeliveryPrepareIssue("error", code, message),
+            *(issue for issue in writer_errors if issue.code != code),
+        ],
+        warnings=[*result.warnings, *_delivery_prepare_issues_from_writer(write_result.warnings)],
+        message=message,
+    )
+
+
+def _delivery_prepare_artifacts_from_writer(
+    write_result: DeliveryPrepareWriteResult,
+) -> list[DeliveryPrepareArtifact]:
+    return [DeliveryPrepareArtifact(artifact.kind, artifact.path) for artifact in write_result.written_artifacts]
+
+
+def _delivery_prepare_authoring_warnings(
+    warnings: list[str],
+    *,
+    audit_path: str | None,
+) -> list[DeliveryPrepareIssue]:
+    if not warnings:
+        return []
+    return [
+        DeliveryPrepareIssue(
+            "warning",
+            "delivery_prepare.authoring_warnings_present",
+            "Delivery authoring assistant reported warnings; inspect the local audit artifact for details.",
+            audit_path,
+        )
+    ]
+
+
+def _delivery_prepare_issues_from_writer(issues: list[Any]) -> list[DeliveryPrepareIssue]:
+    result: list[DeliveryPrepareIssue] = []
+    for issue in issues:
+        path = issue.path if isinstance(issue.path, str) or issue.path is None else str(issue.path)
+        result.append(
+            DeliveryPrepareIssue(
+                str(issue.severity),
+                str(issue.code),
+                str(issue.message),
+                path,
+            )
+        )
+    return result
+
+
+def _delivery_prepare_writer_failure(failure_reason: str | None) -> tuple[str, str]:
+    if failure_reason == _DELIVERY_PREPARE_UNIT_READINESS_FAILURE:
+        return "delivery_prepare.unit_readiness_blocked", _DELIVERY_PREPARE_UNIT_READINESS_FAILED_MESSAGE
+    if failure_reason == _DELIVERY_PREPARE_PLAN_VALIDATION_FAILURE:
+        return "delivery_prepare.plan_validation_failed", _DELIVERY_PREPARE_VALIDATION_FAILED_MESSAGE
+    return "delivery_prepare.write_failed", _DELIVERY_PREPARE_WRITE_FAILED_MESSAGE
+
+
+def _delivery_prepare_blocked_result(
+    result: DeliveryPrepareResult,
+    *,
+    code: str,
+    issue_message: str,
+    result_message: str,
+    audit_path: str | None = None,
+) -> DeliveryPrepareResult:
+    return replace(
+        result,
+        status="blocked",
+        ready=False,
+        prepared=False,
+        authoring=replace(
+            result.authoring,
+            audit_path=audit_path if audit_path is not None else result.authoring.audit_path,
+        ),
+        errors=[
+            *result.errors,
+            DeliveryPrepareIssue(
+                "error",
+                code,
+                issue_message,
+            ),
+        ],
+        message=result_message,
+    )
+
+
+def _delivery_prepare_authoring_audit_path(draft: DeliveryAuthoringDraft, project_root: Path) -> str | None:
+    raw_path = getattr(draft, "audit_path", None)
+    return _delivery_prepare_safe_audit_path(raw_path, project_root)
+
+
+def _delivery_prepare_exception_audit_path(exc: BaseException, project_root: Path) -> str | None:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        audit_path = _delivery_prepare_safe_audit_path(getattr(current, "audit_path", None), project_root)
+        if audit_path is not None:
+            return audit_path
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _delivery_prepare_safe_audit_path(raw_path: Any, project_root: Path) -> str | None:
+    if not raw_path:
+        return None
+    try:
+        audit_path = Path(raw_path)
+        resolved = audit_path.resolve() if audit_path.is_absolute() else (project_root / audit_path).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if not _path_is_within(resolved, project_root):
+        return None
+    return _project_relative_path(resolved, project_root)
+
+
+def _delivery_prepare_authoring_failed(result: DeliveryPrepareResult) -> bool:
+    return any(
+        issue.code in {"delivery_prepare.authoring_failed", "delivery_prepare.authoring_invalid"}
+        for issue in result.errors
+    )
+
+
+def _validate_delivery_prepare_agent_overrides(args: argparse.Namespace) -> list[DeliveryPrepareIssue]:
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            parse_agent_llm_overrides(
+                getattr(args, "agent_model", None),
+                getattr(args, "agent_provider", None),
+                getattr(args, "agent_timeout", None),
+                valid_agents=DELIVERY_PREPARATION_AGENT_NAMES,
+            )
+    except SystemExit as exc:
+        if _system_exit_code(exc) == 0:
+            return []
+        message = output.getvalue().strip() or "Invalid delivery_preparer override."
+        return [
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.agent_override_invalid",
+                message,
+            )
+        ]
+    return []
+
+
+def _prepare_delivery_preflight(
+    args: argparse.Namespace,
+    cfg: dict,
+    *,
+    extra_errors: list[DeliveryPrepareIssue] | None = None,
+) -> DeliveryPrepareResult:
+    project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
+    force = bool(getattr(args, "force", False))
+    errors: list[DeliveryPrepareIssue] = list(extra_errors or [])
+    warnings: list[DeliveryPrepareIssue] = []
+
+    task_path = _resolve_from_cwd(args.task_file)
+    task_rel = _project_relative_path(task_path, project_root) if _path_is_within(task_path, project_root) else None
+    _validate_delivery_prepare_task_path(task_path, task_rel, project_root, errors)
+
+    output_arg = getattr(args, "output", None)
+    if output_arg:
+        _validate_delivery_prepare_output_arg(output_arg, errors)
+    output_path = _resolve_delivery_prepare_output_path(args, task_path, project_root)
+    output_rel = (
+        _project_relative_path(output_path, project_root) if _path_is_within(output_path, project_root) else None
+    )
+    output_error_count = len(errors)
+    _validate_delivery_prepare_output_components(output_path, project_root, errors)
+    output_has_symlink = any(issue.code == "delivery_prepare.output_symlink" for issue in errors[output_error_count:])
+    if output_rel is None:
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.output_outside_project",
+                "Output path must be inside the project root.",
+            )
+        )
+    elif _is_forbidden_delivery_prepare_output_root(output_rel):
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.output_runtime_artifact",
+                "Output path must not be inside Sikula runtime, debug, or VCS metadata directories.",
+                output_rel,
+            )
+        )
+
+    plan_id = output_path.name
+    if not _DELIVERY_PLAN_ID_RE.fullmatch(plan_id):
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.plan_id_invalid",
+                "plan_id may contain only letters, numbers, dots, underscores, and hyphens.",
+                output_rel,
+            )
+        )
+    elif not is_valid_delivery_branch_name(delivery_final_branch_for_plan_id(plan_id)):
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.final_branch_invalid",
+                "Selected plan_id would create an invalid final branch name.",
+                output_rel,
+            )
+        )
+
+    plan_file = output_path / "plan.yaml"
+    units_dir = output_path / "units"
+    plan_rel = _project_relative_path(plan_file, project_root) if output_rel is not None else None
+    units_rel = _project_relative_path(units_dir, project_root) if output_rel is not None else None
+
+    if output_rel is not None and not output_has_symlink and output_path.exists() and not output_path.is_dir():
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.output_not_directory",
+                "Output path already exists and is not a directory.",
+                output_rel,
+            )
+        )
+
+    existing_artifacts = (
+        _find_delivery_prepare_existing_artifacts(plan_file, units_dir, project_root)
+        if output_rel is not None and not output_has_symlink
+        else []
+    )
+    if force and output_rel is not None and not output_has_symlink:
+        _validate_delivery_prepare_non_replaceable_artifacts(plan_file, units_dir, project_root, errors)
+    if existing_artifacts and not force:
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.existing_artifacts",
+                "Existing delivery plan artifacts require --force to replace.",
+                output_rel,
+            )
+        )
+
+    ready = not errors
+    status = "ready" if ready else "blocked"
+    return DeliveryPrepareResult(
+        status=status,
+        ready=ready,
+        prepared=False,
+        force=force,
+        overwrite_allowed=force,
+        selected_plan_id=plan_id if _DELIVERY_PLAN_ID_RE.fullmatch(plan_id) else None,
+        unit_ids=[],
+        paths={
+            "task_file": task_rel,
+            "output_dir": output_rel,
+            "plan_file": plan_rel,
+            "units_dir": units_rel,
+        },
+        unit_task_paths={},
+        written_artifacts=[],
+        existing_artifacts=existing_artifacts,
+        plan_validation=_delivery_prepare_plan_validation_not_run(),
+        unit_readiness=_delivery_prepare_unit_readiness_not_run(),
+        errors=errors,
+        warnings=warnings,
+        message=(
+            "Delivery prepare preflight passed."
+            if ready
+            else "Delivery prepare is blocked; fix the reported errors and retry."
+        ),
+    )
+
+
+def _resolve_delivery_prepare_output_path(args: argparse.Namespace, task_path: Path, project_root: Path) -> Path:
+    output = getattr(args, "output", None)
+    if output:
+        return project_root / Path(output)
+    return project_root / ".sikula" / "delivery" / _kebab_case_slug(task_path.stem)
+
+
+def _validate_delivery_prepare_task_path(
+    task_path: Path,
+    task_rel: str | None,
+    project_root: Path,
+    errors: list[DeliveryPrepareIssue],
+) -> None:
+    if not _path_is_within(task_path, project_root):
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.task_outside_project",
+                "Task path must be inside the project root.",
+            )
+        )
+        return
+    if not task_path.exists():
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.task_missing",
+                "Task file does not exist.",
+                task_rel,
+            )
+        )
+        return
+    if not task_path.is_file():
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.task_not_file",
+                "Task path is not a file.",
+                task_rel,
+            )
+        )
+        return
+    try:
+        task_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.task_not_utf8",
+                "Task file is not readable as UTF-8 text.",
+                task_rel,
+            )
+        )
+    except OSError:
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.task_unreadable",
+                "Task file could not be read.",
+                task_rel,
+            )
+        )
+
+
+def _validate_delivery_prepare_output_arg(output: str | Path, errors: list[DeliveryPrepareIssue]) -> None:
+    if _is_absolute_delivery_prepare_path(output):
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.output_absolute",
+                "Output path must be project-relative.",
+            )
+        )
+    if _has_delivery_prepare_parent_traversal(output):
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.output_traversal",
+                "Output path must not contain parent-directory traversal.",
+            )
+        )
+
+
+def _validate_delivery_prepare_output_components(
+    output_path: Path,
+    project_root: Path,
+    errors: list[DeliveryPrepareIssue],
+) -> None:
+    for component in _existing_delivery_prepare_path_components(output_path, project_root):
+        component_rel = _project_relative_path(component, project_root)
+        if component.is_symlink():
+            errors.append(
+                DeliveryPrepareIssue(
+                    "error",
+                    "delivery_prepare.output_symlink",
+                    "Output directory must not contain symlink components.",
+                    component_rel,
+                )
+            )
+            return
+        if component != output_path and not component.is_dir():
+            errors.append(
+                DeliveryPrepareIssue(
+                    "error",
+                    "delivery_prepare.output_not_directory",
+                    "Output path component already exists and is not a directory.",
+                    component_rel,
+                )
+            )
+            return
+
+
+def _existing_delivery_prepare_path_components(path: Path, project_root: Path) -> list[Path]:
+    try:
+        relative = path.relative_to(project_root)
+    except ValueError:
+        return []
+    components: list[Path] = []
+    current = project_root
+    for part in relative.parts:
+        current = current / part
+        if not current.exists() and not current.is_symlink():
+            break
+        components.append(current)
+    return components
+
+
+def _find_delivery_prepare_existing_artifacts(
+    plan_file: Path,
+    units_dir: Path,
+    project_root: Path,
+) -> list[DeliveryPrepareArtifact]:
+    artifacts: list[DeliveryPrepareArtifact] = []
+    if plan_file.exists() or plan_file.is_symlink():
+        artifacts.append(DeliveryPrepareArtifact("plan", _project_relative_path(plan_file, project_root)))
+    if units_dir.is_symlink():
+        artifacts.append(DeliveryPrepareArtifact("unit_task", _project_relative_path(units_dir, project_root)))
+        return artifacts
+    if units_dir.exists() and not units_dir.is_dir():
+        artifacts.append(DeliveryPrepareArtifact("unit_task", _project_relative_path(units_dir, project_root)))
+        return artifacts
+    if units_dir.is_dir():
+        resolved_units_dir = units_dir.resolve()
+        for unit_path in _iter_delivery_prepare_unit_artifacts(units_dir):
+            if not unit_path.is_symlink() and not _path_is_within(unit_path, resolved_units_dir):
+                continue
+            artifacts.append(DeliveryPrepareArtifact("unit_task", _project_relative_path(unit_path, project_root)))
+    return artifacts
+
+
+def _validate_delivery_prepare_non_replaceable_artifacts(
+    plan_file: Path,
+    units_dir: Path,
+    project_root: Path,
+    errors: list[DeliveryPrepareIssue],
+) -> None:
+    if plan_file.is_symlink():
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.symlink_artifact",
+                "Delivery prepare artifacts must not be symlinks.",
+                _project_relative_path(plan_file, project_root),
+            )
+        )
+        return
+    if plan_file.exists() and not plan_file.is_file():
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.target_not_file",
+                "Delivery prepare target already exists and is not a regular file.",
+                _project_relative_path(plan_file, project_root),
+            )
+        )
+        return
+    if units_dir.is_symlink():
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.units_dir_symlink",
+                "Delivery prepare units directory must not be a symlink.",
+                _project_relative_path(units_dir, project_root),
+            )
+        )
+        return
+    if units_dir.exists() and not units_dir.is_dir():
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.units_dir_not_directory",
+                "Delivery prepare units path already exists and is not a directory.",
+                _project_relative_path(units_dir, project_root),
+            )
+        )
+        return
+    if units_dir.is_dir():
+        for unit_path in _iter_delivery_prepare_unit_artifacts(units_dir):
+            if unit_path.is_symlink():
+                errors.append(
+                    DeliveryPrepareIssue(
+                        "error",
+                        "delivery_prepare.symlink_artifact",
+                        "Delivery prepare artifacts must not be symlinks.",
+                        _project_relative_path(unit_path, project_root),
+                    )
+                )
+                return
+
+
+def _iter_delivery_prepare_unit_artifacts(units_dir: Path) -> list[Path]:
+    artifacts: list[Path] = []
+    pending = [units_dir]
+    while pending:
+        current = pending.pop()
+        try:
+            children = sorted(current.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if child.is_symlink():
+                artifacts.append(child)
+            elif child.is_file():
+                artifacts.append(child)
+            elif child.is_dir():
+                pending.append(child)
+    return sorted(artifacts)
+
+
+def _resolve_from_cwd(path: str | Path) -> Path:
+    raw_path = Path(path)
+    if raw_path.is_absolute():
+        return raw_path.resolve()
+    return (Path.cwd() / raw_path).resolve()
+
+
+def _is_absolute_delivery_prepare_path(path: str | Path) -> bool:
+    raw_path = str(path)
+    windows_path = PureWindowsPath(raw_path)
+    return (
+        Path(raw_path).is_absolute()
+        or PurePosixPath(raw_path).is_absolute()
+        or bool(windows_path.drive or windows_path.root)
+    )
+
+
+def _has_delivery_prepare_parent_traversal(path: str | Path) -> bool:
+    raw_path = str(path)
+    return ".." in PurePosixPath(raw_path).parts or ".." in PureWindowsPath(raw_path).parts
+
+
+def _is_forbidden_delivery_prepare_output_root(path: str | Path) -> bool:
+    raw_path = str(path)
+    return _has_forbidden_delivery_prepare_parts(PurePosixPath(raw_path).parts) or (
+        _has_forbidden_delivery_prepare_parts(PureWindowsPath(raw_path).parts)
+    )
+
+
+def _has_forbidden_delivery_prepare_parts(parts: tuple[str, ...]) -> bool:
+    normalized = tuple(part.casefold() for part in parts if part not in {"", "."})
+    return any(normalized[: len(root)] == root for root in _DELIVERY_PREPARE_FORBIDDEN_OUTPUT_ROOTS)
+
+
+def _project_relative_path(path: Path, project_root: Path) -> str:
+    try:
+        return path.relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _kebab_case_slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").lower()
+    return slug or "delivery-plan"
+
+
+def _format_prepare_issue(issue: DeliveryPrepareIssue) -> str:
+    location = f" [{issue.path}]" if issue.path else ""
+    return f"- {issue.code}{location}: {issue.message}"
 
 
 def cmd_delivery_finalize(args: argparse.Namespace, cfg: dict) -> None:
