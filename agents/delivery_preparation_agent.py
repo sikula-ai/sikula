@@ -146,7 +146,7 @@ class DeliveryPreparationAgent:
             )
         )
         try:
-            output = self.llm.run_readonly_agent(prompt, cwd=root, allow_commands=False)
+            output = self.llm.generate("", prompt)
         except Exception as exc:
             self._record_failure(
                 audit_recorder,
@@ -232,8 +232,10 @@ class DeliveryPreparationAgent:
                 content = resolved.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            if max_chars and len(content) > max_chars:
-                content = content[:max_chars] + f"\n... [truncated; inspect {rel_path} for full content]"
+            if len(content) > max_chars:
+                content = content[:max_chars]
+                if max_chars > 0:
+                    content += f"\n... [truncated; inspect {rel_path} for full content]"
             parts.append(f"=== {rel_path} ===\n{content}")
         return "\n\n".join(parts) if parts else "No configured guidelines content found."
 

@@ -47,7 +47,7 @@ class FakeLLMClient(LLMClient):
     def generate(self, system: str, user: str) -> str:
         return self._generate_response
 
-    def run_readonly_agent(self, prompt: str, cwd: Path, *, allow_commands: bool = True) -> str:
+    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
         if _is_analyst_prompt(prompt) and self._readonly_response == "APPROVED":
             return ANALYST_FAKE_PROMPT
         return self._readonly_response
@@ -90,7 +90,7 @@ class SequencedFakeLLMClient(LLMClient):
     def generate(self, system: str, user: str) -> str:
         return self._generate_queue.popleft() if self._generate_queue else self._default_generate
 
-    def run_readonly_agent(self, prompt: str, cwd: Path, *, allow_commands: bool = True) -> str:
+    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
         response = self._readonly_queue.popleft() if self._readonly_queue else self._default_readonly
         if _is_analyst_prompt(prompt) and response == "APPROVED":
             return ANALYST_FAKE_PROMPT

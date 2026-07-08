@@ -3213,16 +3213,21 @@ def _run_delivery_prepare_authoring(
         cfg=cfg,
     )
     agent = _create_delivery_preparation_agent(args, cfg)
-    draft = agent.author_delivery_plan(
-        task_description=task_text,
-        task_path=task_path,
-        plan_id=selected_plan_id,
-        project_root=project_root,
-        output_dir=output_dir,
-        project_context=_prepare_project_context_from_config(cfg),
-        audit_recorder=audit_recorder,
-    )
-    setattr(draft, "audit_path", _contract_preflight_path(audit_path, project_root))
+    safe_audit_path = _contract_preflight_path(audit_path, project_root)
+    try:
+        draft = agent.author_delivery_plan(
+            task_description=task_text,
+            task_path=task_path,
+            plan_id=selected_plan_id,
+            project_root=project_root,
+            output_dir=output_dir,
+            project_context=_prepare_project_context_from_config(cfg),
+            audit_recorder=audit_recorder,
+        )
+    except Exception as exc:
+        setattr(exc, "audit_path", safe_audit_path)
+        raise
+    setattr(draft, "audit_path", safe_audit_path)
     return draft
 
 

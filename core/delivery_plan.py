@@ -10,6 +10,30 @@ import yaml
 
 SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION = 1
 _DELIVERY_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_GIT_REF_FORBIDDEN_CHARS_RE = re.compile(r"[\000-\037\177 ~^:?*\[\\]")
+
+
+def delivery_final_branch_for_plan_id(plan_id: str) -> str:
+    return f"sikula/delivery/{plan_id}"
+
+
+def is_valid_delivery_branch_name(branch: str) -> bool:
+    if not branch or branch == "@" or branch == "HEAD":
+        return False
+    if (
+        branch.startswith("/")
+        or branch.endswith("/")
+        or branch.endswith(".")
+        or "//" in branch
+        or ".." in branch
+        or "@{" in branch
+        or _GIT_REF_FORBIDDEN_CHARS_RE.search(branch)
+    ):
+        return False
+    for part in branch.split("/"):
+        if not part or part.startswith(".") or part.startswith("-") or part.casefold().endswith(".lock"):
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -297,6 +321,15 @@ def _parse_delivery_plan(
         )
     title = _require_string(data, "title", "title", errors)
     final_branch = _require_string(data, "final_branch", "final_branch", errors)
+    if final_branch and not is_valid_delivery_branch_name(final_branch):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "final_branch.invalid",
+                "final_branch must be a valid local branch name.",
+                "final_branch",
+            )
+        )
     planning_mode = _optional_string(data, "planning_mode", "planning_mode", errors)
     repositories = _parse_repositories(data.get("repositories"), errors)
     repo_ids = {repo.id for repo in repositories}

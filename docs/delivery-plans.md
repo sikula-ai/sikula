@@ -41,9 +41,9 @@ sikula delivery prepare .sikula/tasks/my-task.md --output .sikula/delivery/<slug
 ```
 
 `delivery prepare` validates the task and output paths, calls the
-`delivery_preparer` assistant without command tools, parses one strict
-structured draft, then deterministically writes `plan.yaml` and
-`units/<unit>.md` source artifacts. It is an authoring step only: it does not
+`delivery_preparer` assistant through plain text generation with no provider
+agent/tool mode, parses one strict structured draft, then deterministically
+writes `plan.yaml` and `units/<unit>.md` source artifacts. It is an authoring step only: it does not
 start implementation, create `TaskState`, run delivery units, mutate
 `.sikula/state/delivery/<plan-id>/`, create worktrees, update branches, launch
 nested Sikula commands, or record delivery progress.
@@ -51,8 +51,8 @@ nested Sikula commands, or record delivery progress.
 Existing plan or unit artifacts are refused by default. `--force` may replace
 ordinary existing artifacts inside the selected output directory, but symlinks,
 path traversal, absolute output paths, path collisions, outside-project writes,
-and `.sikula/state`, `.sikula/worktrees`, or `.sikula/contract-reports` targets
-remain rejected.
+`.git`, `.sikula/state`, `.sikula/worktrees`, or `.sikula/contract-reports`
+targets remain rejected.
 
 Generated unit task files should remain product and behavior descriptions with
 acceptance criteria, reviewer focus, security/privacy notes, out-of-scope notes,
@@ -246,7 +246,8 @@ extended or rerun delivery plan must be finalized again after it returns to
 The MVP validator checks:
 
 - `schema_version: 1`,
-- required plan metadata such as `plan_id`, `title`, and `final_branch`,
+- required plan metadata such as `plan_id`, `title`, and a valid local-branch
+  `final_branch`,
 - delivery unit IDs,
 - unit task paths,
 - unit dependency references and cycles,

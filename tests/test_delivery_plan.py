@@ -152,6 +152,26 @@ def test_delivery_plan_check_rejects_plan_id_that_cannot_be_used_for_state_path(
     assert "plan_id.invalid" in _codes(result)
 
 
+@pytest.mark.parametrize(
+    "final_branch",
+    [
+        "sikula/delivery/foo..bar",
+        "sikula/delivery/foo.",
+        "sikula/delivery/foo.lock",
+    ],
+)
+def test_delivery_plan_check_rejects_invalid_final_branch(tmp_path: Path, final_branch: str) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["final_branch"] = final_branch
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is False
+    assert "final_branch.invalid" in _codes(result)
+
+
 def test_delivery_plan_check_reports_duplicate_and_unknown_dependencies(tmp_path: Path) -> None:
     _git_init(tmp_path)
     data = _base_plan(tmp_path)

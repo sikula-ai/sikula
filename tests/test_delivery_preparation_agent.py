@@ -16,34 +16,40 @@ from core.delivery_authoring import DeliveryAuthoringDraft, DeliveryAuthoringPar
 class CapturingLLM:
     def __init__(self, output: str) -> None:
         self.output = output
+        self.system_prompts: list[str] = []
         self.prompts: list[str] = []
-        self.cwd: list[Path] = []
-        self.allow_commands: list[bool] = []
+        self.readonly_agent_calls: list[str] = []
         self.agent_calls: list[str] = []
 
-    def run_readonly_agent(self, prompt: str, cwd: Path, *, allow_commands: bool = True) -> str:
-        self.prompts.append(prompt)
-        self.cwd.append(cwd)
-        self.allow_commands.append(allow_commands)
+    def generate(self, system: str, user: str) -> str:
+        self.system_prompts.append(system)
+        self.prompts.append(user)
         return self.output
+
+    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+        self.readonly_agent_calls.append(prompt)
+        raise AssertionError("delivery preparation must use plain generation")
 
     def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
         self.agent_calls.append(prompt)
-        raise AssertionError("delivery preparation must be read-only")
+        raise AssertionError("delivery preparation must use plain generation")
 
 
 class FailingLLM:
     def __init__(self, error: Exception) -> None:
         self.error = error
+        self.system_prompts: list[str] = []
         self.prompts: list[str] = []
-        self.cwd: list[Path] = []
-        self.allow_commands: list[bool] = []
+        self.readonly_agent_calls: list[str] = []
 
-    def run_readonly_agent(self, prompt: str, cwd: Path, *, allow_commands: bool = True) -> str:
-        self.prompts.append(prompt)
-        self.cwd.append(cwd)
-        self.allow_commands.append(allow_commands)
+    def generate(self, system: str, user: str) -> str:
+        self.system_prompts.append(system)
+        self.prompts.append(user)
         raise self.error
+
+    def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
+        self.readonly_agent_calls.append(prompt)
+        raise AssertionError("delivery preparation must use plain generation")
 
 
 def _unit_markdown(title: str = "Foundation") -> str:
@@ -123,7 +129,7 @@ def _author_delivery_plan(
     )
 
 
-def test_author_delivery_plan_calls_readonly_agent_and_records_success(tmp_path: Path) -> None:
+def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path) -> None:
     (tmp_path / "guidelines.md").write_text("# Project Guidelines\nKeep prompts platform-neutral.\n")
     llm = CapturingLLM(_authoring_output(warnings=["Review before writing artifacts."]))
     agent = DeliveryPreparationAgent(
@@ -147,8 +153,8 @@ def test_author_delivery_plan_calls_readonly_agent_and_records_success(tmp_path:
     assert draft.warnings == ["Review before writing artifacts."]
     assert [unit.id for unit in draft.units] == ["foundation"]
     assert draft.units[0].scope_paths == ["agents"]
-    assert llm.cwd == [tmp_path.resolve()]
-    assert llm.allow_commands == [False]
+    assert llm.system_prompts == [""]
+    assert llm.readonly_agent_calls == []
     assert llm.agent_calls == []
     prompt = llm.prompts[0]
     assert prompt.startswith(AGENT_SECURITY_PREFIX)
@@ -218,6 +224,22 @@ def test_author_delivery_plan_filters_guidelines_paths_and_truncates_content(tmp
     assert "=== missing.md ===" not in prompt
 
 
+def test_author_delivery_plan_honors_zero_guidelines_char_limit(tmp_path: Path) -> None:
+    (tmp_path / "good.md").write_text("SECRET_GUIDELINE_CONTEXT")
+    llm = CapturingLLM(_authoring_output())
+    agent = DeliveryPreparationAgent(
+        llm=llm,
+        project_config={"guidelines": {"context_files": ["good.md"], "max_file_chars": 0}},
+    )
+
+    _author_delivery_plan(agent, tmp_path=tmp_path)
+
+    prompt = llm.prompts[0]
+    assert "=== good.md ===\n" in prompt
+    assert "SECRET_GUIDELINE_CONTEXT" not in prompt
+    assert "[truncated; inspect good.md for full content]" not in prompt
+
+
 def test_author_delivery_plan_uses_default_guidelines_limit_when_config_value_is_invalid(tmp_path: Path) -> None:
     llm = CapturingLLM(_authoring_output())
     agent = DeliveryPreparationAgent(
@@ -276,7 +298,8 @@ def test_author_delivery_plan_wraps_provider_failure_with_safe_exception(tmp_pat
     assert str(exc_info.value) == "Delivery authoring assistant failed."
     assert exc_info.value.__cause__ is None
     assert "SECRET_PROVIDER_OUTPUT" not in str(exc_info.value)
-    assert llm.allow_commands == [False]
+    assert llm.system_prompts == [""]
+    assert llm.readonly_agent_calls == []
     assert len(audit_records) == 1
     record = audit_records[0]
     assert record["phase"] == "delivery_prepare_authoring"

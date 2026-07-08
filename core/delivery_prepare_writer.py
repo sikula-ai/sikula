@@ -16,7 +16,12 @@ from core.delivery_authoring import (
     DeliveryAuthoringUnitDraft,
     derive_delivery_authoring_paths,
 )
-from core.delivery_plan import SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION, check_delivery_plan_file
+from core.delivery_plan import (
+    SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION,
+    check_delivery_plan_file,
+    delivery_final_branch_for_plan_id,
+    is_valid_delivery_branch_name,
+)
 
 
 _PLAN_VALIDATION_NOT_RUN = "not_run"
@@ -30,6 +35,7 @@ _FAILURE_PLAN_VALIDATION_FAILED = "plan_validation_failed"
 _FAILURE_WRITE_FAILED = "write_failed"
 _ROLLBACK_FAILED_MESSAGE = "Delivery prepare failed while restoring artifacts; inspect the selected output directory."
 _FORBIDDEN_OUTPUT_ROOTS = (
+    (".git",),
     (".sikula", "state"),
     (".sikula", "worktrees"),
     (".sikula", "contract-reports"),
@@ -247,7 +253,7 @@ def write_delivery_prepare_artifacts(
                 DeliveryPrepareWriteIssue(
                     "error",
                     "delivery_prepare.output_runtime_artifact",
-                    "Output path must not be inside Sikula runtime or debug artifact directories.",
+                    "Output path must not be inside Sikula runtime, debug, or VCS metadata directories.",
                 )
             ],
         )
@@ -276,6 +282,21 @@ def write_delivery_prepare_artifacts(
                     "error",
                     exc.code,
                     exc.message,
+                )
+            ],
+        )
+    final_branch = delivery_final_branch_for_plan_id(draft.plan_id)
+    if not is_valid_delivery_branch_name(final_branch):
+        return _blocked_result(
+            paths,
+            unit_task_paths=paths.unit_task_paths,
+            failure_reason=_FAILURE_WRITE_FAILED,
+            errors=[
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.final_branch_invalid",
+                    "Selected plan_id would create an invalid final branch name.",
+                    paths.plan_file,
                 )
             ],
         )
@@ -640,7 +661,7 @@ def _render_plan_yaml(draft: DeliveryAuthoringDraft, unit_task_paths: dict[str, 
     }
     if draft.planning_mode:
         plan_data["planning_mode"] = draft.planning_mode
-    plan_data["final_branch"] = f"sikula/delivery/{draft.plan_id}"
+    plan_data["final_branch"] = delivery_final_branch_for_plan_id(draft.plan_id)
     plan_data["repositories"] = [{"id": "main", "root": "."}]
     streams = _distinct_streams(draft)
     if streams:

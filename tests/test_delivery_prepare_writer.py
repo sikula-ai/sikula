@@ -575,6 +575,7 @@ def test_write_delivery_prepare_artifacts_rejects_non_directory_targets(
             "delivery_prepare.output_runtime_artifact",
             id="contract_report_runtime_artifact",
         ),
+        pytest.param(".git/team-invites", "delivery_prepare.output_runtime_artifact", id="git_metadata_artifact"),
     ],
 )
 def test_write_delivery_prepare_artifacts_rejects_unsafe_output_paths(
@@ -596,6 +597,21 @@ def test_write_delivery_prepare_artifacts_rejects_unsafe_output_paths(
     assert result.paths.units_dir == ""
     assert result.paths.unit_task_paths == {}
     assert not (tmp_path / ".sikula").exists()
+
+
+def test_write_delivery_prepare_artifacts_rejects_invalid_generated_final_branch(tmp_path: Path) -> None:
+    result = write_delivery_prepare_artifacts(
+        _draft(plan_id="foo..bar"),
+        output_dir=".sikula/delivery/foo..bar",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "blocked"
+    assert result.failure_reason == "write_failed"
+    assert result.errors[0].code == "delivery_prepare.final_branch_invalid"
+    assert result.written_artifacts == []
+    assert not (tmp_path / ".sikula" / "delivery" / "foo..bar").exists()
 
 
 @pytest.mark.parametrize(

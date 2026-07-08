@@ -8,9 +8,18 @@ from unittest.mock import patch
 import pytest
 
 from core.delivery_authoring import (
+    DeliveryAuthoringDerivedPaths,
     DeliveryAuthoringDraft,
     DeliveryAuthoringParseError,
     DeliveryAuthoringUnitDraft,
+)
+from core.delivery_prepare_writer import (
+    DeliveryPreparePlanValidationSummary,
+    DeliveryPrepareUnitReadinessAggregate,
+    DeliveryPrepareUnitReadinessSummary,
+    DeliveryPrepareWriteIssue,
+    DeliveryPrepareWriteResult,
+    DeliveryPrepareWrittenArtifact,
 )
 import sikula
 from sikula_cli.agent_overrides import (
@@ -122,6 +131,7 @@ def _authoring_draft(
     audit_path: str | Path | None = None,
     task_markdown: str | None = None,
     scope_paths: list[str] | None = None,
+    warnings: list[str] | None = None,
 ) -> DeliveryAuthoringDraft:
     units = [
         DeliveryAuthoringUnitDraft(
@@ -138,6 +148,7 @@ def _authoring_draft(
         title="Team invites delivery",
         units=units,
         planning_mode=planning_mode,
+        warnings=warnings or [],
     )
     if audit_path is not None:
         setattr(draft, "audit_path", str(audit_path))
@@ -493,6 +504,49 @@ def test_run_delivery_prepare_authoring_records_audit_and_forwards_context(tmp_p
     assert not output_dir.exists()
 
 
+def test_run_delivery_prepare_authoring_attaches_audit_path_to_failures(tmp_path: Path) -> None:
+    task_path = _write_task(
+        tmp_path,
+        ".sikula/tasks/team-invites.md",
+        "# Team invites\n\nPRIVATE TASK BODY\n",
+    )
+    output_dir = tmp_path / ".sikula" / "delivery" / "team-invites"
+    args = _args(".sikula/tasks/team-invites.md")
+    cfg = _cfg(tmp_path)
+
+    class FailingDeliveryPreparationAgent:
+        def author_delivery_plan(self, **kwargs):
+            kwargs["audit_recorder"](
+                {
+                    "phase": "delivery_prepare_authoring",
+                    "raw_output": None,
+                    "parsed": {"status": "failed", "error_code": "delivery_prepare.authoring_failed"},
+                }
+            )
+            raise RuntimeError("SECRET_PROVIDER_OUTPUT from prompt")
+
+    with (
+        patch("sikula._create_delivery_preparation_agent", return_value=FailingDeliveryPreparationAgent()),
+        patch("sikula._prepare_project_context_from_config", return_value={}),
+    ):
+        with pytest.raises(RuntimeError) as exc_info:
+            sikula._run_delivery_prepare_authoring(
+                args=args,
+                cfg=cfg,
+                task_path=task_path.resolve(),
+                output_dir=output_dir.resolve(),
+                selected_plan_id="team-invites",
+                project_root=tmp_path.resolve(),
+            )
+
+    audit_path = ".sikula/contract-reports/team-invites.delivery-prepare.auto-llm.jsonl"
+    assert getattr(exc_info.value, "audit_path") == audit_path
+    audit_file = tmp_path / audit_path
+    assert audit_file.is_file()
+    audit_record = json.loads(audit_file.read_text(encoding="utf-8").splitlines()[0])
+    assert audit_record["generated_by"] == "sikula.delivery_prepare"
+
+
 def test_main_dispatches_delivery_prepare_through_runtime_config(tmp_path: Path) -> None:
     task_path = _write_task(tmp_path)
     cfg = _cfg(tmp_path)
@@ -610,6 +664,39 @@ def test_cmd_delivery_prepare_json_is_allowlisted_project_relative_projection(
     assert (tmp_path / ".sikula" / "delivery" / "team-invites" / "units" / "foundation.md").is_file()
 
 
+def test_cmd_delivery_prepare_surfaces_authoring_warnings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_task(tmp_path)
+    draft = _authoring_draft(
+        audit_path=".sikula/contract-reports/team-invites.delivery-prepare.auto-llm.jsonl",
+        warnings=["SECRET_PROVIDER_OUTPUT and PRIVATE TASK BODY"],
+    )
+    monkeypatch.chdir(tmp_path)
+
+    cmd_delivery_prepare(
+        _args("tasks/team-invites.md", json_output=True),
+        _cfg(tmp_path),
+        context=_authoring_context(draft=draft),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    payload_text = json.dumps(payload)
+    assert payload["status"] == "ready"
+    assert payload["warnings"] == [
+        {
+            "code": "delivery_prepare.authoring_warnings_present",
+            "message": "Delivery authoring assistant reported warnings; inspect the local audit artifact for details.",
+            "path": ".sikula/contract-reports/team-invites.delivery-prepare.auto-llm.jsonl",
+            "severity": "warning",
+        }
+    ]
+    assert "SECRET_PROVIDER_OUTPUT" not in payload_text
+    assert "PRIVATE TASK BODY" not in payload_text
+
+
 def test_cmd_delivery_prepare_blocks_unit_readiness_failures_without_artifacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -717,6 +804,97 @@ def test_cmd_delivery_prepare_maps_writer_failures_to_safe_error(
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
 
 
+def test_cmd_delivery_prepare_preserves_writer_artifacts_after_rollback_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_task(tmp_path)
+    draft = _authoring_draft(
+        unit_ids=["foundation"],
+        audit_path=".sikula/contract-reports/team-invites.delivery-prepare.auto-llm.jsonl",
+        warnings=["SECRET_PROVIDER_OUTPUT and PRIVATE TASK BODY"],
+    )
+    monkeypatch.chdir(tmp_path)
+
+    def blocked_writer(*_args, **_kwargs):
+        return DeliveryPrepareWriteResult(
+            status="blocked",
+            prepared=False,
+            paths=DeliveryAuthoringDerivedPaths(
+                plan_file=".sikula/delivery/team-invites/plan.yaml",
+                units_dir=".sikula/delivery/team-invites/units",
+                unit_task_paths={
+                    "foundation": ".sikula/delivery/team-invites/units/foundation.md",
+                },
+            ),
+            unit_task_paths={
+                "foundation": ".sikula/delivery/team-invites/units/foundation.md",
+            },
+            written_artifacts=[
+                DeliveryPrepareWrittenArtifact("plan", ".sikula/delivery/team-invites/plan.yaml"),
+                DeliveryPrepareWrittenArtifact("unit_task", ".sikula/delivery/team-invites/units/foundation.md"),
+            ],
+            plan_validation=DeliveryPreparePlanValidationSummary(status="not_run", valid=None),
+            unit_readiness=DeliveryPrepareUnitReadinessAggregate(
+                status="ready",
+                units=[
+                    DeliveryPrepareUnitReadinessSummary(
+                        unit_id="foundation",
+                        path=".sikula/delivery/team-invites/units/foundation.md",
+                        readiness_score=100,
+                        status="ready",
+                        ready_for_autonomous_delivery=True,
+                        blocking_gap_count=0,
+                        warning_gap_count=0,
+                    )
+                ],
+            ),
+            errors=[
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.write_failed",
+                    "Delivery prepare failed while writing artifacts.",
+                ),
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.rollback_failed",
+                    "Delivery prepare failed while restoring artifacts; inspect the selected output directory.",
+                    ".sikula/delivery/team-invites/plan.yaml",
+                ),
+            ],
+            failure_reason="write_failed",
+        )
+
+    monkeypatch.setattr("sikula_cli.delivery.write_delivery_prepare_artifacts", blocked_writer)
+
+    payload = _blocked_payload(
+        _args("tasks/team-invites.md", json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(draft=draft),
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["written_artifacts"] == [
+        {"kind": "plan", "path": ".sikula/delivery/team-invites/plan.yaml"},
+        {"kind": "unit_task", "path": ".sikula/delivery/team-invites/units/foundation.md"},
+    ]
+    assert payload["errors"][0]["code"] == "delivery_prepare.write_failed"
+    assert payload["errors"][1]["code"] == "delivery_prepare.rollback_failed"
+    assert payload["warnings"] == [
+        {
+            "code": "delivery_prepare.authoring_warnings_present",
+            "message": "Delivery authoring assistant reported warnings; inspect the local audit artifact for details.",
+            "path": ".sikula/contract-reports/team-invites.delivery-prepare.auto-llm.jsonl",
+            "severity": "warning",
+        }
+    ]
+    payload_text = json.dumps(payload)
+    assert "SECRET_PROVIDER_OUTPUT" not in payload_text
+    assert "PRIVATE TASK BODY" not in payload_text
+
+
 def test_cmd_delivery_prepare_does_not_call_authoring_when_preflight_is_blocked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -761,6 +939,30 @@ def test_cmd_delivery_prepare_blocks_provider_failure_with_safe_text(
     assert "SECRET_PROVIDER_OUTPUT" not in out
     assert "PRIVATE TASK BODY" not in out
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+def test_cmd_delivery_prepare_propagates_authoring_failure_audit_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_task(tmp_path, body="# Team invites\n\nPRIVATE TASK BODY\n")
+    failure = RuntimeError("SECRET_PROVIDER_OUTPUT from prompt")
+    setattr(failure, "audit_path", ".sikula/contract-reports/team-invites.delivery-prepare.auto-llm.jsonl")
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args("tasks/team-invites.md", json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(failure=failure),
+    )
+
+    payload_text = json.dumps(payload)
+    assert payload["errors"][0]["code"] == "delivery_prepare.authoring_failed"
+    assert payload["authoring"]["audit_path"] == ".sikula/contract-reports/team-invites.delivery-prepare.auto-llm.jsonl"
+    assert "SECRET_PROVIDER_OUTPUT" not in payload_text
+    assert "PRIVATE TASK BODY" not in payload_text
 
 
 def test_cmd_delivery_prepare_blocks_parse_failure_with_safe_json(
@@ -1072,6 +1274,12 @@ def test_cmd_delivery_prepare_rejects_invalid_output_paths(
             "delivery_prepare.output_runtime_artifact",
             id="contract_report_runtime_artifact",
         ),
+        pytest.param(".git/team-invites", "delivery_prepare.output_runtime_artifact", id="git_metadata_artifact"),
+        pytest.param(
+            ".sikula/delivery/foo..bar",
+            "delivery_prepare.final_branch_invalid",
+            id="invalid_generated_final_branch",
+        ),
     ],
 )
 def test_cmd_delivery_prepare_rejects_unsafe_output_arguments(
@@ -1126,6 +1334,38 @@ def test_cmd_delivery_prepare_rejects_output_symlink_component(
     }
     assert payload["existing_artifacts"] == []
     assert str(target) not in payload_text
+
+
+def test_cmd_delivery_prepare_rejects_output_file_parent_before_authoring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_task(tmp_path)
+    sikula_dir = tmp_path / ".sikula"
+    sikula_dir.mkdir()
+    delivery_parent = sikula_dir / "delivery"
+    delivery_parent.write_text("private parent body\n", encoding="utf-8")
+    calls: list[dict] = []
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args("tasks/team-invites.md", output=".sikula/delivery/team-invites", json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(calls=calls),
+    )
+
+    payload_text = json.dumps(payload)
+    assert payload["errors"][0] == {
+        "code": "delivery_prepare.output_not_directory",
+        "message": "Output path component already exists and is not a directory.",
+        "path": ".sikula/delivery",
+        "severity": "error",
+    }
+    assert payload["existing_artifacts"] == []
+    assert calls == []
+    assert "private parent body" not in payload_text
 
 
 def test_cmd_delivery_prepare_blocks_existing_artifacts_without_force_and_allows_with_force(
@@ -1258,6 +1498,59 @@ def test_cmd_delivery_prepare_blocks_unit_symlink_artifact_without_exposing_targ
     ]
     assert str(target) not in payload_text
     assert "linked unit body" not in payload_text
+
+
+@pytest.mark.parametrize(
+    ("case_name", "expected_code"),
+    [
+        pytest.param("plan_symlink", "delivery_prepare.symlink_artifact", id="plan_symlink"),
+        pytest.param("plan_directory", "delivery_prepare.target_not_file", id="plan_directory"),
+        pytest.param("units_file", "delivery_prepare.units_dir_not_directory", id="units_file"),
+        pytest.param("units_symlink", "delivery_prepare.units_dir_symlink", id="units_symlink"),
+        pytest.param("unit_symlink", "delivery_prepare.symlink_artifact", id="unit_symlink"),
+    ],
+)
+def test_cmd_delivery_prepare_blocks_non_replaceable_artifacts_with_force_before_authoring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case_name: str,
+    expected_code: str,
+) -> None:
+    _write_task(tmp_path)
+    output_dir = tmp_path / ".sikula" / "delivery" / "team-invites"
+    output_dir.mkdir(parents=True)
+    target = tmp_path / "target-artifact"
+    target.write_text("sensitive artifact body\n", encoding="utf-8")
+    if case_name == "plan_symlink":
+        (output_dir / "plan.yaml").symlink_to(target)
+    elif case_name == "plan_directory":
+        (output_dir / "plan.yaml").mkdir()
+    elif case_name == "units_file":
+        (output_dir / "units").write_text("not a directory\n", encoding="utf-8")
+    elif case_name == "units_symlink":
+        target_dir = tmp_path / "target-units"
+        target_dir.mkdir()
+        (output_dir / "units").symlink_to(target_dir, target_is_directory=True)
+    else:
+        units_dir = output_dir / "units"
+        units_dir.mkdir()
+        (units_dir / "linked-unit.md").symlink_to(target)
+    calls: list[dict] = []
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args("tasks/team-invites.md", output=".sikula/delivery/team-invites", force=True, json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(calls=calls),
+    )
+
+    payload_text = json.dumps(payload)
+    assert payload["errors"][0]["code"] == expected_code
+    assert calls == []
+    assert str(target) not in payload_text
+    assert "sensitive artifact body" not in payload_text
 
 
 @pytest.mark.parametrize(

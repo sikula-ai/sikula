@@ -124,7 +124,7 @@ def test_delivery_prepare_cli_authors_artifacts_then_check_succeeds(
     task_path.parent.mkdir(parents=True, exist_ok=True)
     task_path.write_text("# Team invites\n\nPRIVATE TASK BODY\n", encoding="utf-8")
     _write_project_config(git_project)
-    fake = fake_llm(readonly_response=_delivery_prepare_authoring_output())
+    fake = fake_llm(generate_response=_delivery_prepare_authoring_output())
     monkeypatch.chdir(git_project)
 
     with patch("core.llm_client.create_llm_client", return_value=fake):

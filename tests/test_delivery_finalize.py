@@ -419,7 +419,7 @@ def test_preview_delivery_finalize_rejects_branch_checkout_shorthand(tmp_path: P
 
     assert result.ready is False
     assert result.finalized is False
-    assert [issue.code for issue in result.errors] == ["delivery.final_branch_invalid"]
+    assert [issue.code for issue in result.errors] == ["final_branch.invalid"]
     assert result.final_commit is None
 
 
@@ -434,7 +434,7 @@ def test_preview_delivery_finalize_rejects_refs_that_are_not_branch_names(tmp_pa
 
     assert result.ready is False
     assert result.finalized is False
-    assert [issue.code for issue in result.errors] == ["delivery.final_branch_invalid"]
+    assert [issue.code for issue in result.errors] == ["final_branch.invalid"]
     assert result.final_commit is None
 
 
