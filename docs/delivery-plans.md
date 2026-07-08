@@ -1,10 +1,10 @@
 # Delivery Plans
 
 Delivery plans are the planned parent layer for large work that should be split
-into small Sikula delivery units. The current MVP offers read-only authoring
-assistance, validates a tracked plan file, reports privacy-safe parent progress,
-and can run one eligible unit at a time through the normal `sikula run`
-pipeline.
+into small Sikula delivery units. The current MVP offers artifact authoring with
+deterministic writing, validates tracked plan files, reports privacy-safe parent
+progress, and can run one eligible unit at a time through the normal
+`sikula run` pipeline.
 
 Use delivery plans when a request is too large for one implementation contract or
 when the work spans multiple streams such as backend, web, Android, iOS, docs, or
@@ -20,26 +20,42 @@ large request
 
 ## Authoring Assistance
 
-Ask Sikula to draft a delivery plan structure from a task file:
+Ask Sikula to author delivery plan artifacts from a task file:
+
+```bash
+sikula delivery prepare .sikula/tasks/my-task.md
+```
+
+When `--output` is omitted, Sikula derives
+`.sikula/delivery/<task-stem>/` from the task filename. You can select a
+different tracked delivery-plan directory explicitly:
 
 ```bash
 sikula delivery prepare .sikula/tasks/my-task.md --output .sikula/delivery/<slug>
 ```
 
-`delivery prepare` is a read-only authoring assistant. It validates the task and
-output paths, calls the `delivery_preparer` assistant without command tools, and
-parses one strict structured draft for later writer code. This unit does not
-write `plan.yaml` or unit task files.
+`delivery prepare` validates the task and output paths, calls the
+`delivery_preparer` assistant without command tools, parses one strict
+structured draft, then deterministically writes `plan.yaml` and
+`units/<unit>.md` source artifacts. Existing plan or unit files are refused by
+default; pass `--force` to replace ordinary existing artifacts inside the
+selected output directory. Absolute output paths, parent traversal, symlink
+artifacts, symlink escapes, path collisions, outside-project writes, and
+Sikula runtime/debug artifact directories are rejected.
 
-Draft unit tasks should remain product and behavior descriptions with acceptance
-criteria, reviewer focus, security/privacy notes, out-of-scope notes, and
-verification expectations. They should not become file-by-file implementation
-scripts.
+Generated unit task files should remain product and behavior descriptions with
+acceptance criteria, reviewer focus, security/privacy notes, out-of-scope notes,
+and verification expectations. They should not become file-by-file
+implementation scripts.
 
 Sikula derives writer-facing paths from the output directory and unit IDs. Path
-fields from LLM output are rejected instead of trusted. Raw prompts and raw
-provider output live only in local preparation audit artifacts; ordinary text
-and JSON output expose a privacy-safe draft summary.
+fields from LLM output are rejected instead of trusted. Unit task contracts are
+checked for readiness before source artifacts are finalized, and the generated
+plan is validated after writing. If readiness, validation, or filesystem writing
+fails, Sikula rolls back so half-valid source artifacts are not left behind. Raw
+prompts and raw provider output live only in local preparation audit artifacts;
+ordinary text and JSON output expose privacy-safe metadata such as written
+paths, plan validation status, and unit readiness status.
 
 ## Current MVP Commands
 
@@ -233,8 +249,10 @@ can coordinate cross-repo branches, locks, validation, and result sets.
 
 ## Privacy
 
-`delivery check --json`, `delivery status --json`, `delivery run-next --json`,
-and `delivery finalize --json` return plan metadata, validation issues, unit
-paths, compact progress fields, selected child task IDs, final branch metadata,
-and branch/commit pointers when available. They do not embed unit task file
-bodies, prompts, provider output, diffs, logs, or task state.
+`delivery prepare --json`, `delivery check --json`, `delivery status --json`,
+`delivery run-next --json`, and `delivery finalize --json` return allowlisted
+metadata such as written artifact paths, plan validation status, unit readiness,
+plan metadata, validation issues, unit paths, compact progress fields, selected
+child task IDs, final branch metadata, and branch/commit pointers when
+available. They do not embed source task bodies, unit task file bodies, prompts,
+provider output, diffs, logs, or task state.

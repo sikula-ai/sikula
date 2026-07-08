@@ -30,7 +30,10 @@ from sikula_cli.delivery import (
 
 
 def _cfg(root: Path) -> dict:
-    return {"project": {"root_path": str(root)}}
+    return {
+        "project": {"root_path": str(root), "build_tool": "python"},
+        "build": {"test_command": "python3 -m pytest tests/test_delivery_prepare.py"},
+    }
 
 
 def _args(
@@ -61,19 +64,72 @@ def _write_task(root: Path, rel_path: str = "tasks/team-invites.md", body: str =
     return path
 
 
+def _ready_unit_markdown(title: str) -> str:
+    return f"""# {title}
+
+## Goal
+
+Deliver the {title} unit while keeping generated command output privacy-safe.
+
+## Current behavior
+
+- Operators do not yet have this delivery unit as a tracked source artifact.
+- The generated unit body contains PRIVATE UNIT MARKDOWN that must not appear in CLI output.
+
+## Desired behavior
+
+- The unit is represented as a focused task description with observable outcomes.
+- The unit can be checked for readiness before any delivery execution starts.
+- Generated metadata reports only project-relative paths and readiness summaries.
+
+## Acceptance criteria
+
+- The unit task has a deterministic success path.
+- Invalid or incomplete generated content is reported as blocked.
+- Raw prompts, provider output, and generated task bodies are not printed in normal output.
+
+## Security and privacy
+
+- Do not expose raw provider output, task bodies, source excerpts, secrets, or absolute paths.
+- Keep audit artifacts local and separate from ordinary text and JSON projections.
+
+## Reviewer focus
+
+- Confirm readiness checks and privacy-safe output metadata.
+- Confirm generated source artifacts remain project-relative.
+
+## Out of scope
+
+- Do not run generated delivery units.
+- Do not create delivery progress state.
+
+## Tests
+
+- Cover successful artifact writing through the delivery prepare command.
+- Cover blocked readiness, plan validation failure, and writer failure outputs.
+
+## Verification
+
+- `python3 -m pytest tests/test_delivery_prepare.py`
+"""
+
+
 def _authoring_draft(
     *,
     plan_id: str = "team-invites",
     unit_ids: list[str] | None = None,
     planning_mode: str | None = "fixed_window",
     audit_path: str | Path | None = None,
+    task_markdown: str | None = None,
+    scope_paths: list[str] | None = None,
 ) -> DeliveryAuthoringDraft:
     units = [
         DeliveryAuthoringUnitDraft(
             id=unit_id,
             title=f"{unit_id} title",
             depends_on=[],
-            task_markdown=f"# {unit_id}\n\nPRIVATE UNIT MARKDOWN",
+            task_markdown=task_markdown if task_markdown is not None else _ready_unit_markdown(f"{unit_id} title"),
+            scope_paths=scope_paths or [],
         )
         for unit_id in (unit_ids or ["foundation", "cli"])
     ]
@@ -230,7 +286,7 @@ def test_cmd_delivery_prepare_blocks_without_context_after_successful_preflight(
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
 
 
-def test_cmd_delivery_prepare_authors_draft_summary_after_preflight(
+def test_cmd_delivery_prepare_writes_artifacts_after_authoring(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -252,11 +308,26 @@ def test_cmd_delivery_prepare_authors_draft_summary_after_preflight(
     assert "Selected plan: team-invites" in out
     assert "Draft units: 2" in out
     assert "Authoring audit: .sikula/contract-reports/team-invites.audit.json" in out
-    assert "Delivery plan draft authored; no delivery artifacts were written." in out
+    assert "Written artifacts:" in out
+    assert "- plan: .sikula/delivery/team-invites/plan.yaml" in out
+    assert "- unit_task: .sikula/delivery/team-invites/units/foundation.md" in out
+    assert "- unit_task: .sikula/delivery/team-invites/units/cli.md" in out
+    assert "Unit task paths:" in out
+    assert "- foundation: .sikula/delivery/team-invites/units/foundation.md" in out
+    assert "- cli: .sikula/delivery/team-invites/units/cli.md" in out
+    assert "Plan validation:" in out
+    assert "- status: valid" in out
+    assert "- valid: yes" in out
+    assert "Unit readiness:" in out
+    assert "- status: ready" in out
+    assert "Delivery plan artifacts written." in out
     assert "Do not echo this raw task body" not in out
     assert "PRIVATE UNIT MARKDOWN" not in out
     assert str(tmp_path) not in out
-    assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+    assert (tmp_path / ".sikula" / "delivery" / "team-invites" / "plan.yaml").is_file()
+    assert (tmp_path / ".sikula" / "delivery" / "team-invites" / "units" / "foundation.md").is_file()
+    assert (tmp_path / ".sikula" / "delivery" / "team-invites" / "units" / "cli.md").is_file()
+    assert not (tmp_path / ".sikula" / "state" / "delivery" / "team-invites").exists()
     assert len(calls) == 1
     assert calls[0]["task_path"] == (tmp_path / "tasks" / "Team Invites.md").resolve()
     assert calls[0]["output_dir"] == (tmp_path / ".sikula" / "delivery" / "team-invites").resolve()
@@ -494,34 +565,155 @@ def test_cmd_delivery_prepare_json_is_allowlisted_project_relative_projection(
 
     out = capsys.readouterr().out
     payload = json.loads(out)
-    assert payload == {
-        "authoring": {
-            "audit_path": ".sikula/contract-reports/team-invites.audit.json",
-            "drafted": True,
-            "planning_mode": "fixed_window",
-            "unit_count": 2,
-        },
-        "errors": [],
-        "existing_artifacts": [],
-        "force": False,
-        "message": "Delivery plan draft authored; no delivery artifacts were written.",
-        "overwrite_allowed": False,
-        "paths": {
-            "output_dir": ".sikula/delivery/team-invites",
-            "plan_file": ".sikula/delivery/team-invites/plan.yaml",
-            "task_file": "tasks/team-invites.md",
-            "units_dir": ".sikula/delivery/team-invites/units",
-        },
-        "prepared": False,
-        "ready": True,
-        "selected_plan_id": "team-invites",
-        "status": "ready",
-        "unit_ids": ["foundation", "cli"],
-        "warnings": [],
+    assert payload["status"] == "ready"
+    assert payload["ready"] is True
+    assert payload["prepared"] is True
+    assert payload["force"] is False
+    assert payload["overwrite_allowed"] is False
+    assert payload["selected_plan_id"] == "team-invites"
+    assert payload["unit_ids"] == ["foundation", "cli"]
+    assert payload["paths"] == {
+        "output_dir": ".sikula/delivery/team-invites",
+        "plan_file": ".sikula/delivery/team-invites/plan.yaml",
+        "task_file": "tasks/team-invites.md",
+        "units_dir": ".sikula/delivery/team-invites/units",
     }
+    assert payload["unit_task_paths"] == {
+        "foundation": ".sikula/delivery/team-invites/units/foundation.md",
+        "cli": ".sikula/delivery/team-invites/units/cli.md",
+    }
+    assert payload["written_artifacts"] == [
+        {"kind": "plan", "path": ".sikula/delivery/team-invites/plan.yaml"},
+        {"kind": "unit_task", "path": ".sikula/delivery/team-invites/units/foundation.md"},
+        {"kind": "unit_task", "path": ".sikula/delivery/team-invites/units/cli.md"},
+    ]
+    assert payload["existing_artifacts"] == []
+    assert payload["plan_validation"] == {"status": "valid", "valid": True, "errors": [], "warnings": []}
+    assert payload["unit_readiness"]["status"] == "ready"
+    assert [unit["unit_id"] for unit in payload["unit_readiness"]["units"]] == ["foundation", "cli"]
+    assert all(unit["ready_for_autonomous_delivery"] is True for unit in payload["unit_readiness"]["units"])
+    assert all(unit["blocking_gap_count"] == 0 for unit in payload["unit_readiness"]["units"])
+    assert all(unit["blocking_gap_ids"] == [] for unit in payload["unit_readiness"]["units"])
+    assert payload["authoring"] == {
+        "audit_path": ".sikula/contract-reports/team-invites.audit.json",
+        "drafted": True,
+        "planning_mode": "fixed_window",
+        "unit_count": 2,
+    }
+    assert payload["errors"] == []
+    assert payload["warnings"] == []
+    assert payload["message"] == "Delivery plan artifacts written."
     assert str(tmp_path) not in out
     assert "PRIVATE TASK BODY" not in out
     assert "PRIVATE UNIT MARKDOWN" not in out
+    assert (tmp_path / ".sikula" / "delivery" / "team-invites" / "plan.yaml").is_file()
+    assert (tmp_path / ".sikula" / "delivery" / "team-invites" / "units" / "foundation.md").is_file()
+
+
+def test_cmd_delivery_prepare_blocks_unit_readiness_failures_without_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_task(tmp_path, body="# Team invites\n\nPRIVATE TASK BODY\n")
+    weak_draft = _authoring_draft(unit_ids=["weak"], task_markdown="# Weak\n\nToo vague.")
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args("tasks/team-invites.md", json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(draft=weak_draft),
+    )
+
+    payload_text = json.dumps(payload)
+    assert payload["status"] == "blocked"
+    assert payload["ready"] is False
+    assert payload["prepared"] is False
+    assert payload["errors"] == [
+        {
+            "code": "delivery_prepare.unit_readiness_blocked",
+            "message": (
+                "Generated unit task contracts have blocking readiness gaps; no source artifacts were finalized."
+            ),
+            "path": None,
+            "severity": "error",
+        }
+    ]
+    assert payload["plan_validation"] == {"status": "not_run", "valid": None, "errors": [], "warnings": []}
+    assert payload["unit_readiness"]["status"] == "blocked"
+    assert payload["unit_readiness"]["units"][0]["unit_id"] == "weak"
+    assert payload["unit_readiness"]["units"][0]["blocking_gap_count"] > 0
+    assert payload["written_artifacts"] == []
+    assert (
+        payload["message"]
+        == "Generated unit task contracts have blocking readiness gaps; no source artifacts were finalized."
+    )
+    assert "PRIVATE TASK BODY" not in payload_text
+    assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+def test_cmd_delivery_prepare_blocks_plan_validation_failures_and_rolls_back_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_task(tmp_path)
+    draft = _authoring_draft(unit_ids=["foundation"], scope_paths=["../outside"])
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args("tasks/team-invites.md", json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(draft=draft),
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["prepared"] is False
+    assert payload["errors"][0] == {
+        "code": "delivery_prepare.plan_validation_failed",
+        "message": "Generated delivery plan artifacts failed validation; no source artifacts were finalized.",
+        "path": None,
+        "severity": "error",
+    }
+    assert payload["plan_validation"]["status"] == "invalid"
+    assert payload["plan_validation"]["valid"] is False
+    assert payload["plan_validation"]["errors"][0]["code"] == "units.scope_path_outside_project"
+    assert payload["unit_readiness"]["status"] == "ready"
+    assert payload["written_artifacts"] == []
+    assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+def test_cmd_delivery_prepare_maps_writer_failures_to_safe_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_task(tmp_path)
+    invalid_draft = _authoring_draft(unit_ids=["bad/path"])
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args("tasks/team-invites.md", json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(draft=invalid_draft),
+    )
+
+    payload_text = json.dumps(payload)
+    assert payload["status"] == "blocked"
+    assert payload["ready"] is False
+    assert payload["prepared"] is False
+    assert payload["errors"][0] == {
+        "code": "delivery_prepare.write_failed",
+        "message": "Delivery prepare failed while writing artifacts; no source artifacts were finalized.",
+        "path": None,
+        "severity": "error",
+    }
+    assert payload["errors"][1]["code"] == "delivery_authoring.unit_id_invalid"
+    assert payload["written_artifacts"] == []
+    assert "PRIVATE UNIT MARKDOWN" not in payload_text
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
 
 
@@ -659,7 +851,7 @@ def test_cmd_delivery_prepare_omits_authoring_audit_path_outside_project(
     assert str(outside_audit) not in out
 
 
-def test_cmd_delivery_prepare_resolves_relative_paths_from_current_directory(
+def test_cmd_delivery_prepare_resolves_task_path_from_current_directory_and_writes_default_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -670,21 +862,22 @@ def test_cmd_delivery_prepare_resolves_relative_paths_from_current_directory(
     monkeypatch.chdir(workdir)
 
     cmd_delivery_prepare(
-        _args("../tasks/team-invites.md", output="../.sikula/delivery/custom.plan", json_output=True),
+        _args("../tasks/team-invites.md", json_output=True),
         _cfg(tmp_path),
         context=_authoring_context(),
     )
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["ready"] is True
-    assert payload["selected_plan_id"] == "custom.plan"
+    assert payload["prepared"] is True
+    assert payload["selected_plan_id"] == "team-invites"
     assert payload["paths"] == {
-        "output_dir": ".sikula/delivery/custom.plan",
-        "plan_file": ".sikula/delivery/custom.plan/plan.yaml",
+        "output_dir": ".sikula/delivery/team-invites",
+        "plan_file": ".sikula/delivery/team-invites/plan.yaml",
         "task_file": "tasks/team-invites.md",
-        "units_dir": ".sikula/delivery/custom.plan/units",
+        "units_dir": ".sikula/delivery/team-invites/units",
     }
-    assert not (tmp_path / ".sikula" / "delivery" / "custom.plan").exists()
+    assert (tmp_path / ".sikula" / "delivery" / "team-invites" / "plan.yaml").is_file()
 
 
 def test_cmd_delivery_prepare_uses_cwd_when_config_root_is_absent(
@@ -808,10 +1001,16 @@ def test_cmd_delivery_prepare_reports_unreadable_task_file(
 @pytest.mark.parametrize(
     ("case_name", "expected_code", "expected_path", "expected_plan_id"),
     [
-        ("outside", "delivery_prepare.output_outside_project", None, "outside-delivery"),
+        ("outside", "delivery_prepare.output_absolute", None, "outside-delivery"),
         ("invalid_plan_id", "delivery_prepare.plan_id_invalid", ".sikula/delivery/-bad", None),
         ("invalid_plan_id_char", "delivery_prepare.plan_id_invalid", ".sikula/delivery/bad name", None),
         ("file_collision", "delivery_prepare.output_not_directory", "existing-output", "existing-output"),
+        (
+            "runtime_artifact",
+            "delivery_prepare.output_runtime_artifact",
+            ".sikula/state/team-invites",
+            "team-invites",
+        ),
     ],
 )
 def test_cmd_delivery_prepare_rejects_invalid_output_paths(
@@ -835,6 +1034,7 @@ def test_cmd_delivery_prepare_rejects_invalid_output_paths(
         "invalid_plan_id": ".sikula/delivery/-bad",
         "invalid_plan_id_char": ".sikula/delivery/bad name",
         "file_collision": "existing-output",
+        "runtime_artifact": ".sikula/state/team-invites",
     }
 
     payload = _blocked_payload(
@@ -850,6 +1050,84 @@ def test_cmd_delivery_prepare_rejects_invalid_output_paths(
     assert str(tmp_path) not in json.dumps(payload)
 
 
+@pytest.mark.parametrize(
+    ("output", "expected_code"),
+    [
+        pytest.param("../outside", "delivery_prepare.output_traversal", id="posix_parent_traversal"),
+        pytest.param("..\\outside", "delivery_prepare.output_traversal", id="windows_parent_traversal"),
+        pytest.param("/tmp/outside", "delivery_prepare.output_absolute", id="posix_absolute"),
+        pytest.param("C:\\outside", "delivery_prepare.output_absolute", id="windows_absolute"),
+        pytest.param(
+            ".sikula/state/team-invites",
+            "delivery_prepare.output_runtime_artifact",
+            id="state_runtime_artifact",
+        ),
+        pytest.param(
+            ".sikula/worktrees/team-invites",
+            "delivery_prepare.output_runtime_artifact",
+            id="worktree_runtime_artifact",
+        ),
+        pytest.param(
+            ".sikula/contract-reports/team-invites",
+            "delivery_prepare.output_runtime_artifact",
+            id="contract_report_runtime_artifact",
+        ),
+    ],
+)
+def test_cmd_delivery_prepare_rejects_unsafe_output_arguments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    output: str,
+    expected_code: str,
+) -> None:
+    _write_task(tmp_path)
+    calls: list[dict] = []
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args("tasks/team-invites.md", output=output, json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(calls=calls),
+    )
+
+    assert payload["errors"][0]["code"] == expected_code
+    assert calls == []
+    assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+def test_cmd_delivery_prepare_rejects_output_symlink_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_task(tmp_path)
+    delivery_root = tmp_path / ".sikula" / "delivery"
+    target = tmp_path / "outside-target"
+    delivery_root.mkdir(parents=True)
+    target.mkdir()
+    (delivery_root / "team-invites").symlink_to(target, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args("tasks/team-invites.md", output=".sikula/delivery/team-invites", json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(),
+    )
+
+    payload_text = json.dumps(payload)
+    assert payload["errors"][0] == {
+        "code": "delivery_prepare.output_symlink",
+        "message": "Output directory must not contain symlink components.",
+        "path": ".sikula/delivery/team-invites",
+        "severity": "error",
+    }
+    assert payload["existing_artifacts"] == []
+    assert str(target) not in payload_text
+
+
 def test_cmd_delivery_prepare_blocks_existing_artifacts_without_force_and_allows_with_force(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -860,7 +1138,7 @@ def test_cmd_delivery_prepare_blocks_existing_artifacts_without_force_and_allows
     units_dir = output_dir / "units"
     units_dir.mkdir(parents=True)
     plan_file = output_dir / "plan.yaml"
-    unit_file = units_dir / "unit-a.md"
+    unit_file = units_dir / "foundation.md"
     plan_file.write_text("existing plan\n", encoding="utf-8")
     unit_file.write_text("existing unit\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
@@ -881,7 +1159,7 @@ def test_cmd_delivery_prepare_blocks_existing_artifacts_without_force_and_allows
     ]
     assert blocked["existing_artifacts"] == [
         {"kind": "plan", "path": ".sikula/delivery/team-invites/plan.yaml"},
-        {"kind": "unit_task", "path": ".sikula/delivery/team-invites/units/unit-a.md"},
+        {"kind": "unit_task", "path": ".sikula/delivery/team-invites/units/foundation.md"},
     ]
 
     cmd_delivery_prepare(
@@ -892,11 +1170,18 @@ def test_cmd_delivery_prepare_blocks_existing_artifacts_without_force_and_allows
     ready = json.loads(capsys.readouterr().out)
 
     assert ready["ready"] is True
+    assert ready["prepared"] is True
     assert ready["force"] is True
     assert ready["overwrite_allowed"] is True
     assert ready["existing_artifacts"] == blocked["existing_artifacts"]
-    assert plan_file.read_text(encoding="utf-8") == "existing plan\n"
-    assert unit_file.read_text(encoding="utf-8") == "existing unit\n"
+    assert ready["written_artifacts"] == [
+        {"kind": "plan", "path": ".sikula/delivery/team-invites/plan.yaml"},
+        {"kind": "unit_task", "path": ".sikula/delivery/team-invites/units/foundation.md"},
+        {"kind": "unit_task", "path": ".sikula/delivery/team-invites/units/cli.md"},
+    ]
+    assert "existing plan" not in plan_file.read_text(encoding="utf-8")
+    assert "existing unit" not in unit_file.read_text(encoding="utf-8")
+    assert (units_dir / "cli.md").is_file()
 
 
 def test_cmd_delivery_prepare_blocks_nested_unit_artifacts_without_plan(
@@ -1084,6 +1369,27 @@ def test_render_delivery_prepare_includes_errors_and_warnings() -> None:
             "units_dir": None,
         },
         existing_artifacts=[DeliveryPrepareArtifact("plan", ".sikula/delivery/demo/plan.yaml")],
+        unit_task_paths={"unit-a": ".sikula/delivery/demo/units/unit-a.md"},
+        written_artifacts=[
+            DeliveryPrepareArtifact("plan", ".sikula/delivery/demo/plan.yaml"),
+            DeliveryPrepareArtifact("unit_task", ".sikula/delivery/demo/units/unit-a.md"),
+        ],
+        plan_validation={"status": "valid", "valid": True, "errors": [], "warnings": []},
+        unit_readiness={
+            "status": "ready",
+            "units": [
+                {
+                    "unit_id": "unit-a",
+                    "path": ".sikula/delivery/demo/units/unit-a.md",
+                    "readiness_score": 100,
+                    "status": "ready",
+                    "ready_for_autonomous_delivery": True,
+                    "blocking_gap_count": 0,
+                    "warning_gap_count": 0,
+                    "blocking_gap_ids": [],
+                }
+            ],
+        },
         errors=[DeliveryPrepareIssue("error", "delivery_prepare.task_outside_project", "Task path must be inside.")],
         warnings=[
             DeliveryPrepareIssue(
@@ -1103,6 +1409,15 @@ def test_render_delivery_prepare_includes_errors_and_warnings() -> None:
     assert "Draft units: 0" in output
     assert "Existing artifacts:" in output
     assert "- plan: .sikula/delivery/demo/plan.yaml" in output
+    assert "Written artifacts:" in output
+    assert "- unit_task: .sikula/delivery/demo/units/unit-a.md" in output
+    assert "Unit task paths:" in output
+    assert "- unit-a: .sikula/delivery/demo/units/unit-a.md" in output
+    assert "Plan validation:" in output
+    assert "- status: valid" in output
+    assert "- valid: yes" in output
+    assert "Unit readiness:" in output
+    assert "- unit-a: ready, score 100, blocking 0, warnings 0" in output
     assert "Errors:" in output
     assert "- delivery_prepare.task_outside_project: Task path must be inside." in output
     assert "Warnings:" in output

@@ -34,6 +34,7 @@
 | `LLMClient` | `core/llm_client.py` | Abstract interface: `generate()` for single-shot text; `run_readonly_agent(..., allow_commands=True)` for read-only autonomous agents; `run_agent()` for autonomous file-editing agents |
 | `ContractCheck` helpers | `core/contract_check.py` | Deterministic implementation-contract readiness checks for Markdown/plain-text task files; `sikula run` stores a warning-only state snapshot and `sikula contract check --write-report` explicitly writes report artifacts |
 | `DeliveryAuthoring` helpers | `core/delivery_authoring.py` | Side-effect-free parser and derived-path helpers for delivery prepare authoring drafts |
+| `DeliveryPrepareWriter` helpers | `core/delivery_prepare_writer.py` | Deterministic source-artifact writer for parsed delivery authoring drafts; renders `plan.yaml` and unit task files with readiness checks, plan validation, overwrite guards, and rollback |
 | `TaskAsset` helpers | `core/task_assets.py` | Deterministic local task-asset parsing, path canonicalization, answer mapping, and asset-manifest line rendering used by contract preparation |
 | `Worktree` helpers | `core/worktree.py` | Shared low-level git/worktree operations used by run, review, cleanup/delete, and init CLI surfaces; command-specific state mutation stays in the owning command layer |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
@@ -201,20 +202,27 @@ task-hash scoped: when the task content hash changes, existing filled answers ar
 only under `previous_answers`, while active `answers` are reset for the new hash so future
 `contract prepare` or run preflight logic does not treat stale answers as authoritative.
 
-**Delivery plan prepare command:** `sikula delivery prepare TASK_FILE` is a
-read-only authoring preflight for future delivery plan writing. Its CLI wrapper
+**Delivery plan prepare command:** `sikula delivery prepare TASK_FILE` is an
+authoring and deterministic source-artifact writing command. Its CLI wrapper
 lives in `sikula_cli/delivery.py`. It validates the source task and output
 paths, derives the selected plan ID, validates `delivery_preparer`
 model/provider/timeout overrides, then calls `DeliveryPreparationAgent` through
 `LLMClient.run_readonly_agent(..., allow_commands=False)`. The assistant must
 return one strict structured draft, which `core/delivery_authoring.py` parses
-before the CLI projects a privacy-safe summary. `delivery prepare` writes no
-`plan.yaml`, unit task files, delivery progress, or branches; creates no
-`TaskState`; starts no worktrees, child runs, nested Sikula commands, command
-tools, or progress mutations. Raw prompts and provider output are stored only in
-local preparation audit artifacts. Ordinary text and JSON output is allowlisted
-summary data and must not embed source task bodies, unit Markdown, raw provider
-output, prompts, diffs, logs, or task state.
+without side effects. `core/delivery_prepare_writer.py` then derives artifact
+paths, checks unit task readiness in memory, writes `plan.yaml` and
+`units/<unit-id>.md` transactionally, validates the generated plan, and rolls
+back on readiness, validation, write, or filesystem failure. Existing artifacts
+are refused by default; `--force` may replace ordinary plan/unit files inside
+the selected output directory, while absolute output paths, parent traversal,
+symlink artifacts, symlink escapes, path collisions, outside-project writes,
+and Sikula runtime/debug artifact directories are rejected. `delivery prepare`
+does not create delivery progress, branches,
+`TaskState`, worktrees, child runs, nested Sikula commands, command tools, or
+progress mutations. Raw prompts and provider output are stored only in local
+preparation audit artifacts. Ordinary text and JSON output is an explicit
+allowlisted projection and must not embed source task bodies, unit Markdown, raw
+provider output, prompts, diffs, logs, or task state.
 
 **Delivery plan check command:** `sikula delivery check PLAN_FILE` is the first
 delivery-plan MVP primitive. Its CLI wrapper lives in `sikula_cli/delivery.py`;
