@@ -203,10 +203,14 @@ only under `previous_answers`, while active `answers` are reset for the new hash
 `contract prepare` or run preflight logic does not treat stale answers as authoritative.
 
 **Delivery plan prepare command:** `sikula delivery prepare TASK_FILE` is an
-authoring and deterministic source-artifact writing command. Its CLI wrapper
-lives in `sikula_cli/delivery.py`. It validates the source task and output
-paths, derives the selected plan ID, validates `delivery_preparer`
-model/provider/timeout overrides, then calls `DeliveryPreparationAgent` through
+authoring and deterministic source-artifact writing command. Ownership is split
+between the CLI wrapper in `sikula_cli/delivery.py`, the assistant in
+`agents/delivery_preparation_agent.py`, parser and path derivation helpers in
+`core/delivery_authoring.py`, and writer, rollback, readiness, and generated-plan
+validation helpers in `core/delivery_prepare_writer.py`. The CLI validates the
+source task and output paths, derives the selected plan ID, validates
+`delivery_preparer` model/provider/timeout overrides, then calls
+`DeliveryPreparationAgent` through
 `LLMClient.run_readonly_agent(..., allow_commands=False)`. The assistant must
 return one strict structured draft, which `core/delivery_authoring.py` parses
 without side effects. `core/delivery_prepare_writer.py` then derives artifact
@@ -217,12 +221,14 @@ are refused by default; `--force` may replace ordinary plan/unit files inside
 the selected output directory, while absolute output paths, parent traversal,
 symlink artifacts, symlink escapes, path collisions, outside-project writes,
 and Sikula runtime/debug artifact directories are rejected. `delivery prepare`
-does not create delivery progress, branches,
-`TaskState`, worktrees, child runs, nested Sikula commands, command tools, or
-progress mutations. Raw prompts and provider output are stored only in local
-preparation audit artifacts. Ordinary text and JSON output is an explicit
-allowlisted projection and must not embed source task bodies, unit Markdown, raw
-provider output, prompts, diffs, logs, or task state.
+is source-artifact-only: it does not create `TaskState`, worktrees, child runs,
+nested Sikula commands, command tools, delivery progress, branches, or progress
+mutations. Raw prompts and provider output are stored only in local preparation
+audit artifacts at
+`.sikula/contract-reports/<task-stem>.delivery-prepare.auto-llm.jsonl`.
+Ordinary text and JSON output is an explicit allowlisted projection and must not
+embed source task bodies, unit Markdown bodies, prompts, raw provider output,
+diffs, logs, or task state.
 
 **Delivery plan check command:** `sikula delivery check PLAN_FILE` is the first
 delivery-plan MVP primitive. Its CLI wrapper lives in `sikula_cli/delivery.py`;

@@ -132,6 +132,7 @@ These commands also support interactive modes (`--interactive`) and answers-file
 
 ```bash
 sikula delivery prepare .sikula/tasks/my-task.md
+sikula delivery prepare .sikula/tasks/my-task.md --json
 sikula delivery check .sikula/delivery/my-task/plan.yaml
 sikula delivery check .sikula/delivery/my-task/plan.yaml --json
 sikula delivery status .sikula/delivery/my-task/plan.yaml
@@ -144,7 +145,12 @@ sikula delivery finalize .sikula/delivery/my-task/plan.yaml --dry-run
 sikula delivery finalize .sikula/delivery/my-task/plan.yaml
 ```
 
-Use this to author, validate, and inspect the tracked parent plan for larger work split into delivery units. `delivery prepare` parses a strict structured draft, writes `.sikula/delivery/<task-stem>/plan.yaml` plus unit task files by default, validates the generated plan, checks unit task readiness, and keeps raw prompts and provider output in local preparation audit artifacts only. The current MVP checks plan structure, unit dependencies, task paths, stream/component metadata, single-repository scope, and privacy-safe parent progress, can run one eligible unit at a time through the normal `sikula run` pipeline, and can finalize a completed plan into its final branch. See [Delivery Plans](docs/delivery-plans.md).
+Use this to author, validate, and inspect the tracked parent plan for larger work split into delivery units. By default, `delivery prepare` writes:
+
+- `.sikula/delivery/<slug>/plan.yaml`
+- `.sikula/delivery/<slug>/units/<unit-slug>.md`
+
+`delivery prepare` is an authoring step only: it does not start implementation, create task state, run delivery units, mutate `.sikula/state/delivery/<plan-id>/`, or update branches. The follow-up path is to check the plan, dry-run the next eligible unit, run that unit through the normal `sikula run` pipeline, and finalize the completed plan. The current MVP checks plan structure, unit dependencies, task paths, optional planning metadata, single-repository scope, and privacy-safe parent progress. See [Delivery Plans](docs/delivery-plans.md).
 
 **Run a task into a branch**
 

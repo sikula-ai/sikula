@@ -33,6 +33,63 @@ def _write_project_config(root: Path) -> None:
     path.write_text("project:\n  root_path: .\n  build_tool: python\n", encoding="utf-8")
 
 
+def _delivery_prepare_authoring_output() -> str:
+    unit_markdown = """# Prepare delivery artifacts
+
+## Goal
+
+Create the reviewable unit task source artifact for the delivery plan.
+
+## Current behavior
+
+The high-level task has not yet been split into tracked delivery units.
+
+## Desired behavior
+
+The delivery plan contains a focused unit that can be validated before execution.
+
+## Acceptance criteria
+
+- The generated plan references the unit task source artifact.
+- Delivery prepare does not create runtime delivery progress.
+
+## Security/privacy
+
+- Do not expose raw prompts, provider output, source excerpts, secrets, or task state.
+
+## Reviewer focus
+
+- Check that artifact paths are project-relative and deterministic.
+
+## Out of scope
+
+- Do not run the generated unit.
+
+## Verification
+
+- `pytest`
+"""
+    return json.dumps(
+        {
+            "plan_id": "team-invites",
+            "title": "Team invites delivery",
+            "planning_mode": "fixed_window",
+            "warnings": [],
+            "units": [
+                {
+                    "id": "prepare-artifacts",
+                    "title": "Prepare delivery artifacts",
+                    "depends_on": [],
+                    "task_markdown": unit_markdown,
+                    "stream": "docs",
+                    "platform": "shared",
+                    "scope_paths": ["docs"],
+                }
+            ],
+        }
+    )
+
+
 def _git_commit_file(root: Path, name: str, body: str) -> str:
     path = root / name
     path.write_text(body, encoding="utf-8")
@@ -55,6 +112,62 @@ def _git_commit_file(root: Path, name: str, body: str) -> str:
     return subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
     ).stdout.strip()
+
+
+def test_delivery_prepare_cli_authors_artifacts_then_check_succeeds(
+    git_project: Path,
+    fake_llm,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    task_path = git_project / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True, exist_ok=True)
+    task_path.write_text("# Team invites\n\nPRIVATE TASK BODY\n", encoding="utf-8")
+    _write_project_config(git_project)
+    fake = fake_llm(readonly_response=_delivery_prepare_authoring_output())
+    monkeypatch.chdir(git_project)
+
+    with patch("core.llm_client.create_llm_client", return_value=fake):
+        with patch(
+            "sys.argv",
+            ["sikula", "delivery", "prepare", ".sikula/tasks/team-invites.md", "--json"],
+        ):
+            main()
+
+    prepare_payload = json.loads(capsys.readouterr().out)
+    plan_path = git_project / ".sikula" / "delivery" / "team-invites" / "plan.yaml"
+    unit_path = git_project / ".sikula" / "delivery" / "team-invites" / "units" / "prepare-artifacts.md"
+    audit_path = git_project / ".sikula" / "contract-reports" / "team-invites.delivery-prepare.auto-llm.jsonl"
+
+    assert prepare_payload["status"] == "ready"
+    assert prepare_payload["ready"] is True
+    assert prepare_payload["prepared"] is True
+    assert prepare_payload["selected_plan_id"] == "team-invites"
+    assert prepare_payload["paths"] == {
+        "task_file": ".sikula/tasks/team-invites.md",
+        "output_dir": ".sikula/delivery/team-invites",
+        "plan_file": ".sikula/delivery/team-invites/plan.yaml",
+        "units_dir": ".sikula/delivery/team-invites/units",
+    }
+    assert prepare_payload["unit_task_paths"] == {
+        "prepare-artifacts": ".sikula/delivery/team-invites/units/prepare-artifacts.md"
+    }
+    assert prepare_payload["authoring"]["audit_path"] == (
+        ".sikula/contract-reports/team-invites.delivery-prepare.auto-llm.jsonl"
+    )
+    assert "PRIVATE TASK BODY" not in json.dumps(prepare_payload)
+    assert plan_path.is_file()
+    assert unit_path.is_file()
+    assert audit_path.is_file()
+    assert not (git_project / ".sikula" / "state" / "delivery" / "team-invites").exists()
+
+    with patch("sys.argv", ["sikula", "delivery", "check", ".sikula/delivery/team-invites/plan.yaml", "--json"]):
+        main()
+
+    check_payload = json.loads(capsys.readouterr().out)
+    assert check_payload["valid"] is True
+    assert check_payload["plan"]["plan_id"] == "team-invites"
+    assert len(check_payload["plan"]["units"]) == 1
 
 
 def test_delivery_check_cli_validates_plan_without_project_config(
