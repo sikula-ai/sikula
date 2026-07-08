@@ -694,6 +694,14 @@ def _unit_plan_entry(unit: DeliveryAuthoringUnitDraft, task_path: str) -> dict[s
             entry[key] = value
     if unit.scope_paths:
         entry["scope_paths"] = list(unit.scope_paths)
+    if unit.estimated_size:
+        entry["estimated_size"] = unit.estimated_size
+    if unit.risk_tags:
+        entry["risk_tags"] = list(unit.risk_tags)
+    if unit.budget:
+        budget_data = unit.budget.to_dict()
+        if budget_data:
+            entry["budget"] = budget_data
     return entry
 
 

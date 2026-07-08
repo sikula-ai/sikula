@@ -8,9 +8,18 @@ from typing import Any
 
 import yaml
 
+from core.delivery_unit_metadata import (
+    DELIVERY_UNIT_BUDGET_FIELDS,
+    DELIVERY_UNIT_RISK_TAG_VALUES,
+    DELIVERY_UNIT_SIZE_VALUES,
+    DELIVERY_UNIT_SPLIT_RISK_TAGS,
+    DeliveryUnitBudget,
+)
+
 SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION = 1
 _DELIVERY_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _GIT_REF_FORBIDDEN_CHARS_RE = re.compile(r"[\000-\037\177 ~^:?*\[\\]")
+_SPLIT_RECOMMENDED_TAG_SET = frozenset({"external_execution_boundary", "structured_output_contract", "cli_surface"})
 
 
 def delivery_final_branch_for_plan_id(plan_id: str) -> str:
@@ -103,6 +112,9 @@ class DeliveryPlanUnit:
     repo_id: str | None = None
     component: str | None = None
     scope_paths: list[str] = field(default_factory=list)
+    estimated_size: str | None = None
+    risk_tags: list[str] = field(default_factory=list)
+    budget: DeliveryUnitBudget | None = None
     source_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -117,6 +129,14 @@ class DeliveryPlanUnit:
                 data[key] = value
         if self.scope_paths:
             data["scope_paths"] = list(self.scope_paths)
+        if self.estimated_size:
+            data["estimated_size"] = self.estimated_size
+        if self.risk_tags:
+            data["risk_tags"] = list(self.risk_tags)
+        if self.budget:
+            budget_data = self.budget.to_dict()
+            if budget_data:
+                data["budget"] = budget_data
         return data
 
 
@@ -552,6 +572,9 @@ def _parse_units(
         repo_id = _optional_string(item, "repo_id", f"{unit_path}.repo_id", errors)
         component = _optional_string(item, "component", f"{unit_path}.component", errors)
         scope_paths = _optional_string_list(item, "scope_paths", f"{unit_path}.scope_paths", errors)
+        estimated_size = _optional_estimated_size(item, "estimated_size", f"{unit_path}.estimated_size", errors)
+        risk_tags = _optional_risk_tags(item, "risk_tags", f"{unit_path}.risk_tags", errors)
+        budget = _optional_budget(item, "budget", f"{unit_path}.budget", errors)
 
         if unit_id:
             if unit_id in seen:
@@ -607,22 +630,25 @@ def _parse_units(
                 subject="Unit scope path",
             )
         if unit_id and task_path:
-            units.append(
-                DeliveryPlanUnit(
-                    id=unit_id,
-                    title=title,
-                    task_path=task_path,
-                    depends_on=depends_on,
-                    stream=stream,
-                    platform=platform,
-                    phase=phase,
-                    kind=kind,
-                    repo_id=repo_id,
-                    component=component,
-                    scope_paths=scope_paths,
-                    source_path=unit_path,
-                )
+            unit = DeliveryPlanUnit(
+                id=unit_id,
+                title=title,
+                task_path=task_path,
+                depends_on=depends_on,
+                stream=stream,
+                platform=platform,
+                phase=phase,
+                kind=kind,
+                repo_id=repo_id,
+                component=component,
+                scope_paths=scope_paths,
+                estimated_size=estimated_size,
+                risk_tags=risk_tags,
+                budget=budget,
+                source_path=unit_path,
             )
+            units.append(unit)
+            _append_unit_sizing_warnings(unit, warnings)
     return units
 
 
@@ -730,6 +756,169 @@ def _add_invalid_metadata_path_error(
             path,
         )
     )
+
+
+def _optional_estimated_size(
+    data: dict[str, Any],
+    key: str,
+    path: str,
+    errors: list[DeliveryPlanIssue],
+) -> str | None:
+    value = _optional_string(data, key, path, errors)
+    if value is None:
+        return None
+    if value not in DELIVERY_UNIT_SIZE_VALUES:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "units.estimated_size_invalid",
+                f"estimated_size must be one of: {', '.join(DELIVERY_UNIT_SIZE_VALUES)}.",
+                path,
+            )
+        )
+        return None
+    return value
+
+
+def _optional_risk_tags(
+    data: dict[str, Any],
+    key: str,
+    path: str,
+    errors: list[DeliveryPlanIssue],
+) -> list[str]:
+    if key not in data or data.get(key) is None:
+        return []
+    value = data.get(key)
+    if not isinstance(value, list):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "units.risk_tags_invalid_type",
+                "risk_tags must be a list of supported risk tag strings.",
+                path,
+            )
+        )
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(value):
+        item_path = f"{path}[{idx}]"
+        if not isinstance(item, str) or not item.strip():
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "units.risk_tag_invalid",
+                    "risk_tags entries must be non-empty strings.",
+                    item_path,
+                )
+            )
+            continue
+        tag = item.strip()
+        if tag not in DELIVERY_UNIT_RISK_TAG_VALUES:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "units.risk_tag_unknown",
+                    "risk_tags entries must use supported delivery unit risk tags.",
+                    item_path,
+                )
+            )
+            continue
+        if tag in seen:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "units.risk_tag_duplicate",
+                    "risk_tags entries must not contain duplicates.",
+                    item_path,
+                )
+            )
+            continue
+        seen.add(tag)
+        result.append(tag)
+    return result
+
+
+def _optional_budget(
+    data: dict[str, Any],
+    key: str,
+    path: str,
+    errors: list[DeliveryPlanIssue],
+) -> DeliveryUnitBudget | None:
+    if key not in data or data.get(key) is None:
+        return None
+    value = data.get(key)
+    if not isinstance(value, dict):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "units.budget_invalid_type",
+                "budget must be an object with supported positive integer fields.",
+                path,
+            )
+        )
+        return None
+    unknown_fields = [field_name for field_name in value if field_name not in DELIVERY_UNIT_BUDGET_FIELDS]
+    if unknown_fields:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "units.budget_unknown_field",
+                "budget contains an unsupported field.",
+                _budget_unknown_field_path(path, value, unknown_fields[0]),
+            )
+        )
+    kwargs: dict[str, int] = {}
+    for field_name in DELIVERY_UNIT_BUDGET_FIELDS:
+        if field_name not in value:
+            continue
+        field_value = value[field_name]
+        if not isinstance(field_value, int) or isinstance(field_value, bool) or field_value < 1:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "units.budget_value_invalid",
+                    f"{field_name} must be a positive integer.",
+                    f"{path}.{field_name}",
+                )
+            )
+            continue
+        kwargs[field_name] = field_value
+    if not kwargs:
+        return None
+    return DeliveryUnitBudget(**kwargs)
+
+
+def _budget_unknown_field_path(path: str, value: dict[Any, Any], field_name: Any) -> str:
+    if isinstance(field_name, str) and field_name:
+        return f"{path}.{field_name}"
+    for idx, key in enumerate(value):
+        if key == field_name:
+            return f"{path}[{idx}]"
+    return path
+
+
+def _append_unit_sizing_warnings(unit: DeliveryPlanUnit, warnings: list[DeliveryPlanIssue]) -> None:
+    risk_tags = set(unit.risk_tags)
+    split_risk_count = len(risk_tags & DELIVERY_UNIT_SPLIT_RISK_TAGS)
+    if _SPLIT_RECOMMENDED_TAG_SET.issubset(risk_tags) or split_risk_count >= 3:
+        warnings.append(
+            DeliveryPlanIssue(
+                "warning",
+                "units.split_recommended",
+                "Unit combines multiple high-risk delivery surfaces; consider splitting it before execution.",
+                f"{unit.source_path}.risk_tags" if unit.source_path else None,
+            )
+        )
+    elif unit.estimated_size == "large" and split_risk_count >= 2:
+        warnings.append(
+            DeliveryPlanIssue(
+                "warning",
+                "units.large_high_risk",
+                "Large unit includes multiple high-risk delivery surfaces; verify the sizing before execution.",
+                f"{unit.source_path}.risk_tags" if unit.source_path else None,
+            )
+        )
 
 
 def _validate_dependencies(units: list[DeliveryPlanUnit], errors: list[DeliveryPlanIssue]) -> None:

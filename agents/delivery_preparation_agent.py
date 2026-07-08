@@ -72,6 +72,15 @@ Delivery-plan constraints:
 - Optional metadata fields stream, component, phase, kind, and platform must be non-empty strings
   when present.
 - scope_paths must contain only project-relative paths that stay inside the project.
+- estimated_size must be "small", "medium", or "large" when present.
+- risk_tags must use only supported tags: api_surface, audit_artifacts, auth_permissions,
+  automation_behavior, build_pipeline, cli_surface, configuration, data_persistence,
+  docs_coverage, execution_boundary, external_execution_boundary, external_integration,
+  migration, privacy, public_output_contract, release, security_boundary,
+  structured_output_contract, test_hardening, ui_surface, validation.
+- budget, when present, must contain only positive integer fields: max_planner_steps,
+  max_elapsed_minutes, max_review_cycles, max_security_cycles, max_changed_files,
+  max_changed_modules, max_generated_test_files.
 - Unit task Markdown must be product/behavior descriptions with acceptance criteria and verification
   expectations, not file-by-file implementation scripts.
 - Unit task Markdown must include Goal, Current behavior, Desired behavior, Acceptance criteria,
@@ -80,6 +89,28 @@ Delivery-plan constraints:
   source task or configured validation commands.
 - Unit task Markdown must not include "## Asset manifest" or sikula:generated-* markers.
 - Paths for plan.yaml and unit task files are derived later from the output directory and unit IDs.
+
+Sizing and split guidance:
+- Prefer small units with one primary production surface and narrow validation.
+- A small unit changes one module, user workflow, or behavior surface with focused tests.
+- A medium unit changes one feature surface plus directly related tests or docs.
+- A large unit spans multiple modules, product surfaces, or shared framework behavior and should
+  be rare.
+- Do not produce a unit that combines multiple independent risk surfaces. Keep one primary
+  production surface per unit. When relevant, split surfaces such as UI/API/CLI behavior,
+  data model or persistence changes, structured-output parsing or schema validation,
+  automation or prompt-driven behavior, external provider/tool execution boundaries, privacy/public output,
+  audit/log artifact persistence, and docs/test-only hardening.
+- External provider, tool, or integration boundary changes should usually be their own hardening
+  unit with risk_tags including external_execution_boundary or external_integration.
+- Parsing or structured-output validation should usually be separate from execution or integration
+  behavior.
+- Entry-point preflight, flag, route, request, or path validation should usually be separate from
+  generation or downstream execution behavior.
+- Docs and coverage may be a final hardening unit unless they are essential to validate a specific
+  behavior introduced by that unit.
+- If a unit would need broad cross-module tests or many planner steps, split it before returning the
+  draft or mark it large with risk_tags and a narrow budget recommendation.
 
 Source task description:
 ```markdown
@@ -103,6 +134,9 @@ Return this JSON shape:
       "kind": "optional non-empty string",
       "platform": "optional non-empty string",
       "scope_paths": [],
+      "estimated_size": "small",
+      "risk_tags": ["cli_surface"],
+      "budget": {{"max_planner_steps": 3, "max_changed_files": 8}},
       "task_markdown": "# Unit title\\n\\n## Goal\\n\\n...\\n\\n## Verification\\n\\n- `command`"
     }}
   ]

@@ -76,16 +76,51 @@ optionally wrapped in one fenced `json` block. Top-level fields are `plan_id`,
 `planning_mode`, when present, must be `fixed_window`. `units` must be a
 non-empty list of objects with `id`, `title`, `depends_on`, `task_markdown`,
 and optional `stream`, `component`, `phase`, `kind`, `platform`, and
-`scope_paths`. Writer-facing path fields such as `task_path`, `path`,
-`unit_path`, `output_path`, `plan_path`, `units_dir`, and `output_dir` are
-rejected because paths are derived deterministically. IDs must be path-safe and
-unique. Dependencies must reference known units, contain no duplicates or
+`scope_paths`. Units may also include optional sizing metadata:
+
+- `estimated_size`: `small`, `medium`, or `large`
+- `risk_tags`: supported tags are `api_surface`, `audit_artifacts`,
+  `auth_permissions`, `automation_behavior`, `build_pipeline`, `cli_surface`,
+  `configuration`, `data_persistence`, `docs_coverage`,
+  `execution_boundary`, `external_execution_boundary`,
+  `external_integration`, `migration`, `privacy`, `public_output_contract`,
+  `release`, `security_boundary`, `structured_output_contract`,
+  `test_hardening`, `ui_surface`, and `validation`
+- `budget`: positive integer advisory fields such as `max_planner_steps`,
+  `max_elapsed_minutes`, `max_review_cycles`, `max_security_cycles`,
+  `max_changed_files`, `max_changed_modules`, and `max_generated_test_files`
+
+Writer-facing path fields such as `task_path`, `path`, `unit_path`,
+`output_path`, `plan_path`, `units_dir`, and `output_dir` are rejected because
+paths are derived deterministically. IDs must be path-safe and unique.
+Dependencies must reference known units, contain no duplicates or
 self-dependencies, and be acyclic. Scope paths must be project-relative and stay
 inside the project. Unit Markdown must include non-empty Goal, Current behavior,
 Desired behavior, Acceptance criteria, Security/privacy, Reviewer focus, Out of
 scope, and Verification sections; Verification must include explicit validation
 commands. `## Asset manifest` and `sikula:generated-*` markers are rejected
 before writing.
+
+Delivery authoring should prefer smaller units with one primary production
+surface each. Units should avoid combining unrelated risk surfaces. When
+relevant, split surfaces such as UI/API/CLI behavior, data model or persistence
+changes, structured-output parsing or schema validation, automation or
+prompt-driven behavior, external provider/tool execution boundaries,
+privacy/public output, audit/log artifact persistence, and docs/test-only
+hardening. External provider, tool, or integration boundary changes should
+usually become their own hardening unit.
+Parsing or structured-output validation should usually be separate from
+execution or integration behavior, and entry-point preflight/flag/route/request
+or path validation should usually be separate from generation or downstream
+execution behavior. Docs and coverage can be a final hardening unit unless they
+are essential to validate a specific unit.
+
+Sizing metadata is explicit guidance for authoring, `check`, `status`, and
+future execution policy. It does not silently weaken final review/security gates
+or make unsafe units pass. Current plan validation warns when one unit combines
+several high-risk tags, for example external execution boundaries, structured
+output contracts, and CLI surface, so operators can split the plan before
+running that unit.
 
 ## After Preparing
 

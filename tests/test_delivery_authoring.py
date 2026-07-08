@@ -14,6 +14,7 @@ from core.delivery_authoring import (
     derive_delivery_authoring_paths,
     parse_delivery_authoring_output,
 )
+from core.delivery_unit_metadata import DeliveryUnitBudget
 
 
 def _unit_markdown(title: str = "Foundation") -> str:
@@ -107,6 +108,9 @@ def _draft_data() -> dict[str, Any]:
                 "kind": "feature",
                 "platform": "shared",
                 "scope_paths": ["core", "tests"],
+                "estimated_size": "small",
+                "risk_tags": ["validation"],
+                "budget": {"max_planner_steps": 3, "max_changed_files": 8},
             },
             {
                 "id": "cli",
@@ -114,6 +118,8 @@ def _draft_data() -> dict[str, Any]:
                 "depends_on": ["foundation"],
                 "task_markdown": _unit_markdown("CLI behavior"),
                 "scope_paths": ["sikula_cli"],
+                "estimated_size": "medium",
+                "risk_tags": ["cli_surface"],
             },
         ],
     }
@@ -162,6 +168,12 @@ def test_parse_delivery_authoring_output_accepts_valid_json_object(tmp_path: Pat
     assert draft.units[0].kind == "feature"
     assert draft.units[0].platform == "shared"
     assert draft.units[0].scope_paths == ["core", "tests"]
+    assert draft.units[0].estimated_size == "small"
+    assert draft.units[0].risk_tags == ["validation"]
+    assert draft.units[0].budget == DeliveryUnitBudget(max_planner_steps=3, max_changed_files=8)
+    assert draft.units[1].estimated_size == "medium"
+    assert draft.units[1].risk_tags == ["cli_surface"]
+    assert draft.units[1].budget is None
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
 
 
@@ -198,6 +210,9 @@ def test_parse_delivery_authoring_output_defaults_absent_optional_fields(tmp_pat
     assert draft.units[0].kind is None
     assert draft.units[0].platform is None
     assert draft.units[0].scope_paths == []
+    assert draft.units[0].estimated_size is None
+    assert draft.units[0].risk_tags == []
+    assert draft.units[0].budget is None
 
 
 def test_parse_delivery_authoring_output_accepts_text_heading_equivalents(tmp_path: Path) -> None:
@@ -430,6 +445,53 @@ def test_parse_delivery_authoring_output_accepts_text_heading_equivalents(tmp_pa
             lambda root: _output_with(lambda data: data["units"][0].update({"component": " "})),
             "delivery_authoring.string_required",
             id="empty_optional_unit_metadata",
+        ),
+        pytest.param(
+            lambda root: _output_with(lambda data: data["units"][0].update({"estimated_size": "too-large"})),
+            "delivery_authoring.estimated_size_invalid",
+            id="invalid_estimated_size",
+        ),
+        pytest.param(
+            lambda root: _output_with(lambda data: data["units"][0].update({"risk_tags": "cli_surface"})),
+            "delivery_authoring.risk_tags_invalid_type",
+            id="risk_tags_not_list",
+        ),
+        pytest.param(
+            lambda root: _output_with(lambda data: data["units"][0].update({"risk_tags": ["cli_surface", ""]})),
+            "delivery_authoring.risk_tag_invalid",
+            id="risk_tag_empty",
+        ),
+        pytest.param(
+            lambda root: _output_with(lambda data: data["units"][0].update({"risk_tags": ["unknown"]})),
+            "delivery_authoring.risk_tag_unknown",
+            id="risk_tag_unknown",
+        ),
+        pytest.param(
+            lambda root: _output_with(
+                lambda data: data["units"][0].update({"risk_tags": ["cli_surface", "cli_surface"]})
+            ),
+            "delivery_authoring.risk_tag_duplicate",
+            id="risk_tag_duplicate",
+        ),
+        pytest.param(
+            lambda root: _output_with(lambda data: data["units"][0].update({"budget": ["max_planner_steps"]})),
+            "delivery_authoring.budget_invalid_type",
+            id="budget_not_object",
+        ),
+        pytest.param(
+            lambda root: _output_with(lambda data: data["units"][0].update({"budget": {"max_tokens": 100}})),
+            "delivery_authoring.budget_unknown_field",
+            id="budget_unknown_field",
+        ),
+        pytest.param(
+            lambda root: _output_with(lambda data: data["units"][0].update({"budget": {"max_planner_steps": 0}})),
+            "delivery_authoring.budget_value_invalid",
+            id="budget_zero_value",
+        ),
+        pytest.param(
+            lambda root: _output_with(lambda data: data["units"][0].update({"budget": {"max_planner_steps": True}})),
+            "delivery_authoring.budget_value_invalid",
+            id="budget_bool_value",
         ),
         pytest.param(
             lambda root: _output_with(lambda data: data["units"][1].update({"depends_on": "foundation"})),

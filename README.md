@@ -150,7 +150,7 @@ Use this to author, validate, and inspect the tracked parent plan for larger wor
 - `.sikula/delivery/<slug>/plan.yaml`
 - `.sikula/delivery/<slug>/units/<unit-slug>.md`
 
-`delivery prepare` is an authoring step only: it does not start implementation, create task state, run delivery units, mutate `.sikula/state/delivery/<plan-id>/`, or update branches. The follow-up path is to check the plan, dry-run the next eligible unit, run that unit through the normal `sikula run` pipeline, and finalize the completed plan. The current MVP checks plan structure, unit dependencies, task paths, optional planning metadata, single-repository scope, and privacy-safe parent progress. See [Delivery Plans](docs/delivery-plans.md).
+`delivery prepare` is an authoring step only: it does not start implementation, create task state, run delivery units, mutate `.sikula/state/delivery/<plan-id>/`, or update branches. The follow-up path is to check the plan, dry-run the next eligible unit, run that unit through the normal `sikula run` pipeline, and finalize the completed plan. The current MVP checks plan structure, unit dependencies, task paths, optional planning and sizing metadata, single-repository scope, and privacy-safe parent progress. See [Delivery Plans](docs/delivery-plans.md).
 
 **Run a task into a branch**
 

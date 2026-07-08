@@ -100,6 +100,9 @@ def _authoring_output(*, planning_mode: str | None = "fixed_window", warnings: l
                 "depends_on": [],
                 "task_markdown": _unit_markdown("Foundation"),
                 "scope_paths": ["agents"],
+                "estimated_size": "small",
+                "risk_tags": ["automation_behavior"],
+                "budget": {"max_planner_steps": 3},
             }
         ],
     }
@@ -153,6 +156,10 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert draft.warnings == ["Review before writing artifacts."]
     assert [unit.id for unit in draft.units] == ["foundation"]
     assert draft.units[0].scope_paths == ["agents"]
+    assert draft.units[0].estimated_size == "small"
+    assert draft.units[0].risk_tags == ["automation_behavior"]
+    assert draft.units[0].budget is not None
+    assert draft.units[0].budget.to_dict() == {"max_planner_steps": 3}
     assert llm.system_prompts == [""]
     assert llm.readonly_agent_calls == []
     assert llm.agent_calls == []
@@ -168,6 +175,14 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert '"python3 -m pytest tests/"' in prompt
     assert "Do not include writer-facing path fields" in prompt
     assert "Do not write, edit, delete, move, rename, format, or create files." in prompt
+    assert "Prefer small units with one primary production surface" in prompt
+    assert "UI/API/CLI behavior" in prompt
+    assert "data model or persistence changes" in prompt
+    assert "automation or prompt-driven behavior" in prompt
+    assert "External provider, tool, or integration boundary changes" in prompt
+    assert '"estimated_size": "small"' in prompt
+    assert '"risk_tags": ["cli_surface"]' in prompt
+    assert '"budget": {"max_planner_steps": 3, "max_changed_files": 8}' in prompt
     assert "Add team invite authoring without exposing raw task text." in prompt
     assert len(audit_records) == 1
     record = audit_records[0]
