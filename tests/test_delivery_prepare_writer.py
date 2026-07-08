@@ -234,6 +234,33 @@ def test_write_delivery_prepare_artifacts_writes_valid_plan_and_units(tmp_path: 
     assert "Raw prompts" not in repr(result.to_dict())
 
 
+def test_write_delivery_prepare_artifacts_canonicalizes_generated_unit_headings(tmp_path: Path) -> None:
+    task_markdown = _ready_task_markdown("Prepare foundation").replace(
+        "## Security and privacy",
+        "## Security/privacy notes",
+    )
+
+    result = write_delivery_prepare_artifacts(
+        _draft(units=[_unit("foundation", title="Prepare foundation", task_markdown=task_markdown)]),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    foundation_file = tmp_path / ".sikula" / "delivery" / "team-invites" / "units" / "foundation.md"
+    written_markdown = foundation_file.read_text(encoding="utf-8")
+
+    assert result.status == "ready"
+    assert result.prepared is True
+    assert result.unit_readiness.status == "ready"
+    assert result.unit_readiness.units[0].blocking_gap_count == 0
+    assert "## Security and privacy" in written_markdown
+    assert "## Security/privacy notes" not in written_markdown
+    assert not (tmp_path / ".sikula" / "state" / "delivery" / "team-invites").exists()
+    assert str(tmp_path) not in repr(result.to_dict())
+    assert "Raw prompts" not in repr(result.to_dict())
+
+
 def test_write_delivery_prepare_artifacts_omits_absent_optional_fields(tmp_path: Path) -> None:
     draft = _draft(planning_mode=None, units=[_unit("single", title="Single unit")])
 

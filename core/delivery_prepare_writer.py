@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
@@ -22,6 +22,7 @@ from core.delivery_plan import (
     delivery_final_branch_for_plan_id,
     is_valid_delivery_branch_name,
 )
+from core.markdown_headings import MarkdownHeadingScanner, normalize_heading
 
 
 _PLAN_VALIDATION_NOT_RUN = "not_run"
@@ -40,6 +41,46 @@ _FORBIDDEN_OUTPUT_ROOTS = (
     (".sikula", "worktrees"),
     (".sikula", "contract-reports"),
 )
+_CANONICAL_UNIT_SECTION_HEADINGS = {
+    normalize_heading(alias): canonical
+    for canonical, aliases in {
+        "Goal": {"goal", "goals", "objective", "objectives", "summary", "overview"},
+        "Current behavior": {"current behavior", "current behaviour", "existing behavior", "existing behaviour"},
+        "Desired behavior": {"desired behavior", "desired behaviour", "expected behavior", "expected behaviour"},
+        "Acceptance criteria": {"acceptance", "acceptance criteria", "criteria"},
+        "Security and privacy": {
+            "security",
+            "privacy",
+            "security privacy",
+            "security and privacy",
+            "security/privacy",
+            "security privacy notes",
+            "security and privacy notes",
+            "security/privacy notes",
+            "security notes",
+            "privacy notes",
+        },
+        "Reviewer focus": {
+            "reviewer focus",
+            "review focus",
+            "review notes",
+            "risky areas",
+            "risks",
+            "review checklist",
+        },
+        "Out of scope": {"out of scope", "non goals", "non-goals", "not in scope", "excluded", "exclusions"},
+        "Validation": {
+            "verification",
+            "validation",
+            "checks",
+            "check",
+            "test plan",
+            "how to validate",
+            "before merge",
+        },
+    }.items()
+    for alias in aliases
+}
 
 
 @dataclass(frozen=True)
@@ -300,6 +341,7 @@ def write_delivery_prepare_artifacts(
                 )
             ],
         )
+    draft = _canonicalize_unit_task_markdown_headings(draft)
     unit_task_paths = dict(paths.unit_task_paths)
     lexical_paths = _lexical_artifact_paths(draft, output_dir, root, skip_unsafe_unit_ids=False)
 
@@ -651,6 +693,41 @@ def _unit_readiness_summary(
         warning_gap_count=warning_gap_count,
         blocking_gap_ids=blocking_gap_ids,
     )
+
+
+def _canonicalize_unit_task_markdown_headings(draft: DeliveryAuthoringDraft) -> DeliveryAuthoringDraft:
+    units: list[DeliveryAuthoringUnitDraft] = []
+    changed = False
+    for unit in draft.units:
+        task_markdown = _canonicalize_markdown_headings(unit.task_markdown)
+        if task_markdown != unit.task_markdown:
+            changed = True
+            units.append(replace(unit, task_markdown=task_markdown))
+        else:
+            units.append(unit)
+    return replace(draft, units=units) if changed else draft
+
+
+def _canonicalize_markdown_headings(markdown: str) -> str:
+    scanner = MarkdownHeadingScanner(ignore_fenced_blocks=True)
+    lines: list[str] = []
+    changed = False
+    for line in markdown.splitlines():
+        heading = scanner.match(line)
+        canonical = None if heading is None else _CANONICAL_UNIT_SECTION_HEADINGS.get(heading.normalized)
+        if heading is None or heading.is_document_title or canonical is None or heading.raw == canonical:
+            lines.append(line)
+            continue
+        indent = line[: len(line) - len(line.lstrip(" "))]
+        if heading.is_markdown:
+            lines.append(f"{indent}{'#' * heading.level} {canonical}")
+        else:
+            lines.append(f"{indent}{canonical}:")
+        changed = True
+    normalized = "\n".join(lines)
+    if markdown.endswith("\n"):
+        normalized += "\n"
+    return normalized if changed else markdown
 
 
 def _render_plan_yaml(draft: DeliveryAuthoringDraft, unit_task_paths: dict[str, str]) -> str:
