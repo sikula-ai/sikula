@@ -133,6 +133,89 @@ def test_delivery_plan_check_preserves_monorepo_component_metadata(tmp_path: Pat
     assert payload["plan"]["units"][0]["scope_paths"] == ["packages/api/src", "packages/api/package.json"]
 
 
+def test_delivery_plan_check_preserves_unit_sizing_metadata(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["units"][0]["estimated_size"] = "medium"
+    data["units"][0]["risk_tags"] = ["structured_output_contract", "validation"]
+    data["units"][0]["budget"] = {
+        "max_planner_steps": 4,
+        "max_elapsed_minutes": 45,
+        "max_review_cycles": 2,
+        "max_security_cycles": 1,
+        "max_changed_files": 8,
+        "max_changed_modules": 2,
+        "max_generated_test_files": 3,
+    }
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is True
+    assert result.plan is not None
+    unit = result.plan.units[0]
+    assert unit.estimated_size == "medium"
+    assert unit.risk_tags == ["structured_output_contract", "validation"]
+    assert unit.budget is not None
+    assert unit.budget.to_dict() == {
+        "max_planner_steps": 4,
+        "max_elapsed_minutes": 45,
+        "max_review_cycles": 2,
+        "max_security_cycles": 1,
+        "max_changed_files": 8,
+        "max_changed_modules": 2,
+        "max_generated_test_files": 3,
+    }
+    payload = result.to_dict()
+    assert payload["plan"]["units"][0]["estimated_size"] == "medium"
+    assert payload["plan"]["units"][0]["risk_tags"] == ["structured_output_contract", "validation"]
+    assert payload["plan"]["units"][0]["budget"]["max_planner_steps"] == 4
+
+
+def test_delivery_plan_check_warns_when_unit_combines_high_risk_surfaces(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["units"][0]["estimated_size"] = "large"
+    data["units"][0]["risk_tags"] = ["external_execution_boundary", "structured_output_contract", "cli_surface"]
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is True
+    assert [warning.code for warning in result.warnings] == ["units.split_recommended"]
+    assert result.warnings[0].path == "units[0].risk_tags"
+    rendered = render_delivery_plan_check(result)
+    assert "units.split_recommended" in rendered
+
+
+def test_delivery_plan_check_warns_for_broad_product_surface_combination(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["units"][0]["estimated_size"] = "large"
+    data["units"][0]["risk_tags"] = ["ui_surface", "api_surface", "data_persistence"]
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is True
+    assert [warning.code for warning in result.warnings] == ["units.split_recommended"]
+    assert result.warnings[0].path == "units[0].risk_tags"
+
+
+def test_delivery_plan_check_does_not_warn_for_low_risk_narrow_unit(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["units"][0]["estimated_size"] = "small"
+    data["units"][0]["risk_tags"] = ["validation"]
+    data["units"][0]["budget"] = {"max_planner_steps": 2}
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is True
+    assert result.warnings == []
+
+
 def test_delivery_plan_check_rejects_unsupported_schema_version(tmp_path: Path) -> None:
     _git_init(tmp_path)
     data = _base_plan(tmp_path)
@@ -577,6 +660,57 @@ def test_delivery_plan_check_reports_invalid_unit_entry_and_fields(tmp_path: Pat
     assert "units[1].repo_id.invalid_type" in _codes(result)
     assert "units[1].component.invalid_type" in _codes(result)
     assert "units[1].scope_paths.invalid_type" in _codes(result)
+
+
+def test_delivery_plan_check_reports_invalid_unit_sizing_metadata(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["units"][0]["estimated_size"] = "too-large"
+    data["units"][0]["risk_tags"] = ["external_execution_boundary", "external_execution_boundary", "unknown", ""]
+    data["units"][0]["budget"] = {
+        "max_tokens": 100,
+        "max_planner_steps": 0,
+        "max_elapsed_minutes": True,
+    }
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is False
+    assert "units.estimated_size_invalid" in _codes(result)
+    assert "units.risk_tag_duplicate" in _codes(result)
+    assert "units.risk_tag_unknown" in _codes(result)
+    assert "units.risk_tag_invalid" in _codes(result)
+    assert "units.budget_unknown_field" in _codes(result)
+    assert "units.budget_value_invalid" in _codes(result)
+
+
+def test_delivery_plan_check_reports_mixed_type_budget_keys_without_crashing(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["units"][0]["budget"] = {1: 2, "max_tokens": 100}
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is False
+    budget_errors = [issue for issue in result.errors if issue.code == "units.budget_unknown_field"]
+    assert len(budget_errors) == 1
+    assert budget_errors[0].path == "units[0].budget[0]"
+
+
+def test_delivery_plan_check_reports_invalid_unit_sizing_container_types(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["units"][0]["risk_tags"] = "external_execution_boundary"
+    data["units"][0]["budget"] = ["max_planner_steps"]
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is False
+    assert "units.risk_tags_invalid_type" in _codes(result)
+    assert "units.budget_invalid_type" in _codes(result)
 
 
 def test_delivery_plan_check_reports_invalid_dependency_entries(tmp_path: Path) -> None:

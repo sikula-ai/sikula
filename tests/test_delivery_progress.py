@@ -138,6 +138,9 @@ def test_delivery_status_preserves_monorepo_component_metadata(tmp_path: Path) -
                     "stream": "app",
                     "component": "android",
                     "scope_paths": ["apps/android/app", "apps/android/gradle.properties"],
+                    "estimated_size": "small",
+                    "risk_tags": ["validation"],
+                    "budget": {"max_planner_steps": 2, "max_changed_files": 4},
                     "task_path": unit_1,
                     "depends_on": [],
                 }
@@ -151,6 +154,10 @@ def test_delivery_status_preserves_monorepo_component_metadata(tmp_path: Path) -
     assert result.valid is True
     assert result.units[0].component == "android"
     assert result.units[0].scope_paths == ["apps/android/app", "apps/android/gradle.properties"]
+    assert result.units[0].estimated_size == "small"
+    assert result.units[0].risk_tags == ["validation"]
+    assert result.units[0].budget is not None
+    assert result.units[0].budget.to_dict() == {"max_planner_steps": 2, "max_changed_files": 4}
     assert payload["plan"]["components"] == [
         {
             "id": "android",
@@ -161,6 +168,12 @@ def test_delivery_status_preserves_monorepo_component_metadata(tmp_path: Path) -
     ]
     assert payload["units"][0]["component"] == "android"
     assert payload["units"][0]["scope_paths"] == ["apps/android/app", "apps/android/gradle.properties"]
+    assert payload["units"][0]["estimated_size"] == "small"
+    assert payload["units"][0]["risk_tags"] == ["validation"]
+    assert payload["units"][0]["budget"] == {"max_planner_steps": 2, "max_changed_files": 4}
+    rendered = render_delivery_status(result)
+    assert "size=small" in rendered
+    assert "risk=validation" in rendered
 
 
 def test_delivery_status_reads_progress_file(tmp_path: Path) -> None:

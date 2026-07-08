@@ -230,6 +230,10 @@ audit artifacts at
 Ordinary text and JSON output is an explicit allowlisted projection and must not
 embed source task bodies, unit Markdown bodies, prompts, raw provider output,
 diffs, logs, or task state.
+Delivery authoring may include optional unit sizing metadata (`estimated_size`,
+`risk_tags`, and advisory `budget` fields). This metadata guides authoring,
+plan validation warnings, status display, and future explicit execution policy;
+it must not silently weaken review, security, or validation gates.
 
 **Delivery plan check command:** `sikula delivery check PLAN_FILE` is the first
 delivery-plan MVP primitive. Its CLI wrapper lives in `sikula_cli/delivery.py`;
@@ -238,13 +242,17 @@ tracked `.sikula/delivery/<slug>/plan.yaml` files without creating
 `TaskState`, starting agents, creating worktrees, preparing contracts, or
 updating branches. The validator checks schema version, required plan metadata,
 delivery unit IDs, unit task paths, dependency references/cycles, optional stream
-references, optional monorepo component metadata, unit scope paths, and the MVP
-single-repository boundary. Component and scope fields are metadata only: they
-are preserved for JSON consumers and delivery-console grouping, but they do not
-change `sikula run` behavior, provider access, validation command scope, or
-worktree creation. If `repositories` is omitted, the plan is treated as one
-implicit repository with `id: main` and `root: .`; multi-repo plans are rejected
-until cross-repo execution semantics are added.
+references, optional monorepo component metadata, unit scope paths, optional
+unit sizing/risk/budget metadata, and the MVP single-repository boundary.
+Component, scope, sizing, risk, and budget fields are metadata only: they are
+preserved for JSON consumers and delivery-console grouping, but they do not
+change `sikula run` behavior, provider access, validation command scope, review
+or security coverage, or worktree creation. If `repositories` is omitted, the
+plan is treated as one implicit repository with `id: main` and `root: .`;
+multi-repo plans are rejected until cross-repo execution semantics are added.
+The checker emits warnings, not errors, when risk tags indicate that one unit
+combines several independent high-risk delivery surfaces and should likely be
+split before execution.
 
 **Delivery plan status command:** `sikula delivery status PLAN_FILE` is a
 read-only parent-progress view. Its CLI wrapper lives in
@@ -255,7 +263,8 @@ ignored progress from
 is normal before the first unit runs; status derives pending units and dependency
 blockers from the tracked plan. The JSON result is allowlisted metadata only: it
 does not embed unit task bodies, raw child `TaskState`, prompts, provider output,
-logs, diffs, or validation output.
+logs, diffs, or validation output. Unit sizing/risk/budget metadata from the
+tracked plan is preserved in status output for operator review.
 
 **Delivery progress mutation foundation:** `core/delivery_progress.py` also owns
 the non-agent primitives that future delivery execution uses: atomic

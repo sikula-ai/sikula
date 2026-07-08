@@ -7,6 +7,12 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 from typing import Any
 
+from core.delivery_unit_metadata import (
+    DELIVERY_UNIT_BUDGET_FIELDS,
+    DELIVERY_UNIT_RISK_TAG_VALUES,
+    DELIVERY_UNIT_SIZE_VALUES,
+    DeliveryUnitBudget,
+)
 from core.markdown_headings import MarkdownHeading, MarkdownHeadingScanner, normalize_heading
 from core.validation_coverage import extract_validation_commands
 
@@ -28,6 +34,9 @@ _UNIT_FIELDS = {
     "kind",
     "platform",
     "scope_paths",
+    "estimated_size",
+    "risk_tags",
+    "budget",
 }
 _UNIT_PATH_FIELDS = {
     "task_path",
@@ -87,6 +96,9 @@ class DeliveryAuthoringUnitDraft:
     kind: str | None = None
     platform: str | None = None
     scope_paths: list[str] = field(default_factory=list)
+    estimated_size: str | None = None
+    risk_tags: list[str] = field(default_factory=list)
+    budget: DeliveryUnitBudget | None = None
 
 
 @dataclass
@@ -317,6 +329,9 @@ def _parse_units(value: Any, *, project_root: Path) -> list[DeliveryAuthoringUni
                 kind=_optional_string(item, "kind", f"{unit_path}.kind"),
                 platform=_optional_string(item, "platform", f"{unit_path}.platform"),
                 scope_paths=_optional_scope_paths(item, "scope_paths", f"{unit_path}.scope_paths", project_root),
+                estimated_size=_optional_estimated_size(item, "estimated_size", f"{unit_path}.estimated_size"),
+                risk_tags=_optional_risk_tags(item, "risk_tags", f"{unit_path}.risk_tags"),
+                budget=_optional_budget(item, "budget", f"{unit_path}.budget"),
             )
         )
 
@@ -390,6 +405,85 @@ def _optional_string_list(data: dict[str, Any], key: str, path: str) -> list[str
     if key not in data:
         return []
     return _string_list(data.get(key), path)
+
+
+def _optional_estimated_size(data: dict[str, Any], key: str, path: str) -> str | None:
+    value = _optional_string(data, key, path)
+    if value is None:
+        return None
+    if value not in DELIVERY_UNIT_SIZE_VALUES:
+        raise DeliveryAuthoringParseError(
+            "delivery_authoring.estimated_size_invalid",
+            f"{path} must be one of: {', '.join(DELIVERY_UNIT_SIZE_VALUES)}.",
+        )
+    return value
+
+
+def _optional_risk_tags(data: dict[str, Any], key: str, path: str) -> list[str]:
+    if key not in data:
+        return []
+    value = data.get(key)
+    if not isinstance(value, list):
+        raise DeliveryAuthoringParseError(
+            "delivery_authoring.risk_tags_invalid_type",
+            f"{path} must be a list of supported risk tag strings.",
+        )
+    result: list[str] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(value):
+        item_path = f"{path}[{idx}]"
+        if not isinstance(item, str) or not item.strip():
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.risk_tag_invalid",
+                f"{item_path} must be a non-empty risk tag string.",
+            )
+        tag = item.strip()
+        if tag not in DELIVERY_UNIT_RISK_TAG_VALUES:
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.risk_tag_unknown",
+                f"{item_path} must be a supported delivery unit risk tag.",
+            )
+        if tag in seen:
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.risk_tag_duplicate",
+                f"{item_path} duplicates a previous risk tag.",
+            )
+        seen.add(tag)
+        result.append(tag)
+    return result
+
+
+def _optional_budget(data: dict[str, Any], key: str, path: str) -> DeliveryUnitBudget | None:
+    if key not in data:
+        return None
+    value = data.get(key)
+    if not isinstance(value, dict):
+        raise DeliveryAuthoringParseError(
+            "delivery_authoring.budget_invalid_type",
+            f"{path} must be an object with supported positive integer budget fields.",
+        )
+
+    unknown_fields = sorted(set(value) - set(DELIVERY_UNIT_BUDGET_FIELDS))
+    if unknown_fields:
+        raise DeliveryAuthoringParseError(
+            "delivery_authoring.budget_unknown_field",
+            f"{path} contains an unsupported budget field.",
+        )
+
+    kwargs: dict[str, int] = {}
+    for field_name in DELIVERY_UNIT_BUDGET_FIELDS:
+        if field_name not in value:
+            continue
+        field_value = value[field_name]
+        if not isinstance(field_value, int) or isinstance(field_value, bool) or field_value < 1:
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.budget_value_invalid",
+                f"{path}.{field_name} must be a positive integer.",
+            )
+        kwargs[field_name] = field_value
+    if not kwargs:
+        return None
+    return DeliveryUnitBudget(**kwargs)
 
 
 def _string_list(value: Any, path: str) -> list[str]:

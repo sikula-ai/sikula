@@ -7,6 +7,7 @@ import yaml
 
 from core.delivery_authoring import DeliveryAuthoringDraft, DeliveryAuthoringUnitDraft
 from core.delivery_prepare_writer import write_delivery_prepare_artifacts
+from core.delivery_unit_metadata import DeliveryUnitBudget
 
 
 def _project_config(root: Path) -> dict:
@@ -89,6 +90,9 @@ def _unit(
     kind: str | None = None,
     platform: str | None = None,
     scope_paths: list[str] | None = None,
+    estimated_size: str | None = None,
+    risk_tags: list[str] | None = None,
+    budget: DeliveryUnitBudget | None = None,
 ) -> DeliveryAuthoringUnitDraft:
     unit_title = title or f"{unit_id} title"
     return DeliveryAuthoringUnitDraft(
@@ -102,6 +106,9 @@ def _unit(
         kind=kind,
         platform=platform,
         scope_paths=scope_paths or [],
+        estimated_size=estimated_size,
+        risk_tags=risk_tags or [],
+        budget=budget,
     )
 
 
@@ -125,6 +132,9 @@ def _draft(
                 kind="feature",
                 platform="shared",
                 scope_paths=["core", "tests"],
+                estimated_size="small",
+                risk_tags=["validation"],
+                budget=DeliveryUnitBudget(max_planner_steps=3, max_changed_files=8),
             ),
             _unit(
                 "cli",
@@ -135,6 +145,8 @@ def _draft(
                 kind="feature",
                 platform="shared",
                 scope_paths=["sikula_cli"],
+                estimated_size="medium",
+                risk_tags=["cli_surface"],
             ),
         ],
         planning_mode=planning_mode,
@@ -195,6 +207,9 @@ def test_write_delivery_prepare_artifacts_writes_valid_plan_and_units(tmp_path: 
                 "phase": "foundation",
                 "kind": "feature",
                 "scope_paths": ["core", "tests"],
+                "estimated_size": "small",
+                "risk_tags": ["validation"],
+                "budget": {"max_planner_steps": 3, "max_changed_files": 8},
             },
             {
                 "id": "cli",
@@ -206,6 +221,8 @@ def test_write_delivery_prepare_artifacts_writes_valid_plan_and_units(tmp_path: 
                 "phase": "cli",
                 "kind": "feature",
                 "scope_paths": ["sikula_cli"],
+                "estimated_size": "medium",
+                "risk_tags": ["cli_surface"],
             },
         ],
     }
@@ -240,6 +257,9 @@ def test_write_delivery_prepare_artifacts_omits_absent_optional_fields(tmp_path:
     assert "phase" not in unit
     assert "kind" not in unit
     assert "scope_paths" not in unit
+    assert "estimated_size" not in unit
+    assert "risk_tags" not in unit
+    assert "budget" not in unit
 
 
 def test_write_delivery_prepare_artifacts_deduplicates_streams_in_unit_order(tmp_path: Path) -> None:

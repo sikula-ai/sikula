@@ -10,6 +10,7 @@ import tempfile
 from typing import Any
 
 from core.delivery_plan import DeliveryPlan, DeliveryPlanIssue, check_delivery_plan_file
+from core.delivery_unit_metadata import DeliveryUnitBudget
 
 SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION = 1
 DELIVERY_UNIT_STATUSES = {"pending", "running", "done", "failed", "canceled", "waiting"}
@@ -177,6 +178,9 @@ class DeliveryStatusUnit:
     repo_id: str | None = None
     component: str | None = None
     scope_paths: list[str] = field(default_factory=list)
+    estimated_size: str | None = None
+    risk_tags: list[str] = field(default_factory=list)
+    budget: DeliveryUnitBudget | None = None
     child_task_id: str | None = None
     branch: str | None = None
     commit: str | None = None
@@ -221,6 +225,14 @@ class DeliveryStatusUnit:
                 data[key] = value
         if self.scope_paths:
             data["scope_paths"] = list(self.scope_paths)
+        if self.estimated_size:
+            data["estimated_size"] = self.estimated_size
+        if self.risk_tags:
+            data["risk_tags"] = list(self.risk_tags)
+        if self.budget:
+            budget_data = self.budget.to_dict()
+            if budget_data:
+                data["budget"] = budget_data
         return data
 
 
@@ -610,6 +622,10 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
                 detail += f" branch={unit.branch}"
             if unit.commit:
                 detail += f" commit={unit.commit}"
+            if unit.estimated_size:
+                detail += f" size={unit.estimated_size}"
+            if unit.risk_tags:
+                detail += f" risk={','.join(unit.risk_tags)}"
             title = f" — {unit.title}" if unit.title else ""
             lines.append(f"- {unit.id}: {detail}{title}")
 
@@ -818,6 +834,9 @@ def _build_status_units(
                 repo_id=plan_unit.repo_id,
                 component=plan_unit.component,
                 scope_paths=list(plan_unit.scope_paths),
+                estimated_size=plan_unit.estimated_size,
+                risk_tags=list(plan_unit.risk_tags),
+                budget=plan_unit.budget,
                 child_task_id=progress_unit.child_task_id if progress_unit else None,
                 branch=progress_unit.branch if progress_unit else None,
                 commit=progress_unit.commit if progress_unit else None,
