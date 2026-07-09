@@ -80,7 +80,18 @@ class DeliveryRunNextExecutionResult:
         return data
 
 
-def preview_delivery_run_next(path: str | Path, *, project_root: Path | None = None) -> DeliveryRunNextPreview:
+def _project_relative_path(path_str: str, project_root: Path | None) -> str:
+    if not project_root:
+        return path_str
+    try:
+        return Path(path_str).relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        return path_str
+
+
+def preview_delivery_run_next(
+    path: str | Path, *, project_root: Path | None = None, reset_failed: bool = False
+) -> DeliveryRunNextPreview:
     git_root_error: DeliveryPlanIssue | None = None
     if project_root is not None and _find_delivery_git_root(project_root.resolve()) is None:
         git_root_error = DeliveryPlanIssue(
@@ -97,19 +108,28 @@ def preview_delivery_run_next(path: str | Path, *, project_root: Path | None = N
         errors.insert(0, git_root_error)
 
     if status.valid and not errors:
-        selected_unit = select_next_delivery_unit(status)
+        selected_unit = select_next_delivery_unit(status, reset_failed=reset_failed)
         if selected_unit:
-            message = (
-                f"Dry run selected delivery unit {selected_unit.id}; "
-                "no unit was run and delivery progress was not changed."
-            )
+            if reset_failed:
+                message = (
+                    f"Dry run selected failed delivery unit {selected_unit.id}; "
+                    "no unit was run and delivery progress was not changed."
+                )
+            else:
+                message = (
+                    f"Dry run selected delivery unit {selected_unit.id}; "
+                    "no unit was run and delivery progress was not changed."
+                )
         else:
-            code, message = _blocked_run_next_reason(status.status)
+            code, message = _blocked_run_next_reason(status.status, reset_failed=reset_failed)
             errors.append(DeliveryPlanIssue("error", code, message))
 
+    safe_plan_path = _project_relative_path(status.plan_path, project_root)
+    safe_project_root = "." if project_root and status.project_root else None
+
     return DeliveryRunNextPreview(
-        plan_path=status.plan_path,
-        project_root=status.project_root,
+        plan_path=safe_plan_path,
+        project_root=safe_project_root,
         valid=not errors,
         ready=selected_unit is not None and not errors,
         dry_run=True,
@@ -136,6 +156,8 @@ def render_delivery_run_next_preview(result: DeliveryRunNextPreview) -> str:
         title = f" - {result.selected_unit.title}" if result.selected_unit.title else ""
         lines.append(f"Selected unit: {result.selected_unit.id}{title}")
         lines.append(f"Task path: {result.selected_unit.task_path}")
+        if result.selected_unit.child_task_id:
+            lines.append(f"Child task: {result.selected_unit.child_task_id}")
     lines.append(f"Dry run: {'yes' if result.dry_run else 'no'}")
     lines.append(result.message)
     if result.errors:
@@ -189,9 +211,17 @@ def render_delivery_run_next_execution(result: DeliveryRunNextExecutionResult) -
     return "\n".join(lines) + "\n"
 
 
-def _blocked_run_next_reason(status: str) -> tuple[str, str]:
+def _blocked_run_next_reason(status: str, reset_failed: bool = False) -> tuple[str, str]:
     if status == "failed":
-        return "delivery.failed", "Delivery plan has failed unit(s); inspect status before running next."
+        if reset_failed:
+            return (
+                "delivery.failed_reset_unavailable",
+                "No failed delivery unit with a linked child task is available for --reset-failed.",
+            )
+        return (
+            "delivery.failed",
+            "Delivery plan has failed unit(s); rerun with --reset-failed to select a failed unit with a linked child task.",
+        )
     if status == "running":
         return "delivery.running", "Delivery plan already has a running unit."
     if status == "waiting":
@@ -200,6 +230,11 @@ def _blocked_run_next_reason(status: str) -> tuple[str, str]:
         return "delivery.canceled", "Delivery plan has canceled unit(s)."
     if status == "done":
         return "delivery.complete", "Delivery plan is already complete."
+    if reset_failed:
+        return (
+            "delivery.failed_reset_unavailable",
+            "No failed delivery unit with a linked child task is available for --reset-failed.",
+        )
     return "delivery.no_eligible_unit", "Delivery plan has no eligible pending unit."
 
 

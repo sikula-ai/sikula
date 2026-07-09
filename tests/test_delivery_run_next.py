@@ -22,6 +22,7 @@ from core.delivery_run_next import (
     preview_delivery_run_next,
     render_delivery_run_next_execution,
     render_delivery_run_next_preview,
+    _project_relative_path,
 )
 from core.delivery_run_next import _blocked_run_next_reason
 from core.state import JsonStateStore, TaskState
@@ -222,6 +223,7 @@ def _run_next_args(
     plan_path: Path,
     *,
     dry_run: bool = False,
+    reset_failed: bool = False,
     json_output: bool = False,
     agent_model: list[str] | None = None,
     agent_provider: list[str] | None = None,
@@ -230,6 +232,7 @@ def _run_next_args(
     return argparse.Namespace(
         plan_file=str(plan_path),
         dry_run=dry_run,
+        reset_failed=reset_failed,
         json=json_output,
         agent_model=agent_model,
         agent_provider=agent_provider,
@@ -377,6 +380,58 @@ def test_preview_delivery_run_next_blocks_non_runnable_statuses(tmp_path: Path, 
     assert [issue.code for issue in result.errors] == [code]
 
 
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        ("running", "delivery.running"),
+        ("failed", "delivery.failed_reset_unavailable"),
+        ("waiting", "delivery.waiting"),
+        ("canceled", "delivery.canceled"),
+        ("done", "delivery.complete"),
+        ("pending", "delivery.failed_reset_unavailable"),
+    ],
+)
+def test_preview_delivery_run_next_blocks_non_runnable_statuses_with_reset_failed(
+    tmp_path: Path, status: str, code: str
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "done"},
+            {"unit_id": "02-feature", "status": status},
+        ],
+    )
+
+    result = preview_delivery_run_next(plan_path, reset_failed=True)
+
+    assert result.ready is False
+    assert result.selected_unit is None
+    assert [issue.code for issue in result.errors] == [code]
+
+
+def test_preview_delivery_run_next_selects_failed_unit_with_reset_failed(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-abc"},
+        ],
+    )
+
+    result = preview_delivery_run_next(plan_path, reset_failed=True)
+
+    assert result.valid is True
+    assert result.ready is True
+    assert result.dry_run is True
+    assert result.selected_unit is not None
+    assert result.selected_unit.id == "01-foundation"
+    assert result.progress_exists is True
+    assert "Dry run selected failed delivery unit 01-foundation" in result.message
+
+
 def test_render_delivery_run_next_preview_is_safe_and_actionable(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
@@ -387,6 +442,25 @@ def test_render_delivery_run_next_preview_is_safe_and_actionable(tmp_path: Path)
     assert "Selected unit: 01-foundation - Add foundation" in output
     assert "Dry run: yes" in output
     assert "Private task body" not in output
+
+
+def test_render_delivery_run_next_preview_renders_child_task_id(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+        ],
+    )
+
+    output = render_delivery_run_next_preview(preview_delivery_run_next(plan_path, reset_failed=True))
+
+    assert "Status: ready" in output
+    assert "Selected unit: 01-foundation - Add foundation" in output
+    assert "Child task: task-xyz" in output
+    assert "Dry run: yes" in output
+    assert "Dry run selected failed delivery unit 01-foundation" in output
 
 
 def test_render_delivery_run_next_preview_includes_errors_and_warnings() -> None:
@@ -453,11 +527,39 @@ def test_render_delivery_run_next_execution_is_safe_and_actionable() -> None:
     assert "- progress.unit_unknown: Unknown progress unit." in output
 
 
-def test_blocked_run_next_reason_falls_back_for_no_eligible_unit() -> None:
-    assert _blocked_run_next_reason("pending") == (
-        "delivery.no_eligible_unit",
-        "Delivery plan has no eligible pending unit.",
-    )
+@pytest.mark.parametrize(
+    ("status", "reset_failed", "expected_code", "expected_message"),
+    [
+        (
+            "failed",
+            False,
+            "delivery.failed",
+            "Delivery plan has failed unit(s); rerun with --reset-failed to select a failed unit with a linked child task.",
+        ),
+        (
+            "failed",
+            True,
+            "delivery.failed_reset_unavailable",
+            "No failed delivery unit with a linked child task is available for --reset-failed.",
+        ),
+        ("running", False, "delivery.running", "Delivery plan already has a running unit."),
+        ("running", True, "delivery.running", "Delivery plan already has a running unit."),
+        ("waiting", False, "delivery.waiting", "Delivery plan is waiting for human input."),
+        ("canceled", False, "delivery.canceled", "Delivery plan has canceled unit(s)."),
+        ("done", False, "delivery.complete", "Delivery plan is already complete."),
+        ("pending", False, "delivery.no_eligible_unit", "Delivery plan has no eligible pending unit."),
+        (
+            "pending",
+            True,
+            "delivery.failed_reset_unavailable",
+            "No failed delivery unit with a linked child task is available for --reset-failed.",
+        ),
+    ],
+)
+def test_blocked_run_next_reason_maps_statuses_and_flags(
+    status: str, reset_failed: bool, expected_code: str, expected_message: str
+) -> None:
+    assert _blocked_run_next_reason(status, reset_failed=reset_failed) == (expected_code, expected_message)
 
 
 def test_cmd_delivery_run_next_runs_selected_unit_and_records_progress(
@@ -2321,3 +2423,137 @@ def test_cmd_delivery_run_next_omits_unsafe_metadata_plan_path(tmp_path: Path, m
     assert captured_args.delivery_plan_id == "delivery-run-next-demo"
     assert captured_args.delivery_unit_id == "01-foundation"
     assert captured_args.delivery_plan_path is None
+
+
+def test_cmd_delivery_run_next_returns_failed_child_run_with_reset_failed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+        ],
+    )
+
+    child_called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal child_called
+        child_called = True
+        return DeliveryChildRunResult(exit_code=0, child_task_id="new-task")
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, reset_failed=True, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert child_called is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is False
+    assert payload["succeeded"] is False
+    assert payload["valid"] is False
+    assert payload["status"] == "failed"
+    assert payload["unit_status"] == "failed"
+    assert payload["child_task_id"] == "task-xyz"
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["selected_unit"]["status"] == "failed"
+    assert len(payload["errors"]) == 1
+    assert payload["errors"][0]["code"] == "delivery.reset_failed_forwarding_pending"
+    assert "forwarding --reset-failed to the child task is not available yet" in payload["errors"][0]["message"]
+
+
+def test_project_relative_path(tmp_path: Path) -> None:
+    assert _project_relative_path("/foo/bar", None) == "/foo/bar"
+    assert _project_relative_path("/foo/bar", tmp_path) == "/foo/bar"
+
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    file_path = sub / "file.txt"
+    assert _project_relative_path(str(file_path), tmp_path) == "sub/file.txt"
+
+
+def test_cmd_delivery_run_next_blocks_failed_plan_without_reset_failed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+        ],
+    )
+
+    child_called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal child_called
+        child_called = True
+        return DeliveryChildRunResult(exit_code=0, child_task_id="new-task")
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert child_called is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is False
+    assert payload["valid"] is False
+    assert payload["status"] == "failed"
+    assert payload["selected_unit"] is None
+    assert len(payload["errors"]) == 1
+    assert payload["errors"][0]["code"] == "delivery.failed"
+    assert "rerun with --reset-failed" in payload["errors"][0]["message"]
+
+
+def test_cmd_delivery_run_next_blocks_with_reset_failed_when_reset_unavailable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed"},
+        ],
+    )
+
+    child_called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal child_called
+        child_called = True
+        return DeliveryChildRunResult(exit_code=0, child_task_id="new-task")
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, reset_failed=True, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert child_called is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is False
+    assert payload["valid"] is False
+    assert payload["status"] == "failed"
+    assert payload["selected_unit"] is None
+    assert len(payload["errors"]) == 1
+    assert payload["errors"][0]["code"] == "delivery.failed_reset_unavailable"
+    assert (
+        "No failed delivery unit with a linked child task is available for --reset-failed."
+        in payload["errors"][0]["message"]
+    )

@@ -280,7 +280,9 @@ execution dependency result-commit guard so a dry run reports blocked when a
 completed prerequisite commit is not applied to the current checkout. It is
 intentionally side-effect-free: it does not write parent progress, create child
 task state, prepare contracts, create worktrees, start agents, or update
-branches. Its JSON result is also allowlisted metadata only.
+branches. Its JSON result is also allowlisted metadata only. With `--reset-failed`,
+it selects the first failed unit with a linked child task id instead of pending work;
+later pending work is never selected while retry selection is active.
 
 **Delivery run-next execution:** `sikula delivery run-next PLAN_FILE` acquires
 the delivery progress lock and refreshes status under that lock. If exactly one
@@ -297,6 +299,10 @@ is terminal and metadata matches, `run-next` appends `unit.reconcile_intent`
 then records terminal completion through the shared child-completion classification
 pipeline, producing `unit.done` or `unit.failed` while preserving the existing
 finalization rules.
+With `--reset-failed`, if no ambiguous running unit exists, it targets the first
+failed unit with a linked child task id. This unit is selection-only: it returns
+the targeted unit and child task id without starting or resetting the child run, and
+does not forward reset semantics to child args.
 If multiple units are `running`, `run-next` also blocks until the parent progress
 is manually reconciled.
 Resume-path blocks return allowlisted metadata only and do not expose

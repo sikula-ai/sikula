@@ -905,6 +905,118 @@ def test_select_next_delivery_unit_respects_dependencies_and_terminal_status(tmp
     assert select_next_delivery_unit(running) is None
 
 
+def test_select_next_delivery_unit_reset_failed_selection(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [{"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"}],
+        },
+    )
+    failed_with_child = get_delivery_status(plan_path)
+    assert failed_with_child.status == "failed"
+    assert select_next_delivery_unit(failed_with_child) is None
+
+    selected = select_next_delivery_unit(failed_with_child, reset_failed=True)
+    assert selected is not None
+    assert selected.id == "01-foundation"
+
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [{"unit_id": "01-foundation", "status": "failed"}],
+        },
+    )
+    failed_no_child = get_delivery_status(plan_path)
+    assert failed_no_child.status == "failed"
+    assert select_next_delivery_unit(failed_no_child, reset_failed=True) is None
+
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {"unit_id": "01-foundation", "status": "done"},
+                {"unit_id": "02-feature", "status": "failed", "child_task_id": "task-abc"},
+            ],
+        },
+    )
+    failed_later_unit = get_delivery_status(plan_path)
+    assert failed_later_unit.status == "failed"
+    selected_later = select_next_delivery_unit(failed_later_unit, reset_failed=True)
+    assert selected_later is not None
+    assert selected_later.id == "02-feature"
+
+
+def test_select_next_delivery_unit_reset_failed_returns_none_for_terminal_status(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+
+    for status in ["running", "waiting", "canceled", "done"]:
+        _write_progress(
+            tmp_path,
+            "delivery-status-demo",
+            {
+                "schema_version": 1,
+                "plan_id": "delivery-status-demo",
+                "units": [
+                    {"unit_id": "01-foundation", "status": status, "child_task_id": "task-xyz"},
+                    {"unit_id": "02-feature", "status": status, "child_task_id": "task-abc"},
+                ],
+            },
+        )
+        result = get_delivery_status(plan_path)
+        assert result.status == status
+        assert select_next_delivery_unit(result, reset_failed=True) is None
+
+    invalid_path = _write_plan(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "plan_id": "../bad",
+            "title": "Bad plan id",
+            "final_branch": "sikula/delivery/bad",
+            "units": [],
+        },
+    )
+    invalid_result = get_delivery_status(invalid_path)
+    assert not invalid_result.valid
+    assert select_next_delivery_unit(invalid_result, reset_failed=True) is None
+
+
+def test_select_next_delivery_unit_reset_failed_returns_none_for_failed_status_with_running_unit(
+    tmp_path: Path,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+                {"unit_id": "02-feature", "status": "running"},
+            ],
+        },
+    )
+    result = get_delivery_status(plan_path)
+    assert result.status == "failed"
+    assert select_next_delivery_unit(result, reset_failed=True) is None
+
+
 def test_delivery_status_json_is_privacy_safe(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)

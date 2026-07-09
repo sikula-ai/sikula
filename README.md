@@ -139,6 +139,7 @@ sikula delivery status .sikula/delivery/my-task/plan.yaml
 sikula delivery status .sikula/delivery/my-task/plan.yaml --json
 sikula delivery run-next .sikula/delivery/my-task/plan.yaml --dry-run
 sikula delivery run-next .sikula/delivery/my-task/plan.yaml
+sikula delivery run-next .sikula/delivery/my-task/plan.yaml --reset-failed
 sikula delivery run-next .sikula/delivery/my-task/plan.yaml \
   --agent-provider implementer=antigravity
 sikula delivery finalize .sikula/delivery/my-task/plan.yaml --dry-run

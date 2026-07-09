@@ -222,6 +222,7 @@ Run the next eligible unit:
 ```bash
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --json
+sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --reset-failed
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml \
   --agent-provider implementer=antigravity \
   --agent-provider fixer=antigravity
@@ -238,6 +239,10 @@ If the running unit has no linked child task id, the child state is missing, the
 child metadata does not match this run, or the child is terminal (`done` or
 `failed`) with mismatched metadata, `run-next` blocks with a targeted deterministic
 error and does not select a new pending unit.
+Without `--reset-failed`, failed units block instead of silently rerunning children.
+With `--reset-failed`, if no ambiguous running unit exists, `run-next` selects the
+first failed unit with a linked child task id before pending work. This change does
+not yet forward reset semantics to the child task itself.
 If the running unit has a terminal child with matching metadata, `run-next`
 reconciles through shared completion logic instead of starting a new child run:
 it records `unit.reconcile_intent` first, then records `unit.done` or `unit.failed`

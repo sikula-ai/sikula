@@ -463,8 +463,14 @@ def mark_delivery_finalized(
     )
 
 
-def select_next_delivery_unit(status: DeliveryStatusResult) -> DeliveryStatusUnit | None:
-    if not status.valid or status.status in {"failed", "running", "waiting", "canceled", "done"}:
+def select_next_delivery_unit(status: DeliveryStatusResult, reset_failed: bool = False) -> DeliveryStatusUnit | None:
+    if not status.valid or status.status in {"running", "waiting", "canceled", "done"}:
+        return None
+    if reset_failed:
+        if any(unit.status == "running" for unit in status.units):
+            return None
+        return next((unit for unit in status.units if unit.status == "failed" and unit.child_task_id), None)
+    if status.status == "failed":
         return None
     return next((unit for unit in status.units if unit.eligible), None)
 

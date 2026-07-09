@@ -110,6 +110,12 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
         default=False,
         help="Preview the next eligible unit without running agents or writing delivery progress",
     )
+    delivery_run_next_p.add_argument(
+        "--reset-failed",
+        action="store_true",
+        default=False,
+        help="Select a failed delivery unit with a linked child task instead of later pending work",
+    )
     delivery_run_next_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
     delivery_run_next_p.add_argument(
         "--agent-model",
@@ -1099,7 +1105,11 @@ def cmd_delivery_run_next(
     project_root_raw = cfg.get("project", {}).get("root_path") if isinstance(cfg, dict) else None
     project_root = Path(project_root_raw).resolve() if project_root_raw else None
     if getattr(args, "dry_run", False):
-        result = preview_delivery_run_next(args.plan_file, project_root=project_root)
+        result = preview_delivery_run_next(
+            args.plan_file,
+            project_root=project_root,
+            reset_failed=bool(getattr(args, "reset_failed", False)),
+        )
         result = _apply_delivery_preview_execution_guards(result, args.plan_file, project_root=project_root)
         _print_delivery_result(result, json_output=args.json, render=render_delivery_run_next_preview)
         if not result.ready:
@@ -1153,16 +1163,19 @@ def _run_next_delivery_unit(
     )
     from core.state import JsonStateStore
 
-    preflight = preview_delivery_run_next(args.plan_file, project_root=project_root)
+    reset_failed = bool(getattr(args, "reset_failed", False))
+    preflight = preview_delivery_run_next(args.plan_file, project_root=project_root, reset_failed=reset_failed)
+    status = get_delivery_status(args.plan_file, project_root=project_root)
+
     if not preflight.valid:
-        if (
-            preflight.status != "running"
-            or not preflight.errors
-            or not all(issue.code == "delivery.running" for issue in preflight.errors)
-        ):
+        fatal_errors = [
+            issue
+            for issue in preflight.errors
+            if issue.code not in ("delivery.running", "delivery.failed", "delivery.failed_reset_unavailable")
+        ]
+        if not _running_delivery_units(status) or fatal_errors:
             return _execution_result_from_preview(preflight, ran=False)
 
-    status = get_delivery_status(args.plan_file, project_root=project_root)
     if status.plan is None or status.project_root is None:
         return _execution_result_from_preview(preflight, ran=False)
 
@@ -1254,9 +1267,37 @@ def _run_next_delivery_unit(
                 message=message,
             )
 
-        selected_unit = select_next_delivery_unit(status)
+        selected_unit = select_next_delivery_unit(status, reset_failed=reset_failed)
+        if reset_failed and selected_unit is not None and selected_unit.status == "failed":
+            safe_plan_path, safe_progress_path, safe_events_path = _safe_status_relative_paths(
+                status,
+                root=root,
+                progress_path=progress_path,
+                events_path=events_path,
+            )
+            code = "delivery.reset_failed_forwarding_pending"
+            message = f"Delivery unit {selected_unit.id} is selected for failed-child retry; forwarding --reset-failed to the child task is not available yet."
+            return DeliveryRunNextExecutionResult(
+                plan_path=safe_plan_path,
+                project_root=_project_relative_path(root, root),
+                valid=False,
+                ran=False,
+                succeeded=False,
+                status=status.status,
+                progress_exists=status.progress_exists,
+                selected_unit=selected_unit,
+                child_task_id=selected_unit.child_task_id,
+                unit_status="failed",
+                run_exit_code=None,
+                progress_path=safe_progress_path,
+                events_path=safe_events_path,
+                errors=[DeliveryPlanIssue("error", code, message)],
+                warnings=status.warnings,
+                message=message,
+            )
+
         if selected_unit is None:
-            code, message = _blocked_run_next_reason(status.status)
+            code, message = _blocked_run_next_reason(status.status, reset_failed=reset_failed)
             errors.append(DeliveryPlanIssue("error", code, message))
             return _execution_result_from_status(
                 status,
