@@ -2550,6 +2550,10 @@ def test_cmd_delivery_run_next_blocks_with_reset_failed_when_reset_unavailable(
     assert payload["ran"] is False
     assert payload["valid"] is False
     assert payload["status"] == "failed"
+    assert payload["plan_path"] == ".sikula/delivery/demo/plan.yaml"
+    assert payload["project_root"] == "."
+    assert payload["progress_path"] is None
+    assert payload["events_path"] is None
     assert payload["selected_unit"] is None
     assert len(payload["errors"]) == 1
     assert payload["errors"][0]["code"] == "delivery.failed_reset_unavailable"
@@ -2557,3 +2561,66 @@ def test_cmd_delivery_run_next_blocks_with_reset_failed_when_reset_unavailable(
         "No failed delivery unit with a linked child task is available for --reset-failed."
         in payload["errors"][0]["message"]
     )
+    assert str(tmp_path) not in json.dumps(payload)
+
+
+def test_cmd_delivery_run_next_reset_failed_recheck_block_uses_safe_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed"},
+        ],
+    )
+    ready_preview = DeliveryRunNextPreview(
+        plan_path=str(plan_path.resolve()),
+        project_root=str(tmp_path.resolve()),
+        valid=True,
+        ready=True,
+        dry_run=True,
+        status="pending",
+        progress_exists=True,
+        selected_unit=DeliveryStatusUnit(
+            id="01-foundation",
+            status="pending",
+            title="Add foundation",
+            task_path=".sikula/delivery/demo/units/01-foundation.md",
+            depends_on=[],
+        ),
+        errors=[],
+        warnings=[],
+        message="Ready.",
+    )
+    called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal called
+        called = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    monkeypatch.setattr("core.delivery_run_next.preview_delivery_run_next", lambda *args, **kwargs: ready_preview)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, reset_failed=True, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert called is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is False
+    assert payload["valid"] is False
+    assert payload["status"] == "failed"
+    assert payload["plan_path"] == ".sikula/delivery/demo/plan.yaml"
+    assert payload["project_root"] == "."
+    assert payload["progress_path"] == ".sikula/state/delivery/delivery-run-next-demo/progress.json"
+    assert payload["events_path"] == ".sikula/state/delivery/delivery-run-next-demo/events.jsonl"
+    assert payload["selected_unit"] is None
+    assert payload["errors"][0]["code"] == "delivery.failed_reset_unavailable"
+    assert str(tmp_path) not in json.dumps(payload)

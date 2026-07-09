@@ -1299,6 +1299,31 @@ def _run_next_delivery_unit(
         if selected_unit is None:
             code, message = _blocked_run_next_reason(status.status, reset_failed=reset_failed)
             errors.append(DeliveryPlanIssue("error", code, message))
+            if reset_failed:
+                safe_plan_path, safe_progress_path, safe_events_path = _safe_status_relative_paths(
+                    status,
+                    root=root,
+                    progress_path=progress_path,
+                    events_path=events_path,
+                )
+                return DeliveryRunNextExecutionResult(
+                    plan_path=safe_plan_path,
+                    project_root=".",
+                    valid=False,
+                    ran=False,
+                    succeeded=False,
+                    status=status.status,
+                    progress_exists=status.progress_exists,
+                    selected_unit=None,
+                    child_task_id=None,
+                    unit_status=None,
+                    run_exit_code=None,
+                    progress_path=safe_progress_path,
+                    events_path=safe_events_path,
+                    errors=errors,
+                    warnings=status.warnings,
+                    message=message,
+                )
             return _execution_result_from_status(
                 status,
                 ran=False,
