@@ -206,6 +206,9 @@ sikula delivery status .sikula/delivery/<slug>/plan.yaml
 sikula delivery status .sikula/delivery/<slug>/plan.yaml --json
 ```
 
+`delivery status` evaluates the execution state and marks running and failed units with their actionable next steps. In JSON output, each unit includes `run_next_available` (boolean), `run_next_action` (`"resume_or_reconcile"`, `"retry_failed"`, or omitted), and `run_next_blocked_reason` (`"missing_child_task_id"` or omitted).
+For example, running units with linked child task IDs are marked as recoverable (`resume` or `reconcile` action) by `delivery run-next`, which will resume a non-terminal child or reconcile a terminal child after metadata validation. A running unit without a child task ID is a fail-safe condition marked as `block`: `run-next` blocks and does not select pending work. Failed units with linked child task IDs are marked as retryable (`retry` action) with `delivery run-next --reset-failed`. Failed units without linked child task IDs are not retryable through `run-next`.
+
 Preview the next eligible unit without changing delivery progress:
 
 ```bash
@@ -244,6 +247,7 @@ With `--reset-failed`, if no ambiguous running unit exists, `run-next` selects t
 first failed unit with a linked child task id before pending work. It preserves the
 same parent unit and child task id, appends a `unit.retry_intent` event, and
 forwards reset semantics to the child task path (`sikula run --task-id <child_task_id> --reset-failed`).
+`--reset-failed` does not bypass running-unit ambiguity or dependency result-commit checks and does not select later pending work while retry selection is active. Child runs preserve normal `sikula run` semantics, and delivery execution still runs one unit at a time and does not assemble the final branch automatically.
 The JSON/text output remains privacy-safe and allowlisted.
 If the running unit has a terminal child with matching metadata, `run-next`
 reconciles through shared completion logic instead of starting a new child run:
@@ -429,8 +433,8 @@ can coordinate cross-repo branches, locks, validation, and result sets.
 metadata such as written artifact paths, plan validation status, unit readiness,
 plan metadata, validation issues, unit paths, compact progress fields, selected
 child task IDs, final branch metadata, and branch/commit pointers when
-available. They do not embed source task bodies, unit task file bodies, prompts,
-provider output, diffs, logs, or task state. They do not expose absolute local
+available. They do not embed child task state, source task bodies, unit task file bodies, prompts,
+provider output, diffs, logs, validation output, credentials, tokens, or source excerpts. They do not expose absolute local
 paths. The parent plan path stored in the child task state is saved as a
 project-relative path (`delivery_plan_path`). This metadata is strictly
 allowlisted state metadata and does not expose raw prompts, provider output,

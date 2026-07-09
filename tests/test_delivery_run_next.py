@@ -515,7 +515,7 @@ def test_render_delivery_run_next_execution_is_safe_and_actionable() -> None:
 
     output = render_delivery_run_next_execution(result)
 
-    assert "Delivery run-next: /tmp/plan.yaml" in output
+    assert "Delivery run-next: plan.yaml" in output
     assert "Status: failed" in output
     assert "Selected unit: 01-foundation - Add foundation" in output
     assert "Child task: task123" in output
@@ -525,6 +525,120 @@ def test_render_delivery_run_next_execution_is_safe_and_actionable() -> None:
     assert "- delivery.failed [units[0]]: Unit failed." in output
     assert "Warnings:" in output
     assert "- progress.unit_unknown: Unknown progress unit." in output
+
+
+def test_delivery_run_next_preview_projects_paths_relative_to_project_root() -> None:
+    result = DeliveryRunNextPreview(
+        plan_path="/opt/project/plan.yaml",
+        project_root="/opt/project",
+        valid=True,
+        ready=True,
+        dry_run=True,
+        status="pending",
+        progress_exists=True,
+        selected_unit=None,
+        errors=[],
+        warnings=[],
+        message="Dry run message.",
+    )
+
+    output = render_delivery_run_next_preview(result)
+    assert "Delivery run-next dry run: plan.yaml" in output
+    assert "Project root: ." in output
+
+    data = result.to_dict()
+    assert data["project_root"] == "."
+    assert data["plan_path"] == "plan.yaml"
+
+
+def test_delivery_run_next_preview_null_paths() -> None:
+    result = DeliveryRunNextPreview(
+        plan_path="/opt/project/plan.yaml",
+        project_root=None,
+        valid=True,
+        ready=True,
+        dry_run=True,
+        status="pending",
+        progress_exists=True,
+        selected_unit=None,
+        errors=[],
+        warnings=[],
+        message="Dry run message.",
+    )
+
+    output = render_delivery_run_next_preview(result)
+    assert "Delivery run-next dry run: /opt/project/plan.yaml" in output
+    assert "Project root" not in output
+
+    data = result.to_dict()
+    assert data["project_root"] is None
+    assert data["plan_path"] == "/opt/project/plan.yaml"
+
+
+def test_delivery_run_next_execution_projects_paths_relative_to_project_root() -> None:
+    result = DeliveryRunNextExecutionResult(
+        plan_path="/opt/project/plan.yaml",
+        project_root="/opt/project",
+        valid=True,
+        ran=True,
+        succeeded=True,
+        status="done",
+        progress_exists=True,
+        selected_unit=None,
+        child_task_id=None,
+        unit_status=None,
+        run_exit_code=0,
+        progress_path="/opt/project/progress.json",
+        events_path="/opt/project/events.jsonl",
+        errors=[],
+        warnings=[],
+        message="Done.",
+    )
+
+    output = render_delivery_run_next_execution(result)
+    assert "Delivery run-next: plan.yaml" in output
+    assert "Project root: ." in output
+    assert "Progress: progress.json" in output
+    assert "Events: events.jsonl" in output
+
+    data = result.to_dict()
+    assert data["project_root"] == "."
+    assert data["plan_path"] == "plan.yaml"
+    assert data["progress_path"] == "progress.json"
+    assert data["events_path"] == "events.jsonl"
+
+
+def test_delivery_run_next_execution_null_paths() -> None:
+    result = DeliveryRunNextExecutionResult(
+        plan_path="/opt/project/plan.yaml",
+        project_root=None,
+        valid=True,
+        ran=True,
+        succeeded=True,
+        status="done",
+        progress_exists=False,
+        selected_unit=None,
+        child_task_id=None,
+        unit_status=None,
+        run_exit_code=0,
+        progress_path=None,
+        events_path=None,
+        errors=[],
+        warnings=[],
+        message="Done.",
+    )
+
+    output = render_delivery_run_next_execution(result)
+    assert "Delivery run-next: /opt/project/plan.yaml" in output
+    assert "Project root" not in output
+    assert "Progress:" not in output
+    assert "Events:" not in output
+
+    data = result.to_dict()
+    assert data["project_root"] is None
+    assert data["plan_path"] == "/opt/project/plan.yaml"
+    assert data["progress_path"] is None
+    assert data["events_path"] is None
 
 
 @pytest.mark.parametrize(
@@ -545,8 +659,11 @@ def test_render_delivery_run_next_execution_is_safe_and_actionable() -> None:
         ("running", False, "delivery.running", "Delivery plan already has a running unit."),
         ("running", True, "delivery.running", "Delivery plan already has a running unit."),
         ("waiting", False, "delivery.waiting", "Delivery plan is waiting for human input."),
+        ("waiting", True, "delivery.waiting", "Delivery plan is waiting for human input."),
         ("canceled", False, "delivery.canceled", "Delivery plan has canceled unit(s)."),
+        ("canceled", True, "delivery.canceled", "Delivery plan has canceled unit(s)."),
         ("done", False, "delivery.complete", "Delivery plan is already complete."),
+        ("done", True, "delivery.complete", "Delivery plan is already complete."),
         ("pending", False, "delivery.no_eligible_unit", "Delivery plan has no eligible pending unit."),
         (
             "pending",
@@ -2696,12 +2813,52 @@ def test_cmd_delivery_run_next_retries_failed_child_and_handles_interrupt(
 
 def test_project_relative_path(tmp_path: Path) -> None:
     assert _project_relative_path("/foo/bar", None) == "/foo/bar"
-    assert _project_relative_path("/foo/bar", tmp_path) == "/foo/bar"
+    assert _project_relative_path("/foo/bar", tmp_path) == "bar"
 
     sub = tmp_path / "sub"
     sub.mkdir()
     file_path = sub / "file.txt"
     assert _project_relative_path(str(file_path), tmp_path) == "sub/file.txt"
+
+
+def test_sanitize_issue() -> None:
+    from core.delivery_run_next import _sanitize_issue
+
+    issue = DeliveryPlanIssue(
+        "error",
+        "code",
+        "Issue in /opt/project/plan.yaml, /opt/project/progress.json, and /opt/project/events.jsonl",
+        "/opt/project/events.jsonl",
+    )
+
+    # Without project root, returns unchanged
+    assert (
+        _sanitize_issue(
+            issue, None, "/opt/project/plan.yaml", "/opt/project/progress.json", "/opt/project/events.jsonl"
+        )
+        is issue
+    )
+    assert (
+        _sanitize_issue(issue, ".", "/opt/project/plan.yaml", "/opt/project/progress.json", "/opt/project/events.jsonl")
+        is issue
+    )
+
+    # Sanitizes absolute paths inside messages and path
+    sanitized = _sanitize_issue(
+        issue, "/opt/project", "/opt/project/plan.yaml", "/opt/project/progress.json", "/opt/project/events.jsonl"
+    )
+    assert sanitized.message == "Issue in plan.yaml, progress.json, and events.jsonl"
+    assert sanitized.path == "events.jsonl"
+
+    # Sanitizes project root strings not caught by exact matches
+    issue2 = DeliveryPlanIssue(
+        "error", "code", "Error loading /opt/project/some/other/file.txt", "/opt/project/some/other/file.txt"
+    )
+    sanitized2 = _sanitize_issue(
+        issue2, "/opt/project", "/opt/project/plan.yaml", "/opt/project/progress.json", "/opt/project/events.jsonl"
+    )
+    assert sanitized2.message == "Error loading some/other/file.txt"
+    assert sanitized2.path == "some/other/file.txt"
 
 
 def test_cmd_delivery_run_next_blocks_failed_plan_without_reset_failed(

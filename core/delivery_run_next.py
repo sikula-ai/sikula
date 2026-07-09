@@ -23,17 +23,28 @@ class DeliveryRunNextPreview:
     message: str
 
     def to_dict(self) -> dict[str, Any]:
+        plan_path = self.plan_path
+        project_root = self.project_root
+        if project_root and project_root != ".":
+            plan_path = _project_relative_path(plan_path, Path(project_root))
+            project_root = "."
+
         data: dict[str, Any] = {
-            "plan_path": self.plan_path,
-            "project_root": self.project_root,
+            "plan_path": plan_path,
+            "project_root": project_root,
             "valid": self.valid,
             "ready": self.ready,
             "dry_run": self.dry_run,
             "status": self.status,
             "progress_exists": self.progress_exists,
             "selected_unit": self.selected_unit.to_dict() if self.selected_unit else None,
-            "errors": [issue.to_dict() for issue in self.errors],
-            "warnings": [issue.to_dict() for issue in self.warnings],
+            "errors": [
+                _sanitize_issue(issue, self.project_root, self.plan_path, None, None).to_dict() for issue in self.errors
+            ],
+            "warnings": [
+                _sanitize_issue(issue, self.project_root, self.plan_path, None, None).to_dict()
+                for issue in self.warnings
+            ],
             "message": self.message,
         }
         return data
@@ -59,9 +70,22 @@ class DeliveryRunNextExecutionResult:
     message: str
 
     def to_dict(self) -> dict[str, Any]:
+        plan_path = self.plan_path
+        progress_path = self.progress_path
+        events_path = self.events_path
+        project_root = self.project_root
+        if project_root and project_root != ".":
+            root_path = Path(project_root)
+            plan_path = _project_relative_path(plan_path, root_path)
+            if progress_path:
+                progress_path = _project_relative_path(progress_path, root_path)
+            if events_path:
+                events_path = _project_relative_path(events_path, root_path)
+            project_root = "."
+
         data: dict[str, Any] = {
-            "plan_path": self.plan_path,
-            "project_root": self.project_root,
+            "plan_path": plan_path,
+            "project_root": project_root,
             "valid": self.valid,
             "ran": self.ran,
             "succeeded": self.succeeded,
@@ -71,10 +95,20 @@ class DeliveryRunNextExecutionResult:
             "child_task_id": self.child_task_id,
             "unit_status": self.unit_status,
             "run_exit_code": self.run_exit_code,
-            "progress_path": self.progress_path,
-            "events_path": self.events_path,
-            "errors": [issue.to_dict() for issue in self.errors],
-            "warnings": [issue.to_dict() for issue in self.warnings],
+            "progress_path": progress_path,
+            "events_path": events_path,
+            "errors": [
+                _sanitize_issue(
+                    issue, self.project_root, self.plan_path, self.progress_path, self.events_path
+                ).to_dict()
+                for issue in self.errors
+            ],
+            "warnings": [
+                _sanitize_issue(
+                    issue, self.project_root, self.plan_path, self.progress_path, self.events_path
+                ).to_dict()
+                for issue in self.warnings
+            ],
             "message": self.message,
         }
         return data
@@ -84,9 +118,57 @@ def _project_relative_path(path_str: str, project_root: Path | None) -> str:
     if not project_root:
         return path_str
     try:
-        return Path(path_str).relative_to(project_root.resolve()).as_posix()
+        return Path(path_str).resolve().relative_to(project_root.resolve()).as_posix()
     except ValueError:
-        return path_str
+        return Path(path_str).name
+
+
+def _sanitize_issue(
+    issue: DeliveryPlanIssue,
+    project_root: str | None,
+    plan_path: str,
+    progress_path: str | None,
+    events_path: str | None,
+) -> DeliveryPlanIssue:
+    if not project_root or project_root == ".":
+        return issue
+
+    msg = issue.message
+    path = issue.path
+    root_path = Path(project_root)
+
+    plan_rel = _project_relative_path(plan_path, root_path)
+    msg = msg.replace(plan_path, plan_rel)
+    if path:
+        path = path.replace(plan_path, plan_rel)
+
+    if progress_path:
+        prog_rel = _project_relative_path(progress_path, root_path)
+        msg = msg.replace(progress_path, prog_rel)
+        if path:
+            path = path.replace(progress_path, prog_rel)
+
+    if events_path:
+        events_rel = _project_relative_path(events_path, root_path)
+        msg = msg.replace(events_path, events_rel)
+        if path:
+            path = path.replace(events_path, events_rel)
+
+    root_str = str(root_path.resolve())
+    if not root_str.endswith("/"):
+        root_str += "/"
+    msg = msg.replace(root_str, "")
+    if path:
+        path = path.replace(root_str, "")
+
+    root_str_no_slash = str(root_path.resolve())
+    msg = msg.replace(root_str_no_slash, ".")
+    if path:
+        path = path.replace(root_str_no_slash, ".")
+
+    if msg == issue.message and path == issue.path:
+        return issue
+    return DeliveryPlanIssue(issue.severity, issue.code, msg, path)
 
 
 def preview_delivery_run_next(
@@ -124,12 +206,13 @@ def preview_delivery_run_next(
             code, message = _blocked_run_next_reason(status.status, reset_failed=reset_failed)
             errors.append(DeliveryPlanIssue("error", code, message))
 
-    safe_plan_path = _project_relative_path(status.plan_path, project_root)
-    safe_project_root = "." if project_root and status.project_root else None
+    effective_root = (
+        project_root if project_root is not None else (Path(status.project_root) if status.project_root else None)
+    )
 
     return DeliveryRunNextPreview(
-        plan_path=safe_plan_path,
-        project_root=safe_project_root,
+        plan_path=status.plan_path,
+        project_root=str(effective_root.resolve()) if effective_root else status.project_root,
         valid=not errors,
         ready=selected_unit is not None and not errors,
         dry_run=True,
@@ -143,12 +226,18 @@ def preview_delivery_run_next(
 
 
 def render_delivery_run_next_preview(result: DeliveryRunNextPreview) -> str:
+    plan_path = result.plan_path
+    project_root = result.project_root
+    if project_root and project_root != ".":
+        plan_path = _project_relative_path(plan_path, Path(project_root))
+        project_root = "."
+
     lines = [
-        f"Delivery run-next dry run: {result.plan_path}",
+        f"Delivery run-next dry run: {plan_path}",
         f"Status: {'ready' if result.ready else 'blocked'}",
     ]
-    if result.project_root:
-        lines.append(f"Project root: {result.project_root}")
+    if project_root:
+        lines.append(f"Project root: {project_root}")
     if result.status:
         lines.append(f"Plan status: {result.status}")
     lines.append(f"Progress exists: {'yes' if result.progress_exists else 'no'}")
@@ -164,22 +253,35 @@ def render_delivery_run_next_preview(result: DeliveryRunNextPreview) -> str:
         lines.append("")
         lines.append("Errors:")
         for issue in result.errors:
-            lines.append(_format_issue(issue))
+            lines.append(_format_issue(_sanitize_issue(issue, result.project_root, result.plan_path, None, None)))
     if result.warnings:
         lines.append("")
         lines.append("Warnings:")
         for issue in result.warnings:
-            lines.append(_format_issue(issue))
+            lines.append(_format_issue(_sanitize_issue(issue, result.project_root, result.plan_path, None, None)))
     return "\n".join(lines) + "\n"
 
 
 def render_delivery_run_next_execution(result: DeliveryRunNextExecutionResult) -> str:
+    plan_path = result.plan_path
+    progress_path = result.progress_path
+    events_path = result.events_path
+    project_root = result.project_root
+    if project_root and project_root != ".":
+        root_path = Path(project_root)
+        plan_path = _project_relative_path(plan_path, root_path)
+        if progress_path:
+            progress_path = _project_relative_path(progress_path, root_path)
+        if events_path:
+            events_path = _project_relative_path(events_path, root_path)
+        project_root = "."
+
     lines = [
-        f"Delivery run-next: {result.plan_path}",
+        f"Delivery run-next: {plan_path}",
         f"Status: {'done' if result.succeeded else 'failed' if result.ran else 'blocked'}",
     ]
-    if result.project_root:
-        lines.append(f"Project root: {result.project_root}")
+    if project_root:
+        lines.append(f"Project root: {project_root}")
     if result.status:
         lines.append(f"Plan status: {result.status}")
     lines.append(f"Progress exists: {'yes' if result.progress_exists else 'no'}")
@@ -193,21 +295,33 @@ def render_delivery_run_next_execution(result: DeliveryRunNextExecutionResult) -
         lines.append(f"Unit status: {result.unit_status}")
     if result.run_exit_code is not None:
         lines.append(f"Run exit code: {result.run_exit_code}")
-    if result.progress_path:
-        lines.append(f"Progress: {result.progress_path}")
-    if result.events_path:
-        lines.append(f"Events: {result.events_path}")
+    if progress_path:
+        lines.append(f"Progress: {progress_path}")
+    if events_path:
+        lines.append(f"Events: {events_path}")
     lines.append(result.message)
     if result.errors:
         lines.append("")
         lines.append("Errors:")
         for issue in result.errors:
-            lines.append(_format_issue(issue))
+            lines.append(
+                _format_issue(
+                    _sanitize_issue(
+                        issue, result.project_root, result.plan_path, result.progress_path, result.events_path
+                    )
+                )
+            )
     if result.warnings:
         lines.append("")
         lines.append("Warnings:")
         for issue in result.warnings:
-            lines.append(_format_issue(issue))
+            lines.append(
+                _format_issue(
+                    _sanitize_issue(
+                        issue, result.project_root, result.plan_path, result.progress_path, result.events_path
+                    )
+                )
+            )
     return "\n".join(lines) + "\n"
 
 
