@@ -3579,6 +3579,29 @@ class TestCmdRunStateStore:
         assert "Re-run 'sikula review' to start a fresh review." in out
         assert "--reset-failed" not in out
 
+    def test_failed_delivery_child_without_worktree_prints_inspect_hint(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        state = TaskState(
+            task_id="abc123",
+            task_description="orphan delivery child",
+            delivery_plan_id="my-plan-123",
+            delivery_unit_id="unit-456",
+            delivery_plan_path=".sikula/delivery/plan.yaml",
+        )
+        state.failed = True
+        store.save(state)
+
+        with patch("sys.exit"):
+            cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "Delivery parent-child linking failed before a worktree was created." in out
+        assert "Inspect state: sikula show abc123" in out
+        assert "--reset-failed" not in out
+
     def test_failed_report_only_review_cannot_be_reset_failed(self, tmp_path: Path, capsys):
         from core.state import JsonStateStore, TaskState
 
@@ -3807,6 +3830,12 @@ class TestCmdRunChildDeliveryMetadata:
         state = store.load(tasks[0])
         assert state is not None
         assert state.task_id == callback_calls[0]
+        assert state.failed is True
+        assert state.finished_at is not None
+        assert state.worktree_path is None
+        assert state.worktree_branch is None
+        assert state.history[-1]["action"] == "delivery_child_link_failed"
+        assert state.history[-1]["result"] == "delivery child link failed before worktree creation"
 
     def test_cmd_run_forwards_delivery_metadata(self, tmp_path: Path) -> None:
         task_file = tmp_path / "task.md"
@@ -3847,6 +3876,34 @@ class TestCmdRunChildDeliveryMetadata:
         assert state.delivery_plan_id == "my-plan-123"
         assert state.delivery_unit_id == "unit-456"
         assert state.delivery_plan_path == ".sikula/delivery/plan.yaml"
+
+    def test_cmd_run_reset_failed_blocks_delivery_child_without_worktree(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from core.state import TaskState
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = TaskState(
+            task_id="abc123",
+            task_description="orphan delivery child",
+            delivery_plan_id="my-plan-123",
+            delivery_unit_id="unit-456",
+            delivery_plan_path=".sikula/delivery/plan.yaml",
+        )
+        state.failed = True
+        store.save(state)
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_run(_run_args(task_id="abc123", reset_failed=True), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert exc.value.code == 1
+        assert "delivery parent-child linking failed" in out
+        assert "--reset-failed cannot safely resume it" in out
+        loaded = store.load("abc123")
+        assert loaded is not None
+        assert loaded.failed is True
+        assert loaded.worktree_path is None
 
     def test_cmd_run_defaults_delivery_metadata_to_none(self, tmp_path: Path) -> None:
         task_file = tmp_path / "task.md"
