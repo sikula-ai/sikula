@@ -283,16 +283,27 @@ task state, prepare contracts, create worktrees, start agents, or update
 branches. Its JSON result is also allowlisted metadata only.
 
 **Delivery run-next execution:** `sikula delivery run-next PLAN_FILE` acquires
-the delivery progress lock, selects one eligible pending unit, and records it as
-`running`. It then creates a child `TaskState` for that unit. Before any child
-worktree, orchestrator, or agent execution starts, `delivery run-next` updates
-parent progress with the same `running` unit and `child_task_id`, and appends a
-`unit.child_linked` event. If that link update fails, `delivery run-next`
-aborts before any child execution and reports `delivery.child_link_failed`.
+the delivery progress lock and refreshes status under that lock. If exactly one unit
+is already `running`, `run-next` first treats that as a resume candidate. If the
+running unit has a linked non-terminal child, it appends a `unit.resume_intent`
+event and resumes the child through
+`sikula run --task-id <child_task_id>` before selecting a new unit.
+If the running unit has no linked child, the linked child state is missing, or the
+linked child is terminal, `run-next` blocks and returns a targeted error without
+selecting pending work. If multiple units are `running`, `run-next` also blocks until
+the parent progress is manually reconciled.
+Resume-path blocks return allowlisted metadata only and do not expose
+`TaskState` contents or absolute local paths.
+If no ambiguous/runnable running unit exists, `run-next` selects one eligible pending
+unit, records it as `running`, creates one child `TaskState`, and before any child
+worktree, orchestrator, or agent execution starts updates parent progress with
+the same `running` unit and `child_task_id` and appends a `unit.child_linked` event.
+If that link update fails, `delivery run-next` aborts before any child execution and
+reports `delivery.child_link_failed`.
 `run-next` accepts the same per-agent `--agent-model`, `--agent-provider`, and
 `--agent-timeout` overrides as `sikula run` and forwards them to the child run;
 the parent delivery progress model does not store those prompt/provider settings.
-When the child run continues, it keeps normal Sikula behavior: contract preflight,
+When the child run continues (including resume), it keeps normal Sikula behavior: contract preflight,
 worktree isolation, provider execution, validation, review, state persistence, and
 task audit reporting. When the child run exits, delivery progress stores only
 compact parent metadata: unit status, child task id, branch, result commit when
@@ -302,7 +313,8 @@ The parent delivery unit is `done` only when the child exits successfully, the
 child `TaskState` is done, and the child result is finalized. Finalization means
 either a `result_commit` exists or the child left no preserved worktree to
 deliver. A done child task with a preserved worktree but no result commit is
-recorded as `failed` with `child_run_unfinalized`.
+recorded as `failed` with `child_run_unfinalized`. A resumed child that exits
+non-terminal is recorded as `failed` in the same parent status shape.
 Before starting a selected unit, execution walks the selected unit's dependency
 closure and verifies that every completed prerequisite result commit is already
 an ancestor of the current checkout. Completed no-op prerequisites have no

@@ -24,7 +24,7 @@ from core.delivery_run_next import (
     render_delivery_run_next_preview,
 )
 from core.delivery_run_next import _blocked_run_next_reason
-from core.state import JsonStateStore
+from core.state import JsonStateStore, TaskState
 from sikula_cli.delivery import (
     DeliveryChildRunResult,
     DeliveryChildLinkFailed,
@@ -34,7 +34,9 @@ from sikula_cli.delivery import (
     _coerce_child_run_result,
     _dependency_commit_errors,
     _delivery_child_run_args,
+    _delivery_child_resume_run_args,
     _git_commit_is_ancestor,
+    _invoke_delivery_child_run_args,
     _invoke_delivery_child_run,
     _system_exit_code,
     cmd_delivery_run_next,
@@ -1101,7 +1103,7 @@ def test_cmd_delivery_run_next_rechecks_status_after_lock_before_running(
         valid=True,
         ready=True,
         dry_run=True,
-        status="pending",
+        status="running",
         progress_exists=False,
         selected_unit=DeliveryStatusUnit(
             id="01-foundation",
@@ -1110,7 +1112,7 @@ def test_cmd_delivery_run_next_rechecks_status_after_lock_before_running(
             task_path=".sikula/delivery/demo/units/01-foundation.md",
             depends_on=[],
         ),
-        errors=[],
+        errors=[DeliveryPlanIssue("error", "delivery.running", "Running unit already exists.")],
         warnings=[],
         message="Ready.",
     )
@@ -1132,7 +1134,468 @@ def test_cmd_delivery_run_next_rechecks_status_after_lock_before_running(
     assert exc.value.code == 1
     assert called is False
     payload = json.loads(capsys.readouterr().out)
-    assert payload["errors"][0]["code"] == "delivery.running"
+    assert payload["errors"][0]["code"] == "delivery.running_child_missing"
+
+
+def test_cmd_delivery_run_next_resumes_non_terminal_running_child_unit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(tmp_path, [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}])
+    cfg = _run_next_cfg(tmp_path)
+
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    state = TaskState(task_id="resume-child", task_description="resume child")
+    state.done = False
+    store.save(state)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        assert run_args.task_file is None
+        assert run_args.task_id == "resume-child"
+        assert run_args.delivery_plan_id is None
+        assert run_args.delivery_unit_id is None
+        assert run_args.delivery_plan_path is None
+        assert run_args.delivery_child_created_callback is None
+        state = store.load("resume-child")
+        assert state is not None
+        state.done = True
+        state.worktree_branch = "sikula/01-foundation-child"
+        state.result_commit = "abc123"
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=0, child_task_id="resume-child")
+
+    cmd_delivery_run_next(
+        _run_next_args(
+            plan_path,
+            json_output=True,
+            agent_model=["analyst=gpt-5.5"],
+            agent_provider=["implementer=antigravity"],
+            agent_timeout=["implementer=2400"],
+        ),
+        cfg,
+        _run_next_context(tmp_path, runner),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is True
+    assert payload["succeeded"] is True
+    assert payload["unit_status"] == "done"
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["selected_unit"]["status"] == "done"
+    assert payload["selected_unit"]["eligible"] is False
+    assert payload["message"] == "Delivery unit 01-foundation resumed and completed."
+    assert payload["child_task_id"] == "resume-child"
+    assert payload["plan_path"] == ".sikula/delivery/demo/plan.yaml"
+    assert payload["progress_path"] == ".sikula/state/delivery/delivery-run-next-demo/progress.json"
+    assert payload["events_path"] == ".sikula/state/delivery/delivery-run-next-demo/events.jsonl"
+    assert str(tmp_path) not in payload["plan_path"]
+    assert str(tmp_path) not in payload["progress_path"]
+    assert str(tmp_path) not in payload["events_path"]
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["status"] == "done"
+    assert progress["units"][0]["child_task_id"] == "resume-child"
+    assert progress["units"][0]["branch"] == "sikula/01-foundation-child"
+    assert progress["units"][0]["commit"] == "abc123"
+    events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    parsed_events = [json.loads(event) for event in events]
+    assert [event["event_type"] for event in parsed_events] == ["unit.resume_intent", "unit.done"]
+    assert parsed_events[0]["unit_id"] == "01-foundation"
+    assert parsed_events[0]["status"] == "running"
+    assert parsed_events[1]["unit_id"] == "01-foundation"
+    assert parsed_events[1]["child_task_id"] == "resume-child"
+
+
+def test_cmd_delivery_run_next_resumes_running_child_and_records_failed_parent_unit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(tmp_path, [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}])
+    cfg = _run_next_cfg(tmp_path)
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    state = TaskState(task_id="resume-child", task_description="resume child")
+    store.save(state)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        state = store.load("resume-child")
+        assert state is not None
+        state.done = True
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=1, child_task_id=run_args.created_task_id)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(_run_next_args(plan_path, json_output=True), cfg, _run_next_context(tmp_path, runner))
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is True
+    assert payload["succeeded"] is False
+    assert payload["unit_status"] == "failed"
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["selected_unit"]["status"] == "failed"
+    assert payload["selected_unit"]["failure_code"] == "child_run_failed"
+    assert payload["message"] == "Delivery unit 01-foundation resumed and failed; inspect child task state."
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["status"] == "failed"
+    assert progress["units"][0]["failure_code"] == "child_run_failed"
+    events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(event)["event_type"] for event in events] == ["unit.resume_intent", "unit.failed"]
+
+
+def test_cmd_delivery_run_next_resumes_running_child_and_marks_interrupted_parent_unit(
+    tmp_path: Path,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(tmp_path, [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}])
+    cfg = _run_next_cfg(tmp_path)
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    state = TaskState(task_id="resume-child", task_description="resume child")
+    state.done = False
+    store.save(state)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        assert run_args.task_file is None
+        assert run_args.task_id == "resume-child"
+        assert run_args.delivery_plan_id is None
+        assert run_args.delivery_unit_id is None
+        assert run_args.delivery_plan_path is None
+        assert run_args.delivery_child_created_callback is None
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["status"] == "failed"
+    assert progress["units"][0]["failure_code"] == "child_run_interrupted"
+    events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(event)["event_type"] for event in events] == ["unit.resume_intent", "unit.failed"]
+
+
+def test_cmd_delivery_run_next_resumes_running_child_and_marks_exception_parent_unit(
+    tmp_path: Path,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(tmp_path, [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}])
+    cfg = _run_next_cfg(tmp_path)
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    state = TaskState(task_id="resume-child", task_description="resume child")
+    state.done = False
+    store.save(state)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        assert run_args.task_file is None
+        assert run_args.task_id == "resume-child"
+        assert run_args.delivery_plan_id is None
+        assert run_args.delivery_unit_id is None
+        assert run_args.delivery_plan_path is None
+        assert run_args.delivery_child_created_callback is None
+        raise RuntimeError("child task crashed during resume")
+
+    with pytest.raises(RuntimeError, match="child task crashed during resume"):
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["status"] == "failed"
+    assert progress["units"][0]["failure_code"] == "child_run_exception"
+    events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(event)["event_type"] for event in events] == ["unit.resume_intent", "unit.failed"]
+
+
+def test_cmd_delivery_run_next_blocks_running_unit_without_child_task_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(tmp_path, [{"unit_id": "01-foundation", "status": "running"}])
+    cfg = _run_next_cfg(tmp_path)
+    called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal called
+        called = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert called is False
+    assert payload["errors"][0]["code"] == "delivery.running_child_missing"
+    assert payload["message"] == (
+        "Delivery unit 01-foundation is running but has no child task id; "
+        "inspect parent delivery progress before retrying."
+    )
+    assert payload["plan_path"] == ".sikula/delivery/demo/plan.yaml"
+    assert payload["progress_path"] == ".sikula/state/delivery/delivery-run-next-demo/progress.json"
+    assert payload["events_path"] == ".sikula/state/delivery/delivery-run-next-demo/events.jsonl"
+
+
+def test_cmd_delivery_run_next_blocks_running_unit_with_invalid_child_task_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(tmp_path, [{"unit_id": "01-foundation", "status": "running", "child_task_id": "bad:child"}])
+    cfg = _run_next_cfg(tmp_path)
+    called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal called
+        called = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert called is False
+    assert payload["errors"][0]["code"] == "delivery.child_task_missing"
+
+
+def test_cmd_delivery_run_next_blocks_running_unit_with_missing_child_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}],
+    )
+    cfg = _run_next_cfg(tmp_path)
+    called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal called
+        called = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert called is False
+    assert payload["errors"][0]["code"] == "delivery.child_task_missing"
+
+
+@pytest.mark.parametrize(
+    ("progress_payload", "expected_code", "expected_message"),
+    [
+        (
+            {"unit_id": "01-foundation", "status": "running"},
+            "delivery.running_child_missing",
+            "Delivery unit 01-foundation is running but has no child task id; "
+            "inspect parent delivery progress before retrying.",
+        ),
+        (
+            {"unit_id": "01-foundation", "status": "running", "child_task_id": ""},
+            "units[0].child_task_id.invalid_type",
+            "Delivery plan is not ready to run.",
+        ),
+        (
+            {"unit_id": "01-foundation", "status": "running", "child_task_id": None},
+            "delivery.running_child_missing",
+            "Delivery unit 01-foundation is running but has no child task id; "
+            "inspect parent delivery progress before retrying.",
+        ),
+    ],
+)
+def test_cmd_delivery_run_next_blocks_running_unit_without_nonempty_child_task_id(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    progress_payload: dict[str, str | None],
+    expected_code: str,
+    expected_message: str,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(tmp_path, [progress_payload])
+    cfg = _run_next_cfg(tmp_path)
+    called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal called
+        called = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert called is False
+    assert payload["errors"][0]["code"] == expected_code
+    assert payload["message"] == expected_message
+
+
+@pytest.mark.parametrize(
+    ("child_done", "child_failed"),
+    [
+        (True, False),
+        (False, True),
+    ],
+)
+def test_cmd_delivery_run_next_blocks_running_unit_with_terminal_child_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], child_done: bool, child_failed: bool
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}],
+    )
+    cfg = _run_next_cfg(tmp_path)
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    state = TaskState(task_id="resume-child", task_description="resume child")
+    state.done = child_done
+    state.failed = child_failed
+    state.worktree_branch = "sikula/01-foundation-child"
+    state.result_commit = "abc123"
+    store.save(state)
+    called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal called
+        called = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert called is False
+    assert payload["errors"][0]["code"] == "delivery.running_child_terminal"
+
+
+def test_cmd_delivery_run_next_marks_resumed_running_child_failed_when_child_state_missing_after_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(tmp_path, [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}])
+    cfg = _run_next_cfg(tmp_path)
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    state = TaskState(task_id="resume-child", task_description="resume child")
+    state.done = False
+    state.worktree_branch = "sikula/01-foundation-child"
+    store.save(state)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        run_store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        run_store.delete("resume-child")
+        return DeliveryChildRunResult(exit_code=0, child_task_id=run_args.created_task_id)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(_run_next_args(plan_path, json_output=True), cfg, _run_next_context(tmp_path, runner))
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is True
+    assert payload["succeeded"] is False
+    assert payload["selected_unit"]["failure_code"] == "child_task_missing"
+    assert payload["unit_status"] == "failed"
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["status"] == "failed"
+    assert progress["units"][0]["failure_code"] == "child_task_missing"
+    events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(event)["event_type"] for event in events] == ["unit.resume_intent", "unit.failed"]
+
+
+def test_cmd_delivery_run_next_blocks_multiple_running_units_before_pending_selection(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"},
+            {"unit_id": "02-feature", "status": "running", "child_task_id": "resume-child-2"},
+        ],
+    )
+    cfg = _run_next_cfg(tmp_path)
+    called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal called
+        called = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert called is False
+    assert payload["selected_unit"] is None
+    assert payload["errors"][0]["code"] == "delivery.running_unit_ambiguous"
+    assert payload["plan_path"] == ".sikula/delivery/demo/plan.yaml"
+    assert payload["progress_path"] == ".sikula/state/delivery/delivery-run-next-demo/progress.json"
+    assert payload["events_path"] == ".sikula/state/delivery/delivery-run-next-demo/events.jsonl"
+
+
+def test_delivery_child_resume_run_args_uses_task_id_resume_shape() -> None:
+    args = _delivery_child_resume_run_args(
+        child_task_id="resume-child",
+        created_task_id="resume-child",
+        agent_model=["analyst=gpt-5.5"],
+        agent_provider=["implementer=antigravity"],
+        agent_timeout=["implementer=2400"],
+    )
+
+    assert args.task_file is None
+    assert args.task_id == "resume-child"
+    assert args.task_file_pos is None
+    assert args.no_isolate is False
+    assert args.reset_failed is False
+    assert args.delivery_plan_id is None
+    assert args.delivery_unit_id is None
+    assert args.delivery_plan_path is None
+    assert args.delivery_child_created_callback is None
+    assert args.created_task_id == "resume-child"
+    assert args.agent_model == ["analyst=gpt-5.5"]
+    assert args.agent_provider == ["implementer=antigravity"]
+    assert args.agent_timeout == ["implementer=2400"]
 
 
 def test_cmd_delivery_run_next_rejects_existing_progress_lock(
@@ -1228,6 +1691,88 @@ def test_delivery_child_run_helpers_cover_exit_and_result_shapes(tmp_path: Path)
     assert _coerce_child_run_result(None).exit_code == 0
     assert _system_exit_code(SystemExit(3)) == 3
     assert _delivery_child_run_args(root=root, task_path=task_path).task_file == str((root / task_path).resolve())
+
+
+def test_delivery_child_run_args_cover_task_id_resume_invocation(tmp_path: Path) -> None:
+    args = argparse.Namespace(json=False)
+
+    def plain_runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        assert run_args.task_id == "resume-child"
+        assert run_args.task_file is None
+        return DeliveryChildRunResult(exit_code=4, child_task_id=run_args.created_task_id)
+
+    resume_args = _delivery_child_resume_run_args(child_task_id="resume-child", created_task_id="resume-child")
+
+    result = _invoke_delivery_child_run_args(
+        args,
+        cfg={},
+        context=_run_next_context(tmp_path, plain_runner),
+        run_args=resume_args,
+    )
+
+    assert result.exit_code == 4
+    assert result.child_task_id == "resume-child"
+
+
+def test_invoke_delivery_child_run_args_handles_result_shapes(tmp_path: Path) -> None:
+    args = argparse.Namespace(json=False)
+    cfg = {}
+
+    resume_args = _delivery_child_resume_run_args(child_task_id="resume-child", created_task_id="resume-child")
+
+    def raises_none(run_args: argparse.Namespace, run_cfg: dict) -> None:
+        raise SystemExit(None)
+
+    def raises_text(run_args: argparse.Namespace, run_cfg: dict) -> None:
+        raise SystemExit("bad")
+
+    def raises_interrupt(run_args: argparse.Namespace, run_cfg: dict) -> None:
+        raise KeyboardInterrupt
+
+    def raises_exception(run_args: argparse.Namespace, run_cfg: dict) -> None:
+        raise RuntimeError("boom")
+
+    def raises_child_link_failed(run_args: argparse.Namespace, run_cfg: dict) -> None:
+        run_args.created_task_id = "resume-child"
+        raise DeliveryChildLinkFailed()
+
+    def returns_child_run_result(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        return DeliveryChildRunResult(exit_code=3, child_task_id=run_args.created_task_id)
+
+    assert (
+        _invoke_delivery_child_run_args(
+            args, cfg, _run_next_context(tmp_path, raises_none), run_args=resume_args
+        ).exit_code
+        == 0
+    )
+    assert (
+        _invoke_delivery_child_run_args(
+            args, cfg, _run_next_context(tmp_path, raises_text), run_args=resume_args
+        ).exit_code
+        == 1
+    )
+    assert (
+        _invoke_delivery_child_run_args(
+            args, cfg, _run_next_context(tmp_path, raises_interrupt), run_args=resume_args
+        ).interrupted
+        is True
+    )
+    exception_result = _invoke_delivery_child_run_args(
+        args, cfg, _run_next_context(tmp_path, raises_exception), run_args=resume_args
+    )
+    assert exception_result.exit_code == 1
+    assert isinstance(exception_result.exception, RuntimeError)
+    link_failed_result = _invoke_delivery_child_run_args(
+        args, cfg, _run_next_context(tmp_path, raises_child_link_failed), run_args=resume_args
+    )
+    assert link_failed_result.exit_code == 1
+    assert link_failed_result.child_link_failed is True
+    assert link_failed_result.child_task_id == "resume-child"
+    returned_result = _invoke_delivery_child_run_args(
+        args, cfg, _run_next_context(tmp_path, returns_child_run_result), run_args=resume_args
+    )
+    assert returned_result.exit_code == 3
+    assert returned_result.child_task_id == "resume-child"
 
 
 def test_delivery_child_run_args_keeps_child_created_callback() -> None:

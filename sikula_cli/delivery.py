@@ -13,14 +13,18 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import subprocess
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core.delivery_authoring import DeliveryAuthoringDraft, DeliveryAuthoringParseError
 from core.delivery_plan import delivery_final_branch_for_plan_id, is_valid_delivery_branch_name
 from core.delivery_prepare_writer import DeliveryPrepareWriteResult, write_delivery_prepare_artifacts
 from sikula_cli.agent_overrides import DELIVERY_PREPARATION_AGENT_NAMES, parse_agent_llm_overrides
 
+if TYPE_CHECKING:
+    from core.delivery_run_next import DeliveryRunNextExecutionResult
+
 _DELIVERY_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_DELIVERY_CHILD_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _DELIVERY_PREPARE_CONTEXT_MISSING_MESSAGE = "Delivery prepare authoring requires the main Sikula command context."
 _DELIVERY_PREPARE_AUTHORING_FAILED_MESSAGE = (
     "Delivery authoring assistant failed; see local audit artifacts for details."
@@ -1150,8 +1154,13 @@ def _run_next_delivery_unit(
     from core.state import JsonStateStore
 
     preflight = preview_delivery_run_next(args.plan_file, project_root=project_root)
-    if not preflight.ready:
-        return _execution_result_from_preview(preflight, ran=False)
+    if not preflight.valid:
+        if (
+            preflight.status != "running"
+            or not preflight.errors
+            or not all(issue.code == "delivery.running" for issue in preflight.errors)
+        ):
+            return _execution_result_from_preview(preflight, ran=False)
 
     status = get_delivery_status(args.plan_file, project_root=project_root)
     if status.plan is None or status.project_root is None:
@@ -1193,7 +1202,6 @@ def _run_next_delivery_unit(
     with lock:
         status = get_delivery_status(args.plan_file, project_root=project_root)
         errors = list(status.errors)
-        selected_unit = select_next_delivery_unit(status)
         if status.plan is None or status.project_root is None:
             return _execution_result_from_status(
                 status,
@@ -1204,6 +1212,49 @@ def _run_next_delivery_unit(
                 errors=errors,
                 message="Delivery plan is not ready to run.",
             )
+        running_units = _running_delivery_units(status)
+        if len(running_units) == 1:
+            return _handle_running_delivery_unit(
+                args=args,
+                cfg=cfg,
+                context=context,
+                status=status,
+                root=root,
+                plan_id=plan_id,
+                progress_path=progress_path,
+                events_path=events_path,
+                running_unit=running_units[0],
+            )
+        if len(running_units) > 1:
+            blocked_plan_path, blocked_progress_path, blocked_events_path = _safe_status_relative_paths(
+                status,
+                root=root,
+                progress_path=progress_path,
+                events_path=events_path,
+            )
+            code = "delivery.running_unit_ambiguous"
+            message = "Delivery progress has multiple running units; inspect parent progress before retrying."
+            blocked_errors = [*errors, DeliveryPlanIssue("error", code, message)]
+            return DeliveryRunNextExecutionResult(
+                plan_path=blocked_plan_path,
+                project_root=".",
+                valid=False,
+                ran=False,
+                succeeded=False,
+                status=status.status,
+                progress_exists=status.progress_exists,
+                selected_unit=None,
+                child_task_id=None,
+                unit_status=None,
+                run_exit_code=None,
+                progress_path=blocked_progress_path,
+                events_path=blocked_events_path,
+                errors=blocked_errors,
+                warnings=status.warnings,
+                message=message,
+            )
+
+        selected_unit = select_next_delivery_unit(status)
         if selected_unit is None:
             code, message = _blocked_run_next_reason(status.status)
             errors.append(DeliveryPlanIssue("error", code, message))
@@ -1355,22 +1406,15 @@ def _run_next_delivery_unit(
                 message=f"Delivery unit {selected_unit.id} did not start; fix setup and retry.",
             )
         child_state = store.load(child_task_id) if child_task_id else None
-        classification = _classify_delivery_child_run(child_result, child_state)
-        unit_status = classification.unit_status
-        failure_code = classification.failure_code
-        terminal_unit = make_delivery_unit_progress(
-            selected_unit.id,
-            unit_status,
+        progress, unit_status = _record_delivery_child_terminal_result(
+            progress=progress,
+            selected_unit=selected_unit,
             child_task_id=child_task_id,
-            branch=getattr(child_state, "worktree_branch", None) if child_state else None,
-            commit=getattr(child_state, "result_commit", None) if child_state else None,
-            failure_code=failure_code,
-        )
-        progress = upsert_delivery_unit_progress(progress, terminal_unit)
-        write_delivery_progress(progress_path, progress)
-        append_delivery_progress_event(
-            events_path,
-            make_delivery_progress_event(plan_id, f"unit.{unit_status}", unit=terminal_unit),
+            child_state=child_state,
+            child_result=child_result,
+            plan_id=plan_id,
+            progress_path=progress_path,
+            events_path=events_path,
         )
         if child_result.interrupted:
             raise KeyboardInterrupt
@@ -1561,10 +1605,265 @@ def _dependency_commit_errors(status, selected_unit, root: Path):
     return errors
 
 
+def _safe_status_relative_paths(
+    status,
+    *,
+    root: Path,
+    progress_path: Path,
+    events_path: Path,
+) -> tuple[str, str | None, str | None]:
+    plan_path = Path(status.plan_path)
+    if _path_is_within(plan_path, root):
+        safe_plan_path = _project_relative_path(plan_path, root)
+    else:
+        safe_plan_path = plan_path.name
+    safe_progress_path = _project_relative_path(progress_path, root) if _path_is_within(progress_path, root) else None
+    safe_events_path = _project_relative_path(events_path, root) if _path_is_within(events_path, root) else None
+    return safe_plan_path, safe_progress_path, safe_events_path
+
+
+def _running_delivery_units(status) -> list:
+    return [unit for unit in status.units if unit.status == "running"]
+
+
+def _is_valid_delivery_child_task_id(task_id: str) -> bool:
+    return bool(_DELIVERY_CHILD_TASK_ID_RE.fullmatch(task_id))
+
+
+def _handle_running_delivery_unit(
+    args: argparse.Namespace,
+    cfg: dict,
+    context: DeliveryRunNextContext,
+    *,
+    status,
+    root: Path,
+    plan_id: str,
+    progress_path: Path,
+    events_path: Path,
+    running_unit,
+) -> "DeliveryRunNextExecutionResult":
+    from core.delivery_progress import (
+        append_delivery_progress_event,
+        get_delivery_status,
+        make_delivery_progress_event,
+        make_delivery_unit_progress,
+        read_delivery_progress,
+    )
+    from core.delivery_plan import DeliveryPlanIssue
+    from core.delivery_run_next import DeliveryRunNextExecutionResult
+    from core.state import JsonStateStore
+
+    blocked_plan_path, blocked_progress_path, blocked_events_path = _safe_status_relative_paths(
+        status,
+        root=root,
+        progress_path=progress_path,
+        events_path=events_path,
+    )
+    unit_id = running_unit.id
+    child_task_id = running_unit.child_task_id
+    if not child_task_id:
+        code = "delivery.running_child_missing"
+        message = (
+            f"Delivery unit {unit_id} is running but has no child task id; "
+            "inspect parent delivery progress before retrying."
+        )
+        return DeliveryRunNextExecutionResult(
+            plan_path=blocked_plan_path,
+            project_root=".",
+            valid=False,
+            ran=False,
+            succeeded=False,
+            status=status.status,
+            progress_exists=status.progress_exists,
+            selected_unit=running_unit,
+            child_task_id=None,
+            unit_status=None,
+            run_exit_code=None,
+            progress_path=blocked_progress_path,
+            events_path=blocked_events_path,
+            errors=[DeliveryPlanIssue("error", code, message)],
+            warnings=status.warnings,
+            message=message,
+        )
+    if not _is_valid_delivery_child_task_id(child_task_id):
+        code = "delivery.child_task_missing"
+        message = (
+            f"Delivery unit {unit_id} is linked to child task {child_task_id}, but that task state was not found in "
+            "the configured state directory."
+        )
+        return DeliveryRunNextExecutionResult(
+            plan_path=blocked_plan_path,
+            project_root=".",
+            valid=False,
+            ran=False,
+            succeeded=False,
+            status=status.status,
+            progress_exists=status.progress_exists,
+            selected_unit=running_unit,
+            child_task_id=child_task_id,
+            unit_status=None,
+            run_exit_code=None,
+            progress_path=blocked_progress_path,
+            events_path=blocked_events_path,
+            errors=[DeliveryPlanIssue("error", code, message)],
+            warnings=status.warnings,
+            message=message,
+        )
+
+    state_dir = context.resolve_state_dir(cfg)
+    store = JsonStateStore(state_dir)
+    child_state = store.load(child_task_id)
+    if child_state is None:
+        code = "delivery.child_task_missing"
+        message = (
+            f"Delivery unit {unit_id} is linked to child task {child_task_id}, but that task state was not found in "
+            "the configured state directory."
+        )
+        return DeliveryRunNextExecutionResult(
+            plan_path=blocked_plan_path,
+            project_root=".",
+            valid=False,
+            ran=False,
+            succeeded=False,
+            status=status.status,
+            progress_exists=status.progress_exists,
+            selected_unit=running_unit,
+            child_task_id=child_task_id,
+            unit_status=None,
+            run_exit_code=None,
+            progress_path=blocked_progress_path,
+            events_path=blocked_events_path,
+            errors=[DeliveryPlanIssue("error", code, message)],
+            warnings=status.warnings,
+            message=message,
+        )
+
+    if child_state.done or child_state.failed:
+        code = "delivery.running_child_terminal"
+        message = (
+            f"Delivery unit {unit_id} is linked to terminal child task {child_task_id}; "
+            "terminal child reconciliation is out of scope for run-next. Inspect delivery status before retrying."
+        )
+        return DeliveryRunNextExecutionResult(
+            plan_path=blocked_plan_path,
+            project_root=".",
+            valid=False,
+            ran=False,
+            succeeded=False,
+            status=status.status,
+            progress_exists=status.progress_exists,
+            selected_unit=running_unit,
+            child_task_id=child_task_id,
+            unit_status=None,
+            run_exit_code=None,
+            progress_path=blocked_progress_path,
+            events_path=blocked_events_path,
+            errors=[DeliveryPlanIssue("error", code, message)],
+            warnings=status.warnings,
+            message=message,
+        )
+
+    resume_unit = make_delivery_unit_progress(
+        unit_id, "running", child_task_id=child_task_id, timestamp=running_unit.started_at
+    )
+    append_delivery_progress_event(
+        events_path,
+        make_delivery_progress_event(plan_id, "unit.resume_intent", unit=resume_unit),
+    )
+    progress = _progress_for_update(status, progress_path, read_delivery_progress=read_delivery_progress)
+    run_args = _delivery_child_resume_run_args(
+        child_task_id=child_task_id,
+        created_task_id=child_task_id,
+        agent_model=getattr(args, "agent_model", None),
+        agent_provider=getattr(args, "agent_provider", None),
+        agent_timeout=getattr(args, "agent_timeout", None),
+    )
+    child_result = _invoke_delivery_child_run_args(args, cfg, context, run_args)
+    child_state = store.load(child_task_id)
+    progress, unit_status = _record_delivery_child_terminal_result(
+        progress=progress,
+        selected_unit=running_unit,
+        child_task_id=child_task_id,
+        child_state=child_state,
+        child_result=child_result,
+        plan_id=plan_id,
+        progress_path=progress_path,
+        events_path=events_path,
+    )
+    if child_result.interrupted:
+        raise KeyboardInterrupt
+    if child_result.exception is not None:
+        raise child_result.exception
+
+    updated_status = get_delivery_status(args.plan_file, project_root=root)
+    updated_unit = _status_unit_by_id(updated_status, unit_id) or running_unit
+    message = (
+        f"Delivery unit {unit_id} resumed and completed."
+        if unit_status == "done"
+        else f"Delivery unit {unit_id} resumed and failed; inspect child task state."
+    )
+    return DeliveryRunNextExecutionResult(
+        plan_path=blocked_plan_path,
+        project_root=".",
+        valid=updated_status.valid,
+        ran=True,
+        succeeded=unit_status == "done" and updated_status.valid,
+        status=updated_status.status,
+        progress_exists=updated_status.progress_exists,
+        selected_unit=updated_unit,
+        child_task_id=child_task_id,
+        unit_status=unit_status,
+        run_exit_code=child_result.exit_code,
+        progress_path=blocked_progress_path,
+        events_path=blocked_events_path,
+        errors=updated_status.errors,
+        warnings=updated_status.warnings,
+        message=message,
+    )
+
+
 def _child_delivery_result_finalized(child_state) -> bool:
     if getattr(child_state, "result_commit", None):
         return True
     return not (getattr(child_state, "worktree_path", None) or getattr(child_state, "worktree_base", None))
+
+
+def _record_delivery_child_terminal_result(
+    *,
+    progress,
+    selected_unit,
+    child_task_id: str | None,
+    child_state,
+    child_result: "DeliveryChildRunResult",
+    plan_id: str,
+    progress_path: Path,
+    events_path: Path,
+):
+    from core.delivery_progress import (
+        append_delivery_progress_event,
+        make_delivery_progress_event,
+        make_delivery_unit_progress,
+        upsert_delivery_unit_progress,
+        write_delivery_progress,
+    )
+
+    classification = _classify_delivery_child_run(child_result, child_state)
+    unit_status = classification.unit_status
+    terminal_unit = make_delivery_unit_progress(
+        selected_unit.id,
+        unit_status,
+        child_task_id=child_task_id,
+        branch=getattr(child_state, "worktree_branch", None) if child_state else None,
+        commit=getattr(child_state, "result_commit", None) if child_state else None,
+        failure_code=classification.failure_code,
+    )
+    progress = upsert_delivery_unit_progress(progress, terminal_unit)
+    write_delivery_progress(progress_path, progress)
+    append_delivery_progress_event(
+        events_path,
+        make_delivery_progress_event(plan_id, f"unit.{unit_status}", unit=terminal_unit),
+    )
+    return progress, unit_status
 
 
 def _classify_delivery_child_run(
@@ -1649,39 +1948,7 @@ def _invoke_delivery_child_run(
         delivery_plan_path=delivery_plan_path,
         delivery_child_created_callback=delivery_child_created_callback,
     )
-    run_cfg = copy.deepcopy(cfg)
-    try:
-        if getattr(args, "json", False):
-            with contextlib.redirect_stdout(sys.stderr):
-                raw_result = context.run_task(run_args, run_cfg)
-        else:
-            raw_result = context.run_task(run_args, run_cfg)
-    except SystemExit as exc:
-        return DeliveryChildRunResult(
-            exit_code=_system_exit_code(exc),
-            child_task_id=getattr(run_args, "created_task_id", None),
-        )
-    except KeyboardInterrupt:
-        return DeliveryChildRunResult(
-            exit_code=130,
-            child_task_id=getattr(run_args, "created_task_id", None),
-            interrupted=True,
-        )
-    except Exception as exc:
-        if isinstance(exc, DeliveryChildLinkFailed):
-            child_task_id = getattr(run_args, "created_task_id", None)
-            return DeliveryChildRunResult(
-                exit_code=1,
-                child_task_id=child_task_id,
-                exception=exc,
-                child_link_failed=True,
-            )
-        return DeliveryChildRunResult(
-            exit_code=1,
-            child_task_id=getattr(run_args, "created_task_id", None),
-            exception=exc,
-        )
-    return _coerce_child_run_result(raw_result)
+    return _invoke_delivery_child_run_args(args, cfg, context, run_args)
 
 
 def _delivery_child_run_args(
@@ -1722,7 +1989,86 @@ def _delivery_child_run_args(
         delivery_unit_id=delivery_unit_id,
         delivery_plan_path=delivery_plan_path,
         delivery_child_created_callback=delivery_child_created_callback,
+        created_task_id=None,
     )
+
+
+def _delivery_child_resume_run_args(
+    *,
+    child_task_id: str,
+    created_task_id: str,
+    agent_model: list[str] | None = None,
+    agent_provider: list[str] | None = None,
+    agent_timeout: list[str] | None = None,
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        task_file=None,
+        task_file_pos=None,
+        task_id=child_task_id,
+        no_isolate=False,
+        reset_failed=False,
+        build=None,
+        presync=None,
+        presync_clean=None,
+        planner=None,
+        review=None,
+        security_review=None,
+        test_writing=None,
+        tests=None,
+        build_per_step=None,
+        checks=None,
+        require_contract_ready=False,
+        min_contract_score=None,
+        agent_model=agent_model,
+        agent_provider=agent_provider,
+        agent_timeout=agent_timeout,
+        delivery_plan_id=None,
+        delivery_unit_id=None,
+        delivery_plan_path=None,
+        delivery_child_created_callback=None,
+        created_task_id=created_task_id,
+    )
+
+
+def _invoke_delivery_child_run_args(
+    args: argparse.Namespace,
+    cfg: dict,
+    context: DeliveryRunNextContext,
+    run_args: argparse.Namespace,
+) -> DeliveryChildRunResult:
+    run_cfg = copy.deepcopy(cfg)
+    try:
+        if getattr(args, "json", False):
+            with contextlib.redirect_stdout(sys.stderr):
+                raw_result = context.run_task(run_args, run_cfg)
+        else:
+            raw_result = context.run_task(run_args, run_cfg)
+    except SystemExit as exc:
+        return DeliveryChildRunResult(
+            exit_code=_system_exit_code(exc),
+            child_task_id=getattr(run_args, "created_task_id", None),
+        )
+    except KeyboardInterrupt:
+        return DeliveryChildRunResult(
+            exit_code=130,
+            child_task_id=getattr(run_args, "created_task_id", None),
+            interrupted=True,
+        )
+    except Exception as exc:
+        if isinstance(exc, DeliveryChildLinkFailed):
+            child_task_id = getattr(run_args, "created_task_id", None)
+            return DeliveryChildRunResult(
+                exit_code=1,
+                child_task_id=child_task_id,
+                exception=exc,
+                child_link_failed=True,
+            )
+        return DeliveryChildRunResult(
+            exit_code=1,
+            child_task_id=getattr(run_args, "created_task_id", None),
+            exception=exc,
+        )
+    return _coerce_child_run_result(raw_result)
 
 
 def _coerce_child_run_result(result: DeliveryChildRunResult | int | None) -> DeliveryChildRunResult:

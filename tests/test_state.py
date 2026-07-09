@@ -619,6 +619,49 @@ class TestJsonStateStore:
         store = JsonStateStore(tmp_path)
         assert store.load("nonexistent") is None
 
+    @pytest.mark.parametrize(
+        "task_id",
+        [
+            "",
+            "../escape",
+            "a/b",
+            "a b",
+            "bad:task",
+            ".leadingdot",
+            None,
+            0,
+        ],
+    )
+    def test_load_returns_none_for_invalid_task_id(self, tmp_path: Path, task_id) -> None:
+        store = JsonStateStore(tmp_path)
+        assert store.load(task_id) is None  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "task_id",
+        ["", "../escape", "a/b", "a b", "bad:task", ".leadingdot"],
+    )
+    def test_save_rejects_invalid_task_id(self, tmp_path: Path, task_id: str) -> None:
+        store = JsonStateStore(tmp_path)
+        with pytest.raises(ValueError):
+            store.save(TaskState(task_id=task_id, task_description="invalid task"))
+        assert store.list_tasks() == []
+
+    def test_state_store_ignores_invalid_task_ids(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        valid_state = TaskState(task_id="valid-1", task_description="valid task")
+        store.save(valid_state)
+        store.save_text_snapshot("valid-1", "before", {"unit": "abc"})
+
+        store.save_text_snapshot("../escape", "before", {"unit": "abc"})
+        store.delete("../escape")
+        store.delete_text_snapshot("../escape", "before")
+        store.delete_text_snapshots("../escape")
+        store.update_active_operation("../escape", {"phase": "agent"})
+        assert store.load_text_snapshot("../escape", "before") is None
+
+        assert store.load_text_snapshot("valid-1", "before") == {"unit": "abc"}
+        assert store.load("valid-1") is not None
+
     def test_save_updates_updated_at(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
         state = TaskState(task_id="t1", task_description="task")

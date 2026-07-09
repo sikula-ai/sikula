@@ -22,6 +22,14 @@ from typing import Optional
 from core.diagnostics import diagnostic_excerpt, diagnostic_summary_lines
 from core.version import sikula_version
 
+_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def _is_valid_state_task_id(task_id: str) -> bool:
+    if not isinstance(task_id, str):
+        return False
+    return bool(_TASK_ID_RE.fullmatch(task_id))
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -771,9 +779,13 @@ class JsonStateStore(StateStore):
         return [self._dir]
 
     def _path(self, task_id: str) -> Path:
+        if not _is_valid_state_task_id(task_id):
+            raise ValueError(f"Invalid task id: {task_id!r}")
         return self._dir / f"{task_id}.json"
 
     def _snapshot_dir(self, task_id: str) -> Path:
+        if not _is_valid_state_task_id(task_id):
+            raise ValueError(f"Invalid task id: {task_id!r}")
         return self._dir / "_snapshots" / task_id
 
     def _snapshot_path(self, task_id: str, name: str) -> Path:
@@ -803,7 +815,10 @@ class JsonStateStore(StateStore):
 
     def load(self, task_id: str) -> Optional[TaskState]:
         with self._lock:
-            p = self._path(task_id)
+            try:
+                p = self._path(task_id)
+            except ValueError:
+                return None
             if not p.exists():
                 return None
             data = self._read_json(p)
@@ -854,16 +869,22 @@ class JsonStateStore(StateStore):
             return [p.stem for p in sorted(self._dir.glob("*.json"))]
 
     def delete(self, task_id: str) -> None:
+        if not _is_valid_state_task_id(task_id):
+            return
         with self._lock:
             self._path(task_id).unlink(missing_ok=True)
             self._delete_text_snapshots_unlocked(task_id)
 
     def save_text_snapshot(self, task_id: str, name: str, snapshot: dict[str, str | None]) -> None:
+        if not _is_valid_state_task_id(task_id):
+            return
         with self._lock:
             data = {str(path): content if content is None else str(content) for path, content in snapshot.items()}
             self._write_json(self._snapshot_path(task_id, name), {"snapshot": data})
 
     def load_text_snapshot(self, task_id: str, name: str) -> dict[str, str | None] | None:
+        if not _is_valid_state_task_id(task_id):
+            return None
         with self._lock:
             path = self._snapshot_path(task_id, name)
             if not path.exists():
@@ -875,14 +896,20 @@ class JsonStateStore(StateStore):
             return {str(key): value if value is None else str(value) for key, value in snapshot.items()}
 
     def delete_text_snapshot(self, task_id: str, name: str) -> None:
+        if not _is_valid_state_task_id(task_id):
+            return
         with self._lock:
             self._snapshot_path(task_id, name).unlink(missing_ok=True)
 
     def delete_text_snapshots(self, task_id: str) -> None:
+        if not _is_valid_state_task_id(task_id):
+            return
         with self._lock:
             self._delete_text_snapshots_unlocked(task_id)
 
     def update_active_operation(self, task_id: str, active_operation: dict | None) -> None:
+        if not _is_valid_state_task_id(task_id):
+            return
         with self._lock:
             path = self._path(task_id)
             if not path.exists():

@@ -227,11 +227,24 @@ sikula delivery run-next .sikula/delivery/<slug>/plan.yaml \
   --agent-provider fixer=antigravity
 ```
 
-`run-next` without `--dry-run` acquires a parent delivery progress lock, marks
-the selected unit as `running`, creates one child `sikula run` state, then
-updates parent progress with that child task id and a `unit.child_linked` event
-before agent execution. If that update fails, `run-next` stops before agents
-start and reports `delivery.child_link_failed`.
+`run-next` without `--dry-run` acquires a parent delivery progress lock and first
+checks for a recoverable `running` unit. If exactly one unit is running with a
+linked non-terminal child task, it appends a `unit.resume_intent` event first,
+then resumes
+that child through `sikula run --task-id <child_task_id>`. It does not create a
+new child task for that unit.
+If the running unit has no linked child task id, the child state is missing, or the
+child is terminal (`done` or `failed`), `run-next` blocks with a targeted
+deterministic error and does not select a new pending unit.
+If multiple units are `running`, `run-next` also blocks so the operator can
+manually reconcile parent progress.
+When these resume-path blocks occur, `run-next --json` returns allowlisted metadata
+only (error code, task IDs, and paths) and does not expose raw child task state.
+When no running unit blocks, `run-next` marks the selected pending unit as
+`running`, creates one child `sikula run` state, then updates parent progress with
+that child task id and a `unit.child_linked` event before agent execution. If that
+update fails, `run-next` stops before agents start and reports
+`delivery.child_link_failed`.
 When `delivery.child_link_failed` occurs, `run-next` returns the child task id and
 deterministic failure code while omitting absolute filesystem paths from JSON/text
 output.
