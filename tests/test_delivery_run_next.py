@@ -1533,14 +1533,106 @@ def test_cmd_delivery_run_next_blocks_running_unit_without_nonempty_child_task_i
 
 
 @pytest.mark.parametrize(
-    ("child_done", "child_failed"),
+    (
+        "child_done",
+        "child_failed",
+        "result_commit",
+        "worktree_path",
+        "worktree_base",
+        "expected_unit_status",
+        "expected_failure_code",
+        "expected_message",
+        "expected_exit",
+        "expected_succeeded",
+    ),
     [
-        (True, False),
-        (False, True),
+        (
+            True,
+            False,
+            None,
+            None,
+            None,
+            "done",
+            None,
+            "Delivery unit 01-foundation reconciled terminal child task as done.",
+            None,
+            True,
+        ),
+        (
+            True,
+            False,
+            "abc123",
+            None,
+            None,
+            "done",
+            None,
+            "Delivery unit 01-foundation reconciled terminal child task as done.",
+            None,
+            True,
+        ),
+        (
+            False,
+            True,
+            "abc123",
+            None,
+            None,
+            "failed",
+            "child_run_failed",
+            "Delivery unit 01-foundation reconciled terminal child task as failed; inspect child task state.",
+            1,
+            False,
+        ),
+        (
+            True,
+            False,
+            None,
+            "sikula/worktrees/01-foundation-child",
+            None,
+            "failed",
+            "child_run_unfinalized",
+            "Delivery unit 01-foundation reconciled terminal child task as failed; inspect child task state.",
+            1,
+            False,
+        ),
+        (
+            True,
+            False,
+            "abc123",
+            "sikula/worktrees/01-foundation-child",
+            None,
+            "done",
+            None,
+            "Delivery unit 01-foundation reconciled terminal child task as done.",
+            None,
+            True,
+        ),
+        (
+            True,
+            False,
+            None,
+            None,
+            "sikula/worktrees-base/01-foundation-child",
+            "failed",
+            "child_run_unfinalized",
+            "Delivery unit 01-foundation reconciled terminal child task as failed; inspect child task state.",
+            1,
+            False,
+        ),
     ],
 )
-def test_cmd_delivery_run_next_blocks_running_unit_with_terminal_child_state(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], child_done: bool, child_failed: bool
+def test_cmd_delivery_run_next_reconciles_running_unit_with_terminal_child_state(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    child_done: bool,
+    child_failed: bool,
+    result_commit: str | None,
+    worktree_path: str | None,
+    worktree_base: str | None,
+    expected_unit_status: str,
+    expected_failure_code: str | None,
+    expected_message: str,
+    expected_exit: int | None,
+    expected_succeeded: bool,
 ) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
@@ -1553,8 +1645,10 @@ def test_cmd_delivery_run_next_blocks_running_unit_with_terminal_child_state(
     state = _resume_child_state()
     state.done = child_done
     state.failed = child_failed
+    state.result_commit = result_commit
     state.worktree_branch = "sikula/01-foundation-child"
-    state.result_commit = "abc123"
+    state.worktree_path = worktree_path
+    state.worktree_base = worktree_base
     store.save(state)
     called = False
 
@@ -1563,17 +1657,75 @@ def test_cmd_delivery_run_next_blocks_running_unit_with_terminal_child_state(
         called = True
         return DeliveryChildRunResult(exit_code=0)
 
-    with pytest.raises(SystemExit) as exc:
+    if expected_exit is None:
         cmd_delivery_run_next(
             _run_next_args(plan_path, json_output=True),
             cfg,
             _run_next_context(tmp_path, runner),
         )
+        payload = json.loads(capsys.readouterr().out)
+    else:
+        with pytest.raises(SystemExit) as exc:
+            cmd_delivery_run_next(
+                _run_next_args(plan_path, json_output=True),
+                cfg,
+                _run_next_context(tmp_path, runner),
+            )
 
-    assert exc.value.code == 1
-    payload = json.loads(capsys.readouterr().out)
+        assert exc.value.code == expected_exit
+        payload = json.loads(capsys.readouterr().out)
+
     assert called is False
-    assert payload["errors"][0]["code"] == "delivery.running_child_terminal"
+    assert payload["plan_path"] == ".sikula/delivery/demo/plan.yaml"
+    assert payload["progress_path"] == ".sikula/state/delivery/delivery-run-next-demo/progress.json"
+    assert payload["events_path"] == ".sikula/state/delivery/delivery-run-next-demo/events.jsonl"
+    assert payload["ran"] is True
+    assert payload["valid"] is True
+    assert payload["succeeded"] is expected_succeeded
+    assert payload["unit_status"] == expected_unit_status
+    assert payload["child_task_id"] == "resume-child"
+    assert payload["run_exit_code"] is None
+    assert payload["message"] == expected_message
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["selected_unit"]["status"] == expected_unit_status
+    assert payload["selected_unit"]["branch"] == "sikula/01-foundation-child"
+    assert str(tmp_path) not in payload["plan_path"]
+    assert str(tmp_path) not in payload["progress_path"]
+    assert str(tmp_path) not in payload["events_path"]
+    if expected_failure_code is None:
+        assert "failure_code" not in payload["selected_unit"]
+    else:
+        assert payload["selected_unit"]["failure_code"] == expected_failure_code
+    if result_commit is None:
+        assert payload["selected_unit"].get("commit") is None
+    else:
+        assert payload["selected_unit"]["commit"] == result_commit
+    assert payload["errors"] == []
+    assert payload["warnings"] == []
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["status"] == expected_unit_status
+    assert progress["units"][0]["unit_id"] == "01-foundation"
+    assert progress["units"][0]["child_task_id"] == "resume-child"
+    assert progress["units"][0]["branch"] == "sikula/01-foundation-child"
+    if result_commit is None:
+        assert "commit" not in progress["units"][0]
+    else:
+        assert progress["units"][0]["commit"] == result_commit
+    if expected_failure_code is None:
+        assert "failure_code" not in progress["units"][0]
+    else:
+        assert progress["units"][0]["failure_code"] == expected_failure_code
+    events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    parsed_events = [json.loads(event) for event in events]
+    assert [event["event_type"] for event in parsed_events] == [
+        "unit.reconcile_intent",
+        f"unit.{expected_unit_status}",
+    ]
+    assert parsed_events[0]["unit_id"] == "01-foundation"
+    assert parsed_events[0]["status"] == "running"
+    assert parsed_events[1]["unit_id"] == "01-foundation"
+    assert parsed_events[1]["status"] == expected_unit_status
+    assert parsed_events[1]["child_task_id"] == "resume-child"
 
 
 def test_cmd_delivery_run_next_marks_resumed_running_child_failed_when_child_state_missing_after_run(
@@ -1868,6 +2020,26 @@ def test_child_delivery_result_finalized_distinguishes_commits_noops_and_preserv
             argparse.Namespace(result_commit=None, worktree_path=str(tmp_path / "wt"), worktree_base=None)
         )
         is False
+    )
+    assert (
+        _child_delivery_result_finalized(
+            argparse.Namespace(
+                result_commit=None,
+                worktree_path=None,
+                worktree_base="sikula/worktrees-base/01-foundation-child",
+            )
+        )
+        is False
+    )
+    assert (
+        _child_delivery_result_finalized(
+            argparse.Namespace(
+                result_commit="abc123",
+                worktree_path="wt",
+                worktree_base="sikula/worktrees-base/01-foundation-child",
+            )
+        )
+        is True
     )
 
 

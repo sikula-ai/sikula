@@ -1767,27 +1767,48 @@ def _handle_running_delivery_unit(
         )
 
     if child_state.done or child_state.failed:
-        code = "delivery.running_child_terminal"
+        reconcile_unit = make_delivery_unit_progress(
+            unit_id, "running", child_task_id=child_task_id, timestamp=running_unit.started_at
+        )
+        append_delivery_progress_event(
+            events_path,
+            make_delivery_progress_event(plan_id, "unit.reconcile_intent", unit=reconcile_unit),
+        )
+        progress = _progress_for_update(status, progress_path, read_delivery_progress=read_delivery_progress)
+        synthetic_child_result = DeliveryChildRunResult(exit_code=1 if child_state.failed else 0)
+        progress, unit_status = _record_delivery_child_terminal_result(
+            progress=progress,
+            selected_unit=running_unit,
+            child_task_id=child_task_id,
+            child_state=child_state,
+            child_result=synthetic_child_result,
+            plan_id=plan_id,
+            progress_path=progress_path,
+            events_path=events_path,
+        )
+        updated_status = get_delivery_status(args.plan_file, project_root=root)
+        updated_unit = _status_unit_by_id(updated_status, unit_id) or running_unit
         message = (
-            f"Delivery unit {unit_id} is linked to terminal child task {child_task_id}; "
-            "terminal child reconciliation is out of scope for run-next. Inspect delivery status before retrying."
+            f"Delivery unit {unit_id} reconciled terminal child task as done."
+            if unit_status == "done"
+            else f"Delivery unit {unit_id} reconciled terminal child task as failed; inspect child task state."
         )
         return DeliveryRunNextExecutionResult(
             plan_path=blocked_plan_path,
             project_root=".",
-            valid=False,
-            ran=False,
-            succeeded=False,
-            status=status.status,
-            progress_exists=status.progress_exists,
-            selected_unit=running_unit,
+            valid=updated_status.valid,
+            ran=True,
+            succeeded=unit_status == "done" and updated_status.valid,
+            status=updated_status.status,
+            progress_exists=updated_status.progress_exists,
+            selected_unit=updated_unit,
             child_task_id=child_task_id,
-            unit_status=None,
+            unit_status=unit_status,
             run_exit_code=None,
             progress_path=blocked_progress_path,
             events_path=blocked_events_path,
-            errors=[DeliveryPlanIssue("error", code, message)],
-            warnings=status.warnings,
+            errors=updated_status.errors,
+            warnings=updated_status.warnings,
             message=message,
         )
 

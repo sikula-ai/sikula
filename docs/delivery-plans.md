@@ -234,13 +234,20 @@ then resumes that child through `sikula run --task-id <child_task_id>`. The chil
 task state must carry matching delivery metadata for the same parent plan, unit,
 and project-relative plan path before it can be resumed this way. It does not
 create a new child task for that unit.
-If the running unit has no linked child task id, the child state is missing, or the
-child is terminal (`done` or `failed`), `run-next` blocks with a targeted
-deterministic error and does not select a new pending unit.
+If the running unit has no linked child task id, the child state is missing, the
+child metadata does not match this run, or the child is terminal (`done` or
+`failed`) with mismatched metadata, `run-next` blocks with a targeted deterministic
+error and does not select a new pending unit.
+If the running unit has a terminal child with matching metadata, `run-next`
+reconciles through shared completion logic instead of starting a new child run:
+it records `unit.reconcile_intent` first, then records `unit.done` or `unit.failed`
+through the same completion pipeline used after normal child execution.
 If multiple units are `running`, `run-next` also blocks so the operator can
 manually reconcile parent progress.
-When these resume-path blocks occur, `run-next --json` returns allowlisted metadata
+When resume-path blocks occur, `run-next --json` returns allowlisted metadata
 only (error code, task IDs, and paths) and does not expose raw child task state.
+Terminal reconciliation does not duplicate child execution and still reports
+allowlisted JSON/text output.
 When no running unit blocks, `run-next` marks the selected pending unit as
 `running`, creates one child `sikula run` state, then updates parent progress with
 that child task id and a `unit.child_linked` event before agent execution. If that
@@ -262,7 +269,7 @@ child task state is done, and the child result is finalized. A finalized result
 has either a recorded result commit or no preserved task worktree left to
 deliver, which represents a no-op unit. If a child task is done but still keeps a
 worktree without a result commit, the parent unit is recorded as failed with
-`child_run_unfinalized`.
+`child_run_unfinalized`. The same rule applies to terminal-reconciled children.
 
 For dependent units, `run-next` also walks the selected unit's dependency
 closure and checks that each completed prerequisite's recorded result commit,

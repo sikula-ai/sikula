@@ -283,17 +283,22 @@ task state, prepare contracts, create worktrees, start agents, or update
 branches. Its JSON result is also allowlisted metadata only.
 
 **Delivery run-next execution:** `sikula delivery run-next PLAN_FILE` acquires
-the delivery progress lock and refreshes status under that lock. If exactly one unit
-is already `running`, `run-next` first treats that as a resume candidate. If the
-running unit has a linked non-terminal child, it appends a `unit.resume_intent`
-event and resumes the child through
+the delivery progress lock and refreshes status under that lock. If exactly one
+unit is already `running`, `run-next` first treats that as a resume candidate. If
+the running unit has a linked non-terminal child, it appends a
+`unit.resume_intent` event and resumes the child through
 `sikula run --task-id <child_task_id>` before selecting a new unit. The linked
 child task must carry matching delivery metadata for the same parent plan, unit,
 and project-relative plan path before it is trusted for resume.
 If the running unit has no linked child, the linked child state is missing, or the
-linked child is terminal, `run-next` blocks and returns a targeted error without
-selecting pending work. If multiple units are `running`, `run-next` also blocks until
-the parent progress is manually reconciled.
+child metadata does not match for the same parent delivery run, `run-next` blocks
+and returns a targeted error without selecting pending work. If the linked child
+is terminal and metadata matches, `run-next` appends `unit.reconcile_intent`
+then records terminal completion through the shared child-completion classification
+pipeline, producing `unit.done` or `unit.failed` while preserving the existing
+finalization rules.
+If multiple units are `running`, `run-next` also blocks until the parent progress
+is manually reconciled.
 Resume-path blocks return allowlisted metadata only and do not expose
 `TaskState` contents or absolute local paths.
 If no ambiguous/runnable running unit exists, `run-next` selects one eligible pending
