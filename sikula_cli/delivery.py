@@ -2204,7 +2204,13 @@ def _delivery_child_metadata_matches(
 
 
 def _delivery_child_has_resume_worktree(child_state) -> bool:
-    return bool(getattr(child_state, "worktree_path", None))
+    worktree_path = getattr(child_state, "worktree_path", None)
+    if not worktree_path:
+        return False
+    try:
+        return Path(worktree_path).exists()
+    except OSError:
+        return False
 
 
 def _delivery_child_worktree_missing_result(
@@ -2222,7 +2228,7 @@ def _delivery_child_worktree_missing_result(
     code = "delivery.child_worktree_missing"
     message = (
         f"Delivery unit {selected_unit.id} is linked to child task {child_task_id}, but the child task has no "
-        "isolated worktree path recorded; inspect child task state before resuming or retrying."
+        "available isolated worktree path recorded; inspect child task state before resuming or retrying."
     )
     return DeliveryRunNextExecutionResult(
         plan_path=status.plan_path,

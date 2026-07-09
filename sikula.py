@@ -2194,11 +2194,15 @@ def _contract_gate_blocked_without_worktree(state) -> bool:
 
 
 def _delivery_child_without_worktree(state) -> bool:
-    return bool(
-        getattr(state, "delivery_plan_id", None)
-        and getattr(state, "delivery_unit_id", None)
-        and not getattr(state, "worktree_path", None)
-    )
+    if not (getattr(state, "delivery_plan_id", None) and getattr(state, "delivery_unit_id", None)):
+        return False
+    worktree_path = getattr(state, "worktree_path", None)
+    if not worktree_path:
+        return True
+    try:
+        return not Path(worktree_path).exists()
+    except OSError:
+        return True
 
 
 def _contract_gate_next_action(state) -> str:
@@ -2803,6 +2807,7 @@ def _status_context() -> cli_status.StatusContext:
         current_branch_delivery_cleaned=_current_branch_delivery_cleaned,
         contract_gate_blocked_without_worktree=_contract_gate_blocked_without_worktree,
         contract_gate_next_action=_contract_gate_next_action,
+        delivery_child_without_worktree=_delivery_child_without_worktree,
         pid_running=_pid_running,
     )
 

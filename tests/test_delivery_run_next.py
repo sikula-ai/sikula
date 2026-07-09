@@ -1549,7 +1549,7 @@ def test_cmd_delivery_run_next_blocks_running_child_without_isolated_worktree(
     assert payload["child_task_id"] == "resume-child"
     assert payload["selected_unit"]["status"] == "running"
     assert payload["errors"][0]["code"] == "delivery.child_worktree_missing"
-    assert "has no isolated worktree path recorded" in payload["errors"][0]["message"]
+    assert "has no available isolated worktree path recorded" in payload["errors"][0]["message"]
     assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
 
 
@@ -2164,7 +2164,7 @@ def test_cmd_delivery_run_next_reset_failed_blocks_failed_running_child_without_
     assert payload["child_task_id"] == "resume-child"
     assert payload["selected_unit"]["status"] == "running"
     assert payload["errors"][0]["code"] == "delivery.child_worktree_missing"
-    assert "has no isolated worktree path recorded" in payload["errors"][0]["message"]
+    assert "has no available isolated worktree path recorded" in payload["errors"][0]["message"]
     assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
 
 
@@ -2887,7 +2887,55 @@ def test_cmd_delivery_run_next_blocks_failed_child_retry_without_isolated_worktr
     assert payload["child_task_id"] == "task-xyz"
     assert payload["selected_unit"]["status"] == "failed"
     assert payload["errors"][0]["code"] == "delivery.child_worktree_missing"
-    assert "has no isolated worktree path recorded" in payload["errors"][0]["message"]
+    assert "has no available isolated worktree path recorded" in payload["errors"][0]["message"]
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_blocks_failed_child_retry_with_stale_worktree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+        ],
+    )
+
+    state_dir = Path(cfg["tasks"]["state_dir"])
+    store = JsonStateStore(state_dir)
+    state = store.create("task-xyz")
+    state.task_id = "task-xyz"
+    state.delivery_plan_id = "delivery-run-next-demo"
+    state.delivery_unit_id = "01-foundation"
+    state.delivery_plan_path = ".sikula/delivery/demo/plan.yaml"
+    state.worktree_path = str(tmp_path / ".sikula" / "worktrees" / "missing-child")
+    state.worktree_branch = "sikula/stale-child"
+    state.failed = True
+    store.save(state)
+    called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal called
+        called = True
+        return DeliveryChildRunResult(exit_code=0, child_task_id="task-xyz")
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, reset_failed=True, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert called is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is False
+    assert payload["selected_unit"]["status"] == "failed"
+    assert payload["errors"][0]["code"] == "delivery.child_worktree_missing"
+    assert store.load("task-xyz").failed is True
     assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
 
 

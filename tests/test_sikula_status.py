@@ -64,6 +64,27 @@ class TestStatusCliModule:
             == "sikula contract check .sikula/tasks/task.md --write-report"
         )
 
+    def test_default_delivery_child_without_worktree_helper(self, tmp_path: Path):
+        from core.state import TaskState
+        import sikula_cli.status as status_cli
+
+        state = TaskState(
+            task_id="delivery-child",
+            task_description="delivery child",
+            failed=True,
+            delivery_plan_id="plan-123",
+            delivery_unit_id="unit-456",
+        )
+        assert status_cli._status_next_action(state, "FAILED") == "sikula show delivery-child"
+
+        state.worktree_path = str(tmp_path / "missing-worktree")
+        assert status_cli._status_next_action(state, "FAILED") == "sikula show delivery-child"
+
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        state.worktree_path = str(worktree)
+        assert status_cli._status_next_action(state, "FAILED") == "sikula run --task-id delivery-child --reset-failed"
+
     def test_active_operation_fallback_helpers(self):
         from datetime import datetime, timedelta, timezone
         import sikula_cli.status as status_cli
@@ -432,6 +453,28 @@ class TestCmdStatusOutput:
         rows = json.loads(capsys.readouterr().out)
         assert rows[0]["status"] == "FAILED"
         assert rows[0]["next_action"] == "sikula contract check .sikula/tasks/my-task.md --write-report"
+
+    def test_status_json_delivery_child_without_worktree_next_action(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        s = TaskState(
+            task_id="t1",
+            task_description="orphan delivery child",
+            delivery_plan_id="my-plan-123",
+            delivery_unit_id="unit-456",
+            delivery_plan_path=".sikula/delivery/plan.yaml",
+        )
+        s.failed = True
+        s.worktree_path = str(tmp_path / "missing-worktree")
+        store.save(s)
+
+        cfg = {"tasks": {"state_dir": str(tmp_path)}}
+        cmd_status(cfg, argparse.Namespace(json=True, verbose=False, status_filter=[]))
+
+        rows = json.loads(capsys.readouterr().out)
+        assert rows[0]["status"] == "FAILED"
+        assert rows[0]["next_action"] == "sikula show t1"
 
     @pytest.mark.parametrize(
         ("delivery_status", "expected_status"),
