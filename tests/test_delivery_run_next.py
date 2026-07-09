@@ -2939,6 +2939,56 @@ def test_cmd_delivery_run_next_blocks_failed_child_retry_with_stale_worktree(
     assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
 
 
+def test_cmd_delivery_run_next_reconciles_completed_failed_child_retry_without_worktree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+        ],
+    )
+
+    state_dir = Path(cfg["tasks"]["state_dir"])
+    store = JsonStateStore(state_dir)
+    state = store.create("task-xyz")
+    state.task_id = "task-xyz"
+    state.delivery_plan_id = "delivery-run-next-demo"
+    state.delivery_unit_id = "01-foundation"
+    state.delivery_plan_path = ".sikula/delivery/demo/plan.yaml"
+    state.done = True
+    state.result_commit = "abc1234"
+    state.worktree_branch = "sikula/01-foundation-manual"
+    store.save(state)
+    called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal called
+        called = True
+        return DeliveryChildRunResult(exit_code=0, child_task_id="task-xyz")
+
+    cmd_delivery_run_next(
+        _run_next_args(plan_path, reset_failed=True, json_output=True),
+        cfg,
+        _run_next_context(tmp_path, runner),
+    )
+
+    assert called is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is True
+    assert payload["succeeded"] is True
+    assert payload["unit_status"] == "done"
+    assert payload["selected_unit"]["status"] == "done"
+    assert payload["selected_unit"]["commit"] == "abc1234"
+    assert payload["message"] == "Delivery unit 01-foundation reconciled terminal child task as done."
+    events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    parsed_events = [json.loads(event) for event in events]
+    assert [event["event_type"] for event in parsed_events] == ["unit.reconcile_intent", "unit.done"]
+
+
 def test_cmd_delivery_run_next_runs_failed_child_retry(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
@@ -2968,6 +3018,9 @@ def test_cmd_delivery_run_next_runs_failed_child_retry(tmp_path: Path, capsys: p
         assert run_args.task_id == "task-xyz"
         assert run_args.created_task_id == "task-xyz"
         assert run_args.reset_failed is True
+        progress = _load_delivery_progress(tmp_path)
+        assert progress["units"][0]["status"] == "running"
+        assert progress["units"][0]["child_task_id"] == "task-xyz"
         state.done = True
         state.worktree_branch = "sikula/01-foundation-retry"
         state.result_commit = "abc1234"

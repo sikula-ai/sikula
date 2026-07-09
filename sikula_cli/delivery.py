@@ -1805,6 +1805,8 @@ def _run_delivery_child_retry(
         make_delivery_progress_event,
         make_delivery_unit_progress,
         read_delivery_progress,
+        upsert_delivery_unit_progress,
+        write_delivery_progress,
     )
     from core.delivery_run_next import DeliveryRunNextExecutionResult
     from core.state import JsonStateStore
@@ -1838,6 +1840,54 @@ def _run_delivery_child_retry(
             warnings=status.warnings,
             message=message,
         )
+    progress = _progress_for_update(status, progress_path, read_delivery_progress=read_delivery_progress)
+    if child_state.done:
+        reconcile_unit = make_delivery_unit_progress(
+            unit_id,
+            selected_unit.status,
+            child_task_id=child_task_id,
+            timestamp=selected_unit.started_at,
+        )
+        append_delivery_progress_event(
+            events_path,
+            make_delivery_progress_event(plan_id, "unit.reconcile_intent", unit=reconcile_unit),
+        )
+        synthetic_child_result = DeliveryChildRunResult(exit_code=0)
+        progress, unit_status = _record_delivery_child_terminal_result(
+            progress=progress,
+            selected_unit=selected_unit,
+            child_task_id=child_task_id,
+            child_state=child_state,
+            child_result=synthetic_child_result,
+            plan_id=plan_id,
+            progress_path=progress_path,
+            events_path=events_path,
+        )
+        updated_status = get_delivery_status(args.plan_file, project_root=root)
+        updated_unit = _status_unit_by_id(updated_status, unit_id) or selected_unit
+        message = (
+            f"Delivery unit {unit_id} reconciled terminal child task as done."
+            if unit_status == "done"
+            else f"Delivery unit {unit_id} reconciled terminal child task as failed; inspect child task state."
+        )
+        return DeliveryRunNextExecutionResult(
+            plan_path=status.plan_path,
+            project_root=str(root.resolve()),
+            valid=updated_status.valid,
+            ran=True,
+            succeeded=unit_status == "done" and updated_status.valid,
+            status=updated_status.status,
+            progress_exists=updated_status.progress_exists,
+            selected_unit=updated_unit,
+            child_task_id=child_task_id,
+            unit_status=unit_status,
+            run_exit_code=None,
+            progress_path=str(progress_path),
+            events_path=str(events_path),
+            errors=updated_status.errors,
+            warnings=updated_status.warnings,
+            message=message,
+        )
     if not _delivery_child_has_resume_worktree(child_state):
         return _delivery_child_worktree_missing_result(
             status=status,
@@ -1850,7 +1900,7 @@ def _run_delivery_child_retry(
 
     retry_unit = make_delivery_unit_progress(
         unit_id,
-        selected_unit.status,
+        "running",
         child_task_id=child_task_id,
         timestamp=selected_unit.started_at,
     )
@@ -1858,7 +1908,8 @@ def _run_delivery_child_retry(
         events_path,
         make_delivery_progress_event(plan_id, "unit.retry_intent", unit=retry_unit),
     )
-    progress = _progress_for_update(status, progress_path, read_delivery_progress=read_delivery_progress)
+    progress = upsert_delivery_unit_progress(progress, retry_unit)
+    write_delivery_progress(progress_path, progress)
 
     run_args = _delivery_child_resume_run_args(
         child_task_id=child_task_id,
