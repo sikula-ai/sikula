@@ -441,8 +441,11 @@ metadata such as written artifact paths, plan validation status, unit readiness,
 plan metadata, validation issues, unit paths, compact progress fields, selected
 child task IDs, final branch metadata, and branch/commit pointers when
 available. They do not embed child task state, source task bodies, unit task file bodies, prompts,
-provider output, diffs, logs, validation output, credentials, tokens, or source excerpts. They do not expose absolute local
-paths. The parent plan path stored in the child task state is saved as a
-project-relative path (`delivery_plan_path`). This metadata is strictly
-allowlisted state metadata and does not expose raw prompts, provider output,
-diffs, logs, or source excerpts.
+provider output, diffs, logs, validation output, credentials, tokens, or source excerpts.
+Privacy-safe projections such as `delivery prepare --json`, `delivery status --json`,
+and `delivery run-next --json` use project-relative paths for local delivery artifacts
+where possible. Operator/audit commands such as `delivery check --json` and
+`delivery finalize --json` may include local plan, progress, or events paths. The
+parent plan path stored in the child task state is saved as a project-relative path
+(`delivery_plan_path`). This metadata is strictly allowlisted state metadata and
+does not expose raw prompts, provider output, diffs, logs, or source excerpts.

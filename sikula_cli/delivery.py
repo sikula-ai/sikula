@@ -1616,6 +1616,8 @@ def _apply_delivery_preview_execution_guards(preview, plan_file: str | Path, *, 
             warnings=list(status.warnings) or list(preview.warnings),
             message="Delivery plan is not ready to run.",
         )
+    if selected_unit.status == "running":
+        return replace(preview, selected_unit=selected_unit)
 
     dependency_errors = _dependency_commit_errors(status, selected_unit, Path(status.project_root).resolve())
     if not dependency_errors:

@@ -190,19 +190,28 @@ def preview_delivery_run_next(
         errors.insert(0, git_root_error)
 
     if status.valid and not errors:
-        selected_unit = select_next_delivery_unit(status, reset_failed=reset_failed)
-        if selected_unit:
-            if reset_failed:
-                message = (
-                    f"Dry run selected failed delivery unit {selected_unit.id}; "
-                    "no unit was run and delivery progress was not changed."
-                )
-            else:
-                message = (
-                    f"Dry run selected delivery unit {selected_unit.id}; "
-                    "no unit was run and delivery progress was not changed."
-                )
+        running_recovery_unit = _select_running_recovery_unit(status)
+        if running_recovery_unit:
+            selected_unit = running_recovery_unit
+            action_text = "resume, retry, or reconciliation" if reset_failed else "resume or reconciliation"
+            message = (
+                f"Dry run selected running delivery unit {selected_unit.id}; run-next will inspect the linked "
+                f"child task for {action_text} without selecting pending work."
+            )
         else:
+            selected_unit = select_next_delivery_unit(status, reset_failed=reset_failed)
+            if selected_unit:
+                if reset_failed:
+                    message = (
+                        f"Dry run selected failed delivery unit {selected_unit.id}; "
+                        "no unit was run and delivery progress was not changed."
+                    )
+                else:
+                    message = (
+                        f"Dry run selected delivery unit {selected_unit.id}; "
+                        "no unit was run and delivery progress was not changed."
+                    )
+        if selected_unit is None:
             code, message = _blocked_run_next_reason(status.status, reset_failed=reset_failed)
             errors.append(DeliveryPlanIssue("error", code, message))
 
@@ -223,6 +232,13 @@ def preview_delivery_run_next(
         warnings=warnings,
         message=message,
     )
+
+
+def _select_running_recovery_unit(status) -> DeliveryStatusUnit | None:
+    running_units = [unit for unit in status.units if unit.status == "running"]
+    if len(running_units) == 1 and running_units[0].child_task_id:
+        return running_units[0]
+    return None
 
 
 def render_delivery_run_next_preview(result: DeliveryRunNextPreview) -> str:

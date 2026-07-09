@@ -365,6 +365,37 @@ def test_preview_delivery_run_next_respects_completed_dependencies(tmp_path: Pat
 
 
 @pytest.mark.parametrize(
+    ("reset_failed", "expected_message"),
+    [
+        (False, "resume or reconciliation"),
+        (True, "resume, retry, or reconciliation"),
+    ],
+)
+def test_preview_delivery_run_next_selects_running_unit_with_child_task(
+    tmp_path: Path, reset_failed: bool, expected_message: str
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"},
+        ],
+    )
+
+    result = preview_delivery_run_next(plan_path, reset_failed=reset_failed)
+
+    assert result.valid is True
+    assert result.ready is True
+    assert result.selected_unit is not None
+    assert result.selected_unit.id == "01-foundation"
+    assert result.selected_unit.status == "running"
+    assert result.selected_unit.child_task_id == "resume-child"
+    assert result.errors == []
+    assert expected_message in result.message
+
+
+@pytest.mark.parametrize(
     ("status", "code"),
     [
         ("running", "delivery.running"),
@@ -1052,6 +1083,34 @@ def test_cmd_delivery_run_next_dry_run_blocks_dependent_unit_when_dependency_com
     assert payload["selected_unit"]["id"] == "02-feature"
     assert payload["errors"][0]["code"] == "delivery.dependency_commit_unapplied"
     assert "01-foundation" in payload["errors"][0]["message"]
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_dry_run_reports_running_recovery_even_when_dependency_commit_unapplied(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "done", "commit": "deadbeef", "branch": "sikula/unit-01"},
+            {"unit_id": "02-feature", "status": "running", "child_task_id": "resume-child"},
+        ],
+    )
+
+    cmd_delivery_run_next(
+        _run_next_args(plan_path, dry_run=True, json_output=True),
+        _run_next_cfg(tmp_path),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
+    assert payload["selected_unit"]["id"] == "02-feature"
+    assert payload["selected_unit"]["status"] == "running"
+    assert payload["selected_unit"]["child_task_id"] == "resume-child"
+    assert payload["errors"] == []
+    assert "resume or reconciliation" in payload["message"]
     assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
 
 
