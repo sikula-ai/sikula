@@ -241,8 +241,10 @@ child metadata does not match this run, or the child is terminal (`done` or
 error and does not select a new pending unit.
 Without `--reset-failed`, failed units block instead of silently rerunning children.
 With `--reset-failed`, if no ambiguous running unit exists, `run-next` selects the
-first failed unit with a linked child task id before pending work. This change does
-not yet forward reset semantics to the child task itself.
+first failed unit with a linked child task id before pending work. It preserves the
+same parent unit and child task id, appends a `unit.retry_intent` event, and
+forwards reset semantics to the child task path (`sikula run --task-id <child_task_id> --reset-failed`).
+The JSON/text output remains privacy-safe and allowlisted.
 If the running unit has a terminal child with matching metadata, `run-next`
 reconciles through shared completion logic instead of starting a new child run:
 it records `unit.reconcile_intent` first, then records `unit.done` or `unit.failed`

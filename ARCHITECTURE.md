@@ -300,9 +300,10 @@ then records terminal completion through the shared child-completion classificat
 pipeline, producing `unit.done` or `unit.failed` while preserving the existing
 finalization rules.
 With `--reset-failed`, if no ambiguous running unit exists, it targets the first
-failed unit with a linked child task id. This unit is selection-only: it returns
-the targeted unit and child task id without starting or resetting the child run, and
-does not forward reset semantics to child args.
+failed unit with a linked child task id. It appends a `unit.retry_intent` event,
+invokes `sikula run --task-id <child_task_id> --reset-failed`, preserves the same
+parent unit and child task id after metadata validation, and records final status
+through the shared child-completion classification path.
 If multiple units are `running`, `run-next` also blocks until the parent progress
 is manually reconciled.
 Resume-path blocks return allowlisted metadata only and do not expose

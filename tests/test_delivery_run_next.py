@@ -1901,20 +1901,22 @@ def test_cmd_delivery_run_next_blocks_multiple_running_units_before_pending_sele
     assert payload["events_path"] == ".sikula/state/delivery/delivery-run-next-demo/events.jsonl"
 
 
-def test_delivery_child_resume_run_args_uses_task_id_resume_shape() -> None:
+@pytest.mark.parametrize("reset_failed", [False, True])
+def test_delivery_child_resume_run_args_uses_task_id_resume_shape(reset_failed: bool) -> None:
     args = _delivery_child_resume_run_args(
         child_task_id="resume-child",
         created_task_id="resume-child",
         agent_model=["analyst=gpt-5.5"],
         agent_provider=["implementer=antigravity"],
         agent_timeout=["implementer=2400"],
+        reset_failed=reset_failed,
     )
 
     assert args.task_file is None
     assert args.task_id == "resume-child"
     assert args.task_file_pos is None
     assert args.no_isolate is False
-    assert args.reset_failed is False
+    assert args.reset_failed is reset_failed
     assert args.delivery_plan_id is None
     assert args.delivery_unit_id is None
     assert args.delivery_plan_path is None
@@ -2425,7 +2427,7 @@ def test_cmd_delivery_run_next_omits_unsafe_metadata_plan_path(tmp_path: Path, m
     assert captured_args.delivery_plan_path is None
 
 
-def test_cmd_delivery_run_next_returns_failed_child_run_with_reset_failed(
+def test_cmd_delivery_run_next_blocks_missing_child_task_state_for_retry(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _git_init(tmp_path)
@@ -2438,22 +2440,14 @@ def test_cmd_delivery_run_next_returns_failed_child_run_with_reset_failed(
         ],
     )
 
-    child_called = False
-
-    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
-        nonlocal child_called
-        child_called = True
-        return DeliveryChildRunResult(exit_code=0, child_task_id="new-task")
-
     with pytest.raises(SystemExit) as exc:
         cmd_delivery_run_next(
             _run_next_args(plan_path, reset_failed=True, json_output=True),
             cfg,
-            _run_next_context(tmp_path, runner),
+            _run_next_context(tmp_path, lambda *args: None),
         )
 
     assert exc.value.code == 1
-    assert child_called is False
     payload = json.loads(capsys.readouterr().out)
     assert payload["ran"] is False
     assert payload["succeeded"] is False
@@ -2464,8 +2458,240 @@ def test_cmd_delivery_run_next_returns_failed_child_run_with_reset_failed(
     assert payload["selected_unit"]["id"] == "01-foundation"
     assert payload["selected_unit"]["status"] == "failed"
     assert len(payload["errors"]) == 1
-    assert payload["errors"][0]["code"] == "delivery.reset_failed_forwarding_pending"
-    assert "forwarding --reset-failed to the child task is not available yet" in payload["errors"][0]["message"]
+    assert payload["errors"][0]["code"] == "delivery.child_task_missing"
+    assert "was not found in the configured state directory" in payload["errors"][0]["message"]
+
+
+def test_cmd_delivery_run_next_blocks_child_task_metadata_mismatch_for_retry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+        ],
+    )
+
+    state_dir = Path(cfg["tasks"]["state_dir"])
+    store = JsonStateStore(state_dir)
+    state = store.create("task-xyz")
+    state.task_id = "task-xyz"
+    state.delivery_plan_id = "other-plan"
+    store.save(state)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, reset_failed=True, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, lambda *args: None),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is False
+    assert payload["succeeded"] is False
+    assert payload["valid"] is False
+    assert payload["status"] == "failed"
+    assert payload["unit_status"] == "failed"
+    assert payload["child_task_id"] == "task-xyz"
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["selected_unit"]["status"] == "failed"
+    assert len(payload["errors"]) == 1
+    assert payload["errors"][0]["code"] == "delivery.child_task_metadata_mismatch"
+    assert "metadata does not match the parent plan" in payload["errors"][0]["message"]
+
+
+def test_cmd_delivery_run_next_runs_failed_child_retry(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+        ],
+    )
+
+    state_dir = Path(cfg["tasks"]["state_dir"])
+    store = JsonStateStore(state_dir)
+    state = store.create("task-xyz")
+    state.task_id = "task-xyz"
+    state.delivery_plan_id = "delivery-run-next-demo"
+    state.delivery_unit_id = "01-foundation"
+    state.delivery_plan_path = ".sikula/delivery/demo/plan.yaml"
+    store.save(state)
+
+    child_called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal child_called
+        child_called = True
+        assert run_args.task_id == "task-xyz"
+        assert run_args.created_task_id == "task-xyz"
+        assert run_args.reset_failed is True
+        state.done = True
+        state.worktree_branch = "sikula/01-foundation-retry"
+        state.result_commit = "abc1234"
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=0, child_task_id="task-xyz")
+
+    cmd_delivery_run_next(
+        _run_next_args(plan_path, reset_failed=True, json_output=True),
+        cfg,
+        _run_next_context(tmp_path, runner),
+    )
+
+    assert child_called is True
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is True
+    assert payload["succeeded"] is True
+    assert payload["valid"] is True
+    assert payload["status"] == "pending"
+    assert payload["unit_status"] == "done"
+    assert payload["child_task_id"] == "task-xyz"
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["selected_unit"]["status"] == "done"
+    assert payload["selected_unit"]["branch"] == "sikula/01-foundation-retry"
+
+    events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    parsed_events = [json.loads(event) for event in events]
+    assert [event["event_type"] for event in parsed_events] == ["unit.retry_intent", "unit.done"]
+    assert parsed_events[0]["unit_id"] == "01-foundation"
+    assert parsed_events[0]["child_task_id"] == "task-xyz"
+    assert parsed_events[1]["unit_id"] == "01-foundation"
+    assert parsed_events[1]["child_task_id"] == "task-xyz"
+
+
+def test_cmd_delivery_run_next_reports_failed_child_retry(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+        ],
+    )
+
+    state_dir = Path(cfg["tasks"]["state_dir"])
+    store = JsonStateStore(state_dir)
+    state = store.create("task-xyz")
+    state.task_id = "task-xyz"
+    state.delivery_plan_id = "delivery-run-next-demo"
+    state.delivery_unit_id = "01-foundation"
+    state.delivery_plan_path = ".sikula/delivery/demo/plan.yaml"
+    store.save(state)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        state.failed = True
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=1, child_task_id="task-xyz")
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, reset_failed=True, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is True
+    assert payload["succeeded"] is False
+    assert payload["valid"] is True
+    assert payload["status"] == "failed"
+    assert payload["unit_status"] == "failed"
+    assert payload["child_task_id"] == "task-xyz"
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["selected_unit"]["status"] == "failed"
+
+    events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    parsed_events = [json.loads(event) for event in events]
+    assert [event["event_type"] for event in parsed_events] == ["unit.retry_intent", "unit.failed"]
+    assert parsed_events[1]["failure_code"] == "child_run_failed"
+
+
+def test_cmd_delivery_run_next_retries_failed_child_and_marks_exception_parent_unit(
+    tmp_path: Path,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+        ],
+    )
+
+    state_dir = Path(cfg["tasks"]["state_dir"])
+    store = JsonStateStore(state_dir)
+    state = store.create("task-xyz")
+    state.task_id = "task-xyz"
+    state.delivery_plan_id = "delivery-run-next-demo"
+    state.delivery_unit_id = "01-foundation"
+    state.delivery_plan_path = ".sikula/delivery/demo/plan.yaml"
+    store.save(state)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        raise RuntimeError("child task crashed during retry")
+
+    with pytest.raises(RuntimeError, match="child task crashed during retry"):
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, reset_failed=True, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["status"] == "failed"
+    assert progress["units"][0]["failure_code"] == "child_run_exception"
+    events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    parsed_events = [json.loads(event) for event in events]
+    assert [event["event_type"] for event in parsed_events] == ["unit.retry_intent", "unit.failed"]
+
+
+def test_cmd_delivery_run_next_retries_failed_child_and_handles_interrupt(
+    tmp_path: Path,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+        ],
+    )
+
+    state_dir = Path(cfg["tasks"]["state_dir"])
+    store = JsonStateStore(state_dir)
+    state = store.create("task-xyz")
+    state.task_id = "task-xyz"
+    state.delivery_plan_id = "delivery-run-next-demo"
+    state.delivery_unit_id = "01-foundation"
+    state.delivery_plan_path = ".sikula/delivery/demo/plan.yaml"
+    store.save(state)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, reset_failed=True, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["status"] == "failed"
+    assert progress["units"][0]["failure_code"] == "child_run_interrupted"
+    events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    parsed_events = [json.loads(event) for event in events]
+    assert [event["event_type"] for event in parsed_events] == ["unit.retry_intent", "unit.failed"]
 
 
 def test_project_relative_path(tmp_path: Path) -> None:
