@@ -3727,6 +3727,87 @@ class TestCmdRunNoIsolateWarnings:
 
 
 class TestCmdRunChildDeliveryMetadata:
+    def test_cmd_run_calls_delivery_child_created_callback_for_task_file(self, tmp_path: Path) -> None:
+        task_file = tmp_path / "task.md"
+        task_file.write_text("do something")
+
+        callback_calls: list[str] = []
+        callback_state_seen = {"called": False}
+
+        def capture_orch(
+            cfg_arg: dict, overrides: dict | None = None, state_store: JsonStateStore | None = None
+        ) -> MagicMock:
+            mock = MagicMock()
+            assert state_store is not None
+            assert callback_state_seen["called"] is True
+            assert len(callback_calls) == 1
+            tasks = state_store.list_tasks()
+            assert tasks
+            assert tasks[0] == callback_calls[0]
+            state = state_store.load(tasks[0])
+            assert state is not None
+            state.done = True
+            mock.run.return_value = state
+            return mock
+
+        def callback(task_id: str) -> None:
+            callback_calls.append(task_id)
+            callback_state_seen["called"] = True
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            args = _run_args(
+                task_file=str(task_file),
+                no_isolate=True,
+                delivery_child_created_callback=callback,
+            )
+            cmd_run(args, _run_cfg(tmp_path))
+
+        exit_mock.assert_called_with(0)
+        assert len(callback_calls) == 1
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        tasks = store.list_tasks()
+        assert len(tasks) == 1
+        state = store.load(tasks[0])
+        assert state is not None
+        assert state.task_id == callback_calls[0]
+
+    def test_cmd_run_propagates_delivery_child_created_callback_exception(self, tmp_path: Path) -> None:
+        task_file = tmp_path / "task.md"
+        task_file.write_text("explode when linking child")
+
+        callback_calls: list[str] = []
+
+        def callback(_task_id: str) -> None:
+            callback_calls.append(_task_id)
+            raise RuntimeError("delivery link failed")
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula.build_orchestrator") as build_orchestrator,
+        ):
+            with pytest.raises(RuntimeError, match="delivery link failed"):
+                cmd_run(
+                    _run_args(
+                        task_file=str(task_file),
+                        no_isolate=True,
+                        delivery_child_created_callback=callback,
+                    ),
+                    _run_cfg(tmp_path),
+                )
+
+        assert len(callback_calls) == 1
+        build_orchestrator.assert_not_called()
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        tasks = store.list_tasks()
+        assert len(tasks) == 1
+        state = store.load(tasks[0])
+        assert state is not None
+        assert state.task_id == callback_calls[0]
+
     def test_cmd_run_forwards_delivery_metadata(self, tmp_path: Path) -> None:
         task_file = tmp_path / "task.md"
         task_file.write_text("do something")
@@ -3855,3 +3936,36 @@ class TestCmdRunChildDeliveryMetadata:
         assert loaded.delivery_plan_id == "preserved-plan"
         assert loaded.delivery_unit_id == "preserved-unit"
         assert loaded.delivery_plan_path == ".sikula/delivery/preserved.yaml"
+
+    def test_cmd_run_task_id_resume_does_not_call_delivery_child_created_callback(self, tmp_path: Path) -> None:
+        from core.state import TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        state = TaskState(task_id="abc123", task_description="resume me")
+        store.save(state)
+
+        callback_calls: list[str] = []
+
+        def capture_orch(
+            cfg_arg: dict, overrides: dict | None = None, state_store: JsonStateStore | None = None
+        ) -> MagicMock:
+            mock = MagicMock()
+            loaded = state_store.load("abc123")
+            assert loaded is not None
+            loaded.done = True
+            mock.run.return_value = loaded
+            return mock
+
+        with (
+            patch("sikula.build_orchestrator", side_effect=capture_orch),
+            patch("sys.exit") as exit_mock,
+        ):
+            args = _run_args(
+                task_id="abc123",
+                delivery_child_created_callback=lambda task_id: callback_calls.append(task_id),
+            )
+            cmd_run(args, _run_cfg(tmp_path))
+
+        exit_mock.assert_called_with(0)
+        assert callback_calls == []

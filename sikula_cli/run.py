@@ -257,6 +257,9 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             context.contract_preflight_record_result(state.implementation_contract),
         )
         store.save(state)
+        callback = getattr(args, "delivery_child_created_callback", None)
+        if callback is not None:
+            callback(state.task_id)
         context.print_contract_preflight_summary(state.implementation_contract)
         gate_failures = context.contract_readiness_gate_failures(
             state.implementation_contract,

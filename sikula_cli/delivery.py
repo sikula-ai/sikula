@@ -1061,6 +1061,11 @@ class DeliveryChildRunResult:
     child_task_id: str | None = None
     interrupted: bool = False
     exception: BaseException | None = None
+    child_link_failed: bool = False
+
+
+class DeliveryChildLinkFailed(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -1236,6 +1241,24 @@ def _run_next_delivery_unit(
             make_delivery_progress_event(plan_id, "unit.running", unit=running_unit),
         )
 
+        def link_child_task(child_task_id: str) -> None:
+            nonlocal progress
+            try:
+                linked_unit = make_delivery_unit_progress(
+                    selected_unit.id,
+                    "running",
+                    child_task_id=child_task_id,
+                    timestamp=running_unit.started_at,
+                )
+                progress = upsert_delivery_unit_progress(progress, linked_unit)
+                write_delivery_progress(progress_path, progress)
+                append_delivery_progress_event(
+                    events_path,
+                    make_delivery_progress_event(plan_id, "unit.child_linked", unit=linked_unit),
+                )
+            except Exception as exc:
+                raise DeliveryChildLinkFailed() from exc
+
         try:
             delivery_plan_path = Path(status.plan_path).resolve().relative_to(root.resolve()).as_posix()
         except ValueError:
@@ -1250,10 +1273,48 @@ def _run_next_delivery_unit(
             delivery_plan_id=plan_id,
             delivery_unit_id=selected_unit.id,
             delivery_plan_path=delivery_plan_path,
+            delivery_child_created_callback=link_child_task,
         )
         state_dir = context.resolve_state_dir(cfg)
         store = JsonStateStore(state_dir)
         child_task_id = child_result.child_task_id
+        if child_result.child_link_failed:
+            updated_status = get_delivery_status(args.plan_file, project_root=project_root)
+            errors = list(updated_status.errors)
+            safe_plan_path = (
+                _project_relative_path(Path(status.plan_path), root)
+                if _path_is_within(Path(status.plan_path), root)
+                else Path(status.plan_path).name
+            )
+            safe_progress_path = (
+                _project_relative_path(progress_path, root) if _path_is_within(progress_path, root) else None
+            )
+            safe_events_path = _project_relative_path(events_path, root) if _path_is_within(events_path, root) else None
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery.child_link_failed",
+                    "Delivery child task was created, but parent progress could not record the child task id. Child agents were not started; inspect the child task state before retrying.",
+                )
+            )
+            return DeliveryRunNextExecutionResult(
+                plan_path=safe_plan_path,
+                project_root=_project_relative_path(root, root),
+                valid=False,
+                ran=True,
+                succeeded=False,
+                status=updated_status.status,
+                progress_exists=updated_status.progress_exists,
+                selected_unit=_status_unit_by_id(updated_status, selected_unit.id) or selected_unit,
+                child_task_id=child_task_id,
+                unit_status=None,
+                run_exit_code=child_result.exit_code,
+                progress_path=safe_progress_path,
+                events_path=safe_events_path,
+                errors=errors,
+                warnings=updated_status.warnings,
+                message="Delivery child task was created, but parent progress could not record the child task id. Child agents were not started; inspect the child task state before retrying.",
+            )
         if child_task_id is None:
             _restore_delivery_progress(progress_path, progress_before_start, existed=progress_existed_before_start)
             start_failed_unit = make_delivery_unit_progress(selected_unit.id, "pending")
@@ -1575,6 +1636,7 @@ def _invoke_delivery_child_run(
     delivery_plan_id: str | None = None,
     delivery_unit_id: str | None = None,
     delivery_plan_path: str | None = None,
+    delivery_child_created_callback: Callable[[str], None] | None = None,
 ) -> DeliveryChildRunResult:
     run_args = _delivery_child_run_args(
         root=root,
@@ -1585,6 +1647,7 @@ def _invoke_delivery_child_run(
         delivery_plan_id=delivery_plan_id,
         delivery_unit_id=delivery_unit_id,
         delivery_plan_path=delivery_plan_path,
+        delivery_child_created_callback=delivery_child_created_callback,
     )
     run_cfg = copy.deepcopy(cfg)
     try:
@@ -1605,6 +1668,14 @@ def _invoke_delivery_child_run(
             interrupted=True,
         )
     except Exception as exc:
+        if isinstance(exc, DeliveryChildLinkFailed):
+            child_task_id = getattr(run_args, "created_task_id", None)
+            return DeliveryChildRunResult(
+                exit_code=1,
+                child_task_id=child_task_id,
+                exception=exc,
+                child_link_failed=True,
+            )
         return DeliveryChildRunResult(
             exit_code=1,
             child_task_id=getattr(run_args, "created_task_id", None),
@@ -1623,6 +1694,7 @@ def _delivery_child_run_args(
     delivery_plan_id: str | None = None,
     delivery_unit_id: str | None = None,
     delivery_plan_path: str | None = None,
+    delivery_child_created_callback: Callable[[str], None] | None = None,
 ) -> argparse.Namespace:
     absolute_task_path = (root / task_path).resolve()
     return argparse.Namespace(
@@ -1649,6 +1721,7 @@ def _delivery_child_run_args(
         delivery_plan_id=delivery_plan_id,
         delivery_unit_id=delivery_unit_id,
         delivery_plan_path=delivery_plan_path,
+        delivery_child_created_callback=delivery_child_created_callback,
     )
 
 

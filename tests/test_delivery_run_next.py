@@ -27,6 +27,7 @@ from core.delivery_run_next import _blocked_run_next_reason
 from core.state import JsonStateStore
 from sikula_cli.delivery import (
     DeliveryChildRunResult,
+    DeliveryChildLinkFailed,
     DeliveryRunNextContext,
     _child_delivery_result_finalized,
     _classify_delivery_child_run,
@@ -457,6 +458,9 @@ def test_cmd_delivery_run_next_runs_selected_unit_and_records_progress(
         assert run_args.agent_timeout == ["implementer=2400"]
         store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
         state = store.create("child task")
+        store.save(state)
+        run_args.created_task_id = state.task_id
+        run_args.delivery_child_created_callback(state.task_id)
         state.done = True
         state.worktree_branch = "sikula/01-foundation-child"
         state.result_commit = "abc1234"
@@ -501,7 +505,78 @@ def test_cmd_delivery_run_next_runs_selected_unit_and_records_progress(
         }
     ]
     events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
-    assert [json.loads(event)["event_type"] for event in events] == ["unit.running", "unit.done"]
+    parsed_events = [json.loads(event) for event in events]
+    assert [event["event_type"] for event in parsed_events] == ["unit.running", "unit.child_linked", "unit.done"]
+    assert parsed_events[1]["unit_id"] == "01-foundation"
+    assert parsed_events[1]["status"] == "running"
+    assert parsed_events[1]["child_task_id"] == payload["child_task_id"]
+    assert parsed_events[2]["unit_id"] == "01-foundation"
+    assert parsed_events[2]["child_task_id"] == payload["child_task_id"]
+
+
+def test_cmd_delivery_run_next_reports_child_link_failure_if_parent_progress_link_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    created_child_ids: list[str] = []
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        state = store.create("child task")
+        store.save(state)
+        run_args.created_task_id = state.task_id
+        created_child_ids.append(state.task_id)
+        run_args.delivery_child_created_callback(state.task_id)
+        state.done = True
+        state.worktree_branch = "sikula/01-foundation-child"
+        state.result_commit = "abc1234"
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
+
+    import core.delivery_progress as delivery_progress
+
+    original_write_delivery_progress = delivery_progress.write_delivery_progress
+    write_calls = {"count": 0}
+
+    def fail_after_first_write(path: Path, progress) -> None:
+        write_calls["count"] += 1
+        if write_calls["count"] == 2:
+            raise RuntimeError("parent progress write blocked")
+        return original_write_delivery_progress(path, progress)
+
+    monkeypatch.setattr(delivery_progress, "write_delivery_progress", fail_after_first_write)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is True
+    assert payload["valid"] is False
+    assert payload["succeeded"] is False
+    assert payload["child_task_id"] is not None
+    assert payload["child_task_id"] in created_child_ids
+    assert payload["unit_status"] is None
+    assert payload["errors"][0]["code"] == "delivery.child_link_failed"
+    assert payload["errors"][0]["message"] == (
+        "Delivery child task was created, but parent progress could not record the child task id. "
+        "Child agents were not started; inspect the child task state before retrying."
+    )
+    assert "parent progress write blocked" not in payload["message"]
+    assert "parent progress write blocked" not in payload["errors"][0]["message"]
+
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["status"] == "running"
+    assert progress["units"][0].get("failure_code") is None
+    assert progress["units"][0].get("child_task_id") is None
+    events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(event)["event_type"] for event in events] == ["unit.running"]
 
 
 def test_cmd_delivery_run_next_preserves_unknown_progress_entries(
@@ -1109,6 +1184,10 @@ def test_delivery_child_run_helpers_cover_exit_and_result_shapes(tmp_path: Path)
         run_args.created_task_id = "created-child"
         raise SystemExit(0)
 
+    def raises_child_link_failed(run_args: argparse.Namespace, run_cfg: dict) -> int:
+        run_args.created_task_id = "link-failed-child"
+        raise DeliveryChildLinkFailed()
+
     assert (
         _invoke_delivery_child_run(
             args, cfg, _run_next_context(tmp_path, raises_none), root=root, task_path=task_path
@@ -1135,10 +1214,32 @@ def test_delivery_child_run_helpers_cover_exit_and_result_shapes(tmp_path: Path)
     )
     assert created_result.exit_code == 0
     assert created_result.child_task_id == "created-child"
+    link_failed_result = _invoke_delivery_child_run(
+        args,
+        cfg,
+        _run_next_context(tmp_path, raises_child_link_failed),
+        root=root,
+        task_path=task_path,
+    )
+    assert link_failed_result.exit_code == 1
+    assert link_failed_result.child_link_failed is True
+    assert link_failed_result.child_task_id == "link-failed-child"
     assert _coerce_child_run_result(7).exit_code == 7
     assert _coerce_child_run_result(None).exit_code == 0
     assert _system_exit_code(SystemExit(3)) == 3
     assert _delivery_child_run_args(root=root, task_path=task_path).task_file == str((root / task_path).resolve())
+
+
+def test_delivery_child_run_args_keeps_child_created_callback() -> None:
+    def callback(_task_id: str) -> None:
+        pass
+
+    args = _delivery_child_run_args(
+        root=Path("/fake/root"),
+        task_path="tasks/unit.md",
+        delivery_child_created_callback=callback,
+    )
+    assert args.delivery_child_created_callback is callback
 
 
 def test_child_delivery_result_finalized_distinguishes_commits_noops_and_preserved_worktrees(tmp_path: Path) -> None:
@@ -1326,6 +1427,9 @@ def test_delivery_child_run_args_metadata(plan_id: str | None, unit_id: str | No
 def test_invoke_delivery_child_run_forwards_metadata(tmp_path: Path) -> None:
     captured_args = None
 
+    def callback(_task_id: str) -> None:
+        pass
+
     def dummy_runner(args: argparse.Namespace, cfg: dict) -> DeliveryChildRunResult:
         nonlocal captured_args
         captured_args = args
@@ -1346,12 +1450,14 @@ def test_invoke_delivery_child_run_forwards_metadata(tmp_path: Path) -> None:
         delivery_plan_id="my-plan-id",
         delivery_unit_id="my-unit-id",
         delivery_plan_path="my-plan-path",
+        delivery_child_created_callback=callback,
     )
 
     assert captured_args is not None
     assert captured_args.delivery_plan_id == "my-plan-id"
     assert captured_args.delivery_unit_id == "my-unit-id"
     assert captured_args.delivery_plan_path == "my-plan-path"
+    assert captured_args.delivery_child_created_callback is callback
 
 
 def test_cmd_delivery_run_next_computes_and_forwards_metadata(
