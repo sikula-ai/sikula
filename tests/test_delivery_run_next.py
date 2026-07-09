@@ -142,6 +142,22 @@ def _write_plan(root: Path) -> Path:
     return path
 
 
+def _resume_child_state(
+    *,
+    task_id: str = "resume-child",
+    unit_id: str = "01-foundation",
+    plan_id: str = "delivery-run-next-demo",
+    plan_path: str | None = ".sikula/delivery/demo/plan.yaml",
+) -> TaskState:
+    return TaskState(
+        task_id=task_id,
+        task_description="resume child",
+        delivery_plan_id=plan_id,
+        delivery_unit_id=unit_id,
+        delivery_plan_path=plan_path,
+    )
+
+
 def _write_transitive_plan(root: Path) -> Path:
     unit_1 = _write_unit(root, "01-foundation.md", "# Unit 01\n\nPrivate task body.\n")
     unit_2 = _write_unit(root, "02-noop.md", "# Unit 02\n\nNo-op follow-up.\n")
@@ -1147,7 +1163,7 @@ def test_cmd_delivery_run_next_resumes_non_terminal_running_child_unit(
     cfg = _run_next_cfg(tmp_path)
 
     store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
-    state = TaskState(task_id="resume-child", task_description="resume child")
+    state = _resume_child_state()
     state.done = False
     store.save(state)
 
@@ -1215,7 +1231,7 @@ def test_cmd_delivery_run_next_resumes_running_child_and_records_failed_parent_u
     _write_progress(tmp_path, [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}])
     cfg = _run_next_cfg(tmp_path)
     store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
-    state = TaskState(task_id="resume-child", task_description="resume child")
+    state = _resume_child_state()
     store.save(state)
 
     def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
@@ -1252,7 +1268,7 @@ def test_cmd_delivery_run_next_resumes_running_child_and_marks_interrupted_paren
     _write_progress(tmp_path, [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}])
     cfg = _run_next_cfg(tmp_path)
     store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
-    state = TaskState(task_id="resume-child", task_description="resume child")
+    state = _resume_child_state()
     state.done = False
     store.save(state)
 
@@ -1287,7 +1303,7 @@ def test_cmd_delivery_run_next_resumes_running_child_and_marks_exception_parent_
     _write_progress(tmp_path, [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}])
     cfg = _run_next_cfg(tmp_path)
     store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
-    state = TaskState(task_id="resume-child", task_description="resume child")
+    state = _resume_child_state()
     state.done = False
     store.save(state)
 
@@ -1406,6 +1422,63 @@ def test_cmd_delivery_run_next_blocks_running_unit_with_missing_child_state(
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("delivery_plan_id", "other-plan"),
+        ("delivery_unit_id", "02-feature"),
+        ("delivery_plan_path", ".sikula/delivery/other/plan.yaml"),
+        ("delivery_plan_id", None),
+        ("delivery_unit_id", None),
+        ("delivery_plan_path", None),
+    ],
+)
+def test_cmd_delivery_run_next_blocks_running_unit_with_mismatched_child_metadata(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    field: str,
+    value: str | None,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}],
+    )
+    cfg = _run_next_cfg(tmp_path)
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    state = _resume_child_state()
+    setattr(state, field, value)
+    store.save(state)
+    called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal called
+        called = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert called is False
+    assert payload["errors"][0]["code"] == "delivery.child_task_metadata_mismatch"
+    assert payload["message"] == (
+        "Delivery unit 01-foundation is linked to child task resume-child, but the child task delivery metadata "
+        "does not match the parent plan and unit; inspect child task state before retrying."
+    )
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["child_task_id"] == "resume-child"
+    assert "other-plan" not in json.dumps(payload)
+    assert ".sikula/delivery/other/plan.yaml" not in json.dumps(payload)
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+@pytest.mark.parametrize(
     ("progress_payload", "expected_code", "expected_message"),
     [
         (
@@ -1477,7 +1550,7 @@ def test_cmd_delivery_run_next_blocks_running_unit_with_terminal_child_state(
     )
     cfg = _run_next_cfg(tmp_path)
     store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
-    state = TaskState(task_id="resume-child", task_description="resume child")
+    state = _resume_child_state()
     state.done = child_done
     state.failed = child_failed
     state.worktree_branch = "sikula/01-foundation-child"
@@ -1511,7 +1584,7 @@ def test_cmd_delivery_run_next_marks_resumed_running_child_failed_when_child_sta
     _write_progress(tmp_path, [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}])
     cfg = _run_next_cfg(tmp_path)
     store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
-    state = TaskState(task_id="resume-child", task_description="resume child")
+    state = _resume_child_state()
     state.done = False
     state.worktree_branch = "sikula/01-foundation-child"
     store.save(state)

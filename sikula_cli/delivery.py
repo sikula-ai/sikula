@@ -1310,10 +1310,7 @@ def _run_next_delivery_unit(
             except Exception as exc:
                 raise DeliveryChildLinkFailed() from exc
 
-        try:
-            delivery_plan_path = Path(status.plan_path).resolve().relative_to(root.resolve()).as_posix()
-        except ValueError:
-            delivery_plan_path = None
+        delivery_plan_path = _delivery_plan_metadata_path(status, root)
 
         child_result = _invoke_delivery_child_run(
             args,
@@ -1738,6 +1735,37 @@ def _handle_running_delivery_unit(
             message=message,
         )
 
+    expected_plan_path = _delivery_plan_metadata_path(status, root)
+    if not _delivery_child_metadata_matches(
+        child_state,
+        plan_id=plan_id,
+        unit_id=unit_id,
+        plan_path=expected_plan_path,
+    ):
+        code = "delivery.child_task_metadata_mismatch"
+        message = (
+            f"Delivery unit {unit_id} is linked to child task {child_task_id}, but the child task delivery metadata "
+            "does not match the parent plan and unit; inspect child task state before retrying."
+        )
+        return DeliveryRunNextExecutionResult(
+            plan_path=blocked_plan_path,
+            project_root=".",
+            valid=False,
+            ran=False,
+            succeeded=False,
+            status=status.status,
+            progress_exists=status.progress_exists,
+            selected_unit=running_unit,
+            child_task_id=child_task_id,
+            unit_status=None,
+            run_exit_code=None,
+            progress_path=blocked_progress_path,
+            events_path=blocked_events_path,
+            errors=[DeliveryPlanIssue("error", code, message)],
+            warnings=status.warnings,
+            message=message,
+        )
+
     if child_state.done or child_state.failed:
         code = "delivery.running_child_terminal"
         message = (
@@ -1826,6 +1854,27 @@ def _child_delivery_result_finalized(child_state) -> bool:
     if getattr(child_state, "result_commit", None):
         return True
     return not (getattr(child_state, "worktree_path", None) or getattr(child_state, "worktree_base", None))
+
+
+def _delivery_plan_metadata_path(status, root: Path) -> str | None:
+    try:
+        return Path(status.plan_path).resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def _delivery_child_metadata_matches(
+    child_state,
+    *,
+    plan_id: str,
+    unit_id: str,
+    plan_path: str | None,
+) -> bool:
+    return (
+        getattr(child_state, "delivery_plan_id", None) == plan_id
+        and getattr(child_state, "delivery_unit_id", None) == unit_id
+        and getattr(child_state, "delivery_plan_path", None) == plan_path
+    )
 
 
 def _record_delivery_child_terminal_result(

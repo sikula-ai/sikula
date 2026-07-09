@@ -230,9 +230,10 @@ sikula delivery run-next .sikula/delivery/<slug>/plan.yaml \
 `run-next` without `--dry-run` acquires a parent delivery progress lock and first
 checks for a recoverable `running` unit. If exactly one unit is running with a
 linked non-terminal child task, it appends a `unit.resume_intent` event first,
-then resumes
-that child through `sikula run --task-id <child_task_id>`. It does not create a
-new child task for that unit.
+then resumes that child through `sikula run --task-id <child_task_id>`. The child
+task state must carry matching delivery metadata for the same parent plan, unit,
+and project-relative plan path before it can be resumed this way. It does not
+create a new child task for that unit.
 If the running unit has no linked child task id, the child state is missing, or the
 child is terminal (`done` or `failed`), `run-next` blocks with a targeted
 deterministic error and does not select a new pending unit.
