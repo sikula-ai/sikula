@@ -295,6 +295,28 @@ def test_delivery_status_reports_running_without_child_task_id(tmp_path: Path) -
     assert "(run-next blocked: missing child task id)" in rendered
 
 
+def test_delivery_status_reports_multiple_running_units_as_manual_reconciliation(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {"unit_id": "01-foundation", "status": "running", "child_task_id": "task-1"},
+                {"unit_id": "02-feature", "status": "running", "child_task_id": "task-2"},
+            ],
+        },
+    )
+
+    result = get_delivery_status(plan_path)
+
+    assert result.status == "running"
+    assert result.next_action == "inspect parent delivery progress; multiple running units need manual reconciliation"
+
+
 def test_delivery_status_reports_failed_with_child_task_id(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)

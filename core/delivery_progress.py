@@ -1010,6 +1010,8 @@ def _next_action(status: str, units: list[DeliveryStatusUnit], *, final_commit: 
 
     running_units = [u for u in units if u.status == "running"]
     if running_units:
+        if len(running_units) > 1:
+            return "inspect parent delivery progress; multiple running units need manual reconciliation"
         if any(u.child_task_id for u in running_units):
             return "run delivery run-next to resume or reconcile the running unit"
         return "inspect parent delivery progress; running unit has no linked child task"
