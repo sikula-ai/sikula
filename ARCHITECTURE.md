@@ -291,7 +291,10 @@ the running unit has a linked non-terminal child, it appends a
 `unit.resume_intent` event and resumes the child through
 `sikula run --task-id <child_task_id>` before selecting a new unit. The linked
 child task must carry matching delivery metadata for the same parent plan, unit,
-and project-relative plan path before it is trusted for resume.
+and project-relative plan path before it is trusted for resume. Resume and retry
+paths also require the child task to have an isolated worktree path recorded;
+delivery does not forward `sikula run --task-id` for pre-worktree child states
+because that could resume in the parent checkout.
 If the running unit has no linked child, the linked child state is missing, or the
 child metadata does not match for the same parent delivery run, `run-next` blocks
 and returns a targeted error without selecting pending work. If the linked child
@@ -315,7 +318,8 @@ unit, records it as `running`, creates one child `TaskState`, and before any chi
 worktree, orchestrator, or agent execution starts updates parent progress with
 the same `running` unit and `child_task_id` and appends a `unit.child_linked` event.
 If that link update fails, `delivery run-next` aborts before any child execution and
-reports `delivery.child_link_failed`.
+reports `delivery.child_link_failed`; parent progress is restored to its pre-start
+state and an audit event records the failed link attempt.
 `run-next` accepts the same per-agent `--agent-model`, `--agent-provider`, and
 `--agent-timeout` overrides as `sikula run` and forwards them to the child run;
 the parent delivery progress model does not store those prompt/provider settings.

@@ -237,7 +237,9 @@ linked non-terminal child task, it appends a `unit.resume_intent` event first,
 then resumes that child through `sikula run --task-id <child_task_id>`. The child
 task state must carry matching delivery metadata for the same parent plan, unit,
 and project-relative plan path before it can be resumed this way. It does not
-create a new child task for that unit.
+create a new child task for that unit. Resume and retry paths require the child
+task to have an isolated worktree path recorded; `run-next` blocks instead of
+forwarding `sikula run --task-id` for child states created before worktree setup.
 If the running unit has no linked child task id, the child state is missing, the
 child metadata does not match this run, or the child is terminal (`done` or
 `failed`) with mismatched metadata, `run-next` blocks with a targeted deterministic
@@ -266,11 +268,13 @@ When no running unit blocks, `run-next` marks the selected pending unit as
 `running`, creates one child `sikula run` state, then updates parent progress with
 that child task id and a `unit.child_linked` event before agent execution. If that
 update fails, `run-next` stops before agents start and reports
-`delivery.child_link_failed`.
+`delivery.child_link_failed`. It restores parent progress to the pre-start state
+and records an audit event for the failed child-link attempt.
 When `delivery.child_link_failed` occurs, `run-next` returns the child task id and
 deterministic failure code while omitting absolute filesystem paths from JSON/text
 output.
-It then records the terminal unit status as `done` or `failed`.
+After child execution starts, it records the terminal unit status as `done` or
+`failed`.
 It accepts the same per-agent `--agent-model`, `--agent-provider`, and
 `--agent-timeout` overrides as `sikula run` and passes them to the child run.
 When starting the child run, Sikula automatically configures and persists the parent delivery metadata in the child's `TaskState` (specifically the parent `delivery_plan_id`, `delivery_unit_id`, and a project-relative `delivery_plan_path`). This allows the parent plan relationship to be fully recovered from the configured state directory, while keeping ordinary delivery progress records compact.
