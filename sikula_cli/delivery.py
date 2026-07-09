@@ -1672,13 +1672,6 @@ def _handle_failed_delivery_unit_retry(
     failed_unit,
 ) -> "DeliveryRunNextExecutionResult":
     from core.delivery_plan import DeliveryPlanIssue
-    from core.delivery_progress import (
-        append_delivery_progress_event,
-        get_delivery_status,
-        make_delivery_progress_event,
-        make_delivery_unit_progress,
-        read_delivery_progress,
-    )
     from core.delivery_run_next import DeliveryRunNextExecutionResult
     from core.state import JsonStateStore
 
@@ -1768,8 +1761,48 @@ def _handle_failed_delivery_unit_retry(
             message=message,
         )
 
+    return _run_delivery_child_retry(
+        args=args,
+        cfg=cfg,
+        context=context,
+        status=status,
+        root=root,
+        plan_id=plan_id,
+        progress_path=progress_path,
+        events_path=events_path,
+        selected_unit=failed_unit,
+    )
+
+
+def _run_delivery_child_retry(
+    args: argparse.Namespace,
+    cfg: dict,
+    context: DeliveryRunNextContext,
+    *,
+    status,
+    root: Path,
+    plan_id: str,
+    progress_path: Path,
+    events_path: Path,
+    selected_unit,
+) -> "DeliveryRunNextExecutionResult":
+    from core.delivery_progress import (
+        append_delivery_progress_event,
+        get_delivery_status,
+        make_delivery_progress_event,
+        make_delivery_unit_progress,
+        read_delivery_progress,
+    )
+    from core.delivery_run_next import DeliveryRunNextExecutionResult
+    from core.state import JsonStateStore
+
+    unit_id = selected_unit.id
+    child_task_id = selected_unit.child_task_id
     retry_unit = make_delivery_unit_progress(
-        unit_id, "failed", child_task_id=child_task_id, timestamp=failed_unit.started_at
+        unit_id,
+        selected_unit.status,
+        child_task_id=child_task_id,
+        timestamp=selected_unit.started_at,
     )
     append_delivery_progress_event(
         events_path,
@@ -1787,10 +1820,12 @@ def _handle_failed_delivery_unit_retry(
     )
     child_result = _invoke_delivery_child_run_args(args, cfg, context, run_args)
 
+    state_dir = context.resolve_state_dir(cfg)
+    store = JsonStateStore(state_dir)
     child_state = store.load(child_task_id)
     progress, unit_status = _record_delivery_child_terminal_result(
         progress=progress,
-        selected_unit=failed_unit,
+        selected_unit=selected_unit,
         child_task_id=child_task_id,
         child_state=child_state,
         child_result=child_result,
@@ -1805,7 +1840,7 @@ def _handle_failed_delivery_unit_retry(
         raise child_result.exception
 
     updated_status = get_delivery_status(args.plan_file, project_root=root)
-    updated_unit = _status_unit_by_id(updated_status, unit_id) or failed_unit
+    updated_unit = _status_unit_by_id(updated_status, unit_id) or selected_unit
     message = (
         f"Delivery unit {unit_id} retried and completed."
         if unit_status == "done"
@@ -1963,6 +1998,19 @@ def _handle_running_delivery_unit(
             errors=[*status.errors, DeliveryPlanIssue("error", code, message)],
             warnings=status.warnings,
             message=message,
+        )
+
+    if child_state.failed and bool(getattr(args, "reset_failed", False)):
+        return _run_delivery_child_retry(
+            args=args,
+            cfg=cfg,
+            context=context,
+            status=status,
+            root=root,
+            plan_id=plan_id,
+            progress_path=progress_path,
+            events_path=events_path,
+            selected_unit=running_unit,
         )
 
     if child_state.done or child_state.failed:

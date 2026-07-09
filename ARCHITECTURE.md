@@ -298,7 +298,9 @@ and returns a targeted error without selecting pending work. If the linked child
 is terminal and metadata matches, `run-next` appends `unit.reconcile_intent`
 then records terminal completion through the shared child-completion classification
 pipeline, producing `unit.done` or `unit.failed` while preserving the existing
-finalization rules.
+finalization rules. With `--reset-failed`, a running unit whose linked child is
+already failed is retried through `sikula run --task-id <child_task_id>
+--reset-failed` instead of first requiring terminal reconciliation.
 With `--reset-failed`, if no ambiguous running unit exists, it targets the first
 failed unit with a linked child task id. It appends a `unit.retry_intent` event,
 invokes `sikula run --task-id <child_task_id> --reset-failed`, preserves the same
