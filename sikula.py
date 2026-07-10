@@ -1112,6 +1112,12 @@ def _reset_failed_state(task_id: str, cfg: dict, store) -> None:
         print(f"Inspect state: sikula show {task_id}")
         sys.exit(1)
 
+    if _delivery_child_without_worktree(state):
+        print(f"Task {task_id} failed before worktree creation because delivery parent-child linking failed.")
+        print("--reset-failed cannot safely resume it; rerun the parent delivery plan with delivery run-next.")
+        print(f"Inspect state: sikula show {task_id}")
+        sys.exit(1)
+
     if state.review_mode == "review_report":
         print(f"Task {task_id} is a report-only review task and cannot be reset or resumed.")
         print("Re-run 'sikula review' to start a fresh review.")
@@ -2187,6 +2193,18 @@ def _contract_gate_blocked_without_worktree(state) -> bool:
     )
 
 
+def _delivery_child_without_worktree(state) -> bool:
+    if not (getattr(state, "delivery_plan_id", None) and getattr(state, "delivery_unit_id", None)):
+        return False
+    worktree_path = getattr(state, "worktree_path", None)
+    if not worktree_path:
+        return True
+    try:
+        return not Path(worktree_path).exists()
+    except OSError:
+        return True
+
+
 def _contract_gate_next_action(state) -> str:
     path = _contract_gate_task_path(state)
     if path:
@@ -2771,6 +2789,7 @@ def _run_context() -> cli_run.RunContext:
         task_warning_count=_task_warning_count,
         contract_gate_blocked_without_worktree=_contract_gate_blocked_without_worktree,
         contract_gate_next_action=_contract_gate_next_action,
+        delivery_child_without_worktree=_delivery_child_without_worktree,
         fmt_time=_fmt_time,
         print_task_audit_report=_print_task_audit_report,
         logger=log,
@@ -2788,6 +2807,7 @@ def _status_context() -> cli_status.StatusContext:
         current_branch_delivery_cleaned=_current_branch_delivery_cleaned,
         contract_gate_blocked_without_worktree=_contract_gate_blocked_without_worktree,
         contract_gate_next_action=_contract_gate_next_action,
+        delivery_child_without_worktree=_delivery_child_without_worktree,
         pid_running=_pid_running,
     )
 

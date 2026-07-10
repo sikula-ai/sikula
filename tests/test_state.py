@@ -619,6 +619,49 @@ class TestJsonStateStore:
         store = JsonStateStore(tmp_path)
         assert store.load("nonexistent") is None
 
+    @pytest.mark.parametrize(
+        "task_id",
+        [
+            "",
+            "../escape",
+            "a/b",
+            "a b",
+            "bad:task",
+            ".leadingdot",
+            None,
+            0,
+        ],
+    )
+    def test_load_returns_none_for_invalid_task_id(self, tmp_path: Path, task_id) -> None:
+        store = JsonStateStore(tmp_path)
+        assert store.load(task_id) is None  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "task_id",
+        ["", "../escape", "a/b", "a b", "bad:task", ".leadingdot"],
+    )
+    def test_save_rejects_invalid_task_id(self, tmp_path: Path, task_id: str) -> None:
+        store = JsonStateStore(tmp_path)
+        with pytest.raises(ValueError):
+            store.save(TaskState(task_id=task_id, task_description="invalid task"))
+        assert store.list_tasks() == []
+
+    def test_state_store_ignores_invalid_task_ids(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        valid_state = TaskState(task_id="valid-1", task_description="valid task")
+        store.save(valid_state)
+        store.save_text_snapshot("valid-1", "before", {"unit": "abc"})
+
+        store.save_text_snapshot("../escape", "before", {"unit": "abc"})
+        store.delete("../escape")
+        store.delete_text_snapshot("../escape", "before")
+        store.delete_text_snapshots("../escape")
+        store.update_active_operation("../escape", {"phase": "agent"})
+        assert store.load_text_snapshot("../escape", "before") is None
+
+        assert store.load_text_snapshot("valid-1", "before") == {"unit": "abc"}
+        assert store.load("valid-1") is not None
+
     def test_save_updates_updated_at(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
         state = TaskState(task_id="t1", task_description="task")
@@ -1157,3 +1200,55 @@ class TestJsonStateStore:
         assert loaded.final_summary["security_review_records_count"] == 1
         assert loaded.final_summary["reviewer_runs"] == 1
         assert loaded.final_summary["security_reviewer_runs"] == 1
+
+
+class TestTaskStateChildDeliveryMetadata:
+    def test_new_fields_default_to_none(self):
+        state = TaskState(task_id="t1", task_description="task")
+        assert state.delivery_plan_id is None
+        assert state.delivery_unit_id is None
+        assert state.delivery_plan_path is None
+
+    @pytest.mark.parametrize(
+        ("plan_id", "unit_id", "plan_path"),
+        [
+            ("p1", "u1", "path1"),
+            (None, "u1", "path1"),
+            ("p1", None, "path1"),
+            ("p1", "u1", None),
+            (None, None, None),
+        ],
+    )
+    def test_create_delivery_metadata_nullability(
+        self, tmp_path: Path, plan_id: str | None, unit_id: str | None, plan_path: str | None
+    ):
+        store = JsonStateStore(tmp_path)
+        state = store.create(
+            "task description",
+            delivery_plan_id=plan_id,
+            delivery_unit_id=unit_id,
+            delivery_plan_path=plan_path,
+        )
+        assert state.delivery_plan_id == plan_id
+        assert state.delivery_unit_id == unit_id
+        assert state.delivery_plan_path == plan_path
+
+        loaded = store.load(state.task_id)
+        assert loaded is not None
+        assert loaded.delivery_plan_id == plan_id
+        assert loaded.delivery_unit_id == unit_id
+        assert loaded.delivery_plan_path == plan_path
+
+    @pytest.mark.parametrize("field_name", ["delivery_plan_id", "delivery_unit_id", "delivery_plan_path"])
+    def test_load_old_state_without_delivery_metadata_defaults_to_none(self, tmp_path: Path, field_name: str):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="oldchild1", task_description="old child task")
+        store.save(state)
+        path = tmp_path / "oldchild1.json"
+        data = json.loads(path.read_text())
+        data.pop(field_name, None)
+        path.write_text(json.dumps(data))
+
+        loaded = store.load("oldchild1")
+        assert loaded is not None
+        assert getattr(loaded, field_name) is None

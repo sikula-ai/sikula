@@ -214,11 +214,12 @@ def test_delivery_status_reads_progress_file(tmp_path: Path) -> None:
     assert result.units[0].branch == "sikula/unit-1"
     assert result.units[0].commit == "abc123"
     assert result.units[1].status == "running"
-    assert result.next_action == "wait for the running delivery unit"
+    assert result.next_action == "run delivery run-next to resume or reconcile the running unit"
     rendered = render_delivery_status(result)
     assert "task=task-1" in rendered
     assert "branch=sikula/unit-1" in rendered
     assert "commit=abc123" in rendered
+    assert "(run-next: resume or reconcile linked child)" in rendered
 
 
 def test_delivery_status_reports_failed_when_another_unit_is_running(tmp_path: Path) -> None:
@@ -241,7 +242,7 @@ def test_delivery_status_reports_failed_when_another_unit_is_running(tmp_path: P
 
     assert result.valid is True
     assert result.status == "failed"
-    assert result.next_action == "inspect the failed delivery unit"
+    assert result.next_action == "run delivery run-next to resume or reconcile the running unit"
 
 
 def test_delivery_status_reports_waiting_and_failed_states(tmp_path: Path) -> None:
@@ -266,7 +267,188 @@ def test_delivery_status_reports_waiting_and_failed_states(tmp_path: Path) -> No
     assert result.status == "failed"
     assert result.units[0].waiting_reason == "needs_human"
     assert result.units[1].failure_code == "child_failed"
-    assert result.next_action == "inspect the failed delivery unit"
+    assert result.next_action == "inspect the failed delivery unit; no linked child task is available for retry"
+    rendered = render_delivery_status(result)
+    assert "(retry unavailable: missing child task id)" in rendered
+
+
+def test_delivery_status_reports_running_without_child_task_id(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {"unit_id": "01-foundation", "status": "running"},
+            ],
+        },
+    )
+
+    result = get_delivery_status(plan_path)
+
+    assert result.status == "running"
+    assert result.next_action == "inspect parent delivery progress; running unit has no linked child task"
+    rendered = render_delivery_status(result)
+    assert "(run-next blocked: missing child task id)" in rendered
+
+
+def test_delivery_status_reports_multiple_running_units_as_manual_reconciliation(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {"unit_id": "01-foundation", "status": "running", "child_task_id": "task-1"},
+                {"unit_id": "02-feature", "status": "running", "child_task_id": "task-2"},
+            ],
+        },
+    )
+
+    result = get_delivery_status(plan_path)
+
+    assert result.status == "running"
+    assert result.next_action == "inspect parent delivery progress; multiple running units need manual reconciliation"
+
+
+def test_delivery_status_reports_failed_with_child_task_id(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-1"},
+            ],
+        },
+    )
+
+    result = get_delivery_status(plan_path)
+
+    assert result.status == "failed"
+    assert result.next_action == "retry a failed delivery unit with delivery run-next --reset-failed"
+    rendered = render_delivery_status(result)
+    assert "(run-next: retry with --reset-failed)" in rendered
+
+
+@pytest.mark.parametrize(
+    ("status", "child_task_id", "expected_available", "expected_action", "expected_blocked"),
+    [
+        ("running", "task-1", True, "resume_or_reconcile", None),
+        ("running", None, False, None, "missing_child_task_id"),
+        ("failed", "task-1", True, "retry_failed", None),
+        ("failed", None, False, None, "missing_child_task_id"),
+        ("done", "task-1", False, None, None),
+        ("pending", None, False, None, None),
+        ("canceled", None, False, None, None),
+        ("waiting", None, False, None, None),
+    ],
+)
+def test_delivery_status_unit_run_next_metadata(
+    status: str,
+    child_task_id: str | None,
+    expected_available: bool,
+    expected_action: str | None,
+    expected_blocked: str | None,
+) -> None:
+    from core.delivery_progress import DeliveryStatusUnit
+
+    unit = DeliveryStatusUnit(
+        id="unit-1",
+        title="Unit 1",
+        status=status,
+        task_path="path",
+        depends_on=[],
+        child_task_id=child_task_id,
+    )
+
+    assert unit.run_next_available is expected_available
+    assert unit.run_next_action == expected_action
+    assert unit.run_next_blocked_reason == expected_blocked
+
+    data = unit.to_dict()
+    assert data["run_next_available"] is expected_available
+    if expected_action:
+        assert data["run_next_action"] == expected_action
+    else:
+        assert "run_next_action" not in data
+
+    if expected_blocked:
+        assert data["run_next_blocked_reason"] == expected_blocked
+    else:
+        assert "run_next_blocked_reason" not in data
+
+
+def test_delivery_status_projects_paths_relative_to_project_root(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {"unit_id": "01-foundation", "status": "running"},
+            ],
+        },
+    )
+
+    result = get_delivery_status(plan_path, project_root=tmp_path)
+
+    rendered = render_delivery_status(result)
+    assert "Project root: ." in rendered
+    assert "Delivery plan status: .sikula/delivery/demo/plan.yaml" in rendered
+    assert "Progress: .sikula/state/delivery/delivery-status-demo/progress.json" in rendered
+
+    data = result.to_dict()
+    assert data["project_root"] == "."
+    assert data["plan_path"] == ".sikula/delivery/demo/plan.yaml"
+    assert data["progress_path"] == ".sikula/state/delivery/delivery-status-demo/progress.json"
+
+
+def test_delivery_status_result_to_dict_relativizes_plan_paths() -> None:
+    from core.delivery_progress import DeliveryStatusResult
+    from core.delivery_plan import DeliveryPlan, DeliveryRepository, DeliveryComponent
+
+    plan = DeliveryPlan(
+        schema_version=1,
+        plan_id="plan",
+        title="title",
+        final_branch="branch",
+        repositories=[DeliveryRepository(id="main", root="/opt/project/main_repo")],
+        stream_ids={"app"},
+        components=[DeliveryComponent(id="api", label="API", path="/opt/project/apps/api", stream="app")],
+        units=[],
+    )
+
+    result = DeliveryStatusResult(
+        plan_path="/opt/project/plan.yaml",
+        project_root="/opt/project",
+        progress_path="/opt/project/progress.json",
+        progress_exists=True,
+        status="pending",
+        errors=[],
+        warnings=[],
+        units=[],
+        plan=plan,
+    )
+
+    data = result.to_dict()
+    assert data["project_root"] == "."
+    assert data["plan_path"] == "plan.yaml"
+    assert data["progress_path"] == "progress.json"
+    assert data["plan"]["repositories"][0]["root"] == "main_repo"
+    assert data["plan"]["components"][0]["path"] == "apps/api"
 
 
 def test_delivery_status_reports_waiting_when_unit_needs_human_input(tmp_path: Path) -> None:
@@ -444,12 +626,20 @@ def test_delivery_status_reports_invalid_plan_without_progress_path(tmp_path: Pa
         },
     )
 
-    result = get_delivery_status(plan_path)
+    result = get_delivery_status(plan_path, project_root=tmp_path)
 
     assert result.valid is False
     assert result.status == "invalid"
     assert result.progress_path is None
     assert "plan_id.invalid" in _error_codes(result)
+
+    data = result.to_dict()
+    assert data["project_root"] == "."
+    assert data["progress_path"] is None
+
+    rendered = render_delivery_status(result)
+    assert "Project root: ." in rendered
+    assert "Progress:" not in rendered
 
 
 def test_delivery_status_reports_invalid_progress_json(tmp_path: Path) -> None:
@@ -815,6 +1005,20 @@ def test_terminal_delivery_progress_accepts_explicit_started_at() -> None:
     assert unit.failure_code == "tests_failed"
 
 
+def test_running_delivery_progress_accepts_explicit_started_at() -> None:
+    unit = make_delivery_unit_progress(
+        "unit-1",
+        "running",
+        child_task_id="task-1",
+        started_at="2026-07-04T12:00:00+00:00",
+        timestamp="2026-07-04T12:04:00+00:00",
+    )
+
+    assert unit.started_at == "2026-07-04T12:00:00+00:00"
+    assert unit.updated_at == "2026-07-04T12:04:00+00:00"
+    assert unit.completed_at is None
+
+
 def test_delivery_progress_validation_rejects_duplicate_and_invalid_units(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="duplicate"):
         write_delivery_progress(
@@ -905,6 +1109,118 @@ def test_select_next_delivery_unit_respects_dependencies_and_terminal_status(tmp
     assert select_next_delivery_unit(running) is None
 
 
+def test_select_next_delivery_unit_reset_failed_selection(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [{"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"}],
+        },
+    )
+    failed_with_child = get_delivery_status(plan_path)
+    assert failed_with_child.status == "failed"
+    assert select_next_delivery_unit(failed_with_child) is None
+
+    selected = select_next_delivery_unit(failed_with_child, reset_failed=True)
+    assert selected is not None
+    assert selected.id == "01-foundation"
+
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [{"unit_id": "01-foundation", "status": "failed"}],
+        },
+    )
+    failed_no_child = get_delivery_status(plan_path)
+    assert failed_no_child.status == "failed"
+    assert select_next_delivery_unit(failed_no_child, reset_failed=True) is None
+
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {"unit_id": "01-foundation", "status": "done"},
+                {"unit_id": "02-feature", "status": "failed", "child_task_id": "task-abc"},
+            ],
+        },
+    )
+    failed_later_unit = get_delivery_status(plan_path)
+    assert failed_later_unit.status == "failed"
+    selected_later = select_next_delivery_unit(failed_later_unit, reset_failed=True)
+    assert selected_later is not None
+    assert selected_later.id == "02-feature"
+
+
+def test_select_next_delivery_unit_reset_failed_returns_none_for_terminal_status(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+
+    for status in ["running", "waiting", "canceled", "done"]:
+        _write_progress(
+            tmp_path,
+            "delivery-status-demo",
+            {
+                "schema_version": 1,
+                "plan_id": "delivery-status-demo",
+                "units": [
+                    {"unit_id": "01-foundation", "status": status, "child_task_id": "task-xyz"},
+                    {"unit_id": "02-feature", "status": status, "child_task_id": "task-abc"},
+                ],
+            },
+        )
+        result = get_delivery_status(plan_path)
+        assert result.status == status
+        assert select_next_delivery_unit(result, reset_failed=True) is None
+
+    invalid_path = _write_plan(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "plan_id": "../bad",
+            "title": "Bad plan id",
+            "final_branch": "sikula/delivery/bad",
+            "units": [],
+        },
+    )
+    invalid_result = get_delivery_status(invalid_path)
+    assert not invalid_result.valid
+    assert select_next_delivery_unit(invalid_result, reset_failed=True) is None
+
+
+def test_select_next_delivery_unit_reset_failed_returns_none_for_failed_status_with_running_unit(
+    tmp_path: Path,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+                {"unit_id": "02-feature", "status": "running"},
+            ],
+        },
+    )
+    result = get_delivery_status(plan_path)
+    assert result.status == "failed"
+    assert select_next_delivery_unit(result, reset_failed=True) is None
+
+
 def test_delivery_status_json_is_privacy_safe(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
@@ -975,3 +1291,41 @@ def test_main_dispatches_delivery_run_next_through_runtime_config(tmp_path: Path
 
     load_config.assert_called_once()
     delivery_run_next.assert_called_once()
+
+
+def test_project_relative_path(tmp_path: Path) -> None:
+    from core.delivery_progress import _project_relative_path
+
+    assert _project_relative_path("/foo/bar", None) == "/foo/bar"
+    assert _project_relative_path("/foo/bar", str(tmp_path)) == "bar"
+
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    file_path = sub / "file.txt"
+    assert _project_relative_path(str(file_path), str(tmp_path)) == "sub/file.txt"
+
+
+def test_sanitize_issue() -> None:
+    from core.delivery_plan import DeliveryPlanIssue
+    from core.delivery_progress import _sanitize_issue
+
+    issue = DeliveryPlanIssue(
+        "error", "code", "Issue in /opt/project/plan.yaml and /opt/project/progress.json", "/opt/project/plan.yaml"
+    )
+
+    # Without project root, returns unchanged
+    assert _sanitize_issue(issue, None, "/opt/project/plan.yaml", "/opt/project/progress.json") is issue
+    assert _sanitize_issue(issue, ".", "/opt/project/plan.yaml", "/opt/project/progress.json") is issue
+
+    # Sanitizes absolute paths inside messages and path
+    sanitized = _sanitize_issue(issue, "/opt/project", "/opt/project/plan.yaml", "/opt/project/progress.json")
+    assert sanitized.message == "Issue in plan.yaml and progress.json"
+    assert sanitized.path == "plan.yaml"
+
+    # Sanitizes project root strings not caught by exact plan/progress matches
+    issue2 = DeliveryPlanIssue(
+        "error", "code", "Error loading /opt/project/some/other/file.txt", "/opt/project/some/other/file.txt"
+    )
+    sanitized2 = _sanitize_issue(issue2, "/opt/project", "/opt/project/plan.yaml", "/opt/project/progress.json")
+    assert sanitized2.message == "Error loading some/other/file.txt"
+    assert sanitized2.path == "some/other/file.txt"

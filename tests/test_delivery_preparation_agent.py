@@ -71,9 +71,13 @@ The delivery slice is described as product behavior with observable outcomes.
 
 - The delivered behavior has a deterministic success path.
 
-## Security/privacy notes
+## Security and privacy
 
 - Do not expose raw prompts, provider output, or source excerpts.
+
+## Tests
+
+- Cover generated delivery plan authoring output.
 
 ## Reviewer focus
 
@@ -83,7 +87,7 @@ The delivery slice is described as product behavior with observable outcomes.
 
 - Do not write delivery plan files in this unit.
 
-## Verification
+## Validation
 
 - `python3 -m pytest tests/test_delivery_preparation_agent.py`
 """
@@ -176,6 +180,13 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert "Do not include writer-facing path fields" in prompt
     assert "Do not write, edit, delete, move, rename, format, or create files." in prompt
     assert "Prefer small units with one primary production surface" in prompt
+    assert "Security and privacy" in prompt
+    assert "Security/privacy notes" not in prompt
+    assert "Security and privacy, Reviewer focus" in prompt
+    assert "Security and privacy, Tests" not in prompt
+    assert "where applicable" not in prompt
+    assert "must include all of these exact contract-ready section headings" in prompt
+    assert "Validation sections must include explicit commands" in prompt
     assert "UI/API/CLI behavior" in prompt
     assert "data model or persistence changes" in prompt
     assert "automation or prompt-driven behavior" in prompt

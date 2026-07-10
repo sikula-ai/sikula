@@ -143,6 +143,7 @@ class RunContext:
     task_warning_count: Callable[[object], int]
     contract_gate_blocked_without_worktree: Callable[[object], bool]
     contract_gate_next_action: Callable[[object], str]
+    delivery_child_without_worktree: Callable[[object], bool]
     fmt_time: Callable[[float], str]
     print_task_audit_report: Callable[[object], int]
     logger: logging.Logger
@@ -236,7 +237,12 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             context.require_committed_config_for_isolated_run(cfg, git_root, overrides)
 
         description = task_path.read_text().strip()
-        state = store.create(description)
+        state = store.create(
+            description,
+            delivery_plan_id=getattr(args, "delivery_plan_id", None),
+            delivery_unit_id=getattr(args, "delivery_unit_id", None),
+            delivery_plan_path=getattr(args, "delivery_plan_path", None),
+        )
         args.created_task_id = state.task_id
         state.task_file = Path(args.task_file).name
         state.config_snapshot = context.run_config_snapshot(cfg, overrides)
@@ -252,6 +258,20 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             context.contract_preflight_record_result(state.implementation_contract),
         )
         store.save(state)
+        callback = getattr(args, "delivery_child_created_callback", None)
+        if callback is not None:
+            try:
+                callback(state.task_id)
+            except Exception as exc:
+                state.failed = True
+                state.record(
+                    "orchestrator",
+                    "delivery_child_link_failed",
+                    "delivery child link failed before worktree creation",
+                    error=type(exc).__name__,
+                )
+                store.save(state)
+                raise
         context.print_contract_preflight_summary(state.implementation_contract)
         gate_failures = context.contract_readiness_gate_failures(
             state.implementation_contract,
@@ -429,6 +449,9 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             if context.contract_gate_blocked_without_worktree(state):
                 print("The contract readiness gate blocked delivery before a worktree was created.")
                 print(f"Suggested next step: {context.contract_gate_next_action(state)}")
+            elif context.delivery_child_without_worktree(state):
+                print("Delivery parent-child linking failed before a worktree was created.")
+                print(f"Inspect state: sikula show {state.task_id}")
             elif state.review_mode == "review_report":
                 print("Report-only review tasks cannot be retried with sikula run.")
                 print("Re-run 'sikula review' to start a fresh review.")

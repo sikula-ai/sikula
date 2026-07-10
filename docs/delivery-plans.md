@@ -206,6 +206,9 @@ sikula delivery status .sikula/delivery/<slug>/plan.yaml
 sikula delivery status .sikula/delivery/<slug>/plan.yaml --json
 ```
 
+`delivery status` evaluates the execution state and marks running and failed units with their actionable next steps. In JSON output, each unit includes `run_next_available` (boolean), `run_next_action` (`"resume_or_reconcile"`, `"retry_failed"`, or omitted), and `run_next_blocked_reason` (`"missing_child_task_id"` or omitted).
+For example, running units with linked child task IDs are marked as recoverable (`resume` or `reconcile` action) by `delivery run-next`, which will resume a non-terminal child or reconcile a terminal child after metadata validation. A running unit without a child task ID is a fail-safe condition marked as `block`: `run-next` blocks and does not select pending work. Failed units with linked child task IDs are marked as retryable (`retry` action) with `delivery run-next --reset-failed`. Failed units without linked child task IDs are not retryable through `run-next`.
+
 Preview the next eligible unit without changing delivery progress:
 
 ```bash
@@ -222,24 +225,69 @@ Run the next eligible unit:
 ```bash
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --json
+sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --reset-failed
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml \
   --agent-provider implementer=antigravity \
   --agent-provider fixer=antigravity
 ```
 
-`run-next` without `--dry-run` acquires a parent delivery progress lock, marks
-the selected unit as `running`, starts one ordinary child `sikula run` for that
-unit task file, then records the terminal unit status as `done` or `failed`.
+`run-next` without `--dry-run` acquires a parent delivery progress lock and first
+checks for a recoverable `running` unit. If exactly one unit is running with a
+linked non-terminal child task, it appends a `unit.resume_intent` event first,
+then resumes that child through `sikula run --task-id <child_task_id>`. The child
+task state must carry matching delivery metadata for the same parent plan, unit,
+and project-relative plan path before it can be resumed this way. It does not
+create a new child task for that unit. Resume and retry paths require the child
+task to have an isolated worktree path recorded; `run-next` blocks instead of
+forwarding `sikula run --task-id` for child states created before worktree setup.
+If the running unit has no linked child task id, the child state is missing, the
+child metadata does not match this run, or the child is terminal (`done` or
+`failed`) with mismatched metadata, `run-next` blocks with a targeted deterministic
+error and does not select a new pending unit.
+Without `--reset-failed`, failed units block instead of silently rerunning children.
+With `--reset-failed`, a running unit whose linked child task is already failed
+is retried through the same child task id immediately after metadata validation.
+If no ambiguous running unit exists, `run-next` otherwise selects the first failed
+unit with a linked child task id before pending work. It preserves the same parent
+unit and child task id, appends a `unit.retry_intent` event, and forwards reset
+semantics to the child task path (`sikula run --task-id <child_task_id> --reset-failed`).
+`--reset-failed` does not bypass running-unit ambiguity or dependency result-commit checks and does not select later pending work while retry selection is active. Child runs preserve normal `sikula run` semantics, and delivery execution still runs one unit at a time and does not assemble the final branch automatically.
+The JSON/text output remains privacy-safe and allowlisted.
+If the running unit has a terminal child with matching metadata and is not
+retrying a failed child through `--reset-failed`, `run-next`
+reconciles through shared completion logic instead of starting a new child run:
+it records `unit.reconcile_intent` first, then records `unit.done` or `unit.failed`
+through the same completion pipeline used after normal child execution.
+If multiple units are `running`, `run-next` also blocks so the operator can
+manually reconcile parent progress.
+When resume-path blocks occur, `run-next --json` returns allowlisted metadata
+only (error code, task IDs, and paths) and does not expose raw child task state.
+Terminal reconciliation does not duplicate child execution and still reports
+allowlisted JSON/text output.
+When no running unit blocks, `run-next` marks the selected pending unit as
+`running`, creates one child `sikula run` state, then updates parent progress with
+that child task id and a `unit.child_linked` event before agent execution. If that
+update fails, `run-next` stops before agents start and reports
+`delivery.child_link_failed`. It restores parent progress to the pre-start state
+and records an audit event for the failed child-link attempt.
+When `delivery.child_link_failed` occurs, `run-next` returns the child task id and
+deterministic failure code while omitting absolute filesystem paths from JSON/text
+output.
+After child execution starts, it records the terminal unit status as `done` or
+`failed`.
 It accepts the same per-agent `--agent-model`, `--agent-provider`, and
 `--agent-timeout` overrides as `sikula run` and passes them to the child run.
+When starting the child run, Sikula automatically configures and persists the parent delivery metadata in the child's `TaskState` (specifically the parent `delivery_plan_id`, `delivery_unit_id`, and a project-relative `delivery_plan_path`). This allows the parent plan relationship to be fully recovered from the configured state directory, while keeping ordinary delivery progress records compact.
 Child task prompts, provider output, diffs, logs, and full task state remain in
 the normal child task state and are not embedded in delivery progress JSON.
+`delivery run-next --json` reports deterministic failure codes and the child task id
+when link creation succeeds but parent progress mutation fails.
 The parent unit is marked `done` only when the child run exits successfully, the
 child task state is done, and the child result is finalized. A finalized result
 has either a recorded result commit or no preserved task worktree left to
 deliver, which represents a no-op unit. If a child task is done but still keeps a
 worktree without a result commit, the parent unit is recorded as failed with
-`child_run_unfinalized`.
+`child_run_unfinalized`. The same rule applies to terminal-reconciled children.
 
 For dependent units, `run-next` also walks the selected unit's dependency
 closure and checks that each completed prerequisite's recorded result commit,
@@ -392,5 +440,12 @@ can coordinate cross-repo branches, locks, validation, and result sets.
 metadata such as written artifact paths, plan validation status, unit readiness,
 plan metadata, validation issues, unit paths, compact progress fields, selected
 child task IDs, final branch metadata, and branch/commit pointers when
-available. They do not embed source task bodies, unit task file bodies, prompts,
-provider output, diffs, logs, or task state.
+available. They do not embed child task state, source task bodies, unit task file bodies, prompts,
+provider output, diffs, logs, validation output, credentials, tokens, or source excerpts.
+Privacy-safe projections such as `delivery prepare --json`, `delivery status --json`,
+and `delivery run-next --json` use project-relative paths for local delivery artifacts
+where possible. Operator/audit commands such as `delivery check --json` and
+`delivery finalize --json` may include local plan, progress, or events paths. The
+parent plan path stored in the child task state is saved as a project-relative path
+(`delivery_plan_path`). This metadata is strictly allowlisted state metadata and
+does not expose raw prompts, provider output, diffs, logs, or source excerpts.

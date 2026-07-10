@@ -37,9 +37,13 @@ The delivery slice is described as product behavior with observable outcomes.
 - The delivered behavior has a deterministic success path.
 - The delivered behavior rejects invalid input safely.
 
-## Security/privacy notes
+## Security and privacy
 
 - Do not log raw prompts, provider output, secrets, or source excerpts.
+
+## Tests
+
+- Cover the generated delivery unit behavior.
 
 ## Reviewer focus
 
@@ -49,7 +53,7 @@ The delivery slice is described as product behavior with observable outcomes.
 
 - Do not write delivery plan files in this unit.
 
-## Verification
+## Validation
 
 - `python3 -m pytest tests/test_delivery_authoring.py`
 """

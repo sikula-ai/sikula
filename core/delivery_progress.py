@@ -191,6 +191,26 @@ class DeliveryStatusUnit:
     updated_at: str | None = None
 
     @property
+    def run_next_available(self) -> bool:
+        if self.status in ("running", "failed"):
+            return bool(self.child_task_id)
+        return False
+
+    @property
+    def run_next_action(self) -> str | None:
+        if self.status == "running" and self.child_task_id:
+            return "resume_or_reconcile"
+        if self.status == "failed" and self.child_task_id:
+            return "retry_failed"
+        return None
+
+    @property
+    def run_next_blocked_reason(self) -> str | None:
+        if self.status in ("running", "failed") and not self.child_task_id:
+            return "missing_child_task_id"
+        return None
+
+    @property
     def eligible(self) -> bool:
         return self.status == "pending" and not self.blocked_by
 
@@ -202,6 +222,7 @@ class DeliveryStatusUnit:
             "task_path": self.task_path,
             "depends_on": list(self.depends_on),
             "blocked_by": list(self.blocked_by),
+            "run_next_available": self.run_next_available,
         }
         for key in (
             "title",
@@ -223,6 +244,10 @@ class DeliveryStatusUnit:
             value = getattr(self, key)
             if value:
                 data[key] = value
+        if self.run_next_action:
+            data["run_next_action"] = self.run_next_action
+        if self.run_next_blocked_reason:
+            data["run_next_blocked_reason"] = self.run_next_blocked_reason
         if self.scope_paths:
             data["scope_paths"] = list(self.scope_paths)
         if self.estimated_size:
@@ -257,15 +282,29 @@ class DeliveryStatusResult:
         return not self.errors
 
     def to_dict(self) -> dict[str, Any]:
+        plan_path = self.plan_path
+        progress_path = self.progress_path
+        project_root = self.project_root
+        if project_root and project_root != ".":
+            plan_path = _project_relative_path(plan_path, project_root) or plan_path
+            progress_path = _project_relative_path(progress_path, project_root) or progress_path
+            project_root = "."
+
         data: dict[str, Any] = {
-            "plan_path": self.plan_path,
-            "project_root": self.project_root,
-            "progress_path": self.progress_path,
+            "plan_path": plan_path,
+            "project_root": project_root,
+            "progress_path": progress_path,
             "progress_exists": self.progress_exists,
             "valid": self.valid,
             "status": self.status,
-            "errors": [issue.to_dict() for issue in self.errors],
-            "warnings": [issue.to_dict() for issue in self.warnings],
+            "errors": [
+                _sanitize_issue(issue, self.project_root, self.plan_path, self.progress_path).to_dict()
+                for issue in self.errors
+            ],
+            "warnings": [
+                _sanitize_issue(issue, self.project_root, self.plan_path, self.progress_path).to_dict()
+                for issue in self.warnings
+            ],
             "units": [unit.to_dict() for unit in self.units],
         }
         if self.next_action:
@@ -275,17 +314,38 @@ class DeliveryStatusResult:
             if value:
                 data[key] = value
         if self.plan:
-            data["plan"] = {
+            plan_data: dict[str, Any] = {
                 "schema_version": self.plan.schema_version,
                 "plan_id": self.plan.plan_id,
                 "title": self.plan.title,
                 "final_branch": self.plan.final_branch,
                 "planning_mode": self.plan.planning_mode,
-                "repositories": [repo.to_dict() for repo in self.plan.repositories],
                 "streams": list(self.plan.stream_ids),
             }
+            repositories_data = []
+            for repo in self.plan.repositories:
+                r_dict = repo.to_dict()
+                if self.project_root and self.project_root != "." and r_dict.get("root") and r_dict["root"] != ".":
+                    if Path(r_dict["root"]).is_absolute():
+                        rel = _project_relative_path(r_dict["root"], self.project_root)
+                        if rel:
+                            r_dict["root"] = rel
+                repositories_data.append(r_dict)
+            plan_data["repositories"] = repositories_data
+
             if self.plan.components:
-                data["plan"]["components"] = [component.to_dict() for component in self.plan.components]
+                components_data = []
+                for component in self.plan.components:
+                    c_dict = component.to_dict()
+                    if self.project_root and self.project_root != "." and c_dict.get("path"):
+                        if Path(c_dict["path"]).is_absolute():
+                            rel = _project_relative_path(c_dict["path"], self.project_root)
+                            if rel:
+                                c_dict["path"] = rel
+                    components_data.append(c_dict)
+                plan_data["components"] = components_data
+
+            data["plan"] = plan_data
         return data
 
 
@@ -404,7 +464,7 @@ def make_delivery_unit_progress(
     timestamp: str | None = None,
 ) -> DeliveryUnitProgress:
     timestamp = timestamp or _utc_now()
-    started_at = timestamp if status == "running" else started_at
+    started_at = (started_at or timestamp) if status == "running" else started_at
     completed_at = timestamp if status in _TERMINAL_DELIVERY_UNIT_STATUSES else None
     return DeliveryUnitProgress(
         unit_id=unit_id,
@@ -463,8 +523,14 @@ def mark_delivery_finalized(
     )
 
 
-def select_next_delivery_unit(status: DeliveryStatusResult) -> DeliveryStatusUnit | None:
-    if not status.valid or status.status in {"failed", "running", "waiting", "canceled", "done"}:
+def select_next_delivery_unit(status: DeliveryStatusResult, reset_failed: bool = False) -> DeliveryStatusUnit | None:
+    if not status.valid or status.status in {"running", "waiting", "canceled", "done"}:
+        return None
+    if reset_failed:
+        if any(unit.status == "running" for unit in status.units):
+            return None
+        return next((unit for unit in status.units if unit.status == "failed" and unit.child_task_id), None)
+    if status.status == "failed":
         return None
     return next((unit for unit in status.units if unit.eligible), None)
 
@@ -582,16 +648,73 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _project_relative_path(path: str | None, project_root: str | None) -> str | None:
+    if not path or not project_root:
+        return path
+    try:
+        return Path(path).resolve().relative_to(Path(project_root).resolve()).as_posix()
+    except ValueError:
+        return Path(path).name
+
+
+def _sanitize_issue(
+    issue: DeliveryPlanIssue,
+    project_root: str | None,
+    plan_path: str,
+    progress_path: str | None,
+) -> DeliveryPlanIssue:
+    if not project_root or project_root == ".":
+        return issue
+
+    msg = issue.message
+    path = issue.path
+
+    plan_rel = _project_relative_path(plan_path, project_root) or plan_path
+    msg = msg.replace(plan_path, plan_rel)
+    if path:
+        path = path.replace(plan_path, plan_rel)
+
+    if progress_path:
+        prog_rel = _project_relative_path(progress_path, project_root) or progress_path
+        msg = msg.replace(progress_path, prog_rel)
+        if path:
+            path = path.replace(progress_path, prog_rel)
+
+    root_str = str(Path(project_root).resolve())
+    if not root_str.endswith("/"):
+        root_str += "/"
+    msg = msg.replace(root_str, "")
+    if path:
+        path = path.replace(root_str, "")
+
+    root_str_no_slash = str(Path(project_root).resolve())
+    msg = msg.replace(root_str_no_slash, ".")
+    if path:
+        path = path.replace(root_str_no_slash, ".")
+
+    if msg == issue.message and path == issue.path:
+        return issue
+    return DeliveryPlanIssue(issue.severity, issue.code, msg, path)
+
+
 def render_delivery_status(result: DeliveryStatusResult) -> str:
+    plan_path = result.plan_path
+    progress_path = result.progress_path
+    project_root = result.project_root
+    if project_root and project_root != ".":
+        plan_path = _project_relative_path(plan_path, project_root) or plan_path
+        progress_path = _project_relative_path(progress_path, project_root) or progress_path
+        project_root = "."
+
     lines = [
-        f"Delivery plan status: {result.plan_path}",
+        f"Delivery plan status: {plan_path}",
         f"Status: {result.status}",
     ]
-    if result.project_root:
-        lines.append(f"Project root: {result.project_root}")
-    if result.progress_path:
+    if project_root:
+        lines.append(f"Project root: {project_root}")
+    if progress_path:
         progress_note = "present" if result.progress_exists else "not created yet"
-        lines.append(f"Progress: {result.progress_path} ({progress_note})")
+        lines.append(f"Progress: {progress_path} ({progress_note})")
     if result.plan:
         lines.extend(
             [
@@ -612,7 +735,17 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
         lines.append("Units:")
         for unit in result.units:
             detail = unit.status
-            if unit.blocked_by:
+            if unit.status == "running":
+                if unit.child_task_id:
+                    detail += " (run-next: resume or reconcile linked child)"
+                else:
+                    detail += " (run-next blocked: missing child task id)"
+            elif unit.status == "failed":
+                if unit.child_task_id:
+                    detail += " (run-next: retry with --reset-failed)"
+                else:
+                    detail += " (retry unavailable: missing child task id)"
+            elif unit.blocked_by:
                 detail += f" (blocked by: {', '.join(unit.blocked_by)})"
             elif unit.eligible:
                 detail += " (eligible)"
@@ -633,12 +766,16 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
         lines.append("")
         lines.append("Errors:")
         for issue in result.errors:
-            lines.append(_format_issue(issue))
+            lines.append(
+                _format_issue(_sanitize_issue(issue, result.project_root, result.plan_path, result.progress_path))
+            )
     if result.warnings:
         lines.append("")
         lines.append("Warnings:")
         for issue in result.warnings:
-            lines.append(_format_issue(issue))
+            lines.append(
+                _format_issue(_sanitize_issue(issue, result.project_root, result.plan_path, result.progress_path))
+            )
     if result.next_action:
         lines.append("")
         lines.append(f"Next action: {result.next_action}")
@@ -870,10 +1007,21 @@ def _overall_status(units: list[DeliveryStatusUnit]) -> str:
 def _next_action(status: str, units: list[DeliveryStatusUnit], *, final_commit: str | None = None) -> str:
     if status == "invalid":
         return "fix delivery plan status errors"
-    if status == "running":
-        return "wait for the running delivery unit"
-    if status == "failed":
-        return "inspect the failed delivery unit"
+
+    running_units = [u for u in units if u.status == "running"]
+    if running_units:
+        if len(running_units) > 1:
+            return "inspect parent delivery progress; multiple running units need manual reconciliation"
+        if any(u.child_task_id for u in running_units):
+            return "run delivery run-next to resume or reconcile the running unit"
+        return "inspect parent delivery progress; running unit has no linked child task"
+
+    failed_units = [u for u in units if u.status == "failed"]
+    if failed_units:
+        if any(u.child_task_id for u in failed_units):
+            return "retry a failed delivery unit with delivery run-next --reset-failed"
+        return "inspect the failed delivery unit; no linked child task is available for retry"
+
     if status == "waiting":
         return "answer the blocking delivery question or setup requirement"
     if status == "canceled":

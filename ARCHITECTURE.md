@@ -280,26 +280,61 @@ execution dependency result-commit guard so a dry run reports blocked when a
 completed prerequisite commit is not applied to the current checkout. It is
 intentionally side-effect-free: it does not write parent progress, create child
 task state, prepare contracts, create worktrees, start agents, or update
-branches. Its JSON result is also allowlisted metadata only.
+branches. Its JSON result is also allowlisted metadata only. With `--reset-failed`,
+it selects the first failed unit with a linked child task id instead of pending work;
+later pending work is never selected while retry selection is active.
 
 **Delivery run-next execution:** `sikula delivery run-next PLAN_FILE` acquires
-the delivery progress lock, selects one eligible pending unit, records it as
-`running`, and invokes the existing `sikula run` command path for the unit task
-file. The child run keeps all normal Sikula behavior: contract preflight,
-worktree isolation, provider execution, validation, review, state persistence,
-and task audit reporting. `run-next` accepts the same per-agent
-`--agent-model`, `--agent-provider`, and `--agent-timeout` overrides as
-`sikula run` and forwards them to this child run; the parent delivery progress
-model does not store those prompt/provider settings. When the child run exits,
-delivery progress stores only compact parent metadata: unit status, child task
-id, branch, result commit when available, timestamps, and a failure code. Full
-prompts, provider output, diffs, logs, validation records, and task state remain
-in the child task state.
+the delivery progress lock and refreshes status under that lock. If exactly one
+unit is already `running`, `run-next` first treats that as a resume candidate. If
+the running unit has a linked non-terminal child, it appends a
+`unit.resume_intent` event and resumes the child through
+`sikula run --task-id <child_task_id>` before selecting a new unit. The linked
+child task must carry matching delivery metadata for the same parent plan, unit,
+and project-relative plan path before it is trusted for resume. Resume and retry
+paths also require the child task to have an isolated worktree path recorded;
+delivery does not forward `sikula run --task-id` for pre-worktree child states
+because that could resume in the parent checkout.
+If the running unit has no linked child, the linked child state is missing, or the
+child metadata does not match for the same parent delivery run, `run-next` blocks
+and returns a targeted error without selecting pending work. If the linked child
+is terminal and metadata matches, `run-next` appends `unit.reconcile_intent`
+then records terminal completion through the shared child-completion classification
+pipeline, producing `unit.done` or `unit.failed` while preserving the existing
+finalization rules. With `--reset-failed`, a running unit whose linked child is
+already failed is retried through `sikula run --task-id <child_task_id>
+--reset-failed` instead of first requiring terminal reconciliation.
+With `--reset-failed`, if no ambiguous running unit exists, it targets the first
+failed unit with a linked child task id. It appends a `unit.retry_intent` event,
+invokes `sikula run --task-id <child_task_id> --reset-failed`, preserves the same
+parent unit and child task id after metadata validation, and records final status
+through the shared child-completion classification path.
+If multiple units are `running`, `run-next` also blocks until the parent progress
+is manually reconciled.
+Resume-path blocks return allowlisted metadata only and do not expose
+`TaskState` contents or absolute local paths.
+If no ambiguous/runnable running unit exists, `run-next` selects one eligible pending
+unit, records it as `running`, creates one child `TaskState`, and before any child
+worktree, orchestrator, or agent execution starts updates parent progress with
+the same `running` unit and `child_task_id` and appends a `unit.child_linked` event.
+If that link update fails, `delivery run-next` aborts before any child execution and
+reports `delivery.child_link_failed`; parent progress is restored to its pre-start
+state and an audit event records the failed link attempt.
+`run-next` accepts the same per-agent `--agent-model`, `--agent-provider`, and
+`--agent-timeout` overrides as `sikula run` and forwards them to the child run;
+the parent delivery progress model does not store those prompt/provider settings.
+When the child run continues (including resume), it keeps normal Sikula behavior: contract preflight,
+worktree isolation, provider execution, validation, review, state persistence, and
+task audit reporting. When the child run exits, delivery progress stores only
+compact parent metadata: unit status, child task id, branch, result commit when
+available, timestamps, and a failure code. Full prompts, provider output, diffs,
+logs, validation records, and task state remain in the child task state.
 The parent delivery unit is `done` only when the child exits successfully, the
 child `TaskState` is done, and the child result is finalized. Finalization means
 either a `result_commit` exists or the child left no preserved worktree to
 deliver. A done child task with a preserved worktree but no result commit is
-recorded as `failed` with `child_run_unfinalized`.
+recorded as `failed` with `child_run_unfinalized`. A resumed child that exits
+non-terminal is recorded as `failed` in the same parent status shape.
 Before starting a selected unit, execution walks the selected unit's dependency
 closure and verifies that every completed prerequisite result commit is already
 an ancestor of the current checkout. Completed no-op prerequisites have no
@@ -1467,6 +1502,9 @@ Sikula processes at once is still unsupported.
 | `task_description` | `str` | caller | Original plain-text task |
 | `schema_version` | `int` | `StateStore.create()` | State file schema version; used by `JsonStateStore.load()` to run migrations before constructing `TaskState`; current value is `SCHEMA_VERSION = 2` |
 | `task_file` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` | Basename of the task file (e.g. `add-login.md`); set on first run via `--task-file`; used by `status` for display; `None` for tasks created before this field was added or when resuming via `--task-id` only |
+| `delivery_plan_id` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` | Parent delivery plan ID; set only by `delivery run-next` child creation, defaults to `None` for existing/non-delivery state, and must not drive pipeline control flow |
+| `delivery_unit_id` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` | Selected delivery unit ID; set only by `delivery run-next` child creation, defaults to `None` for existing/non-delivery state, and must not drive pipeline control flow |
+| `delivery_plan_path` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` | Project-relative path to the delivery plan file (e.g. `.sikula/delivery/my-plan/plan.yaml`); set only by `delivery run-next` child creation, defaults to `None` for existing/non-delivery state, and must not drive pipeline control flow |
 | `config_snapshot` | `dict` | `cmd_run()` / Orchestrator | Effective run configuration captured on first run before agents start (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `planner.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. It is also saved for contract-gate failures that exit before `Orchestrator.run()`. Visible in `show <task_id>`. |
 | `implementation_contract` | `dict` | `cmd_run()` in `sikula_cli/run.py` | Implementation-contract snapshot for fresh task-file runs: task path/format/hash, readiness status/score, gap metadata, clarifying question IDs, and validation coverage counts. By default it is warning-only additive metadata. Fresh `run TASK_FILE` can opt into pre-agent gating with `--require-contract-ready` or `--min-contract-score N`; resume/review flows do not recompute or re-gate it. |
 | `implementation_asset_records` | `list[dict]` | `cmd_run()` in `sikula_cli/run.py` | Sanitized, non-blocking asset metadata snapshot for fresh task-file runs, copied from the implementation-contract preflight asset references. Contains path/kind/status/project path/hash/declared hash/size/MIME/git status/requested target/provenance metadata only; no raw asset content, OCR text, binary data, internal parser fields, or source excerpts. Used for audit and terminal summary counts, not for run/resume/review control-flow decisions. |

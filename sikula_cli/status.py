@@ -119,6 +119,18 @@ def _default_contract_gate_next_action(state) -> str:
     return f"sikula show {state.task_id}"
 
 
+def _default_delivery_child_without_worktree(state) -> bool:
+    if not (getattr(state, "delivery_plan_id", None) and getattr(state, "delivery_unit_id", None)):
+        return False
+    worktree_path = getattr(state, "worktree_path", None)
+    if not worktree_path:
+        return True
+    try:
+        return not Path(worktree_path).exists()
+    except OSError:
+        return True
+
+
 @dataclass(frozen=True)
 class StatusContext:
     resolve_state_dir: Callable[[dict], Path] = _resolve_state_dir
@@ -128,6 +140,7 @@ class StatusContext:
     current_branch_delivery_cleaned: Callable[[object], bool] = _default_current_branch_delivery_cleaned
     contract_gate_blocked_without_worktree: Callable[[object], bool] = _default_contract_gate_blocked_without_worktree
     contract_gate_next_action: Callable[[object], str] = _default_contract_gate_next_action
+    delivery_child_without_worktree: Callable[[object], bool] = _default_delivery_child_without_worktree
     pid_running: Callable[[int], bool] = _pid_running
 
 
@@ -250,6 +263,8 @@ def _status_next_action(state, status: str, context: StatusContext | None = None
             return "re-run sikula review"
         if context.contract_gate_blocked_without_worktree(state):
             return context.contract_gate_next_action(state)
+        if context.delivery_child_without_worktree(state):
+            return f"sikula show {state.task_id}"
         return f"sikula run --task-id {state.task_id} --reset-failed"
     if state.review_mode == "review_report":
         if state.active_operation and _active_operation_is_fresh(state.active_operation):

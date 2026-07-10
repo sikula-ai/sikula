@@ -1,0 +1,176 @@
+schema_version: 1
+plan_id: delivery-run-next-resume-retry
+title: Delivery run-next resume and retry
+planning_mode: fixed_window
+final_branch: sikula/delivery/delivery-run-next-resume-retry
+repositories:
+- id: main
+  root: .
+streams:
+- delivery
+units:
+- id: durable-child-linkage
+  title: Persist child delivery metadata
+  task_path: .sikula/delivery/delivery-run-next-resume-retry/units/durable-child-linkage.md
+  depends_on: []
+  stream: delivery
+  platform: python
+  phase: foundation
+  kind: implementation
+  scope_paths:
+  - sikula_cli/run.py
+  - core/state.py
+  - tests
+  estimated_size: small
+  risk_tags:
+  - data_persistence
+  - execution_boundary
+  budget:
+    max_planner_steps: 3
+    max_review_cycles: 2
+    max_security_cycles: 2
+    max_changed_files: 6
+- id: parent-child-progress-linkage
+  title: Link parent progress to child creation
+  task_path: .sikula/delivery/delivery-run-next-resume-retry/units/parent-child-progress-linkage.md
+  depends_on:
+  - durable-child-linkage
+  stream: delivery
+  platform: python
+  phase: foundation
+  kind: implementation
+  scope_paths:
+  - sikula_cli/delivery.py
+  - core/delivery_progress.py
+  - tests
+  estimated_size: small
+  risk_tags:
+  - data_persistence
+  - audit_artifacts
+  budget:
+    max_planner_steps: 3
+    max_review_cycles: 2
+    max_security_cycles: 2
+    max_changed_files: 6
+- id: resume-reconcile-running-unit
+  title: Resume linked running child tasks
+  task_path: .sikula/delivery/delivery-run-next-resume-retry/units/resume-reconcile-running-unit.md
+  depends_on:
+  - parent-child-progress-linkage
+  stream: delivery
+  platform: python
+  phase: resume
+  kind: implementation
+  scope_paths:
+  - sikula_cli/delivery.py
+  - core/delivery_progress.py
+  - core/delivery_run_next.py
+  - tests
+  estimated_size: small
+  risk_tags:
+  - cli_surface
+  - execution_boundary
+  budget:
+    max_planner_steps: 3
+    max_review_cycles: 2
+    max_security_cycles: 2
+    max_changed_files: 6
+- id: terminal-child-reconciliation
+  title: Reconcile terminal child tasks
+  task_path: .sikula/delivery/delivery-run-next-resume-retry/units/terminal-child-reconciliation.md
+  depends_on:
+  - resume-reconcile-running-unit
+  stream: delivery
+  platform: python
+  phase: reconcile
+  kind: implementation
+  scope_paths:
+  - sikula_cli/delivery.py
+  - core/delivery_progress.py
+  - core/delivery_run_next.py
+  - tests
+  estimated_size: small
+  risk_tags:
+  - data_persistence
+  - audit_artifacts
+  budget:
+    max_planner_steps: 3
+    max_review_cycles: 2
+    max_security_cycles: 2
+    max_changed_files: 6
+- id: reset-failed-child-retry
+  title: Select failed child retries
+  task_path: .sikula/delivery/delivery-run-next-resume-retry/units/reset-failed-child-retry.md
+  depends_on:
+  - terminal-child-reconciliation
+  stream: delivery
+  platform: python
+  phase: retry
+  kind: implementation
+  scope_paths:
+  - sikula_cli/delivery.py
+  - core/delivery_progress.py
+  - core/delivery_run_next.py
+  - tests
+  estimated_size: small
+  risk_tags:
+  - cli_surface
+  - data_persistence
+  budget:
+    max_planner_steps: 3
+    max_review_cycles: 2
+    max_security_cycles: 2
+    max_changed_files: 6
+- id: reset-failed-child-forwarding
+  title: Forward failed child reset runs
+  task_path: .sikula/delivery/delivery-run-next-resume-retry/units/reset-failed-child-forwarding.md
+  depends_on:
+  - reset-failed-child-retry
+  stream: delivery
+  platform: python
+  phase: retry
+  kind: implementation
+  scope_paths:
+  - sikula_cli/delivery.py
+  - core/delivery_progress.py
+  - core/delivery_run_next.py
+  - tests
+  estimated_size: small
+  risk_tags:
+  - automation_behavior
+  - execution_boundary
+  budget:
+    max_planner_steps: 3
+    max_review_cycles: 2
+    max_security_cycles: 2
+    max_changed_files: 6
+- id: status-docs-test-hardening
+  title: Harden status, docs, and tests
+  task_path: .sikula/delivery/delivery-run-next-resume-retry/units/status-docs-test-hardening.md
+  depends_on:
+  - reset-failed-child-forwarding
+  stream: delivery
+  platform: python
+  phase: hardening
+  kind: documentation-and-tests
+  scope_paths:
+  - core/delivery_progress.py
+  - core/delivery_run_next.py
+  - sikula_cli/delivery.py
+  - README.md
+  - docs
+  - ARCHITECTURE.md
+  - tests
+  estimated_size: medium
+  risk_tags:
+  - docs_coverage
+  - public_output_contract
+  - structured_output_contract
+  - test_hardening
+  - validation
+  budget:
+    max_planner_steps: 4
+    max_review_cycles: 2
+    max_security_cycles: 2
+    max_changed_files: 10
+    max_generated_test_files: 4

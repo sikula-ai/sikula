@@ -83,9 +83,10 @@ Delivery-plan constraints:
   max_changed_modules, max_generated_test_files.
 - Unit task Markdown must be product/behavior descriptions with acceptance criteria and verification
   expectations, not file-by-file implementation scripts.
-- Unit task Markdown must include Goal, Current behavior, Desired behavior, Acceptance criteria,
-  Security/privacy notes, Reviewer focus, Out of scope, and Verification sections.
-- Verification sections must include explicit commands that match or are directly supported by the
+- Unit task Markdown must include all of these exact contract-ready section headings:
+  Goal, Current behavior, Desired behavior, Acceptance criteria, Security and privacy, Reviewer focus,
+  Out of scope, and Validation.
+- Validation sections must include explicit commands that match or are directly supported by the
   source task or configured validation commands.
 - Unit task Markdown must not include "## Asset manifest" or sikula:generated-* markers.
 - Paths for plan.yaml and unit task files are derived later from the output directory and unit IDs.
@@ -137,7 +138,7 @@ Return this JSON shape:
       "estimated_size": "small",
       "risk_tags": ["cli_surface"],
       "budget": {{"max_planner_steps": 3, "max_changed_files": 8}},
-      "task_markdown": "# Unit title\\n\\n## Goal\\n\\n...\\n\\n## Verification\\n\\n- `command`"
+      "task_markdown": "# Unit title\\n\\n## Goal\\n\\n...\\n\\n## Security and privacy\\n\\n...\\n\\n## Validation\\n\\n- `command`"
     }}
   ]
 }}
