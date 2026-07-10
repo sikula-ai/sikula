@@ -1098,10 +1098,15 @@ def test_cmd_delivery_run_next_dry_run_reports_running_recovery_even_when_depend
             {"unit_id": "02-feature", "status": "running", "child_task_id": "resume-child"},
         ],
     )
+    cfg = _run_next_cfg(tmp_path)
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    state = _resume_child_state(task_id="resume-child", unit_id="02-feature")
+    _record_resume_worktree(state, tmp_path)
+    store.save(state)
 
     cmd_delivery_run_next(
         _run_next_args(plan_path, dry_run=True, json_output=True),
-        _run_next_cfg(tmp_path),
+        cfg,
     )
 
     payload = json.loads(capsys.readouterr().out)
@@ -1111,6 +1116,64 @@ def test_cmd_delivery_run_next_dry_run_reports_running_recovery_even_when_depend
     assert payload["selected_unit"]["child_task_id"] == "resume-child"
     assert payload["errors"] == []
     assert "resume or reconciliation" in payload["message"]
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_dry_run_blocks_running_recovery_missing_child_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, dry_run=True, json_output=True),
+            _run_next_cfg(tmp_path),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is False
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["selected_unit"]["status"] == "running"
+    assert payload["selected_unit"]["child_task_id"] == "resume-child"
+    assert payload["errors"][0]["code"] == "delivery.child_task_missing"
+    assert "was not found in the configured state directory" in payload["errors"][0]["message"]
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_dry_run_blocks_running_recovery_child_metadata_mismatch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}],
+    )
+    cfg = _run_next_cfg(tmp_path)
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    state = _resume_child_state(plan_id="other-plan")
+    _record_resume_worktree(state, tmp_path)
+    store.save(state)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, dry_run=True, json_output=True),
+            cfg,
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is False
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["errors"][0]["code"] == "delivery.child_task_metadata_mismatch"
+    assert "metadata does not match the parent plan" in payload["errors"][0]["message"]
+    assert "other-plan" not in json.dumps(payload)
     assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
 
 
@@ -2936,6 +2999,87 @@ def test_cmd_delivery_run_next_blocks_failed_child_retry_with_stale_worktree(
     assert payload["selected_unit"]["status"] == "failed"
     assert payload["errors"][0]["code"] == "delivery.child_worktree_missing"
     assert store.load("task-xyz").failed is True
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_dry_run_blocks_failed_child_retry_with_stale_worktree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+        ],
+    )
+
+    state_dir = Path(cfg["tasks"]["state_dir"])
+    store = JsonStateStore(state_dir)
+    state = store.create("task-xyz")
+    state.task_id = "task-xyz"
+    state.delivery_plan_id = "delivery-run-next-demo"
+    state.delivery_unit_id = "01-foundation"
+    state.delivery_plan_path = ".sikula/delivery/demo/plan.yaml"
+    state.worktree_path = str(tmp_path / ".sikula" / "worktrees" / "missing-child")
+    state.worktree_branch = "sikula/stale-child"
+    state.failed = True
+    store.save(state)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, dry_run=True, reset_failed=True, json_output=True),
+            cfg,
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is False
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["selected_unit"]["status"] == "failed"
+    assert payload["selected_unit"]["child_task_id"] == "task-xyz"
+    assert payload["errors"][0]["code"] == "delivery.child_worktree_missing"
+    assert store.load("task-xyz").failed is True
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_dry_run_allows_completed_failed_child_retry_without_worktree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+        ],
+    )
+
+    state_dir = Path(cfg["tasks"]["state_dir"])
+    store = JsonStateStore(state_dir)
+    state = store.create("task-xyz")
+    state.task_id = "task-xyz"
+    state.delivery_plan_id = "delivery-run-next-demo"
+    state.delivery_unit_id = "01-foundation"
+    state.delivery_plan_path = ".sikula/delivery/demo/plan.yaml"
+    state.done = True
+    state.result_commit = "abc1234"
+    store.save(state)
+
+    cmd_delivery_run_next(
+        _run_next_args(plan_path, dry_run=True, reset_failed=True, json_output=True),
+        cfg,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["selected_unit"]["status"] == "failed"
+    assert payload["selected_unit"]["child_task_id"] == "task-xyz"
+    assert payload["errors"] == []
+    assert "selected failed delivery unit" in payload["message"]
     assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
 
 
