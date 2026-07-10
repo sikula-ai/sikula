@@ -2011,7 +2011,7 @@ def _run_delivery_child_retry(
         unit_id,
         "running",
         child_task_id=child_task_id,
-        timestamp=selected_unit.started_at,
+        started_at=selected_unit.started_at,
     )
     append_delivery_progress_event(
         events_path,

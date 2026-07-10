@@ -464,7 +464,7 @@ def make_delivery_unit_progress(
     timestamp: str | None = None,
 ) -> DeliveryUnitProgress:
     timestamp = timestamp or _utc_now()
-    started_at = timestamp if status == "running" else started_at
+    started_at = (started_at or timestamp) if status == "running" else started_at
     completed_at = timestamp if status in _TERMINAL_DELIVERY_UNIT_STATUSES else None
     return DeliveryUnitProgress(
         unit_id=unit_id,

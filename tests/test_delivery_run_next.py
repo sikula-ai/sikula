@@ -3137,10 +3137,19 @@ def test_cmd_delivery_run_next_runs_failed_child_retry(tmp_path: Path, capsys: p
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
     cfg = _run_next_cfg(tmp_path)
+    original_started_at = "2026-07-04T12:00:00+00:00"
+    original_updated_at = "2026-07-04T12:04:00+00:00"
     _write_progress(
         tmp_path,
         [
-            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-xyz"},
+            {
+                "unit_id": "01-foundation",
+                "status": "failed",
+                "child_task_id": "task-xyz",
+                "started_at": original_started_at,
+                "completed_at": original_updated_at,
+                "updated_at": original_updated_at,
+            },
         ],
     )
 
@@ -3165,6 +3174,8 @@ def test_cmd_delivery_run_next_runs_failed_child_retry(tmp_path: Path, capsys: p
         progress = _load_delivery_progress(tmp_path)
         assert progress["units"][0]["status"] == "running"
         assert progress["units"][0]["child_task_id"] == "task-xyz"
+        assert progress["units"][0]["started_at"] == original_started_at
+        assert progress["units"][0]["updated_at"] not in {original_started_at, original_updated_at}
         state.done = True
         state.worktree_branch = "sikula/01-foundation-retry"
         state.result_commit = "abc1234"
@@ -3194,6 +3205,7 @@ def test_cmd_delivery_run_next_runs_failed_child_retry(tmp_path: Path, capsys: p
     assert [event["event_type"] for event in parsed_events] == ["unit.retry_intent", "unit.done"]
     assert parsed_events[0]["unit_id"] == "01-foundation"
     assert parsed_events[0]["child_task_id"] == "task-xyz"
+    assert parsed_events[0]["timestamp"] not in {original_started_at, original_updated_at}
     assert parsed_events[1]["unit_id"] == "01-foundation"
     assert parsed_events[1]["child_task_id"] == "task-xyz"
 

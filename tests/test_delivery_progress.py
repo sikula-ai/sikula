@@ -1005,6 +1005,20 @@ def test_terminal_delivery_progress_accepts_explicit_started_at() -> None:
     assert unit.failure_code == "tests_failed"
 
 
+def test_running_delivery_progress_accepts_explicit_started_at() -> None:
+    unit = make_delivery_unit_progress(
+        "unit-1",
+        "running",
+        child_task_id="task-1",
+        started_at="2026-07-04T12:00:00+00:00",
+        timestamp="2026-07-04T12:04:00+00:00",
+    )
+
+    assert unit.started_at == "2026-07-04T12:00:00+00:00"
+    assert unit.updated_at == "2026-07-04T12:04:00+00:00"
+    assert unit.completed_at is None
+
+
 def test_delivery_progress_validation_rejects_duplicate_and_invalid_units(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="duplicate"):
         write_delivery_progress(
