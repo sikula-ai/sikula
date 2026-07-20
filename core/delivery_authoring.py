@@ -23,6 +23,14 @@ _FENCED_JSON_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _TOP_LEVEL_FIELDS = {"plan_id", "title", "units", "planning_mode", "warnings"}
+_AMENDMENT_TOP_LEVEL_FIELDS = {
+    "plan_id",
+    "target_unit_id",
+    "replacement_units",
+    "amend_reason",
+    "budget_exceeded",
+    "warnings",
+}
 _UNIT_FIELDS = {
     "id",
     "title",
@@ -112,6 +120,17 @@ class DeliveryAuthoringDraft:
 
 
 @dataclass
+class DeliveryAmendmentAuthoringDraft:
+    plan_id: str
+    target_unit_id: str
+    replacement_units: list[DeliveryAuthoringUnitDraft]
+    amend_reason: str | None = None
+    budget_exceeded: dict[str, Any] | None = None
+    warnings: list[str] = field(default_factory=list)
+    audit_records: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class DeliveryAuthoringDerivedPaths:
     plan_file: str
     units_dir: str
@@ -164,6 +183,82 @@ def parse_delivery_authoring_output(
         planning_mode=planning_mode,
         warnings=warnings,
     )
+
+
+def parse_delivery_amendment_authoring_output(
+    output: str,
+    *,
+    expected_plan_id: str,
+    expected_target_unit_id: str,
+    project_root: str | Path,
+) -> DeliveryAmendmentAuthoringDraft:
+    root = _resolve_project_root(project_root)
+    data = _parse_output_object(output)
+    _reject_unknown_fields(data, _AMENDMENT_TOP_LEVEL_FIELDS, "top-level")
+
+    plan_id = _require_string(data, "plan_id", "plan_id")
+    if plan_id != expected_plan_id:
+        raise DeliveryAuthoringParseError(
+            "delivery_amend_authoring.plan_id_mismatch",
+            "plan_id must match the selected delivery plan.",
+        )
+    target_unit_id = _require_string(data, "target_unit_id", "target_unit_id")
+    if target_unit_id != expected_target_unit_id:
+        raise DeliveryAuthoringParseError(
+            "delivery_amend_authoring.target_unit_mismatch",
+            "target_unit_id must match the selected split unit.",
+        )
+    replacement_units = _parse_units(data.get("replacement_units"), project_root=root)
+    if target_unit_id in {unit.id for unit in replacement_units}:
+        raise DeliveryAuthoringParseError(
+            "delivery_amend_authoring.target_id_reused",
+            "Replacement units must use new unit ids.",
+        )
+    amend_reason = None if data.get("amend_reason") is None else _optional_string(data, "amend_reason", "amend_reason")
+    if amend_reason and not _DELIVERY_AUTHORING_ID_RE.fullmatch(amend_reason):
+        raise DeliveryAuthoringParseError(
+            "delivery_amend_authoring.amend_reason_invalid",
+            "amend_reason must be a stable code.",
+        )
+    budget_exceeded = _parse_budget_exceeded(data.get("budget_exceeded"))
+    warnings = _optional_string_list(data, "warnings", "warnings")
+    return DeliveryAmendmentAuthoringDraft(
+        plan_id=plan_id,
+        target_unit_id=target_unit_id,
+        replacement_units=replacement_units,
+        amend_reason=amend_reason,
+        budget_exceeded=budget_exceeded,
+        warnings=warnings,
+    )
+
+
+def _parse_budget_exceeded(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"name", "limit", "actual"}:
+        raise DeliveryAuthoringParseError(
+            "delivery_amend_authoring.budget_exceeded_invalid",
+            "budget_exceeded must contain exactly name, limit, and actual.",
+        )
+    name = value.get("name")
+    limit = value.get("limit")
+    actual = value.get("actual")
+    if not isinstance(name, str) or not name.strip() or not _DELIVERY_AUTHORING_ID_RE.fullmatch(name.strip()):
+        raise DeliveryAuthoringParseError(
+            "delivery_amend_authoring.budget_exceeded_invalid",
+            "budget_exceeded.name must be a stable code.",
+        )
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise DeliveryAuthoringParseError(
+            "delivery_amend_authoring.budget_exceeded_invalid",
+            "budget_exceeded.limit must be a non-negative integer.",
+        )
+    if isinstance(actual, bool) or not isinstance(actual, int) or actual < 0:
+        raise DeliveryAuthoringParseError(
+            "delivery_amend_authoring.budget_exceeded_invalid",
+            "budget_exceeded.actual must be a non-negative integer.",
+        )
+    return {"name": name.strip(), "limit": limit, "actual": actual}
 
 
 def derive_delivery_authoring_paths(

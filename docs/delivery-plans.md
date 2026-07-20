@@ -122,6 +122,102 @@ several high-risk tags, for example external execution boundaries, structured
 output contracts, and CLI surface, so operators can split the plan before
 running that unit.
 
+## Amend And Split A Unit
+
+An in-progress plan can replace one eligible pending or failed unit with smaller
+units without regenerating the whole plan:
+
+```bash
+sikula delivery amend prepare .sikula/delivery/<slug>/plan.yaml \
+  --split-unit <unit-id>
+sikula delivery amend apply .sikula/delivery/<slug>/plan.yaml \
+  --proposal <proposal-id> --dry-run
+sikula delivery amend apply .sikula/delivery/<slug>/plan.yaml \
+  --proposal <proposal-id>
+```
+
+`amend prepare` is the only model-assisted phase. It uses the existing
+`delivery_preparer` configuration and accepts the same scoped model, provider,
+and timeout overrides as `delivery prepare`. The assistant returns only new
+replacement units; deterministic code derives task paths, makes replacement
+roots inherit the target's upstream dependencies, identifies replacement
+leaves, and determines which direct downstream units need rewiring.
+
+Prepare stores a normalized, content-addressed proposal under
+`.sikula/contract-reports/delivery-amendments/<plan-id>/`. The proposal includes
+the project-relative source plan path, exact replacement definitions and task
+Markdown, plus fingerprints of the source plan, selected target task contract,
+and sanitized parent progress. Raw prompts and provider output stay in the
+separate local authoring audit. Sikula
+captures those fingerprints before invoking the assistant and discards the
+draft if any input changes before proposal storage. Prepare rechecks the source
+fingerprints and deterministic replacement paths before and after publication;
+if either changes during publication, Sikula removes the new proposal and
+reports preparation as blocked. Pre-existing files or symlinks block
+publication. Replacement task Markdown must also pass the normal
+contract-readiness and configured validation-coverage gate, and the resulting
+amended plan must pass deterministic plan validation.
+Proposal publication uses a same-directory temporary file and atomic
+no-overwrite publish, so the content-addressed proposal is complete or absent.
+Directory fsync is best effort, matching Sikula's other state writers.
+Plans under `.git`, `.sikula/state`, `.sikula/worktrees`, configured task state,
+or configured contract-report directories cannot be amended. A selected target
+task resolving into any of those private trees is rejected before its contents
+are read or sent to the authoring model. The authoring boundary validates the
+task location before and after reading and requires its bytes to match the
+captured snapshot before constructing the model request. Prepare does not modify
+the tracked plan, unit files, progress, events, child task state, worktrees,
+branches, or Git refs.
+
+`amend apply --dry-run` loads the exact stored proposal and performs the complete
+deterministic preflight in memory. It invokes no LLM and writes no proposal,
+audit, plan, unit, progress, event, child-state, worktree, branch, or Git-ref
+artifact. Mutating apply repeats the same checks under the delivery mutation
+lock and rejects stale plan, target task, or progress fingerprints instead of
+regenerating the proposal. Preflight reruns replacement contract readiness
+against the current effective project configuration. Mutating apply publishes
+replacement tasks with atomic no-overwrite semantics, rechecks source
+fingerprints, and replaces the plan using the same temporary-file plus
+`os.replace` pattern as Sikula's other state writers. It rechecks target task,
+progress, and every published replacement fingerprint before success. If plan
+rollback cannot be confirmed, replacement task files are retained so the
+published plan does not reference missing contracts. Failure to create or open
+the delivery progress lock also returns a structured blocked result. External
+checkout mutation during mutating apply is unsupported; the delivery lock
+serializes cooperating Sikula operations.
+
+Completed units are immutable. Running units must first be resumed or
+reconciled. A failed unit may be superseded while its original progress,
+failure metadata, and child task link remain inspectable. The tracked plan keeps
+the original target entry and task file, adds `superseded_by` to that entry, and
+adds `supersedes` to each replacement. Pending direct dependents are rewired from
+the target to all replacement leaves. Replacement roots retain all active target
+prerequisites; persisted or imported amendment metadata that weakens that
+ordering is invalid. Missing references, cycles, path collisions, non-pending
+downstream state, unapplied completed prerequisite commits, and any
+completed-unit change fail closed.
+
+Optional `amend_reason` and `budget_exceeded.name` metadata use stable codes,
+not free-form model output, because they are projected into status and audit
+events.
+
+After apply, `delivery status` projects the retained target as `superseded` while
+preserving its historical progress metadata. Superseded units are not eligible
+for `run-next`, do not keep the effective plan failed or pending, and are ignored
+when determining whether the active graph is ready for `finalize`. Successful
+apply records `plan.amend_started`, `unit.split_recommended`,
+`unit.superseded`, `unit.replacement_added`, and `plan.amended` events. Failed
+mutating attempts record `plan.amend_failed` when the plan and proposal identity
+can be established. Failure to append that terminal event is surfaced alongside
+the original amendment failure. Interruptions roll back artifact changes, append
+`plan.amend_failed`, and then propagate to the caller. Existing progress and
+earlier events are never rewritten. Blocked results use a blocked message, and
+outside-project input paths are redacted from human and JSON diagnostics.
+
+Planner-step budget stops and automatic invocation of this flow are not yet
+implemented. This command provides the safe amendment mechanism they can use
+later.
+
 ## After Preparing
 
 After `delivery prepare`, check the tracked plan and preview execution before
@@ -334,6 +430,8 @@ The MVP validator checks:
 - delivery unit IDs,
 - unit task paths,
 - unit dependency references and cycles,
+- consistent `supersedes` and `superseded_by` amendment links, preserved target
+  prerequisites, and active dependencies that do not point to superseded units,
 - optional stream references,
 - optional monorepo component references and project-relative scope paths,
 - single-repository scope.

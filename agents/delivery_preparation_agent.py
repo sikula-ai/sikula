@@ -8,8 +8,10 @@ from typing import Any, Callable
 
 from agents.base_agent import AGENT_SECURITY_PREFIX, guidelines_files, read_only_agent_prompt, tech_stack
 from core.delivery_authoring import (
+    DeliveryAmendmentAuthoringDraft,
     DeliveryAuthoringDraft,
     DeliveryAuthoringParseError,
+    parse_delivery_amendment_authoring_output,
     parse_delivery_authoring_output,
 )
 from core.llm_client import LLMClient
@@ -144,6 +146,101 @@ Return this JSON shape:
 }}
 """
 
+_DELIVERY_AMENDMENT_PROMPT = """\
+You are Sikula's read-only delivery-plan amendment authoring assistant.
+
+Split one selected delivery unit into smaller replacement units. You propose only the replacement
+graph and replacement task contracts. Deterministic Sikula code preserves the existing plan,
+rewires downstream dependencies, and accepts or rejects the proposal.
+
+Hard rules:
+- Do not write, edit, delete, move, rename, format, or create files.
+- Do not run commands, start nested Sikula commands, or use external services.
+- Do not propose edits to existing units or return the whole delivery plan.
+- Do not include path fields such as task_path, path, output_path, or plan_path.
+- Do not include raw prompts, provider output, source excerpts, task state, diffs, logs, secrets,
+  personal data, or absolute local paths in the JSON result.
+- Return exactly one JSON object and no Markdown outside the JSON.
+
+Plan id: {plan_id}
+Target unit id: {target_unit_id_json}
+Project stack: {project_stack}
+
+Target unit metadata:
+```json
+{target_unit_json}
+```
+
+Pending direct dependents that Sikula will rewire to replacement leaves:
+```json
+{downstream_units_json}
+```
+
+Project guidelines files:
+{guidelines_files}
+
+Configured guidelines content:
+```markdown
+{guidelines_context}
+```
+
+Project context:
+```json
+{project_context_json}
+```
+
+Selected unit task:
+```markdown
+{target_task_description}
+```
+
+Replacement constraints:
+- Produce at least two smaller units with new, path-safe ids.
+- depends_on may reference replacement unit ids only. Sikula adds the target's upstream
+  dependencies to replacement roots and rewires existing downstream units to replacement leaves.
+- Prefer one planner step and one primary production surface per replacement.
+- Use only the same metadata, risk tag, sizing, and positive integer budget fields supported by
+  delivery prepare.
+- amend_reason must be omitted, null, or a stable code containing only letters, numbers, dots,
+  underscores, and hyphens.
+- Every task_markdown must contain these exact headings: Goal, Current behavior, Desired behavior,
+  Acceptance criteria, Security and privacy, Reviewer focus, Out of scope, and Validation.
+- Keep acceptance criteria observable and validation commands supported by the source unit or
+  configured project context.
+
+Return this JSON shape:
+{{
+  "plan_id": "{plan_id}",
+  "target_unit_id": {target_unit_id_json},
+  "amend_reason": "unit_budget_exceeded",
+  "budget_exceeded": null,
+  "warnings": [],
+  "replacement_units": [
+    {{
+      "id": "new-unit-a",
+      "title": "Short replacement title",
+      "depends_on": [],
+      "stream": "optional non-empty string",
+      "component": "optional non-empty string",
+      "phase": "optional non-empty string",
+      "kind": "optional non-empty string",
+      "platform": "optional non-empty string",
+      "scope_paths": [],
+      "estimated_size": "small",
+      "risk_tags": ["validation"],
+      "budget": {{"max_planner_steps": 1}},
+      "task_markdown": "# Replacement title\\n\\n## Goal\\n\\n...\\n\\n## Validation\\n\\n- `command`"
+    }},
+    {{
+      "id": "new-unit-b",
+      "title": "Short replacement title",
+      "depends_on": ["new-unit-a"],
+      "task_markdown": "# Replacement title\\n\\n## Goal\\n\\n...\\n\\n## Validation\\n\\n- `command`"
+    }}
+  ]
+}}
+"""
+
 
 class DeliveryPreparationAgentError(RuntimeError):
     """Safe delivery-preparer invocation failure."""
@@ -210,6 +307,63 @@ class DeliveryPreparationAgent:
             raise
 
         self._record_success(audit_recorder, prompt=prompt, output=output, draft=draft)
+        return draft
+
+    def author_delivery_amendment(
+        self,
+        *,
+        plan_id: str,
+        target_unit_id: str,
+        target_task_description: str,
+        target_unit: dict[str, Any],
+        downstream_units: list[dict[str, Any]],
+        project_root: str | Path,
+        project_context: dict[str, Any] | None = None,
+        audit_recorder: DeliveryPreparationAuditRecorder | None = None,
+    ) -> DeliveryAmendmentAuthoringDraft:
+        root = Path(project_root).resolve()
+        prompt = read_only_agent_prompt(
+            AGENT_SECURITY_PREFIX
+            + _DELIVERY_AMENDMENT_PROMPT.format(
+                plan_id=plan_id,
+                target_unit_id_json=json.dumps(target_unit_id),
+                project_stack=tech_stack(self.project_config),
+                target_unit_json=json.dumps(target_unit, indent=2, sort_keys=True),
+                downstream_units_json=json.dumps(downstream_units, indent=2, sort_keys=True),
+                guidelines_files=guidelines_files(self.project_config),
+                guidelines_context=self._guidelines_context(root),
+                project_context_json=json.dumps(project_context or {}, indent=2, sort_keys=True),
+                target_task_description=target_task_description,
+            )
+        )
+        try:
+            output = self.llm.generate("", prompt)
+        except Exception as exc:
+            self._record_amendment_failure(
+                audit_recorder,
+                prompt=prompt,
+                output=None,
+                error=exc,
+                error_code="delivery_amend.authoring_failed",
+            )
+            raise DeliveryPreparationAgentError("Delivery amendment authoring assistant failed.") from None
+        try:
+            draft = parse_delivery_amendment_authoring_output(
+                output,
+                expected_plan_id=plan_id,
+                expected_target_unit_id=target_unit_id,
+                project_root=root,
+            )
+        except DeliveryAuthoringParseError as exc:
+            self._record_amendment_failure(
+                audit_recorder,
+                prompt=prompt,
+                output=output,
+                error=exc,
+                error_code=exc.code,
+            )
+            raise
+        self._record_amendment_success(audit_recorder, prompt=prompt, output=output, draft=draft)
         return draft
 
     def _build_authoring_prompt(
@@ -333,6 +487,59 @@ class DeliveryPreparationAgent:
                 "prompt": prompt,
                 "raw_output": output,
                 "parsed": parsed,
+            }
+        )
+
+    def _record_amendment_success(
+        self,
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+        *,
+        prompt: str,
+        output: str,
+        draft: DeliveryAmendmentAuthoringDraft,
+    ) -> None:
+        if audit_recorder is None:
+            return
+        audit_recorder(
+            {
+                "phase": "delivery_amend_prepare_authoring",
+                "round_index": 1,
+                "prompt": prompt,
+                "raw_output": output,
+                "parsed": {
+                    "status": "parsed",
+                    "plan_id": draft.plan_id,
+                    "target_unit_id": draft.target_unit_id,
+                    "replacement_ids": [unit.id for unit in draft.replacement_units],
+                    "replacement_count": len(draft.replacement_units),
+                    "warnings": list(draft.warnings),
+                },
+            }
+        )
+
+    def _record_amendment_failure(
+        self,
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+        *,
+        prompt: str,
+        output: str | None,
+        error: Exception,
+        error_code: str,
+    ) -> None:
+        if audit_recorder is None:
+            return
+        audit_recorder(
+            {
+                "phase": "delivery_amend_prepare_authoring",
+                "round_index": 1,
+                "prompt": prompt,
+                "raw_output": output,
+                "parsed": {
+                    "status": "failed",
+                    "error_type": type(error).__name__,
+                    "error_code": error_code,
+                    "error": str(error),
+                },
             }
         )
 

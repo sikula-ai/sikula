@@ -12,6 +12,7 @@ from core.delivery_authoring import (
     DeliveryAuthoringParseError,
     DeliveryAuthoringUnitDraft,
     derive_delivery_authoring_paths,
+    parse_delivery_amendment_authoring_output,
     parse_delivery_authoring_output,
 )
 from core.delivery_unit_metadata import DeliveryUnitBudget
@@ -233,6 +234,42 @@ def test_parse_delivery_authoring_output_accepts_text_heading_equivalents(tmp_pa
     draft = _parse(json.dumps(data), tmp_path)
 
     assert draft.units[0].task_markdown.startswith("Goal:")
+
+
+def test_parse_delivery_amendment_authoring_output_accepts_null_amend_reason(tmp_path: Path) -> None:
+    output = json.dumps(
+        {
+            "plan_id": "team-invites",
+            "target_unit_id": "oversized",
+            "amend_reason": None,
+            "budget_exceeded": None,
+            "warnings": [],
+            "replacement_units": [
+                {
+                    "id": "split-a",
+                    "title": "Split A",
+                    "depends_on": [],
+                    "task_markdown": _unit_markdown("Split A"),
+                },
+                {
+                    "id": "split-b",
+                    "title": "Split B",
+                    "depends_on": ["split-a"],
+                    "task_markdown": _unit_markdown("Split B"),
+                },
+            ],
+        }
+    )
+
+    draft = parse_delivery_amendment_authoring_output(
+        output,
+        expected_plan_id="team-invites",
+        expected_target_unit_id="oversized",
+        project_root=tmp_path,
+    )
+
+    assert draft.amend_reason is None
+    assert [unit.id for unit in draft.replacement_units] == ["split-a", "split-b"]
 
 
 @pytest.mark.parametrize(

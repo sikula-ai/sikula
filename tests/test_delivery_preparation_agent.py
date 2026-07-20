@@ -10,7 +10,11 @@ from agents.delivery_preparation_agent import (
     DeliveryPreparationAgent,
     DeliveryPreparationAgentError,
 )
-from core.delivery_authoring import DeliveryAuthoringDraft, DeliveryAuthoringParseError
+from core.delivery_authoring import (
+    DeliveryAmendmentAuthoringDraft,
+    DeliveryAuthoringDraft,
+    DeliveryAuthoringParseError,
+)
 
 
 class CapturingLLM:
@@ -117,6 +121,38 @@ def _authoring_output(*, planning_mode: str | None = "fixed_window", warnings: l
     return json.dumps(data)
 
 
+def _amendment_output(*, target_unit_id: str = "oversized") -> str:
+    return json.dumps(
+        {
+            "plan_id": "team-invites",
+            "target_unit_id": target_unit_id,
+            "amend_reason": "unit_budget_exceeded",
+            "budget_exceeded": {"name": "max_planner_steps", "limit": 2, "actual": 5},
+            "warnings": [],
+            "replacement_units": [
+                {
+                    "id": "invite-storage",
+                    "title": "Invite storage",
+                    "depends_on": [],
+                    "task_markdown": _unit_markdown("Invite storage"),
+                    "estimated_size": "small",
+                    "risk_tags": ["data_persistence"],
+                    "budget": {"max_planner_steps": 1},
+                },
+                {
+                    "id": "invite-cli",
+                    "title": "Invite CLI",
+                    "depends_on": ["invite-storage"],
+                    "task_markdown": _unit_markdown("Invite CLI"),
+                    "estimated_size": "small",
+                    "risk_tags": ["cli_surface"],
+                    "budget": {"max_planner_steps": 1},
+                },
+            ],
+        }
+    )
+
+
 def _author_delivery_plan(
     agent: DeliveryPreparationAgent,
     *,
@@ -132,6 +168,24 @@ def _author_delivery_plan(
         project_root=tmp_path,
         output_dir=".sikula/delivery/team-invites",
         project_context=project_context,
+        audit_recorder=None if audit_records is None else audit_records.append,
+    )
+
+
+def _author_delivery_amendment(
+    agent: DeliveryPreparationAgent,
+    *,
+    tmp_path: Path,
+    audit_records: list[dict] | None = None,
+) -> DeliveryAmendmentAuthoringDraft:
+    return agent.author_delivery_amendment(
+        plan_id="team-invites",
+        target_unit_id="oversized",
+        target_task_description="Split the oversized invite behavior without exposing this body.",
+        target_unit={"id": "oversized", "depends_on": ["foundation"]},
+        downstream_units=[{"id": "release", "depends_on": ["oversized"]}],
+        project_root=tmp_path,
+        project_context={"validation_commands": ["python3 -m pytest tests/"]},
         audit_recorder=None if audit_records is None else audit_records.append,
     )
 
@@ -210,6 +264,52 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
         "warnings": ["Review before writing artifacts."],
     }
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+def test_author_delivery_amendment_uses_plain_generation_and_records_audit(tmp_path: Path) -> None:
+    llm = CapturingLLM(_amendment_output())
+    agent = DeliveryPreparationAgent(llm=llm)
+    audit_records: list[dict] = []
+
+    draft = _author_delivery_amendment(agent, tmp_path=tmp_path, audit_records=audit_records)
+
+    assert draft.plan_id == "team-invites"
+    assert draft.target_unit_id == "oversized"
+    assert [unit.id for unit in draft.replacement_units] == ["invite-storage", "invite-cli"]
+    assert llm.system_prompts == [""]
+    assert llm.readonly_agent_calls == []
+    assert llm.agent_calls == []
+    prompt = llm.prompts[0]
+    assert prompt.startswith(AGENT_SECURITY_PREFIX)
+    assert READONLY_AGENT_PREFIX in prompt
+    assert "Do not propose edits to existing units" in prompt
+    assert "amend_reason must be omitted, null, or a stable code" in prompt
+    assert '"amend_reason": "unit_budget_exceeded"' in prompt
+    assert "optional stable reason" not in prompt
+    assert '"id": "oversized"' in prompt
+    assert "Split the oversized invite behavior" in prompt
+    assert audit_records[0]["phase"] == "delivery_amend_prepare_authoring"
+    assert audit_records[0]["parsed"]["replacement_ids"] == ["invite-storage", "invite-cli"]
+
+
+def test_author_delivery_amendment_json_escapes_plan_valid_target_id(tmp_path: Path) -> None:
+    target_unit_id = 'part"1\\segment\nnext'
+    llm = CapturingLLM(_amendment_output(target_unit_id=target_unit_id))
+    agent = DeliveryPreparationAgent(llm=llm)
+
+    draft = agent.author_delivery_amendment(
+        plan_id="team-invites",
+        target_unit_id=target_unit_id,
+        target_task_description="Split the selected unit.",
+        target_unit={"id": target_unit_id, "depends_on": []},
+        downstream_units=[],
+        project_root=tmp_path,
+    )
+
+    encoded_id = json.dumps(target_unit_id)
+    assert draft.target_unit_id == target_unit_id
+    assert f"Target unit id: {encoded_id}" in llm.prompts[0]
+    assert f'"target_unit_id": {encoded_id}' in llm.prompts[0]
 
 
 def test_author_delivery_plan_handles_absent_context_and_audit_recorder(tmp_path: Path) -> None:

@@ -9,7 +9,7 @@ import re
 import tempfile
 from typing import Any
 
-from core.delivery_plan import DeliveryPlan, DeliveryPlanIssue, check_delivery_plan_file
+from core.delivery_plan import DeliveryBudgetExceeded, DeliveryPlan, DeliveryPlanIssue, check_delivery_plan_file
 from core.delivery_unit_metadata import DeliveryUnitBudget
 
 SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION = 1
@@ -87,6 +87,11 @@ class DeliveryProgressEvent:
     commit: str | None = None
     waiting_reason: str | None = None
     failure_code: str | None = None
+    proposal_id: str | None = None
+    replacement_ids: list[str] = field(default_factory=list)
+    rewired_unit_ids: list[str] = field(default_factory=list)
+    amend_reason: str | None = None
+    budget_exceeded: DeliveryBudgetExceeded | None = None
     schema_version: int = SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
@@ -104,10 +109,18 @@ class DeliveryProgressEvent:
             "commit",
             "waiting_reason",
             "failure_code",
+            "proposal_id",
+            "amend_reason",
         ):
             value = getattr(self, key)
             if value:
                 data[key] = value
+        if self.replacement_ids:
+            data["replacement_ids"] = list(self.replacement_ids)
+        if self.rewired_unit_ids:
+            data["rewired_unit_ids"] = list(self.rewired_unit_ids)
+        if self.budget_exceeded:
+            data["budget_exceeded"] = self.budget_exceeded.to_dict()
         return data
 
 
@@ -181,6 +194,10 @@ class DeliveryStatusUnit:
     estimated_size: str | None = None
     risk_tags: list[str] = field(default_factory=list)
     budget: DeliveryUnitBudget | None = None
+    supersedes: str | None = None
+    superseded_by: list[str] = field(default_factory=list)
+    amend_reason: str | None = None
+    budget_exceeded: DeliveryBudgetExceeded | None = None
     child_task_id: str | None = None
     branch: str | None = None
     commit: str | None = None
@@ -240,6 +257,8 @@ class DeliveryStatusUnit:
             "started_at",
             "completed_at",
             "updated_at",
+            "supersedes",
+            "amend_reason",
         ):
             value = getattr(self, key)
             if value:
@@ -258,6 +277,10 @@ class DeliveryStatusUnit:
             budget_data = self.budget.to_dict()
             if budget_data:
                 data["budget"] = budget_data
+        if self.superseded_by:
+            data["superseded_by"] = list(self.superseded_by)
+        if self.budget_exceeded:
+            data["budget_exceeded"] = self.budget_exceeded.to_dict()
         return data
 
 
@@ -404,6 +427,20 @@ def append_delivery_progress_event(path: Path, event: DeliveryProgressEvent) -> 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(path.parent)
+
+
+def append_delivery_progress_events(path: Path, events: list[DeliveryProgressEvent]) -> None:
+    for event in events:
+        _validate_event(event)
+    if not events:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = "".join(json.dumps(event.to_dict(), sort_keys=True) + "\n" for event in events)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(payload)
         handle.flush()
         os.fsync(handle.fileno())
     _fsync_directory(path.parent)
@@ -564,6 +601,7 @@ def get_delivery_status(path: str | Path, *, project_root: Path | None = None) -
     if progress_exists:
         progress = _load_delivery_progress(progress_path, plan_id=plan.plan_id, errors=errors)
 
+    _validate_amendment_progress(plan, progress, errors)
     units = _build_status_units(plan, progress, warnings)
     status = "invalid" if errors else _overall_status(units)
     final_branch = progress.final_branch if progress else None
@@ -584,6 +622,49 @@ def get_delivery_status(path: str | Path, *, project_root: Path | None = None) -
         final_commit=final_commit,
         finalized_at=finalized_at,
     )
+
+
+def _validate_amendment_progress(
+    plan: DeliveryPlan,
+    progress: DeliveryProgress | None,
+    errors: list[DeliveryPlanIssue],
+) -> None:
+    if progress is None:
+        return
+    progress_by_id = {unit.unit_id: unit for unit in progress.units}
+    for plan_unit in plan.units:
+        if not plan_unit.superseded:
+            continue
+        progress_unit = progress_by_id.get(plan_unit.id)
+        if progress_unit is None:
+            continue
+        if progress_unit.status == "done":
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "amendment.completed_unit_superseded",
+                    f"Completed unit {plan_unit.id} cannot be superseded.",
+                    plan_unit.source_path or "units",
+                )
+            )
+        elif progress_unit.status == "running":
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "amendment.running_unit_superseded",
+                    f"Running unit {plan_unit.id} must be reconciled before supersession.",
+                    plan_unit.source_path or "units",
+                )
+            )
+        elif progress_unit.status not in {"pending", "failed"}:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "amendment.unsafe_unit_superseded",
+                    f"Unit {plan_unit.id} in state {progress_unit.status} cannot be superseded.",
+                    plan_unit.source_path or "units",
+                )
+            )
 
 
 def _delivery_state_dir(project_root: Path, plan_id: str) -> Path:
@@ -745,6 +826,8 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
                     detail += " (run-next: retry with --reset-failed)"
                 else:
                     detail += " (retry unavailable: missing child task id)"
+            elif unit.status == "superseded":
+                detail += f" (replaced by: {', '.join(unit.superseded_by)})"
             elif unit.blocked_by:
                 detail += f" (blocked by: {', '.join(unit.blocked_by)})"
             elif unit.eligible:
@@ -952,7 +1035,7 @@ def _build_status_units(
     status_units: list[DeliveryStatusUnit] = []
     for plan_unit in plan.units:
         progress_unit = progress_by_id.get(plan_unit.id)
-        status = progress_unit.status if progress_unit else "pending"
+        status = "superseded" if plan_unit.superseded else progress_unit.status if progress_unit else "pending"
         blocked_by = [dependency for dependency in plan_unit.depends_on if dependency not in done_ids]
         if status != "pending":
             blocked_by = []
@@ -974,6 +1057,10 @@ def _build_status_units(
                 estimated_size=plan_unit.estimated_size,
                 risk_tags=list(plan_unit.risk_tags),
                 budget=plan_unit.budget,
+                supersedes=plan_unit.supersedes,
+                superseded_by=list(plan_unit.superseded_by),
+                amend_reason=plan_unit.amend_reason,
+                budget_exceeded=plan_unit.budget_exceeded,
                 child_task_id=progress_unit.child_task_id if progress_unit else None,
                 branch=progress_unit.branch if progress_unit else None,
                 commit=progress_unit.commit if progress_unit else None,
@@ -988,9 +1075,10 @@ def _build_status_units(
 
 
 def _overall_status(units: list[DeliveryStatusUnit]) -> str:
-    if not units:
+    active_units = [unit for unit in units if unit.status != "superseded"]
+    if not active_units:
         return "pending"
-    statuses = {unit.status for unit in units}
+    statuses = {unit.status for unit in active_units}
     if "failed" in statuses:
         return "failed"
     if "running" in statuses:
