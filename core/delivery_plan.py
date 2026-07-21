@@ -13,6 +13,7 @@ from core.delivery_unit_metadata import (
     DELIVERY_UNIT_RISK_TAG_VALUES,
     DELIVERY_UNIT_SIZE_VALUES,
     DELIVERY_UNIT_SPLIT_RISK_TAGS,
+    MAX_DELIVERY_UNIT_MAX_PLANNER_STEPS,
     DeliveryUnitBudget,
 )
 
@@ -990,6 +991,16 @@ def _optional_budget(
                     "error",
                     "units.budget_value_invalid",
                     f"{field_name} must be a positive integer.",
+                    f"{path}.{field_name}",
+                )
+            )
+            continue
+        if field_name == "max_planner_steps" and field_value > MAX_DELIVERY_UNIT_MAX_PLANNER_STEPS:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "units.planner_step_budget_invalid",
+                    "max_planner_steps must be 1 or 2; three or more planner steps require a split.",
                     f"{path}.{field_name}",
                 )
             )

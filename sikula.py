@@ -1112,6 +1112,12 @@ def _reset_failed_state(task_id: str, cfg: dict, store) -> None:
         print(f"Inspect state: sikula show {task_id}")
         sys.exit(1)
 
+    if getattr(state, "delivery_budget_stop", None):
+        print(f"Task {task_id} stopped because its delivery unit exceeded the planner-step budget.")
+        print("--reset-failed cannot bypass a delivery budget stop; split the failed unit before continuing.")
+        print(f"Inspect state: sikula show {task_id}")
+        sys.exit(1)
+
     if _delivery_child_without_worktree(state):
         print(f"Task {task_id} failed before worktree creation because delivery parent-child linking failed.")
         print("--reset-failed cannot safely resume it; rerun the parent delivery plan with delivery run-next.")

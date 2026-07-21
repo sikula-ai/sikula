@@ -4923,6 +4923,67 @@ class TestOrchestratorPresync:
 
 
 class TestOrchestratorPlannerAbort:
+    def test_delivery_child_stops_before_implementation_when_planner_budget_is_exceeded(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=False, run_build=False)
+
+        def planner_effect(state: TaskState) -> None:
+            state.plan = ["Step 1", "Step 2", "Step 3"]
+            state.plan_decided = True
+            state.record("planner", "plan", "3 steps")
+
+        stubs["planner"].side_effect = planner_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 1},
+        )
+
+        result = orch.run(task_id="t1")
+        saved = orch._store.load("t1")
+
+        assert result.failed is True
+        assert result.plan == ["Step 1", "Step 2", "Step 3"]
+        assert result.delivery_budget_stop is not None
+        assert result.delivery_budget_stop["code"] == "unit_budget_exceeded"
+        assert result.delivery_budget_stop["name"] == "max_planner_steps"
+        assert result.delivery_budget_stop["limit"] == 1
+        assert result.delivery_budget_stop["actual"] == 3
+        assert result.delivery_budget_stop["phase"] == "planner"
+        assert len(stubs["planner"].calls) == 1
+        assert len(stubs["implementer"].calls) == 0
+        assert saved is not None
+        assert saved.delivery_budget_stop == result.delivery_budget_stop
+        assert any(entry["action"] == "delivery_budget_exceeded" for entry in saved.history)
+
+    def test_delivery_child_allows_explicit_two_step_budget(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=False, run_build=False)
+
+        def planner_effect(state: TaskState) -> None:
+            state.plan = ["Step 1", "Step 2"]
+            state.plan_decided = True
+
+        def implementer_effect(state: TaskState) -> None:
+            state.files_changed.append(f"src/step{len(stubs['implementer'].calls)}.py")
+
+        stubs["planner"].side_effect = planner_effect
+        stubs["implementer"].side_effect = implementer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 2},
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done is True
+        assert result.delivery_budget_stop is None
+        assert len(stubs["planner"].calls) == 1
+        assert len(stubs["implementer"].calls) == 2
+
     def test_planner_failure_aborts_task(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=True, run_build=False)
         stubs["planner"].side_effect = lambda s: setattr(s, "failed", True)

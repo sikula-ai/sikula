@@ -231,10 +231,11 @@ audit artifacts at
 Ordinary text and JSON output is an explicit allowlisted projection and must not
 embed source task bodies, unit Markdown bodies, prompts, raw provider output,
 diffs, logs, or task state.
-Delivery authoring may include optional unit sizing metadata (`estimated_size`,
-`risk_tags`, and advisory `budget` fields). This metadata guides authoring,
-plan validation warnings, status display, and future explicit execution policy;
-it must not silently weaken review, security, or validation gates.
+Delivery authoring includes unit sizing metadata (`estimated_size`, `risk_tags`,
+and `budget` fields). `max_planner_steps` defaults to one, permits two only as
+an explicit tightly coupled exception, and rejects values of three or more as a
+split signal. Other budget fields remain advisory. No budget may weaken review,
+security, or validation gates.
 
 **Delivery plan amendment commands:** `sikula delivery amend prepare PLAN_FILE
 --split-unit UNIT_ID` reuses `DeliveryPreparationAgent` and the
@@ -296,10 +297,11 @@ updating branches. The validator checks schema version, required plan metadata,
 delivery unit IDs, unit task paths, dependency references/cycles, optional stream
 references, optional monorepo component metadata, unit scope paths, optional
 unit sizing/risk/budget metadata, and the MVP single-repository boundary.
-Component, scope, sizing, risk, and budget fields are metadata only: they are
-preserved for JSON consumers and delivery-console grouping, but they do not
-change `sikula run` behavior, provider access, validation command scope, review
-or security coverage, or worktree creation. If `repositories` is omitted, the
+Component, scope, sizing, risk, and budget fields are preserved for JSON
+consumers and delivery-console grouping. The planner-step budget additionally
+controls delivery child execution before implementation; other metadata does
+not change provider access, validation command scope, review or security
+coverage, or worktree creation. If `repositories` is omitted, the
 plan is treated as one implicit repository with `id: main` and `root: .`;
 multi-repo plans are rejected until cross-repo execution semantics are added.
 The checker emits warnings, not errors, when risk tags indicate that one unit
@@ -437,12 +439,15 @@ Orchestrator.run()
    │       writes → state.analyst_prompt (assembled prompt — includes guidelines content)
    │                state.implementation_prompt
    │
-   ├─ Phase 1.5: plan  (only when run_planner: true; skipped if state.plan_decided already set)
+   ├─ Phase 1.5: plan  (when run_planner: true or this is a delivery child;
+   │                   skipped if state.plan_decided already set)
    │     PlannerAgent  [generate call — no codebase access]
    │       reads  → state.implementation_prompt
    │       calls  → LLMClient.generate(system, user)
    │       decides → SINGLE_PASS: state.plan stays empty → single-pass flow
    │              → numbered list: state.plan populated → step loop
+   │       delivery child only → compare planned step count with the persisted
+   │                             unit budget; fail before Phase 2 when exceeded
    │
    ├─ if state.plan non-empty → step loop (see below)
    └─ if state.plan empty    → single-pass (phases 2-5 once)
@@ -866,7 +871,9 @@ prompt context to be present as files in the reviewed branch or captured start c
 
 ### PlannerAgent (`agents/planner_agent.py`)
 
-Runs after `AnalystAgent`, before `ImplementerAgent`. Only active when `run_planner: true`.
+Runs after `AnalystAgent`, before `ImplementerAgent`. Active when
+`run_planner: true`; delivery child tasks force it on so the unit budget can be
+enforced consistently.
 
 **Mechanism:** calls `LLMClient.generate(system, user)` — no codebase access needed because
 the input is purely the `implementation_prompt` text produced by the analyst.
@@ -889,6 +896,7 @@ dependency in the same step. If that makes the split unclear, planner should cho
 
 **Output written to state:**
 - `state.planner_prompt` — full assembled prompt sent to the planner LLM (system + user sections); stored before the LLM call
+- `state.planner_output` — latest raw planner response; kept in local task state for audit and never copied into parent delivery progress
 - `state.planner_retry_records` — rejected over-limit planner outputs, including parsed step count, configured max, rejected output, and retry prompt when another attempt follows
 - `state.plan_decided = True` — set after every successful decision; guards re-run on resume
 - `state.plan` — list of step description strings (only set when splitting; stays empty for SINGLE_PASS)
@@ -896,7 +904,14 @@ dependency in the same step. If that makes the split unclear, planner should cho
 
 **Fallback and retry:** if the output is neither `SINGLE_PASS` nor parseable into 2+ numbered steps,
 `state.plan` stays empty, `state.plan_decided` is still set, and the orchestrator uses single-pass behavior.
-If the output parses into more than `planner.max_steps` steps, Sikula rejects the output and retries once with a stricter format prompt. If the retry is still over the limit, `plan_decided` remains false and the orchestrator fails before implementation starts. Because the task is then in terminal `failed` state, retrying that planner phase requires the normal `--reset-failed` path.
+For ordinary tasks, if the output parses into more than `planner.max_steps`
+steps, Sikula rejects the output and retries once with a stricter format prompt.
+If the retry is still over the limit, `plan_decided` remains false and the
+orchestrator fails before implementation starts. For delivery children, the
+first valid parsed plan is preserved without a format retry; the orchestrator
+compares its size with `delivery_unit_budget.max_planner_steps` and records a
+terminal `unit_budget_exceeded` stop before implementation when oversized.
+That stop requires a delivery amend/split and cannot be reset directly.
 
 ---
 
@@ -1554,9 +1569,11 @@ Sikula processes at once is still unsupported.
 | `task_description` | `str` | caller | Original plain-text task |
 | `schema_version` | `int` | `StateStore.create()` | State file schema version; used by `JsonStateStore.load()` to run migrations before constructing `TaskState`; current value is `SCHEMA_VERSION = 2` |
 | `task_file` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` | Basename of the task file (e.g. `add-login.md`); set on first run via `--task-file`; used by `status` for display; `None` for tasks created before this field was added or when resuming via `--task-id` only |
-| `delivery_plan_id` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` | Parent delivery plan ID; set only by `delivery run-next` child creation, defaults to `None` for existing/non-delivery state, and must not drive pipeline control flow |
-| `delivery_unit_id` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` | Selected delivery unit ID; set only by `delivery run-next` child creation, defaults to `None` for existing/non-delivery state, and must not drive pipeline control flow |
+| `delivery_plan_id` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` | Parent delivery plan ID; together with `delivery_unit_id`, identifies a delivery child and forces planner execution |
+| `delivery_unit_id` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` | Selected delivery unit ID; together with `delivery_plan_id`, identifies the parent unit whose budget is enforced |
 | `delivery_plan_path` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` | Project-relative path to the delivery plan file (e.g. `.sikula/delivery/my-plan/plan.yaml`); set only by `delivery run-next` child creation, defaults to `None` for existing/non-delivery state, and must not drive pipeline control flow |
+| `delivery_unit_budget` | `dict[str, int]` | `delivery run-next` / `cmd_run()` | Effective allowlisted unit budget snapshot persisted at child creation; always includes `max_planner_steps` (default `1`) |
+| `delivery_budget_stop` | `dict \| None` | Orchestrator | Structured terminal planner budget stop with stable code, budget name, limit, actual count, phase, and timestamp; preserved for audit and parent progress classification |
 | `config_snapshot` | `dict` | `cmd_run()` / Orchestrator | Effective run configuration captured on first run before agents start (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `planner.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. It is also saved for contract-gate failures that exit before `Orchestrator.run()`. Visible in `show <task_id>`. |
 | `implementation_contract` | `dict` | `cmd_run()` in `sikula_cli/run.py` | Implementation-contract snapshot for fresh task-file runs: task path/format/hash, readiness status/score, gap metadata, clarifying question IDs, and validation coverage counts. By default it is warning-only additive metadata. Fresh `run TASK_FILE` can opt into pre-agent gating with `--require-contract-ready` or `--min-contract-score N`; resume/review flows do not recompute or re-gate it. |
 | `implementation_asset_records` | `list[dict]` | `cmd_run()` in `sikula_cli/run.py` | Sanitized, non-blocking asset metadata snapshot for fresh task-file runs, copied from the implementation-contract preflight asset references. Contains path/kind/status/project path/hash/declared hash/size/MIME/git status/requested target/provenance metadata only; no raw asset content, OCR text, binary data, internal parser fields, or source excerpts. Used for audit and terminal summary counts, not for run/resume/review control-flow decisions. |
@@ -1565,6 +1582,7 @@ Sikula processes at once is still unsupported.
 | `contract_gate_blocked` | `bool` | `cmd_run()` in `sikula_cli/run.py` | True when an opt-in contract readiness gate failed before worktree creation or agent startup. Such states are kept for audit but are not reset via `--reset-failed`; users should prepare the implementation contract and start a fresh task-file run. |
 | `analyst_prompt` | `str \| None` | AnalystAgent | Full assembled prompt sent to the analyst LLM (system + user sections, including inlined guidelines content); stored before the LLM call so it captures the exact input even on exception; enables post-run analysis of analyst behaviour |
 | `planner_prompt` | `str \| None` | PlannerAgent | Full assembled prompt sent to the planner LLM (system + user sections); stored before the LLM call; `None` when `run_planner: false` or planner not yet reached |
+| `planner_output` | `str \| None` | PlannerAgent | Latest raw planner response, including an oversized delivery-unit plan; retained only in full task audit state and omitted from parent delivery progress and ordinary projections |
 | `implementation_prompt` | `str \| None` | AnalystAgent | Structured prompt fed to ImplementerAgent; the analyst's key output |
 | `presync_done` | `bool` | Orchestrator | Set True after Phase 0 presync attempt (success or failure); guards re-run on resume |
 | `files_changed` | `list[str]` | Implementer / Fixer | Paths touched so far; used by orchestrator for build-config re-sync detection |

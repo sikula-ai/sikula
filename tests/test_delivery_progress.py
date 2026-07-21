@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from core.delivery_plan import DeliveryBudgetExceeded
 from core.delivery_progress import (
     DeliveryProgress,
     DeliveryProgressEvent,
@@ -16,6 +17,7 @@ from core.delivery_progress import (
     DeliveryUnitProgress,
     acquire_delivery_progress_lock,
     append_delivery_progress_event,
+    append_delivery_progress_events,
     delivery_events_path,
     delivery_lock_path,
     delivery_progress_path,
@@ -388,6 +390,71 @@ def test_delivery_status_unit_run_next_metadata(
         assert "run_next_blocked_reason" not in data
 
 
+def test_delivery_status_unit_projects_amendment_metadata() -> None:
+    from core.delivery_progress import DeliveryStatusUnit
+
+    unit = DeliveryStatusUnit(
+        id="original",
+        title="Original unit",
+        status="superseded",
+        task_path="units/original.md",
+        depends_on=[],
+        superseded_by=["replacement-a", "replacement-b"],
+        budget_exceeded=DeliveryBudgetExceeded(name="max_planner_steps", limit=2, actual=5),
+    )
+
+    data = unit.to_dict()
+
+    assert data["superseded_by"] == ["replacement-a", "replacement-b"]
+    assert data["budget_exceeded"] == {"name": "max_planner_steps", "limit": 2, "actual": 5}
+
+
+def test_delivery_status_unit_projects_budget_stop_as_split_only() -> None:
+    from core.delivery_progress import DeliveryStatusUnit
+
+    unit = DeliveryStatusUnit(
+        id="unit-1",
+        title="Unit 1",
+        status="failed",
+        task_path="units/unit-1.md",
+        depends_on=[],
+        child_task_id="task-1",
+        failure_code="unit_budget_exceeded",
+        budget_exceeded=DeliveryBudgetExceeded(name="max_planner_steps", limit=1, actual=3),
+    )
+
+    assert unit.run_next_available is False
+    assert unit.run_next_action is None
+    assert unit.run_next_blocked_reason == "unit_budget_exceeded"
+    assert unit.to_dict()["run_next_blocked_reason"] == "unit_budget_exceeded"
+
+    result = argparse.Namespace(
+        valid=True,
+        status="failed",
+        plan_path="plan.yaml",
+        progress_path=None,
+        progress_exists=True,
+        project_root=None,
+        plan=None,
+        final_branch=None,
+        final_commit=None,
+        finalized_at=None,
+        next_action="split the budget-exceeded unit",
+        units=[unit],
+        errors=[],
+        warnings=[],
+    )
+    assert "split required before implementation" in render_delivery_status(result)
+
+
+def test_append_delivery_progress_events_ignores_empty_batch(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+
+    append_delivery_progress_events(path, [])
+
+    assert not path.exists()
+
+
 def test_delivery_status_projects_paths_relative_to_project_root(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
@@ -746,6 +813,39 @@ def test_delivery_status_reports_invalid_progress_units(tmp_path: Path) -> None:
     assert "units[4].branch.invalid_type" in _error_codes(result)
 
 
+@pytest.mark.parametrize(
+    "budget_exceeded",
+    [
+        {"name": "max_planner_steps", "limit": 1},
+        {"name": "bad value", "limit": 1, "actual": 3},
+    ],
+)
+def test_delivery_status_rejects_invalid_budget_exceeded_metadata(tmp_path: Path, budget_exceeded: dict) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {
+                    "unit_id": "01-foundation",
+                    "status": "failed",
+                    "failure_code": "unit_budget_exceeded",
+                    "budget_exceeded": budget_exceeded,
+                }
+            ],
+        },
+    )
+
+    result = get_delivery_status(plan_path)
+
+    assert result.valid is False
+    assert "progress.budget_exceeded_invalid" in _error_codes(result)
+
+
 def test_delivery_status_reports_invalid_progress_units_container(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
@@ -1044,6 +1144,75 @@ def test_delivery_progress_validation_rejects_duplicate_and_invalid_units(tmp_pa
             DeliveryProgress(schema_version=1, plan_id="plan", units=[]),
             DeliveryUnitProgress(unit_id="unit-1", status="mystery"),
         )
+
+    invalid_budget = DeliveryBudgetExceeded(name="bad value", limit=1, actual=3)
+    with pytest.raises(ValueError, match="budget_exceeded"):
+        write_delivery_progress(
+            tmp_path / "progress.json",
+            DeliveryProgress(
+                schema_version=1,
+                plan_id="plan",
+                units=[
+                    DeliveryUnitProgress(
+                        unit_id="unit-1",
+                        status="failed",
+                        budget_exceeded=invalid_budget,
+                    )
+                ],
+            ),
+        )
+
+    with pytest.raises(ValueError, match="budget_exceeded"):
+        append_delivery_progress_event(
+            tmp_path / "events.jsonl",
+            DeliveryProgressEvent(
+                plan_id="plan",
+                event_type="unit.failed",
+                timestamp="2026-07-21T12:00:00+00:00",
+                budget_exceeded=invalid_budget,
+            ),
+        )
+
+
+def test_delivery_progress_accepts_amendment_budget_metadata_domain(tmp_path: Path) -> None:
+    budget = DeliveryBudgetExceeded(name="MaxFiles", limit=0, actual=2)
+    progress_path = tmp_path / "progress.json"
+    events_path = tmp_path / "events.jsonl"
+
+    write_delivery_progress(
+        progress_path,
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="plan",
+            units=[
+                DeliveryUnitProgress(
+                    unit_id="unit-1",
+                    status="failed",
+                    budget_exceeded=budget,
+                )
+            ],
+        ),
+    )
+    append_delivery_progress_event(
+        events_path,
+        DeliveryProgressEvent(
+            plan_id="plan",
+            event_type="plan.amended",
+            timestamp="2026-07-21T12:00:00+00:00",
+            budget_exceeded=budget,
+        ),
+    )
+
+    assert json.loads(progress_path.read_text())["units"][0]["budget_exceeded"] == {
+        "name": "MaxFiles",
+        "limit": 0,
+        "actual": 2,
+    }
+    assert json.loads(events_path.read_text())["budget_exceeded"] == {
+        "name": "MaxFiles",
+        "limit": 0,
+        "actual": 2,
+    }
 
 
 def test_delivery_progress_validation_rejects_unsupported_schemas(tmp_path: Path) -> None:

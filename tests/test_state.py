@@ -69,6 +69,20 @@ class TestTaskStateRecord:
         state.record("implementer", "implement", "done")
         assert len(state.history) == 2
 
+    def test_delivery_budget_stop_records_structured_audit(self):
+        state = TaskState(task_id="t1", task_description="task")
+
+        state.record_delivery_budget_stop(name="max_planner_steps", limit=1, actual=3)
+
+        assert state.delivery_budget_stop is not None
+        assert state.delivery_budget_stop["code"] == "unit_budget_exceeded"
+        assert state.delivery_budget_stop["name"] == "max_planner_steps"
+        assert state.delivery_budget_stop["limit"] == 1
+        assert state.delivery_budget_stop["actual"] == 3
+        assert state.delivery_budget_stop["phase"] == "planner"
+        assert "timestamp" in state.delivery_budget_stop
+        assert state.history[-1]["action"] == "delivery_budget_exceeded"
+
 
 class TestTaskStateReviewDeliveryMetadata:
     @pytest.mark.parametrize("field_name", _REVIEW_DELIVERY_FIELDS)
@@ -86,11 +100,26 @@ class TestJsonStateStore:
         assert len(state.task_id) == 32  # uuid4().hex
         assert (tmp_path / f"{state.task_id}.json").exists()
 
+    def test_create_persists_delivery_unit_budget_snapshot(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+
+        state = store.create(
+            "delivery child",
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 2, "max_changed_files": 4},
+        )
+        loaded = store.load(state.task_id)
+
+        assert loaded is not None
+        assert loaded.delivery_unit_budget == {"max_planner_steps": 2, "max_changed_files": 4}
+
     def test_save_and_load_roundtrip(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
         state = TaskState(task_id="abc123", task_description="test task")
         state.build_iterations = 3
         state.review_approved = True
+        state.planner_output = "1. Inspect the delivery unit\n2. Implement it"
         state.generated_test_fix_counts = {"tests/LoginTest.py": 2}
         state.implementation_contract = {"status": "warn", "readiness_score": 72}
         state.test_writer_audit_pending = True
@@ -104,6 +133,7 @@ class TestJsonStateStore:
         assert loaded.task_id == "abc123"
         assert loaded.build_iterations == 3
         assert loaded.review_approved is True
+        assert loaded.planner_output == "1. Inspect the delivery unit\n2. Implement it"
         assert loaded.implementation_contract == {"status": "warn", "readiness_score": 72}
         assert loaded.generated_test_fix_counts == {"tests/LoginTest.py": 2}
         assert loaded.test_writer_audit_pending is True

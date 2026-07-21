@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
 from core.diagnostics import diagnostic_excerpt, diagnostic_summary_lines
 from core.version import sikula_version
 
@@ -296,6 +297,8 @@ def _final_summary(state: "TaskState") -> dict:
         ),
         "analyst_retries_count": len(state.analyst_retry_records),
         "planner_retries_count": len(state.planner_retry_records),
+        "delivery_unit_budget": dict(state.delivery_unit_budget),
+        "delivery_budget_stop": dict(state.delivery_budget_stop) if state.delivery_budget_stop else None,
         "llm_retries": sum(1 for entry in state.history if entry.get("action") == "llm_retry"),
         "history_events_count": len(state.history),
         "created_at": state.created_at,
@@ -358,6 +361,7 @@ class TaskState:
     contract_gate_blocked: bool = False
     analyst_prompt: Optional[str] = None
     planner_prompt: Optional[str] = None
+    planner_output: Optional[str] = None
     implementation_prompt: Optional[str] = None
     presync_done: bool = False
     plan: list[str] = field(default_factory=list)
@@ -418,6 +422,8 @@ class TaskState:
     delivery_plan_id: Optional[str] = None
     delivery_unit_id: Optional[str] = None
     delivery_plan_path: Optional[str] = None
+    delivery_unit_budget: dict[str, int] = field(default_factory=dict)
+    delivery_budget_stop: Optional[dict] = None
     worktree_path: Optional[str] = None
     worktree_branch: Optional[str] = None
     worktree_base: Optional[str] = None
@@ -562,6 +568,21 @@ class TaskState:
         self.planner_retry_records.append(entry)
         action = "plan_retry" if will_retry else "plan_rejected"
         self.record("planner", action, reason_excerpt[:500])
+
+    def record_delivery_budget_stop(self, *, name: str, limit: int, actual: int) -> None:
+        self.delivery_budget_stop = {
+            "code": DELIVERY_UNIT_BUDGET_EXCEEDED_CODE,
+            "name": name,
+            "limit": limit,
+            "actual": actual,
+            "phase": "planner",
+            "timestamp": _now(),
+        }
+        self.record(
+            "orchestrator",
+            "delivery_budget_exceeded",
+            f"{name} exceeded: limit={limit}, actual={actual}; split the delivery unit before implementation",
+        )
 
     def record_testability_gap(
         self,
@@ -745,6 +766,7 @@ class StateStore:
         delivery_plan_id: str | None = None,
         delivery_unit_id: str | None = None,
         delivery_plan_path: str | None = None,
+        delivery_unit_budget: dict[str, int] | None = None,
     ) -> TaskState:
         task_id = uuid.uuid4().hex
         state = TaskState(
@@ -753,6 +775,7 @@ class StateStore:
             delivery_plan_id=delivery_plan_id,
             delivery_unit_id=delivery_unit_id,
             delivery_plan_path=delivery_plan_path,
+            delivery_unit_budget=dict(delivery_unit_budget or {}),
         )
         state.runtime_metadata = runtime_metadata_snapshot()
         self.save(state)

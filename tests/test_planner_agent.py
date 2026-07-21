@@ -180,6 +180,45 @@ class TestPlannerAgentRun:
         assert len(llm.generate_calls) == 2
         assert len(state.planner_retry_records) == 1
 
+    def test_delivery_unit_preserves_oversized_plan_without_retry(self):
+        llm = SequentialGenerateLLM(["1. A\n2. B\n3. C\n4. D"])
+        state = TaskState(
+            task_id="t1",
+            task_description="task",
+            implementation_prompt="do x",
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 1},
+        )
+        config = {"planner": {"max_steps": 3}}
+
+        result = _make_agent(llm, project_config=config).run(state)
+
+        assert result.success
+        assert state.plan == ["A", "B", "C", "D"]
+        assert state.plan_decided is True
+        assert len(llm.generate_calls) == 1
+        assert state.planner_retry_records == []
+        assert state.planner_output == "1. A\n2. B\n3. C\n4. D"
+        assert any(record["action"] == "plan" for record in state.history)
+
+    def test_delivery_unit_accepts_plan_within_explicit_two_step_budget(self, stub_llm: StubLLMClient):
+        stub_llm.generate_result = "1. A\n2. B"
+        state = TaskState(
+            task_id="t1",
+            task_description="task",
+            implementation_prompt="do x",
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 2},
+        )
+
+        result = _make_agent(stub_llm).run(state)
+
+        assert result.success
+        assert state.plan == ["A", "B"]
+        assert state.planner_retry_records == []
+
     def test_single_pass_marker_does_not_bypass_over_limit_numbered_plan(self):
         llm = SequentialGenerateLLM(["SINGLE_PASS\n1. A\n2. B\n3. C\n4. D", "SINGLE_PASS"])
         state = TaskState(task_id="t1", task_description="task", implementation_prompt="do x")
@@ -259,6 +298,7 @@ class TestPlannerAgentRun:
         _make_agent(stub_llm).run(state)
         assert state.planner_prompt is not None
         assert "do x" in state.planner_prompt
+        assert state.planner_output == "SINGLE_PASS"
 
 
 class TestPlannerAgentExtraRules:

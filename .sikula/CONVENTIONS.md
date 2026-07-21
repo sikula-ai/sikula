@@ -51,3 +51,14 @@ projects using Sikula.
   titles, for example `Fix review state reset after changes`.
 - Keep the slug stable across the task, delivery plan, branch, and review
   discussion so state, events, and history remain easy to correlate.
+
+## Delivery Unit Sizing
+
+- Author delivery units for one planner step by default and record
+  `budget.max_planner_steps: 1`.
+- Use `budget.max_planner_steps: 2` only when two implementation steps are
+  tightly coupled and splitting them would break the unit contract.
+- Split work that needs three or more planner steps into additional delivery
+  units before implementation.
+- Recover a planner-step budget stop through `delivery amend prepare` and
+  `delivery amend apply`; do not use `--reset-failed` to bypass it.

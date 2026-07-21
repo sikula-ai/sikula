@@ -18,6 +18,7 @@ from agents.base_agent import (
     load_extra_rules as _load_extra_rules,
     tech_stack as _tech_stack,
 )
+from core.delivery_unit_metadata import delivery_unit_planner_step_limit
 from core.state import TaskState
 
 log = logging.getLogger(__name__)
@@ -195,6 +196,7 @@ class PlannerAgent(BaseAgent):
                 state.record(self.name, "plan_failed", msg[:500])
                 return AgentResult(success=False, message=msg[:200])
 
+            state.planner_output = output
             if not output:
                 return AgentResult(success=False, message="Planner produced empty output")
 
@@ -202,6 +204,10 @@ class PlannerAgent(BaseAgent):
                 return self._accept_plan_decision(state, _PlanDecision(single_pass=True, steps=[]))
 
             steps = _parse_plan(output)
+            if state.delivery_plan_id and state.delivery_unit_id:
+                unit_limit = delivery_unit_planner_step_limit(state.delivery_unit_budget)
+                if len(steps) > unit_limit:
+                    return self._accept_plan_decision(state, _PlanDecision(single_pass=False, steps=steps))
             if len(steps) <= max_steps:
                 return self._accept_plan_decision(state, _PlanDecision(single_pass=False, steps=steps))
 
