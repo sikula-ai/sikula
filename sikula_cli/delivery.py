@@ -15,11 +15,15 @@ import subprocess
 import sys
 from typing import TYPE_CHECKING, Any
 
-from core.delivery_authoring import DeliveryAuthoringDraft, DeliveryAuthoringParseError
-from core.delivery_plan import delivery_final_branch_for_plan_id, is_valid_delivery_branch_name
+from core.delivery_authoring import (
+    DeliveryAmendmentAuthoringDraft,
+    DeliveryAuthoringDraft,
+    DeliveryAuthoringParseError,
+)
+from core.delivery_plan import DeliveryPlanIssue, delivery_final_branch_for_plan_id, is_valid_delivery_branch_name
 from core.delivery_prepare_writer import DeliveryPrepareWriteResult, write_delivery_prepare_artifacts
 from sikula_cli.agent_overrides import DELIVERY_PREPARATION_AGENT_NAMES, parse_agent_llm_overrides
-from sikula_cli.config import _resolve_state_dir
+from sikula_cli.config import _resolve_contract_report_dir, _resolve_state_dir
 
 if TYPE_CHECKING:
     from core.delivery_run_next import DeliveryRunNextExecutionResult
@@ -150,6 +154,50 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
     )
     delivery_finalize_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
 
+    delivery_amend_p = delivery_sub.add_parser("amend", help="Safely amend an existing delivery plan")
+    delivery_amend_sub = delivery_amend_p.add_subparsers(dest="delivery_amend_command")
+
+    delivery_amend_prepare_p = delivery_amend_sub.add_parser(
+        "prepare", help="Author and store a split proposal without changing the delivery plan"
+    )
+    delivery_amend_prepare_p.add_argument("plan_file", metavar="PLAN_FILE")
+    delivery_amend_prepare_p.add_argument("--split-unit", required=True, metavar="UNIT_ID")
+    delivery_amend_prepare_p.add_argument("--json", action="store_true", default=False)
+    delivery_amend_prepare_p.add_argument(
+        "--agent-model",
+        action="append",
+        default=None,
+        metavar="AGENT=MODEL",
+        help="Override model for delivery_preparer",
+    )
+    delivery_amend_prepare_p.add_argument(
+        "--agent-provider",
+        action="append",
+        default=None,
+        metavar="AGENT=PROVIDER",
+        help="Override provider for delivery_preparer",
+    )
+    delivery_amend_prepare_p.add_argument(
+        "--agent-timeout",
+        action="append",
+        default=None,
+        metavar="AGENT=SECONDS",
+        help="Override timeout for delivery_preparer",
+    )
+
+    delivery_amend_apply_p = delivery_amend_sub.add_parser(
+        "apply", help="Preview or apply an exact stored split proposal"
+    )
+    delivery_amend_apply_p.add_argument("plan_file", metavar="PLAN_FILE")
+    delivery_amend_apply_p.add_argument("--proposal", required=True, metavar="PROPOSAL_ID")
+    delivery_amend_apply_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Run all deterministic checks without writing delivery artifacts or events",
+    )
+    delivery_amend_apply_p.add_argument("--json", action="store_true", default=False)
+
     return delivery_p
 
 
@@ -175,6 +223,287 @@ def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
         print(render_delivery_status(result), end="")
     if not result.valid:
         sys.exit(1)
+
+
+@dataclass(frozen=True)
+class DeliveryAmendPrepareResult:
+    plan_path: str
+    project_root: str | None
+    status: str
+    prepared: bool
+    plan_id: str | None
+    target_unit_id: str
+    proposal_id: str | None = None
+    replacement_ids: list[str] = field(default_factory=list)
+    proposal_path: str | None = None
+    audit_path: str | None = None
+    errors: list[DeliveryPlanIssue] = field(default_factory=list)
+    warnings: list[DeliveryPlanIssue] = field(default_factory=list)
+    message: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        root = Path(self.project_root).resolve() if self.project_root else None
+
+        def safe_path(value: str | None) -> str | None:
+            if value is None or root is None:
+                return value
+            try:
+                raw_path = Path(value)
+                resolved = raw_path.resolve() if raw_path.is_absolute() else (root / raw_path).resolve()
+                return resolved.relative_to(root).as_posix()
+            except (OSError, RuntimeError, ValueError):
+                return None
+
+        return {
+            "plan_path": safe_path(self.plan_path),
+            "project_root": "." if root else None,
+            "status": self.status,
+            "prepared": self.prepared,
+            "plan_id": self.plan_id,
+            "target_unit_id": self.target_unit_id,
+            "proposal_id": self.proposal_id,
+            "replacement_ids": list(self.replacement_ids),
+            "proposal_path": safe_path(self.proposal_path),
+            "audit_path": safe_path(self.audit_path),
+            "errors": [_safe_amend_issue_dict(issue, root, sensitive_paths=(self.plan_path,)) for issue in self.errors],
+            "warnings": [
+                _safe_amend_issue_dict(issue, root, sensitive_paths=(self.plan_path,)) for issue in self.warnings
+            ],
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True)
+class DeliveryAmendPrepareContext:
+    run_authoring_assistant: Callable[..., DeliveryAmendmentAuthoringDraft]
+
+
+def cmd_delivery_amend_prepare(
+    args: argparse.Namespace,
+    cfg: dict,
+    context: DeliveryAmendPrepareContext | None = None,
+) -> None:
+    from core.delivery_amendment import (
+        DeliveryAmendmentError,
+        capture_delivery_amendment_source_snapshot,
+        create_delivery_amendment_proposal,
+        inspect_delivery_amendment_target,
+    )
+
+    root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
+    plan_path = _resolve_from_cwd(args.plan_file)
+    target_id = str(args.split_unit)
+    errors = _validate_delivery_prepare_agent_overrides(args)
+    target = None
+    if not errors:
+        try:
+            target = inspect_delivery_amendment_target(
+                plan_path,
+                target_id,
+                project_root=root,
+                project_config=cfg,
+            )
+        except DeliveryAmendmentError as exc:
+            errors.append(DeliveryPrepareIssue(exc.issue.severity, exc.issue.code, exc.issue.message, exc.issue.path))
+
+    result = DeliveryAmendPrepareResult(
+        plan_path=str(plan_path),
+        project_root=str(root),
+        status="blocked",
+        prepared=False,
+        plan_id=target.plan.plan_id if target else None,
+        target_unit_id=target_id,
+        errors=[DeliveryPlanIssue(issue.severity, issue.code, issue.message, issue.path) for issue in errors],
+        message="Delivery amendment proposal preparation is blocked.",
+    )
+    if target is not None and not result.errors:
+        if context is None:
+            result = replace(
+                result,
+                errors=[
+                    DeliveryPlanIssue(
+                        "error",
+                        "delivery_amend.authoring_context_missing",
+                        "Delivery amendment authoring requires the main Sikula command context.",
+                    )
+                ],
+            )
+        else:
+            draft = None
+            try:
+                source_snapshot = capture_delivery_amendment_source_snapshot(target)
+                draft = context.run_authoring_assistant(
+                    args=args,
+                    cfg=cfg,
+                    target=target,
+                    source_snapshot=source_snapshot,
+                )
+                proposal, proposal_path = create_delivery_amendment_proposal(
+                    plan_path,
+                    target_id,
+                    draft,
+                    project_root=root,
+                    proposal_root=_resolve_contract_report_dir(cfg),
+                    project_config=cfg,
+                    expected_source_snapshot=source_snapshot,
+                )
+                warnings = []
+                if draft.warnings:
+                    warnings.append(
+                        DeliveryPlanIssue(
+                            "warning",
+                            "delivery_amend.authoring_warnings_present",
+                            "Amendment authoring assistant reported warnings; inspect the local audit artifact.",
+                        )
+                    )
+                result = replace(
+                    result,
+                    status="ready",
+                    prepared=True,
+                    proposal_id=proposal.proposal_id,
+                    replacement_ids=proposal.replacement_ids,
+                    proposal_path=str(proposal_path),
+                    audit_path=getattr(draft, "audit_path", None),
+                    warnings=warnings,
+                    message="Delivery amendment proposal stored; the delivery plan was not changed.",
+                )
+            except DeliveryAuthoringParseError as exc:
+                result = replace(
+                    result,
+                    audit_path=getattr(exc, "audit_path", None),
+                    errors=[DeliveryPlanIssue("error", "delivery_amend.authoring_invalid", exc.message)],
+                    message="Delivery amendment authoring returned an invalid proposal.",
+                )
+            except DeliveryAmendmentError as exc:
+                result = replace(
+                    result,
+                    audit_path=getattr(draft, "audit_path", None),
+                    errors=[exc.issue],
+                    message="Delivery amendment proposal was rejected.",
+                )
+            except Exception as exc:
+                result = replace(
+                    result,
+                    audit_path=getattr(exc, "audit_path", None) or getattr(draft, "audit_path", None),
+                    errors=[
+                        DeliveryPlanIssue(
+                            "error",
+                            "delivery_amend.authoring_failed",
+                            "Delivery amendment authoring assistant failed; inspect the local audit artifact.",
+                        )
+                    ],
+                    message="Delivery amendment proposal preparation failed.",
+                )
+
+    _print_delivery_result(result, json_output=args.json, render=render_delivery_amend_prepare)
+    if not result.prepared:
+        sys.exit(1)
+
+
+def render_delivery_amend_prepare(result: DeliveryAmendPrepareResult) -> str:
+    projection = result.to_dict()
+    lines = [
+        f"Delivery amend prepare: {projection['plan_path']}",
+        f"Status: {result.status}",
+        f"Target unit: {result.target_unit_id}",
+    ]
+    if result.plan_id:
+        lines.append(f"Plan ID: {result.plan_id}")
+    if result.proposal_id:
+        lines.append(f"Proposal: {result.proposal_id}")
+    if result.replacement_ids:
+        lines.append("Replacements: " + ", ".join(result.replacement_ids))
+    if projection["proposal_path"]:
+        lines.append(f"Proposal artifact: {projection['proposal_path']}")
+    if projection["audit_path"]:
+        lines.append(f"Authoring audit: {projection['audit_path']}")
+    lines.append(result.message)
+    if result.errors:
+        lines.extend(["", "Errors:", *[_format_amend_issue_data(issue) for issue in projection["errors"]]])
+    if result.warnings:
+        lines.extend(["", "Warnings:", *[_format_amend_issue_data(issue) for issue in projection["warnings"]]])
+    return "\n".join(lines) + "\n"
+
+
+def cmd_delivery_amend_apply(args: argparse.Namespace, cfg: dict) -> None:
+    from core.delivery_amendment import apply_delivery_amendment, preview_delivery_amendment
+
+    root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
+    kwargs = {
+        "proposal_root": _resolve_contract_report_dir(cfg),
+        "project_root": root,
+        "project_config": cfg,
+    }
+    if args.dry_run:
+        result = preview_delivery_amendment(args.plan_file, args.proposal, **kwargs)
+    else:
+        result = apply_delivery_amendment(args.plan_file, args.proposal, **kwargs)
+    _print_delivery_result(result, json_output=args.json, render=render_delivery_amend_apply)
+    if not result.ready or (not args.dry_run and not result.applied):
+        sys.exit(1)
+
+
+def render_delivery_amend_apply(result) -> str:
+    projection = result.to_dict()
+    lines = [
+        f"Delivery amend apply{' dry run' if result.dry_run else ''}: {projection['plan_path']}",
+        f"Status: {'ready' if result.dry_run and result.ready else 'applied' if result.applied else 'blocked'}",
+        f"Proposal: {result.proposal_id}",
+    ]
+    if result.target_unit_id:
+        lines.append(f"Target unit: {result.target_unit_id}")
+    if result.replacement_ids:
+        lines.append("Replacements: " + ", ".join(result.replacement_ids))
+    if result.rewired_unit_ids:
+        lines.append("Rewired downstream units: " + ", ".join(result.rewired_unit_ids))
+    lines.append(f"Dry run: {'yes' if result.dry_run else 'no'}")
+    lines.append(result.message)
+    if result.errors:
+        lines.extend(["", "Errors:", *[_format_amend_issue_data(issue) for issue in projection["errors"]]])
+    if result.warnings:
+        lines.extend(["", "Warnings:", *[_format_amend_issue_data(issue) for issue in projection["warnings"]]])
+    return "\n".join(lines) + "\n"
+
+
+def _safe_amend_issue_dict(
+    issue: DeliveryPlanIssue,
+    root: Path | None,
+    *,
+    sensitive_paths: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    message = issue.message
+    for sensitive_path in sensitive_paths:
+        try:
+            candidate = Path(sensitive_path)
+            if not candidate.is_absolute():
+                continue
+            if root is None:
+                raise ValueError
+            candidate.resolve(strict=False).relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            message = message.replace(str(candidate), "<redacted>")
+    if root is not None:
+        root_text = str(root)
+        message = message.replace(root_text + "/", "").replace(root_text, ".")
+    path = issue.path
+    if path:
+        try:
+            candidate = Path(path)
+            if candidate.is_absolute():
+                if root is None:
+                    raise ValueError
+                path = candidate.resolve(strict=False).relative_to(root).as_posix()
+            elif root is not None:
+                root_text = str(root)
+                path = path.replace(root_text + "/", "").replace(root_text, ".")
+        except (OSError, RuntimeError, ValueError):
+            path = "<redacted>"
+    return DeliveryPlanIssue(issue.severity, issue.code, message, path).to_dict()
+
+
+def _format_amend_issue_data(issue: dict[str, Any]) -> str:
+    location = f" [{issue['path']}]" if issue.get("path") else ""
+    return f"- {issue['code']}{location}: {issue['message']}"
 
 
 @dataclass(frozen=True)
@@ -2499,6 +2828,8 @@ def _restore_delivery_progress(progress_path: Path, progress, *, existed: bool) 
 
 
 def _status_unit_has_progress(unit) -> bool:
+    if unit.status == "superseded":
+        return False
     return unit.status != "pending" or any(
         (
             unit.child_task_id,

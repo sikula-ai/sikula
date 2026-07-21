@@ -137,6 +137,9 @@ sikula delivery check .sikula/delivery/my-task/plan.yaml
 sikula delivery check .sikula/delivery/my-task/plan.yaml --json
 sikula delivery status .sikula/delivery/my-task/plan.yaml
 sikula delivery status .sikula/delivery/my-task/plan.yaml --json
+sikula delivery amend prepare .sikula/delivery/my-task/plan.yaml --split-unit oversized-unit
+sikula delivery amend apply .sikula/delivery/my-task/plan.yaml --proposal PROPOSAL_ID --dry-run
+sikula delivery amend apply .sikula/delivery/my-task/plan.yaml --proposal PROPOSAL_ID
 sikula delivery run-next .sikula/delivery/my-task/plan.yaml --dry-run
 sikula delivery run-next .sikula/delivery/my-task/plan.yaml
 sikula delivery run-next .sikula/delivery/my-task/plan.yaml --reset-failed
@@ -151,7 +154,7 @@ Use this to author, validate, and inspect the tracked parent plan for larger wor
 - `.sikula/delivery/<slug>/plan.yaml`
 - `.sikula/delivery/<slug>/units/<unit-slug>.md`
 
-`delivery prepare` is an authoring step only: it does not start implementation, create task state, run delivery units, mutate `.sikula/state/delivery/<plan-id>/`, or update branches. The follow-up path is to check the plan, dry-run the next eligible unit, run that unit through the normal `sikula run` pipeline, and finalize the completed plan. The current MVP checks plan structure, unit dependencies, task paths, optional planning and sizing metadata, single-repository scope, and privacy-safe parent progress. See [Delivery Plans](docs/delivery-plans.md).
+`delivery prepare` is an authoring step only: it does not start implementation, create task state, run delivery units, mutate `.sikula/state/delivery/<plan-id>/`, or update branches. An eligible pending or failed unit can later be split through a model-assisted amendment proposal followed by deterministic preview and exact application; completed and running units cannot be split. The follow-up path is to check the plan, dry-run the next eligible unit, run that unit through the normal `sikula run` pipeline, and finalize the completed plan. The current MVP checks plan structure, amendment metadata, unit dependencies, task paths, optional planning and sizing metadata, single-repository scope, and privacy-safe parent progress. See [Delivery Plans](docs/delivery-plans.md).
 
 **Run a task into a branch**
 

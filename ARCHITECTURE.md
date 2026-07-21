@@ -17,7 +17,7 @@
 | `ReviewerAgent` | `agents/reviewer_agent.py` | Read-only review of implementation; checks completeness, logical correctness, semantic consistency, dead members, and shared function scope |
 | `SecurityReviewerAgent` | `agents/security_reviewer_agent.py` | Read-only security review after the review phase; independent of `run_review`; blocking issues feed back to implementer; warnings logged non-blocking |
 | `TestWriterAgent` | `agents/test_writer_agent.py` | Writes and updates unit tests after review/security phases complete; configured to target test source directories |
-| `DeliveryPreparationAgent` | `agents/delivery_preparation_agent.py` | Read-only delivery-plan authoring assistant for `sikula delivery prepare`; returns one structured draft for deterministic parsing |
+| `DeliveryPreparationAgent` | `agents/delivery_preparation_agent.py` | Read-only delivery-plan and split-proposal authoring assistant; returns structured drafts for deterministic parsing and never mutates delivery artifacts |
 | `FixerAgent` | `agents/fixer_agent.py` | Runs the configured LLM as an autonomous agent to fix build or test errors |
 | `FileTool` | `tools/file_tool.py` | Read / write files; enforces sandbox whitelist for direct file-tool calls |
 | `GitTool` | `tools/git_tool.py` | `diff_head()` — called by reviewer, security_reviewer, and test_writer agents to obtain the live diff when `state.review_diff` is not set |
@@ -35,6 +35,7 @@
 | `ContractCheck` helpers | `core/contract_check.py` | Deterministic implementation-contract readiness checks for Markdown/plain-text task files; `sikula run` stores a warning-only state snapshot and `sikula contract check --write-report` explicitly writes report artifacts |
 | `DeliveryAuthoring` helpers | `core/delivery_authoring.py` | Side-effect-free parser and derived-path helpers for delivery prepare authoring drafts |
 | `DeliveryPrepareWriter` helpers | `core/delivery_prepare_writer.py` | Deterministic source-artifact writer for parsed delivery authoring drafts; renders `plan.yaml` and unit task files with readiness checks, plan validation, overwrite guards, and rollback |
+| `DeliveryAmendment` helpers | `core/delivery_amendment.py` | Fingerprinted split proposals, immutable-unit and dependency guards, no-write preview, transactional plan/unit writing, and append-only amendment events |
 | `TaskAsset` helpers | `core/task_assets.py` | Deterministic local task-asset parsing, path canonicalization, answer mapping, and asset-manifest line rendering used by contract preparation |
 | `Worktree` helpers | `core/worktree.py` | Shared low-level git/worktree operations used by run, review, cleanup/delete, and init CLI surfaces; command-specific state mutation stays in the owning command layer |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
@@ -234,6 +235,57 @@ Delivery authoring may include optional unit sizing metadata (`estimated_size`,
 `risk_tags`, and advisory `budget` fields). This metadata guides authoring,
 plan validation warnings, status display, and future explicit execution policy;
 it must not silently weaken review, security, or validation gates.
+
+**Delivery plan amendment commands:** `sikula delivery amend prepare PLAN_FILE
+--split-unit UNIT_ID` reuses `DeliveryPreparationAgent` and the
+`delivery_preparer` configuration to author only a replacement-unit graph. The
+strict amendment parser in `core/delivery_authoring.py` rejects whole-plan and
+writer-path output. `core/delivery_amendment.py` normalizes replacement paths and
+root dependencies, snapshots the source plan, target task contract, and
+sanitized parent progress before model authoring, rejects drafts when those
+inputs change during authoring, validates the resulting amended plan, and
+rechecks source fingerprints and replacement path availability before and after
+publication. A proposal made stale during publication is removed before prepare
+reports failure. The immutable local proposal is bound to the project-relative
+source plan path under the configured contract report directory. Replacement
+task Markdown passes the same contract-readiness and configured
+validation-coverage gate as ordinary delivery preparation. Proposal files use
+atomic no-overwrite publication. Directory fsync is best effort, matching the
+other Sikula state writers.
+Amendment destinations reject Git metadata and Sikula runtime, worktree, and
+report roots at any depth below the project root, including configured task
+state and contract-report roots. Derived replacement task paths are subject to
+the same configured private-root boundary. Prepare also rejects target task
+sources resolving into those private trees before reading content or
+invoking the model. The authoring read validates location before and after the
+read and must match the captured task fingerprint. It does not change the
+tracked plan, unit task files, progress, events, child state, worktrees, or Git
+refs.
+
+`sikula delivery amend apply PLAN_FILE --proposal PROPOSAL_ID --dry-run` loads
+that exact proposal, verifies its content-derived ID, checks plan/task/progress
+freshness, target state, replacement graph, downstream pending state, completed
+dependency commits, replacement contract readiness under the current project
+configuration, deterministic task paths, and the full resulting plan in memory.
+It has no authoring context or agent override flags and performs no writes.
+Mutating apply repeats the same preflight under the delivery progress lock,
+publishes new replacement task files atomically without overwrite, rechecks
+source fingerprints, and replaces the plan with Sikula's standard
+temporary-file plus `os.replace` pattern. It validates the written plan and
+rechecks target-task, progress, and published replacement fingerprints before
+recording allowlisted append-only amendment events. Failed plan rollback
+retains replacement tasks needed by the still-published plan. Lock filesystem
+failures return a structured blocked result. External checkout mutation during
+mutating apply is unsupported; the lock serializes Sikula operations. A
+terminal event-write
+failure is reported together with the original
+amendment failure; all blocked paths replace any earlier ready message and
+redact outside-project input paths. Interruptions append a terminal failed event
+after rollback and then propagate. Completed units and their progress records
+remain unchanged. The superseded target entry and task file remain as audit
+artifacts; status projects it as `superseded`, so run-next and finalize operate
+on the active replacement graph. Budget-stop-triggered amendment remains future
+orchestration work.
 
 **Delivery plan check command:** `sikula delivery check PLAN_FILE` is the first
 delivery-plan MVP primitive. Its CLI wrapper lives in `sikula_cli/delivery.py`;

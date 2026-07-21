@@ -99,7 +99,7 @@ from sikula_cli.agent_overrides import parse_agent_llm_overrides as _parse_agent
 
 if TYPE_CHECKING:
     from agents.delivery_preparation_agent import DeliveryPreparationAgent
-    from core.delivery_authoring import DeliveryAuthoringDraft
+    from core.delivery_authoring import DeliveryAmendmentAuthoringDraft, DeliveryAuthoringDraft
 
 _BASE = Path(__file__).parent
 # When adding a new platform: add it here, in _build_tool() in core/orchestrator.py,
@@ -3256,6 +3256,58 @@ def cmd_delivery_prepare(args: argparse.Namespace, cfg: dict) -> None:
     return cli_delivery.cmd_delivery_prepare(args, cfg, context)
 
 
+def _run_delivery_amend_prepare_authoring(
+    *,
+    args: argparse.Namespace,
+    cfg: dict,
+    target,
+    source_snapshot,
+) -> DeliveryAmendmentAuthoringDraft:
+    from core.delivery_amendment import read_delivery_amendment_target_task
+
+    project_root = Path(target.project_root)
+    task_path, task_text = read_delivery_amendment_target_task(
+        target,
+        expected_fingerprint=source_snapshot.target_task_fingerprint,
+    )
+    output_path = cli_config._resolve_contract_report_dir(cfg) / "delivery-amendments" / target.plan.plan_id
+    audit_recorder, audit_path = _make_auto_preparation_audit_recorder(
+        generated_by="sikula.delivery_amend_prepare",
+        source_path=task_path,
+        source_text=task_text,
+        output_path=output_path,
+        cfg=cfg,
+    )
+    agent = _create_delivery_preparation_agent(args, cfg)
+    safe_audit_path = _contract_preflight_path(audit_path, project_root)
+    downstream_by_id = {unit.id: unit for unit in target.plan.units}
+    try:
+        draft = agent.author_delivery_amendment(
+            plan_id=target.plan.plan_id,
+            target_unit_id=target.target.id,
+            target_task_description=task_text,
+            target_unit=target.target.to_dict(),
+            downstream_units=[downstream_by_id[unit_id].to_dict() for unit_id in target.downstream_unit_ids],
+            project_root=project_root,
+            project_context=_prepare_project_context_from_config(cfg),
+            audit_recorder=audit_recorder,
+        )
+    except Exception as exc:
+        setattr(exc, "audit_path", safe_audit_path)
+        raise
+    setattr(draft, "audit_path", safe_audit_path)
+    return draft
+
+
+def cmd_delivery_amend_prepare(args: argparse.Namespace, cfg: dict) -> None:
+    context = cli_delivery.DeliveryAmendPrepareContext(run_authoring_assistant=_run_delivery_amend_prepare_authoring)
+    return cli_delivery.cmd_delivery_amend_prepare(args, cfg, context)
+
+
+def cmd_delivery_amend_apply(args: argparse.Namespace, cfg: dict) -> None:
+    return cli_delivery.cmd_delivery_amend_apply(args, cfg)
+
+
 def cmd_delivery_finalize(args: argparse.Namespace, cfg: dict) -> None:
     return cli_delivery.cmd_delivery_finalize(args, cfg)
 
@@ -3375,6 +3427,10 @@ def main() -> None:
             cmd_delivery_run_next(args, cfg)
         elif args.delivery_command == "finalize":
             cmd_delivery_finalize(args, cfg)
+        elif args.delivery_command == "amend" and args.delivery_amend_command == "prepare":
+            cmd_delivery_amend_prepare(args, cfg)
+        elif args.delivery_command == "amend" and args.delivery_amend_command == "apply":
+            cmd_delivery_amend_apply(args, cfg)
         else:
             delivery_p.print_help()
             sys.exit(1)
