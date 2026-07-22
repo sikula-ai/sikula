@@ -3840,10 +3840,12 @@ class TestCmdRunChildDeliveryMetadata:
     def test_cmd_run_forwards_delivery_metadata(self, tmp_path: Path) -> None:
         task_file = tmp_path / "task.md"
         task_file.write_text("do something")
+        captured: dict = {}
 
         def capture_orch(
             cfg_arg: dict, overrides: dict | None = None, state_store: JsonStateStore | None = None
         ) -> MagicMock:
+            captured["overrides"] = overrides
             mock = MagicMock()
             assert state_store is not None
             task_id = state_store.list_tasks()[0]
@@ -3864,6 +3866,7 @@ class TestCmdRunChildDeliveryMetadata:
                 delivery_plan_id="my-plan-123",
                 delivery_unit_id="unit-456",
                 delivery_plan_path=".sikula/delivery/plan.yaml",
+                delivery_unit_budget={"max_planner_steps": 2, "max_changed_files": 4},
             )
             cmd_run(args, _run_cfg(tmp_path))
 
@@ -3876,6 +3879,48 @@ class TestCmdRunChildDeliveryMetadata:
         assert state.delivery_plan_id == "my-plan-123"
         assert state.delivery_unit_id == "unit-456"
         assert state.delivery_plan_path == ".sikula/delivery/plan.yaml"
+        assert state.delivery_unit_budget == {"max_planner_steps": 2, "max_changed_files": 4}
+        assert captured["overrides"]["run_planner"] is True
+
+    def test_cmd_run_reset_failed_blocks_delivery_budget_stop(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from core.state import TaskState
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        state = TaskState(
+            task_id="abc123",
+            task_description="oversized delivery child",
+            delivery_plan_id="my-plan-123",
+            delivery_unit_id="unit-456",
+            delivery_plan_path=".sikula/delivery/plan.yaml",
+            delivery_unit_budget={"max_planner_steps": 1},
+            delivery_budget_stop={
+                "code": "unit_budget_exceeded",
+                "name": "max_planner_steps",
+                "limit": 1,
+                "actual": 3,
+                "phase": "planner",
+                "timestamp": "2026-07-21T12:00:00+00:00",
+            },
+            worktree_path=str(worktree),
+        )
+        state.failed = True
+        store.save(state)
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_run(_run_args(task_id="abc123", reset_failed=True), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert exc.value.code == 1
+        assert "exceeded the planner-step budget" in out
+        assert "--reset-failed cannot bypass" in out
+        loaded = store.load("abc123")
+        assert loaded is not None
+        assert loaded.failed is True
+        assert loaded.delivery_budget_stop == state.delivery_budget_stop
 
     def test_cmd_run_reset_failed_blocks_delivery_child_without_worktree(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

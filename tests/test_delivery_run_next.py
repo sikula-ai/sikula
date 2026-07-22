@@ -15,6 +15,7 @@ from core.delivery_progress import (
     delivery_events_path,
     delivery_progress_path,
     get_delivery_status,
+    select_next_delivery_unit,
 )
 from core.delivery_run_next import (
     DeliveryRunNextExecutionResult,
@@ -473,6 +474,52 @@ def test_preview_delivery_run_next_selects_failed_unit_with_reset_failed(tmp_pat
     assert result.selected_unit.id == "01-foundation"
     assert result.progress_exists is True
     assert "Dry run selected failed delivery unit 01-foundation" in result.message
+
+
+@pytest.mark.parametrize("reset_failed", [False, True])
+def test_preview_delivery_run_next_requires_split_for_budget_stop(tmp_path: Path, reset_failed: bool) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "failed",
+                "child_task_id": "task-abc",
+                "failure_code": "unit_budget_exceeded",
+                "budget_exceeded": {
+                    "name": "max_planner_steps",
+                    "limit": 1,
+                    "actual": 3,
+                },
+            },
+        ],
+    )
+
+    result = preview_delivery_run_next(plan_path, reset_failed=reset_failed)
+
+    assert result.ready is False
+    assert result.selected_unit is None
+    assert [issue.code for issue in result.errors] == ["delivery.unit_budget_exceeded"]
+    assert "split it with delivery amend prepare" in result.message
+
+
+def test_blocked_run_next_ignores_superseded_budget_stop() -> None:
+    superseded = DeliveryStatusUnit(
+        id="original",
+        title="Original",
+        status="superseded",
+        task_path="units/original.md",
+        depends_on=[],
+        superseded_by=["replacement"],
+        failure_code="unit_budget_exceeded",
+    )
+
+    assert _blocked_run_next_reason("done", units=[superseded]) == (
+        "delivery.complete",
+        "Delivery plan is already complete.",
+    )
 
 
 def test_render_delivery_run_next_preview_is_safe_and_actionable(tmp_path: Path) -> None:
@@ -2619,6 +2666,55 @@ def test_classify_delivery_child_run_state_matrix(
     assert classification.failure_code == failure_code
 
 
+def test_classify_delivery_child_run_preserves_planner_budget_stop() -> None:
+    child_state = argparse.Namespace(
+        done=False,
+        failed=True,
+        result_commit=None,
+        worktree_path="wt",
+        worktree_base=None,
+        delivery_budget_stop={
+            "code": "unit_budget_exceeded",
+            "name": "max_planner_steps",
+            "limit": 1,
+            "actual": 3,
+            "phase": "planner",
+            "timestamp": "2026-07-21T12:00:00+00:00",
+        },
+    )
+
+    classification = _classify_delivery_child_run(DeliveryChildRunResult(exit_code=1), child_state)
+
+    assert classification.unit_status == "failed"
+    assert classification.failure_code == "unit_budget_exceeded"
+    assert classification.budget_exceeded is not None
+    assert classification.budget_exceeded.to_dict() == {
+        "name": "max_planner_steps",
+        "limit": 1,
+        "actual": 3,
+    }
+
+
+def test_classify_delivery_child_run_rejects_malformed_budget_stop() -> None:
+    child_state = argparse.Namespace(
+        done=False,
+        result_commit=None,
+        worktree_path="wt",
+        worktree_base=None,
+        delivery_budget_stop={
+            "code": "unit_budget_exceeded",
+            "name": "max_planner_steps",
+            "limit": True,
+            "actual": 3,
+        },
+    )
+
+    classification = _classify_delivery_child_run(DeliveryChildRunResult(exit_code=1), child_state)
+
+    assert classification.failure_code == "child_run_failed"
+    assert classification.budget_exceeded is None
+
+
 def test_dependency_commit_errors_ignore_noop_unfinished_or_missing_dependency_units(tmp_path: Path) -> None:
     selected = DeliveryStatusUnit(
         id="02-feature",
@@ -2717,6 +2813,20 @@ def test_delivery_child_run_args_metadata(plan_id: str | None, unit_id: str | No
     assert args.delivery_plan_id == plan_id
     assert args.delivery_unit_id == unit_id
     assert args.delivery_plan_path == plan_path
+    assert args.delivery_unit_budget == {}
+
+
+def test_delivery_child_run_args_copies_unit_budget() -> None:
+    budget = {"max_planner_steps": 2, "max_changed_files": 4}
+
+    args = _delivery_child_run_args(
+        root=Path("/fake/root"),
+        task_path="tasks/unit.md",
+        delivery_unit_budget=budget,
+    )
+    budget["max_planner_steps"] = 1
+
+    assert args.delivery_unit_budget == {"max_planner_steps": 2, "max_changed_files": 4}
 
 
 def test_invoke_delivery_child_run_forwards_metadata(tmp_path: Path) -> None:
@@ -2786,6 +2896,76 @@ def test_cmd_delivery_run_next_computes_and_forwards_metadata(
     assert captured_args.delivery_unit_id == "01-foundation"
     expected_path = plan_path.resolve().relative_to(tmp_path.resolve()).as_posix()
     assert captured_args.delivery_plan_path == expected_path
+    assert captured_args.delivery_unit_budget == {"max_planner_steps": 1}
+
+
+def test_cmd_delivery_run_next_records_planner_budget_stop_and_requires_split(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        assert run_args.delivery_unit_budget == {"max_planner_steps": 1}
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        state = store.create(
+            "child task",
+            delivery_plan_id=run_args.delivery_plan_id,
+            delivery_unit_id=run_args.delivery_unit_id,
+            delivery_plan_path=run_args.delivery_plan_path,
+            delivery_unit_budget=run_args.delivery_unit_budget,
+        )
+        state.failed = True
+        state.worktree_path = str(tmp_path / ".sikula" / "worktrees" / state.task_id / "project")
+        state.planner_prompt = "PRIVATE PLANNER PROMPT"
+        state.planner_output = "PRIVATE PLANNER OUTPUT"
+        state.delivery_budget_stop = {
+            "code": "unit_budget_exceeded",
+            "name": "max_planner_steps",
+            "limit": 1,
+            "actual": 3,
+            "phase": "planner",
+            "timestamp": "2026-07-21T12:00:00+00:00",
+        }
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=1, child_task_id=state.task_id)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    payload = json.loads(capsys.readouterr().out)
+    progress = _load_delivery_progress(tmp_path)
+    events = [
+        json.loads(line) for line in delivery_events_path(tmp_path, "delivery-run-next-demo").read_text().splitlines()
+    ]
+    status = get_delivery_status(plan_path)
+
+    assert exc.value.code == 1
+    assert payload["succeeded"] is False
+    assert payload["unit_status"] == "failed"
+    assert "split the failed unit" in payload["message"]
+    assert payload["selected_unit"]["run_next_available"] is False
+    assert payload["selected_unit"]["run_next_blocked_reason"] == "unit_budget_exceeded"
+    assert progress["units"][0]["failure_code"] == "unit_budget_exceeded"
+    assert progress["units"][0]["budget_exceeded"] == {
+        "name": "max_planner_steps",
+        "limit": 1,
+        "actual": 3,
+    }
+    assert events[-1]["event_type"] == "unit.failed"
+    assert events[-1]["failure_code"] == "unit_budget_exceeded"
+    assert events[-1]["budget_exceeded"] == progress["units"][0]["budget_exceeded"]
+    assert "PRIVATE PLANNER" not in json.dumps(payload)
+    assert "PRIVATE PLANNER" not in json.dumps(progress)
+    assert "PRIVATE PLANNER" not in json.dumps(events)
+    assert status.next_action == "split the budget-exceeded unit with delivery amend prepare before continuing"
+    assert select_next_delivery_unit(status, reset_failed=True) is None
 
 
 def test_cmd_delivery_run_next_omits_unsafe_metadata_plan_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3429,6 +3609,53 @@ def test_cmd_delivery_run_next_blocks_failed_plan_without_reset_failed(
     assert len(payload["errors"]) == 1
     assert payload["errors"][0]["code"] == "delivery.failed"
     assert "rerun with --reset-failed" in payload["errors"][0]["message"]
+
+
+@pytest.mark.parametrize("reset_failed", [False, True])
+def test_cmd_delivery_run_next_blocks_budget_stop_until_split(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    reset_failed: bool,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "failed",
+                "child_task_id": "task-xyz",
+                "failure_code": "unit_budget_exceeded",
+                "budget_exceeded": {
+                    "name": "max_planner_steps",
+                    "limit": 1,
+                    "actual": 3,
+                },
+            },
+        ],
+    )
+    child_called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal child_called
+        child_called = True
+        return DeliveryChildRunResult(exit_code=0, child_task_id="new-task")
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, reset_failed=reset_failed, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert child_called is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is False
+    assert payload["errors"][0]["code"] == "delivery.unit_budget_exceeded"
+    assert "split it with delivery amend prepare" in payload["message"]
 
 
 def test_cmd_delivery_run_next_blocks_with_reset_failed_when_reset_unavailable(

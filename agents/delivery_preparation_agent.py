@@ -80,7 +80,7 @@ Delivery-plan constraints:
   docs_coverage, execution_boundary, external_execution_boundary, external_integration,
   migration, privacy, public_output_contract, release, security_boundary,
   structured_output_contract, test_hardening, ui_surface, validation.
-- budget, when present, must contain only positive integer fields: max_planner_steps,
+- budget must include max_planner_steps set to 1 or 2. It may also contain positive integer fields:
   max_elapsed_minutes, max_review_cycles, max_security_cycles, max_changed_files,
   max_changed_modules, max_generated_test_files.
 - Unit task Markdown must be product/behavior descriptions with acceptance criteria and verification
@@ -94,6 +94,11 @@ Delivery-plan constraints:
 - Paths for plan.yaml and unit task files are derived later from the output directory and unit IDs.
 
 Sizing and split guidance:
+- Design every unit for a single implementation pass and set max_planner_steps to 1 by default.
+- Use max_planner_steps 2 only when two tightly coupled, compile-safe steps cannot be separated into
+  independent delivery units.
+- Never set max_planner_steps to 3 or more. Three or more expected planner steps require splitting
+  the work into additional delivery units before returning the draft.
 - Prefer small units with one primary production surface and narrow validation.
 - A small unit changes one module, user workflow, or behavior surface with focused tests.
 - A medium unit changes one feature surface plus directly related tests or docs.
@@ -112,8 +117,8 @@ Sizing and split guidance:
   generation or downstream execution behavior.
 - Docs and coverage may be a final hardening unit unless they are essential to validate a specific
   behavior introduced by that unit.
-- If a unit would need broad cross-module tests or many planner steps, split it before returning the
-  draft or mark it large with risk_tags and a narrow budget recommendation.
+- If a unit would need broad cross-module tests or three or more planner steps, split it before
+  returning the draft.
 
 Source task description:
 ```markdown
@@ -139,7 +144,7 @@ Return this JSON shape:
       "scope_paths": [],
       "estimated_size": "small",
       "risk_tags": ["cli_surface"],
-      "budget": {{"max_planner_steps": 3, "max_changed_files": 8}},
+      "budget": {{"max_planner_steps": 1, "max_changed_files": 8}},
       "task_markdown": "# Unit title\\n\\n## Goal\\n\\n...\\n\\n## Security and privacy\\n\\n...\\n\\n## Validation\\n\\n- `command`"
     }}
   ]
@@ -199,6 +204,8 @@ Replacement constraints:
 - depends_on may reference replacement unit ids only. Sikula adds the target's upstream
   dependencies to replacement roots and rewires existing downstream units to replacement leaves.
 - Prefer one planner step and one primary production surface per replacement.
+- Set max_planner_steps to 1 by default. Use 2 only for a tightly coupled exception, and never use
+  3 or more; split the replacement again instead.
 - Use only the same metadata, risk tag, sizing, and positive integer budget fields supported by
   delivery prepare.
 - amend_reason must be omitted, null, or a stable code containing only letters, numbers, dots,

@@ -179,6 +179,8 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
         "run_checks": args.checks,
         "agent_llms": context.parse_agent_llm_overrides(args.agent_model, args.agent_provider, args.agent_timeout),
     }
+    if getattr(args, "delivery_plan_id", None) and getattr(args, "delivery_unit_id", None):
+        overrides["run_planner"] = True
     if args.presync_clean is not None:
         overrides["presync_clean"] = args.presync_clean
 
@@ -242,6 +244,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             delivery_plan_id=getattr(args, "delivery_plan_id", None),
             delivery_unit_id=getattr(args, "delivery_unit_id", None),
             delivery_plan_path=getattr(args, "delivery_plan_path", None),
+            delivery_unit_budget=getattr(args, "delivery_unit_budget", None),
         )
         args.created_task_id = state.task_id
         state.task_file = Path(args.task_file).name
@@ -320,6 +323,8 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
         if not state:
             print(f"Task {args.task_id} not found")
             sys.exit(1)
+        if state.delivery_plan_id and state.delivery_unit_id:
+            overrides["run_planner"] = True
         current_branch_delivery_retry = context.current_branch_delivery_needs_finalization(state)
         already_terminal = (state.done or state.failed) and not current_branch_delivery_retry
         is_review_fix_resume = state.review_mode == "review_fix"
@@ -451,6 +456,10 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
                 print(f"Suggested next step: {context.contract_gate_next_action(state)}")
             elif context.delivery_child_without_worktree(state):
                 print("Delivery parent-child linking failed before a worktree was created.")
+                print(f"Inspect state: sikula show {state.task_id}")
+            elif state.delivery_budget_stop:
+                print("This delivery unit exceeded its planner-step budget before implementation.")
+                print("Split the failed unit with delivery amend prepare before continuing the parent plan.")
                 print(f"Inspect state: sikula show {state.task_id}")
             elif state.review_mode == "review_report":
                 print("Report-only review tasks cannot be retried with sikula run.")

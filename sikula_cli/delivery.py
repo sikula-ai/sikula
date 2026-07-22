@@ -20,8 +20,14 @@ from core.delivery_authoring import (
     DeliveryAuthoringDraft,
     DeliveryAuthoringParseError,
 )
-from core.delivery_plan import DeliveryPlanIssue, delivery_final_branch_for_plan_id, is_valid_delivery_branch_name
+from core.delivery_plan import (
+    DeliveryBudgetExceeded,
+    DeliveryPlanIssue,
+    delivery_final_branch_for_plan_id,
+    is_valid_delivery_branch_name,
+)
 from core.delivery_prepare_writer import DeliveryPrepareWriteResult, write_delivery_prepare_artifacts
+from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE, delivery_unit_budget_snapshot
 from sikula_cli.agent_overrides import DELIVERY_PREPARATION_AGENT_NAMES, parse_agent_llm_overrides
 from sikula_cli.config import _resolve_contract_report_dir, _resolve_state_dir
 
@@ -1418,6 +1424,7 @@ class DeliveryRunNextContext:
 class DeliveryChildRunClassification:
     unit_status: str
     failure_code: str | None
+    budget_exceeded: DeliveryBudgetExceeded | None = None
 
 
 def cmd_delivery_run_next(
@@ -1599,7 +1606,11 @@ def _run_next_delivery_unit(
 
         selected_unit = select_next_delivery_unit(status, reset_failed=reset_failed)
         if selected_unit is None:
-            code, message = _blocked_run_next_reason(status.status, reset_failed=reset_failed)
+            code, message = _blocked_run_next_reason(
+                status.status,
+                reset_failed=reset_failed,
+                units=status.units,
+            )
             errors.append(DeliveryPlanIssue("error", code, message))
             if reset_failed:
                 return DeliveryRunNextExecutionResult(
@@ -1715,6 +1726,7 @@ def _run_next_delivery_unit(
             delivery_plan_id=plan_id,
             delivery_unit_id=selected_unit.id,
             delivery_plan_path=delivery_plan_path,
+            delivery_unit_budget=delivery_unit_budget_snapshot(selected_unit.budget),
             delivery_child_created_callback=link_child_task,
         )
         state_dir = context.resolve_state_dir(cfg)
@@ -1815,11 +1827,15 @@ def _run_next_delivery_unit(
         updated_status = get_delivery_status(args.plan_file, project_root=project_root)
         updated_unit = _status_unit_by_id(updated_status, selected_unit.id) or selected_unit
 
-        message = (
-            f"Delivery unit {selected_unit.id} completed."
-            if unit_status == "done"
-            else f"Delivery unit {selected_unit.id} failed; inspect child task state."
-        )
+        if unit_status == "done":
+            message = f"Delivery unit {selected_unit.id} completed."
+        elif updated_unit.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE:
+            message = (
+                f"Delivery unit {selected_unit.id} exceeded its planner-step budget before implementation; "
+                "split the failed unit with delivery amend prepare."
+            )
+        else:
+            message = f"Delivery unit {selected_unit.id} failed; inspect child task state."
         return DeliveryRunNextExecutionResult(
             plan_path=status.plan_path,
             project_root=status.project_root,
@@ -1911,6 +1927,7 @@ def _progress_from_status(status):
                 commit=unit.commit,
                 waiting_reason=unit.waiting_reason,
                 failure_code=unit.failure_code,
+                budget_exceeded=unit.budget_exceeded,
                 started_at=unit.started_at,
                 completed_at=unit.completed_at,
                 updated_at=unit.updated_at,
@@ -2773,6 +2790,7 @@ def _record_delivery_child_terminal_result(
         branch=getattr(child_state, "worktree_branch", None) if child_state else None,
         commit=getattr(child_state, "result_commit", None) if child_state else None,
         failure_code=classification.failure_code,
+        budget_exceeded=classification.budget_exceeded,
     )
     progress = upsert_delivery_unit_progress(progress, terminal_unit)
     write_delivery_progress(progress_path, progress)
@@ -2793,6 +2811,13 @@ def _classify_delivery_child_run(
         return DeliveryChildRunClassification("failed", "child_run_exception")
     if child_state is None:
         return DeliveryChildRunClassification("failed", "child_task_missing")
+    budget_exceeded = _delivery_child_budget_exceeded(child_state)
+    if budget_exceeded is not None:
+        return DeliveryChildRunClassification(
+            "failed",
+            DELIVERY_UNIT_BUDGET_EXCEEDED_CODE,
+            budget_exceeded,
+        )
     if child_result.exit_code != 0:
         return DeliveryChildRunClassification("failed", "child_run_failed")
     if not getattr(child_state, "done", False):
@@ -2800,6 +2825,26 @@ def _classify_delivery_child_run(
     if not _child_delivery_result_finalized(child_state):
         return DeliveryChildRunClassification("failed", "child_run_unfinalized")
     return DeliveryChildRunClassification("done", None)
+
+
+def _delivery_child_budget_exceeded(child_state) -> DeliveryBudgetExceeded | None:
+    value = getattr(child_state, "delivery_budget_stop", None)
+    if not isinstance(value, dict) or value.get("code") != DELIVERY_UNIT_BUDGET_EXCEEDED_CODE:
+        return None
+    name = value.get("name")
+    limit = value.get("limit")
+    actual = value.get("actual")
+    if (
+        name != "max_planner_steps"
+        or not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or limit < 1
+        or not isinstance(actual, int)
+        or isinstance(actual, bool)
+        or actual < 0
+    ):
+        return None
+    return DeliveryBudgetExceeded(name=name, limit=limit, actual=actual)
 
 
 def _git_commit_is_ancestor(root: Path, commit: str) -> bool:
@@ -2854,6 +2899,7 @@ def _invoke_delivery_child_run(
     delivery_plan_id: str | None = None,
     delivery_unit_id: str | None = None,
     delivery_plan_path: str | None = None,
+    delivery_unit_budget: dict[str, int] | None = None,
     delivery_child_created_callback: Callable[[str], None] | None = None,
 ) -> DeliveryChildRunResult:
     run_args = _delivery_child_run_args(
@@ -2865,6 +2911,7 @@ def _invoke_delivery_child_run(
         delivery_plan_id=delivery_plan_id,
         delivery_unit_id=delivery_unit_id,
         delivery_plan_path=delivery_plan_path,
+        delivery_unit_budget=delivery_unit_budget,
         delivery_child_created_callback=delivery_child_created_callback,
     )
     return _invoke_delivery_child_run_args(args, cfg, context, run_args)
@@ -2880,6 +2927,7 @@ def _delivery_child_run_args(
     delivery_plan_id: str | None = None,
     delivery_unit_id: str | None = None,
     delivery_plan_path: str | None = None,
+    delivery_unit_budget: dict[str, int] | None = None,
     delivery_child_created_callback: Callable[[str], None] | None = None,
 ) -> argparse.Namespace:
     absolute_task_path = (root / task_path).resolve()
@@ -2907,6 +2955,7 @@ def _delivery_child_run_args(
         delivery_plan_id=delivery_plan_id,
         delivery_unit_id=delivery_unit_id,
         delivery_plan_path=delivery_plan_path,
+        delivery_unit_budget=dict(delivery_unit_budget or {}),
         delivery_child_created_callback=delivery_child_created_callback,
         created_task_id=None,
     )
@@ -2945,6 +2994,7 @@ def _delivery_child_resume_run_args(
         delivery_plan_id=None,
         delivery_unit_id=None,
         delivery_plan_path=None,
+        delivery_unit_budget=None,
         delivery_child_created_callback=None,
         created_task_id=created_task_id,
     )

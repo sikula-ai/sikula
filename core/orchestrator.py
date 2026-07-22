@@ -51,6 +51,7 @@ from agents.planner_agent import PlannerAgent
 from agents.reviewer_agent import ReviewerAgent
 from agents.security_reviewer_agent import SecurityReviewerAgent
 from agents.test_writer_agent import TestWriterAgent
+from core.delivery_unit_metadata import delivery_unit_planner_step_limit
 from core.diagnostics import diagnostic_excerpt
 from core.llm_client import LLMClient
 from core.progress import ActiveOperationHeartbeat
@@ -501,13 +502,17 @@ class Orchestrator:
                 return
 
         # Phase 1.5: plan (skipped if planner already ran — plan_decided guards resume)
-        if self._config.run_planner and not state.plan_decided:
+        delivery_child = bool(state.delivery_plan_id and state.delivery_unit_id)
+        if (self._config.run_planner or delivery_child) and not state.plan_decided:
             log.info("--- Phase: plan ---")
             result = self._run_agent("planner", state)
             if state.failed or not result.success:
                 state.failed = True
                 self._store.save(state)
                 return
+
+        if self._abort_on_delivery_planner_budget(state):
+            return
 
         # Phases 2-5: step-by-step or single-pass
         if state.plan:
@@ -518,6 +523,25 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _abort_on_delivery_planner_budget(self, state: TaskState) -> bool:
+        if not (state.delivery_plan_id and state.delivery_unit_id and state.plan_decided):
+            return False
+        limit = delivery_unit_planner_step_limit(state.delivery_unit_budget)
+        actual = len(state.plan) if state.plan else 1
+        if actual <= limit:
+            return False
+
+        state.record_delivery_budget_stop(name="max_planner_steps", limit=limit, actual=actual)
+        state.failed = True
+        self._store.save(state)
+        log.error(
+            "Delivery unit %s exceeded max_planner_steps (%d > %d); stopping before implementation",
+            state.delivery_unit_id,
+            actual,
+            limit,
+        )
+        return True
 
     def _abort_on_validation_coverage_gaps(self, state: TaskState) -> bool:
         if state.review_mode in {"review_report", "review_fix"}:

@@ -86,9 +86,15 @@ and optional `stream`, `component`, `phase`, `kind`, `platform`, and
   `external_integration`, `migration`, `privacy`, `public_output_contract`,
   `release`, `security_boundary`, `structured_output_contract`,
   `test_hardening`, `ui_surface`, and `validation`
-- `budget`: positive integer advisory fields such as `max_planner_steps`,
+- `budget`: positive integer fields such as `max_planner_steps`,
   `max_elapsed_minutes`, `max_review_cycles`, `max_security_cycles`,
   `max_changed_files`, `max_changed_modules`, and `max_generated_test_files`
+
+`max_planner_steps` defaults to `1`. Delivery authoring writes that default
+explicitly. `2` is allowed only for a tightly coupled unit that cannot remain
+compile-safe as separate units. Values of `3` or greater are invalid and signal
+that the unit must be split. The other budget fields remain advisory until an
+execution gate is defined for them.
 
 Writer-facing path fields such as `task_path`, `path`, `unit_path`,
 `output_path`, `plan_path`, `units_dir`, and `output_dir` are rejected because
@@ -115,9 +121,11 @@ or path validation should usually be separate from generation or downstream
 execution behavior. Docs and coverage can be a final hardening unit unless they
 are essential to validate a specific unit.
 
-Sizing metadata is explicit guidance for authoring, `check`, `status`, and
-future execution policy. It does not silently weaken final review/security gates
-or make unsafe units pass. Current plan validation warns when one unit combines
+Sizing metadata is explicit guidance for authoring, `check`, and `status`.
+`max_planner_steps` is also enforced before delivery child implementation; the
+remaining sizing fields are advisory. No sizing metadata weakens final
+review/security gates or makes unsafe units pass. Current plan validation warns
+when one unit combines
 several high-risk tags, for example external execution boundaries, structured
 output contracts, and CLI surface, so operators can split the plan before
 running that unit.
@@ -214,9 +222,9 @@ the original amendment failure. Interruptions roll back artifact changes, append
 earlier events are never rewritten. Blocked results use a blocked message, and
 outside-project input paths are redacted from human and JSON diagnostics.
 
-Planner-step budget stops and automatic invocation of this flow are not yet
-implemented. This command provides the safe amendment mechanism they can use
-later.
+Planner-step budget stops use this amendment flow for recovery. Sikula does not
+invoke amendment authoring automatically: the operator prepares and applies the
+split proposal after inspecting the stopped child task and parent status.
 
 ## After Preparing
 
@@ -302,8 +310,13 @@ sikula delivery status .sikula/delivery/<slug>/plan.yaml
 sikula delivery status .sikula/delivery/<slug>/plan.yaml --json
 ```
 
-`delivery status` evaluates the execution state and marks running and failed units with their actionable next steps. In JSON output, each unit includes `run_next_available` (boolean), `run_next_action` (`"resume_or_reconcile"`, `"retry_failed"`, or omitted), and `run_next_blocked_reason` (`"missing_child_task_id"` or omitted).
+`delivery status` evaluates the execution state and marks running and failed units with their actionable next steps. In JSON output, each unit includes `run_next_available` (boolean), `run_next_action` (`"resume_or_reconcile"`, `"retry_failed"`, or omitted), and `run_next_blocked_reason` (`"missing_child_task_id"`, `"unit_budget_exceeded"`, or omitted).
 For example, running units with linked child task IDs are marked as recoverable (`resume` or `reconcile` action) by `delivery run-next`, which will resume a non-terminal child or reconcile a terminal child after metadata validation. A running unit without a child task ID is a fail-safe condition marked as `block`: `run-next` blocks and does not select pending work. Failed units with linked child task IDs are marked as retryable (`retry` action) with `delivery run-next --reset-failed`. Failed units without linked child task IDs are not retryable through `run-next`.
+Budget-stopped units are the exception: they are marked with
+`run_next_blocked_reason: unit_budget_exceeded` and require an amend/split even
+when their child task remains linked and inspectable. Both dry-run and mutating
+`run-next` report `delivery.unit_budget_exceeded`; passing `--reset-failed` does
+not change that recovery action.
 
 Preview the next eligible unit without changing delivery progress:
 
@@ -347,7 +360,7 @@ If no ambiguous running unit exists, `run-next` otherwise selects the first fail
 unit with a linked child task id before pending work. It preserves the same parent
 unit and child task id, appends a `unit.retry_intent` event, and forwards reset
 semantics to the child task path (`sikula run --task-id <child_task_id> --reset-failed`).
-`--reset-failed` does not bypass running-unit ambiguity or dependency result-commit checks and does not select later pending work while retry selection is active. Child runs preserve normal `sikula run` semantics, and delivery execution still runs one unit at a time and does not assemble the final branch automatically.
+`--reset-failed` does not bypass running-unit ambiguity, dependency result-commit checks, or a planner-step budget stop and does not select later pending work while retry selection is active. Child runs preserve normal `sikula run` semantics, and delivery execution still runs one unit at a time and does not assemble the final branch automatically.
 The JSON/text output remains privacy-safe and allowlisted.
 If the running unit has a terminal child with matching metadata and is not
 retrying a failed child through `--reset-failed`, `run-next`
@@ -373,7 +386,7 @@ After child execution starts, it records the terminal unit status as `done` or
 `failed`.
 It accepts the same per-agent `--agent-model`, `--agent-provider`, and
 `--agent-timeout` overrides as `sikula run` and passes them to the child run.
-When starting the child run, Sikula automatically configures and persists the parent delivery metadata in the child's `TaskState` (specifically the parent `delivery_plan_id`, `delivery_unit_id`, and a project-relative `delivery_plan_path`). This allows the parent plan relationship to be fully recovered from the configured state directory, while keeping ordinary delivery progress records compact.
+When starting the child run, Sikula automatically configures and persists the parent delivery metadata in the child's `TaskState` (specifically the parent `delivery_plan_id`, `delivery_unit_id`, a project-relative `delivery_plan_path`, and the effective `delivery_unit_budget`). Delivery children always run the planner, even when ordinary task planning is disabled. If the planner returns more steps than the unit's effective `max_planner_steps`, Sikula preserves the planner prompt and output, records `delivery_budget_stop`, and fails before the implementer starts. Parent progress and the terminal `unit.failed` event receive `failure_code: unit_budget_exceeded` and allowlisted `budget_exceeded` metadata. This allows the parent plan relationship and stop reason to be recovered from the configured state directory without copying prompts or raw child state into parent progress.
 Child task prompts, provider output, diffs, logs, and full task state remain in
 the normal child task state and are not embedded in delivery progress JSON.
 `delivery run-next --json` reports deterministic failure codes and the child task id

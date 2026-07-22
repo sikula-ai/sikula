@@ -110,7 +110,7 @@ def _authoring_output(*, planning_mode: str | None = "fixed_window", warnings: l
                 "scope_paths": ["agents"],
                 "estimated_size": "small",
                 "risk_tags": ["automation_behavior"],
-                "budget": {"max_planner_steps": 3},
+                "budget": {"max_planner_steps": 1},
             }
         ],
     }
@@ -217,7 +217,7 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert draft.units[0].estimated_size == "small"
     assert draft.units[0].risk_tags == ["automation_behavior"]
     assert draft.units[0].budget is not None
-    assert draft.units[0].budget.to_dict() == {"max_planner_steps": 3}
+    assert draft.units[0].budget.to_dict() == {"max_planner_steps": 1}
     assert llm.system_prompts == [""]
     assert llm.readonly_agent_calls == []
     assert llm.agent_calls == []
@@ -247,7 +247,9 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert "External provider, tool, or integration boundary changes" in prompt
     assert '"estimated_size": "small"' in prompt
     assert '"risk_tags": ["cli_surface"]' in prompt
-    assert '"budget": {"max_planner_steps": 3, "max_changed_files": 8}' in prompt
+    assert '"budget": {"max_planner_steps": 1, "max_changed_files": 8}' in prompt
+    assert "Design every unit for a single implementation pass" in prompt
+    assert "Never set max_planner_steps to 3 or more" in prompt
     assert "Add team invite authoring without exposing raw task text." in prompt
     assert len(audit_records) == 1
     record = audit_records[0]
@@ -310,6 +312,42 @@ def test_author_delivery_amendment_json_escapes_plan_valid_target_id(tmp_path: P
     assert draft.target_unit_id == target_unit_id
     assert f"Target unit id: {encoded_id}" in llm.prompts[0]
     assert f'"target_unit_id": {encoded_id}' in llm.prompts[0]
+
+
+def test_author_delivery_amendment_records_parse_failure(tmp_path: Path) -> None:
+    llm = CapturingLLM("Assistant draft:\nSECRET_PROVIDER_OUTPUT")
+    agent = DeliveryPreparationAgent(llm=llm)
+    audit_records: list[dict] = []
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        _author_delivery_amendment(agent, tmp_path=tmp_path, audit_records=audit_records)
+
+    assert exc_info.value.code == "delivery_authoring.json_invalid"
+    assert "SECRET_PROVIDER_OUTPUT" not in str(exc_info.value)
+    assert len(audit_records) == 1
+    record = audit_records[0]
+    assert record["phase"] == "delivery_amend_prepare_authoring"
+    assert record["round_index"] == 1
+    assert record["prompt"] == llm.prompts[0]
+    assert record["raw_output"] == llm.output
+    assert record["parsed"]["status"] == "failed"
+    assert record["parsed"]["error_type"] == "DeliveryAuthoringParseError"
+    assert record["parsed"]["error_code"] == "delivery_authoring.json_invalid"
+    assert "SECRET_PROVIDER_OUTPUT" not in record["parsed"]["error"]
+
+
+def test_author_delivery_amendment_wraps_provider_failure_without_audit(tmp_path: Path) -> None:
+    llm = FailingLLM(RuntimeError("provider timeout with SECRET_PROVIDER_OUTPUT"))
+    agent = DeliveryPreparationAgent(llm=llm)
+
+    with pytest.raises(DeliveryPreparationAgentError) as exc_info:
+        _author_delivery_amendment(agent, tmp_path=tmp_path)
+
+    assert str(exc_info.value) == "Delivery amendment authoring assistant failed."
+    assert exc_info.value.__cause__ is None
+    assert "SECRET_PROVIDER_OUTPUT" not in str(exc_info.value)
+    assert llm.system_prompts == [""]
+    assert llm.readonly_agent_calls == []
 
 
 def test_author_delivery_plan_handles_absent_context_and_audit_recorder(tmp_path: Path) -> None:

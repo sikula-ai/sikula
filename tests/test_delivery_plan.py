@@ -74,6 +74,52 @@ def _base_plan(root: Path) -> dict:
     }
 
 
+@pytest.mark.parametrize(
+    ("metadata", "expected_code"),
+    [
+        pytest.param(
+            {"amend_reason": "not a stable code"},
+            "amendment.amend_reason_invalid",
+            id="amend_reason",
+        ),
+        pytest.param(
+            {"budget_exceeded": []},
+            "amendment.budget_exceeded_invalid",
+            id="budget_type",
+        ),
+        pytest.param(
+            {
+                "budget_exceeded": {
+                    "name": "max_planner_steps",
+                    "limit": 2,
+                    "actual": 5,
+                    "details": "private",
+                }
+            },
+            "amendment.budget_exceeded_unknown_field",
+            id="budget_unknown_field",
+        ),
+        pytest.param(
+            {"budget_exceeded": {"name": "not a code", "limit": -1, "actual": -2}},
+            "amendment.budget_name_invalid",
+            id="budget_values",
+        ),
+    ],
+)
+def test_delivery_plan_rejects_invalid_amendment_metadata(
+    tmp_path: Path,
+    metadata: dict,
+    expected_code: str,
+) -> None:
+    data = _base_plan(tmp_path)
+    data["units"][0].update(metadata)
+
+    result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
+
+    assert result.valid is False
+    assert expected_code in {issue.code for issue in result.errors}
+
+
 def _codes(result) -> set[str]:
     return {issue.code for issue in result.errors}
 
@@ -139,7 +185,7 @@ def test_delivery_plan_check_preserves_unit_sizing_metadata(tmp_path: Path) -> N
     data["units"][0]["estimated_size"] = "medium"
     data["units"][0]["risk_tags"] = ["structured_output_contract", "validation"]
     data["units"][0]["budget"] = {
-        "max_planner_steps": 4,
+        "max_planner_steps": 2,
         "max_elapsed_minutes": 45,
         "max_review_cycles": 2,
         "max_security_cycles": 1,
@@ -158,7 +204,7 @@ def test_delivery_plan_check_preserves_unit_sizing_metadata(tmp_path: Path) -> N
     assert unit.risk_tags == ["structured_output_contract", "validation"]
     assert unit.budget is not None
     assert unit.budget.to_dict() == {
-        "max_planner_steps": 4,
+        "max_planner_steps": 2,
         "max_elapsed_minutes": 45,
         "max_review_cycles": 2,
         "max_security_cycles": 1,
@@ -169,7 +215,7 @@ def test_delivery_plan_check_preserves_unit_sizing_metadata(tmp_path: Path) -> N
     payload = result.to_dict()
     assert payload["plan"]["units"][0]["estimated_size"] == "medium"
     assert payload["plan"]["units"][0]["risk_tags"] == ["structured_output_contract", "validation"]
-    assert payload["plan"]["units"][0]["budget"]["max_planner_steps"] == 4
+    assert payload["plan"]["units"][0]["budget"]["max_planner_steps"] == 2
 
 
 def test_delivery_plan_check_warns_when_unit_combines_high_risk_surfaces(tmp_path: Path) -> None:
@@ -683,6 +729,17 @@ def test_delivery_plan_check_reports_invalid_unit_sizing_metadata(tmp_path: Path
     assert "units.risk_tag_invalid" in _codes(result)
     assert "units.budget_unknown_field" in _codes(result)
     assert "units.budget_value_invalid" in _codes(result)
+
+
+def test_delivery_plan_check_rejects_planner_step_budget_that_requires_split(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["units"][0]["budget"] = {"max_planner_steps": 3}
+
+    result = check_delivery_plan_file(_write_plan(tmp_path, data))
+
+    assert result.valid is False
+    assert "units.planner_step_budget_invalid" in _codes(result)
 
 
 def test_delivery_plan_check_reports_mixed_type_budget_keys_without_crashing(tmp_path: Path) -> None:

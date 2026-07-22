@@ -6,6 +6,7 @@ from typing import Any
 
 from core.delivery_plan import DeliveryPlanIssue, _find_git_root as _find_delivery_git_root
 from core.delivery_progress import DeliveryStatusUnit, get_delivery_status, select_next_delivery_unit
+from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
 
 
 @dataclass(frozen=True)
@@ -212,7 +213,11 @@ def preview_delivery_run_next(
                         "no unit was run and delivery progress was not changed."
                     )
         if selected_unit is None:
-            code, message = _blocked_run_next_reason(status.status, reset_failed=reset_failed)
+            code, message = _blocked_run_next_reason(
+                status.status,
+                reset_failed=reset_failed,
+                units=status.units,
+            )
             errors.append(DeliveryPlanIssue("error", code, message))
 
     effective_root = (
@@ -341,7 +346,16 @@ def render_delivery_run_next_execution(result: DeliveryRunNextExecutionResult) -
     return "\n".join(lines) + "\n"
 
 
-def _blocked_run_next_reason(status: str, reset_failed: bool = False) -> tuple[str, str]:
+def _blocked_run_next_reason(
+    status: str,
+    reset_failed: bool = False,
+    units: list[DeliveryStatusUnit] | None = None,
+) -> tuple[str, str]:
+    if any(unit.status == "failed" and unit.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE for unit in units or []):
+        return (
+            "delivery.unit_budget_exceeded",
+            "A delivery unit exceeded its planner-step budget; split it with delivery amend prepare before continuing.",
+        )
     if status == "failed":
         if reset_failed:
             return (

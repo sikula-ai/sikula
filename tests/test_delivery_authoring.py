@@ -115,7 +115,7 @@ def _draft_data() -> dict[str, Any]:
                 "scope_paths": ["core", "tests"],
                 "estimated_size": "small",
                 "risk_tags": ["validation"],
-                "budget": {"max_planner_steps": 3, "max_changed_files": 8},
+                "budget": {"max_planner_steps": 2, "max_changed_files": 8},
             },
             {
                 "id": "cli",
@@ -175,10 +175,10 @@ def test_parse_delivery_authoring_output_accepts_valid_json_object(tmp_path: Pat
     assert draft.units[0].scope_paths == ["core", "tests"]
     assert draft.units[0].estimated_size == "small"
     assert draft.units[0].risk_tags == ["validation"]
-    assert draft.units[0].budget == DeliveryUnitBudget(max_planner_steps=3, max_changed_files=8)
+    assert draft.units[0].budget == DeliveryUnitBudget(max_planner_steps=2, max_changed_files=8)
     assert draft.units[1].estimated_size == "medium"
     assert draft.units[1].risk_tags == ["cli_surface"]
-    assert draft.units[1].budget is None
+    assert draft.units[1].budget == DeliveryUnitBudget(max_planner_steps=1)
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
 
 
@@ -217,7 +217,7 @@ def test_parse_delivery_authoring_output_defaults_absent_optional_fields(tmp_pat
     assert draft.units[0].scope_paths == []
     assert draft.units[0].estimated_size is None
     assert draft.units[0].risk_tags == []
-    assert draft.units[0].budget is None
+    assert draft.units[0].budget == DeliveryUnitBudget(max_planner_steps=1)
 
 
 def test_parse_delivery_authoring_output_accepts_text_heading_equivalents(tmp_path: Path) -> None:
@@ -270,6 +270,84 @@ def test_parse_delivery_amendment_authoring_output_accepts_null_amend_reason(tmp
 
     assert draft.amend_reason is None
     assert [unit.id for unit in draft.replacement_units] == ["split-a", "split-b"]
+
+
+@pytest.mark.parametrize(
+    ("mutator", "expected_code"),
+    [
+        pytest.param(
+            lambda data: data.update({"plan_id": "other-plan"}),
+            "delivery_amend_authoring.plan_id_mismatch",
+            id="plan_id_mismatch",
+        ),
+        pytest.param(
+            lambda data: data.update({"target_unit_id": "other-unit"}),
+            "delivery_amend_authoring.target_unit_mismatch",
+            id="target_unit_mismatch",
+        ),
+        pytest.param(
+            lambda data: data["replacement_units"][0].update({"id": "oversized"}),
+            "delivery_amend_authoring.target_id_reused",
+            id="target_id_reused",
+        ),
+        pytest.param(
+            lambda data: data.update({"amend_reason": "not a stable code"}),
+            "delivery_amend_authoring.amend_reason_invalid",
+            id="amend_reason_invalid",
+        ),
+        pytest.param(
+            lambda data: data.update({"budget_exceeded": {"name": "max_planner_steps"}}),
+            "delivery_amend_authoring.budget_exceeded_invalid",
+            id="budget_shape_invalid",
+        ),
+        pytest.param(
+            lambda data: data.update({"budget_exceeded": {"name": "not a code", "limit": 2, "actual": 5}}),
+            "delivery_amend_authoring.budget_exceeded_invalid",
+            id="budget_name_invalid",
+        ),
+        pytest.param(
+            lambda data: data.update({"budget_exceeded": {"name": "max_planner_steps", "limit": True, "actual": 5}}),
+            "delivery_amend_authoring.budget_exceeded_invalid",
+            id="budget_limit_invalid",
+        ),
+        pytest.param(
+            lambda data: data.update({"budget_exceeded": {"name": "max_planner_steps", "limit": 2, "actual": -1}}),
+            "delivery_amend_authoring.budget_exceeded_invalid",
+            id="budget_actual_invalid",
+        ),
+    ],
+)
+def test_parse_delivery_amendment_authoring_output_rejects_invalid_metadata(
+    tmp_path: Path,
+    mutator: Callable[[dict[str, Any]], None],
+    expected_code: str,
+) -> None:
+    data = {
+        "plan_id": "team-invites",
+        "target_unit_id": "oversized",
+        "amend_reason": "unit_budget_exceeded",
+        "budget_exceeded": {"name": "max_planner_steps", "limit": 2, "actual": 5},
+        "warnings": [],
+        "replacement_units": [
+            {
+                "id": "split-a",
+                "title": "Split A",
+                "depends_on": [],
+                "task_markdown": _unit_markdown("Split A"),
+            }
+        ],
+    }
+    mutator(data)
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        parse_delivery_amendment_authoring_output(
+            json.dumps(data),
+            expected_plan_id="team-invites",
+            expected_target_unit_id="oversized",
+            project_root=tmp_path,
+        )
+
+    assert exc_info.value.code == expected_code
 
 
 @pytest.mark.parametrize(
@@ -533,6 +611,11 @@ def test_parse_delivery_amendment_authoring_output_accepts_null_amend_reason(tmp
             lambda root: _output_with(lambda data: data["units"][0].update({"budget": {"max_planner_steps": True}})),
             "delivery_authoring.budget_value_invalid",
             id="budget_bool_value",
+        ),
+        pytest.param(
+            lambda root: _output_with(lambda data: data["units"][0].update({"budget": {"max_planner_steps": 3}})),
+            "delivery_authoring.planner_step_budget_invalid",
+            id="planner_step_budget_requires_split",
         ),
         pytest.param(
             lambda root: _output_with(lambda data: data["units"][1].update({"depends_on": "foundation"})),

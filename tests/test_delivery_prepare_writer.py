@@ -134,7 +134,7 @@ def _draft(
                 scope_paths=["core", "tests"],
                 estimated_size="small",
                 risk_tags=["validation"],
-                budget=DeliveryUnitBudget(max_planner_steps=3, max_changed_files=8),
+                budget=DeliveryUnitBudget(max_planner_steps=2, max_changed_files=8),
             ),
             _unit(
                 "cli",
@@ -209,7 +209,7 @@ def test_write_delivery_prepare_artifacts_writes_valid_plan_and_units(tmp_path: 
                 "scope_paths": ["core", "tests"],
                 "estimated_size": "small",
                 "risk_tags": ["validation"],
-                "budget": {"max_planner_steps": 3, "max_changed_files": 8},
+                "budget": {"max_planner_steps": 2, "max_changed_files": 8},
             },
             {
                 "id": "cli",

@@ -10,11 +10,12 @@ import tempfile
 from typing import Any
 
 from core.delivery_plan import DeliveryBudgetExceeded, DeliveryPlan, DeliveryPlanIssue, check_delivery_plan_file
-from core.delivery_unit_metadata import DeliveryUnitBudget
+from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE, DeliveryUnitBudget
 
 SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION = 1
 DELIVERY_UNIT_STATUSES = {"pending", "running", "done", "failed", "canceled", "waiting"}
 _DELIVERY_EVENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
+_DELIVERY_METADATA_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _DELIVERY_PROGRESS_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _TERMINAL_DELIVERY_UNIT_STATUSES = {"done", "failed", "canceled"}
 
@@ -28,6 +29,7 @@ class DeliveryUnitProgress:
     commit: str | None = None
     waiting_reason: str | None = None
     failure_code: str | None = None
+    budget_exceeded: DeliveryBudgetExceeded | None = None
     started_at: str | None = None
     completed_at: str | None = None
     updated_at: str | None = None
@@ -50,6 +52,8 @@ class DeliveryUnitProgress:
             value = getattr(self, key)
             if value:
                 data[key] = value
+        if self.budget_exceeded:
+            data["budget_exceeded"] = self.budget_exceeded.to_dict()
         return data
 
 
@@ -209,6 +213,8 @@ class DeliveryStatusUnit:
 
     @property
     def run_next_available(self) -> bool:
+        if self.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE:
+            return False
         if self.status in ("running", "failed"):
             return bool(self.child_task_id)
         return False
@@ -217,12 +223,14 @@ class DeliveryStatusUnit:
     def run_next_action(self) -> str | None:
         if self.status == "running" and self.child_task_id:
             return "resume_or_reconcile"
-        if self.status == "failed" and self.child_task_id:
+        if self.status == "failed" and self.child_task_id and self.failure_code != DELIVERY_UNIT_BUDGET_EXCEEDED_CODE:
             return "retry_failed"
         return None
 
     @property
     def run_next_blocked_reason(self) -> str | None:
+        if self.status == "failed" and self.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE:
+            return DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
         if self.status in ("running", "failed") and not self.child_task_id:
             return "missing_child_task_id"
         return None
@@ -497,6 +505,7 @@ def make_delivery_unit_progress(
     commit: str | None = None,
     waiting_reason: str | None = None,
     failure_code: str | None = None,
+    budget_exceeded: DeliveryBudgetExceeded | None = None,
     started_at: str | None = None,
     timestamp: str | None = None,
 ) -> DeliveryUnitProgress:
@@ -511,6 +520,7 @@ def make_delivery_unit_progress(
         commit=commit,
         waiting_reason=waiting_reason if status == "waiting" else None,
         failure_code=failure_code if status == "failed" else None,
+        budget_exceeded=budget_exceeded if status == "failed" else None,
         started_at=started_at,
         completed_at=completed_at,
         updated_at=timestamp,
@@ -538,6 +548,7 @@ def make_delivery_progress_event(
         commit=unit.commit if unit else commit,
         waiting_reason=unit.waiting_reason if unit else None,
         failure_code=unit.failure_code if unit else None,
+        budget_exceeded=unit.budget_exceeded if unit else None,
     )
 
 
@@ -566,7 +577,16 @@ def select_next_delivery_unit(status: DeliveryStatusResult, reset_failed: bool =
     if reset_failed:
         if any(unit.status == "running" for unit in status.units):
             return None
-        return next((unit for unit in status.units if unit.status == "failed" and unit.child_task_id), None)
+        return next(
+            (
+                unit
+                for unit in status.units
+                if unit.status == "failed"
+                and unit.child_task_id
+                and unit.failure_code != DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
+            ),
+            None,
+        )
     if status.status == "failed":
         return None
     return next((unit for unit in status.units if unit.eligible), None)
@@ -697,6 +717,13 @@ def _validate_unit_progress(unit: DeliveryUnitProgress) -> None:
         raise ValueError("delivery progress unit_id must be non-empty")
     if unit.status not in DELIVERY_UNIT_STATUSES:
         raise ValueError(f"unknown delivery progress status: {unit.status}")
+    if unit.budget_exceeded is not None:
+        if (
+            not _DELIVERY_METADATA_CODE_RE.fullmatch(unit.budget_exceeded.name)
+            or unit.budget_exceeded.limit < 0
+            or unit.budget_exceeded.actual < 0
+        ):
+            raise ValueError("delivery progress budget_exceeded metadata is invalid")
 
 
 def _validate_event(event: DeliveryProgressEvent) -> None:
@@ -710,6 +737,12 @@ def _validate_event(event: DeliveryProgressEvent) -> None:
         raise ValueError("delivery progress event_type must be a stable code")
     if event.status and event.status not in DELIVERY_UNIT_STATUSES:
         raise ValueError(f"unknown delivery progress event status: {event.status}")
+    if event.budget_exceeded is not None and (
+        not _DELIVERY_METADATA_CODE_RE.fullmatch(event.budget_exceeded.name)
+        or event.budget_exceeded.limit < 0
+        or event.budget_exceeded.actual < 0
+    ):
+        raise ValueError("delivery progress event budget_exceeded metadata is invalid")
 
 
 def _utc_now() -> str:
@@ -822,7 +855,9 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
                 else:
                     detail += " (run-next blocked: missing child task id)"
             elif unit.status == "failed":
-                if unit.child_task_id:
+                if unit.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE:
+                    detail += " (split required before implementation)"
+                elif unit.child_task_id:
                     detail += " (run-next: retry with --reset-failed)"
                 else:
                     detail += " (retry unavailable: missing child task id)"
@@ -990,9 +1025,57 @@ def _parse_progress_unit(
             "updated_at",
         )
     }
+    budget_exceeded = _parse_progress_budget_exceeded(item.get("budget_exceeded"), f"{path}.budget_exceeded", errors)
     if unit_id is None or status is None:
         return None
-    return DeliveryUnitProgress(unit_id=unit_id, status=status, **optional)
+    return DeliveryUnitProgress(
+        unit_id=unit_id,
+        status=status,
+        budget_exceeded=budget_exceeded,
+        **optional,
+    )
+
+
+def _parse_progress_budget_exceeded(
+    value: Any,
+    path: str,
+    errors: list[DeliveryPlanIssue],
+) -> DeliveryBudgetExceeded | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"name", "limit", "actual"}:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "progress.budget_exceeded_invalid",
+                "budget_exceeded must contain exactly name, limit, and actual.",
+                path,
+            )
+        )
+        return None
+    name = value.get("name")
+    limit = value.get("limit")
+    actual = value.get("actual")
+    if (
+        not isinstance(name, str)
+        or not _DELIVERY_METADATA_CODE_RE.fullmatch(name)
+        or not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or limit < 0
+        or not isinstance(actual, int)
+        or isinstance(actual, bool)
+        or actual < 0
+    ):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "progress.budget_exceeded_invalid",
+                "budget_exceeded contains invalid values.",
+                path,
+            )
+        )
+        return None
+    return DeliveryBudgetExceeded(name=name, limit=limit, actual=actual)
 
 
 def _required_string(data: dict[str, Any], key: str, path: str, errors: list[DeliveryPlanIssue]) -> str | None:
@@ -1060,7 +1143,11 @@ def _build_status_units(
                 supersedes=plan_unit.supersedes,
                 superseded_by=list(plan_unit.superseded_by),
                 amend_reason=plan_unit.amend_reason,
-                budget_exceeded=plan_unit.budget_exceeded,
+                budget_exceeded=(
+                    progress_unit.budget_exceeded
+                    if progress_unit and progress_unit.budget_exceeded
+                    else plan_unit.budget_exceeded
+                ),
                 child_task_id=progress_unit.child_task_id if progress_unit else None,
                 branch=progress_unit.branch if progress_unit else None,
                 commit=progress_unit.commit if progress_unit else None,
@@ -1106,6 +1193,8 @@ def _next_action(status: str, units: list[DeliveryStatusUnit], *, final_commit: 
 
     failed_units = [u for u in units if u.status == "failed"]
     if failed_units:
+        if any(u.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE for u in failed_units):
+            return "split the budget-exceeded unit with delivery amend prepare before continuing"
         if any(u.child_task_id for u in failed_units):
             return "retry a failed delivery unit with delivery run-next --reset-failed"
         return "inspect the failed delivery unit; no linked child task is available for retry"

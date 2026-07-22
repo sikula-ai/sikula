@@ -15,13 +15,20 @@ import yaml
 import core.delivery_amendment as delivery_amendment_module
 import sikula
 from core.delivery_amendment import (
+    DeliveryAmendmentApplyResult,
     DeliveryAmendmentError,
     apply_delivery_amendment,
+    capture_delivery_amendment_source_snapshot,
     create_delivery_amendment_proposal,
+    delivery_amendment_proposal_path,
     inspect_delivery_amendment_target,
     preview_delivery_amendment,
 )
-from core.delivery_authoring import DeliveryAmendmentAuthoringDraft, DeliveryAuthoringUnitDraft
+from core.delivery_authoring import (
+    DeliveryAmendmentAuthoringDraft,
+    DeliveryAuthoringParseError,
+    DeliveryAuthoringUnitDraft,
+)
 from core.delivery_finalize import preview_delivery_finalize
 from core.delivery_plan import DeliveryPlanIssue, check_delivery_plan_file
 from core.delivery_progress import (
@@ -43,6 +50,8 @@ from sikula_cli.delivery import (
     cmd_delivery_amend_prepare,
     cmd_delivery_run_next,
     register_parser,
+    render_delivery_amend_apply,
+    render_delivery_amend_prepare,
 )
 
 
@@ -1413,6 +1422,21 @@ def test_main_dispatches_delivery_amend_commands_through_runtime_config(
     assert args.delivery_command == "amend"
 
 
+def test_main_amend_commands_delegate_to_delivery_cli() -> None:
+    args = argparse.Namespace()
+    cfg = {"project": {"root_path": "/project"}}
+
+    with (
+        patch("sikula.cli_delivery.cmd_delivery_amend_prepare", return_value="prepared") as prepare,
+        patch("sikula.cli_delivery.cmd_delivery_amend_apply", return_value="applied") as apply,
+    ):
+        assert sikula.cmd_delivery_amend_prepare(args, cfg) == "prepared"
+        assert sikula.cmd_delivery_amend_apply(args, cfg) == "applied"
+
+    prepare.assert_called_once()
+    apply.assert_called_once_with(args, cfg)
+
+
 def test_amend_prepare_cli_stores_allowlisted_proposal_projection(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1451,6 +1475,234 @@ def test_amend_prepare_cli_stores_allowlisted_proposal_projection(
     assert len(calls) == 1
     assert calls[0]["target"].target.id == "c"
     assert not delivery_events_path(tmp_path, "amend-demo").exists()
+
+
+def test_amend_prepare_cli_reports_authoring_warning(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+
+    def author(**kwargs):
+        return replace(_draft(), warnings=["Review the proposed split."])
+
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        split_unit="c",
+        json=True,
+        agent_model=None,
+        agent_provider=None,
+        agent_timeout=None,
+    )
+    cfg = {
+        **_project_config(tmp_path),
+        "tasks": {"contract_report_dir": str(proposal_root)},
+    }
+
+    cmd_delivery_amend_prepare(args, cfg, DeliveryAmendPrepareContext(author))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert [issue["code"] for issue in payload["warnings"]] == ["delivery_amend.authoring_warnings_present"]
+
+
+def test_amend_prepare_cli_requires_main_command_context(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        split_unit="c",
+        json=True,
+        agent_model=None,
+        agent_provider=None,
+        agent_timeout=None,
+    )
+    cfg = {
+        **_project_config(tmp_path),
+        "tasks": {"contract_report_dir": str(proposal_root)},
+    }
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_amend_prepare(args, cfg)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert [issue["code"] for issue in payload["errors"]] == ["delivery_amend.authoring_context_missing"]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code", "expected_message"),
+    [
+        pytest.param(
+            DeliveryAuthoringParseError("delivery_authoring.json_invalid", "Invalid JSON."),
+            "delivery_amend.authoring_invalid",
+            "Delivery amendment authoring returned an invalid proposal.",
+            id="invalid_draft",
+        ),
+        pytest.param(
+            RuntimeError("provider failed"),
+            "delivery_amend.authoring_failed",
+            "Delivery amendment proposal preparation failed.",
+            id="provider_failure",
+        ),
+    ],
+)
+def test_amend_prepare_cli_projects_authoring_failures(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception,
+    expected_code: str,
+    expected_message: str,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    setattr(error, "audit_path", str(proposal_root / "amend-audit.jsonl"))
+
+    def author(**kwargs):
+        raise error
+
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        split_unit="c",
+        json=True,
+        agent_model=None,
+        agent_provider=None,
+        agent_timeout=None,
+    )
+    cfg = {
+        **_project_config(tmp_path),
+        "tasks": {"contract_report_dir": str(proposal_root)},
+    }
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_amend_prepare(args, cfg, DeliveryAmendPrepareContext(author))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert [issue["code"] for issue in payload["errors"]] == [expected_code]
+    assert payload["message"] == expected_message
+    assert payload["audit_path"] == ".sikula/contract-reports/amend-audit.jsonl"
+
+
+def test_amend_renderers_include_optional_details(tmp_path: Path) -> None:
+    issue = DeliveryPlanIssue("warning", "delivery_amend.review", "Review the split.", "units/c.md")
+    prepare = DeliveryAmendPrepareResult(
+        plan_path=str(tmp_path / "plan.yaml"),
+        project_root=str(tmp_path),
+        status="ready",
+        prepared=True,
+        plan_id="amend-demo",
+        target_unit_id="c",
+        proposal_id="proposal-1",
+        replacement_ids=["c-1", "c-2"],
+        proposal_path=str(tmp_path / "proposal.json"),
+        audit_path=str(tmp_path / "audit.jsonl"),
+        errors=[DeliveryPlanIssue("error", "delivery_amend.example", "Example failure.")],
+        warnings=[issue],
+        message="Proposal prepared.",
+    )
+    apply = DeliveryAmendmentApplyResult(
+        plan_path=str(tmp_path / "plan.yaml"),
+        project_root=str(tmp_path),
+        proposal_id="proposal-1",
+        target_unit_id="c",
+        replacement_ids=["c-1", "c-2"],
+        rewired_unit_ids=["d"],
+        dry_run=True,
+        ready=True,
+        applied=False,
+        proposal_path=str(tmp_path / "proposal.json"),
+        errors=[DeliveryPlanIssue("error", "delivery_amend.example", "Example failure.")],
+        warnings=[issue],
+        message="Ready to apply.",
+    )
+
+    prepare_text = render_delivery_amend_prepare(prepare)
+    apply_text = render_delivery_amend_apply(apply)
+
+    assert "Plan ID: amend-demo" in prepare_text
+    assert "Proposal artifact: proposal.json" in prepare_text
+    assert "Authoring audit: audit.jsonl" in prepare_text
+    assert "Errors:" in prepare_text
+    assert "Warnings:" in prepare_text
+    assert "Status: ready" in apply_text
+    assert "Rewired downstream units: d" in apply_text
+    assert "Dry run: yes" in apply_text
+    assert "Errors:" in apply_text
+    assert "Warnings:" in apply_text
+
+
+def test_main_amend_authoring_adapter_attaches_audit_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    target = inspect_delivery_amendment_target(
+        plan_path,
+        "c",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+    snapshot = capture_delivery_amendment_source_snapshot(target)
+    audit_path = proposal_root / "amend-audit.jsonl"
+
+    class Agent:
+        def author_delivery_amendment(self, **kwargs):
+            assert kwargs["target_unit_id"] == "c"
+            assert kwargs["downstream_units"][0]["id"] == "d"
+            kwargs["audit_recorder"]({"phase": "test"})
+            return _draft()
+
+    audit_records = []
+    monkeypatch.setattr(sikula, "_create_delivery_preparation_agent", lambda args, cfg: Agent())
+    monkeypatch.setattr(
+        sikula,
+        "_make_auto_preparation_audit_recorder",
+        lambda **kwargs: (audit_records.append, audit_path),
+    )
+
+    draft = sikula._run_delivery_amend_prepare_authoring(
+        args=argparse.Namespace(),
+        cfg=_project_config(tmp_path),
+        target=target,
+        source_snapshot=snapshot,
+    )
+
+    assert draft.audit_path == ".sikula/contract-reports/amend-audit.jsonl"
+    assert audit_records == [{"phase": "test"}]
+
+
+def test_main_amend_authoring_adapter_attaches_audit_path_to_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    target = inspect_delivery_amendment_target(
+        plan_path,
+        "c",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+    snapshot = capture_delivery_amendment_source_snapshot(target)
+    audit_path = proposal_root / "amend-audit.jsonl"
+
+    class Agent:
+        def author_delivery_amendment(self, **kwargs):
+            raise RuntimeError("provider failed")
+
+    monkeypatch.setattr(sikula, "_create_delivery_preparation_agent", lambda args, cfg: Agent())
+    monkeypatch.setattr(
+        sikula,
+        "_make_auto_preparation_audit_recorder",
+        lambda **kwargs: (lambda record: None, audit_path),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        sikula._run_delivery_amend_prepare_authoring(
+            args=argparse.Namespace(),
+            cfg=_project_config(tmp_path),
+            target=target,
+            source_snapshot=snapshot,
+        )
+
+    assert exc_info.value.audit_path == ".sikula/contract-reports/amend-audit.jsonl"
 
 
 def test_amend_prepare_cli_reports_git_execution_failure(
@@ -1649,6 +1901,49 @@ def test_preview_rejects_unknown_proposal_without_writing_state(tmp_path: Path) 
     assert result.ready is False
     assert [issue.code for issue in result.errors] == ["delivery_amend.proposal_unknown"]
     assert _snapshot(tmp_path) == before
+
+
+def test_inspect_rejects_invalid_plan(tmp_path: Path) -> None:
+    plan_path = tmp_path / "missing-plan.yaml"
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    assert exc_info.value.issue.code == "plan.missing"
+
+
+@pytest.mark.parametrize("target_status", ["waiting", "canceled"])
+def test_inspect_rejects_unsafe_target_status(tmp_path: Path, target_status: str) -> None:
+    plan_path, _, _ = _setup(tmp_path, target_status=target_status)
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    assert exc_info.value.issue.code == "delivery_amend.target_state_unsafe"
+
+
+def test_proposal_path_rejects_unsafe_identifier(tmp_path: Path) -> None:
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        delivery_amendment_proposal_path(tmp_path, "amend-demo", "../proposal")
+
+    assert exc_info.value.issue.code == "delivery_amend.proposal_id_invalid"
+
+
+def test_preview_rejects_malformed_proposal_artifact(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal_path = delivery_amendment_proposal_path(proposal_root, "amend-demo", "malformed")
+    proposal_path.parent.mkdir(parents=True, exist_ok=True)
+    proposal_path.write_text("{", encoding="utf-8")
+
+    result = preview_delivery_amendment(
+        plan_path,
+        "malformed",
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+    )
+
+    assert result.ready is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.proposal_invalid"]
 
 
 def test_preview_rejects_replacement_task_created_after_prepare(tmp_path: Path) -> None:
