@@ -142,6 +142,7 @@ sikula delivery amend apply .sikula/delivery/my-task/plan.yaml --proposal PROPOS
 sikula delivery amend apply .sikula/delivery/my-task/plan.yaml --proposal PROPOSAL_ID
 sikula delivery run-next .sikula/delivery/my-task/plan.yaml --dry-run
 sikula delivery run-next .sikula/delivery/my-task/plan.yaml
+sikula delivery run-next .sikula/delivery/my-task/plan.yaml --prepare-budget-split
 sikula delivery run-next .sikula/delivery/my-task/plan.yaml --reset-failed
 sikula delivery run-next .sikula/delivery/my-task/plan.yaml \
   --agent-provider implementer=antigravity
@@ -154,7 +155,7 @@ Use this to author, validate, and inspect the tracked parent plan for larger wor
 - `.sikula/delivery/<slug>/plan.yaml`
 - `.sikula/delivery/<slug>/units/<unit-slug>.md`
 
-`delivery prepare` is an authoring step only: it does not start implementation, create task state, run delivery units, mutate `.sikula/state/delivery/<plan-id>/`, or update branches. Prepared units default to one planner step; two steps are an explicit tightly coupled exception, and plans declaring three or more steps per unit are rejected. During `run-next`, an oversized planner result stops before implementation and must be split through a delivery amendment; `--reset-failed` cannot bypass that stop. Completed and running units cannot be split. The follow-up path is to check the plan, dry-run the next eligible unit, run that unit through the normal `sikula run` pipeline, and finalize the completed plan. See [Delivery Plans](docs/delivery-plans.md).
+`delivery prepare` is an authoring step only: it does not start implementation, create task state, run delivery units, mutate `.sikula/state/delivery/<plan-id>/`, or update branches. Prepared units default to one planner step; two steps are an explicit tightly coupled exception, and plans declaring three or more steps per unit are rejected. During `run-next`, an oversized planner result stops before implementation and must be split through a delivery amendment; `--reset-failed` cannot bypass that stop. With explicit `--prepare-budget-split`, `run-next` can verify the parent and child stop evidence and prepare the split proposal after releasing the execution lock. It still exits non-zero, does not apply the proposal, and does not start replacement units. Completed and running units cannot be split. The follow-up path is to check the plan, dry-run the next eligible unit, run that unit through the normal `sikula run` pipeline, and finalize the completed plan. See [Delivery Plans](docs/delivery-plans.md).
 
 **Run a task into a branch**
 

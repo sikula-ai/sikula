@@ -286,12 +286,35 @@ def test_author_delivery_amendment_uses_plain_generation_and_records_audit(tmp_p
     assert READONLY_AGENT_PREFIX in prompt
     assert "Do not propose edits to existing units" in prompt
     assert "amend_reason must be omitted, null, or a stable code" in prompt
-    assert '"amend_reason": "unit_budget_exceeded"' in prompt
+    assert '"amend_reason": null' in prompt
+    assert "Verified recovery metadata supplied by deterministic Sikula code:\n```json\nnull" in prompt
     assert "optional stable reason" not in prompt
     assert '"id": "oversized"' in prompt
     assert "Split the oversized invite behavior" in prompt
     assert audit_records[0]["phase"] == "delivery_amend_prepare_authoring"
     assert audit_records[0]["parsed"]["replacement_ids"] == ["invite-storage", "invite-cli"]
+
+
+def test_author_delivery_amendment_includes_verified_recovery_metadata(tmp_path: Path) -> None:
+    llm = CapturingLLM(_amendment_output())
+    agent = DeliveryPreparationAgent(llm=llm)
+    budget_exceeded = {"name": "max_planner_steps", "limit": 2, "actual": 5}
+
+    agent.author_delivery_amendment(
+        plan_id="team-invites",
+        target_unit_id="oversized",
+        target_task_description="Split the selected unit.",
+        target_unit={"id": "oversized", "depends_on": []},
+        downstream_units=[],
+        project_root=tmp_path,
+        amend_reason="unit_budget_exceeded",
+        budget_exceeded=budget_exceeded,
+    )
+
+    prompt = llm.prompts[0]
+    assert '"amend_reason": "unit_budget_exceeded"' in prompt
+    assert '"actual": 5' in prompt
+    assert '"limit": 2' in prompt
 
 
 def test_author_delivery_amendment_json_escapes_plan_valid_target_id(tmp_path: Path) -> None:

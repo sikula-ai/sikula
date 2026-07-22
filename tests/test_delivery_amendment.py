@@ -30,7 +30,7 @@ from core.delivery_authoring import (
     DeliveryAuthoringUnitDraft,
 )
 from core.delivery_finalize import preview_delivery_finalize
-from core.delivery_plan import DeliveryPlanIssue, check_delivery_plan_file
+from core.delivery_plan import DeliveryBudgetExceeded, DeliveryPlanIssue, check_delivery_plan_file
 from core.delivery_progress import (
     DeliveryProgressLockError,
     delivery_events_path,
@@ -46,6 +46,7 @@ from sikula_cli.delivery import (
     DeliveryAmendPrepareContext,
     DeliveryAmendPrepareResult,
     DeliveryRunNextContext,
+    _bind_authoritative_amendment_metadata,
     cmd_delivery_amend_apply,
     cmd_delivery_amend_prepare,
     cmd_delivery_run_next,
@@ -53,6 +54,35 @@ from sikula_cli.delivery import (
     render_delivery_amend_apply,
     render_delivery_amend_prepare,
 )
+
+
+def test_automatic_amendment_metadata_is_bound_deterministically() -> None:
+    draft = replace(_draft(), amend_reason=None, budget_exceeded=None)
+    setattr(draft, "audit_path", ".sikula/contract-reports/amend.auto-llm.jsonl")
+    budget = DeliveryBudgetExceeded(name="max_planner_steps", limit=1, actual=3)
+
+    bound = _bind_authoritative_amendment_metadata(
+        draft,
+        amend_reason="unit_budget_exceeded",
+        budget_exceeded=budget,
+    )
+
+    assert bound.amend_reason == "unit_budget_exceeded"
+    assert bound.budget_exceeded == budget.to_dict()
+    assert bound.audit_path == ".sikula/contract-reports/amend.auto-llm.jsonl"
+
+
+def test_automatic_amendment_metadata_rejects_model_conflict() -> None:
+    budget = DeliveryBudgetExceeded(name="max_planner_steps", limit=1, actual=3)
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        _bind_authoritative_amendment_metadata(
+            _draft(),
+            amend_reason="unit_budget_exceeded",
+            budget_exceeded=budget,
+        )
+
+    assert exc_info.value.issue.code == "delivery_amend.authoring_recovery_metadata_mismatch"
 
 
 def _git_init(root: Path) -> None:

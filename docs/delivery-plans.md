@@ -222,9 +222,11 @@ the original amendment failure. Interruptions roll back artifact changes, append
 earlier events are never rewritten. Blocked results use a blocked message, and
 outside-project input paths are redacted from human and JSON diagnostics.
 
-Planner-step budget stops use this amendment flow for recovery. Sikula does not
-invoke amendment authoring automatically: the operator prepares and applies the
-split proposal after inspecting the stopped child task and parent status.
+Planner-step budget stops use this amendment flow for recovery. By default the
+operator prepares and applies the split proposal after inspecting the stopped
+child task and parent status. `delivery run-next --prepare-budget-split` is an
+explicit opt-in that verifies an unambiguous parent/child budget stop and invokes
+the same proposal preparation flow. It does not apply the proposal.
 
 ## After Preparing
 
@@ -334,6 +336,7 @@ Run the next eligible unit:
 ```bash
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --json
+sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --prepare-budget-split
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --reset-failed
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml \
   --agent-provider implementer=antigravity \
@@ -361,6 +364,30 @@ unit with a linked child task id before pending work. It preserves the same pare
 unit and child task id, appends a `unit.retry_intent` event, and forwards reset
 semantics to the child task path (`sikula run --task-id <child_task_id> --reset-failed`).
 `--reset-failed` does not bypass running-unit ambiguity, dependency result-commit checks, or a planner-step budget stop and does not select later pending work while retry selection is active. Child runs preserve normal `sikula run` semantics, and delivery execution still runs one unit at a time and does not assemble the final branch automatically.
+`--prepare-budget-split` is mutually exclusive with `--dry-run`. It supports a
+budget stop produced by the current child run and an already persisted,
+unambiguous budget-stopped unit. Sikula first finishes the normal child and
+parent failure recording and releases the `delivery.run-next` progress lock.
+If another delivery operation owns that lock, split preparation does not invoke
+`delivery_preparer` or write proposal/audit artifacts.
+It then verifies that parent progress and the linked failed child identify the
+same plan and unit. The child stop must come from the planner phase, and its
+`max_planner_steps` limit must match parent progress, the child budget snapshot,
+and the current unit budget before Sikula invokes `delivery_preparer`. Missing,
+ambiguous, stale, or mismatched evidence blocks before authoring. Runtime agent
+overrides continue to reach the child, while a `delivery_preparer` override is
+used only for split preparation.
+
+Successful opt-in preparation writes the normal local content-addressed
+proposal and authoring audit, but does not change the tracked plan, unit task
+files, progress, events, child state, worktrees, branches, or Git refs beyond
+the budget failure already recorded by `run-next`. Text and JSON output expose
+an allowlisted `budget_split_preparation` result with the proposal id,
+replacement ids, project-relative artifact paths, and verified budget values.
+The delivery unit remains failed and `run-next` exits non-zero because no
+implementation completed. The operator must still inspect and run `delivery
+amend apply`, then start replacement units separately. Automatic apply,
+replacement execution, and delivery-branch assembly are not performed.
 The JSON/text output remains privacy-safe and allowlisted.
 If the running unit has a terminal child with matching metadata and is not
 retrying a failed child through `--reset-failed`, `run-next`

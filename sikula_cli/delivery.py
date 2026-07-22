@@ -27,12 +27,20 @@ from core.delivery_plan import (
     is_valid_delivery_branch_name,
 )
 from core.delivery_prepare_writer import DeliveryPrepareWriteResult, write_delivery_prepare_artifacts
-from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE, delivery_unit_budget_snapshot
-from sikula_cli.agent_overrides import DELIVERY_PREPARATION_AGENT_NAMES, parse_agent_llm_overrides
+from core.delivery_unit_metadata import (
+    DELIVERY_UNIT_BUDGET_EXCEEDED_CODE,
+    delivery_unit_budget_snapshot,
+    delivery_unit_planner_step_limit,
+)
+from sikula_cli.agent_overrides import (
+    DELIVERY_PREPARATION_AGENT_NAMES,
+    RUNTIME_AGENT_NAMES,
+    parse_agent_llm_overrides,
+)
 from sikula_cli.config import _resolve_contract_report_dir, _resolve_state_dir
 
 if TYPE_CHECKING:
-    from core.delivery_run_next import DeliveryRunNextExecutionResult
+    from core.delivery_run_next import DeliveryBudgetSplitPreparationResult, DeliveryRunNextExecutionResult
 
 _DELIVERY_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _DELIVERY_CHILD_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -115,11 +123,18 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
 
     delivery_run_next_p = delivery_sub.add_parser("run-next", help="Run the next eligible delivery unit")
     delivery_run_next_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
-    delivery_run_next_p.add_argument(
+    delivery_run_next_mode = delivery_run_next_p.add_mutually_exclusive_group()
+    delivery_run_next_mode.add_argument(
         "--dry-run",
         action="store_true",
         default=False,
         help="Preview the next eligible unit without running agents or writing delivery progress",
+    )
+    delivery_run_next_mode.add_argument(
+        "--prepare-budget-split",
+        action="store_true",
+        default=False,
+        help="Prepare, but do not apply, a split proposal after a verified planner budget stop",
     )
     delivery_run_next_p.add_argument(
         "--reset-failed",
@@ -133,21 +148,21 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
         action="append",
         default=None,
         metavar="AGENT=MODEL",
-        help="Override model for one child run agent, e.g. --agent-model analyst=gpt-5.5",
+        help="Override model for one child run or delivery_preparer agent",
     )
     delivery_run_next_p.add_argument(
         "--agent-provider",
         action="append",
         default=None,
         metavar="AGENT=PROVIDER",
-        help="Override provider for one child run agent, e.g. --agent-provider implementer=claude",
+        help="Override provider for one child run or delivery_preparer agent",
     )
     delivery_run_next_p.add_argument(
         "--agent-timeout",
         action="append",
         default=None,
         metavar="AGENT=SECONDS",
-        help="Override timeout for one child run agent, e.g. --agent-timeout implementer=2400",
+        help="Override timeout for one child run or delivery_preparer agent",
     )
 
     delivery_finalize_p = delivery_sub.add_parser("finalize", help="Create or update a delivery plan final branch")
@@ -289,6 +304,20 @@ def cmd_delivery_amend_prepare(
     cfg: dict,
     context: DeliveryAmendPrepareContext | None = None,
 ) -> None:
+    result = _prepare_delivery_amendment(args, cfg, context)
+    _print_delivery_result(result, json_output=args.json, render=render_delivery_amend_prepare)
+    if not result.prepared:
+        sys.exit(1)
+
+
+def _prepare_delivery_amendment(
+    args: argparse.Namespace,
+    cfg: dict,
+    context: DeliveryAmendPrepareContext | None = None,
+    *,
+    authoritative_amend_reason: str | None = None,
+    authoritative_budget_exceeded: DeliveryBudgetExceeded | None = None,
+) -> DeliveryAmendPrepareResult:
     from core.delivery_amendment import (
         DeliveryAmendmentError,
         capture_delivery_amendment_source_snapshot,
@@ -338,11 +367,24 @@ def cmd_delivery_amend_prepare(
             draft = None
             try:
                 source_snapshot = capture_delivery_amendment_source_snapshot(target)
+                authoring_kwargs: dict[str, Any] = {
+                    "args": args,
+                    "cfg": cfg,
+                    "target": target,
+                    "source_snapshot": source_snapshot,
+                }
+                if authoritative_amend_reason is not None or authoritative_budget_exceeded is not None:
+                    authoring_kwargs.update(
+                        amend_reason=authoritative_amend_reason,
+                        budget_exceeded=authoritative_budget_exceeded,
+                    )
                 draft = context.run_authoring_assistant(
-                    args=args,
-                    cfg=cfg,
-                    target=target,
-                    source_snapshot=source_snapshot,
+                    **authoring_kwargs,
+                )
+                draft = _bind_authoritative_amendment_metadata(
+                    draft,
+                    amend_reason=authoritative_amend_reason,
+                    budget_exceeded=authoritative_budget_exceeded,
                 )
                 proposal, proposal_path = create_delivery_amendment_proposal(
                     plan_path,
@@ -400,10 +442,36 @@ def cmd_delivery_amend_prepare(
                     ],
                     message="Delivery amendment proposal preparation failed.",
                 )
+    return result
 
-    _print_delivery_result(result, json_output=args.json, render=render_delivery_amend_prepare)
-    if not result.prepared:
-        sys.exit(1)
+
+def _bind_authoritative_amendment_metadata(
+    draft: DeliveryAmendmentAuthoringDraft,
+    *,
+    amend_reason: str | None,
+    budget_exceeded: DeliveryBudgetExceeded | None,
+) -> DeliveryAmendmentAuthoringDraft:
+    if amend_reason is None and budget_exceeded is None:
+        return draft
+    expected_budget = budget_exceeded.to_dict() if budget_exceeded else None
+    reason_mismatch = draft.amend_reason is not None and draft.amend_reason != amend_reason
+    budget_mismatch = draft.budget_exceeded is not None and draft.budget_exceeded != expected_budget
+    if reason_mismatch or budget_mismatch:
+        from core.delivery_amendment import DeliveryAmendmentError
+
+        raise DeliveryAmendmentError(
+            "delivery_amend.authoring_recovery_metadata_mismatch",
+            "Amendment authoring returned recovery metadata that does not match the verified budget stop.",
+        )
+    bound = replace(
+        draft,
+        amend_reason=amend_reason,
+        budget_exceeded=expected_budget,
+    )
+    audit_path = getattr(draft, "audit_path", None)
+    if audit_path is not None:
+        setattr(bound, "audit_path", audit_path)
+    return bound
 
 
 def render_delivery_amend_prepare(result: DeliveryAmendPrepareResult) -> str:
@@ -1418,6 +1486,7 @@ class DeliveryChildLinkFailed(RuntimeError):
 class DeliveryRunNextContext:
     run_task: Callable[[argparse.Namespace, dict], DeliveryChildRunResult | int]
     resolve_state_dir: Callable[[dict], Path]
+    run_amendment_authoring: Callable[..., DeliveryAmendmentAuthoringDraft] | None = None
 
 
 @dataclass(frozen=True)
@@ -1433,6 +1502,7 @@ def cmd_delivery_run_next(
     context: DeliveryRunNextContext | None = None,
 ) -> None:
     from core.delivery_run_next import (
+        DeliveryRunNextPreview,
         preview_delivery_run_next,
         render_delivery_run_next_execution,
         render_delivery_run_next_preview,
@@ -1441,6 +1511,27 @@ def cmd_delivery_run_next(
     _validate_delivery_run_next_agent_overrides(args)
     project_root_raw = cfg.get("project", {}).get("root_path") if isinstance(cfg, dict) else None
     project_root = Path(project_root_raw).resolve() if project_root_raw else None
+    if getattr(args, "dry_run", False) and getattr(args, "prepare_budget_split", False):
+        issue = DeliveryPlanIssue(
+            "error",
+            "delivery.budget_split_dry_run_conflict",
+            "--prepare-budget-split cannot be used with --dry-run because split preparation invokes an agent and writes local audit artifacts.",
+        )
+        result = DeliveryRunNextPreview(
+            plan_path=str(args.plan_file),
+            project_root=str(project_root) if project_root else None,
+            valid=False,
+            ready=False,
+            dry_run=True,
+            status=None,
+            progress_exists=False,
+            selected_unit=None,
+            errors=[issue],
+            warnings=[],
+            message=issue.message,
+        )
+        _print_delivery_result(result, json_output=args.json, render=render_delivery_run_next_preview)
+        sys.exit(1)
     if getattr(args, "dry_run", False):
         result = preview_delivery_run_next(
             args.plan_file,
@@ -1464,16 +1555,266 @@ def cmd_delivery_run_next(
         sys.exit(2)
 
     result = _run_next_delivery_unit(args, cfg, context, project_root=project_root)
+    if getattr(args, "prepare_budget_split", False) and not any(
+        issue.code == "delivery.locked" for issue in result.errors
+    ):
+        result = _coordinate_budget_split_preparation(
+            args,
+            cfg,
+            context,
+            result,
+            project_root=project_root,
+        )
     _print_delivery_result(result, json_output=args.json, render=render_delivery_run_next_execution)
     if not result.succeeded:
         sys.exit(1)
 
 
 def _validate_delivery_run_next_agent_overrides(args: argparse.Namespace) -> None:
+    valid_agents = set(RUNTIME_AGENT_NAMES)
+    if getattr(args, "prepare_budget_split", False):
+        valid_agents.update(DELIVERY_PREPARATION_AGENT_NAMES)
     parse_agent_llm_overrides(
         getattr(args, "agent_model", None),
         getattr(args, "agent_provider", None),
         getattr(args, "agent_timeout", None),
+        valid_agents=valid_agents,
+    )
+
+
+def _filter_agent_override_entries(entries: list[str] | None, allowed_agents: set[str]) -> list[str] | None:
+    if entries is None:
+        return None
+    filtered = []
+    for entry in entries:
+        raw_agent, _, _ = entry.partition("=")
+        if raw_agent.strip().replace("-", "_") in allowed_agents:
+            filtered.append(entry)
+    return filtered or None
+
+
+def _coordinate_budget_split_preparation(
+    args: argparse.Namespace,
+    cfg: dict,
+    context: DeliveryRunNextContext,
+    result: "DeliveryRunNextExecutionResult",
+    *,
+    project_root: Path | None,
+) -> "DeliveryRunNextExecutionResult":
+    from core.delivery_progress import get_delivery_status
+    from core.delivery_run_next import DeliveryBudgetSplitPreparationResult
+    from core.state import JsonStateStore
+
+    status = get_delivery_status(args.plan_file, project_root=project_root)
+    candidates = [
+        unit
+        for unit in status.units
+        if unit.status == "failed"
+        and unit.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
+        and unit.budget_exceeded is not None
+    ]
+    if not candidates:
+        return result
+    if len(candidates) > 1:
+        issue = DeliveryPlanIssue(
+            "error",
+            "delivery.budget_split_candidate_ambiguous",
+            "Automatic split preparation requires exactly one failed planner-budget-stopped delivery unit.",
+        )
+        preparation = _blocked_budget_split_preparation(
+            issue,
+            target_unit_id=None,
+            budget_exceeded=None,
+            project_root=project_root,
+            plan_path=status.plan_path,
+        )
+        return replace(result, budget_split_preparation=preparation)
+
+    candidate = candidates[0]
+    budget_exceeded = candidate.budget_exceeded
+    child_task_id = candidate.child_task_id
+    if not child_task_id or not _is_valid_delivery_child_task_id(child_task_id):
+        issue = DeliveryPlanIssue(
+            "error",
+            "delivery.child_task_missing",
+            f"Delivery unit {candidate.id} has no valid linked child task for budget split preparation.",
+        )
+        preparation = _blocked_budget_split_preparation(
+            issue,
+            target_unit_id=candidate.id,
+            budget_exceeded=budget_exceeded,
+            project_root=project_root,
+            plan_path=status.plan_path,
+        )
+        return replace(result, budget_split_preparation=preparation)
+
+    store = JsonStateStore(context.resolve_state_dir(cfg))
+    try:
+        child_state = store.load(child_task_id)
+    except (AttributeError, OSError, TypeError, ValueError):
+        issue = DeliveryPlanIssue(
+            "error",
+            "delivery.child_task_state_invalid",
+            f"Delivery unit {candidate.id} is linked to child task {child_task_id}, but that task state is invalid.",
+        )
+        preparation = _blocked_budget_split_preparation(
+            issue,
+            target_unit_id=candidate.id,
+            budget_exceeded=budget_exceeded,
+            project_root=project_root,
+            plan_path=status.plan_path,
+        )
+        return replace(result, budget_split_preparation=preparation)
+    if child_state is None:
+        issue = DeliveryPlanIssue(
+            "error",
+            "delivery.child_task_missing",
+            f"Delivery unit {candidate.id} is linked to child task {child_task_id}, but that task state was not found in the configured state directory.",
+        )
+        preparation = _blocked_budget_split_preparation(
+            issue,
+            target_unit_id=candidate.id,
+            budget_exceeded=budget_exceeded,
+            project_root=project_root,
+            plan_path=status.plan_path,
+        )
+        return replace(result, budget_split_preparation=preparation)
+
+    root = Path(status.project_root).resolve() if status.project_root else project_root
+    expected_plan_path = _delivery_plan_metadata_path(status, root) if root else None
+    if (
+        status.plan is None
+        or root is None
+        or not _delivery_child_metadata_matches(
+            child_state,
+            plan_id=status.plan.plan_id if status.plan else "",
+            unit_id=candidate.id,
+            plan_path=expected_plan_path,
+        )
+    ):
+        issue = DeliveryPlanIssue(
+            "error",
+            "delivery.child_task_metadata_mismatch",
+            f"Delivery unit {candidate.id} and its linked child task do not identify the same delivery plan and unit.",
+        )
+        preparation = _blocked_budget_split_preparation(
+            issue,
+            target_unit_id=candidate.id,
+            budget_exceeded=budget_exceeded,
+            project_root=root,
+            plan_path=status.plan_path,
+        )
+        return replace(result, budget_split_preparation=preparation)
+
+    child_budget_stop = getattr(child_state, "delivery_budget_stop", None)
+    child_budget_exceeded = _delivery_child_budget_exceeded(child_state)
+    child_budget_snapshot = getattr(child_state, "delivery_unit_budget", None)
+    child_budget_limit = (
+        child_budget_snapshot.get("max_planner_steps") if isinstance(child_budget_snapshot, dict) else None
+    )
+    child_budget_limit_valid = (
+        isinstance(child_budget_limit, int) and not isinstance(child_budget_limit, bool) and child_budget_limit > 0
+    )
+    expected_budget_limit = delivery_unit_planner_step_limit(candidate.budget)
+    if (
+        not getattr(child_state, "failed", False)
+        or not isinstance(child_budget_stop, dict)
+        or child_budget_stop.get("phase") != "planner"
+        or child_budget_exceeded != budget_exceeded
+        or not child_budget_limit_valid
+        or child_budget_limit != expected_budget_limit
+        or budget_exceeded.limit != expected_budget_limit
+        or budget_exceeded.actual <= budget_exceeded.limit
+    ):
+        issue = DeliveryPlanIssue(
+            "error",
+            "delivery.budget_split_stop_mismatch",
+            f"Delivery unit {candidate.id} parent and child planner budget-stop metadata do not match.",
+        )
+        preparation = _blocked_budget_split_preparation(
+            issue,
+            target_unit_id=candidate.id,
+            budget_exceeded=budget_exceeded,
+            project_root=root,
+            plan_path=status.plan_path,
+        )
+        return replace(result, budget_split_preparation=preparation)
+
+    if context.run_amendment_authoring is None:
+        issue = DeliveryPlanIssue(
+            "error",
+            "delivery_amend.authoring_context_missing",
+            "Automatic budget split preparation requires the main Sikula amendment authoring context.",
+        )
+        preparation = _blocked_budget_split_preparation(
+            issue,
+            target_unit_id=candidate.id,
+            budget_exceeded=budget_exceeded,
+            project_root=root,
+            plan_path=status.plan_path,
+        )
+        return replace(result, budget_split_preparation=preparation)
+
+    prepare_args = copy.copy(args)
+    prepare_args.split_unit = candidate.id
+    prepare_args.agent_model = _filter_agent_override_entries(
+        getattr(args, "agent_model", None), DELIVERY_PREPARATION_AGENT_NAMES
+    )
+    prepare_args.agent_provider = _filter_agent_override_entries(
+        getattr(args, "agent_provider", None), DELIVERY_PREPARATION_AGENT_NAMES
+    )
+    prepare_args.agent_timeout = _filter_agent_override_entries(
+        getattr(args, "agent_timeout", None), DELIVERY_PREPARATION_AGENT_NAMES
+    )
+    prepare_result = _prepare_delivery_amendment(
+        prepare_args,
+        cfg,
+        DeliveryAmendPrepareContext(context.run_amendment_authoring),
+        authoritative_amend_reason=DELIVERY_UNIT_BUDGET_EXCEEDED_CODE,
+        authoritative_budget_exceeded=budget_exceeded,
+    )
+    projection = prepare_result.to_dict()
+    preparation = DeliveryBudgetSplitPreparationResult(
+        prepared=prepare_result.prepared,
+        target_unit_id=candidate.id,
+        proposal_id=prepare_result.proposal_id,
+        replacement_ids=list(prepare_result.replacement_ids),
+        proposal_path=projection["proposal_path"],
+        audit_path=projection["audit_path"],
+        budget_exceeded=budget_exceeded,
+        errors=list(projection["errors"]),
+        warnings=list(projection["warnings"]),
+        message=(
+            "Budget split proposal prepared; the tracked plan was not changed. Review it and use delivery amend apply."
+            if prepare_result.prepared
+            else prepare_result.message
+        ),
+    )
+    return replace(result, budget_split_preparation=preparation)
+
+
+def _blocked_budget_split_preparation(
+    issue: DeliveryPlanIssue,
+    *,
+    target_unit_id: str | None,
+    budget_exceeded: DeliveryBudgetExceeded | None,
+    project_root: Path | None,
+    plan_path: str,
+) -> "DeliveryBudgetSplitPreparationResult":
+    from core.delivery_run_next import DeliveryBudgetSplitPreparationResult
+
+    safe_issue = _safe_amend_issue_dict(issue, project_root, sensitive_paths=(plan_path,))
+    return DeliveryBudgetSplitPreparationResult(
+        prepared=False,
+        target_unit_id=target_unit_id,
+        proposal_id=None,
+        replacement_ids=[],
+        proposal_path=None,
+        audit_path=None,
+        budget_exceeded=budget_exceeded,
+        errors=[safe_issue],
+        warnings=[],
+        message=issue.message,
     )
 
 
@@ -1511,12 +1852,16 @@ def _run_next_delivery_unit(
     status = get_delivery_status(args.plan_file, project_root=project_root)
 
     if not preflight.valid:
+        budget_split_recovery = bool(getattr(args, "prepare_budget_split", False)) and any(
+            issue.code == "delivery.unit_budget_exceeded" for issue in preflight.errors
+        )
         fatal_errors = [
             issue
             for issue in preflight.errors
             if issue.code not in ("delivery.running", "delivery.failed", "delivery.failed_reset_unavailable")
+            and not (budget_split_recovery and issue.code == "delivery.unit_budget_exceeded")
         ]
-        if not _running_delivery_units(status) or fatal_errors:
+        if (not _running_delivery_units(status) and not budget_split_recovery) or fatal_errors:
             return _execution_result_from_preview(preflight, ran=False)
 
     if status.plan is None or status.project_root is None:
@@ -2949,9 +3294,9 @@ def _delivery_child_run_args(
         checks=None,
         require_contract_ready=False,
         min_contract_score=None,
-        agent_model=agent_model,
-        agent_provider=agent_provider,
-        agent_timeout=agent_timeout,
+        agent_model=_filter_agent_override_entries(agent_model, RUNTIME_AGENT_NAMES),
+        agent_provider=_filter_agent_override_entries(agent_provider, RUNTIME_AGENT_NAMES),
+        agent_timeout=_filter_agent_override_entries(agent_timeout, RUNTIME_AGENT_NAMES),
         delivery_plan_id=delivery_plan_id,
         delivery_unit_id=delivery_unit_id,
         delivery_plan_path=delivery_plan_path,
@@ -2988,9 +3333,9 @@ def _delivery_child_resume_run_args(
         checks=None,
         require_contract_ready=False,
         min_contract_score=None,
-        agent_model=agent_model,
-        agent_provider=agent_provider,
-        agent_timeout=agent_timeout,
+        agent_model=_filter_agent_override_entries(agent_model, RUNTIME_AGENT_NAMES),
+        agent_provider=_filter_agent_override_entries(agent_provider, RUNTIME_AGENT_NAMES),
+        agent_timeout=_filter_agent_override_entries(agent_timeout, RUNTIME_AGENT_NAMES),
         delivery_plan_id=None,
         delivery_unit_id=None,
         delivery_plan_path=None,

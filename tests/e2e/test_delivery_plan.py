@@ -114,6 +114,76 @@ def _git_commit_file(root: Path, name: str, body: str) -> str:
     ).stdout.strip()
 
 
+def _git_commit_all(root: Path, message: str) -> None:
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", message], cwd=root, check=True, capture_output=True)
+
+
+def _budget_split_unit_markdown(title: str) -> str:
+    return f"""# {title}
+
+## Goal
+
+Deliver one focused replacement behavior.
+
+## Current behavior
+
+The behavior belongs to an oversized unit.
+
+## Desired behavior
+
+The behavior can be implemented independently.
+
+## Acceptance criteria
+
+- The focused behavior is implemented and validated.
+
+## Security and privacy
+
+- Do not expose child task audit content.
+
+## Reviewer focus
+
+- Verify the replacement boundary.
+
+## Out of scope
+
+- Do not implement the other replacement behavior.
+
+## Validation
+
+- `python3 -m pytest tests_proj/`
+"""
+
+
+def _budget_split_authoring_output() -> str:
+    return json.dumps(
+        {
+            "plan_id": "delivery-budget-split-smoke",
+            "target_unit_id": "01-foundation",
+            "amend_reason": "unit_budget_exceeded",
+            "budget_exceeded": {"name": "max_planner_steps", "limit": 1, "actual": 3},
+            "warnings": [],
+            "replacement_units": [
+                {
+                    "id": "foundation-a",
+                    "title": "Foundation A",
+                    "depends_on": [],
+                    "budget": {"max_planner_steps": 1},
+                    "task_markdown": _budget_split_unit_markdown("Foundation A"),
+                },
+                {
+                    "id": "foundation-b",
+                    "title": "Foundation B",
+                    "depends_on": ["foundation-a"],
+                    "budget": {"max_planner_steps": 1},
+                    "task_markdown": _budget_split_unit_markdown("Foundation B"),
+                },
+            ],
+        }
+    )
+
+
 def test_delivery_prepare_cli_authors_artifacts_then_check_succeeds(
     git_project: Path,
     fake_llm,
@@ -328,6 +398,123 @@ def test_delivery_run_next_dry_run_reports_selected_unit_with_project_config(
     assert payload["selected_unit"]["scope_paths"] == ["apps/web/src"]
     assert payload["progress_exists"] is False
     assert not (git_project / ".sikula" / "state" / "delivery" / "delivery-run-next-smoke" / "progress.json").exists()
+
+
+def test_delivery_run_next_prepares_budget_split_with_fake_llm(
+    git_project: Path,
+    seq_fake_llm,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    unit_path = _write_delivery_unit(
+        git_project,
+        "01-foundation.md",
+        "# Foundation\n\nImplement the requested foundation behavior.\n",
+    )
+    plan_path = _write_delivery_plan(
+        git_project,
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-budget-split-smoke",
+            "title": "Delivery budget split smoke",
+            "final_branch": "sikula/delivery/delivery-budget-split-smoke",
+            "units": [
+                {
+                    "id": "01-foundation",
+                    "title": "Add foundation",
+                    "task_path": unit_path,
+                    "depends_on": [],
+                    "budget": {"max_planner_steps": 1},
+                }
+            ],
+        },
+    )
+    config_path = git_project / ".sikula" / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "project": {
+                    "name": "budget-split-smoke",
+                    "root_path": ".",
+                    "build_tool": "python",
+                    "language": "Python",
+                },
+                "sandbox": {
+                    "allowed_write_paths": ["src/"],
+                    "allowed_test_write_paths": ["tests_proj/"],
+                    "allowed_read_paths": ["."],
+                    "max_iterations": 1,
+                    "max_review_iterations": 1,
+                    "max_security_review_iterations": 1,
+                },
+                "tasks": {
+                    "state_dir": ".sikula/state/",
+                    "contract_report_dir": ".sikula/contract-reports/",
+                },
+                "guidelines": {"context_files": [], "max_file_chars": 3000},
+                "build": {"test_command": "python3 -m pytest tests_proj/", "timeout": 30},
+                "planner": {"max_steps": 6},
+                "run_planner": False,
+                "run_build": False,
+                "run_review": False,
+                "run_security_review": False,
+                "run_test_writing": False,
+                "run_tests": True,
+                "run_checks": False,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (git_project / ".gitignore").write_text(
+        ".sikula/state/\n.sikula/worktrees/\n.sikula/contract-reports/\n",
+        encoding="utf-8",
+    )
+    _git_commit_all(git_project, "add budget split smoke fixture")
+    fake = seq_fake_llm(
+        generate_responses=[
+            "1. Add the first independent behavior.\n"
+            "2. Add the second independent behavior.\n"
+            "3. Wire the final independent behavior.",
+            _budget_split_authoring_output(),
+        ]
+    )
+    monkeypatch.chdir(git_project)
+
+    with patch("core.llm_client.create_llm_client", return_value=fake):
+        with patch(
+            "sys.argv",
+            [
+                "sikula",
+                "delivery",
+                "run-next",
+                plan_path.relative_to(git_project).as_posix(),
+                "--prepare-budget-split",
+                "--json",
+            ],
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+    payload = json.loads(capsys.readouterr().out)
+    preparation = payload["budget_split_preparation"]
+    assert exc_info.value.code == 1
+    assert payload["unit_status"] == "failed"
+    assert preparation["prepared"] is True
+    assert preparation["budget_exceeded"] == {"name": "max_planner_steps", "limit": 1, "actual": 3}
+    assert preparation["next_action"] == "delivery_amend_apply"
+    assert (git_project / preparation["proposal_path"]).is_file()
+    assert (git_project / preparation["audit_path"]).is_file()
+    assert (
+        subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=git_project,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == ""
+    )
 
 
 def test_delivery_finalize_dry_run_reports_final_branch_with_project_config(
