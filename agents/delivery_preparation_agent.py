@@ -171,6 +171,11 @@ Plan id: {plan_id}
 Target unit id: {target_unit_id_json}
 Project stack: {project_stack}
 
+Verified recovery metadata supplied by deterministic Sikula code:
+```json
+{recovery_metadata_json}
+```
+
 Target unit metadata:
 ```json
 {target_unit_json}
@@ -210,6 +215,8 @@ Replacement constraints:
   delivery prepare.
 - amend_reason must be omitted, null, or a stable code containing only letters, numbers, dots,
   underscores, and hyphens.
+- When verified recovery metadata is non-null, copy its amend_reason and budget_exceeded values
+  exactly. Deterministic Sikula code rejects conflicting recovery metadata.
 - Every task_markdown must contain these exact headings: Goal, Current behavior, Desired behavior,
   Acceptance criteria, Security and privacy, Reviewer focus, Out of scope, and Validation.
 - Keep acceptance criteria observable and validation commands supported by the source unit or
@@ -219,8 +226,8 @@ Return this JSON shape:
 {{
   "plan_id": "{plan_id}",
   "target_unit_id": {target_unit_id_json},
-  "amend_reason": "unit_budget_exceeded",
-  "budget_exceeded": null,
+  "amend_reason": {amend_reason_json},
+  "budget_exceeded": {budget_exceeded_json},
   "warnings": [],
   "replacement_units": [
     {{
@@ -326,6 +333,8 @@ class DeliveryPreparationAgent:
         downstream_units: list[dict[str, Any]],
         project_root: str | Path,
         project_context: dict[str, Any] | None = None,
+        amend_reason: str | None = None,
+        budget_exceeded: dict[str, Any] | None = None,
         audit_recorder: DeliveryPreparationAuditRecorder | None = None,
     ) -> DeliveryAmendmentAuthoringDraft:
         root = Path(project_root).resolve()
@@ -335,6 +344,15 @@ class DeliveryPreparationAgent:
                 plan_id=plan_id,
                 target_unit_id_json=json.dumps(target_unit_id),
                 project_stack=tech_stack(self.project_config),
+                recovery_metadata_json=json.dumps(
+                    {"amend_reason": amend_reason, "budget_exceeded": budget_exceeded}
+                    if amend_reason is not None or budget_exceeded is not None
+                    else None,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                amend_reason_json=json.dumps(amend_reason),
+                budget_exceeded_json=json.dumps(budget_exceeded, sort_keys=True),
                 target_unit_json=json.dumps(target_unit, indent=2, sort_keys=True),
                 downstream_units_json=json.dumps(downstream_units, indent=2, sort_keys=True),
                 guidelines_files=guidelines_files(self.project_config),

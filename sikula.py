@@ -10,6 +10,7 @@ Usage (project-centric, run from project root):
   sikula delivery check .sikula/delivery/my-plan/plan.yaml
   sikula delivery prepare .sikula/tasks/my-task.md --output .sikula/delivery/my-plan/
   sikula delivery status .sikula/delivery/my-plan/plan.yaml
+  sikula delivery run-next .sikula/delivery/my-plan/plan.yaml --prepare-budget-split
   sikula delivery finalize .sikula/delivery/my-plan/plan.yaml --dry-run
   sikula run task.md                 # auto-discovers .sikula/config.yaml
   sikula run --task-id <task-id>     # resume existing task
@@ -100,6 +101,7 @@ from sikula_cli.agent_overrides import parse_agent_llm_overrides as _parse_agent
 if TYPE_CHECKING:
     from agents.delivery_preparation_agent import DeliveryPreparationAgent
     from core.delivery_authoring import DeliveryAmendmentAuthoringDraft, DeliveryAuthoringDraft
+    from core.delivery_plan import DeliveryBudgetExceeded
 
 _BASE = Path(__file__).parent
 # When adding a new platform: add it here, in _build_tool() in core/orchestrator.py,
@@ -3268,6 +3270,8 @@ def _run_delivery_amend_prepare_authoring(
     cfg: dict,
     target,
     source_snapshot,
+    amend_reason: str | None = None,
+    budget_exceeded: DeliveryBudgetExceeded | None = None,
 ) -> DeliveryAmendmentAuthoringDraft:
     from core.delivery_amendment import read_delivery_amendment_target_task
 
@@ -3296,6 +3300,8 @@ def _run_delivery_amend_prepare_authoring(
             downstream_units=[downstream_by_id[unit_id].to_dict() for unit_id in target.downstream_unit_ids],
             project_root=project_root,
             project_context=_prepare_project_context_from_config(cfg),
+            amend_reason=amend_reason,
+            budget_exceeded=budget_exceeded.to_dict() if budget_exceeded else None,
             audit_recorder=audit_recorder,
         )
     except Exception as exc:
@@ -3335,6 +3341,7 @@ def _delivery_run_next_context() -> cli_delivery.DeliveryRunNextContext:
     return cli_delivery.DeliveryRunNextContext(
         run_task=_run_delivery_child_task,
         resolve_state_dir=_resolve_state_dir,
+        run_amendment_authoring=_run_delivery_amend_prepare_authoring,
     )
 
 

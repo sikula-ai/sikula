@@ -285,8 +285,9 @@ redact outside-project input paths. Interruptions append a terminal failed event
 after rollback and then propagate. Completed units and their progress records
 remain unchanged. The superseded target entry and task file remain as audit
 artifacts; status projects it as `superseded`, so run-next and finalize operate
-on the active replacement graph. Budget-stop-triggered amendment remains future
-orchestration work.
+on the active replacement graph. Budget-stop-triggered proposal preparation is
+available as an explicit `delivery run-next --prepare-budget-split` coordinator;
+proposal apply and replacement execution remain separate operator actions.
 
 **Delivery plan check command:** `sikula delivery check PLAN_FILE` is the first
 delivery-plan MVP primitive. Its CLI wrapper lives in `sikula_cli/delivery.py`;
@@ -377,6 +378,10 @@ state and an audit event records the failed link attempt.
 `run-next` accepts the same per-agent `--agent-model`, `--agent-provider`, and
 `--agent-timeout` overrides as `sikula run` and forwards them to the child run;
 the parent delivery progress model does not store those prompt/provider settings.
+With explicit `--prepare-budget-split`, those flags additionally accept a
+`delivery_preparer` override. Runtime overrides are filtered into the child run
+and preparer overrides are filtered into amendment authoring, so neither path
+receives an unsupported agent setting.
 When the child run continues (including resume), it keeps normal Sikula behavior: contract preflight,
 worktree isolation, provider execution, validation, review, state persistence, and
 task audit reporting. When the child run exits, delivery progress stores only
@@ -389,6 +394,22 @@ either a `result_commit` exists or the child left no preserved worktree to
 deliver. A done child task with a preserved worktree but no result commit is
 recorded as `failed` with `child_run_unfinalized`. A resumed child that exits
 non-terminal is recorded as `failed` in the same parent status shape.
+After a fresh or already persisted `unit_budget_exceeded` stop,
+`--prepare-budget-split` may coordinate the existing amendment proposal writer.
+The coordinator runs only after the `delivery.run-next` progress lock is
+released; if this invocation cannot acquire that lock, it does not start
+amendment authoring. It requires exactly one failed budget-stopped unit, matching parent
+and linked-child plan/unit identity, a failed child state, a planner-phase stop,
+and matching allowlisted values across parent progress, the child budget stop,
+the child budget snapshot, and the current unit budget. Deterministic code binds
+`unit_budget_exceeded` and the verified limit/actual values into the proposal;
+conflicting model output is rejected. The nested
+`budget_split_preparation` JSON/text projection contains
+only allowlisted identifiers, project-relative local artifact paths, replacement
+ids, sanitized issues, and budget values. It never includes child prompts,
+planner output, task bodies, source excerpts, diffs, logs, provider output, or
+raw state. Preparation leaves the unit failed and preserves the non-zero
+`run-next` exit because it neither applies the proposal nor runs replacements.
 Before starting a selected unit, execution walks the selected unit's dependency
 closure and verifies that every completed prerequisite result commit is already
 an ancestor of the current checkout. Completed no-op prerequisites have no

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from core.delivery_plan import DeliveryPlanIssue, _find_git_root as _find_delivery_git_root
+from core.delivery_plan import DeliveryBudgetExceeded, DeliveryPlanIssue, _find_git_root as _find_delivery_git_root
 from core.delivery_progress import DeliveryStatusUnit, get_delivery_status, select_next_delivery_unit
 from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
 
@@ -52,6 +52,37 @@ class DeliveryRunNextPreview:
 
 
 @dataclass(frozen=True)
+class DeliveryBudgetSplitPreparationResult:
+    prepared: bool
+    target_unit_id: str | None
+    proposal_id: str | None
+    replacement_ids: list[str]
+    proposal_path: str | None
+    audit_path: str | None
+    budget_exceeded: DeliveryBudgetExceeded | None
+    errors: list[dict[str, Any]]
+    warnings: list[dict[str, Any]]
+    message: str
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "prepared": self.prepared,
+            "target_unit_id": self.target_unit_id,
+            "proposal_id": self.proposal_id,
+            "replacement_ids": list(self.replacement_ids),
+            "proposal_path": self.proposal_path,
+            "audit_path": self.audit_path,
+            "budget_exceeded": self.budget_exceeded.to_dict() if self.budget_exceeded else None,
+            "errors": list(self.errors),
+            "warnings": list(self.warnings),
+            "message": self.message,
+        }
+        if self.prepared:
+            data["next_action"] = "delivery_amend_apply"
+        return data
+
+
+@dataclass(frozen=True)
 class DeliveryRunNextExecutionResult:
     plan_path: str
     project_root: str | None
@@ -69,6 +100,7 @@ class DeliveryRunNextExecutionResult:
     errors: list[DeliveryPlanIssue]
     warnings: list[DeliveryPlanIssue]
     message: str
+    budget_split_preparation: DeliveryBudgetSplitPreparationResult | None = None
 
     def to_dict(self) -> dict[str, Any]:
         plan_path = self.plan_path
@@ -112,6 +144,8 @@ class DeliveryRunNextExecutionResult:
             ],
             "message": self.message,
         }
+        if self.budget_split_preparation is not None:
+            data["budget_split_preparation"] = self.budget_split_preparation.to_dict()
         return data
 
 
@@ -321,6 +355,32 @@ def render_delivery_run_next_execution(result: DeliveryRunNextExecutionResult) -
     if events_path:
         lines.append(f"Events: {events_path}")
     lines.append(result.message)
+    if result.budget_split_preparation is not None:
+        preparation = result.budget_split_preparation
+        lines.extend(
+            [
+                "",
+                "Budget split preparation:",
+                f"Status: {'prepared' if preparation.prepared else 'blocked'}",
+            ]
+        )
+        if preparation.target_unit_id:
+            lines.append(f"Target unit: {preparation.target_unit_id}")
+        if preparation.proposal_id:
+            lines.append(f"Proposal: {preparation.proposal_id}")
+        if preparation.replacement_ids:
+            lines.append("Replacements: " + ", ".join(preparation.replacement_ids))
+        if preparation.proposal_path:
+            lines.append(f"Proposal artifact: {preparation.proposal_path}")
+        if preparation.audit_path:
+            lines.append(f"Authoring audit: {preparation.audit_path}")
+        lines.append(preparation.message)
+        if preparation.errors:
+            lines.append("Preparation errors:")
+            lines.extend(f"- {_format_projected_issue(issue)}" for issue in preparation.errors)
+        if preparation.warnings:
+            lines.append("Preparation warnings:")
+            lines.extend(f"- {_format_projected_issue(issue)}" for issue in preparation.warnings)
     if result.errors:
         lines.append("")
         lines.append("Errors:")
@@ -344,6 +404,13 @@ def render_delivery_run_next_execution(result: DeliveryRunNextExecutionResult) -
                 )
             )
     return "\n".join(lines) + "\n"
+
+
+def _format_projected_issue(issue: dict[str, Any]) -> str:
+    code = issue.get("code") or "delivery.budget_split_preparation_failed"
+    path = f" [{issue['path']}]" if issue.get("path") else ""
+    message = issue.get("message") or "Budget split preparation failed."
+    return f"{code}{path}: {message}"
 
 
 def _blocked_run_next_reason(

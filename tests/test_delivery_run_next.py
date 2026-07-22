@@ -8,7 +8,8 @@ import subprocess
 import pytest
 import yaml
 
-from core.delivery_plan import DeliveryPlanIssue
+from core.delivery_authoring import DeliveryAmendmentAuthoringDraft, DeliveryAuthoringUnitDraft
+from core.delivery_plan import DeliveryBudgetExceeded, DeliveryPlanIssue
 from core.delivery_progress import (
     DeliveryStatusUnit,
     acquire_delivery_progress_lock,
@@ -18,6 +19,7 @@ from core.delivery_progress import (
     select_next_delivery_unit,
 )
 from core.delivery_run_next import (
+    DeliveryBudgetSplitPreparationResult,
     DeliveryRunNextExecutionResult,
     DeliveryRunNextPreview,
     preview_delivery_run_next,
@@ -27,6 +29,7 @@ from core.delivery_run_next import (
 )
 from core.delivery_run_next import _blocked_run_next_reason
 from core.state import JsonStateStore, TaskState
+from core.delivery_unit_metadata import DeliveryUnitBudget
 from sikula_cli.delivery import (
     DeliveryChildRunResult,
     DeliveryChildLinkFailed,
@@ -72,6 +75,51 @@ def test_delivery_run_next_register_parser_sets_agent_overrides() -> None:
     assert args.agent_model == ["analyst=gpt-5.5"]
     assert args.agent_provider == ["implementer=antigravity"]
     assert args.agent_timeout == ["implementer=2400"]
+    assert args.prepare_budget_split is False
+
+
+def test_delivery_run_next_register_parser_accepts_budget_split_preparation() -> None:
+    import sikula_cli.delivery as delivery_cli
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    delivery_cli.register_parser(subparsers)
+
+    args = parser.parse_args(
+        [
+            "delivery",
+            "run-next",
+            ".sikula/delivery/demo/plan.yaml",
+            "--prepare-budget-split",
+            "--agent-model",
+            "delivery_preparer=gpt-5.5",
+        ]
+    )
+
+    assert args.prepare_budget_split is True
+    assert args.dry_run is False
+    assert args.agent_model == ["delivery_preparer=gpt-5.5"]
+
+
+def test_delivery_run_next_register_parser_rejects_budget_split_with_dry_run() -> None:
+    import sikula_cli.delivery as delivery_cli
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    delivery_cli.register_parser(subparsers)
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(
+            [
+                "delivery",
+                "run-next",
+                ".sikula/delivery/demo/plan.yaml",
+                "--dry-run",
+                "--prepare-budget-split",
+            ]
+        )
+
+    assert exc_info.value.code == 2
 
 
 def _git_init(root: Path) -> None:
@@ -237,6 +285,7 @@ def _run_next_args(
     *,
     dry_run: bool = False,
     reset_failed: bool = False,
+    prepare_budget_split: bool = False,
     json_output: bool = False,
     agent_model: list[str] | None = None,
     agent_provider: list[str] | None = None,
@@ -246,6 +295,7 @@ def _run_next_args(
         plan_file=str(plan_path),
         dry_run=dry_run,
         reset_failed=reset_failed,
+        prepare_budget_split=prepare_budget_split,
         json=json_output,
         agent_model=agent_model,
         agent_provider=agent_provider,
@@ -271,6 +321,77 @@ def _load_delivery_progress(root: Path) -> dict:
     return json.loads(delivery_progress_path(root, "delivery-run-next-demo").read_text(encoding="utf-8"))
 
 
+def _budget_split_task_markdown(title: str) -> str:
+    return f"""# {title}
+
+## Goal
+
+Deliver one focused replacement behavior.
+
+## Current behavior
+
+The behavior belongs to an oversized delivery unit.
+
+## Desired behavior
+
+The behavior can be implemented independently.
+
+## Acceptance criteria
+
+- The focused behavior is implemented and validated.
+
+## Security and privacy
+
+- Do not expose child task audit content.
+
+## Reviewer focus
+
+- Verify the replacement boundary.
+
+## Out of scope
+
+- Do not implement the other replacement behavior.
+
+## Validation
+
+- `python3 -m pytest tests/test_delivery_run_next.py`
+"""
+
+
+def _budget_split_draft(*, amend_reason: str | None = None) -> DeliveryAmendmentAuthoringDraft:
+    return DeliveryAmendmentAuthoringDraft(
+        plan_id="delivery-run-next-demo",
+        target_unit_id="01-foundation",
+        amend_reason=amend_reason,
+        replacement_units=[
+            DeliveryAuthoringUnitDraft(
+                id="foundation-a",
+                title="Foundation A",
+                depends_on=[],
+                task_markdown=_budget_split_task_markdown("Foundation A"),
+                budget=DeliveryUnitBudget(max_planner_steps=1),
+            ),
+            DeliveryAuthoringUnitDraft(
+                id="foundation-b",
+                title="Foundation B",
+                depends_on=["foundation-a"],
+                task_markdown=_budget_split_task_markdown("Foundation B"),
+                budget=DeliveryUnitBudget(max_planner_steps=1),
+            ),
+        ],
+    )
+
+
+def _budget_split_cfg(root: Path) -> dict:
+    cfg = _run_next_cfg(root)
+    cfg.update(
+        run_tests=True,
+        build={"test_command": "python3 -m pytest tests/test_delivery_run_next.py"},
+    )
+    cfg["tasks"]["contract_report_dir"] = str(root / ".sikula" / "contract-reports")
+    return cfg
+
+
 def test_cmd_delivery_run_next_dry_run_rejects_invalid_agent_override_before_preview(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -286,6 +407,31 @@ def test_cmd_delivery_run_next_dry_run_rejects_invalid_agent_override_before_pre
 
     assert exc.value.code == 1
     assert "Unknown agent 'bogus'" in capsys.readouterr().out
+    assert not delivery_progress_path(tmp_path, "delivery-run-next-demo").exists()
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_rejects_budget_split_with_dry_run_before_side_effects(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_run_next(
+            _run_next_args(
+                plan_path,
+                dry_run=True,
+                prepare_budget_split=True,
+                json_output=True,
+            ),
+            _run_next_cfg(tmp_path),
+        )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert payload["errors"][0]["code"] == "delivery.budget_split_dry_run_conflict"
     assert not delivery_progress_path(tmp_path, "delivery-run-next-demo").exists()
     assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
 
@@ -615,6 +761,50 @@ def test_render_delivery_run_next_execution_is_safe_and_actionable() -> None:
     assert "- delivery.failed [units[0]]: Unit failed." in output
     assert "Warnings:" in output
     assert "- progress.unit_unknown: Unknown progress unit." in output
+
+
+def test_render_delivery_run_next_execution_includes_budget_split_preparation() -> None:
+    budget = DeliveryBudgetExceeded(name="max_planner_steps", limit=1, actual=3)
+    result = DeliveryRunNextExecutionResult(
+        plan_path="/tmp/project/.sikula/delivery/demo/plan.yaml",
+        project_root="/tmp/project",
+        valid=False,
+        ran=True,
+        succeeded=False,
+        status="failed",
+        progress_exists=True,
+        selected_unit=None,
+        child_task_id="task123",
+        unit_status="failed",
+        run_exit_code=1,
+        progress_path="/tmp/project/.sikula/state/delivery/demo/progress.json",
+        events_path="/tmp/project/.sikula/state/delivery/demo/events.jsonl",
+        errors=[],
+        warnings=[],
+        message="Delivery unit failed.",
+        budget_split_preparation=DeliveryBudgetSplitPreparationResult(
+            prepared=True,
+            target_unit_id="01-foundation",
+            proposal_id="proposal123",
+            replacement_ids=["foundation-a", "foundation-b"],
+            proposal_path=".sikula/contract-reports/delivery-amendments/demo/proposal123.json",
+            audit_path=".sikula/contract-reports/delivery-amendments/demo/audit.json",
+            budget_exceeded=budget,
+            errors=[],
+            warnings=[{"code": "delivery.warning", "message": "Inspect the proposal."}],
+            message="Budget split proposal prepared.",
+        ),
+    )
+
+    output = render_delivery_run_next_execution(result)
+
+    assert "Budget split preparation:" in output
+    assert "Status: prepared" in output
+    assert "Target unit: 01-foundation" in output
+    assert "Proposal: proposal123" in output
+    assert "Replacements: foundation-a, foundation-b" in output
+    assert "Budget split proposal prepared." in output
+    assert "- delivery.warning: Inspect the proposal." in output
 
 
 def test_delivery_run_next_preview_projects_paths_relative_to_project_root() -> None:
@@ -2829,6 +3019,20 @@ def test_delivery_child_run_args_copies_unit_budget() -> None:
     assert args.delivery_unit_budget == {"max_planner_steps": 2, "max_changed_files": 4}
 
 
+def test_delivery_child_run_args_filters_delivery_preparer_overrides() -> None:
+    args = _delivery_child_run_args(
+        root=Path("/fake/root"),
+        task_path="tasks/unit.md",
+        agent_model=["planner=gpt-runtime", "delivery_preparer=gpt-authoring"],
+        agent_provider=["delivery_preparer=codex"],
+        agent_timeout=["implementer=120", "delivery_preparer=240"],
+    )
+
+    assert args.agent_model == ["planner=gpt-runtime"]
+    assert args.agent_provider is None
+    assert args.agent_timeout == ["implementer=120"]
+
+
 def test_invoke_delivery_child_run_forwards_metadata(tmp_path: Path) -> None:
     captured_args = None
 
@@ -2899,6 +3103,82 @@ def test_cmd_delivery_run_next_computes_and_forwards_metadata(
     assert captured_args.delivery_unit_budget == {"max_planner_steps": 1}
 
 
+def test_cmd_delivery_run_next_does_not_prepare_split_when_unit_completes(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        state = store.create("child task")
+        state.done = True
+        state.worktree_branch = "branch"
+        state.result_commit = "commit"
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
+
+    def author(**_kwargs):
+        raise AssertionError("a completed unit must not invoke amendment authoring")
+
+    context = DeliveryRunNextContext(
+        run_task=runner,
+        resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        run_amendment_authoring=author,
+    )
+
+    cmd_delivery_run_next(
+        _run_next_args(plan_path, prepare_budget_split=True, json_output=True),
+        cfg,
+        context,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["succeeded"] is True
+    assert "budget_split_preparation" not in payload
+
+
+def test_cmd_delivery_run_next_does_not_prepare_split_for_non_budget_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        state = store.create("child task")
+        state.failed = True
+        store.save(state)
+        run_args.created_task_id = state.task_id
+        run_args.delivery_child_created_callback(state.task_id)
+        return DeliveryChildRunResult(exit_code=1, child_task_id=state.task_id)
+
+    def author(**_kwargs):
+        raise AssertionError("a non-budget child failure must not invoke amendment authoring")
+
+    context = DeliveryRunNextContext(
+        run_task=runner,
+        resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        run_amendment_authoring=author,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, prepare_budget_split=True, json_output=True),
+            cfg,
+            context,
+        )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert payload["unit_status"] == "failed"
+    assert "budget_split_preparation" not in payload
+
+
 def test_cmd_delivery_run_next_records_planner_budget_stop_and_requires_split(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -2966,6 +3246,445 @@ def test_cmd_delivery_run_next_records_planner_budget_stop_and_requires_split(
     assert "PRIVATE PLANNER" not in json.dumps(events)
     assert status.next_action == "split the budget-exceeded unit with delivery amend prepare before continuing"
     assert select_next_delivery_unit(status, reset_failed=True) is None
+
+
+def test_cmd_delivery_run_next_prepares_existing_budget_split_after_lock_release(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _budget_split_cfg(tmp_path)
+    plan_rel = plan_path.relative_to(tmp_path).as_posix()
+    budget = DeliveryBudgetExceeded(name="max_planner_steps", limit=1, actual=3)
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    child = store.create(
+        "oversized child",
+        delivery_plan_id="delivery-run-next-demo",
+        delivery_unit_id="01-foundation",
+        delivery_plan_path=plan_rel,
+        delivery_unit_budget={"max_planner_steps": 1},
+    )
+    child.failed = True
+    child.delivery_budget_stop = {
+        "code": "unit_budget_exceeded",
+        **budget.to_dict(),
+        "phase": "planner",
+        "timestamp": "2026-07-22T12:00:00Z",
+    }
+    child.planner_prompt = "PRIVATE PLANNER PROMPT"
+    child.planner_output = "PRIVATE PLANNER OUTPUT"
+    store.save(child)
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "failed",
+                "child_task_id": child.task_id,
+                "failure_code": "unit_budget_exceeded",
+                "budget_exceeded": budget.to_dict(),
+            }
+        ],
+    )
+    plan_before = plan_path.read_bytes()
+    progress_path = delivery_progress_path(tmp_path, "delivery-run-next-demo")
+    progress_before = progress_path.read_bytes()
+    author_calls = 0
+
+    def author(**kwargs) -> DeliveryAmendmentAuthoringDraft:
+        nonlocal author_calls
+        author_calls += 1
+        lock = acquire_delivery_progress_lock(tmp_path, "delivery-run-next-demo", owner="budget-split-test")
+        lock.release()
+        assert kwargs["amend_reason"] == "unit_budget_exceeded"
+        assert kwargs["budget_exceeded"] == budget
+        assert kwargs["args"].agent_model == ["delivery_preparer=gpt-5.5"]
+        return _budget_split_draft()
+
+    def runner(*_args):
+        raise AssertionError("an existing budget-stopped child must not be rerun")
+
+    context = DeliveryRunNextContext(
+        run_task=runner,
+        resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        run_amendment_authoring=author,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_run_next(
+            _run_next_args(
+                plan_path,
+                prepare_budget_split=True,
+                json_output=True,
+                agent_model=["delivery_preparer=gpt-5.5"],
+            ),
+            cfg,
+            context,
+        )
+
+    payload = json.loads(capsys.readouterr().out)
+    preparation = payload["budget_split_preparation"]
+    assert exc_info.value.code == 1
+    assert author_calls == 1
+    assert preparation["prepared"] is True
+    assert preparation["target_unit_id"] == "01-foundation"
+    assert preparation["budget_exceeded"] == budget.to_dict()
+    assert preparation["next_action"] == "delivery_amend_apply"
+    assert preparation["proposal_path"].startswith(
+        ".sikula/contract-reports/delivery-amendments/delivery-run-next-demo/"
+    )
+    proposal = json.loads((tmp_path / preparation["proposal_path"]).read_text(encoding="utf-8"))
+    assert proposal["amend_reason"] == "unit_budget_exceeded"
+    assert proposal["budget_exceeded"] == budget.to_dict()
+    assert plan_path.read_bytes() == plan_before
+    assert progress_path.read_bytes() == progress_before
+    assert "PRIVATE PLANNER" not in json.dumps(payload)
+
+
+def test_cmd_delivery_run_next_does_not_prepare_existing_budget_split_while_locked(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _budget_split_cfg(tmp_path)
+    budget = DeliveryBudgetExceeded(name="max_planner_steps", limit=1, actual=3)
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    child = store.create(
+        "oversized child",
+        delivery_plan_id="delivery-run-next-demo",
+        delivery_unit_id="01-foundation",
+        delivery_plan_path=plan_path.relative_to(tmp_path).as_posix(),
+        delivery_unit_budget={"max_planner_steps": 1},
+    )
+    child.failed = True
+    child.delivery_budget_stop = {
+        "code": "unit_budget_exceeded",
+        **budget.to_dict(),
+        "phase": "planner",
+    }
+    store.save(child)
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "failed",
+                "child_task_id": child.task_id,
+                "failure_code": "unit_budget_exceeded",
+                "budget_exceeded": budget.to_dict(),
+            }
+        ],
+    )
+
+    def author(**_kwargs):
+        raise AssertionError("a held delivery lock must block before authoring")
+
+    def runner(*_args):
+        raise AssertionError("a held delivery lock must block before child execution")
+
+    context = DeliveryRunNextContext(
+        run_task=runner,
+        resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        run_amendment_authoring=author,
+    )
+    lock = acquire_delivery_progress_lock(tmp_path, "delivery-run-next-demo")
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_delivery_run_next(
+                _run_next_args(plan_path, prepare_budget_split=True, json_output=True),
+                cfg,
+                context,
+            )
+    finally:
+        lock.release()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert payload["errors"][0]["code"] == "delivery.locked"
+    assert "budget_split_preparation" not in payload
+
+
+def test_cmd_delivery_run_next_prepares_fresh_budget_split_after_child_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _budget_split_cfg(tmp_path)
+    budget = DeliveryBudgetExceeded(name="max_planner_steps", limit=1, actual=3)
+    lock_was_available = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        child = store.create(
+            "oversized child",
+            delivery_plan_id=run_args.delivery_plan_id,
+            delivery_unit_id=run_args.delivery_unit_id,
+            delivery_plan_path=run_args.delivery_plan_path,
+            delivery_unit_budget=run_args.delivery_unit_budget,
+        )
+        child.failed = True
+        child.delivery_budget_stop = {
+            "code": "unit_budget_exceeded",
+            **budget.to_dict(),
+            "phase": "planner",
+            "timestamp": "2026-07-22T12:00:00Z",
+        }
+        store.save(child)
+        run_args.created_task_id = child.task_id
+        run_args.delivery_child_created_callback(child.task_id)
+        return DeliveryChildRunResult(exit_code=1, child_task_id=child.task_id)
+
+    def author(**kwargs) -> DeliveryAmendmentAuthoringDraft:
+        nonlocal lock_was_available
+        lock = acquire_delivery_progress_lock(tmp_path, "delivery-run-next-demo", owner="budget-split-test")
+        lock_was_available = True
+        lock.release()
+        assert kwargs["budget_exceeded"] == budget
+        return _budget_split_draft()
+
+    context = DeliveryRunNextContext(
+        run_task=runner,
+        resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        run_amendment_authoring=author,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, prepare_budget_split=True, json_output=True),
+            cfg,
+            context,
+        )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert lock_was_available is True
+    assert payload["unit_status"] == "failed"
+    assert payload["budget_split_preparation"]["prepared"] is True
+    events = [
+        json.loads(line) for line in delivery_events_path(tmp_path, "delivery-run-next-demo").read_text().splitlines()
+    ]
+    assert events[-1]["event_type"] == "unit.failed"
+    assert events[-1]["budget_exceeded"] == budget.to_dict()
+
+
+def test_cmd_delivery_run_next_budget_split_rejects_mismatched_child_stop_before_authoring(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _budget_split_cfg(tmp_path)
+    parent_budget = DeliveryBudgetExceeded(name="max_planner_steps", limit=1, actual=3)
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    child = store.create(
+        "oversized child",
+        delivery_plan_id="delivery-run-next-demo",
+        delivery_unit_id="01-foundation",
+        delivery_plan_path=plan_path.relative_to(tmp_path).as_posix(),
+        delivery_unit_budget={"max_planner_steps": 1},
+    )
+    child.failed = True
+    child.delivery_budget_stop = {
+        "code": "unit_budget_exceeded",
+        "name": "max_planner_steps",
+        "limit": 1,
+        "actual": 4,
+    }
+    store.save(child)
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "failed",
+                "child_task_id": child.task_id,
+                "failure_code": "unit_budget_exceeded",
+                "budget_exceeded": parent_budget.to_dict(),
+            }
+        ],
+    )
+
+    def author(**_kwargs):
+        raise AssertionError("mismatched budget evidence must block before authoring")
+
+    context = DeliveryRunNextContext(
+        run_task=lambda *_args: None,
+        resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        run_amendment_authoring=author,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, prepare_budget_split=True, json_output=True),
+            cfg,
+            context,
+        )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert payload["budget_split_preparation"]["prepared"] is False
+    assert payload["budget_split_preparation"]["errors"][0]["code"] == "delivery.budget_split_stop_mismatch"
+
+
+@pytest.mark.parametrize("snapshot_limit", [2, True])
+def test_cmd_delivery_run_next_budget_split_rejects_mismatched_child_budget_snapshot(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    snapshot_limit: int | bool,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _budget_split_cfg(tmp_path)
+    budget = DeliveryBudgetExceeded(name="max_planner_steps", limit=1, actual=3)
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    child = store.create(
+        "oversized child",
+        delivery_plan_id="delivery-run-next-demo",
+        delivery_unit_id="01-foundation",
+        delivery_plan_path=plan_path.relative_to(tmp_path).as_posix(),
+        delivery_unit_budget={"max_planner_steps": snapshot_limit},
+    )
+    child.failed = True
+    child.delivery_budget_stop = {
+        "code": "unit_budget_exceeded",
+        **budget.to_dict(),
+        "phase": "planner",
+    }
+    store.save(child)
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "failed",
+                "child_task_id": child.task_id,
+                "failure_code": "unit_budget_exceeded",
+                "budget_exceeded": budget.to_dict(),
+            }
+        ],
+    )
+
+    def author(**_kwargs):
+        raise AssertionError("a stale child budget snapshot must block before authoring")
+
+    context = DeliveryRunNextContext(
+        run_task=lambda *_args: None,
+        resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        run_amendment_authoring=author,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, prepare_budget_split=True, json_output=True),
+            cfg,
+            context,
+        )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert payload["budget_split_preparation"]["prepared"] is False
+    assert payload["budget_split_preparation"]["errors"][0]["code"] == "delivery.budget_split_stop_mismatch"
+
+
+def test_cmd_delivery_run_next_budget_split_blocks_ambiguous_candidates_before_authoring(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _budget_split_cfg(tmp_path)
+    budget = {"name": "max_planner_steps", "limit": 1, "actual": 3}
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": unit_id,
+                "status": "failed",
+                "child_task_id": f"child-{index}",
+                "failure_code": "unit_budget_exceeded",
+                "budget_exceeded": budget,
+            }
+            for index, unit_id in enumerate(("01-foundation", "02-feature"), start=1)
+        ],
+    )
+
+    def author(**_kwargs):
+        raise AssertionError("ambiguous budget-stop candidates must block before authoring")
+
+    context = DeliveryRunNextContext(
+        run_task=lambda *_args: None,
+        resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        run_amendment_authoring=author,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, prepare_budget_split=True, json_output=True),
+            cfg,
+            context,
+        )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert payload["budget_split_preparation"]["prepared"] is False
+    assert payload["budget_split_preparation"]["errors"][0]["code"] == ("delivery.budget_split_candidate_ambiguous")
+
+
+@pytest.mark.parametrize("invalid_state", ["{", "[]"])
+def test_cmd_delivery_run_next_budget_split_blocks_invalid_child_state_before_authoring(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    invalid_state: str,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _budget_split_cfg(tmp_path)
+    budget = DeliveryBudgetExceeded(name="max_planner_steps", limit=1, actual=3)
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    child = store.create(
+        "oversized child",
+        delivery_plan_id="delivery-run-next-demo",
+        delivery_unit_id="01-foundation",
+        delivery_plan_path=plan_path.relative_to(tmp_path).as_posix(),
+        delivery_unit_budget={"max_planner_steps": 1},
+    )
+    Path(cfg["tasks"]["state_dir"], f"{child.task_id}.json").write_text(invalid_state, encoding="utf-8")
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "failed",
+                "child_task_id": child.task_id,
+                "failure_code": "unit_budget_exceeded",
+                "budget_exceeded": budget.to_dict(),
+            }
+        ],
+    )
+
+    def author(**_kwargs):
+        raise AssertionError("invalid child state must block before authoring")
+
+    context = DeliveryRunNextContext(
+        run_task=lambda *_args: None,
+        resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        run_amendment_authoring=author,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, prepare_budget_split=True, json_output=True),
+            cfg,
+            context,
+        )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert payload["budget_split_preparation"]["prepared"] is False
+    assert payload["budget_split_preparation"]["errors"][0]["code"] == "delivery.child_task_state_invalid"
 
 
 def test_cmd_delivery_run_next_omits_unsafe_metadata_plan_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
