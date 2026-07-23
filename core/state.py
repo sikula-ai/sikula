@@ -6,6 +6,7 @@ subclass StateStore and swap it in sikula.py — nothing else needs to change.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import platform
@@ -299,6 +300,8 @@ def _final_summary(state: "TaskState") -> dict:
         "planner_retries_count": len(state.planner_retry_records),
         "delivery_unit_budget": dict(state.delivery_unit_budget),
         "delivery_budget_stop": dict(state.delivery_budget_stop) if state.delivery_budget_stop else None,
+        "delivery_handoff_schema_version": state.delivery_handoff_schema_version,
+        "delivery_dependency_handoffs_count": len(state.delivery_dependency_handoffs),
         "llm_retries": sum(1 for entry in state.history if entry.get("action") == "llm_retry"),
         "history_events_count": len(state.history),
         "created_at": state.created_at,
@@ -369,6 +372,8 @@ class TaskState:
     plan_completed: bool = False
     current_step: int = 0
     step_implemented: bool = False
+    step_file_tracking_enabled: bool = False
+    step_files_changed: list[str] = field(default_factory=list)
     active_scope: Optional[str] = None
     final_full_task_review_done: bool = False
     files_changed: list[str] = field(default_factory=list)
@@ -424,6 +429,8 @@ class TaskState:
     delivery_plan_path: Optional[str] = None
     delivery_unit_budget: dict[str, int] = field(default_factory=dict)
     delivery_budget_stop: Optional[dict] = None
+    delivery_handoff_schema_version: Optional[int] = None
+    delivery_dependency_handoffs: list[dict] = field(default_factory=list)
     worktree_path: Optional[str] = None
     worktree_branch: Optional[str] = None
     worktree_base: Optional[str] = None
@@ -767,6 +774,8 @@ class StateStore:
         delivery_unit_id: str | None = None,
         delivery_plan_path: str | None = None,
         delivery_unit_budget: dict[str, int] | None = None,
+        delivery_handoff_schema_version: int | None = None,
+        delivery_dependency_handoffs: list[dict] | None = None,
     ) -> TaskState:
         task_id = uuid.uuid4().hex
         state = TaskState(
@@ -776,6 +785,8 @@ class StateStore:
             delivery_unit_id=delivery_unit_id,
             delivery_plan_path=delivery_plan_path,
             delivery_unit_budget=dict(delivery_unit_budget or {}),
+            delivery_handoff_schema_version=delivery_handoff_schema_version,
+            delivery_dependency_handoffs=copy.deepcopy(delivery_dependency_handoffs or []),
         )
         state.runtime_metadata = runtime_metadata_snapshot()
         self.save(state)

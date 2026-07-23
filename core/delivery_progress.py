@@ -17,6 +17,7 @@ DELIVERY_UNIT_STATUSES = {"pending", "running", "done", "failed", "canceled", "w
 _DELIVERY_EVENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _DELIVERY_METADATA_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _DELIVERY_PROGRESS_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_DELIVERY_HANDOFF_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 _TERMINAL_DELIVERY_UNIT_STATUSES = {"done", "failed", "canceled"}
 
 
@@ -30,6 +31,8 @@ class DeliveryUnitProgress:
     waiting_reason: str | None = None
     failure_code: str | None = None
     budget_exceeded: DeliveryBudgetExceeded | None = None
+    handoff_schema_version: int | None = None
+    handoff_fingerprint: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
     updated_at: str | None = None
@@ -45,6 +48,7 @@ class DeliveryUnitProgress:
             "commit",
             "waiting_reason",
             "failure_code",
+            "handoff_fingerprint",
             "started_at",
             "completed_at",
             "updated_at",
@@ -54,6 +58,8 @@ class DeliveryUnitProgress:
                 data[key] = value
         if self.budget_exceeded:
             data["budget_exceeded"] = self.budget_exceeded.to_dict()
+        if self.handoff_schema_version is not None:
+            data["handoff_schema_version"] = self.handoff_schema_version
         return data
 
 
@@ -96,6 +102,8 @@ class DeliveryProgressEvent:
     rewired_unit_ids: list[str] = field(default_factory=list)
     amend_reason: str | None = None
     budget_exceeded: DeliveryBudgetExceeded | None = None
+    handoff_schema_version: int | None = None
+    handoff_fingerprint: str | None = None
     schema_version: int = SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
@@ -115,6 +123,7 @@ class DeliveryProgressEvent:
             "failure_code",
             "proposal_id",
             "amend_reason",
+            "handoff_fingerprint",
         ):
             value = getattr(self, key)
             if value:
@@ -125,6 +134,8 @@ class DeliveryProgressEvent:
             data["rewired_unit_ids"] = list(self.rewired_unit_ids)
         if self.budget_exceeded:
             data["budget_exceeded"] = self.budget_exceeded.to_dict()
+        if self.handoff_schema_version is not None:
+            data["handoff_schema_version"] = self.handoff_schema_version
         return data
 
 
@@ -207,6 +218,8 @@ class DeliveryStatusUnit:
     commit: str | None = None
     waiting_reason: str | None = None
     failure_code: str | None = None
+    handoff_schema_version: int | None = None
+    handoff_fingerprint: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
     updated_at: str | None = None
@@ -262,6 +275,7 @@ class DeliveryStatusUnit:
             "commit",
             "waiting_reason",
             "failure_code",
+            "handoff_fingerprint",
             "started_at",
             "completed_at",
             "updated_at",
@@ -289,6 +303,8 @@ class DeliveryStatusUnit:
             data["superseded_by"] = list(self.superseded_by)
         if self.budget_exceeded:
             data["budget_exceeded"] = self.budget_exceeded.to_dict()
+        if self.handoff_schema_version is not None:
+            data["handoff_schema_version"] = self.handoff_schema_version
         return data
 
 
@@ -506,6 +522,8 @@ def make_delivery_unit_progress(
     waiting_reason: str | None = None,
     failure_code: str | None = None,
     budget_exceeded: DeliveryBudgetExceeded | None = None,
+    handoff_schema_version: int | None = None,
+    handoff_fingerprint: str | None = None,
     started_at: str | None = None,
     timestamp: str | None = None,
 ) -> DeliveryUnitProgress:
@@ -521,6 +539,8 @@ def make_delivery_unit_progress(
         waiting_reason=waiting_reason if status == "waiting" else None,
         failure_code=failure_code if status == "failed" else None,
         budget_exceeded=budget_exceeded if status == "failed" else None,
+        handoff_schema_version=handoff_schema_version,
+        handoff_fingerprint=handoff_fingerprint,
         started_at=started_at,
         completed_at=completed_at,
         updated_at=timestamp,
@@ -549,6 +569,8 @@ def make_delivery_progress_event(
         waiting_reason=unit.waiting_reason if unit else None,
         failure_code=unit.failure_code if unit else None,
         budget_exceeded=unit.budget_exceeded if unit else None,
+        handoff_schema_version=unit.handoff_schema_version if unit else None,
+        handoff_fingerprint=unit.handoff_fingerprint if unit else None,
     )
 
 
@@ -724,6 +746,18 @@ def _validate_unit_progress(unit: DeliveryUnitProgress) -> None:
             or unit.budget_exceeded.actual < 0
         ):
             raise ValueError("delivery progress budget_exceeded metadata is invalid")
+    has_handoff_schema = unit.handoff_schema_version is not None
+    has_handoff_fingerprint = unit.handoff_fingerprint is not None
+    if has_handoff_schema != has_handoff_fingerprint:
+        raise ValueError("delivery progress handoff metadata must include schema version and fingerprint")
+    if has_handoff_schema and (
+        not isinstance(unit.handoff_schema_version, int)
+        or isinstance(unit.handoff_schema_version, bool)
+        or unit.handoff_schema_version < 1
+        or not isinstance(unit.handoff_fingerprint, str)
+        or not _DELIVERY_HANDOFF_FINGERPRINT_RE.fullmatch(unit.handoff_fingerprint)
+    ):
+        raise ValueError("delivery progress handoff metadata is invalid")
 
 
 def _validate_event(event: DeliveryProgressEvent) -> None:
@@ -743,6 +777,18 @@ def _validate_event(event: DeliveryProgressEvent) -> None:
         or event.budget_exceeded.actual < 0
     ):
         raise ValueError("delivery progress event budget_exceeded metadata is invalid")
+    has_handoff_schema = event.handoff_schema_version is not None
+    has_handoff_fingerprint = event.handoff_fingerprint is not None
+    if has_handoff_schema != has_handoff_fingerprint:
+        raise ValueError("delivery progress event handoff metadata must include schema version and fingerprint")
+    if has_handoff_schema and (
+        not isinstance(event.handoff_schema_version, int)
+        or isinstance(event.handoff_schema_version, bool)
+        or event.handoff_schema_version < 1
+        or not isinstance(event.handoff_fingerprint, str)
+        or not _DELIVERY_HANDOFF_FINGERPRINT_RE.fullmatch(event.handoff_fingerprint)
+    ):
+        raise ValueError("delivery progress event handoff metadata is invalid")
 
 
 def _utc_now() -> str:
@@ -1020,11 +1066,46 @@ def _parse_progress_unit(
             "commit",
             "waiting_reason",
             "failure_code",
+            "handoff_fingerprint",
             "started_at",
             "completed_at",
             "updated_at",
         )
     }
+    handoff_schema_version = _optional_nonnegative_int(
+        item,
+        "handoff_schema_version",
+        f"{path}.handoff_schema_version",
+        errors,
+    )
+    if handoff_schema_version is not None and handoff_schema_version < 1:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "progress.handoff_schema_version_invalid",
+                "handoff_schema_version must be a positive integer.",
+                f"{path}.handoff_schema_version",
+            )
+        )
+    handoff_fingerprint = optional["handoff_fingerprint"]
+    if handoff_fingerprint is not None and not _DELIVERY_HANDOFF_FINGERPRINT_RE.fullmatch(handoff_fingerprint):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "progress.handoff_fingerprint_invalid",
+                "handoff_fingerprint must be a lowercase SHA-256 digest.",
+                f"{path}.handoff_fingerprint",
+            )
+        )
+    if (handoff_schema_version is None) != (optional["handoff_fingerprint"] is None):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "progress.handoff_metadata_incomplete",
+                "handoff_schema_version and handoff_fingerprint must be provided together.",
+                path,
+            )
+        )
     budget_exceeded = _parse_progress_budget_exceeded(item.get("budget_exceeded"), f"{path}.budget_exceeded", errors)
     if unit_id is None or status is None:
         return None
@@ -1032,6 +1113,7 @@ def _parse_progress_unit(
         unit_id=unit_id,
         status=status,
         budget_exceeded=budget_exceeded,
+        handoff_schema_version=handoff_schema_version,
         **optional,
     )
 
@@ -1096,6 +1178,28 @@ def _optional_string(data: dict[str, Any], key: str, path: str, errors: list[Del
     return value.strip()
 
 
+def _optional_nonnegative_int(
+    data: dict[str, Any],
+    key: str,
+    path: str,
+    errors: list[DeliveryPlanIssue],
+) -> int | None:
+    if key not in data or data.get(key) is None:
+        return None
+    value = data.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                f"{path}.invalid_type",
+                f"{key} must be a non-negative integer.",
+                path,
+            )
+        )
+        return None
+    return value
+
+
 def _build_status_units(
     plan: DeliveryPlan,
     progress: DeliveryProgress | None,
@@ -1153,6 +1257,8 @@ def _build_status_units(
                 commit=progress_unit.commit if progress_unit else None,
                 waiting_reason=progress_unit.waiting_reason if progress_unit else None,
                 failure_code=progress_unit.failure_code if progress_unit else None,
+                handoff_schema_version=progress_unit.handoff_schema_version if progress_unit else None,
+                handoff_fingerprint=progress_unit.handoff_fingerprint if progress_unit else None,
                 started_at=progress_unit.started_at if progress_unit else None,
                 completed_at=progress_unit.completed_at if progress_unit else None,
                 updated_at=progress_unit.updated_at if progress_unit else None,

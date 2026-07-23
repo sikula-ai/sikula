@@ -10,6 +10,8 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from core.delivery_handoff import delivery_unit_handoff_path, read_delivery_unit_handoff
+from core.state import JsonStateStore
 from sikula import main
 
 
@@ -31,6 +33,48 @@ def _write_project_config(root: Path) -> None:
     path = root / ".sikula" / "config.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("project:\n  root_path: .\n  build_tool: python\n", encoding="utf-8")
+
+
+def _write_handoff_smoke_config(root: Path) -> None:
+    path = root / ".sikula" / "config.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "project": {
+                    "name": "delivery-handoff-smoke",
+                    "root_path": ".",
+                    "build_tool": "python",
+                    "language": "Python",
+                },
+                "sandbox": {
+                    "allowed_write_paths": ["src/"],
+                    "allowed_test_write_paths": ["tests_proj/"],
+                    "allowed_read_paths": ["."],
+                    "max_iterations": 1,
+                    "max_review_iterations": 1,
+                    "max_security_review_iterations": 1,
+                },
+                "tasks": {"state_dir": ".sikula/state/"},
+                "guidelines": {"context_files": [], "max_file_chars": 3000},
+                "build": {"test_command": "python3 -m pytest tests_proj/", "timeout": 30},
+                "planner": {"max_steps": 2},
+                "run_planner": False,
+                "run_build": False,
+                "run_review": False,
+                "run_security_review": False,
+                "run_test_writing": False,
+                "run_tests": False,
+                "run_checks": False,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (root / ".gitignore").write_text(
+        ".sikula/state/\n.sikula/worktrees/\n.sikula/contract-reports/\n",
+        encoding="utf-8",
+    )
 
 
 def _delivery_prepare_authoring_output() -> str:
@@ -398,6 +442,106 @@ def test_delivery_run_next_dry_run_reports_selected_unit_with_project_config(
     assert payload["selected_unit"]["scope_paths"] == ["apps/web/src"]
     assert payload["progress_exists"] is False
     assert not (git_project / ".sikula" / "state" / "delivery" / "delivery-run-next-smoke" / "progress.json").exists()
+
+
+def test_delivery_run_next_handoff_flows_between_dependent_children(
+    git_project: Path,
+    fake_llm,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    unit_1 = _write_delivery_unit(
+        git_project,
+        "01-foundation.md",
+        "# Foundation\n\nAdd subtraction support to the calculator.\n",
+    )
+    unit_2 = _write_delivery_unit(
+        git_project,
+        "02-feature.md",
+        "# Feature\n\nAdd multiplication support while preserving subtraction.\n",
+    )
+    plan_path = _write_delivery_plan(
+        git_project,
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-handoff-smoke",
+            "title": "Delivery handoff smoke",
+            "final_branch": "sikula/delivery/delivery-handoff-smoke",
+            "units": [
+                {
+                    "id": "01-foundation",
+                    "title": "Add subtraction",
+                    "task_path": unit_1,
+                    "depends_on": [],
+                },
+                {
+                    "id": "02-feature",
+                    "title": "Add multiplication",
+                    "task_path": unit_2,
+                    "depends_on": ["01-foundation"],
+                },
+            ],
+        },
+    )
+    _write_handoff_smoke_config(git_project)
+    _git_commit_all(git_project, "add delivery handoff smoke fixture")
+    fake = fake_llm(
+        agent_responses=[
+            {"src/calculator.py": ("def add(a, b):\n    return a + b\n\ndef subtract(a, b):\n    return a - b\n")},
+            {
+                "src/calculator.py": (
+                    "def add(a, b):\n"
+                    "    return a + b\n\n"
+                    "def subtract(a, b):\n"
+                    "    return a - b\n\n"
+                    "def multiply(a, b):\n"
+                    "    return a * b\n"
+                )
+            },
+        ]
+    )
+    relative_plan = plan_path.relative_to(git_project).as_posix()
+    monkeypatch.chdir(git_project)
+
+    with patch("core.llm_client.create_llm_client", return_value=fake):
+        with patch("sys.argv", ["sikula", "delivery", "run-next", relative_plan, "--json"]):
+            main()
+
+        first_payload = json.loads(capsys.readouterr().out)
+        first_handoff = read_delivery_unit_handoff(
+            delivery_unit_handoff_path(git_project, "delivery-handoff-smoke", "01-foundation")
+        )
+        assert first_payload["succeeded"] is True
+        assert first_payload["selected_unit"]["status"] == "done"
+        assert first_handoff.result_commit
+        assert "task_description" not in first_handoff.to_dict()
+
+        subprocess.run(
+            ["git", "merge", "--ff-only", first_handoff.result_commit],
+            cwd=git_project,
+            check=True,
+            capture_output=True,
+        )
+
+        with patch("sys.argv", ["sikula", "delivery", "run-next", relative_plan, "--json"]):
+            main()
+
+    second_payload = json.loads(capsys.readouterr().out)
+    second_child = JsonStateStore(git_project / ".sikula" / "state").load(second_payload["child_task_id"])
+    progress = json.loads(
+        (git_project / ".sikula" / "state" / "delivery" / "delivery-handoff-smoke" / "progress.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert second_payload["succeeded"] is True
+    assert second_payload["selected_unit"]["id"] == "02-feature"
+    assert second_child is not None
+    assert second_child.delivery_dependency_handoffs == [first_handoff.to_dict()]
+    assert "Prior delivery dependency handoffs:" in second_child.analyst_prompt
+    assert first_handoff.fingerprint in second_child.analyst_prompt
+    assert progress["units"][0]["handoff_fingerprint"] == first_handoff.fingerprint
+    assert progress["units"][1]["handoff_schema_version"] == 1
 
 
 def test_delivery_run_next_prepares_budget_split_with_fake_llm(

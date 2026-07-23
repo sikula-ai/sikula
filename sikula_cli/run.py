@@ -245,6 +245,8 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             delivery_unit_id=getattr(args, "delivery_unit_id", None),
             delivery_plan_path=getattr(args, "delivery_plan_path", None),
             delivery_unit_budget=getattr(args, "delivery_unit_budget", None),
+            delivery_handoff_schema_version=getattr(args, "delivery_handoff_schema_version", None),
+            delivery_dependency_handoffs=getattr(args, "delivery_dependency_handoffs", None),
         )
         args.created_task_id = state.task_id
         state.task_file = Path(args.task_file).name

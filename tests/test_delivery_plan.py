@@ -286,6 +286,19 @@ def test_delivery_plan_check_rejects_plan_id_that_cannot_be_used_for_state_path(
     assert "plan_id.invalid" in _codes(result)
 
 
+@pytest.mark.parametrize("unit_id", ["unit\x01one", "x" * 1001])
+def test_delivery_plan_check_rejects_unit_id_that_cannot_be_bounded_in_handoff(tmp_path: Path, unit_id: str) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["units"][0]["id"] = unit_id
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is False
+    assert "units.id_invalid" in _codes(result)
+
+
 def test_delivery_branch_name_allows_hyphen_prefixed_later_path_component(tmp_path: Path) -> None:
     _git_init(tmp_path)
     data = _base_plan(tmp_path)
@@ -476,6 +489,18 @@ def test_delivery_plan_check_reports_invalid_component_shapes_and_references(tmp
     assert "units.scope_path_absolute" in _codes(result)
     assert "units.scope_path_outside_project" in _codes(result)
     assert "units.scope_path_invalid" in _codes(result)
+
+
+def test_delivery_plan_check_rejects_parent_traversal_in_contained_scope_path(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["units"][0]["scope_paths"] = ["src/../tests_proj"]
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is False
+    assert "units.scope_path_parent_traversal" in _codes(result)
 
 
 def test_delivery_plan_check_resolves_relative_plan_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

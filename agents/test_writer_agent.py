@@ -291,6 +291,20 @@ def _step_scope(state: TaskState) -> str:
     return f"\nCURRENT STEP:\nStep {step_idx + 1}/{len(state.plan)}: {state.plan[step_idx]}\n"
 
 
+def _change_context_files(state: TaskState) -> tuple[list[str], bool]:
+    step_files = state.step_files_changed
+    if (
+        state.plan
+        and state.active_scope != _SCOPE_FINAL_FULL_TASK
+        and state.step_file_tracking_enabled is True
+        and isinstance(step_files, list)
+        and step_files
+        and all(isinstance(path, str) and path.strip() for path in step_files)
+    ):
+        return list(step_files), True
+    return list(state.files_changed), False
+
+
 def _parse_testability_gaps(output: str | None) -> list[dict]:
     if not output or _TESTABILITY_GAP_MARKER.lower() not in output.lower():
         return []
@@ -370,10 +384,11 @@ class TestWriterAgent(BaseAgent):
         allowed_read_str = ", ".join(allowed_read_paths)
         coverage_target = self.project_config.get("test_writer", {}).get("coverage_target", _DEFAULT_COVERAGE_TARGET)
         test_surface_policy = _test_surface_policy(self.project_config)
+        change_context_files, active_step_context = _change_context_files(state)
 
         diff = ""
         if git_tool:
-            result = git_tool.diff_head()
+            result = git_tool.diff_head(change_context_files if active_step_context else None)
             if result.success and result.output.strip():
                 diff = result.output[:_MAX_DIFF_CHARS]
                 if len(result.output) > _MAX_DIFF_CHARS:
@@ -392,7 +407,7 @@ class TestWriterAgent(BaseAgent):
             task_description=state.task_description,
             step_scope=_step_scope(state),
             synthetic_harness_audit_context=_synthetic_harness_prompt_context(state.synthetic_test_harness_records),
-            files_changed="\n".join(f"  - {f}" for f in state.files_changed),
+            files_changed="\n".join(f"  - {f}" for f in change_context_files),
             diff=diff,
         )
 

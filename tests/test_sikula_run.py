@@ -3867,6 +3867,8 @@ class TestCmdRunChildDeliveryMetadata:
                 delivery_unit_id="unit-456",
                 delivery_plan_path=".sikula/delivery/plan.yaml",
                 delivery_unit_budget={"max_planner_steps": 2, "max_changed_files": 4},
+                delivery_handoff_schema_version=1,
+                delivery_dependency_handoffs=[{"schema_version": 1, "fingerprint": "a" * 64}],
             )
             cmd_run(args, _run_cfg(tmp_path))
 
@@ -3880,6 +3882,8 @@ class TestCmdRunChildDeliveryMetadata:
         assert state.delivery_unit_id == "unit-456"
         assert state.delivery_plan_path == ".sikula/delivery/plan.yaml"
         assert state.delivery_unit_budget == {"max_planner_steps": 2, "max_changed_files": 4}
+        assert state.delivery_handoff_schema_version == 1
+        assert state.delivery_dependency_handoffs == [{"schema_version": 1, "fingerprint": "a" * 64}]
         assert captured["overrides"]["run_planner"] is True
 
     def test_cmd_run_reset_failed_blocks_delivery_budget_stop(

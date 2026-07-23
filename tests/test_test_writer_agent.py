@@ -5,8 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from agents.base_agent import AGENT_SECURITY_PREFIX
-from agents.test_writer_agent import TestWriterAgent, _MAX_DIFF_CHARS, _parse_testability_gaps, _step_scope
+from agents.test_writer_agent import (
+    TestWriterAgent,
+    _MAX_DIFF_CHARS,
+    _change_context_files,
+    _parse_testability_gaps,
+    _step_scope,
+)
 from tests.conftest import StubLLMClient
 from core.state import TaskState
 from tools.base_tool import ToolResult
@@ -141,6 +149,83 @@ class TestTestWriterAgentSuccess:
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool, project_config=_config_with_test_paths()).run(state)
         assert state.tests_up_to_date is True
+
+    def test_current_step_uses_tracked_step_files_for_diff_and_prompt(
+        self,
+        stub_llm: StubLLMClient,
+        file_tool,
+        git_tool,
+    ):
+        git_tool.diff_head = MagicMock(return_value=ToolResult(success=True, output="diff --git a/src/current.py"))
+        state = _make_state(
+            plan=["Change previous module", "Change current module"],
+            current_step=1,
+            files_changed=["src/previous.py", "src/current.py"],
+            step_file_tracking_enabled=True,
+            step_files_changed=["src/current.py"],
+        )
+
+        _make_agent(
+            stub_llm,
+            file_tool=file_tool,
+            git_tool=git_tool,
+            project_config=_config_with_test_paths(),
+        ).run(state)
+
+        git_tool.diff_head.assert_called_once_with(["src/current.py"])
+        prompt = stub_llm.agent_calls[0]
+        assert "src/current.py" in prompt
+        assert "src/previous.py" not in prompt
+
+    def test_final_scope_uses_complete_change_context(self, stub_llm: StubLLMClient, file_tool, git_tool):
+        git_tool.diff_head = MagicMock(return_value=ToolResult(success=True, output="full diff"))
+        state = _make_state(
+            plan=["Change previous module", "Change current module"],
+            current_step=1,
+            active_scope="final_full_task",
+            files_changed=["src/previous.py", "src/current.py"],
+            step_file_tracking_enabled=True,
+            step_files_changed=["src/current.py"],
+        )
+
+        _make_agent(
+            stub_llm,
+            file_tool=file_tool,
+            git_tool=git_tool,
+            project_config=_config_with_test_paths(),
+        ).run(state)
+
+        git_tool.diff_head.assert_called_once_with(None)
+        prompt = stub_llm.agent_calls[0]
+        assert "src/previous.py" in prompt
+        assert "src/current.py" in prompt
+
+    def test_legacy_step_state_without_tracking_uses_complete_context(self):
+        state = _make_state(
+            plan=["Change previous module", "Change current module"],
+            current_step=1,
+            files_changed=["src/previous.py", "src/current.py"],
+        )
+
+        files, scoped = _change_context_files(state)
+
+        assert files == ["src/previous.py", "src/current.py"]
+        assert scoped is False
+
+    @pytest.mark.parametrize("step_files", [True, "src/current.py", [True], [" "]])
+    def test_invalid_step_file_evidence_uses_complete_context(self, step_files):
+        state = _make_state(
+            plan=["Change previous module", "Change current module"],
+            current_step=1,
+            files_changed=["src/previous.py", "src/current.py"],
+            step_file_tracking_enabled=True,
+            step_files_changed=step_files,
+        )
+
+        files, scoped = _change_context_files(state)
+
+        assert files == ["src/previous.py", "src/current.py"]
+        assert scoped is False
 
     def test_test_write_recorded_in_history(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["tests/LoginTest.kt"]

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import subprocess
 from typing import Any
@@ -19,6 +19,7 @@ from core.delivery_unit_metadata import (
 
 SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION = 1
 _DELIVERY_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+MAX_DELIVERY_UNIT_ID_LENGTH = 1000
 _GIT_REF_FORBIDDEN_CHARS_RE = re.compile(r"[\000-\037\177 ~^:?*\[\\]")
 _SPLIT_RECOMMENDED_TAG_SET = frozenset({"external_execution_boundary", "structured_output_contract", "cli_surface"})
 
@@ -664,6 +665,18 @@ def _parse_units(
         )
 
         if unit_id:
+            if len(unit_id) > MAX_DELIVERY_UNIT_ID_LENGTH or any(ord(char) < 32 for char in unit_id):
+                errors.append(
+                    DeliveryPlanIssue(
+                        "error",
+                        "units.id_invalid",
+                        (
+                            f"Unit id must be at most {MAX_DELIVERY_UNIT_ID_LENGTH} characters "
+                            "and contain no control characters."
+                        ),
+                        f"{unit_path}.id",
+                    )
+                )
             if unit_id in seen:
                 errors.append(
                     DeliveryPlanIssue("error", "units.duplicate_id", f"Duplicate unit id: {unit_id}", f"{unit_path}.id")
@@ -823,6 +836,18 @@ def _validate_project_relative_metadata_path(
     code_prefix: str,
     subject: str,
 ) -> None:
+    posix_path = PurePosixPath(path_value)
+    windows_path = PureWindowsPath(path_value)
+    if posix_path.is_absolute() or windows_path.is_absolute() or windows_path.drive:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                f"{code_prefix}_absolute",
+                f"{subject} must be project-relative so the plan remains portable.",
+                path,
+            )
+        )
+        return
     try:
         raw_path = Path(path_value)
     except (OSError, ValueError):
@@ -849,6 +874,16 @@ def _validate_project_relative_metadata_path(
                 "error",
                 f"{code_prefix}_outside_project",
                 f"{subject} escapes the project root.",
+                path,
+            )
+        )
+        return
+    if ".." in posix_path.parts or ".." in windows_path.parts:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                f"{code_prefix}_parent_traversal",
+                f"{subject} must not contain parent-directory traversal.",
                 path,
             )
         )

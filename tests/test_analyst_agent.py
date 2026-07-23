@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 
 from agents.analyst_agent import AnalystAgent
 from agents.base_agent import AGENT_SECURITY_PREFIX, READONLY_AGENT_PREFIX
-from tests.conftest import StubLLMClient
+from core.delivery_handoff import build_delivery_unit_handoff
 from core.state import TaskState
+from tests.conftest import StubLLMClient
 
 VALID_ANALYST_PROMPT = (
     "1. Context: feature module\n"
@@ -106,6 +108,49 @@ class TestAnalystAgentRun:
         agent = _make_agent(stub_llm, file_tool)
         agent.run(task_state)
         assert task_state.task_description in task_state.analyst_prompt
+
+    def test_analyst_prompt_contains_validated_dependency_handoff(
+        self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
+    ):
+        child_state = TaskState(
+            task_id="dependency-child",
+            task_description="Private dependency task",
+            delivery_handoff_schema_version=1,
+        )
+        child_state.worktree_branch = "sikula/dependency-child"
+        child_state.result_commit = "a" * 40
+        handoff = build_delivery_unit_handoff(
+            plan_id="demo-plan",
+            selected_unit=SimpleNamespace(
+                id="foundation",
+                title="Foundation",
+                component="delivery",
+                depends_on=[],
+                scope_paths=["core/"],
+            ),
+            child_task_id=child_state.task_id,
+            child_state=child_state,
+        )
+        task_state.delivery_dependency_handoffs = [handoff.to_dict()]
+        stub_llm.readonly_result = VALID_ANALYST_PROMPT
+
+        _make_agent(stub_llm, file_tool).run(task_state)
+
+        assert "Prior delivery dependency handoffs:" in task_state.analyst_prompt
+        assert handoff.fingerprint in task_state.analyst_prompt
+        assert "Private dependency task" not in task_state.analyst_prompt
+
+    def test_analyst_ignores_malformed_dependency_handoff(
+        self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
+    ):
+        task_state.delivery_dependency_handoffs = [{"raw_prompt": "private"}]
+        stub_llm.readonly_result = VALID_ANALYST_PROMPT
+
+        result = _make_agent(stub_llm, file_tool).run(task_state)
+
+        assert result.success
+        assert "private" not in task_state.analyst_prompt
+        assert any(entry["action"] == "delivery_handoff_rejected" for entry in task_state.history)
 
     def test_analyst_prompt_contains_guidelines_content(
         self, stub_llm: StubLLMClient, task_state: TaskState, file_tool, tmp_project: Path

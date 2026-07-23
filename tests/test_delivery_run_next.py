@@ -4,11 +4,18 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from core.delivery_authoring import DeliveryAmendmentAuthoringDraft, DeliveryAuthoringUnitDraft
+from core.delivery_handoff import (
+    build_delivery_unit_handoff,
+    delivery_unit_handoff_path,
+    read_delivery_unit_handoff,
+    write_delivery_unit_handoff,
+)
 from core.delivery_plan import DeliveryBudgetExceeded, DeliveryPlanIssue
 from core.delivery_progress import (
     DeliveryStatusUnit,
@@ -43,6 +50,7 @@ from sikula_cli.delivery import (
     _git_commit_is_ancestor,
     _invoke_delivery_child_run_args,
     _invoke_delivery_child_run,
+    _progress_from_status,
     _system_exit_code,
     cmd_delivery_run_next,
 )
@@ -390,6 +398,29 @@ def _budget_split_cfg(root: Path) -> dict:
     )
     cfg["tasks"]["contract_report_dir"] = str(root / ".sikula" / "contract-reports")
     return cfg
+
+
+def test_progress_from_status_preserves_handoff_references(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "done",
+                "child_task_id": "child-123",
+                "handoff_schema_version": 1,
+                "handoff_fingerprint": "a" * 64,
+            }
+        ],
+    )
+    status = get_delivery_status(plan_path, project_root=tmp_path)
+
+    reconstructed = _progress_from_status(status)
+
+    assert reconstructed.units[0].handoff_schema_version == 1
+    assert reconstructed.units[0].handoff_fingerprint == "a" * 64
 
 
 def test_cmd_delivery_run_next_dry_run_rejects_invalid_agent_override_before_preview(
@@ -1526,6 +1557,327 @@ def test_cmd_delivery_run_next_runs_dependent_unit_when_dependency_commit_is_app
     assert progress["units"][0]["unit_id"] == "01-foundation"
     assert progress["units"][1]["unit_id"] == "02-feature"
     assert progress["units"][1]["status"] == "done"
+
+
+def test_run_next_persists_handoff_and_passes_it_to_dependent_child(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    child_ids: list[str] = []
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        state = store.create(
+            "child task",
+            delivery_plan_id=run_args.delivery_plan_id,
+            delivery_unit_id=run_args.delivery_unit_id,
+            delivery_plan_path=run_args.delivery_plan_path,
+            delivery_unit_budget=run_args.delivery_unit_budget,
+            delivery_handoff_schema_version=run_args.delivery_handoff_schema_version,
+            delivery_dependency_handoffs=run_args.delivery_dependency_handoffs,
+        )
+        run_args.created_task_id = state.task_id
+        run_args.delivery_child_created_callback(state.task_id)
+        state.done = True
+        state.worktree_branch = f"sikula/{run_args.delivery_unit_id}-child"
+        if run_args.delivery_unit_id == "01-foundation":
+            state.result_commit = _git_commit(tmp_path, "foundation.txt", "foundation\n")
+            state.build_status = "success"
+            state.test_status = "success"
+            state.check_status = "success"
+            state.test_files_written = ["tests/test_foundation.py"]
+        store.save(state)
+        child_ids.append(state.task_id)
+        return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
+
+    context = _run_next_context(tmp_path, runner)
+    cmd_delivery_run_next(_run_next_args(plan_path, json_output=True), cfg, context)
+    capsys.readouterr()
+    first_handoff = read_delivery_unit_handoff(
+        delivery_unit_handoff_path(tmp_path, "delivery-run-next-demo", "01-foundation")
+    )
+    first_events = [
+        json.loads(line)
+        for line in delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    ]
+    assert first_events[-1]["handoff_schema_version"] == 1
+    assert first_events[-1]["handoff_fingerprint"] == first_handoff.fingerprint
+
+    cmd_delivery_run_next(_run_next_args(plan_path, json_output=True), cfg, context)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["succeeded"] is True
+    assert payload["selected_unit"]["id"] == "02-feature"
+    assert len(child_ids) == 2
+    second_child = JsonStateStore(Path(cfg["tasks"]["state_dir"])).load(child_ids[1])
+    assert second_child is not None
+    assert second_child.delivery_handoff_schema_version == 1
+    assert second_child.delivery_dependency_handoffs == [first_handoff.to_dict()]
+    assert first_handoff.test_files_written == ["tests/test_foundation.py"]
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["handoff_schema_version"] == 1
+    assert progress["units"][0]["handoff_fingerprint"] == first_handoff.fingerprint
+    assert progress["units"][1]["handoff_schema_version"] == 1
+
+
+def test_run_next_blocks_when_referenced_dependency_handoff_is_missing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    dependency_commit = _git_commit(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "done",
+                "child_task_id": "child-123",
+                "commit": dependency_commit,
+                "branch": "sikula/unit-01",
+                "handoff_schema_version": 1,
+                "handoff_fingerprint": "a" * 64,
+            }
+        ],
+    )
+    child_started = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal child_started
+        child_started = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            _run_next_cfg(tmp_path),
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert child_started is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["errors"][0]["code"] == "delivery.dependency_handoff_missing"
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_run_next_dry_run_blocks_when_referenced_dependency_handoff_is_missing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    dependency_commit = _git_commit(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "done",
+                "child_task_id": "child-123",
+                "commit": dependency_commit,
+                "branch": "sikula/unit-01",
+                "handoff_schema_version": 1,
+                "handoff_fingerprint": "a" * 64,
+            }
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, dry_run=True, json_output=True),
+            _run_next_cfg(tmp_path),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is False
+    assert payload["errors"][0]["code"] == "delivery.dependency_handoff_missing"
+
+
+def test_run_next_blocks_when_dependency_handoff_unit_metadata_is_stale(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    dependency_commit = _git_commit(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    child_state = TaskState(
+        task_id="child-123",
+        task_description="private child task",
+        delivery_handoff_schema_version=1,
+    )
+    child_state.worktree_branch = "sikula/unit-01"
+    child_state.result_commit = dependency_commit
+    stale_unit = SimpleNamespace(
+        id="01-foundation",
+        title="Stale foundation title",
+        component=None,
+        depends_on=[],
+        scope_paths=[],
+    )
+    handoff = build_delivery_unit_handoff(
+        plan_id="delivery-run-next-demo",
+        selected_unit=stale_unit,
+        child_task_id=child_state.task_id,
+        child_state=child_state,
+    )
+    write_delivery_unit_handoff(
+        delivery_unit_handoff_path(tmp_path, "delivery-run-next-demo", "01-foundation"),
+        handoff,
+    )
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "done",
+                "child_task_id": child_state.task_id,
+                "commit": dependency_commit,
+                "branch": child_state.worktree_branch,
+                "handoff_schema_version": handoff.schema_version,
+                "handoff_fingerprint": handoff.fingerprint,
+            }
+        ],
+    )
+    child_started = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal child_started
+        child_started = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            _run_next_cfg(tmp_path),
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert child_started is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["errors"][0]["code"] == "delivery.dependency_handoff_mismatch"
+
+
+def test_run_next_reconciles_completed_child_after_handoff_write_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import core.delivery_handoff as delivery_handoff
+
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    original_write = delivery_handoff.write_delivery_unit_handoff
+    child_ids: list[str] = []
+
+    def fail_handoff_write(path: Path, handoff: object) -> None:
+        raise OSError("handoff storage unavailable")
+
+    monkeypatch.setattr(delivery_handoff, "write_delivery_unit_handoff", fail_handoff_write)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        state = store.create(
+            "child task",
+            delivery_plan_id=run_args.delivery_plan_id,
+            delivery_unit_id=run_args.delivery_unit_id,
+            delivery_plan_path=run_args.delivery_plan_path,
+            delivery_unit_budget=run_args.delivery_unit_budget,
+            delivery_handoff_schema_version=run_args.delivery_handoff_schema_version,
+            delivery_dependency_handoffs=run_args.delivery_dependency_handoffs,
+        )
+        run_args.created_task_id = state.task_id
+        run_args.delivery_child_created_callback(state.task_id)
+        state.done = True
+        state.worktree_branch = "sikula/foundation-child"
+        state.result_commit = "a" * 40
+        store.save(state)
+        child_ids.append(state.task_id)
+        return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    failed_payload = json.loads(capsys.readouterr().out)
+    assert failed_payload["errors"][0]["code"] == "delivery.unit_handoff_write_failed"
+    assert failed_payload["selected_unit"]["status"] == "running"
+    assert len(child_ids) == 1
+
+    monkeypatch.setattr(delivery_handoff, "write_delivery_unit_handoff", original_write)
+    cmd_delivery_run_next(
+        _run_next_args(plan_path, json_output=True),
+        cfg,
+        _run_next_context(tmp_path, runner),
+    )
+
+    reconciled_payload = json.loads(capsys.readouterr().out)
+    assert reconciled_payload["succeeded"] is True
+    assert reconciled_payload["selected_unit"]["status"] == "done"
+    assert len(child_ids) == 1
+    assert delivery_unit_handoff_path(tmp_path, "delivery-run-next-demo", "01-foundation").exists()
+
+
+def test_reset_failed_handoff_write_failure_persists_running_for_ordinary_reconciliation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import core.delivery_handoff as delivery_handoff
+
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-foundation", "status": "failed", "child_task_id": "retry-child"}],
+    )
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    child_state = _resume_child_state(task_id="retry-child")
+    child_state.done = True
+    child_state.delivery_handoff_schema_version = 1
+    child_state.worktree_branch = "sikula/foundation-child"
+    child_state.result_commit = "a" * 40
+    store.save(child_state)
+    original_write = delivery_handoff.write_delivery_unit_handoff
+
+    def fail_handoff_write(path: Path, handoff: object) -> None:
+        raise OSError("handoff storage unavailable")
+
+    monkeypatch.setattr(delivery_handoff, "write_delivery_unit_handoff", fail_handoff_write)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        raise AssertionError("terminal child must be reconciled without running agents")
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, reset_failed=True, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    failed_payload = json.loads(capsys.readouterr().out)
+    assert failed_payload["unit_status"] == "running"
+    assert _load_delivery_progress(tmp_path)["units"][0]["status"] == "running"
+
+    monkeypatch.setattr(delivery_handoff, "write_delivery_unit_handoff", original_write)
+    cmd_delivery_run_next(
+        _run_next_args(plan_path, json_output=True),
+        cfg,
+        _run_next_context(tmp_path, runner),
+    )
+
+    reconciled_payload = json.loads(capsys.readouterr().out)
+    assert reconciled_payload["succeeded"] is True
+    assert reconciled_payload["selected_unit"]["status"] == "done"
 
 
 def test_cmd_delivery_run_next_keeps_unit_retryable_when_child_run_does_not_start(

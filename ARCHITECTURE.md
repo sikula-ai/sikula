@@ -20,7 +20,7 @@
 | `DeliveryPreparationAgent` | `agents/delivery_preparation_agent.py` | Read-only delivery-plan and split-proposal authoring assistant; returns structured drafts for deterministic parsing and never mutates delivery artifacts |
 | `FixerAgent` | `agents/fixer_agent.py` | Runs the configured LLM as an autonomous agent to fix build or test errors |
 | `FileTool` | `tools/file_tool.py` | Read / write files; enforces sandbox whitelist for direct file-tool calls |
-| `GitTool` | `tools/git_tool.py` | `diff_head()` — called by reviewer, security_reviewer, and test_writer agents to obtain the live diff when `state.review_diff` is not set |
+| `GitTool` | `tools/git_tool.py` | `diff_head(paths=None)` — called by reviewer, security_reviewer, and test_writer agents to obtain the live diff when `state.review_diff` is not set; optional project-relative paths constrain the diff with literal Git pathspecs, while absolute and parent-traversing paths fail closed |
 | `BuildTool` | `tools/base_tool.py` | **Abstract interface** for platform build systems — implement per platform |
 | `GradleBaseTool` | `tools/gradle_tool.py` | Shared Gradle mechanics (`_run`, `run_check`, `is_build_config_file`); subclassed by Android and JVM variants |
 | `AndroidGradleTool` | `tools/gradle_android_tool.py` | `BuildTool` implementation for Android / Gradle |
@@ -36,6 +36,7 @@
 | `DeliveryAuthoring` helpers | `core/delivery_authoring.py` | Side-effect-free parser and derived-path helpers for delivery prepare authoring drafts |
 | `DeliveryPrepareWriter` helpers | `core/delivery_prepare_writer.py` | Deterministic source-artifact writer for parsed delivery authoring drafts; renders `plan.yaml` and unit task files with readiness checks, plan validation, overwrite guards, and rollback |
 | `DeliveryAmendment` helpers | `core/delivery_amendment.py` | Fingerprinted split proposals, immutable-unit and dependency guards, no-write preview, transactional plan/unit writing, and append-only amendment events |
+| `DeliveryHandoff` helpers | `core/delivery_handoff.py` | Versioned, fingerprinted, privacy-safe unit handoff artifacts consumed by later dependency units |
 | `TaskAsset` helpers | `core/task_assets.py` | Deterministic local task-asset parsing, path canonicalization, answer mapping, and asset-manifest line rendering used by contract preparation |
 | `Worktree` helpers | `core/worktree.py` | Shared low-level git/worktree operations used by run, review, cleanup/delete, and init CLI surfaces; command-specific state mutation stays in the owning command layer |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
@@ -320,6 +321,10 @@ blockers from the tracked plan. The JSON result is allowlisted metadata only: it
 does not embed unit task bodies, raw child `TaskState`, prompts, provider output,
 logs, diffs, or validation output. Unit sizing/risk/budget metadata from the
 tracked plan is preserved in status output for operator review.
+Plan validation rejects scope paths containing parent-directory traversal before
+`run-next` can create a child. Handoff filenames use a bounded readable prefix
+plus a SHA-256 digest of the complete unit ID, preserving legacy unit identities
+while preventing filesystem and case-folding collisions.
 
 **Delivery progress mutation foundation:** `core/delivery_progress.py` also owns
 the non-agent primitives that future delivery execution uses: atomic
@@ -332,7 +337,9 @@ worktrees, prepare contracts, start agents, or update branches by themselves.
 loads project runtime config, validates delivery status, and reports the first
 eligible unit that a future execution command would run. It also mirrors the
 execution dependency result-commit guard so a dry run reports blocked when a
-completed prerequisite commit is not applied to the current checkout. It is
+completed prerequisite commit is not applied to the current checkout. It also
+validates any referenced dependency handoff schema, fingerprint, artifact, and
+parent-progress correlation. It is
 intentionally side-effect-free: it does not write parent progress, create child
 task state, prepare contracts, create worktrees, start agents, or update
 branches. Its JSON result is also allowlisted metadata only. With `--reset-failed`,
@@ -386,8 +393,30 @@ When the child run continues (including resume), it keeps normal Sikula behavior
 worktree isolation, provider execution, validation, review, state persistence, and
 task audit reporting. When the child run exits, delivery progress stores only
 compact parent metadata: unit status, child task id, branch, result commit when
-available, timestamps, and a failure code. Full prompts, provider output, diffs,
-logs, validation records, and task state remain in the child task state.
+available, handoff schema/fingerprint reference, timestamps, and a failure code.
+New delivery children opt into the current handoff schema when their state is
+created. A successfully completed opted-in child produces
+`.sikula/state/delivery/<plan-id>/handoffs/<unit-key>.json` before its parent unit
+becomes `done`. The fingerprinted artifact contains allowlisted unit identity,
+branch/commit correlation, changed-file paths, validation counts/statuses, and
+test file/gap counts. Unit title and component labels longer than the handoff
+metadata bound are projected as a bounded prefix plus a SHA-256 suffix, so
+otherwise-valid plan metadata cannot prevent terminal reconciliation and edits
+remain detectable;
+it does not copy task bodies, prompts, provider output, diffs, logs, validation
+output, or raw child state. Later units receive validated handoffs from their
+dependency closure in `TaskState.delivery_dependency_handoffs`, and
+`AnalystAgent` includes that compact evidence in analysis without treating it
+as scope authority. Existing children and completed progress without a handoff
+schema marker remain valid legacy state and continue without handoff context.
+If progress references a missing, malformed, stale, or mismatched handoff,
+or the handoff file is a symlink or resolves outside the project root,
+`run-next` blocks before creating another child. If a completed child handoff
+cannot be written, the parent is durably persisted as `running` so a later
+ordinary `run-next` can reconcile it without rerunning agents, including after
+`--reset-failed`. Progress reconstruction preserves existing handoff schema and
+fingerprint references. Full prompts, provider output, diffs, logs, validation
+records, and task state remain in the child task state.
 The parent delivery unit is `done` only when the child exits successfully, the
 child `TaskState` is done, and the child result is finalized. Finalization means
 either a `result_commit` exists or the child left no preserved worktree to
@@ -630,7 +659,7 @@ Orchestrator.run()
 
 **Step loop** (`state.plan` is non-empty — when `run_planner: true` and plan parsed successfully):
 
-Per-step flags (`step_implemented`, `review_approved`, `review_issues`, `review_iterations`, `security_approved`, `security_review_iterations`, `tests_up_to_date`) reset on each step transition. `files_changed` and `build_iterations` accumulate across all steps. `max_iterations` is applied per active build/fix loop, not globally across the whole task, so per-step builds do not consume the final full-task build budget.
+Per-step flags (`step_implemented`, `review_approved`, `review_issues`, `review_iterations`, `security_approved`, `security_review_iterations`, `tests_up_to_date`) reset on each step transition. `files_changed` and `build_iterations` accumulate across all steps. New planned runs also track the current step's writes in `step_files_changed`; that list resets on each step transition and lets TestWriterAgent avoid repeatedly receiving the growing whole-task diff. `max_iterations` is applied per active build/fix loop, not globally across the whole task, so per-step builds do not consume the final full-task build budget.
 
 Build behaviour is controlled by `run_build_per_step` (default: `false`):
 
@@ -665,6 +694,12 @@ Deferred build is a performance choice, not permission for obviously uncompilabl
 ```
 
 The `step_start` / `step_done` markers in `state.history` make the JSON audit log unambiguous — every agent action between a pair of markers belongs to that step.
+
+Current-step file tracking is enabled only when the active Sikula version successfully
+creates a multi-step plan. Legacy persisted plans do not have trusted per-step provenance,
+so resume leaves tracking disabled and TestWriterAgent falls back to the complete
+`files_changed` list and full live diff. Single-pass runs and the final full-task gate also
+use the complete change context.
 
 After the last step completes, `plan_completed` guards resume so the final step is not
 re-run just because the final review/build phase was interrupted. The final full-task
@@ -1237,8 +1272,9 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
 **Input:**
 - `state.task_description` — original task description; used to honor explicit testing requirements
 - `state.implementation_prompt` — what was implemented and why
-- `state.files_changed` — production files that were changed
-- git diff HEAD (capped at 40 000 chars) — the exact changes made
+- current-step tracked files for a new multi-step plan; otherwise all `state.files_changed`
+- git diff HEAD (capped at 40 000 chars) — constrained to the tracked current-step paths
+  for a new multi-step plan, and otherwise the complete live diff
 - current planner step description when `state.plan` is non-empty — injected as `CURRENT STEP`
 - `test_writer.coverage_target` from project config (default: 90) — injected into the prompt
   as a target within the configured test surface
@@ -1595,6 +1631,8 @@ Sikula processes at once is still unsupported.
 | `delivery_plan_path` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` | Project-relative path to the delivery plan file (e.g. `.sikula/delivery/my-plan/plan.yaml`); set only by `delivery run-next` child creation, defaults to `None` for existing/non-delivery state, and must not drive pipeline control flow |
 | `delivery_unit_budget` | `dict[str, int]` | `delivery run-next` / `cmd_run()` | Effective allowlisted unit budget snapshot persisted at child creation; always includes `max_planner_steps` (default `1`) |
 | `delivery_budget_stop` | `dict \| None` | Orchestrator | Structured terminal planner budget stop with stable code, budget name, limit, actual count, phase, and timestamp; preserved for audit and parent progress classification |
+| `delivery_handoff_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Opt-in schema marker set on newly created delivery children. Legacy children keep `None`, so terminal reconciliation does not fabricate or require a handoff for state created by older versions. |
+| `delivery_dependency_handoffs` | `list[dict]` | `delivery run-next` / `cmd_run()` | Validated, fingerprinted, allowlisted snapshots from the child unit's completed dependency closure. `AnalystAgent` consumes them as supporting evidence; malformed resume-state entries are ignored and recorded as warnings rather than injected into prompts. |
 | `config_snapshot` | `dict` | `cmd_run()` / Orchestrator | Effective run configuration captured on first run before agents start (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `planner.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. It is also saved for contract-gate failures that exit before `Orchestrator.run()`. Visible in `show <task_id>`. |
 | `implementation_contract` | `dict` | `cmd_run()` in `sikula_cli/run.py` | Implementation-contract snapshot for fresh task-file runs: task path/format/hash, readiness status/score, gap metadata, clarifying question IDs, and validation coverage counts. By default it is warning-only additive metadata. Fresh `run TASK_FILE` can opt into pre-agent gating with `--require-contract-ready` or `--min-contract-score N`; resume/review flows do not recompute or re-gate it. |
 | `implementation_asset_records` | `list[dict]` | `cmd_run()` in `sikula_cli/run.py` | Sanitized, non-blocking asset metadata snapshot for fresh task-file runs, copied from the implementation-contract preflight asset references. Contains path/kind/status/project path/hash/declared hash/size/MIME/git status/requested target/provenance metadata only; no raw asset content, OCR text, binary data, internal parser fields, or source excerpts. Used for audit and terminal summary counts, not for run/resume/review control-flow decisions. |
@@ -1670,6 +1708,8 @@ Sikula processes at once is still unsupported.
 | `final_full_task_review_done` | `bool` | Orchestrator | Set True after the final full-task reviewer/security/test-writer gate has completed for the current files. Reset when final-scope fixer changes code, then set True again after the post-fix final-scope review/security/test pass. |
 | `current_step` | `int` | Orchestrator | Index into `plan`; advances after each step completes its implement/review/security/test-write phases. With `run_build_per_step: true`, each step also passes build/fix before advancing; otherwise build/fix is deferred until all steps are complete. |
 | `step_implemented` | `bool` | Orchestrator | Set True after implementer succeeds for the current step; reset on step transition; guards re-runs on resume |
+| `step_file_tracking_enabled` | `bool` | Orchestrator | True only after the current Sikula version successfully creates a multi-step plan. Distinguishes trusted per-step file provenance from legacy resumed plans, which safely retain the default False and use complete TestWriter change context. |
+| `step_files_changed` | `list[str]` | Orchestrator | De-duplicated paths reported or adopted during the current planner step; reset on step transition. Used only to scope TestWriterAgent's current-step file list and live diff. It does not replace cumulative `files_changed`, and final full-task gates ignore it. |
 | `pid` | `int \| None` | `Orchestrator.run()` | PID of the orchestrator process; set at the start of every run (including resume); used by `sikula status` to detect interrupted tasks. A fresh `active_operation` heartbeat takes precedence when the PID is not visible across process namespaces; otherwise, if the PID is no longer running, status shows `INTERRUPTED`. |
 | `created_at` | `str` | `StateStore.create()` | ISO-8601 UTC timestamp set once at task creation; never overwritten |
 | `updated_at` | `str` | `JsonStateStore.save()` | ISO-8601 UTC timestamp refreshed on every save; reflects last mutation |
