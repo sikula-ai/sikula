@@ -68,6 +68,12 @@ class DeliveryProgress:
     schema_version: int
     plan_id: str
     units: list[DeliveryUnitProgress] = field(default_factory=list)
+    assembly_base_commit: str | None = None
+    assembled_commit: str | None = None
+    assembly_status: str | None = None
+    assembly_unit_id: str | None = None
+    assembly_error_code: str | None = None
+    assembly_updated_at: str | None = None
     final_branch: str | None = None
     final_commit: str | None = None
     finalized_at: str | None = None
@@ -78,7 +84,17 @@ class DeliveryProgress:
             "plan_id": self.plan_id,
             "units": [unit.to_dict() for unit in self.units],
         }
-        for key in ("final_branch", "final_commit", "finalized_at"):
+        for key in (
+            "assembly_base_commit",
+            "assembled_commit",
+            "assembly_status",
+            "assembly_unit_id",
+            "assembly_error_code",
+            "assembly_updated_at",
+            "final_branch",
+            "final_commit",
+            "finalized_at",
+        ):
             value = getattr(self, key)
             if value:
                 data[key] = value
@@ -320,6 +336,12 @@ class DeliveryStatusResult:
     plan: DeliveryPlan | None = None
     units: list[DeliveryStatusUnit] = field(default_factory=list)
     next_action: str | None = None
+    assembly_base_commit: str | None = None
+    assembled_commit: str | None = None
+    assembly_status: str | None = None
+    assembly_unit_id: str | None = None
+    assembly_error_code: str | None = None
+    assembly_updated_at: str | None = None
     final_branch: str | None = None
     final_commit: str | None = None
     finalized_at: str | None = None
@@ -356,7 +378,17 @@ class DeliveryStatusResult:
         }
         if self.next_action:
             data["next_action"] = self.next_action
-        for key in ("final_branch", "final_commit", "finalized_at"):
+        for key in (
+            "assembly_base_commit",
+            "assembled_commit",
+            "assembly_status",
+            "assembly_unit_id",
+            "assembly_error_code",
+            "assembly_updated_at",
+            "final_branch",
+            "final_commit",
+            "finalized_at",
+        ):
             value = getattr(self, key)
             if value:
                 data[key] = value
@@ -506,6 +538,12 @@ def upsert_delivery_unit_progress(
         schema_version=progress.schema_version,
         plan_id=progress.plan_id,
         units=units,
+        assembly_base_commit=progress.assembly_base_commit,
+        assembled_commit=progress.assembled_commit,
+        assembly_status=progress.assembly_status,
+        assembly_unit_id=progress.assembly_unit_id,
+        assembly_error_code=progress.assembly_error_code,
+        assembly_updated_at=progress.assembly_updated_at,
         final_branch=final_branch,
         final_commit=final_commit,
         finalized_at=finalized_at,
@@ -574,6 +612,38 @@ def make_delivery_progress_event(
     )
 
 
+def mark_delivery_assembly(
+    progress: DeliveryProgress,
+    *,
+    base_commit: str,
+    assembled_commit: str | None,
+    status: str,
+    unit_id: str | None = None,
+    error_code: str | None = None,
+    timestamp: str | None = None,
+) -> DeliveryProgress:
+    _validate_progress(progress)
+    if status not in {"ready", "failed"}:
+        raise ValueError("delivery assembly status must be ready or failed")
+    if status == "failed" and not error_code:
+        raise ValueError("failed delivery assembly requires an error code")
+    timestamp = timestamp or _utc_now()
+    return DeliveryProgress(
+        schema_version=progress.schema_version,
+        plan_id=progress.plan_id,
+        units=list(progress.units),
+        assembly_base_commit=base_commit,
+        assembled_commit=assembled_commit,
+        assembly_status=status,
+        assembly_unit_id=unit_id if status == "failed" else None,
+        assembly_error_code=error_code if status == "failed" else None,
+        assembly_updated_at=timestamp,
+        final_branch=None,
+        final_commit=None,
+        finalized_at=None,
+    )
+
+
 def mark_delivery_finalized(
     progress: DeliveryProgress,
     *,
@@ -587,6 +657,12 @@ def mark_delivery_finalized(
         schema_version=progress.schema_version,
         plan_id=progress.plan_id,
         units=list(progress.units),
+        assembly_base_commit=progress.assembly_base_commit,
+        assembled_commit=progress.assembled_commit,
+        assembly_status=progress.assembly_status,
+        assembly_unit_id=progress.assembly_unit_id,
+        assembly_error_code=progress.assembly_error_code,
+        assembly_updated_at=progress.assembly_updated_at,
         final_branch=final_branch,
         final_commit=final_commit,
         finalized_at=timestamp,
@@ -649,6 +725,12 @@ def get_delivery_status(path: str | Path, *, project_root: Path | None = None) -
     final_branch = progress.final_branch if progress else None
     final_commit = progress.final_commit if progress else None
     finalized_at = progress.finalized_at if progress else None
+    assembly_base_commit = progress.assembly_base_commit if progress else None
+    assembled_commit = progress.assembled_commit if progress else None
+    assembly_status = progress.assembly_status if progress else None
+    assembly_unit_id = progress.assembly_unit_id if progress else None
+    assembly_error_code = progress.assembly_error_code if progress else None
+    assembly_updated_at = progress.assembly_updated_at if progress else None
     return DeliveryStatusResult(
         plan_path=check_result.plan_path,
         project_root=check_result.project_root,
@@ -659,7 +741,19 @@ def get_delivery_status(path: str | Path, *, project_root: Path | None = None) -
         warnings=warnings,
         plan=plan,
         units=units,
-        next_action=_next_action(status, units, final_commit=final_commit),
+        next_action=_next_action(
+            status,
+            units,
+            final_commit=final_commit,
+            assembly_status=assembly_status,
+            assembly_unit_id=assembly_unit_id,
+        ),
+        assembly_base_commit=assembly_base_commit,
+        assembled_commit=assembled_commit,
+        assembly_status=assembly_status,
+        assembly_unit_id=assembly_unit_id,
+        assembly_error_code=assembly_error_code,
+        assembly_updated_at=assembly_updated_at,
         final_branch=final_branch,
         final_commit=final_commit,
         finalized_at=finalized_at,
@@ -732,6 +826,22 @@ def _validate_progress(progress: DeliveryProgress) -> None:
         if unit.unit_id in seen:
             raise ValueError(f"duplicate delivery progress unit id: {unit.unit_id}")
         seen.add(unit.unit_id)
+    if progress.assembly_status not in {None, "ready", "failed"}:
+        raise ValueError("delivery progress assembly_status is invalid")
+    assembly_values = (
+        progress.assembled_commit,
+        progress.assembly_status,
+        progress.assembly_unit_id,
+        progress.assembly_error_code,
+        progress.assembly_updated_at,
+    )
+    if any(assembly_values) and not progress.assembly_base_commit:
+        raise ValueError("delivery progress assembly metadata requires assembly_base_commit")
+    if progress.assembly_status == "failed":
+        if not progress.assembly_error_code:
+            raise ValueError("failed delivery assembly metadata requires an error code")
+    elif progress.assembly_unit_id or progress.assembly_error_code:
+        raise ValueError("delivery assembly failure metadata requires failed status")
 
 
 def _validate_unit_progress(unit: DeliveryUnitProgress) -> None:
@@ -883,6 +993,13 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
                 f"Final branch: {result.plan.final_branch}",
             ]
         )
+    assembled_commit = getattr(result, "assembled_commit", None)
+    if assembled_commit:
+        assembly_detail = f"{result.plan.final_branch} @ {assembled_commit}" if result.plan else assembled_commit
+        lines.append(f"Assembled: {assembly_detail}")
+        assembly_unit_id = getattr(result, "assembly_unit_id", None)
+        if getattr(result, "assembly_status", None) == "failed" and assembly_unit_id:
+            lines.append(f"Assembly blocked at unit: {assembly_unit_id}")
     if result.final_commit:
         final_branch = result.final_branch or (result.plan.final_branch if result.plan else None)
         final_ref = f"{final_branch} @ {result.final_commit}" if final_branch else result.final_commit
@@ -1006,6 +1123,12 @@ def _load_delivery_progress(path: Path, *, plan_id: str, errors: list[DeliveryPl
     progress_metadata = {
         key: _optional_string(data, key, key, errors)
         for key in (
+            "assembly_base_commit",
+            "assembled_commit",
+            "assembly_status",
+            "assembly_unit_id",
+            "assembly_error_code",
+            "assembly_updated_at",
             "final_branch",
             "final_commit",
             "finalized_at",
@@ -1032,7 +1155,20 @@ def _load_delivery_progress(path: Path, *, plan_id: str, errors: list[DeliveryPl
         units.append(unit)
     if errors:
         return None
-    return DeliveryProgress(schema_version=schema_version, plan_id=plan_id, units=units, **progress_metadata)
+    progress = DeliveryProgress(schema_version=schema_version, plan_id=plan_id, units=units, **progress_metadata)
+    try:
+        _validate_progress(progress)
+    except ValueError:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "progress.assembly_invalid",
+                "Delivery progress assembly metadata is invalid.",
+                "assembly_status",
+            )
+        )
+        return None
+    return progress
 
 
 def _parse_progress_unit(
@@ -1285,9 +1421,20 @@ def _overall_status(units: list[DeliveryStatusUnit]) -> str:
     return "pending"
 
 
-def _next_action(status: str, units: list[DeliveryStatusUnit], *, final_commit: str | None = None) -> str:
+def _next_action(
+    status: str,
+    units: list[DeliveryStatusUnit],
+    *,
+    final_commit: str | None = None,
+    assembly_status: str | None = None,
+    assembly_unit_id: str | None = None,
+) -> str:
     if status == "invalid":
         return "fix delivery plan status errors"
+    if assembly_status == "failed":
+        unit_detail = f" for unit {assembly_unit_id}" if assembly_unit_id else ""
+        command = "delivery finalize" if status == "done" else "delivery run-next"
+        return f"resolve delivery branch assembly{unit_detail}, then rerun {command}"
 
     running_units = [u for u in units if u.status == "running"]
     if running_units:

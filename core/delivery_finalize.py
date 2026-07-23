@@ -1,25 +1,29 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import subprocess
 from typing import Any
 
+from core.delivery_assembly import delivery_assembly_branch_is_symbolic
 from core.delivery_plan import DeliveryPlanIssue
 from core.delivery_progress import (
+    DeliveryProgressEvent,
     DeliveryProgressLockError,
     acquire_delivery_progress_lock,
     append_delivery_progress_event,
     delivery_events_path,
     delivery_progress_path,
     get_delivery_status,
+    mark_delivery_assembly,
     make_delivery_progress_event,
     mark_delivery_finalized,
     read_delivery_progress,
     write_delivery_progress,
 )
+from core.worktree import branch_checked_out
 
-_NULL_COMMIT = "0" * 40
+_UNSET: Any = object()
 
 
 @dataclass(frozen=True)
@@ -101,8 +105,7 @@ def finalize_delivery_plan(path: str | Path, *, project_root: Path | None = None
             return result
         root = Path(result.project_root).resolve()
         branch = result.final_branch
-        commit = result.final_commit
-        if branch is None or commit is None:
+        if branch is None:
             return _replace_result(
                 result,
                 ready=False,
@@ -128,14 +131,25 @@ def finalize_delivery_plan(path: str | Path, *, project_root: Path | None = None
                 message="Delivery progress could not be updated.",
             )
 
-        update_error = _update_final_branch(root, branch, commit)
-        if update_error:
+        progress, commit, assembly_error = _assemble_for_finalize(
+            root=root,
+            status=get_delivery_status(path, project_root=project_root),
+            progress=progress,
+            progress_path=progress_path,
+            events_path=events_path,
+        )
+        if assembly_error is not None or commit is None:
             return _replace_result(
                 result,
                 ready=False,
                 finalized=False,
-                errors=[*result.errors, update_error],
-                message="Delivery final branch could not be updated.",
+                final_commit=None,
+                errors=[*result.errors, assembly_error] if assembly_error else list(result.errors),
+                message=(
+                    assembly_error.message
+                    if assembly_error
+                    else "Delivery assembly did not produce a final branch commit."
+                ),
             )
 
         progress = mark_delivery_finalized(progress, final_branch=branch, final_commit=commit)
@@ -218,6 +232,7 @@ def _preflight_delivery_finalize(
     events_path: str | None = None
     branch = status.plan.final_branch if status.plan else None
     commit: str | None = None
+    assembly_pending = False
     message = "Delivery final branch is not ready."
 
     root = Path(status.project_root).resolve() if status.project_root else None
@@ -243,10 +258,27 @@ def _preflight_delivery_finalize(
         )
 
     if status.valid and root is not None and branch:
-        errors.extend(_finalize_git_errors(root, branch, status.units))
+        errors.extend(
+            _finalize_git_errors(
+                root,
+                branch,
+                status.units,
+                assembly_base_commit=status.assembly_base_commit,
+                assembled_commit=status.assembled_commit,
+            )
+        )
         if not errors:
-            commit = _final_commit_candidate(root)
-            if commit is None:
+            capability_error = _finalize_assembly_capability_error(root, status)
+            if capability_error is not None:
+                errors.append(capability_error)
+        if not errors:
+            candidate = _final_commit_candidate(
+                root,
+                branch=branch,
+                assembly_base_commit=status.assembly_base_commit,
+                assembled_commit=status.assembled_commit,
+            )
+            if candidate is None:
                 errors.append(
                     DeliveryPlanIssue(
                         "error",
@@ -254,14 +286,25 @@ def _preflight_delivery_finalize(
                         "Delivery finalize could not determine a final branch commit.",
                     )
                 )
-            else:
+            elif _commit_contains_completed_units(root, candidate, status.units):
+                commit = candidate
                 message = (
                     f"Dry run would update final branch {branch} to {commit}."
                     if dry_run
                     else f"Delivery final branch {branch} is ready to update to {commit}."
                 )
+            else:
+                assembly_pending = True
+                message = (
+                    (
+                        f"Dry run would assemble completed units into final branch {branch}; "
+                        "the resulting commit is not known yet."
+                    )
+                    if dry_run
+                    else f"Delivery final branch {branch} is ready for assembly."
+                )
 
-    ready = status.valid and not errors and branch is not None and commit is not None
+    ready = status.valid and not errors and branch is not None and (commit is not None or assembly_pending)
     return _FinalizePreflight(
         result=DeliveryFinalizeResult(
             plan_path=status.plan_path,
@@ -284,7 +327,32 @@ def _preflight_delivery_finalize(
     )
 
 
-def _finalize_git_errors(root: Path, branch: str, units) -> list[DeliveryPlanIssue]:
+def _finalize_assembly_capability_error(root: Path, status: Any) -> DeliveryPlanIssue | None:
+    from core.delivery_assembly import ordered_delivery_assembly_units, preview_delivery_assembly
+
+    if status.plan is None:
+        return None
+    completed_commits = {unit.id: unit.commit for unit in status.units if unit.status == "done"}
+    preview = preview_delivery_assembly(
+        root,
+        branch=status.plan.final_branch,
+        base_commit=status.assembly_base_commit or "HEAD",
+        expected_commit=status.assembled_commit,
+        units=ordered_delivery_assembly_units(status.plan, completed_commits),
+    )
+    if preview.error is not None and preview.error.code == "delivery.assembly_git_unsupported":
+        return preview.error
+    return None
+
+
+def _finalize_git_errors(
+    root: Path,
+    branch: str,
+    units,
+    *,
+    assembly_base_commit: str | None,
+    assembled_commit: str | None,
+) -> list[DeliveryPlanIssue]:
     errors: list[DeliveryPlanIssue] = []
     if not _valid_branch_name(root, branch):
         return [
@@ -294,20 +362,24 @@ def _finalize_git_errors(root: Path, branch: str, units) -> list[DeliveryPlanIss
                 "Delivery final_branch is not a valid local branch name.",
             )
         ]
+    if delivery_assembly_branch_is_symbolic(root, branch):
+        return [
+            DeliveryPlanIssue(
+                "error",
+                "delivery.assembly_branch_symbolic",
+                "Delivery final_branch must be a direct ref, not a symbolic ref.",
+            )
+        ]
 
-    head = _resolve_commit(root, "HEAD")
-    if head is None:
+    base = _resolve_commit(root, assembly_base_commit or "HEAD")
+    if base is None:
         errors.append(
             DeliveryPlanIssue(
                 "error",
-                "delivery.head_missing",
-                "Delivery finalize requires a current Git HEAD commit.",
+                "delivery.assembly_base_missing",
+                "Delivery finalize requires a resolvable assembly base commit.",
             )
         )
-        return errors
-
-    candidate = _final_commit_candidate(root)
-    if candidate is None:
         return errors
 
     for unit in units:
@@ -323,68 +395,197 @@ def _finalize_git_errors(root: Path, branch: str, units) -> list[DeliveryPlanIss
                 )
             )
             continue
-        if not _git_commit_is_ancestor(root, commit, head):
+    existing = _branch_commit(root, branch)
+    expected = _resolve_commit(root, assembled_commit) if assembled_commit else None
+    if assembled_commit and expected is None:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "delivery.assembly_expected_commit_missing",
+                "Recorded delivery assembly commit is missing.",
+            )
+        )
+    elif existing is None and expected is not None:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "delivery.assembly_branch_missing",
+                "Delivery assembly branch is missing after assembly progress was recorded.",
+            )
+        )
+    elif existing is not None and expected is not None and not _git_commit_is_ancestor(root, expected, existing):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "delivery.assembly_branch_diverged",
+                "Delivery assembly branch diverged from recorded assembly progress.",
+            )
+        )
+    elif existing is not None and expected is None:
+        branch_contains_base = _git_commit_is_ancestor(root, base, existing)
+        if branch_contains_base and existing != base:
             errors.append(
                 DeliveryPlanIssue(
                     "error",
-                    "delivery.unit_commit_unapplied",
-                    f"Unit {unit.id} result commit is not applied to the current checkout.",
+                    "delivery.assembly_branch_diverged",
+                    "Delivery assembly branch is ahead of the base without recorded assembly progress.",
                 )
             )
-        if not _git_commit_is_ancestor(root, commit, candidate):
+        elif not _git_commit_is_ancestor(root, existing, base):
             errors.append(
                 DeliveryPlanIssue(
                     "error",
-                    "delivery.final_commit_missing_unit",
-                    f"Unit {unit.id} result commit is not included in the final branch commit candidate.",
+                    "delivery.assembly_branch_diverged",
+                    "Delivery assembly branch does not share the assembly base history.",
                 )
             )
-
-    branch_error = _final_branch_move_error(root, branch, _branch_commit(root, branch), candidate)
-    if branch_error:
-        errors.append(branch_error)
+    if existing is not None and branch_checked_out(root, branch):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "delivery.assembly_branch_checked_out",
+                "Delivery assembly branch is checked out; switch that worktree away before retrying.",
+            )
+        )
     return errors
 
 
-def _final_commit_candidate(root: Path) -> str | None:
-    return _resolve_commit(root, "HEAD")
+def _final_commit_candidate(
+    root: Path,
+    *,
+    branch: str,
+    assembly_base_commit: str | None,
+    assembled_commit: str | None,
+) -> str | None:
+    branch_commit = _resolve_commit(root, f"refs/heads/{branch}")
+    expected_commit = _resolve_commit(root, assembled_commit) if assembled_commit else None
+    base_commit = _resolve_commit(root, assembly_base_commit or "HEAD")
+    if (
+        branch_commit is not None
+        and expected_commit is None
+        and base_commit is not None
+        and _git_commit_is_ancestor(root, branch_commit, base_commit)
+    ):
+        return base_commit
+    return branch_commit or expected_commit or base_commit
 
 
-def _update_final_branch(root: Path, branch: str, commit: str) -> DeliveryPlanIssue | None:
-    ref = f"refs/heads/{branch}"
-    existing = _branch_commit(root, branch)
-    if existing == commit:
-        return None
-    branch_error = _final_branch_move_error(root, branch, existing, commit)
-    if branch_error:
-        return branch_error
-    args = ["git", "update-ref", ref, commit, existing or _NULL_COMMIT]
-    result = subprocess.run(args, cwd=root, capture_output=True, text=True)
-    if result.returncode == 0:
-        return None
-    return DeliveryPlanIssue(
-        "error",
-        "delivery.final_branch_update_failed",
-        "Git refused to update the delivery final branch.",
+def _commit_contains_completed_units(root: Path, candidate: str, units) -> bool:
+    for unit in units:
+        if unit.status != "done" or not unit.commit:
+            continue
+        commit = _resolve_commit(root, unit.commit)
+        if commit is None or not _git_commit_is_ancestor(root, commit, candidate):
+            return False
+    return True
+
+
+def _assemble_for_finalize(
+    *,
+    root: Path,
+    status,
+    progress,
+    progress_path: Path,
+    events_path: Path,
+):
+    from core.delivery_assembly import assemble_delivery_commits, ordered_delivery_assembly_units
+
+    if status.plan is None:
+        issue = DeliveryPlanIssue(
+            "error",
+            "delivery.assembly_plan_missing",
+            "Delivery finalize requires a valid delivery plan.",
+        )
+        return progress, None, issue
+
+    base_commit = progress.assembly_base_commit or _resolve_commit(root, "HEAD")
+    if base_commit is None:
+        issue = DeliveryPlanIssue(
+            "error",
+            "delivery.assembly_base_missing",
+            "Delivery finalize requires a resolvable assembly base commit.",
+        )
+        return progress, None, issue
+    if progress.assembly_base_commit is None:
+        progress = replace(progress, assembly_base_commit=base_commit)
+        write_delivery_progress(progress_path, progress)
+
+    completed_commits = {unit.id: unit.commit for unit in status.units if unit.status == "done"}
+    units = ordered_delivery_assembly_units(status.plan, completed_commits)
+    previous_commit = progress.assembled_commit
+    result = assemble_delivery_commits(
+        root,
+        plan_id=status.plan.plan_id,
+        branch=status.plan.final_branch,
+        base_commit=base_commit,
+        expected_commit=progress.assembled_commit,
+        units=units,
     )
-
-
-def _final_branch_move_error(root: Path, branch: str, existing: str | None, target: str) -> DeliveryPlanIssue | None:
-    if existing is None or existing == target:
-        return None
-    if not _git_commit_is_ancestor(root, existing, target):
-        return DeliveryPlanIssue(
-            "error",
-            "delivery.final_branch_diverged",
-            "Delivery final branch already exists and cannot be fast-forwarded.",
+    if result.success and result.assembled_commit is not None:
+        progress = mark_delivery_assembly(
+            progress,
+            base_commit=result.base_commit,
+            assembled_commit=result.assembled_commit,
+            status="ready",
         )
-    if _branch_checked_out(root, branch):
-        return DeliveryPlanIssue(
-            "error",
-            "delivery.final_branch_checked_out",
-            "Delivery final branch is checked out; switch away before finalizing.",
+        write_delivery_progress(progress_path, progress)
+        for outcome in result.outcomes:
+            if outcome.outcome in {"already_applied", "no_op"} and previous_commit == outcome.assembled_commit:
+                continue
+            append_delivery_progress_event(
+                events_path,
+                DeliveryProgressEvent(
+                    plan_id=status.plan.plan_id,
+                    event_type=f"assembly.{outcome.outcome}",
+                    timestamp=progress.assembly_updated_at,
+                    unit_id=outcome.unit_id,
+                    branch=status.plan.final_branch,
+                    commit=outcome.assembled_commit,
+                ),
+            )
+        return progress, result.assembled_commit, None
+
+    issue = result.error or DeliveryPlanIssue(
+        "error",
+        "delivery.assembly_failed",
+        "Delivery branch assembly failed.",
+    )
+    progress = mark_delivery_assembly(
+        progress,
+        base_commit=result.base_commit,
+        assembled_commit=result.assembled_commit,
+        status="failed",
+        unit_id=result.failed_unit_id,
+        error_code=issue.code,
+    )
+    write_delivery_progress(progress_path, progress)
+    for outcome in result.outcomes:
+        if outcome.outcome in {"already_applied", "no_op"} and previous_commit == outcome.assembled_commit:
+            continue
+        append_delivery_progress_event(
+            events_path,
+            DeliveryProgressEvent(
+                plan_id=status.plan.plan_id,
+                event_type=f"assembly.{outcome.outcome}",
+                timestamp=progress.assembly_updated_at,
+                unit_id=outcome.unit_id,
+                branch=status.plan.final_branch,
+                commit=outcome.assembled_commit,
+            ),
         )
-    return None
+    append_delivery_progress_event(
+        events_path,
+        DeliveryProgressEvent(
+            plan_id=status.plan.plan_id,
+            event_type="assembly.failed",
+            timestamp=progress.assembly_updated_at,
+            unit_id=result.failed_unit_id,
+            branch=status.plan.final_branch,
+            commit=result.assembled_commit,
+            failure_code=issue.code,
+        ),
+    )
+    return progress, result.assembled_commit, issue
 
 
 def _valid_branch_name(root: Path, branch: str) -> bool:
@@ -405,14 +606,6 @@ def _valid_branch_name(root: Path, branch: str) -> bool:
 
 def _branch_commit(root: Path, branch: str) -> str | None:
     return _resolve_commit(root, f"refs/heads/{branch}")
-
-
-def _branch_checked_out(root: Path, branch: str) -> bool:
-    result = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=root, capture_output=True, text=True)
-    if result.returncode != 0:
-        return True
-    branch_ref = f"branch refs/heads/{branch}"
-    return any(line.strip() == branch_ref for line in result.stdout.splitlines())
 
 
 def _resolve_commit(root: Path, ref: str) -> str | None:
@@ -445,6 +638,7 @@ def _replace_result(
     finalized: bool,
     errors: list[DeliveryPlanIssue],
     message: str,
+    final_commit: str | None | Any = _UNSET,
 ) -> DeliveryFinalizeResult:
     return DeliveryFinalizeResult(
         plan_path=result.plan_path,
@@ -456,7 +650,7 @@ def _replace_result(
         status=result.status,
         progress_exists=result.progress_exists,
         final_branch=result.final_branch,
-        final_commit=result.final_commit,
+        final_commit=result.final_commit if final_commit is _UNSET else final_commit,
         progress_path=result.progress_path,
         events_path=result.events_path,
         errors=errors,

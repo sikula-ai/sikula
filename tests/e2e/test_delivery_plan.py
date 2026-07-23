@@ -516,13 +516,6 @@ def test_delivery_run_next_handoff_flows_between_dependent_children(
         assert first_handoff.result_commit
         assert "task_description" not in first_handoff.to_dict()
 
-        subprocess.run(
-            ["git", "merge", "--ff-only", first_handoff.result_commit],
-            cwd=git_project,
-            check=True,
-            capture_output=True,
-        )
-
         with patch("sys.argv", ["sikula", "delivery", "run-next", relative_plan, "--json"]):
             main()
 
@@ -542,6 +535,24 @@ def test_delivery_run_next_handoff_flows_between_dependent_children(
     assert first_handoff.fingerprint in second_child.analyst_prompt
     assert progress["units"][0]["handoff_fingerprint"] == first_handoff.fingerprint
     assert progress["units"][1]["handoff_schema_version"] == 1
+    assert progress["assembly_status"] == "ready"
+    assert progress["assembled_commit"] == second_child.result_commit
+    assert (
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", first_handoff.result_commit, progress["assembled_commit"]],
+            cwd=git_project,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+    operator_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=git_project,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert operator_head != progress["assembled_commit"]
 
 
 def test_delivery_run_next_prepares_budget_split_with_fake_llm(

@@ -22,6 +22,7 @@ from core.delivery_progress import (
     delivery_lock_path,
     delivery_progress_path,
     get_delivery_status,
+    mark_delivery_assembly,
     make_delivery_progress_event,
     make_delivery_unit_progress,
     render_delivery_status,
@@ -658,6 +659,10 @@ def test_unit_progress_update_clears_stale_finalization_metadata(tmp_path: Path)
             DeliveryUnitProgress(unit_id="01-foundation", status="done", commit="commit-1"),
             DeliveryUnitProgress(unit_id="02-feature", status="done", commit="commit-2"),
         ],
+        assembly_base_commit="base-commit",
+        assembled_commit="commit-2",
+        assembly_status="ready",
+        assembly_updated_at="2026-07-04T11:59:00+00:00",
         final_branch="sikula/delivery/status-demo",
         final_commit="commit-2",
         finalized_at="2026-07-04T12:00:00+00:00",
@@ -673,11 +678,45 @@ def test_unit_progress_update_clears_stale_finalization_metadata(tmp_path: Path)
     assert updated.final_branch is None
     assert updated.final_commit is None
     assert updated.finalized_at is None
+    assert updated.assembly_base_commit == "base-commit"
+    assert updated.assembled_commit == "commit-2"
+    assert updated.assembly_status == "ready"
     assert result.status == "done"
+    assert result.assembly_base_commit == "base-commit"
+    assert result.assembled_commit == "commit-2"
+    assert result.assembly_status == "ready"
     assert result.final_branch is None
     assert result.final_commit is None
     assert result.finalized_at is None
     assert result.next_action == "finalize delivery branch"
+
+
+def test_mark_delivery_assembly_records_and_clears_recoverable_failure() -> None:
+    progress = DeliveryProgress(schema_version=1, plan_id="plan", units=[])
+
+    failed = mark_delivery_assembly(
+        progress,
+        base_commit="base",
+        assembled_commit="partial",
+        status="failed",
+        unit_id="unit-2",
+        error_code="delivery.assembly_conflict",
+        timestamp="2026-07-04T12:00:00+00:00",
+    )
+    ready = mark_delivery_assembly(
+        failed,
+        base_commit="base",
+        assembled_commit="resolved",
+        status="ready",
+        timestamp="2026-07-04T12:05:00+00:00",
+    )
+
+    assert failed.to_dict()["assembly_error_code"] == "delivery.assembly_conflict"
+    assert failed.assembly_unit_id == "unit-2"
+    assert ready.assembly_status == "ready"
+    assert ready.assembled_commit == "resolved"
+    assert ready.assembly_unit_id is None
+    assert ready.assembly_error_code is None
 
 
 def test_delivery_status_reports_invalid_plan_without_progress_path(tmp_path: Path) -> None:
@@ -721,6 +760,28 @@ def test_delivery_status_reports_invalid_progress_json(tmp_path: Path) -> None:
     assert result.valid is False
     assert result.status == "invalid"
     assert "progress.parse_failed" in _error_codes(result)
+
+
+def test_delivery_status_rejects_inconsistent_assembly_metadata(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [],
+            "assembly_base_commit": "base",
+            "assembly_status": "failed",
+            "assembly_updated_at": "2026-07-04T12:00:00+00:00",
+        },
+    )
+
+    result = get_delivery_status(plan_path)
+
+    assert result.valid is False
+    assert "progress.assembly_invalid" in _error_codes(result)
 
 
 def test_delivery_status_reports_non_utf8_progress_file(tmp_path: Path) -> None:

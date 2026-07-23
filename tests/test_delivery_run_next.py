@@ -1523,6 +1523,66 @@ def test_cmd_delivery_run_next_dry_run_blocks_transitive_dependency_commit_when_
     assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
 
 
+def test_cmd_delivery_run_next_persists_assembly_conflict_without_starting_child(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    base = _git_commit(tmp_path, "shared.txt", "base\n")
+    main_branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "-q", "-b", "unit-one", base], cwd=tmp_path, check=True)
+    first_commit = _git_commit(tmp_path, "shared.txt", "unit one\n")
+    subprocess.run(["git", "checkout", "-q", "-b", "unit-two", base], cwd=tmp_path, check=True)
+    second_commit = _git_commit(tmp_path, "shared.txt", "unit two\n")
+    subprocess.run(["git", "checkout", "-q", main_branch], cwd=tmp_path, check=True)
+    plan_path = _write_transitive_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "done", "commit": first_commit},
+            {"unit_id": "02-noop", "status": "done", "commit": second_commit},
+        ],
+    )
+    child_started = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal child_started
+        child_started = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            _run_next_cfg(tmp_path),
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert child_started is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_unit"]["id"] == "03-feature"
+    assert payload["errors"][0]["code"] == "delivery.assembly_conflict"
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["assembly_status"] == "failed"
+    assert progress["assembly_unit_id"] == "02-noop"
+    assert progress["assembled_commit"] == first_commit
+    operator_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert operator_head == base
+    assert not (tmp_path / ".git" / "MERGE_HEAD").exists()
+
+
 def test_cmd_delivery_run_next_runs_dependent_unit_when_dependency_commit_is_applied(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1557,6 +1617,44 @@ def test_cmd_delivery_run_next_runs_dependent_unit_when_dependency_commit_is_app
     assert progress["units"][0]["unit_id"] == "01-foundation"
     assert progress["units"][1]["unit_id"] == "02-feature"
     assert progress["units"][1]["status"] == "done"
+
+
+def test_cmd_delivery_run_next_dry_run_allows_assemblable_dependency_not_in_head(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    base = _git_commit(tmp_path, "base.txt", "base\n")
+    main_branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "-q", "-b", "unit-one", base], cwd=tmp_path, check=True)
+    dependency_commit = _git_commit(tmp_path, "dependency.txt", "dependency\n")
+    subprocess.run(["git", "checkout", "-q", main_branch], cwd=tmp_path, check=True)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-foundation", "status": "done", "commit": dependency_commit}],
+    )
+
+    cmd_delivery_run_next(
+        _run_next_args(plan_path, dry_run=True, json_output=True),
+        _run_next_cfg(tmp_path),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
+    assert payload["selected_unit"]["id"] == "02-feature"
+    final_ref = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", "refs/heads/sikula/delivery/run-next-demo"],
+        cwd=tmp_path,
+    )
+    assert final_ref.returncode == 1
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
 
 
 def test_run_next_persists_handoff_and_passes_it_to_dependent_child(
@@ -1602,8 +1700,10 @@ def test_run_next_persists_handoff_and_passes_it_to_dependent_child(
         json.loads(line)
         for line in delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
     ]
-    assert first_events[-1]["handoff_schema_version"] == 1
-    assert first_events[-1]["handoff_fingerprint"] == first_handoff.fingerprint
+    done_event = next(event for event in first_events if event["event_type"] == "unit.done")
+    assert done_event["handoff_schema_version"] == 1
+    assert done_event["handoff_fingerprint"] == first_handoff.fingerprint
+    assert first_events[-1]["event_type"] in {"assembly.fast_forward", "assembly.already_applied"}
 
     cmd_delivery_run_next(_run_next_args(plan_path, json_output=True), cfg, context)
 
@@ -4331,6 +4431,42 @@ def test_cmd_delivery_run_next_dry_run_allows_completed_failed_child_retry_witho
     assert payload["selected_unit"]["child_task_id"] == "task-xyz"
     assert payload["errors"] == []
     assert "selected failed delivery unit" in payload["message"]
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_dry_run_blocks_failed_retry_with_unapplied_dependency(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    _git_commit(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "done", "commit": "deadbeef"},
+            {"unit_id": "02-feature", "status": "failed", "child_task_id": "task-xyz"},
+        ],
+    )
+
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    state = _resume_child_state(task_id="task-xyz", unit_id="02-feature")
+    state.failed = True
+    _record_resume_worktree(state, tmp_path, branch="sikula/02-feature-child")
+    store.save(state)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, dry_run=True, reset_failed=True, json_output=True),
+            cfg,
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is False
+    assert payload["selected_unit"]["id"] == "02-feature"
+    assert payload["selected_unit"]["status"] == "failed"
+    assert payload["errors"][0]["code"] == "delivery.dependency_commit_unapplied"
     assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
 
 

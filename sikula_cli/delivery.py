@@ -1987,38 +1987,6 @@ def _run_next_delivery_unit(
                 message=message,
             )
 
-        dependency_errors = _dependency_commit_errors(status, selected_unit, root)
-        if dependency_errors:
-            errors.extend(dependency_errors)
-            if reset_failed:
-                return DeliveryRunNextExecutionResult(
-                    plan_path=status.plan_path,
-                    project_root=str(root.resolve()),
-                    valid=False,
-                    ran=False,
-                    succeeded=False,
-                    status=status.status,
-                    progress_exists=status.progress_exists,
-                    selected_unit=selected_unit,
-                    child_task_id=None,
-                    unit_status=None,
-                    run_exit_code=None,
-                    progress_path=str(progress_path),
-                    events_path=str(events_path),
-                    errors=errors,
-                    warnings=status.warnings,
-                    message="Delivery unit dependencies are not applied to the current checkout.",
-                )
-            return _execution_result_from_status(
-                status,
-                ran=False,
-                selected_unit=selected_unit,
-                progress_path=str(progress_path),
-                events_path=str(events_path),
-                errors=errors,
-                message="Delivery unit dependencies are not applied to the current checkout.",
-            )
-
         dependency_handoffs, handoff_errors = _load_dependency_handoffs(status, selected_unit, root)
         if handoff_errors:
             errors.extend(handoff_errors)
@@ -2033,6 +2001,23 @@ def _run_next_delivery_unit(
             )
 
         if reset_failed and selected_unit.status == "failed":
+            dependency_errors = _dependency_commit_errors(
+                status,
+                selected_unit,
+                root,
+                target_commit=_delivery_assembly_target_commit(status, root),
+            )
+            if dependency_errors:
+                errors.extend(dependency_errors)
+                return _execution_result_from_status(
+                    status,
+                    ran=False,
+                    selected_unit=selected_unit,
+                    progress_path=str(progress_path),
+                    events_path=str(events_path),
+                    errors=errors,
+                    message="Delivery unit dependencies are not present in the assembled delivery branch.",
+                )
             return _handle_failed_delivery_unit_retry(
                 args=args,
                 cfg=cfg,
@@ -2046,6 +2031,43 @@ def _run_next_delivery_unit(
             )
 
         progress = _progress_for_update(status, progress_path, read_delivery_progress=read_delivery_progress)
+        progress, assembly_commit, assembly_issue = _assemble_completed_delivery_units(
+            status=status,
+            root=root,
+            progress=progress,
+            progress_path=progress_path,
+            events_path=events_path,
+        )
+        if assembly_issue is not None:
+            updated_status = get_delivery_status(args.plan_file, project_root=project_root)
+            return _execution_result_from_status(
+                updated_status,
+                ran=False,
+                selected_unit=selected_unit,
+                progress_path=str(progress_path),
+                events_path=str(events_path),
+                errors=[*updated_status.errors, assembly_issue],
+                message=assembly_issue.message,
+            )
+
+        dependency_errors = _dependency_commit_errors(
+            status,
+            selected_unit,
+            root,
+            target_commit=assembly_commit,
+        )
+        if dependency_errors:
+            errors.extend(dependency_errors)
+            return _execution_result_from_status(
+                status,
+                ran=False,
+                selected_unit=selected_unit,
+                progress_path=str(progress_path),
+                events_path=str(events_path),
+                errors=errors,
+                message="Delivery unit dependencies are not present in the assembled delivery branch.",
+            )
+
         progress_before_start = progress
         progress_existed_before_start = progress_path.exists()
         running_unit = make_delivery_unit_progress(selected_unit.id, "running")
@@ -2089,6 +2111,7 @@ def _run_next_delivery_unit(
             delivery_handoff_schema_version=SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION,
             delivery_dependency_handoffs=dependency_handoffs,
             delivery_child_created_callback=link_child_task,
+            worktree_start_ref=assembly_commit,
         )
         state_dir = context.resolve_state_dir(cfg)
         store = JsonStateStore(state_dir)
@@ -2182,15 +2205,25 @@ def _run_next_delivery_unit(
             progress_path=progress_path,
             events_path=events_path,
         )
+        progress, updated_status, assembly_issue = _assemble_terminal_delivery_result(
+            plan_file=args.plan_file,
+            root=root,
+            progress=progress,
+            progress_path=progress_path,
+            events_path=events_path,
+            unit_status=unit_status,
+            handoff_issue=handoff_issue,
+        )
         if child_result.interrupted:
             raise KeyboardInterrupt
         if child_result.exception is not None:
             raise child_result.exception
-        updated_status = get_delivery_status(args.plan_file, project_root=project_root)
         updated_unit = _status_unit_by_id(updated_status, selected_unit.id) or selected_unit
 
         if handoff_issue is not None:
             message = handoff_issue.message
+        elif assembly_issue is not None:
+            message = assembly_issue.message
         elif unit_status == "done":
             message = f"Delivery unit {selected_unit.id} completed."
         elif updated_unit.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE:
@@ -2203,9 +2236,9 @@ def _run_next_delivery_unit(
         return DeliveryRunNextExecutionResult(
             plan_path=status.plan_path,
             project_root=status.project_root,
-            valid=updated_status.valid and handoff_issue is None,
+            valid=updated_status.valid and handoff_issue is None and assembly_issue is None,
             ran=True,
-            succeeded=unit_status == "done" and updated_status.valid,
+            succeeded=unit_status == "done" and updated_status.valid and assembly_issue is None,
             status=updated_status.status,
             progress_exists=updated_status.progress_exists,
             selected_unit=updated_unit,
@@ -2214,7 +2247,11 @@ def _run_next_delivery_unit(
             run_exit_code=child_result.exit_code,
             progress_path=str(progress_path),
             events_path=str(events_path),
-            errors=[*updated_status.errors, *([handoff_issue] if handoff_issue else [])],
+            errors=[
+                *updated_status.errors,
+                *([handoff_issue] if handoff_issue else []),
+                *([assembly_issue] if assembly_issue else []),
+            ],
             warnings=updated_status.warnings,
             message=message,
         )
@@ -2303,6 +2340,12 @@ def _progress_from_status(status):
         schema_version=1,
         plan_id=status.plan.plan_id,
         units=units,
+        assembly_base_commit=status.assembly_base_commit,
+        assembled_commit=status.assembled_commit,
+        assembly_status=status.assembly_status,
+        assembly_unit_id=status.assembly_unit_id,
+        assembly_error_code=status.assembly_error_code,
+        assembly_updated_at=status.assembly_updated_at,
         final_branch=status.final_branch,
         final_commit=status.final_commit,
         finalized_at=status.finalized_at,
@@ -2315,6 +2358,235 @@ def _progress_for_update(status, progress_path: Path, *, read_delivery_progress:
         if progress is not None and not errors:
             return progress
     return _progress_from_status(status)
+
+
+def _assemble_completed_delivery_units(
+    *,
+    status,
+    root: Path,
+    progress,
+    progress_path: Path,
+    events_path: Path,
+):
+    from core.delivery_assembly import assemble_delivery_commits, ordered_delivery_assembly_units
+    from core.delivery_plan import DeliveryPlanIssue
+    from core.delivery_progress import (
+        DeliveryProgressEvent,
+        append_delivery_progress_event,
+        mark_delivery_assembly,
+        write_delivery_progress,
+    )
+
+    if status.plan is None:
+        issue = DeliveryPlanIssue(
+            "error",
+            "delivery.assembly_plan_missing",
+            "Delivery assembly requires a valid delivery plan.",
+        )
+        return progress, None, issue
+
+    base_commit = progress.assembly_base_commit or _resolve_git_commit(root, "HEAD")
+    if base_commit is None:
+        return progress, None, None
+
+    initialized = progress.assembly_base_commit is None
+    if initialized:
+        progress = replace(progress, assembly_base_commit=base_commit)
+        write_delivery_progress(progress_path, progress)
+
+    completed_commits = {
+        unit.id: unit.commit for unit in status.units if unit.status == "done" and unit.status != "superseded"
+    }
+    units = ordered_delivery_assembly_units(status.plan, completed_commits)
+    previous_commit = progress.assembled_commit
+    previous_status = progress.assembly_status
+    previous_updated_at = progress.assembly_updated_at
+    result = assemble_delivery_commits(
+        root,
+        plan_id=status.plan.plan_id,
+        branch=status.plan.final_branch,
+        base_commit=base_commit,
+        expected_commit=previous_commit,
+        units=units,
+    )
+
+    if result.success and result.assembled_commit is not None:
+        progress = mark_delivery_assembly(
+            progress,
+            base_commit=result.base_commit,
+            assembled_commit=result.assembled_commit,
+            status="ready",
+        )
+        write_delivery_progress(progress_path, progress)
+        if initialized:
+            append_delivery_progress_event(
+                events_path,
+                DeliveryProgressEvent(
+                    plan_id=status.plan.plan_id,
+                    event_type="assembly.initialized",
+                    timestamp=progress.assembly_updated_at,
+                    branch=status.plan.final_branch,
+                    commit=result.base_commit,
+                ),
+            )
+        status_units = {unit.id: unit for unit in status.units}
+        for outcome in result.outcomes:
+            unit = status_units.get(outcome.unit_id)
+            if not _delivery_assembly_outcome_is_new(
+                root=root,
+                outcome=outcome,
+                unit=unit,
+                previous_commit=previous_commit,
+                previous_status=previous_status,
+                previous_updated_at=previous_updated_at,
+            ):
+                continue
+            append_delivery_progress_event(
+                events_path,
+                DeliveryProgressEvent(
+                    plan_id=status.plan.plan_id,
+                    event_type=f"assembly.{outcome.outcome}",
+                    timestamp=progress.assembly_updated_at,
+                    unit_id=outcome.unit_id,
+                    branch=status.plan.final_branch,
+                    commit=outcome.assembled_commit,
+                ),
+            )
+        return progress, result.assembled_commit, None
+
+    issue = result.error or DeliveryPlanIssue(
+        "error",
+        "delivery.assembly_failed",
+        "Delivery branch assembly failed.",
+    )
+    progress = mark_delivery_assembly(
+        progress,
+        base_commit=result.base_commit,
+        assembled_commit=result.assembled_commit,
+        status="failed",
+        unit_id=result.failed_unit_id,
+        error_code=issue.code,
+    )
+    write_delivery_progress(progress_path, progress)
+    status_units = {unit.id: unit for unit in status.units}
+    for outcome in result.outcomes:
+        unit = status_units.get(outcome.unit_id)
+        if not _delivery_assembly_outcome_is_new(
+            root=root,
+            outcome=outcome,
+            unit=unit,
+            previous_commit=previous_commit,
+            previous_status=previous_status,
+            previous_updated_at=previous_updated_at,
+        ):
+            continue
+        append_delivery_progress_event(
+            events_path,
+            DeliveryProgressEvent(
+                plan_id=status.plan.plan_id,
+                event_type=f"assembly.{outcome.outcome}",
+                timestamp=progress.assembly_updated_at,
+                unit_id=outcome.unit_id,
+                branch=status.plan.final_branch,
+                commit=outcome.assembled_commit,
+            ),
+        )
+    append_delivery_progress_event(
+        events_path,
+        DeliveryProgressEvent(
+            plan_id=status.plan.plan_id,
+            event_type="assembly.failed",
+            timestamp=progress.assembly_updated_at,
+            unit_id=result.failed_unit_id,
+            branch=status.plan.final_branch,
+            commit=result.assembled_commit,
+            failure_code=issue.code,
+        ),
+    )
+    return progress, result.assembled_commit, issue
+
+
+def _assemble_terminal_delivery_result(
+    *,
+    plan_file: str | Path,
+    root: Path,
+    progress,
+    progress_path: Path,
+    events_path: Path,
+    unit_status: str,
+    handoff_issue,
+):
+    from core.delivery_progress import get_delivery_status
+
+    status = get_delivery_status(plan_file, project_root=root)
+    assembly_issue = None
+    if unit_status == "done" and handoff_issue is None:
+        progress, _, assembly_issue = _assemble_completed_delivery_units(
+            status=status,
+            root=root,
+            progress=progress,
+            progress_path=progress_path,
+            events_path=events_path,
+        )
+        status = get_delivery_status(plan_file, project_root=root)
+    return progress, status, assembly_issue
+
+
+def _delivery_assembly_outcome_is_new(
+    *,
+    root: Path,
+    outcome,
+    unit,
+    previous_commit: str | None,
+    previous_status: str | None,
+    previous_updated_at: str | None,
+) -> bool:
+    if outcome.outcome in {"fast_forward", "merged"}:
+        return True
+    if outcome.outcome == "already_applied":
+        if previous_commit is None or outcome.result_commit is None:
+            return previous_status != "ready"
+        return not _git_commit_is_ancestor(root, outcome.result_commit, previous_commit)
+    if outcome.outcome == "no_op":
+        unit_updated_at = getattr(unit, "updated_at", None)
+        return previous_updated_at is None or (unit_updated_at is not None and unit_updated_at > previous_updated_at)
+    return previous_status != "ready"
+
+
+def _delivery_assembly_target_commit(status, root: Path) -> str | None:
+    if status.assembled_commit:
+        return _resolve_git_commit(root, status.assembled_commit)
+    if status.plan is not None:
+        branch_commit = _resolve_git_commit(root, f"refs/heads/{status.plan.final_branch}")
+        if branch_commit:
+            return branch_commit
+    return _resolve_git_commit(root, "HEAD")
+
+
+def _delivery_assembly_preview_issue(status: Any, root: Path) -> DeliveryPlanIssue | None:
+    from core.delivery_assembly import ordered_delivery_assembly_units, preview_delivery_assembly
+
+    if status.plan is None:
+        return None
+    base_commit = status.assembly_base_commit or _resolve_git_commit(root, "HEAD")
+    if base_commit is None:
+        return None
+    completed_commits = {unit.id: unit.commit for unit in status.units if unit.status == "done"}
+    result = preview_delivery_assembly(
+        root,
+        branch=status.plan.final_branch,
+        base_commit=base_commit,
+        expected_commit=status.assembled_commit,
+        units=ordered_delivery_assembly_units(status.plan, completed_commits),
+    )
+    return result.error
+
+
+def _resolve_git_commit(root: Path, ref: str) -> str | None:
+    from core.worktree import resolve_git_commit
+
+    commit, _ = resolve_git_commit(root, ref)
+    return commit
 
 
 def _apply_delivery_preview_execution_guards(
@@ -2362,16 +2634,6 @@ def _apply_delivery_preview_execution_guards(
     if selected_unit.status == "running":
         return replace(preview, selected_unit=selected_unit)
 
-    dependency_errors = _dependency_commit_errors(status, selected_unit, root)
-    if dependency_errors:
-        return replace(
-            preview,
-            valid=False,
-            ready=False,
-            selected_unit=selected_unit,
-            errors=[*preview.errors, *dependency_errors],
-            message="Delivery unit dependencies are not applied to the current checkout.",
-        )
     _, handoff_errors = _load_dependency_handoffs(status, selected_unit, root)
     if handoff_errors:
         return replace(
@@ -2382,6 +2644,45 @@ def _apply_delivery_preview_execution_guards(
             errors=[*preview.errors, *handoff_errors],
             message="Delivery unit dependency handoff evidence is unavailable or invalid.",
         )
+    if selected_unit.status == "failed":
+        dependency_errors = _dependency_commit_errors(
+            status,
+            selected_unit,
+            root,
+            target_commit=_delivery_assembly_target_commit(status, root),
+        )
+        if dependency_errors:
+            return replace(
+                preview,
+                valid=False,
+                ready=False,
+                selected_unit=selected_unit,
+                errors=[*preview.errors, *dependency_errors],
+                message="Delivery unit dependencies are not present in the assembled delivery branch.",
+            )
+        return preview
+    assembly_issue = _delivery_assembly_preview_issue(status, root)
+    if assembly_issue is not None:
+        return replace(
+            preview,
+            valid=False,
+            ready=False,
+            selected_unit=selected_unit,
+            errors=[*preview.errors, assembly_issue],
+            message=assembly_issue.message,
+        )
+    assembly_base = status.assembly_base_commit or _resolve_git_commit(root, "HEAD")
+    if assembly_base is None:
+        dependency_errors = _dependency_commit_errors(status, selected_unit, root)
+        if dependency_errors:
+            return replace(
+                preview,
+                valid=False,
+                ready=False,
+                selected_unit=selected_unit,
+                errors=[*preview.errors, *dependency_errors],
+                message="Delivery unit dependencies are not present in the assembled delivery branch.",
+            )
     return preview
 
 
@@ -2463,7 +2764,7 @@ def _delivery_preview_child_state_issue(
     return None
 
 
-def _dependency_commit_errors(status, selected_unit, root: Path):
+def _dependency_commit_errors(status, selected_unit, root: Path, *, target_commit: str | None = None):
     from core.delivery_plan import DeliveryPlanIssue
 
     units_by_id = {unit.id: unit for unit in status.units}
@@ -2483,12 +2784,22 @@ def _dependency_commit_errors(status, selected_unit, root: Path):
             continue
         if not dependency_unit.commit:
             continue
-        if not _git_commit_is_ancestor(root, dependency_unit.commit):
+        resolved_commit = _resolve_git_commit(root, dependency_unit.commit)
+        if resolved_commit is None:
             errors.append(
                 DeliveryPlanIssue(
                     "error",
                     "delivery.dependency_commit_unapplied",
-                    f"Dependency unit {dependency} result commit is not applied to the current checkout.",
+                    f"Dependency unit {dependency} result commit is not present in the assembled delivery branch.",
+                )
+            )
+            continue
+        if target_commit is not None and not _git_commit_is_ancestor(root, resolved_commit, target_commit):
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery.dependency_commit_unapplied",
+                    f"Dependency unit {dependency} result commit is not present in the assembled delivery branch.",
                 )
             )
     return errors
@@ -2717,7 +3028,6 @@ def _run_delivery_child_retry(
     from core.delivery_plan import DeliveryPlanIssue
     from core.delivery_progress import (
         append_delivery_progress_event,
-        get_delivery_status,
         make_delivery_progress_event,
         make_delivery_unit_progress,
         read_delivery_progress,
@@ -2780,11 +3090,21 @@ def _run_delivery_child_retry(
             progress_path=progress_path,
             events_path=events_path,
         )
-        updated_status = get_delivery_status(args.plan_file, project_root=root)
+        progress, updated_status, assembly_issue = _assemble_terminal_delivery_result(
+            plan_file=args.plan_file,
+            root=root,
+            progress=progress,
+            progress_path=progress_path,
+            events_path=events_path,
+            unit_status=unit_status,
+            handoff_issue=handoff_issue,
+        )
         updated_unit = _status_unit_by_id(updated_status, unit_id) or selected_unit
         message = (
             handoff_issue.message
             if handoff_issue is not None
+            else assembly_issue.message
+            if assembly_issue is not None
             else (
                 f"Delivery unit {unit_id} reconciled terminal child task as done."
                 if unit_status == "done"
@@ -2794,9 +3114,9 @@ def _run_delivery_child_retry(
         return DeliveryRunNextExecutionResult(
             plan_path=status.plan_path,
             project_root=str(root.resolve()),
-            valid=updated_status.valid and handoff_issue is None,
+            valid=updated_status.valid and handoff_issue is None and assembly_issue is None,
             ran=True,
-            succeeded=unit_status == "done" and updated_status.valid,
+            succeeded=unit_status == "done" and updated_status.valid and assembly_issue is None,
             status=updated_status.status,
             progress_exists=updated_status.progress_exists,
             selected_unit=updated_unit,
@@ -2805,7 +3125,11 @@ def _run_delivery_child_retry(
             run_exit_code=None,
             progress_path=str(progress_path),
             events_path=str(events_path),
-            errors=[*updated_status.errors, *([handoff_issue] if handoff_issue else [])],
+            errors=[
+                *updated_status.errors,
+                *([handoff_issue] if handoff_issue else []),
+                *([assembly_issue] if assembly_issue else []),
+            ],
             warnings=updated_status.warnings,
             message=message,
         )
@@ -2854,17 +3178,27 @@ def _run_delivery_child_retry(
         progress_path=progress_path,
         events_path=events_path,
     )
+    progress, updated_status, assembly_issue = _assemble_terminal_delivery_result(
+        plan_file=args.plan_file,
+        root=root,
+        progress=progress,
+        progress_path=progress_path,
+        events_path=events_path,
+        unit_status=unit_status,
+        handoff_issue=handoff_issue,
+    )
 
     if child_result.interrupted:
         raise KeyboardInterrupt
     if child_result.exception is not None:
         raise child_result.exception
 
-    updated_status = get_delivery_status(args.plan_file, project_root=root)
     updated_unit = _status_unit_by_id(updated_status, unit_id) or selected_unit
     message = (
         handoff_issue.message
         if handoff_issue is not None
+        else assembly_issue.message
+        if assembly_issue is not None
         else (
             f"Delivery unit {unit_id} retried and completed."
             if unit_status == "done"
@@ -2875,9 +3209,9 @@ def _run_delivery_child_retry(
     return DeliveryRunNextExecutionResult(
         plan_path=status.plan_path,
         project_root=str(root.resolve()),
-        valid=updated_status.valid and handoff_issue is None,
+        valid=updated_status.valid and handoff_issue is None and assembly_issue is None,
         ran=True,
-        succeeded=unit_status == "done" and updated_status.valid,
+        succeeded=unit_status == "done" and updated_status.valid and assembly_issue is None,
         status=updated_status.status,
         progress_exists=updated_status.progress_exists,
         selected_unit=updated_unit,
@@ -2886,7 +3220,11 @@ def _run_delivery_child_retry(
         run_exit_code=child_result.exit_code,
         progress_path=str(progress_path),
         events_path=str(events_path),
-        errors=[*updated_status.errors, *([handoff_issue] if handoff_issue else [])],
+        errors=[
+            *updated_status.errors,
+            *([handoff_issue] if handoff_issue else []),
+            *([assembly_issue] if assembly_issue else []),
+        ],
         warnings=updated_status.warnings,
         message=message,
     )
@@ -2906,7 +3244,6 @@ def _handle_running_delivery_unit(
 ) -> "DeliveryRunNextExecutionResult":
     from core.delivery_progress import (
         append_delivery_progress_event,
-        get_delivery_status,
         make_delivery_progress_event,
         make_delivery_unit_progress,
         read_delivery_progress,
@@ -3059,11 +3396,21 @@ def _handle_running_delivery_unit(
             progress_path=progress_path,
             events_path=events_path,
         )
-        updated_status = get_delivery_status(args.plan_file, project_root=root)
+        progress, updated_status, assembly_issue = _assemble_terminal_delivery_result(
+            plan_file=args.plan_file,
+            root=root,
+            progress=progress,
+            progress_path=progress_path,
+            events_path=events_path,
+            unit_status=unit_status,
+            handoff_issue=handoff_issue,
+        )
         updated_unit = _status_unit_by_id(updated_status, unit_id) or running_unit
         message = (
             handoff_issue.message
             if handoff_issue is not None
+            else assembly_issue.message
+            if assembly_issue is not None
             else (
                 f"Delivery unit {unit_id} reconciled terminal child task as done."
                 if unit_status == "done"
@@ -3073,9 +3420,9 @@ def _handle_running_delivery_unit(
         return DeliveryRunNextExecutionResult(
             plan_path=status.plan_path,
             project_root=str(root.resolve()),
-            valid=updated_status.valid and handoff_issue is None,
+            valid=updated_status.valid and handoff_issue is None and assembly_issue is None,
             ran=True,
-            succeeded=unit_status == "done" and updated_status.valid,
+            succeeded=unit_status == "done" and updated_status.valid and assembly_issue is None,
             status=updated_status.status,
             progress_exists=updated_status.progress_exists,
             selected_unit=updated_unit,
@@ -3084,7 +3431,11 @@ def _handle_running_delivery_unit(
             run_exit_code=None,
             progress_path=str(progress_path),
             events_path=str(events_path),
-            errors=[*updated_status.errors, *([handoff_issue] if handoff_issue else [])],
+            errors=[
+                *updated_status.errors,
+                *([handoff_issue] if handoff_issue else []),
+                *([assembly_issue] if assembly_issue else []),
+            ],
             warnings=updated_status.warnings,
             message=message,
         )
@@ -3127,16 +3478,26 @@ def _handle_running_delivery_unit(
         progress_path=progress_path,
         events_path=events_path,
     )
+    progress, updated_status, assembly_issue = _assemble_terminal_delivery_result(
+        plan_file=args.plan_file,
+        root=root,
+        progress=progress,
+        progress_path=progress_path,
+        events_path=events_path,
+        unit_status=unit_status,
+        handoff_issue=handoff_issue,
+    )
     if child_result.interrupted:
         raise KeyboardInterrupt
     if child_result.exception is not None:
         raise child_result.exception
 
-    updated_status = get_delivery_status(args.plan_file, project_root=root)
     updated_unit = _status_unit_by_id(updated_status, unit_id) or running_unit
     message = (
         handoff_issue.message
         if handoff_issue is not None
+        else assembly_issue.message
+        if assembly_issue is not None
         else (
             f"Delivery unit {unit_id} resumed and completed."
             if unit_status == "done"
@@ -3146,9 +3507,9 @@ def _handle_running_delivery_unit(
     return DeliveryRunNextExecutionResult(
         plan_path=status.plan_path,
         project_root=str(root.resolve()),
-        valid=updated_status.valid and handoff_issue is None,
+        valid=updated_status.valid and handoff_issue is None and assembly_issue is None,
         ran=True,
-        succeeded=unit_status == "done" and updated_status.valid,
+        succeeded=unit_status == "done" and updated_status.valid and assembly_issue is None,
         status=updated_status.status,
         progress_exists=updated_status.progress_exists,
         selected_unit=updated_unit,
@@ -3157,7 +3518,11 @@ def _handle_running_delivery_unit(
         run_exit_code=child_result.exit_code,
         progress_path=str(progress_path),
         events_path=str(events_path),
-        errors=[*updated_status.errors, *([handoff_issue] if handoff_issue else [])],
+        errors=[
+            *updated_status.errors,
+            *([handoff_issue] if handoff_issue else []),
+            *([assembly_issue] if assembly_issue else []),
+        ],
         warnings=updated_status.warnings,
         message=message,
     )
@@ -3377,10 +3742,10 @@ def _delivery_child_budget_exceeded(child_state) -> DeliveryBudgetExceeded | Non
     return DeliveryBudgetExceeded(name=name, limit=limit, actual=actual)
 
 
-def _git_commit_is_ancestor(root: Path, commit: str) -> bool:
+def _git_commit_is_ancestor(root: Path, commit: str, descendant: str = "HEAD") -> bool:
     try:
         result = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+            ["git", "merge-base", "--is-ancestor", commit, descendant],
             cwd=root,
             capture_output=True,
             text=True,
@@ -3433,6 +3798,7 @@ def _invoke_delivery_child_run(
     delivery_handoff_schema_version: int | None = None,
     delivery_dependency_handoffs: list[dict] | None = None,
     delivery_child_created_callback: Callable[[str], None] | None = None,
+    worktree_start_ref: str | None = None,
 ) -> DeliveryChildRunResult:
     run_args = _delivery_child_run_args(
         root=root,
@@ -3447,6 +3813,7 @@ def _invoke_delivery_child_run(
         delivery_handoff_schema_version=delivery_handoff_schema_version,
         delivery_dependency_handoffs=delivery_dependency_handoffs,
         delivery_child_created_callback=delivery_child_created_callback,
+        worktree_start_ref=worktree_start_ref,
     )
     return _invoke_delivery_child_run_args(args, cfg, context, run_args)
 
@@ -3465,6 +3832,7 @@ def _delivery_child_run_args(
     delivery_handoff_schema_version: int | None = None,
     delivery_dependency_handoffs: list[dict] | None = None,
     delivery_child_created_callback: Callable[[str], None] | None = None,
+    worktree_start_ref: str | None = None,
 ) -> argparse.Namespace:
     absolute_task_path = (root / task_path).resolve()
     return argparse.Namespace(
@@ -3495,6 +3863,7 @@ def _delivery_child_run_args(
         delivery_handoff_schema_version=delivery_handoff_schema_version,
         delivery_dependency_handoffs=copy.deepcopy(delivery_dependency_handoffs or []),
         delivery_child_created_callback=delivery_child_created_callback,
+        worktree_start_ref=worktree_start_ref,
         created_task_id=None,
     )
 
@@ -3536,6 +3905,7 @@ def _delivery_child_resume_run_args(
         delivery_handoff_schema_version=None,
         delivery_dependency_handoffs=None,
         delivery_child_created_callback=None,
+        worktree_start_ref=None,
         created_task_id=created_task_id,
     )
 

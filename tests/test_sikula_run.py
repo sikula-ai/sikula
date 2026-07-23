@@ -1459,6 +1459,54 @@ class TestIsolatedRunConfigGuard:
 
         _require_committed_config_for_isolated_run({"_config_path": str(config_path)}, tmp_path)
 
+    def test_assembled_start_ref_with_different_config_exits_before_worktree(
+        self,
+        tmp_path: Path,
+        capsys,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        config_path = self._init_repo_with_config(tmp_path, commit_config=True)
+        main_branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "checkout", "-q", "-b", "assembled"], cwd=tmp_path, check=True)
+        config_path.write_text("project:\n  root_path: .\n  build_tool: python\nrun_tests: false\n")
+        _git_commit_all(tmp_path, "Change assembled config")
+        assembled_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "checkout", "-q", main_branch], cwd=tmp_path, check=True)
+        task_file = tmp_path / "task.md"
+        task_file.write_text("do something")
+        cfg = _run_cfg(tmp_path)
+        cfg["_config_path"] = str(config_path)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_run(
+                _run_args(
+                    task_file=str(task_file),
+                    worktree_start_ref=assembled_commit,
+                ),
+                cfg,
+            )
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert ".sikula/config.yaml (config): differs from the committed config loaded for this run" in out
+        assert "Start a fresh run from a checkout whose committed config matches the worktree start ref." in out
+        assert "git add" not in out
+        assert "--no-isolate" not in out
+        assert not (tmp_path / ".sikula" / "state").exists()
+
     def test_untracked_config_exits_before_worktree(self, tmp_path: Path, capsys):
         config_path = self._init_repo_with_config(tmp_path, commit_config=False)
 
