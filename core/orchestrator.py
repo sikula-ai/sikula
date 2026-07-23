@@ -510,6 +510,10 @@ class Orchestrator:
                 state.failed = True
                 self._store.save(state)
                 return
+            if state.plan:
+                state.step_file_tracking_enabled = True
+                state.step_files_changed = []
+                self._store.save(state)
 
         if self._abort_on_delivery_planner_budget(state):
             return
@@ -565,6 +569,22 @@ class Orchestrator:
         state.failed = True
         self._store.save(state)
         return True
+
+    def _record_step_files_changed(self, state: TaskState, paths: object) -> None:
+        if (
+            state.step_file_tracking_enabled is not True
+            or not state.plan
+            or state.active_scope == _SCOPE_FINAL_FULL_TASK
+            or not isinstance(paths, (list, tuple, set))
+            or not isinstance(state.step_files_changed, list)
+        ):
+            return
+        for raw_path in paths:
+            if not isinstance(raw_path, str):
+                continue
+            path = raw_path.strip()
+            if path and path not in state.step_files_changed:
+                state.step_files_changed.append(path)
 
     def _worktree_dirty_files(self, state: TaskState) -> list[str]:
         """Return project-root-relative paths of uncommitted changes in the worktree.
@@ -825,6 +845,8 @@ class Orchestrator:
                 state.security_approved = False
                 state.security_review_iterations = 0
                 state.tests_up_to_date = False
+                if state.step_file_tracking_enabled:
+                    state.step_files_changed = []
                 self._store.save(state)
             else:
                 state.plan_completed = True
@@ -925,6 +947,7 @@ class Orchestrator:
                         len(dirty),
                     )
                     state.files_changed.extend(dirty)
+                    self._record_step_files_changed(state, dirty)
                     state.record(
                         "orchestrator", "adopt_worktree_changes", f"{len(dirty)} file(s) adopted from worktree"
                     )
@@ -1836,6 +1859,12 @@ class Orchestrator:
                 for path in state.files_changed
                 if _normalize_project_path(str(path)) not in files_changed_prune_paths
             ]
+            if state.step_file_tracking_enabled is True and isinstance(state.step_files_changed, list):
+                state.step_files_changed = [
+                    path
+                    for path in state.step_files_changed
+                    if _normalize_project_path(str(path)) not in files_changed_prune_paths
+                ]
         state.test_files_written = [
             path for path in state.test_files_written if _normalize_project_path(str(path)) not in clean_paths
         ]
@@ -2154,6 +2183,7 @@ class Orchestrator:
         for path in paths:
             if path not in state.files_changed:
                 state.files_changed.append(path)
+        self._record_step_files_changed(state, paths)
         self._session_code_changed = True
         state.review_approved = False
         state.security_approved = False
@@ -2515,6 +2545,8 @@ class Orchestrator:
             log.info(f"{name}: {result.message} ({elapsed})")
         else:
             log.error(f"{name} failed: {result.message} ({elapsed})")
+        data = result.data if isinstance(result.data, dict) else {}
+        self._record_step_files_changed(state, data.get("files_written", []))
         self._store.save(state)
         return result
 

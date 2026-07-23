@@ -369,6 +369,8 @@ class TaskState:
     plan_completed: bool = False
     current_step: int = 0
     step_implemented: bool = False
+    step_file_tracking_enabled: bool = False
+    step_files_changed: list[str] = field(default_factory=list)
     active_scope: Optional[str] = None
     final_full_task_review_done: bool = False
     files_changed: list[str] = field(default_factory=list)

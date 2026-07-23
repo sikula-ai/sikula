@@ -238,6 +238,64 @@ class TestMultiStepRun:
         assert state.done is True
         assert len(state.plan) == 2
 
+    def test_test_writer_uses_step_scoped_change_context_then_full_context(self, git_project: Path):
+        first = git_project / "src" / "first.py"
+        second = git_project / "src" / "second.py"
+        first.write_text("VALUE = 0\n")
+        second.write_text("VALUE = 0\n")
+        subprocess.run(["git", "add", "."], cwd=git_project, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add step fixtures"], cwd=git_project, check=True, capture_output=True)
+
+        class StepContextFake(LLMClient):
+            def generate(self, system, user):
+                return "1. Change the first module\n2. Change the second module"
+
+            def run_readonly_agent(self, prompt, cwd):
+                if "Produce the implementation prompt." in prompt:
+                    return _ANALYST_PROMPT
+                if "Your job is to identify security vulnerabilities" in prompt:
+                    return "Security checks found no vulnerabilities.\nAPPROVED"
+                return "APPROVED"
+
+            def run_agent(self, prompt, cwd):
+                if "WHAT WAS IMPLEMENTED:" in prompt:
+                    return [], "Existing tests cover this change."
+                if "CURRENT STEP (1/2)" in prompt:
+                    first.write_text("VALUE = 1\n")
+                    return ["src/first.py"], "Changed first module."
+                second.write_text("VALUE = 2\n")
+                return ["src/second.py"], "Changed second module."
+
+        cfg = _cfg(git_project)
+        cfg["run_test_writing"] = True
+        with patch("core.llm_client.create_llm_client", return_value=StepContextFake()):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_run(_args(task_file=str(_task(git_project, "Implement two module changes."))), cfg)
+
+        assert exc_info.value.code == 0
+
+        from core.state import JsonStateStore
+
+        store = JsonStateStore(git_project / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state is not None
+        assert state.step_file_tracking_enabled is True
+        assert state.step_files_changed == ["src/second.py"]
+        assert [record["scope"] for record in state.test_write_records] == [
+            "step",
+            "step",
+            "final_full_task",
+        ]
+        first_prompt, second_prompt, final_prompt = [
+            record["test_writer_prompt"] for record in state.test_write_records
+        ]
+        assert "src/first.py" in first_prompt
+        assert "src/second.py" not in first_prompt
+        assert "src/first.py" not in second_prompt
+        assert "src/second.py" in second_prompt
+        assert "src/first.py" in final_prompt
+        assert "src/second.py" in final_prompt
+
     def test_final_full_task_review_can_reject_after_step_reviews_approved(self, git_project: Path):
         class FinalReviewRejectsFake(LLMClient):
             def __init__(self) -> None:

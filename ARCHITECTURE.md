@@ -20,7 +20,7 @@
 | `DeliveryPreparationAgent` | `agents/delivery_preparation_agent.py` | Read-only delivery-plan and split-proposal authoring assistant; returns structured drafts for deterministic parsing and never mutates delivery artifacts |
 | `FixerAgent` | `agents/fixer_agent.py` | Runs the configured LLM as an autonomous agent to fix build or test errors |
 | `FileTool` | `tools/file_tool.py` | Read / write files; enforces sandbox whitelist for direct file-tool calls |
-| `GitTool` | `tools/git_tool.py` | `diff_head()` — called by reviewer, security_reviewer, and test_writer agents to obtain the live diff when `state.review_diff` is not set |
+| `GitTool` | `tools/git_tool.py` | `diff_head(paths=None)` — called by reviewer, security_reviewer, and test_writer agents to obtain the live diff when `state.review_diff` is not set; optional project-relative paths constrain the diff with literal Git pathspecs, while absolute and parent-traversing paths fail closed |
 | `BuildTool` | `tools/base_tool.py` | **Abstract interface** for platform build systems — implement per platform |
 | `GradleBaseTool` | `tools/gradle_tool.py` | Shared Gradle mechanics (`_run`, `run_check`, `is_build_config_file`); subclassed by Android and JVM variants |
 | `AndroidGradleTool` | `tools/gradle_android_tool.py` | `BuildTool` implementation for Android / Gradle |
@@ -630,7 +630,7 @@ Orchestrator.run()
 
 **Step loop** (`state.plan` is non-empty — when `run_planner: true` and plan parsed successfully):
 
-Per-step flags (`step_implemented`, `review_approved`, `review_issues`, `review_iterations`, `security_approved`, `security_review_iterations`, `tests_up_to_date`) reset on each step transition. `files_changed` and `build_iterations` accumulate across all steps. `max_iterations` is applied per active build/fix loop, not globally across the whole task, so per-step builds do not consume the final full-task build budget.
+Per-step flags (`step_implemented`, `review_approved`, `review_issues`, `review_iterations`, `security_approved`, `security_review_iterations`, `tests_up_to_date`) reset on each step transition. `files_changed` and `build_iterations` accumulate across all steps. New planned runs also track the current step's writes in `step_files_changed`; that list resets on each step transition and lets TestWriterAgent avoid repeatedly receiving the growing whole-task diff. `max_iterations` is applied per active build/fix loop, not globally across the whole task, so per-step builds do not consume the final full-task build budget.
 
 Build behaviour is controlled by `run_build_per_step` (default: `false`):
 
@@ -665,6 +665,12 @@ Deferred build is a performance choice, not permission for obviously uncompilabl
 ```
 
 The `step_start` / `step_done` markers in `state.history` make the JSON audit log unambiguous — every agent action between a pair of markers belongs to that step.
+
+Current-step file tracking is enabled only when the active Sikula version successfully
+creates a multi-step plan. Legacy persisted plans do not have trusted per-step provenance,
+so resume leaves tracking disabled and TestWriterAgent falls back to the complete
+`files_changed` list and full live diff. Single-pass runs and the final full-task gate also
+use the complete change context.
 
 After the last step completes, `plan_completed` guards resume so the final step is not
 re-run just because the final review/build phase was interrupted. The final full-task
@@ -1237,8 +1243,9 @@ sandbox section above). After the agent returns, Sikula records a non-blocking
 **Input:**
 - `state.task_description` — original task description; used to honor explicit testing requirements
 - `state.implementation_prompt` — what was implemented and why
-- `state.files_changed` — production files that were changed
-- git diff HEAD (capped at 40 000 chars) — the exact changes made
+- current-step tracked files for a new multi-step plan; otherwise all `state.files_changed`
+- git diff HEAD (capped at 40 000 chars) — constrained to the tracked current-step paths
+  for a new multi-step plan, and otherwise the complete live diff
 - current planner step description when `state.plan` is non-empty — injected as `CURRENT STEP`
 - `test_writer.coverage_target` from project config (default: 90) — injected into the prompt
   as a target within the configured test surface
@@ -1670,6 +1677,8 @@ Sikula processes at once is still unsupported.
 | `final_full_task_review_done` | `bool` | Orchestrator | Set True after the final full-task reviewer/security/test-writer gate has completed for the current files. Reset when final-scope fixer changes code, then set True again after the post-fix final-scope review/security/test pass. |
 | `current_step` | `int` | Orchestrator | Index into `plan`; advances after each step completes its implement/review/security/test-write phases. With `run_build_per_step: true`, each step also passes build/fix before advancing; otherwise build/fix is deferred until all steps are complete. |
 | `step_implemented` | `bool` | Orchestrator | Set True after implementer succeeds for the current step; reset on step transition; guards re-runs on resume |
+| `step_file_tracking_enabled` | `bool` | Orchestrator | True only after the current Sikula version successfully creates a multi-step plan. Distinguishes trusted per-step file provenance from legacy resumed plans, which safely retain the default False and use complete TestWriter change context. |
+| `step_files_changed` | `list[str]` | Orchestrator | De-duplicated paths reported or adopted during the current planner step; reset on step transition. Used only to scope TestWriterAgent's current-step file list and live diff. It does not replace cumulative `files_changed`, and final full-task gates ignore it. |
 | `pid` | `int \| None` | `Orchestrator.run()` | PID of the orchestrator process; set at the start of every run (including resume); used by `sikula status` to detect interrupted tasks. A fresh `active_operation` heartbeat takes precedence when the PID is not visible across process namespaces; otherwise, if the PID is no longer running, status shows `INTERRUPTED`. |
 | `created_at` | `str` | `StateStore.create()` | ISO-8601 UTC timestamp set once at task creation; never overwritten |
 | `updated_at` | `str` | `JsonStateStore.save()` | ISO-8601 UTC timestamp refreshed on every save; reflects last mutation |

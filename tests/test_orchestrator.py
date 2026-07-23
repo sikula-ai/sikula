@@ -2399,7 +2399,15 @@ mod tests {
             state.files_changed.append("tests/client_main.test.ts")
 
         stubs["test_writer"].side_effect = test_writer_effect
-        state = _save_state(orch, implementation_prompt="p", files_changed=["src/main.py"])
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Add production behavior", "Harden tests"],
+            plan_decided=True,
+            step_file_tracking_enabled=True,
+            step_files_changed=["src/main.py"],
+            files_changed=["src/main.py"],
+        )
 
         changed = orch._run_test_write_phase(state)
 
@@ -2411,6 +2419,7 @@ mod tests {
         assert len(state.testability_gaps) == 1
         assert state.testability_gaps[0]["target"] == "synthetic runtime harness in tests/client_main.test.ts"
         assert "tests/client_main.test.ts" not in state.files_changed
+        assert "tests/client_main.test.ts" not in state.step_files_changed
         assert "tests/client_main.test.ts" not in state.test_files_written
 
     def test_test_writer_synthetic_harness_recovery_preserves_other_written_tests(self, tmp_path: Path):
@@ -3675,6 +3684,57 @@ class TestOrchestratorInterruptResume:
         assert result.done
         assert len(stubs["implementer"].calls) == 2
 
+    def test_step_file_tracking_resets_between_steps(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=True,
+        )
+        test_writer_contexts: list[tuple[str | None, list[str]]] = []
+
+        def implementer_effect(state: TaskState) -> None:
+            state.files_changed.append(f"src/step{state.current_step}.py")
+
+        def test_writer_effect(state: TaskState) -> None:
+            test_writer_contexts.append((state.active_scope, list(state.step_files_changed)))
+            state.tests_up_to_date = True
+
+        stubs["implementer"].side_effect = implementer_effect
+        stubs["test_writer"].side_effect = test_writer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: add feature A", "Step 2: add feature B"],
+            plan_decided=True,
+            step_file_tracking_enabled=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert test_writer_contexts == [
+            (None, ["src/step0.py"]),
+            (None, ["src/step1.py"]),
+            ("final_full_task", ["src/step1.py"]),
+        ]
+
+    def test_step_file_tracking_ignores_malformed_persisted_evidence(self, tmp_path: Path):
+        orch, _, _ = _make_orchestrator(tmp_path)
+        state = TaskState(
+            task_id="t1",
+            task_description="test task",
+            plan=["Step 1", "Step 2"],
+            step_file_tracking_enabled=True,
+            step_files_changed=True,  # type: ignore[arg-type]
+        )
+
+        orch._record_step_files_changed(state, ["src/current.py"])
+
+        assert state.step_files_changed is True
+
     def test_step_loop_implementer_failure_aborts_before_review(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=True, run_build=False)
         stubs["implementer"].result_success = False
@@ -3797,6 +3857,43 @@ class TestOrchestratorInterruptResume:
         result = orch.run(task_id="t1")
         assert result.done
         assert len(stubs["implementer"].calls) == 2
+
+    def test_step_loop_resume_preserves_current_step_file_tracking(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=True,
+        )
+        test_writer_contexts: list[tuple[str | None, list[str]]] = []
+
+        def test_writer_effect(state: TaskState) -> None:
+            test_writer_contexts.append((state.active_scope, list(state.step_files_changed)))
+            state.tests_up_to_date = True
+
+        stubs["test_writer"].side_effect = test_writer_effect
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: add feature A", "Step 2: add feature B"],
+            plan_decided=True,
+            current_step=1,
+            step_implemented=True,
+            step_file_tracking_enabled=True,
+            step_files_changed=["src/current.py"],
+            files_changed=["src/previous.py", "src/current.py"],
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done
+        assert len(stubs["implementer"].calls) == 0
+        assert test_writer_contexts == [
+            (None, ["src/current.py"]),
+            ("final_full_task", ["src/current.py"]),
+        ]
 
     def test_step_loop_no_changes_advances_to_next_step(self, tmp_path: Path):
         """Step with no file changes must not abort — treat as already implemented and advance."""
@@ -4983,6 +5080,8 @@ class TestOrchestratorPlannerAbort:
         assert result.delivery_budget_stop is None
         assert len(stubs["planner"].calls) == 1
         assert len(stubs["implementer"].calls) == 2
+        assert result.step_file_tracking_enabled is True
+        assert result.step_files_changed == ["src/step2.py"]
 
     def test_planner_failure_aborts_task(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=True, run_build=False)

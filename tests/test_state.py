@@ -141,6 +141,48 @@ class TestJsonStateStore:
         assert loaded.test_writer_audit_files_written == ["tests/LoginTest.py"]
         assert loaded.test_writer_audit_gate_counts == {"tests/LoginTest.py": {"skip:abc123": 1}}
 
+    def test_legacy_state_without_step_file_tracking_loads_with_safe_defaults(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(
+            task_id="legacy-step-files",
+            task_description="legacy planned task",
+            plan=["Step 1", "Step 2"],
+            plan_decided=True,
+            files_changed=["src/step1.py"],
+        )
+        store.save(state)
+        path = tmp_path / "legacy-step-files.json"
+        data = json.loads(path.read_text())
+        data.pop("step_file_tracking_enabled")
+        data.pop("step_files_changed")
+        path.write_text(json.dumps(data))
+
+        loaded = store.load(state.task_id)
+
+        assert loaded is not None
+        assert loaded.step_file_tracking_enabled is False
+        assert loaded.step_files_changed == []
+
+    def test_step_file_tracking_round_trips_for_resume(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(
+            task_id="tracked-step-files",
+            task_description="planned task",
+            plan=["Step 1", "Step 2"],
+            plan_decided=True,
+            current_step=1,
+            step_file_tracking_enabled=True,
+            step_files_changed=["src/current.py"],
+            files_changed=["src/previous.py", "src/current.py"],
+        )
+
+        store.save(state)
+        loaded = store.load(state.task_id)
+
+        assert loaded is not None
+        assert loaded.step_file_tracking_enabled is True
+        assert loaded.step_files_changed == ["src/current.py"]
+
     @pytest.mark.parametrize(("field_name", "value"), _REVIEW_DELIVERY_FIELD_VALUES)
     def test_review_delivery_fields_round_trip(self, tmp_path: Path, field_name: str, value: str):
         store = JsonStateStore(tmp_path)
