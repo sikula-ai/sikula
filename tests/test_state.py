@@ -114,6 +114,33 @@ class TestJsonStateStore:
         assert loaded is not None
         assert loaded.delivery_unit_budget == {"max_planner_steps": 2, "max_changed_files": 4}
 
+    def test_create_persists_delivery_handoff_inputs(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        dependency_handoff = {
+            "schema_version": 1,
+            "fingerprint": "a" * 64,
+            "unit": {"depends_on": ["foundation"]},
+        }
+
+        state = store.create(
+            "delivery child",
+            delivery_handoff_schema_version=1,
+            delivery_dependency_handoffs=[dependency_handoff],
+        )
+        dependency_handoff["schema_version"] = 2
+        dependency_handoff["unit"]["depends_on"].append("mutated")
+        loaded = store.load(state.task_id)
+
+        assert loaded is not None
+        assert loaded.delivery_handoff_schema_version == 1
+        assert loaded.delivery_dependency_handoffs == [
+            {
+                "schema_version": 1,
+                "fingerprint": "a" * 64,
+                "unit": {"depends_on": ["foundation"]},
+            }
+        ]
+
     def test_save_and_load_roundtrip(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
         state = TaskState(task_id="abc123", task_description="test task")

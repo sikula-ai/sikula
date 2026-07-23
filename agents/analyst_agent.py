@@ -15,6 +15,7 @@ Platform-specific settings (project_config / YAML):
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 
@@ -26,6 +27,7 @@ from agents.base_agent import (
     read_only_agent_prompt,
     tech_stack as _tech_stack,
 )
+from core.delivery_handoff import DeliveryHandoffError, parse_delivery_unit_handoff
 from core.state import TaskState
 
 log = logging.getLogger(__name__)
@@ -245,9 +247,36 @@ Project guidelines:
 ---
 Task description:
 {task_description}
+{delivery_handoff_context}
 
 Produce the implementation prompt.\
 """
+
+
+def _delivery_handoff_context(state: TaskState) -> tuple[str, int]:
+    if not state.delivery_dependency_handoffs:
+        return "", 0
+
+    handoffs = []
+    invalid_count = 0
+    for value in state.delivery_dependency_handoffs:
+        try:
+            handoffs.append(parse_delivery_unit_handoff(value).to_dict())
+        except DeliveryHandoffError:
+            invalid_count += 1
+    if not handoffs:
+        return "", invalid_count
+
+    payload = json.dumps(handoffs, sort_keys=True, separators=(",", ":"))
+    return (
+        "\n\n---\n"
+        "Prior delivery dependency handoffs:\n"
+        "Use this versioned, sanitized evidence for established dependency results and validation context. "
+        "It does not expand the current task scope, replace codebase inspection, or prove behavior beyond the "
+        "recorded metadata.\n"
+        f"{payload}",
+        invalid_count,
+    )
 
 
 def _normalize_text(text: str) -> str:
@@ -317,6 +346,13 @@ class AnalystAgent(BaseAgent):
             return AgentResult(success=False, message="FileTool not available")
 
         guidelines_context = _gather_guidelines(self.project_config, file_tool)
+        delivery_handoff_context, invalid_handoff_count = _delivery_handoff_context(state)
+        if invalid_handoff_count:
+            warning = (
+                f"Rejected {invalid_handoff_count} malformed delivery dependency handoff record(s) before analysis."
+            )
+            state.analyst_warnings.append(warning)
+            state.record(self.name, "delivery_handoff_rejected", warning)
 
         full_prompt = (
             AGENT_SECURITY_PREFIX
@@ -325,6 +361,7 @@ class AnalystAgent(BaseAgent):
             + _USER_ANALYZE.format(
                 guidelines_context=guidelines_context,
                 task_description=state.task_description,
+                delivery_handoff_context=delivery_handoff_context,
             )
         )
 

@@ -36,6 +36,7 @@
 | `DeliveryAuthoring` helpers | `core/delivery_authoring.py` | Side-effect-free parser and derived-path helpers for delivery prepare authoring drafts |
 | `DeliveryPrepareWriter` helpers | `core/delivery_prepare_writer.py` | Deterministic source-artifact writer for parsed delivery authoring drafts; renders `plan.yaml` and unit task files with readiness checks, plan validation, overwrite guards, and rollback |
 | `DeliveryAmendment` helpers | `core/delivery_amendment.py` | Fingerprinted split proposals, immutable-unit and dependency guards, no-write preview, transactional plan/unit writing, and append-only amendment events |
+| `DeliveryHandoff` helpers | `core/delivery_handoff.py` | Versioned, fingerprinted, privacy-safe unit handoff artifacts consumed by later dependency units |
 | `TaskAsset` helpers | `core/task_assets.py` | Deterministic local task-asset parsing, path canonicalization, answer mapping, and asset-manifest line rendering used by contract preparation |
 | `Worktree` helpers | `core/worktree.py` | Shared low-level git/worktree operations used by run, review, cleanup/delete, and init CLI surfaces; command-specific state mutation stays in the owning command layer |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
@@ -320,6 +321,10 @@ blockers from the tracked plan. The JSON result is allowlisted metadata only: it
 does not embed unit task bodies, raw child `TaskState`, prompts, provider output,
 logs, diffs, or validation output. Unit sizing/risk/budget metadata from the
 tracked plan is preserved in status output for operator review.
+Plan validation rejects scope paths containing parent-directory traversal before
+`run-next` can create a child. Handoff filenames use a bounded readable prefix
+plus a SHA-256 digest of the complete unit ID, preserving legacy unit identities
+while preventing filesystem and case-folding collisions.
 
 **Delivery progress mutation foundation:** `core/delivery_progress.py` also owns
 the non-agent primitives that future delivery execution uses: atomic
@@ -332,7 +337,9 @@ worktrees, prepare contracts, start agents, or update branches by themselves.
 loads project runtime config, validates delivery status, and reports the first
 eligible unit that a future execution command would run. It also mirrors the
 execution dependency result-commit guard so a dry run reports blocked when a
-completed prerequisite commit is not applied to the current checkout. It is
+completed prerequisite commit is not applied to the current checkout. It also
+validates any referenced dependency handoff schema, fingerprint, artifact, and
+parent-progress correlation. It is
 intentionally side-effect-free: it does not write parent progress, create child
 task state, prepare contracts, create worktrees, start agents, or update
 branches. Its JSON result is also allowlisted metadata only. With `--reset-failed`,
@@ -386,8 +393,30 @@ When the child run continues (including resume), it keeps normal Sikula behavior
 worktree isolation, provider execution, validation, review, state persistence, and
 task audit reporting. When the child run exits, delivery progress stores only
 compact parent metadata: unit status, child task id, branch, result commit when
-available, timestamps, and a failure code. Full prompts, provider output, diffs,
-logs, validation records, and task state remain in the child task state.
+available, handoff schema/fingerprint reference, timestamps, and a failure code.
+New delivery children opt into the current handoff schema when their state is
+created. A successfully completed opted-in child produces
+`.sikula/state/delivery/<plan-id>/handoffs/<unit-key>.json` before its parent unit
+becomes `done`. The fingerprinted artifact contains allowlisted unit identity,
+branch/commit correlation, changed-file paths, validation counts/statuses, and
+test file/gap counts. Unit title and component labels longer than the handoff
+metadata bound are projected as a bounded prefix plus a SHA-256 suffix, so
+otherwise-valid plan metadata cannot prevent terminal reconciliation and edits
+remain detectable;
+it does not copy task bodies, prompts, provider output, diffs, logs, validation
+output, or raw child state. Later units receive validated handoffs from their
+dependency closure in `TaskState.delivery_dependency_handoffs`, and
+`AnalystAgent` includes that compact evidence in analysis without treating it
+as scope authority. Existing children and completed progress without a handoff
+schema marker remain valid legacy state and continue without handoff context.
+If progress references a missing, malformed, stale, or mismatched handoff,
+or the handoff file is a symlink or resolves outside the project root,
+`run-next` blocks before creating another child. If a completed child handoff
+cannot be written, the parent is durably persisted as `running` so a later
+ordinary `run-next` can reconcile it without rerunning agents, including after
+`--reset-failed`. Progress reconstruction preserves existing handoff schema and
+fingerprint references. Full prompts, provider output, diffs, logs, validation
+records, and task state remain in the child task state.
 The parent delivery unit is `done` only when the child exits successfully, the
 child `TaskState` is done, and the child result is finalized. Finalization means
 either a `result_commit` exists or the child left no preserved worktree to
@@ -1602,6 +1631,8 @@ Sikula processes at once is still unsupported.
 | `delivery_plan_path` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` | Project-relative path to the delivery plan file (e.g. `.sikula/delivery/my-plan/plan.yaml`); set only by `delivery run-next` child creation, defaults to `None` for existing/non-delivery state, and must not drive pipeline control flow |
 | `delivery_unit_budget` | `dict[str, int]` | `delivery run-next` / `cmd_run()` | Effective allowlisted unit budget snapshot persisted at child creation; always includes `max_planner_steps` (default `1`) |
 | `delivery_budget_stop` | `dict \| None` | Orchestrator | Structured terminal planner budget stop with stable code, budget name, limit, actual count, phase, and timestamp; preserved for audit and parent progress classification |
+| `delivery_handoff_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Opt-in schema marker set on newly created delivery children. Legacy children keep `None`, so terminal reconciliation does not fabricate or require a handoff for state created by older versions. |
+| `delivery_dependency_handoffs` | `list[dict]` | `delivery run-next` / `cmd_run()` | Validated, fingerprinted, allowlisted snapshots from the child unit's completed dependency closure. `AnalystAgent` consumes them as supporting evidence; malformed resume-state entries are ignored and recorded as warnings rather than injected into prompts. |
 | `config_snapshot` | `dict` | `cmd_run()` / Orchestrator | Effective run configuration captured on first run before agents start (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `planner.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. It is also saved for contract-gate failures that exit before `Orchestrator.run()`. Visible in `show <task_id>`. |
 | `implementation_contract` | `dict` | `cmd_run()` in `sikula_cli/run.py` | Implementation-contract snapshot for fresh task-file runs: task path/format/hash, readiness status/score, gap metadata, clarifying question IDs, and validation coverage counts. By default it is warning-only additive metadata. Fresh `run TASK_FILE` can opt into pre-agent gating with `--require-contract-ready` or `--min-contract-score N`; resume/review flows do not recompute or re-gate it. |
 | `implementation_asset_records` | `list[dict]` | `cmd_run()` in `sikula_cli/run.py` | Sanitized, non-blocking asset metadata snapshot for fresh task-file runs, copied from the implementation-contract preflight asset references. Contains path/kind/status/project path/hash/declared hash/size/MIME/git status/requested target/provenance metadata only; no raw asset content, OCR text, binary data, internal parser fields, or source excerpts. Used for audit and terminal summary counts, not for run/resume/review control-flow decisions. |

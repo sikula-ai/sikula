@@ -20,6 +20,7 @@ from core.delivery_authoring import (
     DeliveryAuthoringDraft,
     DeliveryAuthoringParseError,
 )
+from core.delivery_handoff import SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION
 from core.delivery_plan import (
     DeliveryBudgetExceeded,
     DeliveryPlanIssue,
@@ -2018,6 +2019,19 @@ def _run_next_delivery_unit(
                 message="Delivery unit dependencies are not applied to the current checkout.",
             )
 
+        dependency_handoffs, handoff_errors = _load_dependency_handoffs(status, selected_unit, root)
+        if handoff_errors:
+            errors.extend(handoff_errors)
+            return _execution_result_from_status(
+                status,
+                ran=False,
+                selected_unit=selected_unit,
+                progress_path=str(progress_path),
+                events_path=str(events_path),
+                errors=errors,
+                message="Delivery unit dependency handoff evidence is unavailable or invalid.",
+            )
+
         if reset_failed and selected_unit.status == "failed":
             return _handle_failed_delivery_unit_retry(
                 args=args,
@@ -2072,6 +2086,8 @@ def _run_next_delivery_unit(
             delivery_unit_id=selected_unit.id,
             delivery_plan_path=delivery_plan_path,
             delivery_unit_budget=delivery_unit_budget_snapshot(selected_unit.budget),
+            delivery_handoff_schema_version=SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION,
+            delivery_dependency_handoffs=dependency_handoffs,
             delivery_child_created_callback=link_child_task,
         )
         state_dir = context.resolve_state_dir(cfg)
@@ -2155,13 +2171,14 @@ def _run_next_delivery_unit(
                 message=f"Delivery unit {selected_unit.id} did not start; fix setup and retry.",
             )
         child_state = store.load(child_task_id) if child_task_id else None
-        progress, unit_status = _record_delivery_child_terminal_result(
+        progress, unit_status, handoff_issue = _record_delivery_child_terminal_result(
             progress=progress,
             selected_unit=selected_unit,
             child_task_id=child_task_id,
             child_state=child_state,
             child_result=child_result,
             plan_id=plan_id,
+            project_root=root,
             progress_path=progress_path,
             events_path=events_path,
         )
@@ -2172,7 +2189,9 @@ def _run_next_delivery_unit(
         updated_status = get_delivery_status(args.plan_file, project_root=project_root)
         updated_unit = _status_unit_by_id(updated_status, selected_unit.id) or selected_unit
 
-        if unit_status == "done":
+        if handoff_issue is not None:
+            message = handoff_issue.message
+        elif unit_status == "done":
             message = f"Delivery unit {selected_unit.id} completed."
         elif updated_unit.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE:
             message = (
@@ -2184,7 +2203,7 @@ def _run_next_delivery_unit(
         return DeliveryRunNextExecutionResult(
             plan_path=status.plan_path,
             project_root=status.project_root,
-            valid=updated_status.valid,
+            valid=updated_status.valid and handoff_issue is None,
             ran=True,
             succeeded=unit_status == "done" and updated_status.valid,
             status=updated_status.status,
@@ -2195,7 +2214,7 @@ def _run_next_delivery_unit(
             run_exit_code=child_result.exit_code,
             progress_path=str(progress_path),
             events_path=str(events_path),
-            errors=updated_status.errors,
+            errors=[*updated_status.errors, *([handoff_issue] if handoff_issue else [])],
             warnings=updated_status.warnings,
             message=message,
         )
@@ -2273,6 +2292,8 @@ def _progress_from_status(status):
                 waiting_reason=unit.waiting_reason,
                 failure_code=unit.failure_code,
                 budget_exceeded=unit.budget_exceeded,
+                handoff_schema_version=unit.handoff_schema_version,
+                handoff_fingerprint=unit.handoff_fingerprint,
                 started_at=unit.started_at,
                 completed_at=unit.completed_at,
                 updated_at=unit.updated_at,
@@ -2342,16 +2363,26 @@ def _apply_delivery_preview_execution_guards(
         return replace(preview, selected_unit=selected_unit)
 
     dependency_errors = _dependency_commit_errors(status, selected_unit, root)
-    if not dependency_errors:
-        return preview
-    return replace(
-        preview,
-        valid=False,
-        ready=False,
-        selected_unit=selected_unit,
-        errors=[*preview.errors, *dependency_errors],
-        message="Delivery unit dependencies are not applied to the current checkout.",
-    )
+    if dependency_errors:
+        return replace(
+            preview,
+            valid=False,
+            ready=False,
+            selected_unit=selected_unit,
+            errors=[*preview.errors, *dependency_errors],
+            message="Delivery unit dependencies are not applied to the current checkout.",
+        )
+    _, handoff_errors = _load_dependency_handoffs(status, selected_unit, root)
+    if handoff_errors:
+        return replace(
+            preview,
+            valid=False,
+            ready=False,
+            selected_unit=selected_unit,
+            errors=[*preview.errors, *handoff_errors],
+            message="Delivery unit dependency handoff evidence is unavailable or invalid.",
+        )
+    return preview
 
 
 def _delivery_preview_child_state_issue(
@@ -2461,6 +2492,91 @@ def _dependency_commit_errors(status, selected_unit, root: Path):
                 )
             )
     return errors
+
+
+def _load_dependency_handoffs(
+    status: Any,
+    selected_unit: Any,
+    root: Path,
+) -> tuple[list[dict[str, Any]], list[DeliveryPlanIssue]]:
+    from core.delivery_handoff import (
+        DeliveryHandoffError,
+        delivery_unit_handoff_path,
+        delivery_unit_handoff_matches_unit,
+        read_delivery_unit_handoff,
+    )
+
+    units_by_id = {unit.id: unit for unit in status.units}
+    dependency_ids: set[str] = set()
+    pending = list(selected_unit.depends_on)
+    while pending:
+        dependency_id = pending.pop(0)
+        if dependency_id in dependency_ids:
+            continue
+        dependency_ids.add(dependency_id)
+        dependency = units_by_id.get(dependency_id)
+        if dependency is not None:
+            pending.extend(dependency.depends_on)
+
+    handoffs: list[dict[str, Any]] = []
+    errors: list[DeliveryPlanIssue] = []
+    for dependency in status.units:
+        if dependency.id not in dependency_ids or dependency.status != "done":
+            continue
+        if dependency.handoff_schema_version is None and dependency.handoff_fingerprint is None:
+            continue
+        if dependency.handoff_schema_version != SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery.dependency_handoff_schema_unsupported",
+                    f"Dependency unit {dependency.id} uses an unsupported delivery handoff schema.",
+                )
+            )
+            continue
+
+        try:
+            path = delivery_unit_handoff_path(root, status.plan.plan_id, dependency.id)
+            handoff = read_delivery_unit_handoff(path, project_root=root)
+        except FileNotFoundError:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery.dependency_handoff_missing",
+                    f"Dependency unit {dependency.id} references a delivery handoff that is missing.",
+                )
+            )
+            continue
+        except DeliveryHandoffError:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery.dependency_handoff_invalid",
+                    f"Dependency unit {dependency.id} references an invalid delivery handoff.",
+                )
+            )
+            continue
+
+        if (
+            handoff.schema_version != dependency.handoff_schema_version
+            or handoff.fingerprint != dependency.handoff_fingerprint
+            or handoff.plan_id != status.plan.plan_id
+            or handoff.unit_id != dependency.id
+            or handoff.child_task_id != dependency.child_task_id
+            or handoff.result_branch != dependency.branch
+            or handoff.result_commit != dependency.commit
+            or not delivery_unit_handoff_matches_unit(handoff, dependency)
+        ):
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery.dependency_handoff_mismatch",
+                    f"Dependency unit {dependency.id} handoff does not match parent progress evidence.",
+                )
+            )
+            continue
+        handoffs.append(handoff.to_dict())
+    return handoffs, errors
 
 
 def _running_delivery_units(status) -> list:
@@ -2653,27 +2769,32 @@ def _run_delivery_child_retry(
             make_delivery_progress_event(plan_id, "unit.reconcile_intent", unit=reconcile_unit),
         )
         synthetic_child_result = DeliveryChildRunResult(exit_code=0)
-        progress, unit_status = _record_delivery_child_terminal_result(
+        progress, unit_status, handoff_issue = _record_delivery_child_terminal_result(
             progress=progress,
             selected_unit=selected_unit,
             child_task_id=child_task_id,
             child_state=child_state,
             child_result=synthetic_child_result,
             plan_id=plan_id,
+            project_root=root,
             progress_path=progress_path,
             events_path=events_path,
         )
         updated_status = get_delivery_status(args.plan_file, project_root=root)
         updated_unit = _status_unit_by_id(updated_status, unit_id) or selected_unit
         message = (
-            f"Delivery unit {unit_id} reconciled terminal child task as done."
-            if unit_status == "done"
-            else f"Delivery unit {unit_id} reconciled terminal child task as failed; inspect child task state."
+            handoff_issue.message
+            if handoff_issue is not None
+            else (
+                f"Delivery unit {unit_id} reconciled terminal child task as done."
+                if unit_status == "done"
+                else f"Delivery unit {unit_id} reconciled terminal child task as failed; inspect child task state."
+            )
         )
         return DeliveryRunNextExecutionResult(
             plan_path=status.plan_path,
             project_root=str(root.resolve()),
-            valid=updated_status.valid,
+            valid=updated_status.valid and handoff_issue is None,
             ran=True,
             succeeded=unit_status == "done" and updated_status.valid,
             status=updated_status.status,
@@ -2684,7 +2805,7 @@ def _run_delivery_child_retry(
             run_exit_code=None,
             progress_path=str(progress_path),
             events_path=str(events_path),
-            errors=updated_status.errors,
+            errors=[*updated_status.errors, *([handoff_issue] if handoff_issue else [])],
             warnings=updated_status.warnings,
             message=message,
         )
@@ -2722,13 +2843,14 @@ def _run_delivery_child_retry(
     child_result = _invoke_delivery_child_run_args(args, cfg, context, run_args)
 
     child_state = store.load(child_task_id)
-    progress, unit_status = _record_delivery_child_terminal_result(
+    progress, unit_status, handoff_issue = _record_delivery_child_terminal_result(
         progress=progress,
         selected_unit=selected_unit,
         child_task_id=child_task_id,
         child_state=child_state,
         child_result=child_result,
         plan_id=plan_id,
+        project_root=root,
         progress_path=progress_path,
         events_path=events_path,
     )
@@ -2741,15 +2863,19 @@ def _run_delivery_child_retry(
     updated_status = get_delivery_status(args.plan_file, project_root=root)
     updated_unit = _status_unit_by_id(updated_status, unit_id) or selected_unit
     message = (
-        f"Delivery unit {unit_id} retried and completed."
-        if unit_status == "done"
-        else f"Delivery unit {unit_id} retried and failed; inspect child task state."
+        handoff_issue.message
+        if handoff_issue is not None
+        else (
+            f"Delivery unit {unit_id} retried and completed."
+            if unit_status == "done"
+            else f"Delivery unit {unit_id} retried and failed; inspect child task state."
+        )
     )
 
     return DeliveryRunNextExecutionResult(
         plan_path=status.plan_path,
         project_root=str(root.resolve()),
-        valid=updated_status.valid,
+        valid=updated_status.valid and handoff_issue is None,
         ran=True,
         succeeded=unit_status == "done" and updated_status.valid,
         status=updated_status.status,
@@ -2760,7 +2886,7 @@ def _run_delivery_child_retry(
         run_exit_code=child_result.exit_code,
         progress_path=str(progress_path),
         events_path=str(events_path),
-        errors=updated_status.errors,
+        errors=[*updated_status.errors, *([handoff_issue] if handoff_issue else [])],
         warnings=updated_status.warnings,
         message=message,
     )
@@ -2922,27 +3048,32 @@ def _handle_running_delivery_unit(
         )
         progress = _progress_for_update(status, progress_path, read_delivery_progress=read_delivery_progress)
         synthetic_child_result = DeliveryChildRunResult(exit_code=1 if child_state.failed else 0)
-        progress, unit_status = _record_delivery_child_terminal_result(
+        progress, unit_status, handoff_issue = _record_delivery_child_terminal_result(
             progress=progress,
             selected_unit=running_unit,
             child_task_id=child_task_id,
             child_state=child_state,
             child_result=synthetic_child_result,
             plan_id=plan_id,
+            project_root=root,
             progress_path=progress_path,
             events_path=events_path,
         )
         updated_status = get_delivery_status(args.plan_file, project_root=root)
         updated_unit = _status_unit_by_id(updated_status, unit_id) or running_unit
         message = (
-            f"Delivery unit {unit_id} reconciled terminal child task as done."
-            if unit_status == "done"
-            else f"Delivery unit {unit_id} reconciled terminal child task as failed; inspect child task state."
+            handoff_issue.message
+            if handoff_issue is not None
+            else (
+                f"Delivery unit {unit_id} reconciled terminal child task as done."
+                if unit_status == "done"
+                else f"Delivery unit {unit_id} reconciled terminal child task as failed; inspect child task state."
+            )
         )
         return DeliveryRunNextExecutionResult(
             plan_path=status.plan_path,
             project_root=str(root.resolve()),
-            valid=updated_status.valid,
+            valid=updated_status.valid and handoff_issue is None,
             ran=True,
             succeeded=unit_status == "done" and updated_status.valid,
             status=updated_status.status,
@@ -2953,7 +3084,7 @@ def _handle_running_delivery_unit(
             run_exit_code=None,
             progress_path=str(progress_path),
             events_path=str(events_path),
-            errors=updated_status.errors,
+            errors=[*updated_status.errors, *([handoff_issue] if handoff_issue else [])],
             warnings=updated_status.warnings,
             message=message,
         )
@@ -2985,13 +3116,14 @@ def _handle_running_delivery_unit(
     )
     child_result = _invoke_delivery_child_run_args(args, cfg, context, run_args)
     child_state = store.load(child_task_id)
-    progress, unit_status = _record_delivery_child_terminal_result(
+    progress, unit_status, handoff_issue = _record_delivery_child_terminal_result(
         progress=progress,
         selected_unit=running_unit,
         child_task_id=child_task_id,
         child_state=child_state,
         child_result=child_result,
         plan_id=plan_id,
+        project_root=root,
         progress_path=progress_path,
         events_path=events_path,
     )
@@ -3003,14 +3135,18 @@ def _handle_running_delivery_unit(
     updated_status = get_delivery_status(args.plan_file, project_root=root)
     updated_unit = _status_unit_by_id(updated_status, unit_id) or running_unit
     message = (
-        f"Delivery unit {unit_id} resumed and completed."
-        if unit_status == "done"
-        else f"Delivery unit {unit_id} resumed and failed; inspect child task state."
+        handoff_issue.message
+        if handoff_issue is not None
+        else (
+            f"Delivery unit {unit_id} resumed and completed."
+            if unit_status == "done"
+            else f"Delivery unit {unit_id} resumed and failed; inspect child task state."
+        )
     )
     return DeliveryRunNextExecutionResult(
         plan_path=status.plan_path,
         project_root=str(root.resolve()),
-        valid=updated_status.valid,
+        valid=updated_status.valid and handoff_issue is None,
         ran=True,
         succeeded=unit_status == "done" and updated_status.valid,
         status=updated_status.status,
@@ -3021,7 +3157,7 @@ def _handle_running_delivery_unit(
         run_exit_code=child_result.exit_code,
         progress_path=str(progress_path),
         events_path=str(events_path),
-        errors=updated_status.errors,
+        errors=[*updated_status.errors, *([handoff_issue] if handoff_issue else [])],
         warnings=updated_status.warnings,
         message=message,
     )
@@ -3115,9 +3251,17 @@ def _record_delivery_child_terminal_result(
     child_state,
     child_result: "DeliveryChildRunResult",
     plan_id: str,
+    project_root: Path,
     progress_path: Path,
     events_path: Path,
 ):
+    from core.delivery_handoff import (
+        DeliveryHandoffError,
+        build_delivery_unit_handoff,
+        delivery_unit_handoff_path,
+        write_delivery_unit_handoff,
+    )
+    from core.delivery_plan import DeliveryPlanIssue
     from core.delivery_progress import (
         append_delivery_progress_event,
         make_delivery_progress_event,
@@ -3128,6 +3272,45 @@ def _record_delivery_child_terminal_result(
 
     classification = _classify_delivery_child_run(child_result, child_state)
     unit_status = classification.unit_status
+    handoff = None
+    handoff_schema_version = getattr(child_state, "delivery_handoff_schema_version", None) if child_state else None
+    if unit_status == "done" and handoff_schema_version is not None:
+        try:
+            handoff = build_delivery_unit_handoff(
+                plan_id=plan_id,
+                selected_unit=selected_unit,
+                child_task_id=child_task_id,
+                child_state=child_state,
+            )
+            write_delivery_unit_handoff(
+                delivery_unit_handoff_path(project_root, plan_id, selected_unit.id),
+                handoff,
+            )
+        except (DeliveryHandoffError, OSError):
+            running_unit = make_delivery_unit_progress(
+                selected_unit.id,
+                "running",
+                child_task_id=child_task_id,
+                branch=getattr(child_state, "worktree_branch", None),
+                commit=getattr(child_state, "result_commit", None),
+                timestamp=getattr(selected_unit, "started_at", None),
+            )
+            progress = upsert_delivery_unit_progress(progress, running_unit)
+            write_delivery_progress(progress_path, progress)
+            append_delivery_progress_event(
+                events_path,
+                make_delivery_progress_event(plan_id, "unit.handoff_write_failed", unit=running_unit),
+            )
+            issue = DeliveryPlanIssue(
+                "error",
+                "delivery.unit_handoff_write_failed",
+                (
+                    f"Delivery unit {selected_unit.id} child completed, but its handoff could not be persisted; "
+                    "rerun delivery run-next to reconcile it."
+                ),
+            )
+            return progress, "running", issue
+
     terminal_unit = make_delivery_unit_progress(
         selected_unit.id,
         unit_status,
@@ -3136,6 +3319,8 @@ def _record_delivery_child_terminal_result(
         commit=getattr(child_state, "result_commit", None) if child_state else None,
         failure_code=classification.failure_code,
         budget_exceeded=classification.budget_exceeded,
+        handoff_schema_version=handoff.schema_version if handoff else None,
+        handoff_fingerprint=handoff.fingerprint if handoff else None,
     )
     progress = upsert_delivery_unit_progress(progress, terminal_unit)
     write_delivery_progress(progress_path, progress)
@@ -3143,7 +3328,7 @@ def _record_delivery_child_terminal_result(
         events_path,
         make_delivery_progress_event(plan_id, f"unit.{unit_status}", unit=terminal_unit),
     )
-    return progress, unit_status
+    return progress, unit_status, None
 
 
 def _classify_delivery_child_run(
@@ -3245,6 +3430,8 @@ def _invoke_delivery_child_run(
     delivery_unit_id: str | None = None,
     delivery_plan_path: str | None = None,
     delivery_unit_budget: dict[str, int] | None = None,
+    delivery_handoff_schema_version: int | None = None,
+    delivery_dependency_handoffs: list[dict] | None = None,
     delivery_child_created_callback: Callable[[str], None] | None = None,
 ) -> DeliveryChildRunResult:
     run_args = _delivery_child_run_args(
@@ -3257,6 +3444,8 @@ def _invoke_delivery_child_run(
         delivery_unit_id=delivery_unit_id,
         delivery_plan_path=delivery_plan_path,
         delivery_unit_budget=delivery_unit_budget,
+        delivery_handoff_schema_version=delivery_handoff_schema_version,
+        delivery_dependency_handoffs=delivery_dependency_handoffs,
         delivery_child_created_callback=delivery_child_created_callback,
     )
     return _invoke_delivery_child_run_args(args, cfg, context, run_args)
@@ -3273,6 +3462,8 @@ def _delivery_child_run_args(
     delivery_unit_id: str | None = None,
     delivery_plan_path: str | None = None,
     delivery_unit_budget: dict[str, int] | None = None,
+    delivery_handoff_schema_version: int | None = None,
+    delivery_dependency_handoffs: list[dict] | None = None,
     delivery_child_created_callback: Callable[[str], None] | None = None,
 ) -> argparse.Namespace:
     absolute_task_path = (root / task_path).resolve()
@@ -3301,6 +3492,8 @@ def _delivery_child_run_args(
         delivery_unit_id=delivery_unit_id,
         delivery_plan_path=delivery_plan_path,
         delivery_unit_budget=dict(delivery_unit_budget or {}),
+        delivery_handoff_schema_version=delivery_handoff_schema_version,
+        delivery_dependency_handoffs=copy.deepcopy(delivery_dependency_handoffs or []),
         delivery_child_created_callback=delivery_child_created_callback,
         created_task_id=None,
     )
@@ -3340,6 +3533,8 @@ def _delivery_child_resume_run_args(
         delivery_unit_id=None,
         delivery_plan_path=None,
         delivery_unit_budget=None,
+        delivery_handoff_schema_version=None,
+        delivery_dependency_handoffs=None,
         delivery_child_created_callback=None,
         created_task_id=created_task_id,
     )

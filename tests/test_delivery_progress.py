@@ -846,6 +846,39 @@ def test_delivery_status_rejects_invalid_budget_exceeded_metadata(tmp_path: Path
     assert "progress.budget_exceeded_invalid" in _error_codes(result)
 
 
+@pytest.mark.parametrize(
+    "handoff_metadata",
+    [
+        {"handoff_schema_version": True, "handoff_fingerprint": "a" * 64},
+        {"handoff_schema_version": 1},
+        {"handoff_fingerprint": "a" * 64},
+    ],
+)
+def test_delivery_status_rejects_invalid_handoff_reference(tmp_path: Path, handoff_metadata: dict) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {
+                    "unit_id": "01-foundation",
+                    "status": "done",
+                    **handoff_metadata,
+                }
+            ],
+        },
+    )
+
+    result = get_delivery_status(plan_path)
+
+    assert result.valid is False
+    assert any("handoff" in code for code in _error_codes(result))
+
+
 def test_delivery_status_reports_invalid_progress_units_container(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)

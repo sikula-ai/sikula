@@ -100,8 +100,9 @@ Writer-facing path fields such as `task_path`, `path`, `unit_path`,
 `output_path`, `plan_path`, `units_dir`, and `output_dir` are rejected because
 paths are derived deterministically. IDs must be path-safe and unique.
 Dependencies must reference known units, contain no duplicates or
-self-dependencies, and be acyclic. Scope paths must be project-relative and stay
-inside the project. Unit Markdown must include non-empty Goal, Current behavior,
+self-dependencies, and be acyclic. Scope paths must be project-relative, stay
+inside the project, and must not contain parent-directory (`..`) traversal.
+Unit Markdown must include non-empty Goal, Current behavior,
 Desired behavior, Acceptance criteria, Security/privacy, Reviewer focus, Out of
 scope, and Verification sections; Verification must include explicit validation
 commands. `## Asset manifest` and `sikula:generated-*` markers are rejected
@@ -327,9 +328,9 @@ sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --dry-run
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --dry-run --json
 ```
 
-The dry run mirrors execution preflight, including dependency result-commit
-checks, but does not acquire the progress lock, write parent progress, create
-child task state, or start agents.
+The dry run mirrors execution preflight, including dependency result-commit and
+referenced handoff integrity checks, but does not acquire the progress lock,
+write parent progress, create child task state, or start agents.
 
 Run the next eligible unit:
 
@@ -413,7 +414,7 @@ After child execution starts, it records the terminal unit status as `done` or
 `failed`.
 It accepts the same per-agent `--agent-model`, `--agent-provider`, and
 `--agent-timeout` overrides as `sikula run` and passes them to the child run.
-When starting the child run, Sikula automatically configures and persists the parent delivery metadata in the child's `TaskState` (specifically the parent `delivery_plan_id`, `delivery_unit_id`, a project-relative `delivery_plan_path`, and the effective `delivery_unit_budget`). Delivery children always run the planner, even when ordinary task planning is disabled. If the planner returns more steps than the unit's effective `max_planner_steps`, Sikula preserves the planner prompt and output, records `delivery_budget_stop`, and fails before the implementer starts. Parent progress and the terminal `unit.failed` event receive `failure_code: unit_budget_exceeded` and allowlisted `budget_exceeded` metadata. This allows the parent plan relationship and stop reason to be recovered from the configured state directory without copying prompts or raw child state into parent progress.
+When starting the child run, Sikula automatically configures and persists the parent delivery metadata in the child's `TaskState` (specifically the parent `delivery_plan_id`, `delivery_unit_id`, a project-relative `delivery_plan_path`, the effective `delivery_unit_budget`, the current `delivery_handoff_schema_version`, and validated `delivery_dependency_handoffs`). Delivery children always run the planner, even when ordinary task planning is disabled. If the planner returns more steps than the unit's effective `max_planner_steps`, Sikula preserves the planner prompt and output, records `delivery_budget_stop`, and fails before the implementer starts. Parent progress and the terminal `unit.failed` event receive `failure_code: unit_budget_exceeded` and allowlisted `budget_exceeded` metadata. This allows the parent plan relationship and stop reason to be recovered from the configured state directory without copying prompts or raw child state into parent progress.
 Child task prompts, provider output, diffs, logs, and full task state remain in
 the normal child task state and are not embedded in delivery progress JSON.
 `delivery run-next --json` reports deterministic failure codes and the child task id
@@ -424,6 +425,32 @@ has either a recorded result commit or no preserved task worktree left to
 deliver, which represents a no-op unit. If a child task is done but still keeps a
 worktree without a result commit, the parent unit is recorded as failed with
 `child_run_unfinalized`. The same rule applies to terminal-reconciled children.
+
+New delivery children also produce a versioned handoff at
+`.sikula/state/delivery/<plan-id>/handoffs/<unit-key>.json` before their parent
+unit becomes `done`. The bounded filename key combines a readable unit ID prefix
+with a SHA-256 digest of the complete ID, so legacy IDs and IDs that differ only
+by case cannot collide on common filesystems. The parent progress entry records
+the handoff schema and content fingerprint. The artifact contains only
+correlated unit, branch/commit, changed-file path, validation status/count, and
+test file/gap-count metadata. Unit title and component labels that exceed the
+metadata bound use a bounded prefix with a SHA-256 suffix instead of failing
+handoff creation. It does not contain task bodies, prompts, model output, diffs,
+logs, validation output, source excerpts, or raw child state.
+
+Before a dependent child is created, `run-next` validates referenced handoffs
+across its completed dependency closure and snapshots them into the new child
+state. The Analyst receives this evidence as supporting context, while the
+current unit task remains the scope authority. A missing, malformed, stale, or
+mismatched referenced handoff, including a symlink or path outside the project
+root, blocks before child creation. Correlation includes the current plan's unit
+title, component, dependencies, and scope paths so edited plan metadata cannot
+silently reuse stale evidence. Progress and child states created by older Sikula
+versions have no handoff schema marker; they remain compatible and continue
+without fabricated handoff context. If writing a new handoff fails after the
+child completed, the parent unit is durably persisted as `running`; rerunning
+ordinary `delivery run-next` retries terminal reconciliation without rerunning
+the child agents, including after a `--reset-failed` attempt.
 
 For dependent units, `run-next` also walks the selected unit's dependency
 closure and checks that each completed prerequisite's recorded result commit,
@@ -577,7 +604,8 @@ can coordinate cross-repo branches, locks, validation, and result sets.
 `delivery run-next --json`, and `delivery finalize --json` return allowlisted
 metadata such as written artifact paths, plan validation status, unit readiness,
 plan metadata, validation issues, unit paths, compact progress fields, selected
-child task IDs, final branch metadata, and branch/commit pointers when
+child task IDs, handoff schema/fingerprint references, final branch metadata,
+and branch/commit pointers when
 available. They do not embed child task state, source task bodies, unit task file bodies, prompts,
 provider output, diffs, logs, validation output, credentials, tokens, or source excerpts.
 Privacy-safe projections such as `delivery prepare --json`, `delivery status --json`,
