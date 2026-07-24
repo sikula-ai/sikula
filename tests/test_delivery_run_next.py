@@ -1663,6 +1663,10 @@ def test_cmd_delivery_run_next_dry_run_allows_recorded_resolved_assembly_conflic
     resolved_commit = subprocess.run(
         [
             "git",
+            "-c",
+            "user.name=Sikula Test",
+            "-c",
+            "user.email=sikula@example.test",
             "commit-tree",
             resolved_tree,
             "-p",
