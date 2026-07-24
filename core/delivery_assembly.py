@@ -36,6 +36,45 @@ class DeliveryAssemblyResult:
     error: DeliveryPlanIssue | None = None
 
 
+def recorded_delivery_assembly_conflict_issue(
+    project_root: Path,
+    *,
+    branch: str,
+    assembly_status: str | None,
+    assembly_error_code: str | None,
+    assembled_commit: str | None,
+    failed_unit_id: str | None,
+    failed_unit_commit: str | None,
+) -> DeliveryPlanIssue | None:
+    if assembly_status != "failed" or assembly_error_code != "delivery.assembly_conflict":
+        return None
+
+    root = project_root.resolve()
+    branch_commit = _branch_commit(root, branch)
+    resolved_assembled = resolve_git_commit(root, assembled_commit)[0] if assembled_commit else None
+    resolved_failed_unit = resolve_git_commit(root, failed_unit_commit)[0] if failed_unit_commit else None
+    conflict_resolved = (
+        branch_commit is not None
+        and resolved_assembled is not None
+        and resolved_failed_unit is not None
+        and branch_commit != resolved_assembled
+        and _is_ancestor(root, resolved_assembled, branch_commit)
+        and _is_ancestor(root, resolved_failed_unit, branch_commit)
+    )
+    if conflict_resolved:
+        return None
+
+    unit_detail = f" at unit {failed_unit_id}" if failed_unit_id else ""
+    return DeliveryPlanIssue(
+        "error",
+        "delivery.assembly_conflict",
+        (
+            f"Delivery assembly remains blocked by the recorded merge conflict{unit_detail}; "
+            f"resolve it on {branch} before retrying."
+        ),
+    )
+
+
 def ordered_delivery_assembly_units(
     plan: DeliveryPlan,
     completed_commits: dict[str, str | None],

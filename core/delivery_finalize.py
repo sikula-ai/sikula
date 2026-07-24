@@ -268,9 +268,9 @@ def _preflight_delivery_finalize(
             )
         )
         if not errors:
-            capability_error = _finalize_assembly_capability_error(root, status)
-            if capability_error is not None:
-                errors.append(capability_error)
+            assembly_issue = _finalize_assembly_preview_issue(root, status)
+            if assembly_issue is not None:
+                errors.append(assembly_issue)
         if not errors:
             candidate = _final_commit_candidate(
                 root,
@@ -327,8 +327,12 @@ def _preflight_delivery_finalize(
     )
 
 
-def _finalize_assembly_capability_error(root: Path, status: Any) -> DeliveryPlanIssue | None:
-    from core.delivery_assembly import ordered_delivery_assembly_units, preview_delivery_assembly
+def _finalize_assembly_preview_issue(root: Path, status: Any) -> DeliveryPlanIssue | None:
+    from core.delivery_assembly import (
+        ordered_delivery_assembly_units,
+        preview_delivery_assembly,
+        recorded_delivery_assembly_conflict_issue,
+    )
 
     if status.plan is None:
         return None
@@ -342,7 +346,16 @@ def _finalize_assembly_capability_error(root: Path, status: Any) -> DeliveryPlan
     )
     if preview.error is not None and preview.error.code == "delivery.assembly_git_unsupported":
         return preview.error
-    return None
+    failed_unit = next((unit for unit in status.units if unit.id == status.assembly_unit_id), None)
+    return recorded_delivery_assembly_conflict_issue(
+        root,
+        branch=status.plan.final_branch,
+        assembly_status=status.assembly_status,
+        assembly_error_code=status.assembly_error_code,
+        assembled_commit=status.assembled_commit,
+        failed_unit_id=status.assembly_unit_id,
+        failed_unit_commit=failed_unit.commit if failed_unit else None,
+    )
 
 
 def _finalize_git_errors(

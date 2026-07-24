@@ -68,6 +68,42 @@ def _rev_parse(root: Path, ref: str) -> str:
     ).stdout.strip()
 
 
+def _git_conflicting_unit_commits(root: Path) -> tuple[str, str, str]:
+    base = _git_commit(root, "shared.txt", "base\n")
+    main_branch = _current_branch(root)
+    subprocess.run(["git", "checkout", "-q", "-b", "unit-one", base], cwd=root, check=True)
+    first_commit = _git_commit(root, "shared.txt", "unit one\n")
+    subprocess.run(["git", "checkout", "-q", "-b", "unit-two", base], cwd=root, check=True)
+    second_commit = _git_commit(root, "shared.txt", "unit two\n")
+    subprocess.run(["git", "checkout", "-q", main_branch], cwd=root, check=True)
+    return base, first_commit, second_commit
+
+
+def _git_merge_commit(root: Path, current: str, incoming: str) -> str:
+    tree = _rev_parse(root, f"{current}^{{tree}}")
+    return subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Sikula Test",
+            "-c",
+            "user.email=sikula@example.test",
+            "commit-tree",
+            tree,
+            "-p",
+            current,
+            "-p",
+            incoming,
+            "-m",
+            "resolve delivery conflict",
+        ],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def _write_unit(root: Path, name: str) -> str:
     path = root / ".sikula" / "delivery" / "demo" / "units" / name
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -636,13 +672,7 @@ def test_preview_delivery_finalize_rejects_git_without_write_tree_merge_support(
 
 def test_finalize_delivery_plan_persists_recoverable_assembly_conflict(tmp_path: Path) -> None:
     _git_init(tmp_path)
-    base = _git_commit(tmp_path, "shared.txt", "base\n")
-    main_branch = _current_branch(tmp_path)
-    subprocess.run(["git", "checkout", "-q", "-b", "unit-one", base], cwd=tmp_path, check=True)
-    first_commit = _git_commit(tmp_path, "shared.txt", "unit one\n")
-    subprocess.run(["git", "checkout", "-q", "-b", "unit-two", base], cwd=tmp_path, check=True)
-    second_commit = _git_commit(tmp_path, "shared.txt", "unit two\n")
-    subprocess.run(["git", "checkout", "-q", main_branch], cwd=tmp_path, check=True)
+    base, first_commit, second_commit = _git_conflicting_unit_commits(tmp_path)
     plan_path = _write_plan(tmp_path)
     _write_progress(
         tmp_path,
@@ -664,6 +694,45 @@ def test_finalize_delivery_plan_persists_recoverable_assembly_conflict(tmp_path:
     assert _rev_parse(tmp_path, "refs/heads/sikula/delivery/final") == first_commit
     assert _rev_parse(tmp_path, "HEAD") == base
     assert not (tmp_path / ".git" / "MERGE_HEAD").exists()
+
+    preview = preview_delivery_finalize(plan_path, project_root=tmp_path)
+
+    assert preview.ready is False
+    assert [issue.code for issue in preview.errors] == ["delivery.assembly_conflict"]
+    assert "recorded merge conflict" in preview.errors[0].message
+
+
+def test_preview_delivery_finalize_allows_recorded_resolved_assembly_conflict(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    _, first_commit, second_commit = _git_conflicting_unit_commits(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-unit", "status": "done", "commit": first_commit},
+            {"unit_id": "02-unit", "status": "done", "commit": second_commit},
+        ],
+    )
+    conflict = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    assert [issue.code for issue in conflict.errors] == ["delivery.assembly_conflict"]
+    resolved_commit = _git_merge_commit(tmp_path, first_commit, second_commit)
+    subprocess.run(
+        [
+            "git",
+            "update-ref",
+            "refs/heads/sikula/delivery/final",
+            resolved_commit,
+            first_commit,
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    preview = preview_delivery_finalize(plan_path, project_root=tmp_path)
+
+    assert preview.ready is True
+    assert preview.errors == []
+    assert preview.final_commit == resolved_commit
 
 
 def test_cmd_delivery_finalize_dry_run_outputs_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
