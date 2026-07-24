@@ -134,6 +134,16 @@ def _git_init(root: Path) -> None:
     subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
 
 
+def _git_rev_parse(root: Path, ref: str) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", ref],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def _git_commit(root: Path, name: str = "tracked.txt", body: str = "tracked\n") -> str:
     path = root / name
     path.write_text(body, encoding="utf-8")
@@ -153,9 +163,24 @@ def _git_commit(root: Path, name: str = "tracked.txt", body: str = "tracked\n") 
         check=True,
         capture_output=True,
     )
-    return subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+    return _git_rev_parse(root, "HEAD")
+
+
+def _git_conflicting_unit_commits(root: Path) -> tuple[str, str, str]:
+    base = _git_commit(root, "shared.txt", "base\n")
+    main_branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
+    subprocess.run(["git", "checkout", "-q", "-b", "unit-one", base], cwd=root, check=True)
+    first_commit = _git_commit(root, "shared.txt", "unit one\n")
+    subprocess.run(["git", "checkout", "-q", "-b", "unit-two", base], cwd=root, check=True)
+    second_commit = _git_commit(root, "shared.txt", "unit two\n")
+    subprocess.run(["git", "checkout", "-q", main_branch], cwd=root, check=True)
+    return base, first_commit, second_commit
 
 
 def _write_unit(root: Path, name: str, body: str) -> str:
@@ -272,7 +297,7 @@ def _write_transitive_plan(root: Path) -> Path:
     return path
 
 
-def _write_progress(root: Path, units: list[dict]) -> None:
+def _write_progress(root: Path, units: list[dict], **metadata: object) -> None:
     path = delivery_progress_path(root, "delivery-run-next-demo")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -281,10 +306,33 @@ def _write_progress(root: Path, units: list[dict]) -> None:
                 "schema_version": 1,
                 "plan_id": "delivery-run-next-demo",
                 "units": units,
+                **metadata,
             },
             indent=2,
         ),
         encoding="utf-8",
+    )
+
+
+def _write_recorded_assembly_conflict(
+    root: Path,
+    *,
+    base: str,
+    assembled_commit: str,
+    blocked_commit: str,
+) -> None:
+    _write_progress(
+        root,
+        [
+            {"unit_id": "01-foundation", "status": "done", "commit": assembled_commit},
+            {"unit_id": "02-noop", "status": "done", "commit": blocked_commit},
+        ],
+        assembly_base_commit=base,
+        assembled_commit=assembled_commit,
+        assembly_status="failed",
+        assembly_unit_id="02-noop",
+        assembly_error_code="delivery.assembly_conflict",
+        assembly_updated_at="2026-07-24T05:00:00+00:00",
     )
 
 
@@ -1528,19 +1576,7 @@ def test_cmd_delivery_run_next_persists_assembly_conflict_without_starting_child
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _git_init(tmp_path)
-    base = _git_commit(tmp_path, "shared.txt", "base\n")
-    main_branch = subprocess.run(
-        ["git", "branch", "--show-current"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    subprocess.run(["git", "checkout", "-q", "-b", "unit-one", base], cwd=tmp_path, check=True)
-    first_commit = _git_commit(tmp_path, "shared.txt", "unit one\n")
-    subprocess.run(["git", "checkout", "-q", "-b", "unit-two", base], cwd=tmp_path, check=True)
-    second_commit = _git_commit(tmp_path, "shared.txt", "unit two\n")
-    subprocess.run(["git", "checkout", "-q", main_branch], cwd=tmp_path, check=True)
+    base, first_commit, second_commit = _git_conflicting_unit_commits(tmp_path)
     plan_path = _write_transitive_plan(tmp_path)
     _write_progress(
         tmp_path,
@@ -1581,6 +1617,88 @@ def test_cmd_delivery_run_next_persists_assembly_conflict_without_starting_child
     ).stdout.strip()
     assert operator_head == base
     assert not (tmp_path / ".git" / "MERGE_HEAD").exists()
+
+
+def test_cmd_delivery_run_next_dry_run_blocks_recorded_unresolved_assembly_conflict(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    base, first_commit, second_commit = _git_conflicting_unit_commits(tmp_path)
+    subprocess.run(
+        ["git", "branch", "sikula/delivery/run-next-demo", first_commit],
+        cwd=tmp_path,
+        check=True,
+    )
+    plan_path = _write_transitive_plan(tmp_path)
+    _write_recorded_assembly_conflict(
+        tmp_path,
+        base=base,
+        assembled_commit=first_commit,
+        blocked_commit=second_commit,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, dry_run=True, json_output=True),
+            _run_next_cfg(tmp_path),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is False
+    assert payload["selected_unit"]["id"] == "03-feature"
+    assert payload["errors"][0]["code"] == "delivery.assembly_conflict"
+    assert "recorded merge conflict" in payload["errors"][0]["message"]
+    assert _git_rev_parse(tmp_path, "refs/heads/sikula/delivery/run-next-demo") == first_commit
+
+
+def test_cmd_delivery_run_next_dry_run_allows_recorded_resolved_assembly_conflict(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    base, first_commit, second_commit = _git_conflicting_unit_commits(tmp_path)
+    resolved_tree = _git_rev_parse(tmp_path, f"{first_commit}^{{tree}}")
+    resolved_commit = subprocess.run(
+        [
+            "git",
+            "commit-tree",
+            resolved_tree,
+            "-p",
+            first_commit,
+            "-p",
+            second_commit,
+            "-m",
+            "resolve delivery conflict",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "branch", "sikula/delivery/run-next-demo", resolved_commit],
+        cwd=tmp_path,
+        check=True,
+    )
+    plan_path = _write_transitive_plan(tmp_path)
+    _write_recorded_assembly_conflict(
+        tmp_path,
+        base=base,
+        assembled_commit=first_commit,
+        blocked_commit=second_commit,
+    )
+
+    cmd_delivery_run_next(
+        _run_next_args(plan_path, dry_run=True, json_output=True),
+        _run_next_cfg(tmp_path),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
+    assert payload["selected_unit"]["id"] == "03-feature"
+    assert _git_rev_parse(tmp_path, "refs/heads/sikula/delivery/run-next-demo") == resolved_commit
 
 
 def test_cmd_delivery_run_next_runs_dependent_unit_when_dependency_commit_is_applied(

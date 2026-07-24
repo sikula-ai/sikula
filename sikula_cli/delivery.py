@@ -2579,7 +2579,35 @@ def _delivery_assembly_preview_issue(status: Any, root: Path) -> DeliveryPlanIss
         expected_commit=status.assembled_commit,
         units=ordered_delivery_assembly_units(status.plan, completed_commits),
     )
-    return result.error
+    if result.error is not None:
+        return result.error
+    if status.assembly_status != "failed" or status.assembly_error_code != "delivery.assembly_conflict":
+        return None
+
+    branch_commit = _resolve_git_commit(root, f"refs/heads/{status.plan.final_branch}")
+    assembled_commit = _resolve_git_commit(root, status.assembled_commit) if status.assembled_commit else None
+    failed_unit = _status_unit_by_id(status, status.assembly_unit_id) if status.assembly_unit_id else None
+    failed_unit_commit = _resolve_git_commit(root, failed_unit.commit) if failed_unit and failed_unit.commit else None
+    conflict_resolved = (
+        branch_commit is not None
+        and assembled_commit is not None
+        and failed_unit_commit is not None
+        and branch_commit != assembled_commit
+        and _git_commit_is_ancestor(root, assembled_commit, branch_commit)
+        and _git_commit_is_ancestor(root, failed_unit_commit, branch_commit)
+    )
+    if conflict_resolved:
+        return None
+
+    unit_detail = f" at unit {status.assembly_unit_id}" if status.assembly_unit_id else ""
+    return DeliveryPlanIssue(
+        "error",
+        "delivery.assembly_conflict",
+        (
+            f"Delivery assembly remains blocked by the recorded merge conflict{unit_detail}; "
+            f"resolve it on {status.plan.final_branch} before retrying."
+        ),
+    )
 
 
 def _resolve_git_commit(root: Path, ref: str) -> str | None:

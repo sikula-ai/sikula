@@ -467,7 +467,9 @@ returns `delivery.assembly_git_unsupported` before ref updates on older Git
 versions, while fast-forward and no-op assembly remain available. Conflict
 metadata and partial assembly progress are durable; after an operator resolves
 the merge on `final_branch` and switches away, rerunning `run-next` resumes by
-ancestry without duplicating integration.
+ancestry without duplicating integration. A recorded conflict also blocks
+`run-next --dry-run` until the branch contains both the prior assembled commit
+and the blocked unit commit.
 
 **Delivery final branch command:** `sikula delivery finalize PLAN_FILE` is the
 explicit final branch assembly step for a completed delivery plan. Its CLI

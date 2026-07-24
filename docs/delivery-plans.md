@@ -506,10 +506,13 @@ otherwise it is treated as stale and rejected. Sikula never force-updates these
 branches. No-op plans retain the recorded assembly base. Like `run-next`,
 `finalize` loads project runtime config because it mutates Git refs and parent
 delivery progress. `--dry-run` validates static ref and commit preconditions
-without writing refs, Git objects, or progress; merge conflicts are
-conclusively reported by the mutating command. When pending assembly must
-create a new commit, the dry-run remains ready but reports `final_commit: null`
-because that commit ID is not available without creating the Git object.
+without writing refs, Git objects, or progress. A newly encountered merge
+conflict is conclusively reported by the mutating command. Once recorded,
+however, that conflict also blocks later `run-next --dry-run` previews until
+`final_branch` advances to a resolution containing both the prior assembled
+commit and the blocked unit commit. When pending assembly must create a new
+commit, the dry-run remains ready but reports `final_commit: null` because that
+commit ID is not available without creating the Git object.
 Any later unit progress update clears the recorded final branch metadata, so an
 extended or rerun delivery plan must be finalized again after it returns to
 `done`.
