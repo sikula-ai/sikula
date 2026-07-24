@@ -18,14 +18,52 @@ large request
   -> final delivery branch
 ```
 
+## Choose An Execution Mode
+
+After refining a task, ask Sikula for an advisory workflow recommendation:
+
+```bash
+sikula delivery assess .sikula/tasks/my-task.refined.md
+sikula delivery assess .sikula/tasks/my-task.refined.md --json
+```
+
+Assessment returns one of:
+
+- `single_run` for one cohesive implementation-contract boundary;
+- `delivery_plan` for multiple independently reviewable surfaces, platforms,
+  components, risk boundaries, or dependency-ordered outcomes;
+- `needs_clarification` when the available scope, acceptance, ownership, or
+  validation evidence is insufficient.
+
+A delivery-plan recommendation includes the proposed unit count. The
+model-authored outline remains in the local audit rather than ordinary text or
+JSON output; `delivery prepare` authors the reviewable unit metadata and task
+Markdown after the operator chooses that workflow. The same decision flow
+applies to every supported project stack and to mixed-platform monorepos.
+
+`delivery assess` is read-only with respect to project source, task and
+delivery state, worktrees, and Git. It does not start `sikula run` or
+`delivery prepare`; the operator still chooses the workflow explicitly.
+For `needs_clarification`, the suggested `task refine` command uses an
+explicit first-available `.vN.md` output so it does not overwrite the assessed
+task.
+Prompts and raw provider output remain in the local
+`.sikula/contract-reports/<task-stem>[-<path-hash>].delivery-assess.auto-llm.jsonl`
+audit, with a path hash when same-named tasks would otherwise collide,
+while text and JSON output contain only validated reason codes, deterministic
+summaries, the proposed unit count, and project-relative artifact paths.
+Suggested commands use paths relative to the invocation directory when it is
+inside the project. They are omitted outside the project and when the current
+platform cannot represent the path as a portable safe command token.
+
 ## Authoring Assistance
 
 Ask Sikula to author reviewable delivery plan source artifacts from one
-high-level task file:
+refined task file:
 
 ```bash
-sikula delivery prepare .sikula/tasks/my-task.md
-sikula delivery prepare .sikula/tasks/my-task.md --json
+sikula delivery prepare .sikula/tasks/my-task.refined.md
+sikula delivery prepare .sikula/tasks/my-task.refined.md --json
 ```
 
 When `--output` is omitted, Sikula derives the delivery slug from the task
@@ -37,7 +75,7 @@ filename and writes:
 You can select a different tracked delivery-plan directory explicitly:
 
 ```bash
-sikula delivery prepare .sikula/tasks/my-task.md --output .sikula/delivery/<slug>
+sikula delivery prepare .sikula/tasks/my-task.refined.md --output .sikula/delivery/<slug>
 ```
 
 `delivery prepare` validates the task and output paths, calls the
@@ -53,6 +91,11 @@ ordinary existing artifacts inside the selected output directory, but symlinks,
 path traversal, absolute output paths, path collisions, outside-project writes,
 `.git`, `.sikula/state`, `.sikula/worktrees`, or `.sikula/contract-reports`
 targets remain rejected.
+Generated plan titles and unit title, stream, component, phase, kind, and
+platform metadata must also be bounded, single-line, and free of absolute local
+paths. Slash-prefixed API routes belong in unit task Markdown rather than these
+public metadata fields; full `https://` URLs remain valid metadata. The parser
+and deterministic writer both enforce this boundary before writing.
 
 Generated unit task files should remain product and behavior descriptions with
 acceptance criteria, reviewer focus, security/privacy notes, out-of-scope notes,
@@ -644,3 +687,7 @@ where possible. Operator/audit commands such as `delivery check --json` and
 parent plan path stored in the child task state is saved as a project-relative path
 (`delivery_plan_path`). This metadata is strictly allowlisted state metadata and
 does not expose raw prompts, provider output, diffs, logs, or source excerpts.
+Unsafe free-form delivery metadata is replaced with `<redacted>` in public text
+and JSON projections. Unsafe identity values and their graph references use the
+same stable opaque fingerprint, preserving correlation without exposing the
+original value or changing execution behavior.

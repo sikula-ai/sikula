@@ -206,6 +206,35 @@ task-hash scoped: when the task content hash changes, existing filled answers ar
 only under `previous_answers`, while active `answers` are reset for the new hash so future
 `contract prepare` or run preflight logic does not treat stale answers as authoritative.
 
+**Delivery mode assessment command:** `sikula delivery assess TASK_FILE` is a
+read-only advisory step between task refinement and the operator's workflow
+choice. The CLI wrapper in `sikula_cli/delivery.py` validates the project-local
+task path and `delivery_preparer` overrides, while
+`DeliveryPreparationAgent` uses `LLMClient.generate()` with the source task,
+effective project context, configured validation commands, and checked-in
+guidelines. `core/delivery_authoring.py` strictly parses one of
+`single_run`, `delivery_plan`, or `needs_clarification`, stable mode-compatible
+reason codes, and an optional bounded dependency outline. Contract readiness
+and delivery-mode suitability remain separate decisions; assessment does not
+derive its recommendation primarily from task length.
+
+Platform, component, stream, stack, and validation values are project metadata.
+The assessment parser, prompt rules, and CLI flow do not branch on a specific
+platform, language, build tool, or Sikula self-hosting. The ordinary text and
+JSON projections are deterministic and allowlisted; human summaries are
+derived from the parsed mode and reason codes rather than exposing free-form
+model rationale. Raw prompts and provider output remain only in the local
+`.sikula/contract-reports/<task-stem>[-<path-hash>].delivery-assess.auto-llm.jsonl`
+audit; the path hash is added when same-named tasks would otherwise share an
+artifact.
+Assessment does not write source artifacts, create task or delivery state,
+create worktrees, run nested commands, or modify Git. Its suggested next
+command is advisory and relative to the invocation directory when that
+directory is inside the project. The command is omitted for invocations from
+outside the project rather than exposing an absolute local path. The operator
+still explicitly chooses and starts contract preparation, delivery
+preparation, or further task refinement.
+
 **Delivery plan prepare command:** `sikula delivery prepare TASK_FILE` is an
 authoring and deterministic source-artifact writing command. Ownership is split
 between the CLI wrapper in `sikula_cli/delivery.py`, the assistant in
@@ -217,11 +246,15 @@ source task and output paths, derives the selected plan ID, validates
 `DeliveryPreparationAgent`, which uses `LLMClient.generate()` with a
 command-free prompt assembled from the task and checked-in project context.
 The assistant must return one strict structured draft, which
-`core/delivery_authoring.py` parses without side effects.
+`core/delivery_authoring.py` parses without side effects. Public plan and unit
+metadata is bounded, single-line, and rejects absolute local paths while
+preserving explicit HTTP routes such as `GET /users`.
 `core/delivery_prepare_writer.py` then derives artifact
 paths, checks unit task readiness in memory, writes `plan.yaml` and
 `units/<unit-id>.md` transactionally, validates the generated plan, and rolls
-back on readiness, validation, write, or filesystem failure. Existing artifacts
+back on readiness, metadata, validation, write, or filesystem failure. The
+writer repeats the public-metadata check before any filesystem mutation so
+typed drafts cannot bypass the parser boundary. Existing artifacts
 are refused by default; `--force` may replace ordinary plan/unit files inside
 the selected output directory, while absolute output paths, parent traversal,
 symlink artifacts, symlink escapes, path collisions, outside-project writes,
@@ -310,7 +343,10 @@ plan is treated as one implicit repository with `id: main` and `root: .`;
 multi-repo plans are rejected until cross-repo execution semantics are added.
 The checker emits warnings, not errors, when risk tags indicate that one unit
 combines several independent high-risk delivery surfaces and should likely be
-split before execution.
+split before execution. Public projections replace unsafe free-form delivery
+metadata with `<redacted>`. Unsafe identity values and graph references use a
+stable SHA-256-derived opaque token so dependency and amendment correlation
+remains visible without changing the in-memory execution model.
 
 **Delivery plan status command:** `sikula delivery status PLAN_FILE` is a
 read-only parent-progress view. Its CLI wrapper lives in

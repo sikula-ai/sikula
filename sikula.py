@@ -4,15 +4,29 @@
 Usage (project-centric, run from project root):
   sikula init                        # create .sikula/config.yaml
   sikula init --guidelines --provider codex --model gpt-5.5
-  sikula contract check task.md      # read-only implementation-contract preflight
-  sikula task refine task.md --auto --output task.refined.md
-  sikula contract prepare task.refined.md --output .sikula/contracts/task.contract.md
+  sikula contract check .sikula/tasks/my-task.md
+  sikula task refine .sikula/tasks/my-task.md --auto \\
+      --output .sikula/tasks/my-task.refined.md
+  sikula delivery assess .sikula/tasks/my-task.refined.md
+
+Single-contract workflow after assessment:
+  sikula contract prepare .sikula/tasks/my-task.refined.md --auto \\
+      --output .sikula/contracts/my-task.contract.md
+  sikula run .sikula/contracts/my-task.contract.md --require-contract-ready
+
+Delivery-plan workflow after assessment:
+  sikula delivery prepare .sikula/tasks/my-task.refined.md --output .sikula/delivery/my-plan/
   sikula delivery check .sikula/delivery/my-plan/plan.yaml
-  sikula delivery prepare .sikula/tasks/my-task.md --output .sikula/delivery/my-plan/
   sikula delivery status .sikula/delivery/my-plan/plan.yaml
-  sikula delivery run-next .sikula/delivery/my-plan/plan.yaml --prepare-budget-split
+  sikula delivery run-next .sikula/delivery/my-plan/plan.yaml --dry-run
+  sikula delivery run-next .sikula/delivery/my-plan/plan.yaml
   sikula delivery finalize .sikula/delivery/my-plan/plan.yaml --dry-run
-  sikula run task.md                 # auto-discovers .sikula/config.yaml
+  sikula delivery finalize .sikula/delivery/my-plan/plan.yaml
+
+Delivery-plan budget recovery after a verified planner stop:
+  sikula delivery run-next .sikula/delivery/my-plan/plan.yaml --prepare-budget-split
+
+Task operations:
   sikula run --task-id <task-id>     # resume existing task
   sikula status
   sikula show <task-id>
@@ -21,8 +35,8 @@ Usage (project-centric, run from project root):
   sikula review --branch feature/xyz --base-branch main --description-file pr.md
 
 Usage (explicit config, run from anywhere):
-  sikula --config /path/to/config.yaml run task.md \\
-      --no-planner --no-tests --presync-clean \\
+  sikula --config /path/to/config.yaml run /path/to/task.contract.md \\
+      --require-contract-ready \\
       --agent-model analyst=gpt-5.5 \\
       --agent-provider implementer=gemini --agent-model implementer=gemini-2.5-flash \\
       --agent-timeout implementer=2400
@@ -59,6 +73,7 @@ Per-agent LLM flags (repeatable, agent name uses _ or -):
   CLI values layer on top of YAML agents.<name>.llm overrides.
   Valid run/review agents: analyst, planner, implementer, reviewer, security_reviewer, test_writer, fixer
   task refine --auto and contract prepare --auto accept task_preparer overrides.
+  delivery assess, prepare, amend prepare, and run-next split preparation accept delivery_preparer overrides.
 
 --task-file accepts absolute paths or paths relative to CWD.
 """
@@ -100,7 +115,11 @@ from sikula_cli.agent_overrides import parse_agent_llm_overrides as _parse_agent
 
 if TYPE_CHECKING:
     from agents.delivery_preparation_agent import DeliveryPreparationAgent
-    from core.delivery_authoring import DeliveryAmendmentAuthoringDraft, DeliveryAuthoringDraft
+    from core.delivery_authoring import (
+        DeliveryAmendmentAuthoringDraft,
+        DeliveryAssessmentDraft,
+        DeliveryAuthoringDraft,
+    )
     from core.delivery_plan import DeliveryBudgetExceeded
 
 _BASE = Path(__file__).parent
@@ -1534,10 +1553,17 @@ def _default_contract_path(task_path: Path, cfg: dict) -> Path:
 
 
 def _strip_known_task_suffixes(stem: str) -> str:
-    for suffix in (".refined", ".contract", ".v2", ".v3"):
-        if stem.endswith(suffix):
-            return stem[: -len(suffix)]
-    return stem
+    while True:
+        versionless = re.sub(r"\.v[0-9]+$", "", stem)
+        if versionless != stem:
+            stem = versionless
+            continue
+        for suffix in (".refined", ".contract"):
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
+        else:
+            return stem
 
 
 def _read_interactive_contract_answer(prompt: str, current_answer: str) -> tuple[str, bool]:
@@ -1721,8 +1747,52 @@ def _prepare_auto_preparation_audit_path(source_path: Path, cfg: dict, *, genera
     answers_path = _prepare_answers_path(source_path, cfg, generated_by=generated_by)
     suffix = ".answers.yaml"
     if answers_path.name.endswith(suffix):
-        return answers_path.with_name(f"{answers_path.name[: -len(suffix)]}.auto-llm.jsonl")
-    return answers_path.with_suffix(".auto-llm.jsonl")
+        audit_path = answers_path.with_name(f"{answers_path.name[: -len(suffix)]}.auto-llm.jsonl")
+    else:
+        audit_path = answers_path.with_suffix(".auto-llm.jsonl")
+
+    artifact_base = _prepare_answers_artifact_base(audit_path.parent, cfg)
+    if _prepare_auto_audit_path_available_for_task(audit_path, source_path, artifact_base, generated_by):
+        return audit_path
+
+    phase = generated_by.removeprefix("sikula.").replace("_", "-")
+    stem = _strip_known_task_suffixes(source_path.stem)
+    path_hash = sha256(str(source_path.resolve()).encode("utf-8")).hexdigest()[:8]
+    hashed_path = audit_path.parent / f"{stem}-{path_hash}.{phase}.auto-llm.jsonl"
+    if not _prepare_auto_audit_path_available_for_task(hashed_path, source_path, artifact_base, generated_by):
+        raise FileExistsError(f"audit path already exists for a different task: {hashed_path}")
+    return hashed_path
+
+
+def _prepare_auto_audit_path_available_for_task(
+    path: Path,
+    source_path: Path,
+    artifact_base: Path,
+    generated_by: str,
+) -> bool:
+    if not path.exists() and not path.is_symlink():
+        return True
+    if path.is_symlink() or not path.is_file():
+        return False
+
+    found_record = False
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                data = json.loads(line)
+                if (
+                    not isinstance(data, dict)
+                    or data.get("schema_version") != 1
+                    or data.get("generated_by") != generated_by
+                    or not _prepare_answers_task_path_matches(data.get("task"), source_path, artifact_base)
+                ):
+                    return False
+                found_record = True
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return found_record
 
 
 def _prefill_prepare_answers(answers_data: dict, answers: dict[str, dict]) -> None:
@@ -3262,6 +3332,43 @@ def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
     return cli_delivery.cmd_delivery_status(args, cfg)
 
 
+def _run_delivery_assessment(
+    *,
+    args: argparse.Namespace,
+    cfg: dict,
+    task_path: Path,
+    project_root: Path,
+) -> DeliveryAssessmentDraft:
+    task_text = task_path.read_text(encoding="utf-8")
+    audit_recorder, audit_path = _make_auto_preparation_audit_recorder(
+        generated_by="sikula.delivery_assess",
+        source_path=task_path,
+        source_text=task_text,
+        output_path=cli_config._resolve_contract_report_dir(cfg),
+        cfg=cfg,
+    )
+    agent = _create_delivery_preparation_agent(args, cfg)
+    safe_audit_path = _contract_preflight_path(audit_path, project_root)
+    try:
+        draft = agent.assess_delivery_mode(
+            task_description=task_text,
+            task_path=task_path,
+            project_root=project_root,
+            project_context=_prepare_project_context_from_config(cfg),
+            audit_recorder=audit_recorder,
+        )
+    except Exception as exc:
+        setattr(exc, "audit_path", safe_audit_path)
+        raise
+    setattr(draft, "audit_path", safe_audit_path)
+    return draft
+
+
+def cmd_delivery_assess(args: argparse.Namespace, cfg: dict) -> None:
+    context = cli_delivery.DeliveryAssessmentContext(run_assessment_assistant=_run_delivery_assessment)
+    return cli_delivery.cmd_delivery_assess(args, cfg, context)
+
+
 def _run_delivery_prepare_authoring(
     *,
     args: argparse.Namespace,
@@ -3335,8 +3442,8 @@ def _run_delivery_amend_prepare_authoring(
             plan_id=target.plan.plan_id,
             target_unit_id=target.target.id,
             target_task_description=task_text,
-            target_unit=target.target.to_dict(),
-            downstream_units=[downstream_by_id[unit_id].to_dict() for unit_id in target.downstream_unit_ids],
+            target_unit=target.target.to_authoring_dict(),
+            downstream_units=[downstream_by_id[unit_id].to_authoring_dict() for unit_id in target.downstream_unit_ids],
             project_root=project_root,
             project_context=_prepare_project_context_from_config(cfg),
             amend_reason=amend_reason,
@@ -3473,6 +3580,8 @@ def main() -> None:
             cmd_delivery_check(args, cfg)
         elif args.delivery_command == "status":
             cmd_delivery_status(args, cfg)
+        elif args.delivery_command == "assess":
+            cmd_delivery_assess(args, cfg)
         elif args.delivery_command == "prepare":
             cmd_delivery_prepare(args, cfg)
         elif args.delivery_command == "run-next":

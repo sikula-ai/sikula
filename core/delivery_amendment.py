@@ -31,6 +31,10 @@ from core.delivery_plan import (
     check_delivery_plan_data,
     check_delivery_plan_file,
 )
+from core.delivery_public_metadata import (
+    project_delivery_public_identity,
+    sanitize_delivery_public_metadata,
+)
 from core.delivery_progress import (
     DeliveryProgressLockError,
     DeliveryProgressEvent,
@@ -194,16 +198,16 @@ class DeliveryAmendmentApplyResult:
             "plan_path": _safe_relative(self.plan_path, self.project_root),
             "project_root": "." if self.project_root else None,
             "proposal_id": self.proposal_id,
-            "target_unit_id": self.target_unit_id,
-            "replacement_ids": list(self.replacement_ids),
-            "rewired_unit_ids": list(self.rewired_unit_ids),
+            "target_unit_id": project_delivery_public_identity(self.target_unit_id),
+            "replacement_ids": [project_delivery_public_identity(value) for value in self.replacement_ids],
+            "rewired_unit_ids": [project_delivery_public_identity(value) for value in self.rewired_unit_ids],
             "dry_run": self.dry_run,
             "ready": self.ready,
             "applied": self.applied,
             "proposal_path": _safe_relative(self.proposal_path, self.project_root),
             "errors": [issue.to_dict() for issue in safe_errors],
             "warnings": [issue.to_dict() for issue in safe_warnings],
-            "message": self.message,
+            "message": sanitize_delivery_public_metadata(self.message),
         }
 
 
@@ -713,6 +717,15 @@ def _preflight_amendment(
             raise DeliveryAmendmentError(
                 "delivery_amend.progress_stale", "Delivery progress changed after the proposal was prepared."
             )
+        _validate_loaded_replacement_contracts(
+            proposal.plan_id,
+            proposal.target_unit_id,
+            proposal.replacement_units,
+            proposal.amend_reason,
+            proposal.budget_exceeded,
+            inherited_from=target.target,
+            project_root=Path(root_text),
+        )
         _validate_proposal_against_target(proposal, target)
         readiness_errors = _replacement_contract_readiness_errors(
             proposal.replacement_units,
@@ -823,14 +836,6 @@ def load_delivery_amendment_proposal(
     units = [_proposal_unit_from_dict(item) for item in raw_units]
     if len({unit.id for unit in units}) != len(units):
         raise DeliveryAmendmentError("delivery_amend.replacement_duplicate", "Replacement unit ids must be unique.")
-    _validate_loaded_replacement_contracts(
-        plan_id,
-        target_unit_id,
-        units,
-        amend_reason,
-        budget_exceeded,
-        project_root=project_root,
-    )
     proposal = DeliveryAmendmentProposal(
         proposal_id=proposal_id,
         plan_id=plan_id,
@@ -1302,6 +1307,7 @@ def _validate_loaded_replacement_contracts(
     amend_reason: str | None,
     budget_exceeded: DeliveryBudgetExceeded | None,
     *,
+    inherited_from: DeliveryPlanUnit,
     project_root: Path,
 ) -> None:
     replacement_ids = {unit.id for unit in units}
@@ -1316,6 +1322,9 @@ def _validate_loaded_replacement_contracts(
         )
         authored_units[-1].pop("task_path")
         authored_units[-1].pop("repo_id", None)
+        for key in ("stream", "component", "phase", "kind", "platform"):
+            if authored_units[-1].get(key) == getattr(inherited_from, key):
+                authored_units[-1].pop(key, None)
     payload = {
         "plan_id": plan_id,
         "target_unit_id": target_unit_id,

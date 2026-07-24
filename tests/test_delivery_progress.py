@@ -14,6 +14,8 @@ from core.delivery_progress import (
     DeliveryProgress,
     DeliveryProgressEvent,
     DeliveryProgressLockError,
+    DeliveryStatusResult,
+    DeliveryStatusUnit,
     DeliveryUnitProgress,
     acquire_delivery_progress_lock,
     append_delivery_progress_event,
@@ -113,6 +115,105 @@ def test_delivery_status_defaults_to_pending_when_progress_is_missing(tmp_path: 
     assert "Progress:" in rendered
     assert "not created yet" in rendered
     assert "01-foundation: pending (eligible)" in rendered
+
+
+def test_delivery_status_redacts_unsafe_metadata_from_public_projection(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    private_path = "/Users/example/private/task.md"
+    plan_path = _write_plan(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "title": f"Read {private_path}",
+            "final_branch": "sikula/delivery/status-demo",
+            "units": [
+                {
+                    "id": "01-foundation",
+                    "title": f"Implement from {private_path}",
+                    "task_path": _write_unit(tmp_path, "01-foundation.md"),
+                    "depends_on": [],
+                }
+            ],
+        },
+    )
+
+    result = get_delivery_status(plan_path)
+    payload = result.to_dict()
+    rendered = render_delivery_status(result)
+
+    assert result.valid is True
+    assert result.plan is not None
+    assert result.plan.title == f"Read {private_path}"
+    assert payload["plan"]["title"] == "<redacted>"
+    assert payload["units"][0]["title"] == "<redacted>"
+    assert "Title: <redacted>" in rendered
+    assert "01-foundation: pending (eligible) — <redacted>" in rendered
+    assert private_path not in json.dumps(payload)
+    assert private_path not in rendered
+
+
+def test_delivery_status_projects_unsafe_identity_references_consistently(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    repository_id = "/Users/example/private/repository"
+    first_unit_id = "/Users/example/private/foundation"
+    second_unit_id = r"C:\Users\example\private\feature"
+    plan_path = _write_plan(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "title": "Delivery status demo",
+            "final_branch": "sikula/delivery/status-demo",
+            "repositories": [{"id": repository_id, "root": "."}],
+            "units": [
+                {
+                    "id": first_unit_id,
+                    "repo_id": repository_id,
+                    "task_path": _write_unit(tmp_path, "01-foundation.md"),
+                    "depends_on": [],
+                },
+                {
+                    "id": second_unit_id,
+                    "repo_id": repository_id,
+                    "task_path": _write_unit(tmp_path, "02-feature.md"),
+                    "depends_on": [first_unit_id],
+                },
+            ],
+        },
+    )
+    write_delivery_progress(
+        delivery_progress_path(tmp_path, "delivery-status-demo"),
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="delivery-status-demo",
+            units=[],
+            assembly_base_commit="base-commit",
+            assembly_status="failed",
+            assembly_unit_id=first_unit_id,
+            assembly_error_code="delivery.assembly_conflict",
+        ),
+    )
+
+    result = get_delivery_status(plan_path)
+    payload = result.to_dict()
+    rendered = render_delivery_status(result)
+
+    assert result.valid is True
+    projected_repo = payload["plan"]["repositories"][0]["id"]
+    projected_first = payload["units"][0]["id"]
+    assert projected_repo == payload["units"][0]["repo_id"]
+    assert projected_repo == payload["units"][1]["repo_id"]
+    assert projected_first == payload["units"][1]["depends_on"][0]
+    assert projected_first == payload["assembly_unit_id"]
+    assert projected_first in payload["next_action"]
+    serialized = json.dumps(payload)
+    assert repository_id not in serialized
+    assert first_unit_id not in serialized
+    assert second_unit_id not in serialized
+    assert repository_id not in rendered
+    assert first_unit_id not in rendered
+    assert second_unit_id not in rendered
 
 
 def test_delivery_status_preserves_monorepo_component_metadata(tmp_path: Path) -> None:
@@ -251,6 +352,7 @@ def test_delivery_status_reports_failed_when_another_unit_is_running(tmp_path: P
 def test_delivery_status_reports_waiting_and_failed_states(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
+    private_waiting_reason = "/Users/example/private/waiting"
     _write_progress(
         tmp_path,
         "delivery-status-demo",
@@ -258,7 +360,11 @@ def test_delivery_status_reports_waiting_and_failed_states(tmp_path: Path) -> No
             "schema_version": 1,
             "plan_id": "delivery-status-demo",
             "units": [
-                {"unit_id": "01-foundation", "status": "waiting", "waiting_reason": "needs_human"},
+                {
+                    "unit_id": "01-foundation",
+                    "status": "waiting",
+                    "waiting_reason": private_waiting_reason,
+                },
                 {"unit_id": "02-feature", "status": "failed", "failure_code": "child_failed"},
             ],
         },
@@ -268,11 +374,47 @@ def test_delivery_status_reports_waiting_and_failed_states(tmp_path: Path) -> No
 
     assert result.valid is True
     assert result.status == "failed"
-    assert result.units[0].waiting_reason == "needs_human"
+    assert result.units[0].waiting_reason == private_waiting_reason
+    assert result.to_dict()["units"][0]["waiting_reason"] == "<redacted>"
     assert result.units[1].failure_code == "child_failed"
     assert result.next_action == "inspect the failed delivery unit; no linked child task is available for retry"
     rendered = render_delivery_status(result)
     assert "(retry unavailable: missing child task id)" in rendered
+    assert private_waiting_reason not in rendered
+
+
+def test_delivery_status_unit_redacts_unvalidated_progress_strings() -> None:
+    private_path = "/Users/example/private/progress"
+    unit = DeliveryStatusUnit(
+        id="unit",
+        status="waiting",
+        title="Unit",
+        task_path="unit.md",
+        depends_on=[],
+        child_task_id=private_path,
+        branch=private_path,
+        commit=private_path,
+        waiting_reason=private_path,
+        failure_code=private_path,
+        started_at=private_path,
+        completed_at=private_path,
+        updated_at=private_path,
+    )
+
+    payload = unit.to_dict()
+
+    assert payload["child_task_id"].startswith("<redacted:")
+    for key in (
+        "branch",
+        "commit",
+        "waiting_reason",
+        "failure_code",
+        "started_at",
+        "completed_at",
+        "updated_at",
+    ):
+        assert payload[key] == "<redacted>"
+    assert private_path not in json.dumps(payload)
 
 
 def test_delivery_status_reports_running_without_child_task_id(tmp_path: Path) -> None:
@@ -411,8 +553,6 @@ def test_delivery_status_unit_projects_amendment_metadata() -> None:
 
 
 def test_delivery_status_unit_projects_budget_stop_as_split_only() -> None:
-    from core.delivery_progress import DeliveryStatusUnit
-
     unit = DeliveryStatusUnit(
         id="unit-1",
         title="Unit 1",
@@ -429,8 +569,7 @@ def test_delivery_status_unit_projects_budget_stop_as_split_only() -> None:
     assert unit.run_next_blocked_reason == "unit_budget_exceeded"
     assert unit.to_dict()["run_next_blocked_reason"] == "unit_budget_exceeded"
 
-    result = argparse.Namespace(
-        valid=True,
+    result = DeliveryStatusResult(
         status="failed",
         plan_path="plan.yaml",
         progress_path=None,
@@ -616,6 +755,51 @@ def test_delivery_status_reports_finalized_branch_metadata(tmp_path: Path) -> No
     rendered = render_delivery_status(result)
     assert "Finalized: sikula/delivery/status-demo @ abc123" in rendered
     assert "Next action: review finalized delivery branch" in rendered
+
+
+def test_delivery_status_sanitizes_all_top_level_progress_metadata(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    private_value = "/Users/example/private/progress-value"
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "assembly_base_commit": private_value,
+            "assembled_commit": private_value,
+            "assembly_status": "failed",
+            "assembly_unit_id": private_value,
+            "assembly_error_code": private_value,
+            "assembly_updated_at": private_value,
+            "final_branch": private_value,
+            "final_commit": private_value,
+            "finalized_at": private_value,
+            "units": [],
+        },
+    )
+
+    result = get_delivery_status(plan_path)
+    payload = result.to_dict()
+    rendered = render_delivery_status(result)
+
+    assert result.valid is True
+    for key in (
+        "assembly_base_commit",
+        "assembled_commit",
+        "assembly_error_code",
+        "assembly_updated_at",
+        "final_branch",
+        "final_commit",
+        "finalized_at",
+    ):
+        assert getattr(result, key) == private_value
+        assert payload[key] == "<redacted>"
+    assert result.assembly_unit_id == private_value
+    assert payload["assembly_unit_id"].startswith("<redacted:")
+    assert private_value not in json.dumps(payload)
+    assert private_value not in rendered
 
 
 def test_unit_progress_update_clears_stale_finalization_metadata(tmp_path: Path) -> None:

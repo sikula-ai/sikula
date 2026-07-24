@@ -221,8 +221,9 @@ def test_attach_reference_asset_copies_file_and_prints_snippet_without_writing_t
     assert "## Assets" not in task_file.read_text(encoding="utf-8")
 
 
-def test_attach_uses_base_task_stem_for_refined_or_contract_task_files(tmp_path: Path):
-    task_file = tmp_path / ".sikula" / "tasks" / "team-invites.refined.md"
+@pytest.mark.parametrize("task_suffix", [".refined", ".contract", ".v4", ".v12.refined"])
+def test_attach_uses_base_task_stem_for_generated_task_files(tmp_path: Path, task_suffix: str):
+    task_file = tmp_path / ".sikula" / "tasks" / f"team-invites{task_suffix}.md"
     task_file.parent.mkdir(parents=True)
     task_file.write_text("# Add team invite\n", encoding="utf-8")
     source = tmp_path / "mockup.png"

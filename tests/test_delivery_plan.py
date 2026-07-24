@@ -141,6 +141,79 @@ def test_delivery_plan_check_accepts_valid_single_repo_plan(tmp_path: Path) -> N
     assert "Units: 2" in rendered
 
 
+def test_delivery_plan_check_redacts_unsafe_metadata_from_public_projection(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    private_path = "/Users/example/private/task.md"
+    data["title"] = f"Read {private_path}"
+    data["units"][0]["title"] = f"Implement from {private_path}"
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+    payload = result.to_dict()
+    rendered = render_delivery_plan_check(result)
+
+    assert result.valid is True
+    assert result.plan is not None
+    assert result.plan.title == f"Read {private_path}"
+    assert payload["plan"]["title"] == "<redacted>"
+    assert payload["plan"]["units"][0]["title"] == "<redacted>"
+    assert "<redacted>" in rendered
+    assert private_path not in json.dumps(payload)
+    assert private_path not in rendered
+
+
+def test_delivery_plan_check_redacts_unsafe_metadata_from_validation_issues(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    private_stream_id = "/Users/example/private/stream"
+    data = _base_plan(tmp_path)
+    data["streams"] = [
+        {"id": private_stream_id},
+        {"id": private_stream_id},
+    ]
+
+    result = check_delivery_plan_file(_write_plan(tmp_path, data))
+    payload = result.to_dict()
+    rendered = render_delivery_plan_check(result)
+
+    assert result.valid is False
+    assert "streams.duplicate_id" in {issue.code for issue in result.errors}
+    assert private_stream_id not in json.dumps(payload)
+    assert private_stream_id not in rendered
+    assert "<redacted>" in json.dumps(payload)
+    assert "<redacted>" in rendered
+
+
+def test_delivery_plan_check_projects_unsafe_identity_references_consistently(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    repository_id = "/Users/example/private/repository"
+    first_unit_id = "/Users/example/private/domain"
+    second_unit_id = r"C:\Users\example\private\api"
+    data["repositories"] = [{"id": repository_id, "root": "."}]
+    data["units"][0]["id"] = first_unit_id
+    data["units"][0]["repo_id"] = repository_id
+    data["units"][1]["id"] = second_unit_id
+    data["units"][1]["repo_id"] = repository_id
+    data["units"][1]["depends_on"] = [first_unit_id]
+
+    result = check_delivery_plan_file(_write_plan(tmp_path, data))
+    payload = result.to_dict()
+
+    assert result.valid is True
+    projected_repo = payload["plan"]["repositories"][0]["id"]
+    projected_first = payload["plan"]["units"][0]["id"]
+    projected_second = payload["plan"]["units"][1]["id"]
+    assert projected_repo == payload["plan"]["units"][0]["repo_id"]
+    assert projected_repo == payload["plan"]["units"][1]["repo_id"]
+    assert projected_first == payload["plan"]["units"][1]["depends_on"][0]
+    assert projected_first != projected_second
+    serialized = json.dumps(payload)
+    assert repository_id not in serialized
+    assert first_unit_id not in serialized
+    assert second_unit_id not in serialized
+
+
 def test_delivery_plan_check_preserves_monorepo_component_metadata(tmp_path: Path) -> None:
     _git_init(tmp_path)
     data = _base_plan(tmp_path)

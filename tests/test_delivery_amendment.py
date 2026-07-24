@@ -442,6 +442,36 @@ def test_prepare_rejects_unknown_target(tmp_path: Path) -> None:
     assert exc_info.value.issue.code == "delivery_amend.target_unknown"
 
 
+def test_amend_prepare_redacts_unsafe_unknown_target_from_public_errors(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    private_target = "/Users/example/private/unit"
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        split_unit=private_target,
+        json=True,
+        agent_model=None,
+        agent_provider=None,
+        agent_timeout=None,
+    )
+    cfg = {
+        **_project_config(tmp_path),
+        "tasks": {"contract_report_dir": str(proposal_root)},
+    }
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_amend_prepare(args, cfg)
+
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert exc_info.value.code == 1
+    assert payload["target_unit_id"].startswith("<redacted:")
+    assert payload["errors"][0]["message"] == "<redacted>"
+    assert private_target not in output
+
+
 @pytest.mark.parametrize(
     "private_path",
     [
@@ -1699,6 +1729,82 @@ def test_main_amend_authoring_adapter_attaches_audit_path(
     assert audit_records == [{"phase": "test"}]
 
 
+def test_main_amend_authoring_adapter_preserves_raw_plan_references(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    legacy_metadata = {
+        "stream": "/Users/alice/private-stream",
+        "component": "/Users/alice/private-component",
+        "phase": "/Users/alice/private-phase",
+        "kind": "/Users/alice/private-kind",
+        "platform": "/Users/alice/private-platform",
+    }
+    plan_data = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan_data["streams"] = [legacy_metadata["stream"]]
+    plan_data["components"] = [
+        {
+            "id": legacy_metadata["component"],
+            "path": ".",
+            "stream": legacy_metadata["stream"],
+        }
+    ]
+    for unit in plan_data["units"]:
+        unit.update(legacy_metadata)
+    plan_path.write_text(yaml.safe_dump(plan_data, sort_keys=False), encoding="utf-8")
+
+    target = inspect_delivery_amendment_target(
+        plan_path,
+        "c",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+    snapshot = capture_delivery_amendment_source_snapshot(target)
+    audit_path = proposal_root / "amend-audit.jsonl"
+
+    class Agent:
+        def author_delivery_amendment(self, **kwargs):
+            for key, value in legacy_metadata.items():
+                assert kwargs["target_unit"][key] == value
+                assert kwargs["downstream_units"][0][key] == value
+            return _draft()
+
+    monkeypatch.setattr(sikula, "_create_delivery_preparation_agent", lambda args, cfg: Agent())
+    monkeypatch.setattr(
+        sikula,
+        "_make_auto_preparation_audit_recorder",
+        lambda **kwargs: (lambda record: None, audit_path),
+    )
+
+    draft = sikula._run_delivery_amend_prepare_authoring(
+        args=argparse.Namespace(),
+        cfg=_project_config(tmp_path),
+        target=target,
+        source_snapshot=snapshot,
+    )
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path,
+        "c",
+        draft,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+        project_config=_project_config(tmp_path),
+        expected_source_snapshot=snapshot,
+    )
+
+    for key, value in legacy_metadata.items():
+        assert {getattr(unit, key) for unit in proposal.replacement_units} == {value}
+    preview = preview_delivery_amendment(
+        plan_path,
+        proposal.proposal_id,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+        project_config=_project_config(tmp_path),
+    )
+    assert preview.ready is True
+
+
 def test_main_amend_authoring_adapter_attaches_audit_path_to_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1803,6 +1909,65 @@ def test_amendment_results_redact_outside_project_plan_paths(tmp_path: Path) -> 
     assert apply_payload["plan_path"] is None
     assert str(outside_plan) not in serialized
     assert "<redacted>" in serialized
+
+
+def test_amendment_results_project_unsafe_identity_references(tmp_path: Path) -> None:
+    target_id = "/Users/example/private/target"
+    replacement_id = r"C:\Users\example\private\replacement"
+    prepare_result = DeliveryAmendPrepareResult(
+        plan_path=str(tmp_path / "plan.yaml"),
+        project_root=str(tmp_path),
+        status="ready",
+        prepared=True,
+        plan_id="amend-demo",
+        target_unit_id=target_id,
+        replacement_ids=[replacement_id],
+        errors=[
+            DeliveryPlanIssue(
+                "error",
+                "amendment.target_unknown",
+                f"Unknown target unit: {target_id}",
+            )
+        ],
+        message=f"Prepared replacement for {target_id}.",
+    )
+    apply_result = DeliveryAmendmentApplyResult(
+        plan_path=str(tmp_path / "plan.yaml"),
+        project_root=str(tmp_path),
+        proposal_id="proposal-1",
+        target_unit_id=target_id,
+        replacement_ids=[replacement_id],
+        rewired_unit_ids=[target_id],
+        dry_run=True,
+        ready=True,
+        applied=False,
+        proposal_path=None,
+        errors=[
+            DeliveryPlanIssue(
+                "error",
+                "amendment.target_unknown",
+                f"Unknown target unit: {target_id}",
+            )
+        ],
+        warnings=[],
+        message=f"Ready to replace {target_id}.",
+    )
+
+    prepare_payload = prepare_result.to_dict()
+    apply_payload = apply_result.to_dict()
+    prepare_text = render_delivery_amend_prepare(prepare_result)
+    apply_text = render_delivery_amend_apply(apply_result)
+
+    assert prepare_payload["target_unit_id"] == apply_payload["target_unit_id"]
+    assert prepare_payload["replacement_ids"] == apply_payload["replacement_ids"]
+    assert apply_payload["target_unit_id"] == apply_payload["rewired_unit_ids"][0]
+    serialized = json.dumps({"prepare": prepare_payload, "apply": apply_payload})
+    assert target_id not in serialized
+    assert replacement_id not in serialized
+    assert target_id not in prepare_text
+    assert replacement_id not in prepare_text
+    assert target_id not in apply_text
+    assert replacement_id not in apply_text
 
 
 @pytest.mark.parametrize("changed_input", ["plan", "target_task", "progress"])

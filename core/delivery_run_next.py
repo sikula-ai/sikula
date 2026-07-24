@@ -6,6 +6,10 @@ from typing import Any
 
 from core.delivery_plan import DeliveryBudgetExceeded, DeliveryPlanIssue, _find_git_root as _find_delivery_git_root
 from core.delivery_progress import DeliveryStatusUnit, get_delivery_status, select_next_delivery_unit
+from core.delivery_public_metadata import (
+    project_delivery_public_identity,
+    sanitize_delivery_public_metadata,
+)
 from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
 
 
@@ -46,7 +50,7 @@ class DeliveryRunNextPreview:
                 _sanitize_issue(issue, self.project_root, self.plan_path, None, None).to_dict()
                 for issue in self.warnings
             ],
-            "message": self.message,
+            "message": sanitize_delivery_public_metadata(self.message),
         }
         return data
 
@@ -67,19 +71,28 @@ class DeliveryBudgetSplitPreparationResult:
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "prepared": self.prepared,
-            "target_unit_id": self.target_unit_id,
+            "target_unit_id": project_delivery_public_identity(self.target_unit_id),
             "proposal_id": self.proposal_id,
-            "replacement_ids": list(self.replacement_ids),
-            "proposal_path": self.proposal_path,
-            "audit_path": self.audit_path,
+            "replacement_ids": [project_delivery_public_identity(value) for value in self.replacement_ids],
+            "proposal_path": sanitize_delivery_public_metadata(self.proposal_path),
+            "audit_path": sanitize_delivery_public_metadata(self.audit_path),
             "budget_exceeded": self.budget_exceeded.to_dict() if self.budget_exceeded else None,
-            "errors": list(self.errors),
-            "warnings": list(self.warnings),
-            "message": self.message,
+            "errors": [_project_budget_split_issue(issue) for issue in self.errors],
+            "warnings": [_project_budget_split_issue(issue) for issue in self.warnings],
+            "message": sanitize_delivery_public_metadata(self.message),
         }
         if self.prepared:
             data["next_action"] = "delivery_amend_apply"
         return data
+
+
+def _project_budget_split_issue(issue: dict[str, Any]) -> dict[str, Any]:
+    projected: dict[str, Any] = {}
+    for key in ("severity", "code", "message", "path"):
+        value = issue.get(key)
+        if isinstance(value, str):
+            projected[key] = sanitize_delivery_public_metadata(value)
+    return projected
 
 
 @dataclass(frozen=True)
@@ -125,7 +138,7 @@ class DeliveryRunNextExecutionResult:
             "status": self.status,
             "progress_exists": self.progress_exists,
             "selected_unit": self.selected_unit.to_dict() if self.selected_unit else None,
-            "child_task_id": self.child_task_id,
+            "child_task_id": project_delivery_public_identity(self.child_task_id),
             "unit_status": self.unit_status,
             "run_exit_code": self.run_exit_code,
             "progress_path": progress_path,
@@ -142,7 +155,7 @@ class DeliveryRunNextExecutionResult:
                 ).to_dict()
                 for issue in self.warnings
             ],
-            "message": self.message,
+            "message": sanitize_delivery_public_metadata(self.message),
         }
         if self.budget_split_preparation is not None:
             data["budget_split_preparation"] = self.budget_split_preparation.to_dict()
@@ -297,13 +310,15 @@ def render_delivery_run_next_preview(result: DeliveryRunNextPreview) -> str:
         lines.append(f"Plan status: {result.status}")
     lines.append(f"Progress exists: {'yes' if result.progress_exists else 'no'}")
     if result.selected_unit:
-        title = f" - {result.selected_unit.title}" if result.selected_unit.title else ""
-        lines.append(f"Selected unit: {result.selected_unit.id}{title}")
-        lines.append(f"Task path: {result.selected_unit.task_path}")
-        if result.selected_unit.child_task_id:
-            lines.append(f"Child task: {result.selected_unit.child_task_id}")
+        selected_unit = result.selected_unit.to_dict()
+        safe_title = selected_unit.get("title")
+        title = f" - {safe_title}" if safe_title else ""
+        lines.append(f"Selected unit: {selected_unit['id']}{title}")
+        lines.append(f"Task path: {selected_unit['task_path']}")
+        if selected_unit.get("child_task_id"):
+            lines.append(f"Child task: {selected_unit['child_task_id']}")
     lines.append(f"Dry run: {'yes' if result.dry_run else 'no'}")
-    lines.append(result.message)
+    lines.append(sanitize_delivery_public_metadata(result.message) or "")
     if result.errors:
         lines.append("")
         lines.append("Errors:")
@@ -341,11 +356,13 @@ def render_delivery_run_next_execution(result: DeliveryRunNextExecutionResult) -
         lines.append(f"Plan status: {result.status}")
     lines.append(f"Progress exists: {'yes' if result.progress_exists else 'no'}")
     if result.selected_unit:
-        title = f" - {result.selected_unit.title}" if result.selected_unit.title else ""
-        lines.append(f"Selected unit: {result.selected_unit.id}{title}")
-        lines.append(f"Task path: {result.selected_unit.task_path}")
+        selected_unit = result.selected_unit.to_dict()
+        safe_title = selected_unit.get("title")
+        title = f" - {safe_title}" if safe_title else ""
+        lines.append(f"Selected unit: {selected_unit['id']}{title}")
+        lines.append(f"Task path: {selected_unit['task_path']}")
     if result.child_task_id:
-        lines.append(f"Child task: {result.child_task_id}")
+        lines.append(f"Child task: {project_delivery_public_identity(result.child_task_id)}")
     if result.unit_status:
         lines.append(f"Unit status: {result.unit_status}")
     if result.run_exit_code is not None:
@@ -354,9 +371,10 @@ def render_delivery_run_next_execution(result: DeliveryRunNextExecutionResult) -
         lines.append(f"Progress: {progress_path}")
     if events_path:
         lines.append(f"Events: {events_path}")
-    lines.append(result.message)
+    lines.append(sanitize_delivery_public_metadata(result.message) or "")
     if result.budget_split_preparation is not None:
         preparation = result.budget_split_preparation
+        preparation_data = preparation.to_dict()
         lines.extend(
             [
                 "",
@@ -364,23 +382,23 @@ def render_delivery_run_next_execution(result: DeliveryRunNextExecutionResult) -
                 f"Status: {'prepared' if preparation.prepared else 'blocked'}",
             ]
         )
-        if preparation.target_unit_id:
-            lines.append(f"Target unit: {preparation.target_unit_id}")
-        if preparation.proposal_id:
-            lines.append(f"Proposal: {preparation.proposal_id}")
-        if preparation.replacement_ids:
-            lines.append("Replacements: " + ", ".join(preparation.replacement_ids))
-        if preparation.proposal_path:
-            lines.append(f"Proposal artifact: {preparation.proposal_path}")
-        if preparation.audit_path:
-            lines.append(f"Authoring audit: {preparation.audit_path}")
-        lines.append(preparation.message)
-        if preparation.errors:
+        if preparation_data["target_unit_id"]:
+            lines.append(f"Target unit: {preparation_data['target_unit_id']}")
+        if preparation_data["proposal_id"]:
+            lines.append(f"Proposal: {preparation_data['proposal_id']}")
+        if preparation_data["replacement_ids"]:
+            lines.append("Replacements: " + ", ".join(preparation_data["replacement_ids"]))
+        if preparation_data["proposal_path"]:
+            lines.append(f"Proposal artifact: {preparation_data['proposal_path']}")
+        if preparation_data["audit_path"]:
+            lines.append(f"Authoring audit: {preparation_data['audit_path']}")
+        lines.append(preparation_data["message"] or "")
+        if preparation_data["errors"]:
             lines.append("Preparation errors:")
-            lines.extend(f"- {_format_projected_issue(issue)}" for issue in preparation.errors)
-        if preparation.warnings:
+            lines.extend(f"- {_format_projected_issue(issue)}" for issue in preparation_data["errors"])
+        if preparation_data["warnings"]:
             lines.append("Preparation warnings:")
-            lines.extend(f"- {_format_projected_issue(issue)}" for issue in preparation.warnings)
+            lines.extend(f"- {_format_projected_issue(issue)}" for issue in preparation_data["warnings"])
     if result.errors:
         lines.append("")
         lines.append("Errors:")
@@ -450,5 +468,4 @@ def _blocked_run_next_reason(
 
 
 def _format_issue(issue: DeliveryPlanIssue) -> str:
-    location = f" [{issue.path}]" if issue.path else ""
-    return f"- {issue.code}{location}: {issue.message}"
+    return issue.to_public_text()

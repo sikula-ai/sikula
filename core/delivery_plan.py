@@ -8,6 +8,10 @@ from typing import Any
 
 import yaml
 
+from core.delivery_public_metadata import (
+    project_delivery_public_identity,
+    sanitize_delivery_public_metadata,
+)
 from core.delivery_unit_metadata import (
     DELIVERY_UNIT_BUDGET_FIELDS,
     DELIVERY_UNIT_RISK_TAG_VALUES,
@@ -59,11 +63,16 @@ class DeliveryPlanIssue:
         data = {
             "severity": self.severity,
             "code": self.code,
-            "message": self.message,
+            "message": sanitize_delivery_public_metadata(self.message),
         }
         if self.path:
-            data["path"] = self.path
+            data["path"] = sanitize_delivery_public_metadata(self.path)
         return data
+
+    def to_public_text(self) -> str:
+        data = self.to_dict()
+        location = f" [{data['path']}]" if data.get("path") else ""
+        return f"- {data['code']}{location}: {data['message']}"
 
 
 @dataclass(frozen=True)
@@ -74,7 +83,7 @@ class DeliveryRepository:
 
     def to_dict(self) -> dict[str, Any]:
         data = {
-            "id": self.id,
+            "id": project_delivery_public_identity(self.id),
             "root": self.root,
         }
         if self.implicit:
@@ -91,13 +100,17 @@ class DeliveryComponent:
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
-            "id": self.id,
+            "id": project_delivery_public_identity(self.id),
             "path": self.path,
         }
         for key in ("label", "stream"):
             value = getattr(self, key)
             if value:
-                data[key] = value
+                data[key] = (
+                    project_delivery_public_identity(value)
+                    if key == "stream"
+                    else sanitize_delivery_public_metadata(value)
+                )
         return data
 
 
@@ -138,10 +151,17 @@ class DeliveryPlanUnit:
         return bool(self.superseded_by)
 
     def to_dict(self) -> dict[str, Any]:
+        return self._to_dict(public=True)
+
+    def to_authoring_dict(self) -> dict[str, Any]:
+        return self._to_dict(public=False)
+
+    def _to_dict(self, *, public: bool) -> dict[str, Any]:
+        project_identity = project_delivery_public_identity if public else lambda value: value
         data: dict[str, Any] = {
-            "id": self.id,
+            "id": project_identity(self.id),
             "task_path": self.task_path,
-            "depends_on": list(self.depends_on),
+            "depends_on": [project_identity(value) for value in self.depends_on],
         }
         for key in (
             "title",
@@ -156,6 +176,10 @@ class DeliveryPlanUnit:
         ):
             value = getattr(self, key)
             if value:
+                if key in {"stream", "repo_id", "component", "supersedes"}:
+                    value = project_identity(value)
+                elif public and key in {"title", "platform", "phase", "kind"}:
+                    value = sanitize_delivery_public_metadata(value)
                 data[key] = value
         if self.scope_paths:
             data["scope_paths"] = list(self.scope_paths)
@@ -168,7 +192,7 @@ class DeliveryPlanUnit:
             if budget_data:
                 data["budget"] = budget_data
         if self.superseded_by:
-            data["superseded_by"] = list(self.superseded_by)
+            data["superseded_by"] = [project_identity(value) for value in self.superseded_by]
         if self.budget_exceeded:
             data["budget_exceeded"] = self.budget_exceeded.to_dict()
         return data
@@ -190,13 +214,13 @@ class DeliveryPlan:
         data: dict[str, Any] = {
             "schema_version": self.schema_version,
             "plan_id": self.plan_id,
-            "title": self.title,
+            "title": sanitize_delivery_public_metadata(self.title),
             "final_branch": self.final_branch,
             "repositories": [repo.to_dict() for repo in self.repositories],
             "units": [unit.to_dict() for unit in self.units],
         }
         if self.stream_ids:
-            data["streams"] = list(self.stream_ids)
+            data["streams"] = [project_delivery_public_identity(stream) for stream in self.stream_ids]
         if self.components:
             data["components"] = [component.to_dict() for component in self.components]
         if self.planning_mode:
@@ -315,7 +339,7 @@ def render_delivery_plan_check(result: DeliveryPlanCheckResult) -> str:
         lines.extend(
             [
                 f"Plan ID: {result.plan.plan_id}",
-                f"Title: {result.plan.title}",
+                f"Title: {sanitize_delivery_public_metadata(result.plan.title)}",
                 f"Final branch: {result.plan.final_branch}",
                 f"Units: {len(result.plan.units)}",
             ]
@@ -337,8 +361,7 @@ def render_delivery_plan_check(result: DeliveryPlanCheckResult) -> str:
 
 
 def _format_issue(issue: DeliveryPlanIssue) -> str:
-    location = f" [{issue.path}]" if issue.path else ""
-    return f"- {issue.code}{location}: {issue.message}"
+    return issue.to_public_text()
 
 
 def _load_plan_yaml(path: Path, errors: list[DeliveryPlanIssue]) -> Any:

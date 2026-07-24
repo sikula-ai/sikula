@@ -23,6 +23,14 @@ load_config = config_cli.load_config
 cmd_init = init_cli.cmd_init
 
 
+@pytest.mark.parametrize(
+    "stem",
+    ["team-invites.refined", "team-invites.contract", "team-invites.v4", "team-invites.v12.refined"],
+)
+def test_strip_known_task_suffixes_preserves_base_task_identity(stem: str) -> None:
+    assert sikula_module._strip_known_task_suffixes(stem) == "team-invites"
+
+
 def test_config_cli_module_imports() -> None:
     import sikula_cli.config as config_cli
 

@@ -133,8 +133,10 @@ These commands also support interactive modes (`--interactive`) and answers-file
 **Author and check a delivery plan**
 
 ```bash
-sikula delivery prepare .sikula/tasks/my-task.md
-sikula delivery prepare .sikula/tasks/my-task.md --json
+sikula delivery assess .sikula/tasks/my-task.refined.md
+sikula delivery assess .sikula/tasks/my-task.refined.md --json
+sikula delivery prepare .sikula/tasks/my-task.refined.md
+sikula delivery prepare .sikula/tasks/my-task.refined.md --json
 sikula delivery check .sikula/delivery/my-task/plan.yaml
 sikula delivery check .sikula/delivery/my-task/plan.yaml --json
 sikula delivery status .sikula/delivery/my-task/plan.yaml
@@ -152,14 +154,25 @@ sikula delivery finalize .sikula/delivery/my-task/plan.yaml --dry-run
 sikula delivery finalize .sikula/delivery/my-task/plan.yaml
 ```
 
-Use this to author, validate, and inspect the tracked parent plan for larger work split into delivery units. By default, `delivery prepare` writes:
+Use `delivery assess` after task refinement when you want Sikula to recommend a
+standard single-contract run, a delivery plan, or further clarification. The
+recommendation is platform-neutral and advisory: it does not start either
+workflow, write source artifacts, create state, or update Git, and the operator
+still makes the final choice.
+
+Use the remaining commands to author, validate, and inspect the tracked parent
+plan for larger work split into delivery units. By default, `delivery prepare`
+writes:
 
 - `.sikula/delivery/<slug>/plan.yaml`
 - `.sikula/delivery/<slug>/units/<unit-slug>.md`
 
 `delivery prepare` is an authoring step only. It writes tracked plan and unit
 artifacts but does not start implementation, create task state, mutate delivery
-progress, or update branches.
+progress, or update branches. Generated plan and unit metadata must be bounded,
+single-line, and free of absolute local paths. Slash-prefixed API routes belong
+in task or contract Markdown rather than these public metadata fields; full
+`https://` URLs remain valid metadata.
 
 Prepared units use `budget.max_planner_steps: 1` by default. A limit of `2` is
 allowed only for tightly coupled work; limits of `3` or more are rejected.

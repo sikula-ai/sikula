@@ -207,10 +207,17 @@ def _safe_filename(name: str) -> str:
 
 
 def _strip_known_task_suffixes(stem: str) -> str:
-    for suffix in (".refined", ".contract", ".v2", ".v3"):
-        if stem.endswith(suffix):
-            return stem[: -len(suffix)]
-    return stem
+    while True:
+        versionless = re.sub(r"\.v[0-9]+$", "", stem)
+        if versionless != stem:
+            stem = versionless
+            continue
+        for suffix in (".refined", ".contract"):
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
+        else:
+            return stem
 
 
 def _safe_stem(value: str) -> str:

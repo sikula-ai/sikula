@@ -153,6 +153,25 @@ def _draft(
     )
 
 
+def test_writer_rejects_unsafe_public_metadata_before_writing(tmp_path: Path) -> None:
+    draft = _draft(units=[_unit("foundation", title="Read /Users/example/private/task.md")])
+
+    result = write_delivery_prepare_artifacts(
+        draft,
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "blocked"
+    assert result.prepared is False
+    assert result.failure_reason == "write_failed"
+    assert result.errors[0].code == "delivery_prepare.metadata_invalid"
+    assert result.errors[0].path == "units[0].title"
+    assert str(tmp_path) not in str(result.to_dict())
+    assert not (tmp_path / ".sikula" / "delivery").exists()
+
+
 def test_write_delivery_prepare_artifacts_writes_valid_plan_and_units(tmp_path: Path) -> None:
     result = write_delivery_prepare_artifacts(
         _draft(),
