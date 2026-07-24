@@ -7,12 +7,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
-- **Review Fix Current Branch**: Added `sikula review --fix --current-branch` so operators can apply review fixes to the currently checked-out branch while Sikula keeps write-capable agent work in an isolated worktree, delivers by local fast-forward only after safety checks pass, and never pushes or opens pull requests.
+- **Delivery Branch Assembly**: `delivery run-next` now assembles completed unit result commits into the plan's final branch in dependency order, starts later child worktrees from that assembled commit, preserves original result SHA ancestry, and records resumable fail-closed conflict metadata without changing the operator checkout. `delivery finalize` reconciles legacy or interrupted completed plans through the same assembly engine.
+- **Delivery Handoffs**: Completed delivery units now produce versioned, fingerprinted handoffs with allowlisted result and validation metadata. Dependent units validate and consume those handoffs as Analyst context while legacy progress remains compatible.
+- **Delivery Unit Sizing And Budgets**: Delivery preparation now emits sizing, risk, and budget metadata; units default to one planner step, tightly coupled two-step units remain explicit exceptions, and oversized planner results stop before implementation. `run-next --prepare-budget-split` can prepare a verified split proposal without applying it.
+- **Delivery Recovery And Amendments**: Delivery units can resume, reconcile terminal children, and retry linked failed children through `run-next --reset-failed`. Added model-assisted `delivery amend prepare` plus deterministic `amend apply` preview/application for safely splitting eligible units without losing completed work or audit history.
+- **Delivery Plans**: Added `sikula delivery prepare`, `check`, `status`, `run-next`, and `finalize` for authoring, validating, executing, inspecting, and finalizing large requests as tracked plans of isolated Sikula units, with dry-run and privacy-safe JSON projections.
+- **Delivery Plan Metadata**: Plans can describe monorepo components and project-relative unit scope paths, and delivery execution accepts the standard per-agent model, provider, and timeout overrides.
 - **Self-hosting Guidance**: Added Sikula-specific agent guidance, role-specific review/security/test-writer rules, and init-template comments for safe self-hosted Sikula development.
+- **Review Fix Current Branch**: Added `sikula review --fix --current-branch` so operators can apply review fixes to the currently checked-out branch while Sikula keeps write-capable agent work in an isolated worktree, delivers by local fast-forward only after safety checks pass, and never pushes or opens pull requests.
+
+### Changed
+- **Test Writer Context**: During multi-step runs, per-step TestWriter passes now use the active step's changed files and focused diff instead of the full accumulated task diff; the final full-task pass still receives the integrated change.
 
 ### Fixed
 - **Worktree Prompt Context**: Isolated run and review guards now require committed `extra_rules` files only for enabled agent phases, while still failing fast when consumed prompt-context files would be missing, stale, or non-file paths in the worktree start ref.
 - **Self-hosting Write Scope**: Allowed `CHANGELOG.md` updates while keeping Sikula self-hosting config, agent guidance, contributing docs, generated guidelines, and package metadata outside ordinary agent write scope.
+- **Task Worktree Detection**: Starting a task for another project from inside an unrelated Sikula worktree no longer triggers the current-project worktree guard, while task files and project roots that belong to the active worktree remain blocked.
 
 ## [0.3.0] - 2026-06-29
 

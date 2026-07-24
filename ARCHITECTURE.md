@@ -37,6 +37,7 @@
 | `DeliveryPrepareWriter` helpers | `core/delivery_prepare_writer.py` | Deterministic source-artifact writer for parsed delivery authoring drafts; renders `plan.yaml` and unit task files with readiness checks, plan validation, overwrite guards, and rollback |
 | `DeliveryAmendment` helpers | `core/delivery_amendment.py` | Fingerprinted split proposals, immutable-unit and dependency guards, no-write preview, transactional plan/unit writing, and append-only amendment events |
 | `DeliveryHandoff` helpers | `core/delivery_handoff.py` | Versioned, fingerprinted, privacy-safe unit handoff artifacts consumed by later dependency units |
+| `DeliveryAssembly` helpers | `core/delivery_assembly.py` | Dependency-ordered result-commit integration with ancestry-preserving fast-forward/merge outcomes and compare-and-swap ref updates |
 | `TaskAsset` helpers | `core/task_assets.py` | Deterministic local task-asset parsing, path canonicalization, answer mapping, and asset-manifest line rendering used by contract preparation |
 | `Worktree` helpers | `core/worktree.py` | Shared low-level git/worktree operations used by run, review, cleanup/delete, and init CLI surfaces; command-specific state mutation stays in the owning command layer |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
@@ -68,7 +69,8 @@ cmd_run()
    │     + optional contract readiness gate may mark state failed before worktree
    │
    ├─ isolation (default on, skip with --no-isolate):
-   │     git worktree add .sikula/worktrees/<task_id>  -b sikula/<stem>-<task_id>
+   │     git worktree add .sikula/worktrees/<task_id> -b sikula/<stem>-<task_id>
+   │       <delivery assembled commit, otherwise HEAD>
    │     copy BuildTool.env_files() from original project root to worktree
    │     (e.g. local.properties for AndroidGradleTool)
    │     state.worktree_path / worktree_base / worktree_branch set
@@ -332,12 +334,17 @@ the non-agent primitives that future delivery execution uses: atomic
 progress upserts, and deterministic next-unit selection from the status model.
 These helpers are intentionally privacy-safe and allowlisted. They do not create
 worktrees, prepare contracts, start agents, or update branches by themselves.
+Progress stores additive assembly metadata (`assembly_base_commit`,
+`assembled_commit`, `assembly_status`, `assembly_unit_id`,
+`assembly_error_code`, and `assembly_updated_at`). Legacy progress without
+these fields remains valid. Unit updates preserve assembly evidence while
+clearing only stale finalization metadata.
 
 **Delivery run-next dry run:** `sikula delivery run-next PLAN_FILE --dry-run`
 loads project runtime config, validates delivery status, and reports the first
 eligible unit that a future execution command would run. It also mirrors the
-execution dependency result-commit guard so a dry run reports blocked when a
-completed prerequisite commit is not applied to the current checkout. It also
+execution dependency result-commit guard against the recorded assembly commit
+when available and verifies that dependency result commits are resolvable. It also
 validates any referenced dependency handoff schema, fingerprint, artifact, and
 parent-progress correlation. It is
 intentionally side-effect-free: it does not write parent progress, create child
@@ -440,26 +447,47 @@ planner output, task bodies, source excerpts, diffs, logs, provider output, or
 raw state. Preparation leaves the unit failed and preserves the non-zero
 `run-next` exit because it neither applies the proposal nor runs replacements.
 Before starting a selected unit, execution walks the selected unit's dependency
-closure and verifies that every completed prerequisite result commit is already
-an ancestor of the current checkout. Completed no-op prerequisites have no
-commit to verify, but their own prerequisites are still checked.
-The execution MVP runs one unit at a time. It intentionally does not assemble
-the plan's final delivery branch automatically.
+closure and verifies that every completed prerequisite result commit is an
+ancestor of the assembled delivery commit. Completed no-op prerequisites have
+no commit to verify, but their own prerequisites are still checked.
+Execution still runs one unit at a time. Before a new child starts,
+`core/delivery_assembly.py` integrates completed results into `final_branch` in
+dependency order. It fast-forwards when possible and otherwise creates a
+two-parent merge commit through Git plumbing, preserving the original unit
+commit as an ancestor without changing the operator checkout or index. The
+child worktree is created from the assembled commit only when that commit's
+config blob matches the committed config loaded by the parent process; config
+drift fails before child state or worktree creation. Symbolic `final_branch`
+refs are rejected, and ref updates use a non-dereferencing expected-old-value
+compare-and-swap. Checked-out, missing, conflicting, or diverged refs fail
+closed. Without a recorded assembled commit, an existing branch ahead of the
+assembly base is untrusted and rejected rather than reset or reused. Merges
+require Git 2.38+ with `git merge-tree --write-tree`; a capability preflight
+returns `delivery.assembly_git_unsupported` before ref updates on older Git
+versions, while fast-forward and no-op assembly remain available. Conflict
+metadata and partial assembly progress are durable; after an operator resolves
+the merge on `final_branch` and switches away, rerunning `run-next` resumes by
+ancestry without duplicating integration. A recorded conflict also blocks
+`run-next --dry-run` and `finalize --dry-run` until the branch contains both the
+prior assembled commit and the blocked unit commit.
 
 **Delivery final branch command:** `sikula delivery finalize PLAN_FILE` is the
 explicit final branch assembly step for a completed delivery plan. Its CLI
 wrapper lives in `sikula_cli/delivery.py`; deterministic preflight and Git ref
 updates are implemented by `core/delivery_finalize.py`. Finalize requires the
-plan status to be `done`, verifies that each completed unit result commit is
-applied to the current checkout, then uses the current `HEAD` as the final
-commit candidate and creates or fast-forwards `final_branch`. Existing diverged
-final branches are rejected; Sikula does not force-update them. The command
-records only compact parent metadata in delivery progress: final branch, final
-commit, finalized timestamp, and an append-only `plan.finalized` event. It does
+plan status to be `done`, reconciles legacy or interrupted progress through the
+same dependency-ordered assembly engine, verifies the resulting ancestry, and
+records the assembled commit as final. Existing diverged or checked-out final
+branches are rejected; Sikula does not force-update them. The command records
+only compact parent metadata in delivery progress: assembly state, final branch,
+final commit, finalized timestamp, and append-only assembly/finalization events. It does
 not embed child task state, prompts, provider output, diffs, logs, or validation
 records. Any later unit progress update clears finalization metadata because the
 recorded final branch is a snapshot of a specific completed unit set.
 `--dry-run` performs the same preflight without mutating Git refs or progress.
+Its projection exposes `final_commit` only when the candidate already contains
+every completed unit result; otherwise it remains ready with a null
+`final_commit` until the mutating command creates the required Git object.
 
 ---
 

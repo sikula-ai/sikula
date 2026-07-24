@@ -364,7 +364,7 @@ If no ambiguous running unit exists, `run-next` otherwise selects the first fail
 unit with a linked child task id before pending work. It preserves the same parent
 unit and child task id, appends a `unit.retry_intent` event, and forwards reset
 semantics to the child task path (`sikula run --task-id <child_task_id> --reset-failed`).
-`--reset-failed` does not bypass running-unit ambiguity, dependency result-commit checks, or a planner-step budget stop and does not select later pending work while retry selection is active. Child runs preserve normal `sikula run` semantics, and delivery execution still runs one unit at a time and does not assemble the final branch automatically.
+`--reset-failed` does not bypass running-unit ambiguity, dependency result-commit checks, or a planner-step budget stop and does not select later pending work while retry selection is active. Child runs preserve normal `sikula run` semantics, and delivery execution still runs one unit at a time.
 `--prepare-budget-split` is mutually exclusive with `--dry-run`. It supports a
 budget stop produced by the current child run and an already persisted,
 unambiguous budget-stopped unit. Sikula first finishes the normal child and
@@ -452,13 +452,32 @@ child completed, the parent unit is durably persisted as `running`; rerunning
 ordinary `delivery run-next` retries terminal reconciliation without rerunning
 the child agents, including after a `--reset-failed` attempt.
 
-For dependent units, `run-next` also walks the selected unit's dependency
-closure and checks that each completed prerequisite's recorded result commit,
-when present, is already applied to the current checkout. A completed
-prerequisite with no result commit is treated as a no-op prerequisite, but its
-own prerequisites are still checked. The current execution MVP does not assemble
-an accumulated delivery branch, so dependent units are blocked until the
-operator has merged or otherwise applied prerequisite unit branches locally.
+Before starting a new child, `run-next` assembles completed unit result commits
+into the plan's `final_branch` in dependency-safe order. Fast-forward,
+already-applied, merge, and no-op outcomes are recorded as compact events.
+Independent histories are combined with a two-parent merge commit so every
+original unit result SHA remains an ancestor; Sikula does not cherry-pick or
+rewrite unit results. The selected child worktree starts from the assembled
+commit, so dependent units no longer require a manual merge into the operator
+checkout. Before child state or a worktree is created, the assembled commit's
+`.sikula/config.yaml` must match the committed config loaded from the operator
+checkout; a unit that changes runtime config therefore requires a fresh run
+from that updated config. Completed no-op prerequisites have no result commit,
+but their own dependency closure is still checked.
+
+Assembly does not check out `final_branch` and does not change the operator
+working tree or index. `final_branch` must be a direct ref; symbolic refs are
+rejected, and ref updates are non-dereferencing compare-and-swap operations.
+Missing commits or recorded refs, checked-out branches, diverged refs, stale
+branches ahead of the base without recorded assembly progress, and merge
+conflicts fail closed with stable `delivery.assembly_*` codes. A merge between
+independent unit commits requires Git 2.38+ and fails in preflight with
+`delivery.assembly_git_unsupported` on older installations; pure fast-forward,
+already-applied, and no-op assembly does not require this merge capability.
+Progress retains the assembly base, current assembled commit, failure code, and
+blocked unit. Resolve a reported conflict on `final_branch`, switch that
+worktree away, and rerun `delivery run-next`; ancestry checks make the retry
+idempotent.
 
 Unlike `check` and `status`, `run-next` loads project runtime config because it
 uses the same project settings as `sikula run`.
@@ -477,14 +496,24 @@ sikula delivery finalize .sikula/delivery/<slug>/plan.yaml
 sikula delivery finalize .sikula/delivery/<slug>/plan.yaml --json
 ```
 
-`finalize` requires the delivery plan status to be `done`. It verifies that each
-completed unit result commit, when present, is applied to the current checkout.
-The current `HEAD` is the final commit candidate, so YAML unit ordering does not
-affect final branch selection. It then creates `final_branch` or fast-forwards
-it. Existing diverged branches are rejected; Sikula does not force-update a
-final branch. No-op plans with no unit result commits also finalize to the
-current `HEAD`. Like `run-next`, `finalize` loads project runtime config because
-it mutates Git refs and parent delivery progress.
+`finalize` requires the delivery plan status to be `done`. It verifies and, for
+legacy or interrupted progress, reconciles all completed unit results through
+the same dependency-ordered assembly engine. The assembled branch commit,
+rather than the operator's current `HEAD`, becomes the final commit. Existing
+diverged or checked-out branches are rejected. A branch ahead of the assembly
+base is trusted only when progress records an expected assembled commit;
+otherwise it is treated as stale and rejected. Sikula never force-updates these
+branches. No-op plans retain the recorded assembly base. Like `run-next`,
+`finalize` loads project runtime config because it mutates Git refs and parent
+delivery progress. `--dry-run` validates static ref and commit preconditions
+without writing refs, Git objects, or progress. A newly encountered merge
+conflict is conclusively reported by the mutating command. Once recorded,
+however, that conflict also blocks later `run-next --dry-run` and
+`finalize --dry-run` previews until `final_branch` advances to a resolution
+containing both the prior assembled commit and the blocked unit commit. When
+pending assembly must create a new commit, the dry-run remains ready but
+reports `final_commit: null` because that commit ID is not available without
+creating the Git object.
 Any later unit progress update clears the recorded final branch metadata, so an
 extended or rerun delivery plan must be finalized again after it returns to
 `done`.
@@ -604,7 +633,7 @@ can coordinate cross-repo branches, locks, validation, and result sets.
 `delivery run-next --json`, and `delivery finalize --json` return allowlisted
 metadata such as written artifact paths, plan validation status, unit readiness,
 plan metadata, validation issues, unit paths, compact progress fields, selected
-child task IDs, handoff schema/fingerprint references, final branch metadata,
+child task IDs, handoff schema/fingerprint references, assembly/final branch metadata,
 and branch/commit pointers when
 available. They do not embed child task state, source task bodies, unit task file bodies, prompts,
 provider output, diffs, logs, validation output, credentials, tokens, or source excerpts.

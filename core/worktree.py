@@ -97,8 +97,14 @@ def tracked_clean_file_status(git_root: Path, path: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def file_blob_status_at_ref(git_root: Path, ref: str, rel_path: str) -> tuple[bool, str]:
-    """Return whether rel_path resolves to a file blob at ref."""
+def file_blob_status_at_ref(
+    git_root: Path,
+    ref: str,
+    rel_path: str,
+    *,
+    expected_ref: str | None = None,
+) -> tuple[bool, str]:
+    """Return whether rel_path is a file blob at ref and optionally matches another ref."""
     result = subprocess.run(
         ["git", "cat-file", "-t", f"{ref}:{rel_path}"],
         capture_output=True,
@@ -110,6 +116,13 @@ def file_blob_status_at_ref(git_root: Path, ref: str, rel_path: str) -> tuple[bo
 
     object_type = result.stdout.strip()
     if object_type == "blob":
+        if expected_ref is not None:
+            expected_oid = _file_blob_oid_at_ref(git_root, expected_ref, rel_path)
+            actual_oid = _file_blob_oid_at_ref(git_root, ref, rel_path)
+            if expected_oid is None or actual_oid is None:
+                return False, f"could not compare with file in reference '{expected_ref}'"
+            if actual_oid != expected_oid:
+                return False, f"differs from file in reference '{expected_ref}'"
         return True, ""
 
     type_label = {
@@ -117,6 +130,18 @@ def file_blob_status_at_ref(git_root: Path, ref: str, rel_path: str) -> tuple[bo
         "commit": "submodule/gitlink",
     }.get(object_type, f"{object_type or 'non-file'} object")
     return False, f"is a {type_label} in worktree start ref '{ref}', expected a file"
+
+
+def _file_blob_oid_at_ref(git_root: Path, ref: str, rel_path: str) -> str | None:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{ref}:{rel_path}"],
+        capture_output=True,
+        text=True,
+        cwd=git_root,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return result.stdout.strip().splitlines()[0]
 
 
 def current_branch_name(git_root: Path) -> tuple[str | None, str | None]:
@@ -141,6 +166,19 @@ def current_branch_name(git_root: Path) -> tuple[str | None, str | None]:
     if head.returncode == 0:
         return None, "detached"
     return None, "unknown"
+
+
+def branch_checked_out(git_root: Path, branch: str) -> bool:
+    result = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        cwd=git_root,
+    )
+    if result.returncode != 0:
+        return True
+    branch_ref = f"branch refs/heads/{branch}"
+    return any(line.strip() == branch_ref for line in result.stdout.splitlines())
 
 
 def resolve_git_commit(git_root: Path, ref: str) -> tuple[str | None, str]:

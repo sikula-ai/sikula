@@ -56,7 +56,9 @@ This demo shows Sikula taking a task through analysis, implementation, independe
 
 ## Get Started
 
-Prerequisites: Python 3.10+, `git`, `pipx`, a git repository for the target project, and one authenticated LLM CLI provider.
+Prerequisites: Python 3.10+, `git`, `pipx`, a git repository for the target
+project, and one authenticated LLM CLI provider. Delivery assembly that must
+merge independent unit commits requires Git 2.38+.
 
 ### Install Sikula
 
@@ -155,7 +157,22 @@ Use this to author, validate, and inspect the tracked parent plan for larger wor
 - `.sikula/delivery/<slug>/plan.yaml`
 - `.sikula/delivery/<slug>/units/<unit-slug>.md`
 
-`delivery prepare` is an authoring step only: it does not start implementation, create task state, run delivery units, mutate `.sikula/state/delivery/<plan-id>/`, or update branches. Prepared units default to one planner step; two steps are an explicit tightly coupled exception, and plans declaring three or more steps per unit are rejected. During `run-next`, an oversized planner result stops before implementation and must be split through a delivery amendment; `--reset-failed` cannot bypass that stop. With explicit `--prepare-budget-split`, `run-next` can verify the parent and child stop evidence and prepare the split proposal after releasing the execution lock. It still exits non-zero, does not apply the proposal, and does not start replacement units. Completed and running units cannot be split. Successful new units produce compact fingerprinted handoffs, and later dependency units receive those validated handoffs as Analyst context; legacy delivery progress without handoffs remains compatible. The follow-up path is to check the plan, dry-run the next eligible unit, run that unit through the normal `sikula run` pipeline, and finalize the completed plan. See [Delivery Plans](docs/delivery-plans.md).
+`delivery prepare` is an authoring step only. It writes tracked plan and unit
+artifacts but does not start implementation, create task state, mutate delivery
+progress, or update branches.
+
+Prepared units use `budget.max_planner_steps: 1` by default. A limit of `2` is
+allowed only for tightly coupled work; limits of `3` or more are rejected.
+During `run-next`, planner output that exceeds the unit budget stops before
+implementation. The unit must then be split through a delivery amendment;
+`--reset-failed` cannot bypass this stop. With `--prepare-budget-split`,
+`run-next` can prepare, but not apply, a verified split proposal.
+
+Successful new units produce fingerprinted handoffs for dependent units.
+`run-next` assembles completed result commits into `final_branch` in dependency
+order and starts subsequent child worktrees from the assembled commit without
+changing the operator checkout. After all units complete, finalize the assembled
+plan. See [Delivery Plans](docs/delivery-plans.md).
 
 **Run a task into a branch**
 
@@ -198,7 +215,7 @@ delivery safety checks pass.
 ## Common First-Run Issues
 
 - **`pipx: command not found`** - install `pipx` from <https://pipx.pypa.io/stable/installation/>.
-- **Config, guidelines, or rules missing in the worktree** - commit `.sikula/config.yaml`, any generated `.sikula/guidelines.md`, and any `extra_rules` files used by enabled phases before the first isolated run. These prompt-context paths must be files in the worktree start ref. For `sikula review`, make sure the reviewed branch contains its configured guidelines/rules files.
+- **Config, guidelines, or rules missing in the worktree** - commit `.sikula/config.yaml`, any generated `.sikula/guidelines.md`, and any `extra_rules` files used by enabled phases before the first isolated run. These prompt-context paths must be files in the worktree start ref. A delivery child assembled from another commit also requires that commit to contain the same config loaded for the run. For `sikula review`, make sure the reviewed branch contains its configured guidelines/rules files.
 - **Provider is not authenticated** - run `codex login` or see [Providers](docs/providers.md) for Claude, Gemini, OpenCode, and Antigravity.
 - **Task is too vague** - run `sikula contract check .sikula/tasks/my-task.md` and see [Writing Sikula Tasks](docs/writing-tasks.md).
 - **Run failed after creating a worktree** - inspect `sikula show <task-id>` and `.sikula/worktrees/<task-id>/`; retry with `sikula run --task-id <task-id> --reset-failed`.

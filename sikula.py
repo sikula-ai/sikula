@@ -497,8 +497,14 @@ def _isolation_context_files(cfg: dict, overrides: dict | None = None) -> list[t
     )
 
 
-def _git_file_blob_status_at_ref(git_root: Path, ref: str, rel_path: str) -> tuple[bool, str]:
-    return core_worktree.file_blob_status_at_ref(git_root, ref, rel_path)
+def _git_file_blob_status_at_ref(
+    git_root: Path,
+    ref: str,
+    rel_path: str,
+    *,
+    expected_ref: str | None = None,
+) -> tuple[bool, str]:
+    return core_worktree.file_blob_status_at_ref(git_root, ref, rel_path, expected_ref=expected_ref)
 
 
 def _require_worktree_context_files(
@@ -524,8 +530,16 @@ def _require_worktree_context_files(
             problems.append((kind, rel, reason))
             continue
 
-        ok, reason = _git_file_blob_status_at_ref(git_root, start_ref, rel)
+        expected_ref = "HEAD" if kind == "config" and start_ref != "HEAD" else None
+        ok, reason = _git_file_blob_status_at_ref(
+            git_root,
+            start_ref,
+            rel,
+            expected_ref=expected_ref,
+        )
         if not ok:
+            if kind == "config" and expected_ref is not None and reason.startswith("differs from"):
+                reason = "differs from the committed config loaded for this run"
             problems.append((kind, rel, reason))
 
     if not problems:
@@ -539,27 +553,44 @@ def _require_worktree_context_files(
     print("Problem files:")
     for kind, rel, reason in problems:
         print(f"  - {rel} ({kind}): {reason}")
-    if include_config:
-        add_paths = " ".join(rel for _, rel, _ in problems)
+    config_drift = any(
+        kind == "config" and reason == "differs from the committed config loaded for this run"
+        for kind, _, reason in problems
+    )
+    commit_problems = [
+        (kind, rel, reason)
+        for kind, rel, reason in problems
+        if not (kind == "config" and reason == "differs from the committed config loaded for this run")
+    ]
+    if include_config and commit_problems:
+        add_paths = " ".join(rel for _, rel, _ in commit_problems)
         print(f"Run: git add {add_paths} && git commit -m 'Add Sikula config'")
-    else:
+    if config_drift:
+        print("Start a fresh run from a checkout whose committed config matches the worktree start ref.")
+    elif not include_config:
         print("Commit local context changes, then ensure the reviewed branch contains those commits before retrying.")
     if show_no_isolate_hint:
         print("Or use --no-isolate for a local experiment.")
     sys.exit(1)
 
 
-def _require_committed_config_for_isolated_run(cfg: dict, git_root: Path, overrides: dict | None = None) -> None:
+def _require_committed_config_for_isolated_run(
+    cfg: dict,
+    git_root: Path,
+    overrides: dict | None = None,
+    *,
+    start_ref: str = "HEAD",
+) -> None:
     """Fail fast when config/prompt context will not exist unchanged in a new worktree."""
     _require_worktree_context_files(
         cfg,
         git_root,
-        start_ref="HEAD",
+        start_ref=start_ref,
         include_config=True,
         agent_names=_run_context_agent_names(cfg, overrides),
         command_label="isolated run",
         worktree_label="task worktree",
-        show_no_isolate_hint=True,
+        show_no_isolate_hint=start_ref == "HEAD",
     )
 
 
@@ -581,10 +612,18 @@ def _require_worktree_context_for_review(
     )
 
 
-def _create_worktree(git_root: Path, worktree_base: Path, branch: str) -> tuple[bool, str]:
+def _create_worktree(
+    git_root: Path,
+    worktree_base: Path,
+    branch: str,
+    start_ref: str | None = None,
+) -> tuple[bool, str]:
     worktree_base.parent.mkdir(parents=True, exist_ok=True)
+    args = ["git", "worktree", "add", str(worktree_base), "-b", branch]
+    if start_ref:
+        args.append(start_ref)
     r = subprocess.run(
-        ["git", "worktree", "add", str(worktree_base), "-b", branch],
+        args,
         capture_output=True,
         text=True,
         cwd=git_root,

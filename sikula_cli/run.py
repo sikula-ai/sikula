@@ -116,7 +116,7 @@ class RunContext:
     reset_failed_state: Callable[..., None]
     resolve_task_path: Callable[[str, Path], Path | None]
     find_git_root: Callable[[Path], Path | None]
-    require_committed_config_for_isolated_run: Callable[[dict, Path, dict | None], None]
+    require_committed_config_for_isolated_run: Callable[..., None]
     run_config_snapshot: Callable[..., dict]
     contract_preflight_config: Callable[[dict, dict], dict]
     build_contract_preflight_snapshot_and_assets: Callable[..., tuple[dict, list[dict]]]
@@ -127,7 +127,7 @@ class RunContext:
     print_contract_readiness_gate_failure: Callable[[dict, list[str], str], None]
     branch_stem: Callable[[str], str]
     ensure_gitignore: Callable[[Path], None]
-    create_worktree: Callable[[Path, Path, str], tuple[bool, str]]
+    create_worktree: Callable[..., tuple[bool, str]]
     build_tool_class: Callable[[dict], object]
     record_snapshot_asset_drift: Callable[..., None]
     build_orchestrator: Callable[..., object]
@@ -236,7 +236,16 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             print("  Run 'git init && git add -A && git commit -m init' to initialize a repository.")
             sys.exit(1)
         if isolate:
-            context.require_committed_config_for_isolated_run(cfg, git_root, overrides)
+            worktree_start_ref = getattr(args, "worktree_start_ref", None)
+            if worktree_start_ref:
+                context.require_committed_config_for_isolated_run(
+                    cfg,
+                    git_root,
+                    overrides,
+                    start_ref=worktree_start_ref,
+                )
+            else:
+                context.require_committed_config_for_isolated_run(cfg, git_root, overrides)
 
         description = task_path.read_text().strip()
         state = store.create(
@@ -298,7 +307,11 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             rel = original_project_root.relative_to(git_root)
             worktree_project_root = worktree_base / rel
             context.ensure_gitignore(git_root)
-            ok, err = context.create_worktree(git_root, worktree_base, branch)
+            worktree_start_ref = getattr(args, "worktree_start_ref", None)
+            if worktree_start_ref:
+                ok, err = context.create_worktree(git_root, worktree_base, branch, worktree_start_ref)
+            else:
+                ok, err = context.create_worktree(git_root, worktree_base, branch)
             if not ok:
                 print(f"Failed to create git worktree: {err}")
                 sys.exit(1)
