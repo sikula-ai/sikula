@@ -191,6 +191,38 @@ def test_parse_delivery_authoring_output_accepts_single_fenced_json_block(tmp_pa
     assert [unit.id for unit in draft.units] == ["foundation", "cli"]
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("plan_title", "Deliver GET /users"),
+        ("title", "Implement POST /home"),
+        ("plan_title", "Read /Users/example/private/task.md"),
+        ("title", "Read /Users/example/private/task.md"),
+        ("stream", r"client at C:\Users\example\private"),
+        ("component", r"\\server\private\project"),
+        ("phase", "Injected\nline"),
+        ("kind", "x" * 1001),
+        ("platform", "file:///Users/example/private"),
+    ],
+)
+def test_parse_delivery_authoring_output_rejects_unsafe_public_metadata(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    data = _draft_data()
+    if field == "plan_title":
+        data["title"] = value
+    else:
+        data["units"][0][field] = value
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        _parse(json.dumps(data), tmp_path)
+
+    assert exc_info.value.code == "delivery_authoring.label_invalid"
+    assert value not in str(exc_info.value)
+
+
 def test_parse_delivery_authoring_output_defaults_absent_optional_fields(tmp_path: Path) -> None:
     data = {
         "plan_id": "team-invites",

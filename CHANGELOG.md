@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Delivery Mode Assessment**: Added `sikula delivery assess` to recommend a standard run, delivery plan, or further task clarification from project-aware, platform-neutral evidence without starting implementation or writing delivery artifacts.
 - **Delivery Branch Assembly**: `delivery run-next` now assembles completed unit result commits into the plan's final branch in dependency order, starts later child worktrees from that assembled commit, preserves original result SHA ancestry, and records resumable fail-closed conflict metadata without changing the operator checkout. `delivery finalize` reconciles legacy or interrupted completed plans through the same assembly engine.
 - **Delivery Handoffs**: Completed delivery units now produce versioned, fingerprinted handoffs with allowlisted result and validation metadata. Dependent units validate and consume those handoffs as Analyst context while legacy progress remains compatible.
 - **Delivery Unit Sizing And Budgets**: Delivery preparation now emits sizing, risk, and budget metadata; units default to one planner step, tightly coupled two-step units remain explicit exceptions, and oversized planner results stop before implementation. `run-next --prepare-budget-split` can prepare a verified split proposal without applying it.
@@ -18,10 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 - **Test Writer Context**: During multi-step runs, per-step TestWriter passes now use the active step's changed files and focused diff instead of the full accumulated task diff; the final full-task pass still receives the integrated change.
+- **Self-hosting Write Scope**: Expanded the repository's self-hosted Sikula write scope to include user-facing documentation and `CHANGELOG.md` while keeping configuration, agent guidance, contributing docs, generated guidelines, and package metadata maintainer-owned.
 
 ### Fixed
 - **Worktree Prompt Context**: Isolated run and review guards now require committed `extra_rules` files only for enabled agent phases, while still failing fast when consumed prompt-context files would be missing, stale, or non-file paths in the worktree start ref.
-- **Self-hosting Write Scope**: Allowed `CHANGELOG.md` updates while keeping Sikula self-hosting config, agent guidance, contributing docs, generated guidelines, and package metadata outside ordinary agent write scope.
 - **Task Worktree Detection**: Starting a task for another project from inside an unrelated Sikula worktree no longer triggers the current-project worktree guard, while task files and project roots that belong to the active worktree remain blocked.
 
 ## [0.3.0] - 2026-06-29

@@ -4877,10 +4877,11 @@ def test_prepare_implementation_contract_ready_result_includes_safe_save_and_run
     assert result.to_dict()["authoritative_output_markdown"] == result.prepared_contract_markdown
 
 
-def test_prepare_implementation_contract_safe_path_strips_refined_suffix():
+@pytest.mark.parametrize("task_suffix", [".refined", ".contract", ".v4", ".v12.refined"])
+def test_prepare_implementation_contract_safe_path_strips_generated_suffixes(task_suffix: str):
     result = prepare_implementation_contract(
         "# Add team invites\n\nUsers should be able to invite teammates by email.",
-        contract_name="team-invites.refined.md",
+        contract_name=f"team-invites{task_suffix}.md",
         project_context={"validation_commands": ["pytest"]},
     )
 
@@ -6806,6 +6807,32 @@ def test_task_refine_cli_auto_existing_output_does_not_call_llm(
     assert exc.value.code == 1
     assert "refusing to overwrite existing output file" in err
     assert "Choose a new --output path" in err
+
+
+def test_task_refine_cli_auto_rejects_dangling_symlink_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    task_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text("# Add team invites\n\nUsers should be able to invite teammates by email.", encoding="utf-8")
+    output_path = task_path.with_name("team-invites.v2.md")
+    outside_target = tmp_path.parent / f"{tmp_path.name}-outside.md"
+    output_path.symlink_to(outside_target)
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("core.llm_client.create_llm_client", side_effect=AssertionError("LLM must not be created")),
+        patch("sys.argv", ["sikula", "task", "refine", str(task_path), "--auto", "--output", str(output_path)]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    err = capsys.readouterr().err
+    assert exc.value.code == 1
+    assert "refusing to overwrite existing output file" in err
+    assert not outside_target.exists()
 
 
 def test_contract_prepare_cli_interactive_prefills_existing_answers_for_line_editing(

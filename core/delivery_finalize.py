@@ -673,5 +673,4 @@ def _replace_result(
 
 
 def _format_issue(issue: DeliveryPlanIssue) -> str:
-    location = f" [{issue.path}]" if issue.path else ""
-    return f"- {issue.code}{location}: {issue.message}"
+    return issue.to_public_text()

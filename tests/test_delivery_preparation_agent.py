@@ -12,6 +12,7 @@ from agents.delivery_preparation_agent import (
 )
 from core.delivery_authoring import (
     DeliveryAmendmentAuthoringDraft,
+    DeliveryAssessmentDraft,
     DeliveryAuthoringDraft,
     DeliveryAuthoringParseError,
 )
@@ -153,6 +154,38 @@ def _amendment_output(*, target_unit_id: str = "oversized") -> str:
     )
 
 
+def _assessment_output() -> str:
+    return json.dumps(
+        {
+            "recommended_mode": "delivery_plan",
+            "reason_codes": ["multiple_platforms", "dependency_order_required"],
+            "units": [
+                {
+                    "id": "shared",
+                    "title": "Shared behavior",
+                    "depends_on": [],
+                    "component": "shared",
+                    "platform": "shared",
+                },
+                {
+                    "id": "platform-a",
+                    "title": "Platform A",
+                    "depends_on": ["shared"],
+                    "component": "client-a",
+                    "platform": "platform-a",
+                },
+                {
+                    "id": "platform-b",
+                    "title": "Platform B",
+                    "depends_on": ["shared"],
+                    "component": "client-b",
+                    "platform": "platform-b",
+                },
+            ],
+        }
+    )
+
+
 def _author_delivery_plan(
     agent: DeliveryPreparationAgent,
     *,
@@ -168,6 +201,24 @@ def _author_delivery_plan(
         project_root=tmp_path,
         output_dir=".sikula/delivery/team-invites",
         project_context=project_context,
+        audit_recorder=None if audit_records is None else audit_records.append,
+    )
+
+
+def _assess_delivery_mode(
+    agent: DeliveryPreparationAgent,
+    *,
+    tmp_path: Path,
+    audit_records: list[dict] | None = None,
+) -> DeliveryAssessmentDraft:
+    return agent.assess_delivery_mode(
+        task_description="Implement the same observable feature across two project platforms.",
+        task_path=".sikula/tasks/cross-platform-feature.md",
+        project_root=tmp_path,
+        project_context={
+            "stack": "mixed client monorepo",
+            "validation_commands": ["project-test-command"],
+        },
         audit_recorder=None if audit_records is None else audit_records.append,
     )
 
@@ -497,3 +548,87 @@ def test_author_delivery_plan_wraps_provider_failure_with_safe_exception(tmp_pat
         "error_code": "delivery_prepare.authoring_failed",
         "error": "provider timeout with SECRET_PROVIDER_OUTPUT",
     }
+
+
+def test_assess_delivery_mode_uses_platform_neutral_read_only_prompt_and_records_audit(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "guidelines.md").write_text("# Rules\nKeep orchestration platform-neutral.\n")
+    llm = CapturingLLM(_assessment_output())
+    agent = DeliveryPreparationAgent(
+        llm=llm,
+        project_config={
+            "project": {"platform": "multi", "language": "mixed"},
+            "guidelines": {"context_files": ["guidelines.md"], "max_file_chars": 5000},
+        },
+    )
+    audit_records: list[dict] = []
+
+    draft = _assess_delivery_mode(agent, tmp_path=tmp_path, audit_records=audit_records)
+
+    assert draft.recommended_mode == "delivery_plan"
+    assert draft.reason_codes == ["multiple_platforms", "dependency_order_required"]
+    assert [unit.id for unit in draft.units] == ["shared", "platform-a", "platform-b"]
+    assert draft.units[1].platform == "platform-a"
+    assert draft.units[2].depends_on == ["shared"]
+    assert llm.system_prompts == [""]
+    assert llm.readonly_agent_calls == []
+    assert llm.agent_calls == []
+    prompt = llm.prompts[0]
+    assert prompt.startswith(AGENT_SECURITY_PREFIX)
+    assert READONLY_AGENT_PREFIX in prompt
+    assert "Use the same decision flow for every project and platform." in prompt
+    assert "Treat platform, stack, component, scope, validation, and risk information as project data." in prompt
+    assert "Do not classify primarily from task length." in prompt
+    assert "Do not return free-form rationale" in prompt
+    assert "Project stack: multi / mixed" in prompt
+    assert "Source task file: .sikula/tasks/cross-platform-feature.md" in prompt
+    assert '"project-test-command"' in prompt
+    assert "Implement the same observable feature across two project platforms." in prompt
+    assert audit_records == [
+        {
+            "phase": "delivery_assessment",
+            "round_index": 1,
+            "prompt": prompt,
+            "raw_output": llm.output,
+            "parsed": {
+                "status": "parsed",
+                "recommended_mode": "delivery_plan",
+                "reason_codes": ["multiple_platforms", "dependency_order_required"],
+                "unit_ids": ["shared", "platform-a", "platform-b"],
+                "unit_count": 3,
+            },
+        }
+    ]
+
+
+def test_assess_delivery_mode_records_parse_failure_without_exposing_output(tmp_path: Path) -> None:
+    llm = CapturingLLM('{"recommended_mode":"delivery_plan","raw_output":"SECRET"}')
+    agent = DeliveryPreparationAgent(llm=llm)
+    audit_records: list[dict] = []
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        _assess_delivery_mode(agent, tmp_path=tmp_path, audit_records=audit_records)
+
+    assert exc_info.value.code == "delivery_authoring.unknown_field"
+    assert "SECRET" not in str(exc_info.value)
+    assert audit_records[0]["phase"] == "delivery_assessment"
+    assert audit_records[0]["raw_output"] == llm.output
+    assert audit_records[0]["parsed"]["status"] == "failed"
+    assert audit_records[0]["parsed"]["error_code"] == "delivery_authoring.unknown_field"
+
+
+def test_assess_delivery_mode_wraps_provider_failure_with_safe_exception(tmp_path: Path) -> None:
+    llm = FailingLLM(RuntimeError("provider timeout with SECRET_PROVIDER_OUTPUT"))
+    agent = DeliveryPreparationAgent(llm=llm)
+    audit_records: list[dict] = []
+
+    with pytest.raises(DeliveryPreparationAgentError) as exc_info:
+        _assess_delivery_mode(agent, tmp_path=tmp_path, audit_records=audit_records)
+
+    assert str(exc_info.value) == "Delivery assessment assistant failed."
+    assert exc_info.value.__cause__ is None
+    assert "SECRET_PROVIDER_OUTPUT" not in str(exc_info.value)
+    assert audit_records[0]["phase"] == "delivery_assessment"
+    assert audit_records[0]["raw_output"] is None
+    assert audit_records[0]["parsed"]["error_code"] == "delivery_assessment.authoring_failed"

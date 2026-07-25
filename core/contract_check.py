@@ -1482,10 +1482,17 @@ def _contract_path_source_name(contract_name: str | None, contract_markdown: str
 
 
 def _strip_contract_path_suffixes(stem: str) -> str:
-    for suffix in (".refined", ".contract", ".v2", ".v3"):
-        if stem.endswith(suffix):
-            return stem[: -len(suffix)]
-    return stem
+    while True:
+        versionless = re.sub(r"\.v[0-9]+$", "", stem)
+        if versionless != stem:
+            stem = versionless
+            continue
+        for suffix in (".refined", ".contract"):
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
+        else:
+            return stem
 
 
 def _normalize_prepare_product_context(

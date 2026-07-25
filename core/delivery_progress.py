@@ -10,6 +10,10 @@ import tempfile
 from typing import Any
 
 from core.delivery_plan import DeliveryBudgetExceeded, DeliveryPlan, DeliveryPlanIssue, check_delivery_plan_file
+from core.delivery_public_metadata import (
+    project_delivery_public_identity,
+    sanitize_delivery_public_metadata,
+)
 from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE, DeliveryUnitBudget
 
 SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION = 1
@@ -270,12 +274,12 @@ class DeliveryStatusUnit:
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
-            "id": self.id,
+            "id": project_delivery_public_identity(self.id),
             "status": self.status,
             "eligible": self.eligible,
             "task_path": self.task_path,
-            "depends_on": list(self.depends_on),
-            "blocked_by": list(self.blocked_by),
+            "depends_on": [project_delivery_public_identity(value) for value in self.depends_on],
+            "blocked_by": [project_delivery_public_identity(value) for value in self.blocked_by],
             "run_next_available": self.run_next_available,
         }
         for key in (
@@ -300,6 +304,10 @@ class DeliveryStatusUnit:
         ):
             value = getattr(self, key)
             if value:
+                if key in {"stream", "repo_id", "component", "supersedes", "child_task_id"}:
+                    value = project_delivery_public_identity(value)
+                else:
+                    value = sanitize_delivery_public_metadata(value)
                 data[key] = value
         if self.run_next_action:
             data["run_next_action"] = self.run_next_action
@@ -316,7 +324,7 @@ class DeliveryStatusUnit:
             if budget_data:
                 data["budget"] = budget_data
         if self.superseded_by:
-            data["superseded_by"] = list(self.superseded_by)
+            data["superseded_by"] = [project_delivery_public_identity(value) for value in self.superseded_by]
         if self.budget_exceeded:
             data["budget_exceeded"] = self.budget_exceeded.to_dict()
         if self.handoff_schema_version is not None:
@@ -377,7 +385,7 @@ class DeliveryStatusResult:
             "units": [unit.to_dict() for unit in self.units],
         }
         if self.next_action:
-            data["next_action"] = self.next_action
+            data["next_action"] = sanitize_delivery_public_metadata(self.next_action)
         for key in (
             "assembly_base_commit",
             "assembled_commit",
@@ -391,15 +399,19 @@ class DeliveryStatusResult:
         ):
             value = getattr(self, key)
             if value:
-                data[key] = value
+                data[key] = (
+                    project_delivery_public_identity(value)
+                    if key == "assembly_unit_id"
+                    else sanitize_delivery_public_metadata(value)
+                )
         if self.plan:
             plan_data: dict[str, Any] = {
                 "schema_version": self.plan.schema_version,
                 "plan_id": self.plan.plan_id,
-                "title": self.plan.title,
+                "title": sanitize_delivery_public_metadata(self.plan.title),
                 "final_branch": self.plan.final_branch,
                 "planning_mode": self.plan.planning_mode,
-                "streams": list(self.plan.stream_ids),
+                "streams": [project_delivery_public_identity(stream) for stream in self.plan.stream_ids],
             }
             repositories_data = []
             for repo in self.plan.repositories:
@@ -968,49 +980,49 @@ def _sanitize_issue(
 
 
 def render_delivery_status(result: DeliveryStatusResult) -> str:
-    plan_path = result.plan_path
-    progress_path = result.progress_path
-    project_root = result.project_root
-    if project_root and project_root != ".":
-        plan_path = _project_relative_path(plan_path, project_root) or plan_path
-        progress_path = _project_relative_path(progress_path, project_root) or progress_path
-        project_root = "."
+    projection = result.to_dict()
+    plan_path = projection["plan_path"]
+    progress_path = projection["progress_path"]
+    project_root = projection["project_root"]
+    plan_data = projection.get("plan")
 
     lines = [
         f"Delivery plan status: {plan_path}",
-        f"Status: {result.status}",
+        f"Status: {projection['status']}",
     ]
     if project_root:
         lines.append(f"Project root: {project_root}")
     if progress_path:
         progress_note = "present" if result.progress_exists else "not created yet"
         lines.append(f"Progress: {progress_path} ({progress_note})")
-    if result.plan:
+    if plan_data:
         lines.extend(
             [
-                f"Plan ID: {result.plan.plan_id}",
-                f"Title: {result.plan.title}",
-                f"Final branch: {result.plan.final_branch}",
+                f"Plan ID: {plan_data['plan_id']}",
+                f"Title: {plan_data['title']}",
+                f"Final branch: {plan_data['final_branch']}",
             ]
         )
-    assembled_commit = getattr(result, "assembled_commit", None)
+    assembled_commit = projection.get("assembled_commit")
     if assembled_commit:
-        assembly_detail = f"{result.plan.final_branch} @ {assembled_commit}" if result.plan else assembled_commit
+        assembly_detail = f"{plan_data['final_branch']} @ {assembled_commit}" if plan_data else assembled_commit
         lines.append(f"Assembled: {assembly_detail}")
-        assembly_unit_id = getattr(result, "assembly_unit_id", None)
-        if getattr(result, "assembly_status", None) == "failed" and assembly_unit_id:
+        assembly_unit_id = projection.get("assembly_unit_id")
+        if projection.get("assembly_status") == "failed" and assembly_unit_id:
             lines.append(f"Assembly blocked at unit: {assembly_unit_id}")
-    if result.final_commit:
-        final_branch = result.final_branch or (result.plan.final_branch if result.plan else None)
-        final_ref = f"{final_branch} @ {result.final_commit}" if final_branch else result.final_commit
+    final_commit = projection.get("final_commit")
+    if final_commit:
+        final_branch = projection.get("final_branch") or (plan_data["final_branch"] if plan_data else None)
+        final_ref = f"{final_branch} @ {final_commit}" if final_branch else final_commit
         lines.append(f"Finalized: {final_ref}")
-        if result.finalized_at:
-            lines.append(f"Finalized at: {result.finalized_at}")
+        if projection.get("finalized_at"):
+            lines.append(f"Finalized at: {projection['finalized_at']}")
 
     if result.units:
         lines.append("")
         lines.append("Units:")
         for unit in result.units:
+            unit_data = unit.to_dict()
             detail = unit.status
             if unit.status == "running":
                 if unit.child_task_id:
@@ -1025,23 +1037,26 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
                 else:
                     detail += " (retry unavailable: missing child task id)"
             elif unit.status == "superseded":
-                detail += f" (replaced by: {', '.join(unit.superseded_by)})"
+                replacements = unit_data.get("superseded_by", [])
+                detail += f" (replaced by: {', '.join(replacements)})"
             elif unit.blocked_by:
-                detail += f" (blocked by: {', '.join(unit.blocked_by)})"
+                blockers = unit_data["blocked_by"]
+                detail += f" (blocked by: {', '.join(blockers)})"
             elif unit.eligible:
                 detail += " (eligible)"
-            if unit.child_task_id:
-                detail += f" task={unit.child_task_id}"
-            if unit.branch:
-                detail += f" branch={unit.branch}"
-            if unit.commit:
-                detail += f" commit={unit.commit}"
+            if unit_data.get("child_task_id"):
+                detail += f" task={unit_data['child_task_id']}"
+            if unit_data.get("branch"):
+                detail += f" branch={unit_data['branch']}"
+            if unit_data.get("commit"):
+                detail += f" commit={unit_data['commit']}"
             if unit.estimated_size:
                 detail += f" size={unit.estimated_size}"
             if unit.risk_tags:
                 detail += f" risk={','.join(unit.risk_tags)}"
-            title = f" — {unit.title}" if unit.title else ""
-            lines.append(f"- {unit.id}: {detail}{title}")
+            safe_title = unit_data.get("title")
+            title = f" — {safe_title}" if safe_title else ""
+            lines.append(f"- {unit_data['id']}: {detail}{title}")
 
     if result.errors:
         lines.append("")
@@ -1057,9 +1072,9 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
             lines.append(
                 _format_issue(_sanitize_issue(issue, result.project_root, result.plan_path, result.progress_path))
             )
-    if result.next_action:
+    if projection.get("next_action"):
         lines.append("")
-        lines.append(f"Next action: {result.next_action}")
+        lines.append(f"Next action: {projection['next_action']}")
     return "\n".join(lines) + "\n"
 
 
@@ -1432,7 +1447,8 @@ def _next_action(
     if status == "invalid":
         return "fix delivery plan status errors"
     if assembly_status == "failed":
-        unit_detail = f" for unit {assembly_unit_id}" if assembly_unit_id else ""
+        safe_unit_id = project_delivery_public_identity(assembly_unit_id)
+        unit_detail = f" for unit {safe_unit_id}" if safe_unit_id else ""
         command = "delivery finalize" if status == "done" else "delivery run-next"
         return f"resolve delivery branch assembly{unit_detail}, then rerun {command}"
 
@@ -1464,5 +1480,4 @@ def _next_action(
 
 
 def _format_issue(issue: DeliveryPlanIssue) -> str:
-    location = f" [{issue.path}]" if issue.path else ""
-    return f"- {issue.code}{location}: {issue.message}"
+    return issue.to_public_text()

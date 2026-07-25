@@ -33,15 +33,22 @@ metadata.
 The current MVP exposes:
 
 ```bash
+sikula delivery assess .sikula/tasks/<task>.refined.md
+sikula delivery prepare .sikula/tasks/<task>.refined.md
 sikula delivery check .sikula/delivery/<slug>/plan.yaml
 sikula delivery status .sikula/delivery/<slug>/plan.yaml
+sikula delivery run-next .sikula/delivery/<slug>/plan.yaml
+sikula delivery finalize .sikula/delivery/<slug>/plan.yaml
 ```
 
-These commands validate the tracked plan file and can emit JSON. `delivery
-status` also reads ignored parent progress from
+`delivery assess` recommends a standard run, delivery plan, or task
+clarification without starting either workflow. `delivery prepare` authors
+tracked plan source artifacts. The remaining commands validate, inspect,
+execute, and finalize that explicit plan, and can emit privacy-safe JSON.
+`delivery status` also reads ignored parent progress from
 `.sikula/state/delivery/<plan-id>/progress.json` when present; if progress does
-not exist yet, units are reported as pending from the plan. They do not create
-worktrees, create task state, run agents, prepare contracts, or update branches.
+not exist yet, units are reported as pending from the plan. Assessment and
+preparation do not create worktrees, task state, or delivery progress.
 The validator currently enforces single-repository scope and rejects multi-repo
 plans until cross-repo branching, locking, validation, and result-set semantics
 exist. See [Delivery Plans](delivery-plans.md).

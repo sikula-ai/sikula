@@ -22,6 +22,7 @@ from core.delivery_plan import (
     delivery_final_branch_for_plan_id,
     is_valid_delivery_branch_name,
 )
+from core.delivery_public_metadata import is_safe_delivery_public_metadata
 from core.markdown_headings import MarkdownHeadingScanner, normalize_heading
 
 
@@ -255,6 +256,22 @@ def write_delivery_prepare_artifacts(
             failure_reason=_FAILURE_WRITE_FAILED,
             errors=exc.issues,
             written_artifacts=exc.written_artifacts,
+        )
+
+    invalid_metadata_path = _invalid_delivery_public_metadata_path(draft)
+    if invalid_metadata_path is not None:
+        return _blocked_result(
+            DeliveryAuthoringDerivedPaths(plan_file="", units_dir="", unit_task_paths={}),
+            unit_task_paths={},
+            failure_reason=_FAILURE_WRITE_FAILED,
+            errors=[
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.metadata_invalid",
+                    "Delivery metadata must be bounded, single-line, and free of absolute local paths.",
+                    invalid_metadata_path,
+                )
+            ],
         )
 
     if _is_absolute_path(output_dir):
@@ -553,6 +570,17 @@ def _lexical_artifact_paths(
         units_dir=units_dir,
         unit_task_paths=unit_task_paths,
     )
+
+
+def _invalid_delivery_public_metadata_path(draft: DeliveryAuthoringDraft) -> str | None:
+    if not is_safe_delivery_public_metadata(draft.title):
+        return "title"
+    for index, unit in enumerate(draft.units):
+        for field_name in ("title", "stream", "component", "phase", "kind", "platform"):
+            value = getattr(unit, field_name)
+            if value is not None and not is_safe_delivery_public_metadata(value):
+                return f"units[{index}].{field_name}"
+    return None
 
 
 def _lexical_project_relative_path(path: str | Path, root: Path) -> Path:

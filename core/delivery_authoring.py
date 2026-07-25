@@ -15,11 +15,53 @@ from core.delivery_unit_metadata import (
     MAX_DELIVERY_UNIT_MAX_PLANNER_STEPS,
     DeliveryUnitBudget,
 )
+from core.delivery_plan import MAX_DELIVERY_UNIT_ID_LENGTH
+from core.delivery_public_metadata import is_safe_delivery_public_metadata
 from core.markdown_headings import MarkdownHeading, MarkdownHeadingScanner, normalize_heading
 from core.validation_coverage import extract_validation_commands
 
 _DELIVERY_AUTHORING_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _PLANNING_MODES = {"fixed_window"}
+DELIVERY_ASSESSMENT_MODES = frozenset({"single_run", "delivery_plan", "needs_clarification"})
+DELIVERY_ASSESSMENT_REASON_CODES = frozenset(
+    {
+        "single_cohesive_surface",
+        "single_validation_boundary",
+        "multiple_independent_surfaces",
+        "multiple_platforms",
+        "multiple_components",
+        "multiple_risk_boundaries",
+        "dependency_order_required",
+        "scope_unclear",
+        "acceptance_criteria_unclear",
+        "ownership_unclear",
+        "validation_unclear",
+        "decomposition_unclear",
+    }
+)
+_DELIVERY_ASSESSMENT_REASON_CODES_BY_MODE = {
+    "single_run": frozenset({"single_cohesive_surface", "single_validation_boundary"}),
+    "delivery_plan": frozenset(
+        {
+            "multiple_independent_surfaces",
+            "multiple_platforms",
+            "multiple_components",
+            "multiple_risk_boundaries",
+            "dependency_order_required",
+        }
+    ),
+    "needs_clarification": frozenset(
+        {
+            "scope_unclear",
+            "acceptance_criteria_unclear",
+            "ownership_unclear",
+            "validation_unclear",
+            "decomposition_unclear",
+        }
+    ),
+}
+_MAX_DELIVERY_ASSESSMENT_REASONS = 16
+_MAX_DELIVERY_ASSESSMENT_UNITS = 100
 _FENCED_JSON_RE = re.compile(
     r"^\s*(?P<fence>`{3,}|~{3,})[ \t]*json[ \t]*\r?\n(?P<content>.*)\r?\n(?P=fence)[ \t]*\s*$",
     re.DOTALL | re.IGNORECASE,
@@ -33,6 +75,8 @@ _AMENDMENT_TOP_LEVEL_FIELDS = {
     "budget_exceeded",
     "warnings",
 }
+_ASSESSMENT_TOP_LEVEL_FIELDS = {"recommended_mode", "reason_codes", "units"}
+_ASSESSMENT_UNIT_FIELDS = {"id", "title", "depends_on", "stream", "component", "platform"}
 _UNIT_FIELDS = {
     "id",
     "title",
@@ -139,6 +183,37 @@ class DeliveryAuthoringDerivedPaths:
     unit_task_paths: dict[str, str]
 
 
+@dataclass(frozen=True)
+class DeliveryAssessmentUnitDraft:
+    id: str
+    title: str
+    depends_on: list[str]
+    stream: str | None = None
+    component: str | None = None
+    platform: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "id": self.id,
+            "title": self.title,
+            "depends_on": list(self.depends_on),
+        }
+        if self.stream is not None:
+            data["stream"] = self.stream
+        if self.component is not None:
+            data["component"] = self.component
+        if self.platform is not None:
+            data["platform"] = self.platform
+        return data
+
+
+@dataclass
+class DeliveryAssessmentDraft:
+    recommended_mode: str
+    reason_codes: list[str]
+    units: list[DeliveryAssessmentUnitDraft] = field(default_factory=list)
+
+
 class DeliveryAuthoringParseError(ValueError):
     code: str
     message: str
@@ -147,6 +222,37 @@ class DeliveryAuthoringParseError(ValueError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def parse_delivery_assessment_output(output: str) -> DeliveryAssessmentDraft:
+    data = _parse_output_object(output)
+    _reject_unknown_fields(data, _ASSESSMENT_TOP_LEVEL_FIELDS, "assessment top-level")
+
+    recommended_mode = _require_string(data, "recommended_mode", "recommended_mode")
+    if recommended_mode not in DELIVERY_ASSESSMENT_MODES:
+        raise DeliveryAuthoringParseError(
+            "delivery_assessment.mode_invalid",
+            "recommended_mode must be a supported delivery assessment mode.",
+        )
+
+    reason_codes = _assessment_reason_codes(data.get("reason_codes"), recommended_mode)
+    units = _parse_assessment_units(data.get("units", []))
+    if recommended_mode == "delivery_plan" and len(units) < 2:
+        raise DeliveryAuthoringParseError(
+            "delivery_assessment.units_required",
+            "delivery_plan recommendations must include at least two proposed units.",
+        )
+    if recommended_mode != "delivery_plan" and units:
+        raise DeliveryAuthoringParseError(
+            "delivery_assessment.units_forbidden",
+            "Only delivery_plan recommendations may include proposed units.",
+        )
+
+    return DeliveryAssessmentDraft(
+        recommended_mode=recommended_mode,
+        reason_codes=reason_codes,
+        units=units,
+    )
 
 
 def parse_delivery_authoring_output(
@@ -173,7 +279,7 @@ def parse_delivery_authoring_output(
             "plan_id must match the selected delivery plan id.",
         )
 
-    title = _require_string(data, "title", "title")
+    title = _bounded_authoring_string(data, "title", "title")
     planning_mode = _optional_planning_mode(data, "planning_mode", "planning_mode")
     warnings = _optional_string_list(data, "warnings", "warnings")
     units = _parse_units(data.get("units"), project_root=root)
@@ -409,7 +515,7 @@ def _parse_units(value: Any, *, project_root: Path) -> list[DeliveryAuthoringUni
             )
         seen.add(unit_id)
 
-        title = _require_string(item, "title", f"{unit_path}.title")
+        title = _bounded_authoring_string(item, "title", f"{unit_path}.title")
         depends_on = _require_string_list(item, "depends_on", f"{unit_path}.depends_on")
         task_markdown = _require_string(item, "task_markdown", f"{unit_path}.task_markdown")
         _validate_unit_task_markdown(task_markdown)
@@ -420,11 +526,11 @@ def _parse_units(value: Any, *, project_root: Path) -> list[DeliveryAuthoringUni
                 title=title,
                 depends_on=depends_on,
                 task_markdown=task_markdown,
-                stream=_optional_string(item, "stream", f"{unit_path}.stream"),
-                component=_optional_string(item, "component", f"{unit_path}.component"),
-                phase=_optional_string(item, "phase", f"{unit_path}.phase"),
-                kind=_optional_string(item, "kind", f"{unit_path}.kind"),
-                platform=_optional_string(item, "platform", f"{unit_path}.platform"),
+                stream=_optional_bounded_authoring_string(item, "stream", f"{unit_path}.stream"),
+                component=_optional_bounded_authoring_string(item, "component", f"{unit_path}.component"),
+                phase=_optional_bounded_authoring_string(item, "phase", f"{unit_path}.phase"),
+                kind=_optional_bounded_authoring_string(item, "kind", f"{unit_path}.kind"),
+                platform=_optional_bounded_authoring_string(item, "platform", f"{unit_path}.platform"),
                 scope_paths=_optional_scope_paths(item, "scope_paths", f"{unit_path}.scope_paths", project_root),
                 estimated_size=_optional_estimated_size(item, "estimated_size", f"{unit_path}.estimated_size"),
                 risk_tags=_optional_risk_tags(item, "risk_tags", f"{unit_path}.risk_tags"),
@@ -434,6 +540,159 @@ def _parse_units(value: Any, *, project_root: Path) -> list[DeliveryAuthoringUni
 
     _validate_dependencies(units)
     return units
+
+
+def _assessment_reason_codes(value: Any, recommended_mode: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise DeliveryAuthoringParseError(
+            "delivery_assessment.reason_codes_required",
+            "reason_codes must be a non-empty list of stable reason codes.",
+        )
+    if len(value) > _MAX_DELIVERY_ASSESSMENT_REASONS:
+        raise DeliveryAuthoringParseError(
+            "delivery_assessment.reason_codes_too_many",
+            "reason_codes contains too many entries.",
+        )
+
+    allowed = _DELIVERY_ASSESSMENT_REASON_CODES_BY_MODE[recommended_mode]
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or item not in DELIVERY_ASSESSMENT_REASON_CODES:
+            raise DeliveryAuthoringParseError(
+                "delivery_assessment.reason_code_invalid",
+                "reason_codes must contain supported stable codes only.",
+            )
+        if item not in allowed:
+            raise DeliveryAuthoringParseError(
+                "delivery_assessment.reason_code_mode_mismatch",
+                "reason_codes must be compatible with recommended_mode.",
+            )
+        if item in seen:
+            raise DeliveryAuthoringParseError(
+                "delivery_assessment.reason_code_duplicate",
+                "reason_codes must not contain duplicates.",
+            )
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _parse_assessment_units(value: Any) -> list[DeliveryAssessmentUnitDraft]:
+    if not isinstance(value, list):
+        raise DeliveryAuthoringParseError(
+            "delivery_assessment.units_invalid_type",
+            "units must be a list of proposed unit objects.",
+        )
+    if len(value) > _MAX_DELIVERY_ASSESSMENT_UNITS:
+        raise DeliveryAuthoringParseError(
+            "delivery_assessment.units_too_many",
+            "units contains too many proposed units.",
+        )
+
+    units: list[DeliveryAssessmentUnitDraft] = []
+    seen: set[str] = set()
+    seen_casefolded: set[str] = set()
+    for idx, item in enumerate(value):
+        unit_path = f"units[{idx}]"
+        if not isinstance(item, dict):
+            raise DeliveryAuthoringParseError(
+                "delivery_assessment.unit_not_object",
+                "Assessment unit entries must be JSON objects.",
+            )
+        _reject_unknown_fields(item, _ASSESSMENT_UNIT_FIELDS, unit_path)
+        unit_id = _require_string(item, "id", f"{unit_path}.id")
+        _validate_unit_id(unit_id, f"{unit_path}.id")
+        if unit_id in seen or unit_id.casefold() in seen_casefolded:
+            raise DeliveryAuthoringParseError(
+                "delivery_assessment.unit_id_duplicate",
+                "Assessment unit IDs must be case-insensitively unique.",
+            )
+        seen.add(unit_id)
+        seen_casefolded.add(unit_id.casefold())
+        units.append(
+            DeliveryAssessmentUnitDraft(
+                id=unit_id,
+                title=_bounded_assessment_string(item, "title", f"{unit_path}.title"),
+                depends_on=_require_string_list(item, "depends_on", f"{unit_path}.depends_on"),
+                stream=_optional_bounded_assessment_string(item, "stream", f"{unit_path}.stream"),
+                component=_optional_bounded_assessment_string(item, "component", f"{unit_path}.component"),
+                platform=_optional_bounded_assessment_string(item, "platform", f"{unit_path}.platform"),
+            )
+        )
+    _validate_assessment_dependencies(units)
+    return units
+
+
+def _bounded_assessment_string(data: dict[str, Any], key: str, path: str) -> str:
+    value = _require_string(data, key, path)
+    if not is_safe_delivery_public_metadata(value):
+        raise DeliveryAuthoringParseError(
+            "delivery_assessment.label_invalid",
+            f"{path} must be bounded single-line delivery assessment metadata without absolute paths.",
+        )
+    return value
+
+
+def _optional_bounded_assessment_string(data: dict[str, Any], key: str, path: str) -> str | None:
+    value = _optional_string(data, key, path)
+    if value is not None and not is_safe_delivery_public_metadata(value):
+        raise DeliveryAuthoringParseError(
+            "delivery_assessment.label_invalid",
+            f"{path} must be bounded single-line delivery assessment metadata without absolute paths.",
+        )
+    return value
+
+
+def _bounded_authoring_string(data: dict[str, Any], key: str, path: str) -> str:
+    value = _require_string(data, key, path)
+    if not is_safe_delivery_public_metadata(value):
+        raise DeliveryAuthoringParseError(
+            "delivery_authoring.label_invalid",
+            f"{path} must be bounded single-line delivery metadata without absolute paths.",
+        )
+    return value
+
+
+def _optional_bounded_authoring_string(data: dict[str, Any], key: str, path: str) -> str | None:
+    value = _optional_string(data, key, path)
+    if value is not None and not is_safe_delivery_public_metadata(value):
+        raise DeliveryAuthoringParseError(
+            "delivery_authoring.label_invalid",
+            f"{path} must be bounded single-line delivery metadata without absolute paths.",
+        )
+    return value
+
+
+def _validate_assessment_dependencies(units: list[DeliveryAssessmentUnitDraft]) -> None:
+    unit_ids = {unit.id for unit in units}
+    deps_by_id: dict[str, list[str]] = {}
+    for unit in units:
+        seen: set[str] = set()
+        deps_by_id[unit.id] = []
+        for dependency in unit.depends_on:
+            if dependency in seen:
+                raise DeliveryAuthoringParseError(
+                    "delivery_assessment.dependency_duplicate",
+                    "depends_on must not contain duplicate dependencies.",
+                )
+            seen.add(dependency)
+            if dependency == unit.id:
+                raise DeliveryAuthoringParseError(
+                    "delivery_assessment.dependency_self",
+                    "Assessment units cannot depend on themselves.",
+                )
+            if dependency not in unit_ids:
+                raise DeliveryAuthoringParseError(
+                    "delivery_assessment.dependency_unknown",
+                    "depends_on must reference known assessment unit IDs only.",
+                )
+            deps_by_id[unit.id].append(dependency)
+    if _find_dependency_cycle(deps_by_id):
+        raise DeliveryAuthoringParseError(
+            "delivery_assessment.dependency_cycle",
+            "Assessment unit dependencies must not contain cycles.",
+        )
 
 
 def _reject_unknown_fields(data: dict[str, Any], allowed_fields: set[str], location: str) -> None:
@@ -608,6 +867,7 @@ def _string_list(value: Any, path: str) -> list[str]:
 def _validate_unit_id(unit_id: str, path: str) -> None:
     if (
         not unit_id
+        or len(unit_id) > MAX_DELIVERY_UNIT_ID_LENGTH
         or unit_id in {".", ".."}
         or "/" in unit_id
         or "\\" in unit_id

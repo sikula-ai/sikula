@@ -759,6 +759,44 @@ def test_render_delivery_run_next_preview_is_safe_and_actionable(tmp_path: Path)
     assert "Private task body" not in output
 
 
+def test_run_next_preview_redacts_unsafe_unit_metadata() -> None:
+    private_path = "/Users/example/private/task.md"
+    private_unit_id = "/Users/example/private/unit"
+    selected_unit = DeliveryStatusUnit(
+        id=private_unit_id,
+        status="pending",
+        title=f"Implement from {private_path}",
+        task_path=".sikula/delivery/demo/units/01-foundation.md",
+        depends_on=[],
+    )
+    result = DeliveryRunNextPreview(
+        plan_path=".sikula/delivery/demo/plan.yaml",
+        project_root=".",
+        valid=True,
+        ready=True,
+        dry_run=True,
+        status="pending",
+        progress_exists=False,
+        selected_unit=selected_unit,
+        errors=[],
+        warnings=[],
+        message=f"Delivery unit {private_unit_id} is ready.",
+    )
+
+    payload = result.to_dict()
+    rendered = render_delivery_run_next_preview(result)
+
+    assert selected_unit.title == f"Implement from {private_path}"
+    assert payload["selected_unit"]["title"] == "<redacted>"
+    assert payload["selected_unit"]["id"].startswith("<redacted:")
+    assert payload["message"] == "<redacted>"
+    assert "Selected unit: <redacted:" in rendered
+    assert private_path not in json.dumps(payload)
+    assert private_path not in rendered
+    assert private_unit_id not in json.dumps(payload)
+    assert private_unit_id not in rendered
+
+
 def test_render_delivery_run_next_preview_renders_child_task_id(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
@@ -844,6 +882,7 @@ def test_render_delivery_run_next_execution_is_safe_and_actionable() -> None:
 
 def test_render_delivery_run_next_execution_includes_budget_split_preparation() -> None:
     budget = DeliveryBudgetExceeded(name="max_planner_steps", limit=1, actual=3)
+    private_unit_id = "/Users/example/private/unit"
     result = DeliveryRunNextExecutionResult(
         plan_path="/tmp/project/.sikula/delivery/demo/plan.yaml",
         project_root="/tmp/project",
@@ -863,27 +902,37 @@ def test_render_delivery_run_next_execution_includes_budget_split_preparation() 
         message="Delivery unit failed.",
         budget_split_preparation=DeliveryBudgetSplitPreparationResult(
             prepared=True,
-            target_unit_id="01-foundation",
+            target_unit_id=private_unit_id,
             proposal_id="proposal123",
             replacement_ids=["foundation-a", "foundation-b"],
             proposal_path=".sikula/contract-reports/delivery-amendments/demo/proposal123.json",
             audit_path=".sikula/contract-reports/delivery-amendments/demo/audit.json",
             budget_exceeded=budget,
-            errors=[],
-            warnings=[{"code": "delivery.warning", "message": "Inspect the proposal."}],
+            errors=[
+                {
+                    "code": "delivery.blocked",
+                    "message": f"Delivery unit {private_unit_id} is blocked.",
+                    "path": private_unit_id,
+                }
+            ],
+            warnings=[{"code": "delivery.warning", "message": f"Inspect {private_unit_id}."}],
             message="Budget split proposal prepared.",
         ),
     )
 
+    payload = result.to_dict()
     output = render_delivery_run_next_execution(result)
 
     assert "Budget split preparation:" in output
     assert "Status: prepared" in output
-    assert "Target unit: 01-foundation" in output
+    assert "Target unit: <redacted:" in output
     assert "Proposal: proposal123" in output
     assert "Replacements: foundation-a, foundation-b" in output
     assert "Budget split proposal prepared." in output
-    assert "- delivery.warning: Inspect the proposal." in output
+    assert "- delivery.blocked [<redacted>]: <redacted>" in output
+    assert "- delivery.warning: <redacted>" in output
+    assert private_unit_id not in json.dumps(payload)
+    assert private_unit_id not in output
 
 
 def test_delivery_run_next_preview_projects_paths_relative_to_project_root() -> None:

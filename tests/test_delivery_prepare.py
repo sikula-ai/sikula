@@ -1082,6 +1082,31 @@ def test_cmd_delivery_prepare_resolves_task_path_from_current_directory_and_writ
     assert (tmp_path / ".sikula" / "delivery" / "team-invites" / "plan.yaml").is_file()
 
 
+@pytest.mark.parametrize("task_suffix", [".refined", ".v4", ".v12.refined"])
+def test_cmd_delivery_prepare_strips_generated_suffixes_from_default_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    task_suffix: str,
+) -> None:
+    task_file = f"tasks/team-invites{task_suffix}.md"
+    _write_task(tmp_path, task_file)
+    monkeypatch.chdir(tmp_path)
+
+    cmd_delivery_prepare(
+        _args(task_file, json_output=True),
+        _cfg(tmp_path),
+        context=_authoring_context(),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
+    assert payload["selected_plan_id"] == "team-invites"
+    assert payload["paths"]["output_dir"] == ".sikula/delivery/team-invites"
+    assert payload["paths"]["plan_file"] == ".sikula/delivery/team-invites/plan.yaml"
+    assert (tmp_path / ".sikula" / "delivery" / "team-invites" / "plan.yaml").is_file()
+
+
 def test_cmd_delivery_prepare_uses_cwd_when_config_root_is_absent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1198,6 +1223,37 @@ def test_cmd_delivery_prepare_reports_unreadable_task_file(
 
     assert payload["errors"][0]["code"] == "delivery_prepare.task_unreadable"
     assert payload["errors"][0]["path"] == "tasks/team-invites.md"
+
+
+@pytest.mark.parametrize(
+    ("task_file", "tasks_config"),
+    [
+        (".sikula/state/private.json", {}),
+        ("private-reports/private.jsonl", {"contract_report_dir": "private-reports"}),
+    ],
+)
+def test_cmd_delivery_prepare_rejects_private_artifact_task_files_before_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    task_file: str,
+    tasks_config: dict[str, str],
+) -> None:
+    _write_task(tmp_path, task_file, body="PRIVATE PROVIDER INPUT")
+    calls: list[dict] = []
+    cfg = _cfg(tmp_path)
+    cfg["tasks"] = tasks_config
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args(task_file, json_output=True),
+        cfg,
+        capsys,
+        context=_authoring_context(calls=calls),
+    )
+
+    assert payload["errors"][0]["code"] == "delivery_prepare.task_runtime_artifact"
+    assert calls == []
 
 
 @pytest.mark.parametrize(

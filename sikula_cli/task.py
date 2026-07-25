@@ -183,7 +183,7 @@ def cmd_task_refine(
         context.resolve_output_path(args.output) if args.output else context.default_refined_task_path(task_path, cfg)
     )
     if args.auto:
-        if output_path.exists():
+        if output_path.exists() or output_path.is_symlink():
             print(f"Failed to refine task: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
             context.print_existing_output_hint(output_path)
             sys.exit(1)
@@ -255,11 +255,11 @@ def cmd_task_refine(
         print("Next step:")
         print(f"- Fill the answers file, then run: sikula task refine {args.task_file} --answers {answers_path}")
         print(f"- Or answer in the terminal: sikula task refine {args.task_file} --interactive")
-        if output_path.exists():
+        if output_path.exists() or output_path.is_symlink():
             context.print_existing_output_next_step_note(output_path)
         sys.exit(1)
 
-    if output_path.exists():
+    if output_path.exists() or output_path.is_symlink():
         print(f"Failed to refine task: refusing to overwrite existing output file: {output_path}", file=sys.stderr)
         context.print_existing_output_hint(output_path)
         sys.exit(1)

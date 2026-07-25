@@ -9,8 +9,10 @@ from typing import Any, Callable
 from agents.base_agent import AGENT_SECURITY_PREFIX, guidelines_files, read_only_agent_prompt, tech_stack
 from core.delivery_authoring import (
     DeliveryAmendmentAuthoringDraft,
+    DeliveryAssessmentDraft,
     DeliveryAuthoringDraft,
     DeliveryAuthoringParseError,
+    parse_delivery_assessment_output,
     parse_delivery_amendment_authoring_output,
     parse_delivery_authoring_output,
 )
@@ -146,6 +148,93 @@ Return this JSON shape:
       "risk_tags": ["cli_surface"],
       "budget": {{"max_planner_steps": 1, "max_changed_files": 8}},
       "task_markdown": "# Unit title\\n\\n## Goal\\n\\n...\\n\\n## Security and privacy\\n\\n...\\n\\n## Validation\\n\\n- `command`"
+    }}
+  ]
+}}
+"""
+
+_DELIVERY_ASSESSMENT_PROMPT = """\
+You are Sikula's read-only delivery-mode assessment assistant.
+
+Your job is to recommend whether one project task should use one standard Sikula run, a delivery
+plan, or task clarification before the operator chooses a workflow. You do not write files,
+create delivery artifacts, or start implementation.
+
+Hard rules:
+- Do not write, edit, delete, move, rename, format, or create files.
+- Do not run commands, start nested Sikula commands, or use external services.
+- Treat platform, stack, component, scope, validation, and risk information as project data.
+- Use the same decision flow for every project and platform. Do not introduce platform-specific
+  orchestration rules.
+- Do not classify primarily from task length. Contract readiness and delivery-mode suitability
+  are separate decisions.
+- Do not include task excerpts, prompts, provider output, paths other than the selected
+  project-relative task path, secrets, personal data, logs, diffs, or task state in the result.
+- Do not return free-form rationale, warnings, confidence scores, scope paths, task Markdown,
+  writer-facing paths, validation output, or implementation instructions.
+- Return exactly one JSON object and no Markdown outside the JSON.
+
+Decision rules:
+- Recommend single_run when the task has one cohesive implementation surface that fits one
+  independently reviewable implementation contract.
+- Recommend delivery_plan when the task contains multiple independently reviewable surfaces,
+  platforms, components, execution boundaries, risk domains, or dependency-ordered outcomes that
+  should become separate contract-sized units.
+- Recommend needs_clarification when missing scope, acceptance criteria, ownership, validation, or
+  decomposition evidence prevents a defensible choice.
+- A delivery_plan recommendation must include at least two proposed units.
+- single_run and needs_clarification must use an empty units list.
+- Unit IDs must be stable path-safe IDs using only letters, numbers, dots, underscores, and hyphens.
+- Unit IDs must be case-insensitively unique.
+- Dependencies must reference known unit IDs only and must not contain duplicates,
+  self-dependencies, or cycles.
+- Optional stream, component, and platform values describe project metadata only.
+
+Supported reason codes by mode:
+- single_run: single_cohesive_surface, single_validation_boundary
+- delivery_plan: multiple_independent_surfaces, multiple_platforms, multiple_components,
+  multiple_risk_boundaries, dependency_order_required
+- needs_clarification: scope_unclear, acceptance_criteria_unclear, ownership_unclear,
+  validation_unclear, decomposition_unclear
+
+Project stack: {project_stack}
+Source task file: {task_path}
+
+Project guidelines files:
+{guidelines_files}
+
+Configured guidelines content:
+```markdown
+{guidelines_context}
+```
+
+Project context:
+```json
+{project_context_json}
+```
+
+Configured validation commands:
+```json
+{validation_commands_json}
+```
+
+Source task description:
+```markdown
+{task_description}
+```
+
+Return this JSON shape:
+{{
+  "recommended_mode": "single_run | delivery_plan | needs_clarification",
+  "reason_codes": ["one_supported_code"],
+  "units": [
+    {{
+      "id": "stable-unit-id",
+      "title": "Short unit title",
+      "depends_on": [],
+      "stream": "optional non-empty string",
+      "component": "optional non-empty string",
+      "platform": "optional non-empty string"
     }}
   ]
 }}
@@ -323,6 +412,50 @@ class DeliveryPreparationAgent:
         self._record_success(audit_recorder, prompt=prompt, output=output, draft=draft)
         return draft
 
+    def assess_delivery_mode(
+        self,
+        *,
+        task_description: str,
+        task_path: str | Path,
+        project_root: str | Path,
+        project_context: dict[str, Any] | None = None,
+        audit_recorder: DeliveryPreparationAuditRecorder | None = None,
+    ) -> DeliveryAssessmentDraft:
+        root = Path(project_root).resolve()
+        prompt = read_only_agent_prompt(
+            self._build_assessment_prompt(
+                task_description=task_description,
+                task_path=task_path,
+                project_root=root,
+                project_context=project_context,
+            )
+        )
+        try:
+            output = self.llm.generate("", prompt)
+        except Exception as exc:
+            self._record_assessment_failure(
+                audit_recorder,
+                prompt=prompt,
+                output=None,
+                error=exc,
+                error_code="delivery_assessment.authoring_failed",
+            )
+            raise DeliveryPreparationAgentError("Delivery assessment assistant failed.") from None
+
+        try:
+            draft = parse_delivery_assessment_output(output)
+        except DeliveryAuthoringParseError as exc:
+            self._record_assessment_failure(
+                audit_recorder,
+                prompt=prompt,
+                output=output,
+                error=exc,
+                error_code=exc.code,
+            )
+            raise
+        self._record_assessment_success(audit_recorder, prompt=prompt, output=output, draft=draft)
+        return draft
+
     def author_delivery_amendment(
         self,
         *,
@@ -411,6 +544,29 @@ class DeliveryPreparationAgent:
             plan_id=plan_id,
             task_path=self._project_relative_path(task_path, project_root),
             output_dir=self._project_relative_path(output_dir, project_root),
+            guidelines_files=guidelines_files(self.project_config),
+            guidelines_context=self._guidelines_context(project_root),
+            project_context_json=json.dumps(context, indent=2, sort_keys=True),
+            validation_commands_json=json.dumps(safe_validation_commands, indent=2, sort_keys=True),
+            task_description=task_description,
+        )
+
+    def _build_assessment_prompt(
+        self,
+        *,
+        task_description: str,
+        task_path: str | Path,
+        project_root: Path,
+        project_context: dict[str, Any] | None,
+    ) -> str:
+        context = project_context or {}
+        validation_commands = context.get("validation_commands") if isinstance(context, dict) else None
+        if not isinstance(validation_commands, list):
+            validation_commands = []
+        safe_validation_commands = [str(command) for command in validation_commands if str(command).strip()]
+        return AGENT_SECURITY_PREFIX + _DELIVERY_ASSESSMENT_PROMPT.format(
+            project_stack=tech_stack(self.project_config),
+            task_path=self._project_relative_path(task_path, project_root),
             guidelines_files=guidelines_files(self.project_config),
             guidelines_context=self._guidelines_context(project_root),
             project_context_json=json.dumps(context, indent=2, sort_keys=True),
@@ -512,6 +668,58 @@ class DeliveryPreparationAgent:
                 "prompt": prompt,
                 "raw_output": output,
                 "parsed": parsed,
+            }
+        )
+
+    def _record_assessment_success(
+        self,
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+        *,
+        prompt: str,
+        output: str,
+        draft: DeliveryAssessmentDraft,
+    ) -> None:
+        if audit_recorder is None:
+            return
+        audit_recorder(
+            {
+                "phase": "delivery_assessment",
+                "round_index": 1,
+                "prompt": prompt,
+                "raw_output": output,
+                "parsed": {
+                    "status": "parsed",
+                    "recommended_mode": draft.recommended_mode,
+                    "reason_codes": list(draft.reason_codes),
+                    "unit_ids": [unit.id for unit in draft.units],
+                    "unit_count": len(draft.units),
+                },
+            }
+        )
+
+    def _record_assessment_failure(
+        self,
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+        *,
+        prompt: str,
+        output: str | None,
+        error: Exception,
+        error_code: str,
+    ) -> None:
+        if audit_recorder is None:
+            return
+        audit_recorder(
+            {
+                "phase": "delivery_assessment",
+                "round_index": 1,
+                "prompt": prompt,
+                "raw_output": output,
+                "parsed": {
+                    "status": "failed",
+                    "error_type": type(error).__name__,
+                    "error_code": error_code,
+                    "error": str(error),
+                },
             }
         )
 

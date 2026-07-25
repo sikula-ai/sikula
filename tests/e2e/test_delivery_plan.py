@@ -134,6 +134,38 @@ The delivery plan contains a focused unit that can be validated before execution
     )
 
 
+def _delivery_assessment_output() -> str:
+    return json.dumps(
+        {
+            "recommended_mode": "delivery_plan",
+            "reason_codes": ["multiple_platforms", "dependency_order_required"],
+            "units": [
+                {
+                    "id": "shared",
+                    "title": "Shared behavior",
+                    "depends_on": [],
+                    "component": "shared",
+                    "platform": "shared",
+                },
+                {
+                    "id": "platform-a",
+                    "title": "Platform A",
+                    "depends_on": ["shared"],
+                    "component": "client-a",
+                    "platform": "platform-a",
+                },
+                {
+                    "id": "platform-b",
+                    "title": "Platform B",
+                    "depends_on": ["shared"],
+                    "component": "client-b",
+                    "platform": "platform-b",
+                },
+            ],
+        }
+    )
+
+
 def _git_commit_file(root: Path, name: str, body: str) -> str:
     path = root / name
     path.write_text(body, encoding="utf-8")
@@ -226,6 +258,44 @@ def _budget_split_authoring_output() -> str:
             ],
         }
     )
+
+
+def test_delivery_assess_cli_recommends_mixed_platform_plan_without_source_or_state_writes(
+    git_project: Path,
+    fake_llm,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    task_path = git_project / ".sikula" / "tasks" / "cross-platform-feature.md"
+    task_path.parent.mkdir(parents=True, exist_ok=True)
+    task_path.write_text("# Cross-platform feature\n\nPRIVATE TASK BODY\n", encoding="utf-8")
+    _write_project_config(git_project)
+    fake = fake_llm(generate_response=_delivery_assessment_output())
+    monkeypatch.chdir(git_project)
+
+    with patch("core.llm_client.create_llm_client", return_value=fake):
+        with patch(
+            "sys.argv",
+            ["sikula", "delivery", "assess", ".sikula/tasks/cross-platform-feature.md", "--json"],
+        ):
+            main()
+
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    audit_path = git_project / ".sikula" / "contract-reports" / "cross-platform-feature.delivery-assess.auto-llm.jsonl"
+
+    assert payload["status"] == "ready"
+    assert payload["recommended_mode"] == "delivery_plan"
+    assert payload["reason_codes"] == ["multiple_platforms", "dependency_order_required"]
+    assert payload["unit_count"] == 3
+    assert payload["next_command"] == ("sikula delivery prepare .sikula/tasks/cross-platform-feature.md")
+    assert payload["audit_path"] == (".sikula/contract-reports/cross-platform-feature.delivery-assess.auto-llm.jsonl")
+    assert "PRIVATE TASK BODY" not in output
+    assert str(git_project) not in output
+    assert audit_path.is_file()
+    assert not (git_project / ".sikula" / "delivery").exists()
+    assert not (git_project / ".sikula" / "state").exists()
+    assert not (git_project / ".sikula" / "worktrees").exists()
 
 
 def test_delivery_prepare_cli_authors_artifacts_then_check_succeeds(

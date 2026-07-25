@@ -9,14 +9,17 @@ import copy
 from dataclasses import dataclass, field, replace
 import io
 import json
+import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
+import shlex
 import subprocess
 import sys
 from typing import TYPE_CHECKING, Any
 
 from core.delivery_authoring import (
     DeliveryAmendmentAuthoringDraft,
+    DeliveryAssessmentDraft,
     DeliveryAuthoringDraft,
     DeliveryAuthoringParseError,
 )
@@ -26,6 +29,11 @@ from core.delivery_plan import (
     DeliveryPlanIssue,
     delivery_final_branch_for_plan_id,
     is_valid_delivery_branch_name,
+)
+from core.delivery_public_metadata import (
+    is_safe_delivery_public_metadata,
+    project_delivery_public_identity,
+    sanitize_delivery_public_metadata,
 )
 from core.delivery_prepare_writer import DeliveryPrepareWriteResult, write_delivery_prepare_artifacts
 from core.delivery_unit_metadata import (
@@ -66,6 +74,22 @@ _DELIVERY_PREPARE_UNIT_READINESS_FAILED_MESSAGE = (
 )
 _DELIVERY_PREPARE_UNIT_READINESS_FAILURE = "unit_readiness_blocked"
 _DELIVERY_PREPARE_PLAN_VALIDATION_FAILURE = "plan_validation_failed"
+_DELIVERY_ASSESSMENT_CONTEXT_MISSING_MESSAGE = "Delivery assessment requires the main Sikula command context."
+_DELIVERY_ASSESSMENT_PORTABLE_COMMAND_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+_DELIVERY_ASSESSMENT_REASON_MESSAGES = {
+    "single_cohesive_surface": "The task describes one cohesive implementation surface.",
+    "single_validation_boundary": "The task can be validated as one implementation boundary.",
+    "multiple_independent_surfaces": "The task contains multiple independently reviewable surfaces.",
+    "multiple_platforms": "The task spans multiple project platforms.",
+    "multiple_components": "The task spans multiple project components.",
+    "multiple_risk_boundaries": "The task contains risk boundaries that should be reviewed separately.",
+    "dependency_order_required": "The expected outcomes require explicit dependency ordering.",
+    "scope_unclear": "The task scope is not clear enough to choose an execution mode.",
+    "acceptance_criteria_unclear": "Acceptance criteria are not clear enough to choose an execution mode.",
+    "ownership_unclear": "Platform or component ownership is not clear enough to decompose the task.",
+    "validation_unclear": "Validation evidence is not clear enough to choose an execution mode.",
+    "decomposition_unclear": "The task cannot yet be decomposed into defensible delivery boundaries.",
+}
 _DELIVERY_PREPARE_FORBIDDEN_OUTPUT_ROOTS = (
     (".git",),
     (".sikula", "state"),
@@ -75,12 +99,40 @@ _DELIVERY_PREPARE_FORBIDDEN_OUTPUT_ROOTS = (
 
 
 def register_parser(subparsers) -> argparse.ArgumentParser:
-    delivery_p = subparsers.add_parser("delivery", help="Inspect and run delivery plans")
+    delivery_p = subparsers.add_parser("delivery", help="Assess, prepare, inspect, and run delivery plans")
     delivery_sub = delivery_p.add_subparsers(dest="delivery_command")
 
     delivery_check_p = delivery_sub.add_parser("check", help="Check a delivery plan file")
     delivery_check_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
     delivery_check_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
+
+    delivery_assess_p = delivery_sub.add_parser(
+        "assess",
+        help="Recommend a standard run or delivery plan for a task",
+    )
+    delivery_assess_p.add_argument("task_file", metavar="TASK_FILE", help="Path to source task .txt/.md file")
+    delivery_assess_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
+    delivery_assess_p.add_argument(
+        "--agent-model",
+        action="append",
+        default=None,
+        metavar="AGENT=MODEL",
+        help="Override model for delivery_preparer, e.g. --agent-model delivery_preparer=gpt-5.5",
+    )
+    delivery_assess_p.add_argument(
+        "--agent-provider",
+        action="append",
+        default=None,
+        metavar="AGENT=PROVIDER",
+        help="Override provider for delivery_preparer, e.g. --agent-provider delivery_preparer=claude",
+    )
+    delivery_assess_p.add_argument(
+        "--agent-timeout",
+        action="append",
+        default=None,
+        metavar="AGENT=SECONDS",
+        help="Override timeout for delivery_preparer, e.g. --agent-timeout delivery_preparer=1200",
+    )
 
     delivery_prepare_p = delivery_sub.add_parser("prepare", help="Prepare delivery plan artifacts from a task file")
     delivery_prepare_p.add_argument("task_file", metavar="TASK_FILE", help="Path to source task .txt/.md file")
@@ -282,16 +334,16 @@ class DeliveryAmendPrepareResult:
             "status": self.status,
             "prepared": self.prepared,
             "plan_id": self.plan_id,
-            "target_unit_id": self.target_unit_id,
+            "target_unit_id": project_delivery_public_identity(self.target_unit_id),
             "proposal_id": self.proposal_id,
-            "replacement_ids": list(self.replacement_ids),
+            "replacement_ids": [project_delivery_public_identity(value) for value in self.replacement_ids],
             "proposal_path": safe_path(self.proposal_path),
             "audit_path": safe_path(self.audit_path),
             "errors": [_safe_amend_issue_dict(issue, root, sensitive_paths=(self.plan_path,)) for issue in self.errors],
             "warnings": [
                 _safe_amend_issue_dict(issue, root, sensitive_paths=(self.plan_path,)) for issue in self.warnings
             ],
-            "message": self.message,
+            "message": sanitize_delivery_public_metadata(self.message),
         }
 
 
@@ -480,19 +532,19 @@ def render_delivery_amend_prepare(result: DeliveryAmendPrepareResult) -> str:
     lines = [
         f"Delivery amend prepare: {projection['plan_path']}",
         f"Status: {result.status}",
-        f"Target unit: {result.target_unit_id}",
+        f"Target unit: {projection['target_unit_id']}",
     ]
     if result.plan_id:
         lines.append(f"Plan ID: {result.plan_id}")
     if result.proposal_id:
         lines.append(f"Proposal: {result.proposal_id}")
-    if result.replacement_ids:
-        lines.append("Replacements: " + ", ".join(result.replacement_ids))
+    if projection["replacement_ids"]:
+        lines.append("Replacements: " + ", ".join(projection["replacement_ids"]))
     if projection["proposal_path"]:
         lines.append(f"Proposal artifact: {projection['proposal_path']}")
     if projection["audit_path"]:
         lines.append(f"Authoring audit: {projection['audit_path']}")
-    lines.append(result.message)
+    lines.append(projection["message"])
     if result.errors:
         lines.extend(["", "Errors:", *[_format_amend_issue_data(issue) for issue in projection["errors"]]])
     if result.warnings:
@@ -525,14 +577,14 @@ def render_delivery_amend_apply(result) -> str:
         f"Status: {'ready' if result.dry_run and result.ready else 'applied' if result.applied else 'blocked'}",
         f"Proposal: {result.proposal_id}",
     ]
-    if result.target_unit_id:
-        lines.append(f"Target unit: {result.target_unit_id}")
-    if result.replacement_ids:
-        lines.append("Replacements: " + ", ".join(result.replacement_ids))
-    if result.rewired_unit_ids:
-        lines.append("Rewired downstream units: " + ", ".join(result.rewired_unit_ids))
+    if projection["target_unit_id"]:
+        lines.append(f"Target unit: {projection['target_unit_id']}")
+    if projection["replacement_ids"]:
+        lines.append("Replacements: " + ", ".join(projection["replacement_ids"]))
+    if projection["rewired_unit_ids"]:
+        lines.append("Rewired downstream units: " + ", ".join(projection["rewired_unit_ids"]))
     lines.append(f"Dry run: {'yes' if result.dry_run else 'no'}")
-    lines.append(result.message)
+    lines.append(projection["message"])
     if result.errors:
         lines.extend(["", "Errors:", *[_format_amend_issue_data(issue) for issue in projection["errors"]]])
     if result.warnings:
@@ -595,6 +647,339 @@ class DeliveryPrepareIssue:
             "message": self.message,
             "path": self.path,
         }
+
+
+@dataclass(frozen=True)
+class DeliveryAssessmentResult:
+    status: str
+    ready: bool
+    task_file: str | None
+    recommended_mode: str | None = None
+    reason_codes: list[str] = field(default_factory=list)
+    unit_count: int = 0
+    audit_path: str | None = None
+    next_command: str | None = None
+    errors: list[DeliveryPrepareIssue] = field(default_factory=list)
+    message: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "ready": self.ready,
+            "task_file": self.task_file,
+            "recommended_mode": self.recommended_mode,
+            "reason_codes": list(self.reason_codes),
+            "reasons": [
+                {"code": code, "message": _DELIVERY_ASSESSMENT_REASON_MESSAGES[code]} for code in self.reason_codes
+            ],
+            "unit_count": self.unit_count,
+            "audit_path": self.audit_path,
+            "next_command": self.next_command,
+            "errors": [issue.to_dict() for issue in self.errors],
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True)
+class DeliveryAssessmentContext:
+    run_assessment_assistant: Callable[..., DeliveryAssessmentDraft]
+
+
+def cmd_delivery_assess(
+    args: argparse.Namespace,
+    cfg: dict,
+    context: DeliveryAssessmentContext | None = None,
+) -> None:
+    result = _run_delivery_assessment(args, cfg, context)
+    _print_delivery_result(result, json_output=args.json, render=render_delivery_assessment)
+    if not result.ready:
+        sys.exit(1)
+
+
+def _run_delivery_assessment(
+    args: argparse.Namespace,
+    cfg: dict,
+    context: DeliveryAssessmentContext | None,
+) -> DeliveryAssessmentResult:
+    project_root = Path(cfg.get("project", {}).get("root_path") or Path.cwd()).resolve()
+    task_path = _resolve_from_cwd(args.task_file)
+    task_rel = _project_relative_path(task_path, project_root) if _path_is_within(task_path, project_root) else None
+    public_task_rel = task_rel if task_rel is not None and is_safe_delivery_public_metadata(task_rel) else None
+    errors = _validate_delivery_prepare_agent_overrides(
+        args,
+        error_code="delivery_assessment.agent_override_invalid",
+    )
+    _validate_delivery_assessment_task_path(
+        task_path,
+        task_rel,
+        project_root,
+        errors,
+        private_artifact_roots=_delivery_private_artifact_roots(project_root, cfg),
+    )
+    if errors:
+        return DeliveryAssessmentResult(
+            status="blocked",
+            ready=False,
+            task_file=public_task_rel,
+            errors=errors,
+            message="Delivery assessment is blocked; fix the reported errors and retry.",
+        )
+    if context is None:
+        return DeliveryAssessmentResult(
+            status="blocked",
+            ready=False,
+            task_file=public_task_rel,
+            errors=[
+                DeliveryPrepareIssue(
+                    "error",
+                    "delivery_assessment.context_missing",
+                    _DELIVERY_ASSESSMENT_CONTEXT_MISSING_MESSAGE,
+                )
+            ],
+            message=_DELIVERY_ASSESSMENT_CONTEXT_MISSING_MESSAGE,
+        )
+
+    try:
+        draft = context.run_assessment_assistant(
+            args=args,
+            cfg=cfg,
+            task_path=task_path,
+            project_root=project_root,
+        )
+    except DeliveryAuthoringParseError as exc:
+        return DeliveryAssessmentResult(
+            status="blocked",
+            ready=False,
+            task_file=public_task_rel,
+            audit_path=_delivery_prepare_exception_audit_path(exc, project_root),
+            errors=[
+                DeliveryPrepareIssue(
+                    "error",
+                    "delivery_assessment.authoring_invalid",
+                    "Delivery assessment assistant returned an invalid result; inspect the local audit artifact.",
+                )
+            ],
+            message="Delivery assessment returned an invalid result.",
+        )
+    except Exception as exc:
+        return DeliveryAssessmentResult(
+            status="blocked",
+            ready=False,
+            task_file=public_task_rel,
+            audit_path=_delivery_prepare_exception_audit_path(exc, project_root),
+            errors=[
+                DeliveryPrepareIssue(
+                    "error",
+                    "delivery_assessment.authoring_failed",
+                    "Delivery assessment assistant failed; inspect the local audit artifact.",
+                )
+            ],
+            message="Delivery assessment failed.",
+        )
+    if not isinstance(draft, DeliveryAssessmentDraft):
+        return DeliveryAssessmentResult(
+            status="blocked",
+            ready=False,
+            task_file=public_task_rel,
+            errors=[
+                DeliveryPrepareIssue(
+                    "error",
+                    "delivery_assessment.authoring_invalid",
+                    "Delivery assessment assistant returned an invalid result.",
+                )
+            ],
+            message="Delivery assessment returned an invalid result.",
+        )
+
+    unit_count = len(draft.units)
+    invocation_root = Path.cwd().resolve()
+    command_task = _delivery_assessment_command_task_path(task_path, project_root, invocation_root)
+    explicit_config = getattr(args, "config", None)
+    command_config = _delivery_assessment_command_config_path(
+        explicit_config,
+        project_root,
+        invocation_root,
+    )
+    next_command = (
+        _delivery_assessment_next_command(
+            draft.recommended_mode,
+            command_task,
+            invocation_root,
+            config_file=command_config,
+        )
+        if explicit_config is None or command_config is not None
+        else None
+    )
+    return DeliveryAssessmentResult(
+        status="ready",
+        ready=True,
+        task_file=public_task_rel,
+        recommended_mode=draft.recommended_mode,
+        reason_codes=list(draft.reason_codes),
+        unit_count=unit_count,
+        audit_path=_delivery_prepare_authoring_audit_path(draft, project_root),
+        next_command=next_command,
+        message=_delivery_assessment_summary(draft.recommended_mode, unit_count),
+    )
+
+
+def render_delivery_assessment(result: DeliveryAssessmentResult) -> str:
+    projection = result.to_dict()
+    lines = [
+        f"Delivery assessment: {result.task_file or '<unknown>'}",
+        f"Status: {result.status}",
+    ]
+    if result.recommended_mode is not None:
+        lines.append(f"Recommended mode: {result.recommended_mode}")
+    if result.reason_codes:
+        lines.append("Reasons:")
+        for reason in projection["reasons"]:
+            lines.append(f"- {reason['code']}: {reason['message']}")
+    if result.unit_count:
+        lines.append(f"Proposed unit count: {result.unit_count}")
+    if result.audit_path:
+        lines.append(f"Assessment audit: {result.audit_path}")
+    lines.append(result.message)
+    if result.next_command:
+        lines.append(f"Suggested next step: {result.next_command}")
+    if result.errors:
+        lines.extend(["", "Errors:", *[_format_prepare_issue(issue) for issue in result.errors]])
+    return "\n".join(lines) + "\n"
+
+
+def _delivery_assessment_summary(mode: str, unit_count: int) -> str:
+    if mode == "single_run":
+        return "Use one prepared implementation contract and the standard Sikula run workflow."
+    if mode == "delivery_plan":
+        return f"Use a delivery plan with {unit_count} proposed independently reviewable units."
+    return "Clarify the task before choosing a standard run or delivery plan."
+
+
+def _delivery_assessment_next_command(
+    mode: str,
+    task_file: str | None,
+    invocation_root: Path,
+    *,
+    config_file: str | None = None,
+) -> str | None:
+    if task_file is None:
+        return None
+    quoted_task = _quote_delivery_assessment_path(task_file)
+    if quoted_task is None:
+        return None
+    command = "sikula"
+    if config_file is not None:
+        quoted_config = _quote_delivery_assessment_path(config_file)
+        if quoted_config is None:
+            return None
+        command += f" --config {quoted_config}"
+    if mode == "single_run":
+        return f"{command} contract prepare {quoted_task}"
+    if mode == "delivery_plan":
+        return f"{command} delivery prepare {quoted_task}"
+    output_path = _next_delivery_assessment_task_revision(task_file, invocation_root)
+    quoted_output = _quote_delivery_assessment_path(output_path)
+    if quoted_output is None:
+        return None
+    return f"{command} task refine {quoted_task} --auto --output {quoted_output}"
+
+
+def _quote_delivery_assessment_path(path: str) -> str | None:
+    command_path = f"./{path}" if path.startswith("-") else path
+    if os.name == "nt":
+        return command_path if _DELIVERY_ASSESSMENT_PORTABLE_COMMAND_PATH_RE.fullmatch(command_path) else None
+    return shlex.quote(command_path)
+
+
+def _next_delivery_assessment_task_revision(task_file: str, invocation_root: Path) -> str:
+    task_path = PurePosixPath(task_file)
+    stem = task_path.stem
+    for suffix in (".refined", ".contract"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+
+    version_match = re.search(r"\.v(?P<version>[0-9]+)$", stem)
+    if version_match:
+        version = max(2, int(version_match.group("version")) + 1)
+        stem = stem[: version_match.start()]
+    else:
+        version = 2
+
+    while True:
+        candidate = task_path.with_name(f"{stem}.v{version}.md").as_posix()
+        candidate_path = invocation_root / Path(candidate)
+        if not candidate_path.exists() and not candidate_path.is_symlink():
+            return candidate
+        version += 1
+
+
+def _delivery_assessment_command_task_path(
+    task_path: Path,
+    project_root: Path,
+    invocation_root: Path,
+) -> str | None:
+    if not _path_is_within(invocation_root, project_root):
+        return None
+    try:
+        return Path(os.path.relpath(task_path, invocation_root)).as_posix()
+    except (OSError, ValueError):
+        return None
+
+
+def _delivery_assessment_command_config_path(
+    config_arg: str | None,
+    project_root: Path,
+    invocation_root: Path,
+) -> str | None:
+    if config_arg is None:
+        return None
+    try:
+        config_path = Path(config_arg)
+        absolute_path = (config_path if config_path.is_absolute() else invocation_root / config_path).resolve()
+        if not _path_is_within(absolute_path, project_root):
+            return None
+        command_path = Path(os.path.relpath(absolute_path, invocation_root)).as_posix()
+    except (OSError, ValueError):
+        return None
+    return command_path if is_safe_delivery_public_metadata(command_path) else None
+
+
+def _validate_delivery_assessment_task_path(
+    task_path: Path,
+    task_rel: str | None,
+    project_root: Path,
+    errors: list[DeliveryPrepareIssue],
+    *,
+    private_artifact_roots: tuple[Path, ...],
+) -> None:
+    if task_rel is not None and not is_safe_delivery_public_metadata(task_rel):
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_assessment.task_path_unsafe",
+                "Task path contains characters that are unsafe for public command output.",
+            )
+        )
+        return
+    prepare_errors: list[DeliveryPrepareIssue] = []
+    _validate_delivery_prepare_task_path(
+        task_path,
+        task_rel,
+        project_root,
+        prepare_errors,
+        private_artifact_roots=private_artifact_roots,
+    )
+    for issue in prepare_errors:
+        suffix = issue.code.removeprefix("delivery_prepare.")
+        errors.append(
+            DeliveryPrepareIssue(
+                issue.severity,
+                f"delivery_assessment.{suffix}",
+                issue.message,
+                issue.path,
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -1015,7 +1400,11 @@ def _delivery_prepare_authoring_failed(result: DeliveryPrepareResult) -> bool:
     )
 
 
-def _validate_delivery_prepare_agent_overrides(args: argparse.Namespace) -> list[DeliveryPrepareIssue]:
+def _validate_delivery_prepare_agent_overrides(
+    args: argparse.Namespace,
+    *,
+    error_code: str = "delivery_prepare.agent_override_invalid",
+) -> list[DeliveryPrepareIssue]:
     try:
         with contextlib.redirect_stdout(io.StringIO()) as output:
             parse_agent_llm_overrides(
@@ -1031,7 +1420,7 @@ def _validate_delivery_prepare_agent_overrides(args: argparse.Namespace) -> list
         return [
             DeliveryPrepareIssue(
                 "error",
-                "delivery_prepare.agent_override_invalid",
+                error_code,
                 message,
             )
         ]
@@ -1051,7 +1440,13 @@ def _prepare_delivery_preflight(
 
     task_path = _resolve_from_cwd(args.task_file)
     task_rel = _project_relative_path(task_path, project_root) if _path_is_within(task_path, project_root) else None
-    _validate_delivery_prepare_task_path(task_path, task_rel, project_root, errors)
+    _validate_delivery_prepare_task_path(
+        task_path,
+        task_rel,
+        project_root,
+        errors,
+        private_artifact_roots=_delivery_private_artifact_roots(project_root, cfg),
+    )
 
     output_arg = getattr(args, "output", None)
     if output_arg:
@@ -1168,7 +1563,8 @@ def _resolve_delivery_prepare_output_path(args: argparse.Namespace, task_path: P
     output = getattr(args, "output", None)
     if output:
         return project_root / Path(output)
-    return project_root / ".sikula" / "delivery" / _kebab_case_slug(task_path.stem)
+    task_stem = _strip_known_task_suffixes(task_path.stem)
+    return project_root / ".sikula" / "delivery" / _kebab_case_slug(task_stem)
 
 
 def _validate_delivery_prepare_task_path(
@@ -1176,6 +1572,8 @@ def _validate_delivery_prepare_task_path(
     task_rel: str | None,
     project_root: Path,
     errors: list[DeliveryPrepareIssue],
+    *,
+    private_artifact_roots: tuple[Path, ...],
 ) -> None:
     if not _path_is_within(task_path, project_root):
         errors.append(
@@ -1183,6 +1581,18 @@ def _validate_delivery_prepare_task_path(
                 "error",
                 "delivery_prepare.task_outside_project",
                 "Task path must be inside the project root.",
+            )
+        )
+        return
+    if (task_rel is not None and _is_forbidden_delivery_private_artifact_path(task_rel)) or any(
+        _path_is_within(task_path, root) for root in private_artifact_roots
+    ):
+        errors.append(
+            DeliveryPrepareIssue(
+                "error",
+                "delivery_prepare.task_runtime_artifact",
+                "Task file must not be inside Sikula runtime, report, worktree, or VCS metadata directories.",
+                task_rel,
             )
         )
         return
@@ -1422,9 +1832,42 @@ def _is_forbidden_delivery_prepare_output_root(path: str | Path) -> bool:
     )
 
 
+def _is_forbidden_delivery_private_artifact_path(path: str | Path) -> bool:
+    raw_path = str(path)
+    return _has_forbidden_delivery_private_artifact_parts(PurePosixPath(raw_path).parts) or (
+        _has_forbidden_delivery_private_artifact_parts(PureWindowsPath(raw_path).parts)
+    )
+
+
 def _has_forbidden_delivery_prepare_parts(parts: tuple[str, ...]) -> bool:
     normalized = tuple(part.casefold() for part in parts if part not in {"", "."})
     return any(normalized[: len(root)] == root for root in _DELIVERY_PREPARE_FORBIDDEN_OUTPUT_ROOTS)
+
+
+def _has_forbidden_delivery_private_artifact_parts(parts: tuple[str, ...]) -> bool:
+    normalized = tuple(part.casefold() for part in parts if part not in {"", "."})
+    return any(
+        normalized[index : index + len(root)] == root
+        for root in _DELIVERY_PREPARE_FORBIDDEN_OUTPUT_ROOTS
+        for index in range(len(normalized) - len(root) + 1)
+    )
+
+
+def _delivery_private_artifact_roots(project_root: Path, cfg: dict) -> tuple[Path, ...]:
+    candidates = (
+        project_root / ".git",
+        project_root / ".sikula" / "state",
+        project_root / ".sikula" / "worktrees",
+        project_root / ".sikula" / "contract-reports",
+        _resolve_state_dir(cfg),
+        _resolve_contract_report_dir(cfg),
+    )
+    roots: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved not in roots:
+            roots.append(resolved)
+    return tuple(roots)
 
 
 def _project_relative_path(path: Path, project_root: Path) -> str:
@@ -1445,6 +1888,20 @@ def _path_is_within(path: Path, root: Path) -> bool:
 def _kebab_case_slug(value: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").lower()
     return slug or "delivery-plan"
+
+
+def _strip_known_task_suffixes(stem: str) -> str:
+    while True:
+        versionless = re.sub(r"\.v[0-9]+$", "", stem)
+        if versionless != stem:
+            stem = versionless
+            continue
+        for suffix in (".refined", ".contract"):
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
+        else:
+            return stem
 
 
 def _format_prepare_issue(issue: DeliveryPrepareIssue) -> str:
