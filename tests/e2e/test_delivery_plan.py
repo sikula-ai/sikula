@@ -625,6 +625,136 @@ def test_delivery_run_next_handoff_flows_between_dependent_children(
     assert operator_head != progress["assembled_commit"]
 
 
+def test_delivery_run_executes_and_finalizes_two_unit_plan(
+    git_project: Path,
+    fake_llm,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    unit_1 = _write_delivery_unit(
+        git_project,
+        "01-run-foundation.md",
+        "# Foundation\n\nAdd subtraction support to the calculator.\n",
+    )
+    unit_2 = _write_delivery_unit(
+        git_project,
+        "02-run-feature.md",
+        "# Feature\n\nAdd multiplication support while preserving subtraction.\n",
+    )
+    plan_path = _write_delivery_plan(
+        git_project,
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-run-smoke",
+            "title": "Delivery run smoke",
+            "final_branch": "sikula/delivery/delivery-run-smoke",
+            "units": [
+                {
+                    "id": "01-foundation",
+                    "title": "Add subtraction",
+                    "task_path": unit_1,
+                    "depends_on": [],
+                },
+                {
+                    "id": "02-feature",
+                    "title": "Add multiplication",
+                    "task_path": unit_2,
+                    "depends_on": ["01-foundation"],
+                },
+            ],
+        },
+    )
+    _write_handoff_smoke_config(git_project)
+    _git_commit_all(git_project, "add delivery run smoke fixture")
+    operator_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=git_project,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    fake = fake_llm(
+        agent_responses=[
+            {"src/calculator.py": ("def add(a, b):\n    return a + b\n\ndef subtract(a, b):\n    return a - b\n")},
+            {
+                "src/calculator.py": (
+                    "def add(a, b):\n"
+                    "    return a + b\n\n"
+                    "def subtract(a, b):\n"
+                    "    return a - b\n\n"
+                    "def multiply(a, b):\n"
+                    "    return a * b\n"
+                )
+            },
+        ]
+    )
+    relative_plan = plan_path.relative_to(git_project).as_posix()
+    progress_path = git_project / ".sikula" / "state" / "delivery" / "delivery-run-smoke" / "progress.json"
+    final_ref = "refs/heads/sikula/delivery/delivery-run-smoke"
+    monkeypatch.chdir(git_project)
+
+    with patch("core.llm_client.create_llm_client", return_value=fake):
+        with patch("sys.argv", ["sikula", "delivery", "run", relative_plan, "--dry-run", "--json"]):
+            main()
+
+        preview = json.loads(capsys.readouterr().out)
+        assert preview["ready"] is True
+        assert preview["started"] is False
+        assert preview["units_attempted"] == 0
+        assert not progress_path.exists()
+        assert (
+            subprocess.run(
+                ["git", "show-ref", "--verify", "--quiet", final_ref],
+                cwd=git_project,
+                check=False,
+            ).returncode
+            != 0
+        )
+
+        with patch("sys.argv", ["sikula", "delivery", "run", relative_plan, "--json"]):
+            main()
+
+        payload = json.loads(capsys.readouterr().out)
+        events_path = git_project / ".sikula" / "state" / "delivery" / "delivery-run-smoke" / "events.jsonl"
+        first_events = events_path.read_text(encoding="utf-8").splitlines()
+
+        with patch("sys.argv", ["sikula", "delivery", "run", relative_plan, "--json"]):
+            main()
+
+    repeated = json.loads(capsys.readouterr().out)
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    final_commit = subprocess.run(
+        ["git", "rev-parse", final_ref],
+        cwd=git_project,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert payload["succeeded"] is True
+    assert payload["completed"] is True
+    assert payload["finalized"] is True
+    assert payload["units_attempted"] == 2
+    assert payload["units_succeeded"] == 2
+    assert payload["stop_code"] == "delivery.run.completed"
+    assert progress["final_commit"] == final_commit
+    assert all(unit["status"] == "done" for unit in progress["units"])
+    assert repeated["succeeded"] is True
+    assert repeated["completed"] is True
+    assert repeated["units_attempted"] == 0
+    assert events_path.read_text(encoding="utf-8").splitlines() == first_events
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_project,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == operator_head
+    )
+
+
 def test_delivery_run_next_prepares_budget_split_with_fake_llm(
     git_project: Path,
     seq_fake_llm,

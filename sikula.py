@@ -20,6 +20,7 @@ Delivery-plan workflow after assessment:
   sikula delivery status .sikula/delivery/my-plan/plan.yaml
   sikula delivery run-next .sikula/delivery/my-plan/plan.yaml --dry-run
   sikula delivery run-next .sikula/delivery/my-plan/plan.yaml
+  sikula delivery run .sikula/delivery/my-plan/plan.yaml
   sikula delivery finalize .sikula/delivery/my-plan/plan.yaml --dry-run
   sikula delivery finalize .sikula/delivery/my-plan/plan.yaml
 
@@ -3495,6 +3496,10 @@ def cmd_delivery_run_next(args: argparse.Namespace, cfg: dict) -> None:
     return cli_delivery.cmd_delivery_run_next(args, cfg, _delivery_run_next_context())
 
 
+def cmd_delivery_run(args: argparse.Namespace, cfg: dict) -> None:
+    return cli_delivery.cmd_delivery_run(args, cfg, _delivery_run_next_context())
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -3586,6 +3591,8 @@ def main() -> None:
             cmd_delivery_prepare(args, cfg)
         elif args.delivery_command == "run-next":
             cmd_delivery_run_next(args, cfg)
+        elif args.delivery_command == "run":
+            cmd_delivery_run(args, cfg)
         elif args.delivery_command == "finalize":
             cmd_delivery_finalize(args, cfg)
         elif args.delivery_command == "amend" and args.delivery_amend_command == "prepare":

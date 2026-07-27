@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import json
 from pathlib import Path
 import subprocess
 from typing import Any
@@ -10,6 +11,7 @@ from core.delivery_plan import DeliveryPlanIssue
 from core.delivery_progress import (
     DeliveryProgressEvent,
     DeliveryProgressLockError,
+    DeliveryStatusResult,
     acquire_delivery_progress_lock,
     append_delivery_progress_event,
     delivery_events_path,
@@ -76,22 +78,36 @@ def preview_delivery_finalize(path: str | Path, *, project_root: Path | None = N
 
 
 def finalize_delivery_plan(path: str | Path, *, project_root: Path | None = None) -> DeliveryFinalizeResult:
-    preflight = _preflight_delivery_finalize(path, project_root=project_root, dry_run=False)
-    if not preflight.result.ready or preflight.plan_id is None or preflight.result.project_root is None:
-        return preflight.result
+    current_status = get_delivery_status(path, project_root=project_root)
+    if delivery_finalization_is_current(current_status):
+        initial_result = _current_finalization_result(current_status)
+        assert current_status.plan is not None
+        assert current_status.project_root is not None
+        root = Path(current_status.project_root).resolve()
+        plan_id = current_status.plan.plan_id
+        progress_path = delivery_progress_path(root, plan_id)
+        events_path = delivery_events_path(root, plan_id)
+        if _finalization_event_exists(events_path, current_status):
+            return initial_result
+    else:
+        preflight = _preflight_delivery_finalize(path, project_root=project_root, dry_run=False)
+        if not preflight.result.ready or preflight.plan_id is None or preflight.result.project_root is None:
+            return preflight.result
+        initial_result = preflight.result
+        root = Path(preflight.result.project_root).resolve()
+        plan_id = preflight.plan_id
+        progress_path = delivery_progress_path(root, plan_id)
+        events_path = delivery_events_path(root, plan_id)
 
-    root = Path(preflight.result.project_root).resolve()
-    progress_path = delivery_progress_path(root, preflight.plan_id)
-    events_path = delivery_events_path(root, preflight.plan_id)
     try:
-        lock = acquire_delivery_progress_lock(root, preflight.plan_id, owner="delivery.finalize")
+        lock = acquire_delivery_progress_lock(root, plan_id, owner="delivery.finalize")
     except DeliveryProgressLockError:
         errors = [
-            *preflight.result.errors,
+            *initial_result.errors,
             DeliveryPlanIssue("error", "delivery.locked", "Delivery progress is locked by another process."),
         ]
         return _replace_result(
-            preflight.result,
+            initial_result,
             ready=False,
             finalized=False,
             errors=errors,
@@ -99,6 +115,10 @@ def finalize_delivery_plan(path: str | Path, *, project_root: Path | None = None
         )
 
     with lock:
+        current_status = get_delivery_status(path, project_root=project_root)
+        if delivery_finalization_is_current(current_status):
+            _repair_finalization_event(events_path, current_status)
+            return _current_finalization_result(current_status)
         preflight = _preflight_delivery_finalize(path, project_root=project_root, dry_run=False)
         result = preflight.result
         if not result.ready or preflight.plan_id is None or result.project_root is None:
@@ -183,6 +203,94 @@ def finalize_delivery_plan(path: str | Path, *, project_root: Path | None = None
             warnings=finalized_status.warnings,
             message=f"Delivery final branch {branch} points to {commit}.",
         )
+
+
+def delivery_finalization_is_current(status: DeliveryStatusResult) -> bool:
+    if not (
+        status.valid
+        and status.status == "done"
+        and status.progress_exists
+        and status.finalized_at
+        and status.final_branch
+        and status.final_commit
+        and status.project_root
+        and status.plan
+        and status.plan.final_branch == status.final_branch
+    ):
+        return False
+    root = Path(status.project_root).resolve()
+    try:
+        if delivery_assembly_branch_is_symbolic(root, status.final_branch):
+            return False
+        branch_commit = _branch_commit(root, status.final_branch)
+        recorded_commit = _resolve_commit(root, status.final_commit)
+    except OSError:
+        return False
+    return branch_commit is not None and branch_commit == recorded_commit
+
+
+def _current_finalization_result(status: DeliveryStatusResult) -> DeliveryFinalizeResult:
+    assert status.project_root is not None
+    assert status.plan is not None
+    root = Path(status.project_root).resolve()
+    return DeliveryFinalizeResult(
+        plan_path=status.plan_path,
+        project_root=status.project_root,
+        valid=status.valid,
+        ready=True,
+        dry_run=False,
+        finalized=True,
+        status=status.status,
+        progress_exists=status.progress_exists,
+        final_branch=status.final_branch,
+        final_commit=status.final_commit,
+        progress_path=str(delivery_progress_path(root, status.plan.plan_id)),
+        events_path=str(delivery_events_path(root, status.plan.plan_id)),
+        errors=status.errors,
+        warnings=status.warnings,
+        message=(f"Delivery final branch {status.final_branch} already points to {status.final_commit}."),
+    )
+
+
+def _finalization_event_exists(path: Path, status: DeliveryStatusResult) -> bool:
+    if status.plan is None:
+        return False
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(event, dict)
+                    and event.get("schema_version") == 1
+                    and event.get("plan_id") == status.plan.plan_id
+                    and event.get("event_type") == "plan.finalized"
+                    and event.get("timestamp") == status.finalized_at
+                    and event.get("branch") == status.final_branch
+                    and event.get("commit") == status.final_commit
+                ):
+                    return True
+    except (OSError, UnicodeError):
+        return False
+    return False
+
+
+def _repair_finalization_event(path: Path, status: DeliveryStatusResult) -> None:
+    assert status.plan is not None
+    if _finalization_event_exists(path, status):
+        return
+    append_delivery_progress_event(
+        path,
+        make_delivery_progress_event(
+            status.plan.plan_id,
+            "plan.finalized",
+            branch=status.final_branch,
+            commit=status.final_commit,
+            timestamp=status.finalized_at,
+        ),
+    )
 
 
 def render_delivery_finalize(result: DeliveryFinalizeResult) -> str:

@@ -150,6 +150,12 @@ sikula delivery run-next .sikula/delivery/my-task/plan.yaml --prepare-budget-spl
 sikula delivery run-next .sikula/delivery/my-task/plan.yaml --reset-failed
 sikula delivery run-next .sikula/delivery/my-task/plan.yaml \
   --agent-provider implementer=antigravity
+sikula delivery run .sikula/delivery/my-task/plan.yaml --dry-run
+sikula delivery run .sikula/delivery/my-task/plan.yaml
+sikula delivery run .sikula/delivery/my-task/plan.yaml --max-units 3
+sikula delivery run .sikula/delivery/my-task/plan.yaml \
+  --max-elapsed-minutes 60
+sikula delivery run .sikula/delivery/my-task/plan.yaml --reset-failed
 sikula delivery finalize .sikula/delivery/my-task/plan.yaml --dry-run
 sikula delivery finalize .sikula/delivery/my-task/plan.yaml
 ```
@@ -184,8 +190,16 @@ implementation. The unit must then be split through a delivery amendment;
 Successful new units produce fingerprinted handoffs for dependent units.
 `run-next` assembles completed result commits into `final_branch` in dependency
 order and starts subsequent child worktrees from the assembled commit without
-changing the operator checkout. After all units complete, finalize the assembled
-plan. See [Delivery Plans](docs/delivery-plans.md).
+changing the operator checkout. `delivery run` repeatedly invokes that same
+one-unit path, stops on the first blocker or failure, and automatically
+finalizes a completed plan. By default it is bounded to the active units that
+exist when the command starts; `--max-units` and the between-unit soft
+`--max-elapsed-minutes` limit can stop earlier without failing the plan.
+Each explicit `delivery run --reset-failed` invocation retries the current
+failed child once and continues only after that retry succeeds; a later failure
+stops again and requires another explicit invocation.
+`run-next` remains available for explicit one-unit execution and recovery.
+See [Delivery Plans](docs/delivery-plans.md).
 
 **Run a task into a branch**
 

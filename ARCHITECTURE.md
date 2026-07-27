@@ -507,6 +507,37 @@ ancestry without duplicating integration. A recorded conflict also blocks
 `run-next --dry-run` and `finalize --dry-run` until the branch contains both the
 prior assembled commit and the blocked unit commit.
 
+**Delivery bounded run command:** `sikula delivery run PLAN_FILE` is a CLI
+coordinator over the existing one-unit `run-next` path. The loop lives in
+`sikula_cli/delivery.py`; `core/delivery_run.py` owns its typed, privacy-safe
+aggregate result and text rendering. It does not introduce a second delivery
+executor, loop-level lock, or parent progress schema. Before each attempt and
+after each child returns, it reloads status from durable plan progress, while
+each child retains the existing `delivery.run-next` lock and normal isolated
+Sikula pipeline.
+
+Each invocation has a finite unit-attempt bound. The default is the number of
+active units present when the loop starts, and `--max-units` can lower or
+explicitly set that bound. `--max-elapsed-minutes` is a soft wall-clock bound
+checked only between child runs; an active child is never interrupted. A bound
+stop is resumable and successful. A failed, waiting, budget-stopped, ambiguous,
+or assembly-blocked unit stops the loop immediately without automatic reset,
+amendment, split, or unit skipping. Explicit `--reset-failed` permits one
+failed-child retry per `delivery run` command invocation: the first `run-next`
+attempt may retry the current failed child, the permission is consumed after
+success, and later units execute without reset semantics. A later failure
+therefore stops the loop again; the operator can start another explicit
+`delivery run --reset-failed` invocation.
+
+When durable status becomes `done`, the coordinator calls the existing delivery
+finalization engine. An already current finalized plan returns idempotently
+without duplicating its finalization event. Dry-run uses the existing run-next
+and finalize previews and does not mutate state or Git. JSON output is one
+compact aggregate projection rather than accumulated child state; child
+machine-readable output is redirected to stderr. This coordinator adds no
+whole-plan LLM review or validation pass, so quality gates and audit state remain
+owned by each ordinary unit run.
+
 **Delivery final branch command:** `sikula delivery finalize PLAN_FILE` is the
 explicit final branch assembly step for a completed delivery plan. Its CLI
 wrapper lives in `sikula_cli/delivery.py`; deterministic preflight and Git ref
