@@ -90,6 +90,13 @@ class TestPythonToolRun:
 
 
 class TestPythonToolCompileCheck:
+    def test_replaces_undecodable_output_with_locale_encoding(self, tmp_path: Path):
+        tool = _make_tool(tmp_path)
+        with patch("tools.python_tool.subprocess.run", return_value=_mock_run()) as mock:
+            tool.compile_check()
+        assert mock.call_args.kwargs["errors"] == "replace"
+        assert "encoding" not in mock.call_args.kwargs
+
     def test_uses_configured_compile_command(self, tmp_path: Path):
         tool = _make_tool(tmp_path, compile_command="mypy .")
         with patch("tools.python_tool.subprocess.run", return_value=_mock_run()) as mock:
@@ -147,12 +154,16 @@ class TestPythonToolSync:
     def test_runs_pip_install_when_requirements_txt_exists(self, tmp_path: Path):
         (tmp_path / "requirements.txt").write_text("pyyaml\n")
         tool = _make_tool(tmp_path)
-        with patch("tools.python_tool.subprocess.run", return_value=_mock_run()) as mock:
+        executable = r"C:\Program Files\Python\python.exe"
+        with (
+            patch("tools.python_tool.sys.executable", executable),
+            patch("tools.python_tool.subprocess.run", return_value=_mock_run()) as mock,
+        ):
             result = tool.sync()
         assert result.success
         args, _ = mock.call_args
-        assert "-m pip install" in args[0]
-        assert "requirements.txt" in args[0]
+        assert args[0] == [executable, "-m", "pip", "install", "-r", "requirements.txt"]
+        assert mock.call_args.kwargs["shell"] is False
 
 
 class TestPythonToolIsBuildConfigFile:

@@ -363,6 +363,7 @@ def test_pending_middle_split_preserves_progress_and_rewires_to_all_leaves(tmp_p
     assert events[-1]["rewired_unit_ids"] == ["d"]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions")
 def test_apply_sets_normal_source_permissions_on_replacement_tasks(tmp_path: Path) -> None:
     plan_path, _, proposal_root = _setup(tmp_path)
     proposal, _ = create_delivery_amendment_proposal(

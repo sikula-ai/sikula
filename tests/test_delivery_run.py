@@ -912,7 +912,9 @@ def test_render_delivery_run_statuses(
     assert expected in render_delivery_run(result)
 
 
-def test_render_delivery_run_includes_optional_public_fields() -> None:
+def test_render_delivery_run_includes_optional_public_fields(tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    plan_path = str(project_root / "plan.yaml")
     unit = DeliveryStatusUnit(
         id="unit-1",
         status="done",
@@ -920,10 +922,10 @@ def test_render_delivery_run_includes_optional_public_fields() -> None:
         task_path="units/unit-1.md",
         depends_on=[],
     )
-    warning = DeliveryPlanIssue("warning", "delivery.warning", "Warning.", path="/project/plan.yaml")
+    warning = DeliveryPlanIssue("warning", "delivery.warning", "Warning.", path=plan_path)
     result = DeliveryRunResult(
-        plan_path="/project/plan.yaml",
-        project_root="/project",
+        plan_path=plan_path,
+        project_root=str(project_root),
         valid=True,
         ready=True,
         dry_run=False,
@@ -939,7 +941,7 @@ def test_render_delivery_run_includes_optional_public_fields() -> None:
         last_unit=unit,
         child_task_id="child-1",
         stop_code=DELIVERY_RUN_COMPLETED,
-        progress_path="/project/progress.json",
+        progress_path=str(project_root / "progress.json"),
         final_branch="sikula/delivery/demo",
         final_commit="a" * 40,
         errors=[],

@@ -4946,42 +4946,33 @@ def test_project_relative_path(tmp_path: Path) -> None:
     assert _project_relative_path(str(file_path), tmp_path) == "sub/file.txt"
 
 
-def test_sanitize_issue() -> None:
+def test_sanitize_issue(tmp_path: Path) -> None:
     from core.delivery_run_next import _sanitize_issue
 
+    project_root = tmp_path / "project"
+    plan_path = str(project_root / "plan.yaml")
+    progress_path = str(project_root / "progress.json")
+    events_path = str(project_root / "events.jsonl")
     issue = DeliveryPlanIssue(
         "error",
         "code",
-        "Issue in /opt/project/plan.yaml, /opt/project/progress.json, and /opt/project/events.jsonl",
-        "/opt/project/events.jsonl",
+        f"Issue in {plan_path}, {progress_path}, and {events_path}",
+        events_path,
     )
 
     # Without project root, returns unchanged
-    assert (
-        _sanitize_issue(
-            issue, None, "/opt/project/plan.yaml", "/opt/project/progress.json", "/opt/project/events.jsonl"
-        )
-        is issue
-    )
-    assert (
-        _sanitize_issue(issue, ".", "/opt/project/plan.yaml", "/opt/project/progress.json", "/opt/project/events.jsonl")
-        is issue
-    )
+    assert _sanitize_issue(issue, None, plan_path, progress_path, events_path) is issue
+    assert _sanitize_issue(issue, ".", plan_path, progress_path, events_path) is issue
 
     # Sanitizes absolute paths inside messages and path
-    sanitized = _sanitize_issue(
-        issue, "/opt/project", "/opt/project/plan.yaml", "/opt/project/progress.json", "/opt/project/events.jsonl"
-    )
+    sanitized = _sanitize_issue(issue, str(project_root), plan_path, progress_path, events_path)
     assert sanitized.message == "Issue in plan.yaml, progress.json, and events.jsonl"
     assert sanitized.path == "events.jsonl"
 
     # Sanitizes project root strings not caught by exact matches
-    issue2 = DeliveryPlanIssue(
-        "error", "code", "Error loading /opt/project/some/other/file.txt", "/opt/project/some/other/file.txt"
-    )
-    sanitized2 = _sanitize_issue(
-        issue2, "/opt/project", "/opt/project/plan.yaml", "/opt/project/progress.json", "/opt/project/events.jsonl"
-    )
+    other_path = str(project_root / "some" / "other" / "file.txt")
+    issue2 = DeliveryPlanIssue("error", "code", f"Error loading {other_path}", other_path)
+    sanitized2 = _sanitize_issue(issue2, str(project_root), plan_path, progress_path, events_path)
     assert sanitized2.message == "Error loading some/other/file.txt"
     assert sanitized2.path == "some/other/file.txt"
 

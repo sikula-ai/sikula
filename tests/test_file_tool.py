@@ -33,6 +33,24 @@ class TestFileTool:
         assert result.success
         assert "print('hello')" in result.output
 
+    def test_read_uses_utf8(self, file_tool: FileTool, project: Path, monkeypatch):
+        source = project / "src" / "localized.txt"
+        source.write_bytes("Přidat uživatelský profil".encode())
+        original_read_text = Path.read_text
+        encodings: list[str | None] = []
+
+        def tracked_read_text(path: Path, *args, **kwargs):
+            encodings.append(kwargs.get("encoding"))
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", tracked_read_text)
+
+        result = file_tool.read("src/localized.txt")
+
+        assert result.success
+        assert result.output == "Přidat uživatelský profil"
+        assert encodings == ["utf-8"]
+
     def test_read_denied_outside_sandbox(self, file_tool: FileTool, project: Path):
         result = file_tool.read(str(project.parent / "outside.py"))
         assert not result.success
@@ -47,6 +65,17 @@ class TestFileTool:
         result = file_tool.write("src/new_module.py", "x = 1\n")
         assert result.success
         assert (project / "src" / "new_module.py").read_text() == "x = 1\n"
+
+    def test_write_round_trips_utf8(self, file_tool: FileTool, project: Path):
+        content = "Přidat uživatelský profil"
+
+        write_result = file_tool.write("src/localized.txt", content)
+        read_result = file_tool.read("src/localized.txt")
+
+        assert write_result.success
+        assert (project / "src" / "localized.txt").read_bytes() == content.encode()
+        assert read_result.success
+        assert read_result.output == content
 
     def test_write_creates_parent_dirs(self, file_tool: FileTool, project: Path):
         result = file_tool.write("src/sub/deep/file.py", "pass\n")

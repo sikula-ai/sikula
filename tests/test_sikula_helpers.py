@@ -20,6 +20,7 @@ _resolve_state_dir = config_cli._resolve_state_dir
 _generate_config = init_cli.generate_config
 _branch_stem = sikula_module._branch_stem
 load_config = config_cli.load_config
+load_init_config = init_cli.load_init_config
 cmd_init = init_cli.cmd_init
 
 
@@ -277,6 +278,24 @@ class TestLoadConfig:
         with pytest.raises(SystemExit) as exc:
             load_config(tmp_path / "nonexistent.yaml")
         assert exc.value.code == 1
+
+    @pytest.mark.parametrize("loader", [load_config, load_init_config])
+    def test_reads_config_as_utf8(self, loader, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "config.yaml"
+        cfg.write_bytes("project:\n  name: Přehled zákazníků\n".encode())
+        original_read_text = Path.read_text
+        encodings: list[str | None] = []
+
+        def tracked_read_text(path: Path, *args, **kwargs):
+            encodings.append(kwargs.get("encoding"))
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", tracked_read_text)
+
+        result = loader(cfg)
+
+        assert result["project"]["name"] == "Přehled zákazníků"
+        assert encodings == ["utf-8"]
 
 
 # ---------------------------------------------------------------------------

@@ -245,7 +245,7 @@ def test_restore_recreates_dirty_symlink_replaced_by_file_without_touching_targe
 
     assert errors == []
     assert source.is_symlink()
-    assert str(source.readlink()) == str(outside)
+    assert source.samefile(outside)
     assert outside.read_text() == "outside original\n"
 
 

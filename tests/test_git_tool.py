@@ -114,11 +114,20 @@ class TestGitToolSubprocessMock:
             "src/main.py",
         ]
 
-    @pytest.mark.parametrize("paths", [["../outside.py"], ["/tmp/outside.py"], "src/main.py", [True]])
+    @pytest.mark.parametrize("paths", [["../outside.py"], "src/main.py", [True]])
     def test_invalid_scoped_paths_fail_without_running_git(self, tmp_path: Path, paths):
         tool = self._make_tool(tmp_path)
         with patch("tools.git_tool.subprocess.run") as run:
             result = tool.diff_head(paths)
+
+        assert not result.success
+        run.assert_not_called()
+
+    def test_absolute_scoped_paths_fail_without_running_git(self, tmp_path: Path):
+        tool = self._make_tool(tmp_path)
+        outside = str(tmp_path.parent / "outside.py")
+        with patch("tools.git_tool.subprocess.run") as run:
+            result = tool.diff_head([outside])
 
         assert not result.success
         run.assert_not_called()

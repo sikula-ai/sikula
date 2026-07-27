@@ -12,6 +12,14 @@ Sikula has built-in CLI integrations for Codex, Claude, Gemini, OpenCode, and An
 
 Provider CLIs and model names change over time. Keep model examples in your project config current with the provider documentation you use.
 
+On Windows, Sikula uses the normal executable lookup for every built-in provider. Native
+executables launch directly; provider commands installed as `.cmd` or `.bat` wrappers launch
+through the Windows command processor with argument-safe encoding. Provider text-mode stdin
+and stdout use UTF-8 independently of the process locale. Streaming agent calls use a Windows
+process group plus a Job Object for both native executables and batch wrappers, so timeout,
+interruption, fatal-error, and normal-completion cleanup covers the managed process tree.
+Batch-backed one-shot provider calls use the same job-backed lifecycle.
+
 Antigravity model values are not normalized by Sikula. If the display name contains spaces,
 quote it in YAML:
 

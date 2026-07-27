@@ -156,4 +156,7 @@ def test_happy_path(git_project, fake_llm):
 - [ ] `ARCHITECTURE.md`, `README.md`, and relevant topic docs updated if the change affects documented behaviour
 - [ ] CI passes on the PR
 
-CI runs automatically on every PR (Python 3.10–3.13 matrix, compile check, tests, ruff lint/format, and Codecov diff coverage). All checks must pass before merge.
+CI runs automatically on every PR. Linux runs the Python 3.10–3.13 matrix,
+compile check, tests, Ruff lint/format, and Codecov diff coverage. A Python 3.12
+Windows job runs the compile check and full test suite. All checks must pass
+before merge.

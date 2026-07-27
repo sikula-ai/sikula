@@ -145,6 +145,13 @@ class TestCargoToolRun:
         _, kwargs = mock.call_args
         assert kwargs["cwd"] == tmp_path.resolve()
 
+    def test_replaces_undecodable_output_with_locale_encoding(self, tmp_path: Path):
+        tool = _make_tool(tmp_path)
+        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+            tool.compile_check()
+        assert mock.call_args.kwargs["errors"] == "replace"
+        assert "encoding" not in mock.call_args.kwargs
+
     def test_default_timeout_used(self, tmp_path: Path):
         tool = CargoTool(
             sandbox=Sandbox(project_root=tmp_path, allowed_write_paths=["."], allowed_read_paths=["."]),

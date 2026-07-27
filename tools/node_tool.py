@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from core.subprocess_utils import run_windows_shell_process
 from tools.base_tool import BuildTool, Sandbox, ToolResult, tool_error_excerpt
 
 log = logging.getLogger(__name__)
@@ -243,14 +245,17 @@ class NodeTool(BuildTool):
     def _run(self, command: str, timeout: int) -> ToolResult:
         log.info(f"$ {command}  [cwd: {self._root}]  (timeout {timeout}s)")
         try:
-            r = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                cwd=self._root,
-                timeout=timeout,
-            )
+            run_kwargs = {
+                "capture_output": True,
+                "text": True,
+                "errors": "replace",
+                "cwd": self._root,
+                "timeout": timeout,
+            }
+            if os.name == "nt":
+                r = run_windows_shell_process(command, **run_kwargs)
+            else:
+                r = subprocess.run(command, shell=True, **run_kwargs)
             output = r.stdout + r.stderr
             if r.returncode != 0:
                 return ToolResult(success=False, output=output, error=tool_error_excerpt(output))

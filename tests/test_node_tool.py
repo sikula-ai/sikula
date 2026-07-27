@@ -224,6 +224,13 @@ class TestNodeToolCommands:
         _, kwargs = mock.call_args
         assert kwargs["cwd"] == tmp_path.resolve()
 
+    def test_replaces_undecodable_output_with_locale_encoding(self, tmp_path: Path):
+        tool = _make_tool(tmp_path, compile_command="npm run build")
+        with patch("tools.node_tool.subprocess.run", return_value=_mock_run()) as mock:
+            tool.compile_check()
+        assert mock.call_args.kwargs["errors"] == "replace"
+        assert "encoding" not in mock.call_args.kwargs
+
 
 class TestNodeToolResults:
     def test_success_returns_combined_output(self, tmp_path: Path):

@@ -951,6 +951,11 @@ def _sanitize_issue(
     msg = issue.message
     path = issue.path
 
+    if path and Path(path).is_absolute():
+        path_rel = _project_relative_path(path, project_root) or Path(path).name
+        msg = msg.replace(path, path_rel)
+        path = path_rel
+
     plan_rel = _project_relative_path(plan_path, project_root) or plan_path
     msg = msg.replace(plan_path, plan_rel)
     if path:

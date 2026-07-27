@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
 
+from core.subprocess_utils import run_windows_shell_process
 from tools.base_tool import BuildTool, Sandbox, ToolResult, tool_error_excerpt
 
 log = logging.getLogger(__name__)
@@ -40,24 +42,28 @@ class PythonTool(BuildTool):
         self._test_command = test_command
         self._timeout = timeout
 
-    def _run(self, command: str, timeout: int | None = None) -> ToolResult:
+    def _run(self, command: str | list[str], timeout: int | None = None) -> ToolResult:
         t = timeout or self._timeout
-        log.info(f"$ {command}  [cwd: {self._root}]  (timeout {t}s)")
+        display_command = command if isinstance(command, str) else subprocess.list2cmdline(command)
+        log.info(f"$ {display_command}  [cwd: {self._root}]  (timeout {t}s)")
         try:
-            r = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                cwd=self._root,
-                timeout=t,
-            )
+            run_kwargs = {
+                "capture_output": True,
+                "text": True,
+                "errors": "replace",
+                "cwd": self._root,
+                "timeout": t,
+            }
+            if isinstance(command, str) and os.name == "nt":
+                r = run_windows_shell_process(command, **run_kwargs)
+            else:
+                r = subprocess.run(command, shell=isinstance(command, str), **run_kwargs)
             output = r.stdout + r.stderr
             if r.returncode not in (0, 5):  # pytest exit 5 = no tests collected
                 return ToolResult(success=False, output=output, error=tool_error_excerpt(output))
             return ToolResult(success=True, output=output)
         except subprocess.TimeoutExpired:
-            return ToolResult(success=False, output="", error=f"Command timed out: {command}")
+            return ToolResult(success=False, output="", error=f"Command timed out: {display_command}")
         except Exception as e:
             return ToolResult(success=False, output="", error=str(e))
 
@@ -65,7 +71,7 @@ class PythonTool(BuildTool):
         """Install dependencies from requirements.txt if present."""
         req = self._root / "requirements.txt"
         if req.exists():
-            return self._run(f"{sys.executable} -m pip install -r requirements.txt")
+            return self._run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
         return ToolResult(success=True, output="No requirements.txt — skipping sync")
 
     def compile_check(self) -> ToolResult:

@@ -611,7 +611,7 @@ class Orchestrator:
             if len(line) > 3:
                 abs_path = git_root / line[3:].strip()
                 try:
-                    files.append(str(abs_path.relative_to(project_root)))
+                    files.append(abs_path.relative_to(project_root).as_posix())
                 except ValueError:
                     pass  # file outside project root — skip
         return files

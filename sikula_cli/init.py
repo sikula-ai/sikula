@@ -359,7 +359,7 @@ test_writer:
 
 def load_init_config(path: Path, *, strict: bool = False) -> dict:
     try:
-        data = yaml.safe_load(path.read_text())
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except OSError as e:
         if strict:
             print(f"Could not read config: {path}")
@@ -409,7 +409,7 @@ def insert_guidelines_reference(config_path: Path, guidelines_ref: str) -> bool:
     if config_references_guidelines(config_path, guidelines_ref):
         return False
 
-    text = config_path.read_text()
+    text = config_path.read_text(encoding="utf-8")
     lines = text.splitlines(keepends=True)
     newline = "\n"
 
@@ -425,7 +425,7 @@ def insert_guidelines_reference(config_path: Path, guidelines_ref: str) -> bool:
     if guidelines_idx is None:
         suffix = "" if text.endswith(("\n", "\r\n")) or not text else newline
         block = f"{suffix}guidelines:{newline}  context_files:{newline}    - {guidelines_ref}{newline}"
-        config_path.write_text(text + block)
+        config_path.write_text(text + block, encoding="utf-8")
         return True
 
     guidelines_indent = _indent(lines[guidelines_idx])
@@ -446,7 +446,7 @@ def insert_guidelines_reference(config_path: Path, guidelines_ref: str) -> bool:
         item = f"{' ' * (guidelines_indent + 2)}context_files:{newline}"
         item += f"{' ' * (guidelines_indent + 4)}- {guidelines_ref}{newline}"
         lines.insert(guidelines_idx + 1, item)
-        config_path.write_text("".join(lines))
+        config_path.write_text("".join(lines), encoding="utf-8")
         return True
 
     prefix, _, suffix = lines[context_idx].partition("context_files:")
@@ -461,11 +461,11 @@ def insert_guidelines_reference(config_path: Path, guidelines_ref: str) -> bool:
         replacement = f"{prefix}context_files:{newline}"
         replacement += "".join(f"{' ' * item_indent}- {ref}{newline}" for ref in refs)
         lines[context_idx] = replacement
-        config_path.write_text("".join(lines))
+        config_path.write_text("".join(lines), encoding="utf-8")
         return True
 
     lines.insert(context_idx + 1, f"{' ' * item_indent}- {guidelines_ref}{newline}")
-    config_path.write_text("".join(lines))
+    config_path.write_text("".join(lines), encoding="utf-8")
     return True
 
 
@@ -481,7 +481,7 @@ def generate_guidelines_for_init(project_root: Path, tech: str, provider: str, m
 
 def ensure_sikula_gitignore(sikula_dir: Path) -> None:
     gitignore = sikula_dir / ".gitignore"
-    existing = gitignore.read_text() if gitignore.exists() else ""
+    existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
     lines = existing.splitlines()
     missing = [entry for entry in _SIKULA_GITIGNORE_ENTRIES if entry not in {line.strip() for line in lines}]
     if not missing:
@@ -490,7 +490,7 @@ def ensure_sikula_gitignore(sikula_dir: Path) -> None:
     if content and not content.endswith("\n"):
         content += "\n"
     content += "".join(f"{entry}\n" for entry in missing)
-    gitignore.write_text(content)
+    gitignore.write_text(content, encoding="utf-8")
 
 
 def ensure_provider_gitignore_entry(project_root: Path, provider: str | None) -> None:
@@ -551,7 +551,7 @@ def cmd_init_guidelines_only(
         return
 
     gl_path = sikula_dir / "guidelines.md"
-    gl_path.write_text(guidelines_content)
+    gl_path.write_text(guidelines_content, encoding="utf-8")
     guidelines_ref = ".sikula/guidelines.md"
     updated = context.insert_guidelines_reference(config_path, guidelines_ref)
     print("  Generated  : .sikula/guidelines.md")
@@ -638,7 +638,7 @@ def cmd_init(args: argparse.Namespace, context: InitContext | None = None) -> No
         guidelines_files = [existing_gl] + guidelines_files
     if guidelines_content:
         gl_path = sikula_dir / "guidelines.md"
-        gl_path.write_text(guidelines_content)
+        gl_path.write_text(guidelines_content, encoding="utf-8")
         guidelines_files = [existing_gl] + [f for f in guidelines_files if f != existing_gl and f != "guidelines.md"]
         print("  Generated  : .sikula/guidelines.md")
 
@@ -666,7 +666,7 @@ def cmd_init(args: argparse.Namespace, context: InitContext | None = None) -> No
         node_test_command=result.node_test_command,
         node_checks=result.node_checks,
     )
-    config_path.write_text(config)
+    config_path.write_text(config, encoding="utf-8")
 
     todos: list[str] = []
     if not result.build_tool:

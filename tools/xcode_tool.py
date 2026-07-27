@@ -59,6 +59,7 @@ class XcodeTool(BuildTool):
                 cmd,
                 capture_output=True,
                 text=True,
+                errors="replace",
                 cwd=self._root,
                 timeout=timeout,
             )
@@ -82,6 +83,7 @@ class XcodeTool(BuildTool):
                 shell=True,
                 capture_output=True,
                 text=True,
+                errors="replace",
                 cwd=self._root,
                 timeout=timeout,
             )
@@ -139,7 +141,13 @@ class XcodeTool(BuildTool):
         ]
         for cmd in commands:
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=30,
+                )
             except Exception:
                 continue
             if result.returncode != 0:

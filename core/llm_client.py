@@ -35,8 +35,17 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
-from urllib.parse import unquote
+from typing import Any, Callable, Iterator
+from urllib.parse import quote, unquote
+
+from core.subprocess_utils import (
+    release_windows_process_job,
+    resolve_windows_batch_command,
+    run_windows_batch_process,
+    start_windows_process_job,
+    terminate_windows_process_tree,
+    windows_batch_command_path,
+)
 
 log = logging.getLogger(__name__)
 
@@ -397,6 +406,30 @@ def _claude_write_settings(cwd: Path) -> Path:
     return settings_path
 
 
+def _run_provider_cli(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    env = kwargs.get("env")
+    args, executable, batch_env = resolve_windows_batch_command(
+        command,
+        env=env if isinstance(env, dict) else None,
+    )
+    # Pin UTF-8 for text-mode calls so the prompt (passed via input=) is not
+    # encoded with the process locale codec (e.g. cp1250 on Windows), which
+    # raises UnicodeEncodeError and never reaches the provider. Byte-mode calls
+    # are left untouched.
+    if kwargs.get("text") or kwargs.get("universal_newlines"):
+        kwargs.setdefault("encoding", "utf-8")
+        kwargs.setdefault("errors", "replace")
+    try:
+        if executable is not None:
+            kwargs["env"] = batch_env
+            return run_windows_batch_process(args, executable=executable, **kwargs)
+        return subprocess.run(args, **kwargs)
+    except FileNotFoundError as exc:
+        raise LLMConfigurationError(
+            f"{command[0]} CLI not found: install and authenticate the configured provider"
+        ) from exc
+
+
 class ClaudeClient(LLMClient):
     """Calls Claude via the `claude -p` CLI. Requires Claude Code to be installed and authenticated."""
 
@@ -408,7 +441,7 @@ class ClaudeClient(LLMClient):
         log.info(f"Calling LLM ({self._config.model}, ~{len(prompt) // 4} tokens) — waiting for response...")
 
         def _call():
-            result = subprocess.run(
+            result = _run_provider_cli(
                 ["claude", "-p", "--model", self._config.model],
                 capture_output=True,
                 input=prompt,
@@ -427,7 +460,7 @@ class ClaudeClient(LLMClient):
         log.info(f"Running Claude read-only agent ({self._config.model}) — waiting for completion...")
 
         def _call():
-            result = subprocess.run(
+            result = _run_provider_cli(
                 [
                     "claude",
                     "-p",
@@ -831,6 +864,8 @@ def _signal_process_group(process: subprocess.Popen[str], sig: int) -> bool:
 
 def _terminate_process(process: subprocess.Popen[str], *, process_group: bool = False) -> None:
     if process_group:
+        if terminate_windows_process_tree(process):
+            return
         if _signal_process_group(process, signal.SIGTERM):
             if process.poll() is None:
                 try:
@@ -968,6 +1003,7 @@ def _run_agent_subprocess_streaming(
     stderr_error_parser: StreamErrorParser | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run an agent subprocess while watching provider-owned events for fatal errors."""
+    launch_cmd, executable, batch_env = resolve_windows_batch_command(cmd, env=env)
     popen_kwargs = {
         "cwd": cwd,
         "env": env,
@@ -975,17 +1011,39 @@ def _run_agent_subprocess_streaming(
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
+        # Provider CLIs speak UTF-8 on stdin/stdout. Pin the pipe encoding so the
+        # prompt is not encoded with the process locale codec (e.g. cp1250 on
+        # Windows), which raises UnicodeEncodeError on characters outside that
+        # codepage and never delivers the prompt. "replace" keeps decoding of
+        # provider output resilient to any stray non-UTF-8 bytes.
+        "encoding": "utf-8",
+        "errors": "replace",
         "bufsize": 1,
     }
     if os.name == "posix":
         popen_kwargs["start_new_session"] = True
+    elif os.name == "nt":
+        popen_kwargs["creationflags"] = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)) | int(
+            getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+        )
+    if executable is not None:
+        popen_kwargs["executable"] = executable
+        popen_kwargs["env"] = batch_env
     try:
-        process = subprocess.Popen(cmd, **popen_kwargs)
+        process = subprocess.Popen(launch_cmd, **popen_kwargs)
+    except FileNotFoundError as exc:
+        raise LLMConfigurationError(
+            f"{cmd[0]} CLI not found: install and authenticate the configured provider"
+        ) from exc
     except OSError as exc:
         environment_error = _local_environment_error_from_os_error(f"{provider} agent", exc)
         if environment_error is not None:
             raise environment_error from exc
         raise
+    if os.name == "nt":
+        job_started = start_windows_process_job(process)
+        if job_started is False:
+            raise LLMEnvironmentError(f"{provider} agent could not initialize Windows process isolation")
     assert process.stdin is not None
     assert process.stdout is not None
     assert process.stderr is not None
@@ -1095,39 +1153,50 @@ def _run_agent_subprocess_streaming(
             if exc.errno != errno.EPIPE:
                 writer_errors.put(exc)
 
-    threads = [
-        threading.Thread(target=_reader, args=("stdout", process.stdout), daemon=True),
-        threading.Thread(target=_reader, args=("stderr", process.stderr), daemon=True),
-    ]
-    for thread in threads:
-        thread.start()
-    writer_thread = threading.Thread(target=_writer, daemon=True)
-    writer_thread.start()
+    try:
+        threads = [
+            threading.Thread(target=_reader, args=("stdout", process.stdout), daemon=True),
+            threading.Thread(target=_reader, args=("stderr", process.stderr), daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        writer_thread = threading.Thread(target=_writer, daemon=True)
+        writer_thread.start()
 
-    deadline = time.monotonic() + timeout
-    while True:
-        _drain_ready_chunks(deadline)
+        deadline = time.monotonic() + timeout
+        while True:
+            _drain_ready_chunks(deadline)
+            _check_writer_error()
+            if process.poll() is not None and not any(thread.is_alive() for thread in threads) and chunks.empty():
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _raise_timeout()
+            try:
+                name, chunk = chunks.get(timeout=min(0.2, remaining))
+            except queue.Empty:
+                continue
+            _record_or_raise(name, chunk)
+
+        while writer_thread.is_alive():
+            _check_writer_error()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _raise_timeout()
+            writer_thread.join(timeout=min(0.2, remaining))
         _check_writer_error()
-        if process.poll() is not None and not any(thread.is_alive() for thread in threads) and chunks.empty():
-            break
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _raise_timeout()
-        try:
-            name, chunk = chunks.get(timeout=min(0.2, remaining))
-        except queue.Empty:
-            continue
-        _record_or_raise(name, chunk)
 
-    while writer_thread.is_alive():
-        _check_writer_error()
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _raise_timeout()
-        writer_thread.join(timeout=min(0.2, remaining))
-    _check_writer_error()
-
-    return subprocess.CompletedProcess(cmd, process.returncode or 0, "".join(stdout_parts), "".join(stderr_parts))
+        return subprocess.CompletedProcess(
+            launch_cmd,
+            process.returncode or 0,
+            "".join(stdout_parts),
+            "".join(stderr_parts),
+        )
+    except BaseException:
+        _terminate_process(process, process_group=True)
+        raise
+    finally:
+        release_windows_process_job(process)
 
 
 def _run_opencode_streaming(
@@ -1168,7 +1237,7 @@ class OpenCodeClient(LLMClient):
         )
 
         def _call():
-            result = subprocess.run(
+            result = _run_provider_cli(
                 [
                     "opencode",
                     "run",
@@ -1200,7 +1269,7 @@ class OpenCodeClient(LLMClient):
 
         def _call():
             with _opencode_agent_env() as env:
-                result = subprocess.run(
+                result = _run_provider_cli(
                     [
                         "opencode",
                         "run",
@@ -1416,17 +1485,26 @@ class GeminiClient(LLMClient):
             "json",
         ]
 
+    def _invocation(self, prompt: str, extra: list[str] | None = None) -> tuple[list[str], str | None]:
+        command = self._cmd(prompt, extra)
+        if windows_batch_command_path(command) is None:
+            return command, None
+        return self._cmd("", extra), prompt
+
     def generate(self, system: str, user: str) -> str:
         prompt = f"{system}\n\n{user}"
         log.info(f"Calling LLM via Gemini ({self._config.model}, ~{len(prompt) // 4} tokens) — waiting for response...")
 
         def _call():
-            result = subprocess.run(
-                self._cmd(prompt),
-                capture_output=True,
-                text=True,
-                timeout=self._config.agent_timeout,
-            )
+            command, stdin_text = self._invocation(prompt)
+            run_kwargs: dict[str, Any] = {
+                "capture_output": True,
+                "text": True,
+                "timeout": self._config.agent_timeout,
+            }
+            if stdin_text is not None:
+                run_kwargs["input"] = stdin_text
+            result = _run_provider_cli(command, **run_kwargs)
             if result.returncode != 0:
                 raise _gemini_result_error(result, "CLI")
             return _gemini_parse_response(result.stdout)
@@ -1438,13 +1516,16 @@ class GeminiClient(LLMClient):
         log.info(f"Running Gemini read-only agent ({self._config.model}) — waiting for completion...")
 
         def _call():
-            result = subprocess.run(
-                self._cmd(prompt, ["--approval-mode", "yolo"]),
-                capture_output=True,
-                text=True,
-                cwd=cwd,
-                timeout=self._config.agent_timeout,
-            )
+            command, stdin_text = self._invocation(prompt, ["--approval-mode", "yolo"])
+            run_kwargs: dict[str, Any] = {
+                "capture_output": True,
+                "text": True,
+                "cwd": cwd,
+                "timeout": self._config.agent_timeout,
+            }
+            if stdin_text is not None:
+                run_kwargs["input"] = stdin_text
+            result = _run_provider_cli(command, **run_kwargs)
             if result.returncode != 0:
                 raise _gemini_result_error(result, "agent")
             return _gemini_parse_response(result.stdout)
@@ -1460,12 +1541,14 @@ class GeminiClient(LLMClient):
         last_exc: Exception | None = None
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
             try:
+                command, stdin_text = self._invocation(prompt, ["--approval-mode", "yolo"])
                 result = _run_agent_subprocess_streaming(
-                    self._cmd(prompt, ["--approval-mode", "yolo"]),
+                    command,
                     cwd=cwd,
                     env=None,
                     timeout=self._config.agent_timeout,
                     provider="gemini",
+                    stdin_text=stdin_text,
                 )
                 if result.returncode != 0:
                     raise _gemini_result_error(result, "agent")
@@ -1700,7 +1783,7 @@ class CodexClient(LLMClient):
         log.info(f"Calling LLM via Codex ({self._config.model}, ~{len(prompt) // 4} tokens) — waiting for response...")
 
         def _call():
-            result = subprocess.run(
+            result = _run_provider_cli(
                 self._exec_cmd("read-only"),
                 capture_output=True,
                 input=prompt,
@@ -1717,7 +1800,7 @@ class CodexClient(LLMClient):
         log.info(f"Running Codex read-only agent ({self._config.model}) — waiting for completion...")
 
         def _call():
-            result = subprocess.run(
+            result = _run_provider_cli(
                 self._exec_cmd("read-only"),
                 capture_output=True,
                 input=prompt,
@@ -2401,20 +2484,33 @@ def _antigravity_snapshot_changed(before: dict[str, str], after: dict[str, str])
 def _antigravity_sanitize_readonly_output(output: str, workspace: Path) -> str:
     roots: list[str] = []
     for root_path in (workspace, workspace.resolve()):
-        root = root_path.as_posix().rstrip("/")
-        if root and root not in roots:
-            roots.append(root)
+        for root in (str(root_path).rstrip("/\\"), root_path.as_posix().rstrip("/")):
+            if root and root not in roots:
+                roots.append(root)
+    uri_roots = list(roots)
+    for root in roots:
+        encoded_root = quote(root, safe="/:\\")
+        if encoded_root not in uri_roots:
+            uri_roots.append(encoded_root)
 
     sanitized = output
 
     def _replacement(match: re.Match[str]) -> str:
-        return unquote(match.group("suffix").lstrip("/"))
+        return unquote(match.group("suffix").lstrip("/\\")).replace("\\", "/")
 
-    suffix_pattern = r"(?P<suffix>/[^\s<>\]\"'`)]+)"
+    suffix_pattern = r"(?P<suffix>[/\\][^\s<>\]\"'`)]+)"
+    flags = re.IGNORECASE if os.name == "nt" else 0
+    for root in sorted(uri_roots, key=len, reverse=True):
+        escaped_root = re.escape(root)
+        sanitized = re.sub(rf"file:///?{escaped_root}{suffix_pattern}", _replacement, sanitized, flags=flags)
     for root in sorted(roots, key=len, reverse=True):
         escaped_root = re.escape(root)
-        sanitized = re.sub(rf"file://{escaped_root}{suffix_pattern}", _replacement, sanitized)
-        sanitized = re.sub(rf"(?<![\w:/.-]){escaped_root}{suffix_pattern}", _replacement, sanitized)
+        sanitized = re.sub(
+            rf"(?<![\w:/\\.-]){escaped_root}{suffix_pattern}",
+            _replacement,
+            sanitized,
+            flags=flags,
+        )
     return sanitized
 
 
@@ -2447,7 +2543,7 @@ def _antigravity_parse_version(text: str) -> tuple[int, int, int] | None:
 
 def _antigravity_require_supported_version() -> None:
     try:
-        result = subprocess.run(
+        result = _run_provider_cli(
             ["agy", "--version"],
             capture_output=True,
             text=True,
@@ -2532,7 +2628,7 @@ class AntigravityClient(LLMClient):
 
         def _call():
             with _antigravity_log_file() as log_file:
-                result = subprocess.run(
+                result = _run_provider_cli(
                     self._cmd(
                         cwd=None,
                         timeout=self._config.agent_timeout,
@@ -2561,7 +2657,7 @@ class AntigravityClient(LLMClient):
                 copy_policy = _antigravity_copy_workspace(cwd, workspace)
                 before = _antigravity_directory_snapshot(workspace, copy_policy)
                 with _antigravity_log_file() as log_file:
-                    result = subprocess.run(
+                    result = _run_provider_cli(
                         self._cmd(
                             cwd=workspace,
                             timeout=self._config.agent_timeout,
