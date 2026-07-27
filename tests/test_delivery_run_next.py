@@ -51,6 +51,7 @@ from sikula_cli.delivery import (
     _invoke_delivery_child_run_args,
     _invoke_delivery_child_run,
     _progress_from_status,
+    _run_next_delivery_unit,
     _system_exit_code,
     cmd_delivery_run_next,
 )
@@ -469,6 +470,41 @@ def test_progress_from_status_preserves_handoff_references(tmp_path: Path) -> No
 
     assert reconstructed.units[0].handoff_schema_version == 1
     assert reconstructed.units[0].handoff_fingerprint == "a" * 64
+
+
+@pytest.mark.parametrize("running", [False, True])
+def test_bounded_run_next_rejects_unit_outside_initial_snapshot(
+    tmp_path: Path,
+    running: bool,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    if running:
+        _write_progress(
+            tmp_path,
+            [
+                {
+                    "unit_id": "01-foundation",
+                    "status": "running",
+                    "child_task_id": "new-child",
+                }
+            ],
+        )
+    args = _run_next_args(plan_path)
+
+    result = _run_next_delivery_unit(
+        args,
+        _run_next_cfg(tmp_path),
+        _run_next_context(tmp_path, lambda *args, **kwargs: pytest.fail("child must not run")),
+        project_root=tmp_path,
+        bounded_run_unit_ids=frozenset({"02-feature"}),
+    )
+
+    assert result.ran is False
+    assert result.succeeded is False
+    assert result.selected_unit.id == "01-foundation"
+    assert [issue.code for issue in result.errors][-1] == "delivery.run.snapshot_exhausted"
+    assert delivery_progress_path(tmp_path, "delivery-run-next-demo").exists() is running
 
 
 def test_cmd_delivery_run_next_dry_run_rejects_invalid_agent_override_before_preview(

@@ -38,6 +38,7 @@ sikula delivery prepare .sikula/tasks/<task>.refined.md
 sikula delivery check .sikula/delivery/<slug>/plan.yaml
 sikula delivery status .sikula/delivery/<slug>/plan.yaml
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml
+sikula delivery run .sikula/delivery/<slug>/plan.yaml
 sikula delivery finalize .sikula/delivery/<slug>/plan.yaml
 ```
 
@@ -45,6 +46,12 @@ sikula delivery finalize .sikula/delivery/<slug>/plan.yaml
 clarification without starting either workflow. `delivery prepare` authors
 tracked plan source artifacts. The remaining commands validate, inspect,
 execute, and finalize that explicit plan, and can emit privacy-safe JSON.
+`delivery run-next` executes or reconciles one unit. `delivery run` is a bounded
+coordinator over that primitive: it reloads durable parent status between units,
+stops on the first blocker or failure, and finalizes automatically when every
+unit is done. Explicit `--reset-failed` authorizes one retry of the current
+failed child before normal bounded execution continues. It does not add another
+agent pipeline or replace unit-level Sikula runs.
 `delivery status` also reads ignored parent progress from
 `.sikula/state/delivery/<plan-id>/progress.json` when present; if progress does
 not exist yet, units are reported as pending from the plan. Assessment and

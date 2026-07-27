@@ -15,6 +15,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from typing import TYPE_CHECKING, Any
 
 from core.delivery_authoring import (
@@ -96,6 +97,16 @@ _DELIVERY_PREPARE_FORBIDDEN_OUTPUT_ROOTS = (
     (".sikula", "worktrees"),
     (".sikula", "contract-reports"),
 )
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return parsed
 
 
 def register_parser(subparsers) -> argparse.ArgumentParser:
@@ -216,6 +227,58 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
         default=None,
         metavar="AGENT=SECONDS",
         help="Override timeout for one child run or delivery_preparer agent",
+    )
+
+    delivery_run_p = delivery_sub.add_parser(
+        "run",
+        help="Run a bounded sequence of eligible delivery units and finalize the completed plan",
+    )
+    delivery_run_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
+    delivery_run_p.add_argument(
+        "--max-units",
+        type=_positive_int,
+        metavar="N",
+        help="Stop after N successful unit executions; defaults to active units present at start",
+    )
+    delivery_run_p.add_argument(
+        "--max-elapsed-minutes",
+        type=_positive_int,
+        metavar="N",
+        help="Soft elapsed limit checked between child runs; an active child is never terminated",
+    )
+    delivery_run_p.add_argument(
+        "--reset-failed",
+        action="store_true",
+        default=False,
+        help="Retry the current failed child once, then continue the bounded run after success",
+    )
+    delivery_run_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Preview the first bounded-run action without writing state or running agents",
+    )
+    delivery_run_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
+    delivery_run_p.add_argument(
+        "--agent-model",
+        action="append",
+        default=None,
+        metavar="AGENT=MODEL",
+        help="Override model for each child run",
+    )
+    delivery_run_p.add_argument(
+        "--agent-provider",
+        action="append",
+        default=None,
+        metavar="AGENT=PROVIDER",
+        help="Override provider for each child run",
+    )
+    delivery_run_p.add_argument(
+        "--agent-timeout",
+        action="append",
+        default=None,
+        metavar="AGENT=SECONDS",
+        help="Override timeout for each child run",
     )
 
     delivery_finalize_p = delivery_sub.add_parser("finalize", help="Create or update a delivery plan final branch")
@@ -1909,6 +1972,459 @@ def _format_prepare_issue(issue: DeliveryPrepareIssue) -> str:
     return f"- {issue.code}{location}: {issue.message}"
 
 
+def cmd_delivery_run(
+    args: argparse.Namespace,
+    cfg: dict,
+    context: DeliveryRunNextContext | None = None,
+) -> None:
+    from core.delivery_run import render_delivery_run
+
+    _validate_delivery_run_agent_overrides(args)
+    project_root_raw = cfg.get("project", {}).get("root_path") if isinstance(cfg, dict) else None
+    project_root = Path(project_root_raw).resolve() if project_root_raw else None
+    if getattr(args, "dry_run", False):
+        result = _preview_delivery_run(args, cfg, project_root=project_root)
+    else:
+        if context is None:
+            print("delivery run execution requires the main Sikula command context.")
+            sys.exit(2)
+        result = _run_delivery_plan(args, cfg, context, project_root=project_root)
+
+    _print_delivery_result(result, json_output=args.json, render=render_delivery_run)
+    if (result.dry_run and not result.ready) or (not result.dry_run and not result.succeeded):
+        sys.exit(1)
+
+
+def _validate_delivery_run_agent_overrides(args: argparse.Namespace) -> None:
+    parse_agent_llm_overrides(
+        getattr(args, "agent_model", None),
+        getattr(args, "agent_provider", None),
+        getattr(args, "agent_timeout", None),
+        valid_agents=set(RUNTIME_AGENT_NAMES),
+    )
+
+
+def _preview_delivery_run(
+    args: argparse.Namespace,
+    cfg: dict,
+    *,
+    project_root: Path | None,
+):
+    from core.delivery_finalize import preview_delivery_finalize
+    from core.delivery_progress import get_delivery_status
+    from core.delivery_run import (
+        DELIVERY_RUN_BLOCKED,
+        DELIVERY_RUN_COMPLETED,
+        DELIVERY_RUN_PREVIEW,
+    )
+    from core.delivery_run_next import preview_delivery_run_next
+
+    status = get_delivery_status(args.plan_file, project_root=project_root)
+    max_units = _delivery_run_unit_limit(args, status)
+    if not status.valid:
+        return _delivery_run_result(
+            status=status,
+            max_units=max_units,
+            max_elapsed_minutes=getattr(args, "max_elapsed_minutes", None),
+            dry_run=True,
+            ready=False,
+            succeeded=False,
+            stop_code=DELIVERY_RUN_BLOCKED,
+            errors=status.errors,
+            warnings=status.warnings,
+            message="Delivery plan is not ready for bounded execution.",
+        )
+
+    if status.status == "done":
+        already_finalized = _delivery_run_is_current_finalization(status)
+        if already_finalized:
+            return _delivery_run_result(
+                status=status,
+                max_units=max_units,
+                max_elapsed_minutes=getattr(args, "max_elapsed_minutes", None),
+                dry_run=True,
+                ready=True,
+                succeeded=False,
+                completed=True,
+                finalized=True,
+                stop_code=DELIVERY_RUN_COMPLETED,
+                final_branch=status.final_branch,
+                final_commit=status.final_commit,
+                errors=status.errors,
+                warnings=status.warnings,
+                message="Delivery plan is already finalized at the current assembled commit.",
+            )
+        final_preview = preview_delivery_finalize(args.plan_file, project_root=project_root)
+        return _delivery_run_result(
+            status=status,
+            max_units=max_units,
+            max_elapsed_minutes=getattr(args, "max_elapsed_minutes", None),
+            dry_run=True,
+            ready=final_preview.ready,
+            succeeded=False,
+            completed=False,
+            finalized=False,
+            stop_code=DELIVERY_RUN_PREVIEW if final_preview.ready else DELIVERY_RUN_BLOCKED,
+            final_branch=final_preview.final_branch,
+            final_commit=final_preview.final_commit,
+            errors=final_preview.errors,
+            warnings=final_preview.warnings,
+            message=(
+                final_preview.message if final_preview.ready else "Delivery plan finalization preview is blocked."
+            ),
+        )
+
+    reset_failed = bool(getattr(args, "reset_failed", False))
+    preview = preview_delivery_run_next(
+        args.plan_file,
+        project_root=project_root,
+        reset_failed=reset_failed,
+    )
+    preview = _apply_delivery_preview_execution_guards(
+        preview,
+        args.plan_file,
+        cfg=cfg,
+        project_root=project_root,
+        reset_failed=reset_failed,
+    )
+    return _delivery_run_result(
+        status=status,
+        max_units=max_units,
+        max_elapsed_minutes=getattr(args, "max_elapsed_minutes", None),
+        dry_run=True,
+        ready=preview.ready,
+        succeeded=False,
+        last_unit=preview.selected_unit,
+        stop_code=DELIVERY_RUN_PREVIEW if preview.ready else DELIVERY_RUN_BLOCKED,
+        errors=preview.errors,
+        warnings=preview.warnings,
+        message=(
+            f"Dry run would start bounded delivery execution with unit {preview.selected_unit.id}."
+            if preview.ready and preview.selected_unit
+            else preview.message
+        ),
+    )
+
+
+def _run_delivery_plan(
+    args: argparse.Namespace,
+    cfg: dict,
+    context: DeliveryRunNextContext,
+    *,
+    project_root: Path | None,
+):
+    from core.delivery_plan import DeliveryPlanIssue
+    from core.delivery_progress import get_delivery_status
+    from core.delivery_run import (
+        DELIVERY_RUN_BLOCKED,
+        DELIVERY_RUN_ELAPSED_LIMIT_REACHED,
+        DELIVERY_RUN_NO_PROGRESS,
+        DELIVERY_RUN_SNAPSHOT_EXHAUSTED,
+        DELIVERY_RUN_UNIT_FAILED,
+        DELIVERY_RUN_UNIT_LIMIT_REACHED,
+    )
+
+    args = copy.copy(args)
+    plan_path = Path(args.plan_file).expanduser()
+    if not plan_path.is_absolute():
+        plan_path = Path.cwd() / plan_path
+    args.plan_file = str(plan_path.resolve())
+    status = get_delivery_status(args.plan_file, project_root=project_root)
+    max_units = _delivery_run_unit_limit(args, status)
+    initial_unit_ids = frozenset(unit.id for unit in status.units if unit.status not in {"done", "superseded"})
+    max_elapsed_minutes = getattr(args, "max_elapsed_minutes", None)
+    started_at = time.monotonic()
+    units_attempted = 0
+    units_succeeded = 0
+    last_unit = None
+    child_task_id = None
+    reset_failed_pending = bool(getattr(args, "reset_failed", False))
+
+    while True:
+        status = get_delivery_status(args.plan_file, project_root=project_root)
+        if not status.valid:
+            return _delivery_run_result(
+                status=status,
+                max_units=max_units,
+                max_elapsed_minutes=max_elapsed_minutes,
+                started=units_attempted > 0,
+                units_attempted=units_attempted,
+                units_succeeded=units_succeeded,
+                last_unit=last_unit,
+                child_task_id=child_task_id,
+                stop_code=DELIVERY_RUN_BLOCKED if units_attempted == 0 else DELIVERY_RUN_UNIT_FAILED,
+                errors=status.errors,
+                warnings=status.warnings,
+                message="Delivery plan became invalid during bounded execution.",
+            )
+        if status.status == "done":
+            return _finalize_delivery_run(
+                args,
+                status=status,
+                project_root=project_root,
+                max_units=max_units,
+                max_elapsed_minutes=max_elapsed_minutes,
+                units_attempted=units_attempted,
+                units_succeeded=units_succeeded,
+                last_unit=last_unit,
+                child_task_id=child_task_id,
+            )
+        if units_succeeded >= max_units:
+            return _delivery_run_result(
+                status=status,
+                max_units=max_units,
+                max_elapsed_minutes=max_elapsed_minutes,
+                started=units_attempted > 0,
+                ready=True,
+                succeeded=True,
+                units_attempted=units_attempted,
+                units_succeeded=units_succeeded,
+                last_unit=last_unit,
+                child_task_id=child_task_id,
+                stop_code=DELIVERY_RUN_UNIT_LIMIT_REACHED,
+                warnings=status.warnings,
+                message="Delivery run reached its unit limit at a resumable boundary.",
+            )
+        if (
+            max_elapsed_minutes is not None
+            and units_attempted > 0
+            and time.monotonic() - started_at >= max_elapsed_minutes * 60
+        ):
+            return _delivery_run_result(
+                status=status,
+                max_units=max_units,
+                max_elapsed_minutes=max_elapsed_minutes,
+                started=units_attempted > 0,
+                ready=True,
+                succeeded=True,
+                units_attempted=units_attempted,
+                units_succeeded=units_succeeded,
+                last_unit=last_unit,
+                child_task_id=child_task_id,
+                stop_code=DELIVERY_RUN_ELAPSED_LIMIT_REACHED,
+                warnings=status.warnings,
+                message="Delivery run reached its elapsed limit at a resumable boundary.",
+            )
+
+        before = _delivery_run_status_signature(status)
+        run_next_args = copy.copy(args)
+        run_next_args.reset_failed = reset_failed_pending
+        unit_result = _run_next_delivery_unit(
+            run_next_args,
+            cfg,
+            context,
+            project_root=project_root,
+            bounded_run_unit_ids=initial_unit_ids,
+        )
+        if any(issue.code == DELIVERY_RUN_SNAPSHOT_EXHAUSTED for issue in unit_result.errors):
+            return _delivery_run_result(
+                status=get_delivery_status(args.plan_file, project_root=project_root),
+                max_units=max_units,
+                max_elapsed_minutes=max_elapsed_minutes,
+                started=units_attempted > 0,
+                ready=True,
+                succeeded=True,
+                units_attempted=units_attempted,
+                units_succeeded=units_succeeded,
+                last_unit=last_unit,
+                child_task_id=child_task_id,
+                stop_code=DELIVERY_RUN_UNIT_LIMIT_REACHED,
+                warnings=unit_result.warnings,
+                message="Delivery run reached its initial unit snapshot at a resumable boundary.",
+            )
+        last_unit = unit_result.selected_unit
+        child_task_id = unit_result.child_task_id
+        if unit_result.ran:
+            units_attempted += 1
+        if not unit_result.succeeded:
+            return _delivery_run_result(
+                status=get_delivery_status(args.plan_file, project_root=project_root),
+                max_units=max_units,
+                max_elapsed_minutes=max_elapsed_minutes,
+                started=units_attempted > 0,
+                units_attempted=units_attempted,
+                units_succeeded=units_succeeded,
+                last_unit=last_unit,
+                child_task_id=child_task_id,
+                stop_code=DELIVERY_RUN_UNIT_FAILED if unit_result.ran else DELIVERY_RUN_BLOCKED,
+                errors=unit_result.errors,
+                warnings=unit_result.warnings,
+                message=unit_result.message,
+            )
+        reset_failed_pending = False
+
+        updated_status = get_delivery_status(args.plan_file, project_root=project_root)
+        if updated_status.status != "done" and _delivery_run_status_signature(updated_status) == before:
+            issue = DeliveryPlanIssue(
+                "error",
+                DELIVERY_RUN_NO_PROGRESS,
+                "Delivery run-next reported success without changing durable delivery progress.",
+            )
+            return _delivery_run_result(
+                status=updated_status,
+                max_units=max_units,
+                max_elapsed_minutes=max_elapsed_minutes,
+                started=True,
+                units_attempted=units_attempted,
+                units_succeeded=units_succeeded,
+                last_unit=last_unit,
+                child_task_id=child_task_id,
+                stop_code=DELIVERY_RUN_NO_PROGRESS,
+                errors=[*updated_status.errors, issue],
+                warnings=updated_status.warnings,
+                message=issue.message,
+            )
+        units_succeeded += 1
+
+
+def _finalize_delivery_run(
+    args: argparse.Namespace,
+    *,
+    status,
+    project_root: Path | None,
+    max_units: int,
+    max_elapsed_minutes: int | None,
+    units_attempted: int,
+    units_succeeded: int,
+    last_unit,
+    child_task_id: str | None,
+):
+    from core.delivery_finalize import finalize_delivery_plan, preview_delivery_finalize
+    from core.delivery_progress import get_delivery_status
+    from core.delivery_run import DELIVERY_RUN_COMPLETED, DELIVERY_RUN_FINALIZE_FAILED
+
+    if not _delivery_run_is_current_finalization(status):
+        preview = preview_delivery_finalize(args.plan_file, project_root=project_root)
+        if not preview.ready:
+            return _delivery_run_result(
+                status=status,
+                max_units=max_units,
+                max_elapsed_minutes=max_elapsed_minutes,
+                started=units_attempted > 0,
+                units_attempted=units_attempted,
+                units_succeeded=units_succeeded,
+                last_unit=last_unit,
+                child_task_id=child_task_id,
+                stop_code=DELIVERY_RUN_FINALIZE_FAILED,
+                final_branch=preview.final_branch,
+                final_commit=preview.final_commit,
+                errors=preview.errors,
+                warnings=preview.warnings,
+                message="Delivery units completed, but finalization preflight is blocked.",
+            )
+
+    final_result = finalize_delivery_plan(args.plan_file, project_root=project_root)
+    updated_status = get_delivery_status(args.plan_file, project_root=project_root)
+    return _delivery_run_result(
+        status=updated_status,
+        max_units=max_units,
+        max_elapsed_minutes=max_elapsed_minutes,
+        started=units_attempted > 0,
+        ready=final_result.finalized,
+        succeeded=final_result.finalized,
+        completed=final_result.finalized,
+        finalized=final_result.finalized,
+        units_attempted=units_attempted,
+        units_succeeded=units_succeeded,
+        last_unit=last_unit,
+        child_task_id=child_task_id,
+        stop_code=DELIVERY_RUN_COMPLETED if final_result.finalized else DELIVERY_RUN_FINALIZE_FAILED,
+        final_branch=final_result.final_branch,
+        final_commit=final_result.final_commit,
+        errors=final_result.errors,
+        warnings=final_result.warnings,
+        message=(
+            f"Delivery plan completed and finalized at {final_result.final_commit}."
+            if final_result.finalized
+            else final_result.message
+        ),
+    )
+
+
+def _delivery_run_is_current_finalization(status) -> bool:
+    from core.delivery_finalize import delivery_finalization_is_current
+
+    return delivery_finalization_is_current(status)
+
+
+def _delivery_run_unit_limit(args: argparse.Namespace, status) -> int:
+    configured = getattr(args, "max_units", None)
+    if configured is not None:
+        return configured
+    return sum(unit.status not in {"done", "superseded"} for unit in status.units)
+
+
+def _delivery_run_status_signature(status) -> tuple[Any, ...]:
+    return (
+        status.status,
+        status.assembled_commit,
+        status.assembly_status,
+        status.final_commit,
+        tuple(
+            (
+                unit.id,
+                unit.status,
+                unit.child_task_id,
+                unit.commit,
+                unit.failure_code,
+                unit.handoff_fingerprint,
+            )
+            for unit in status.units
+        ),
+    )
+
+
+def _delivery_run_result(
+    *,
+    status,
+    max_units: int,
+    max_elapsed_minutes: int | None,
+    dry_run: bool = False,
+    started: bool = False,
+    ready: bool = False,
+    succeeded: bool = False,
+    completed: bool = False,
+    finalized: bool = False,
+    units_attempted: int = 0,
+    units_succeeded: int = 0,
+    last_unit=None,
+    child_task_id: str | None = None,
+    stop_code: str,
+    final_branch: str | None = None,
+    final_commit: str | None = None,
+    errors: list | None = None,
+    warnings: list | None = None,
+    message: str,
+):
+    from core.delivery_run import DeliveryRunResult
+
+    return DeliveryRunResult(
+        plan_path=status.plan_path,
+        project_root=status.project_root,
+        valid=status.valid and not errors,
+        ready=ready,
+        dry_run=dry_run,
+        started=started,
+        succeeded=succeeded,
+        completed=completed,
+        finalized=finalized,
+        status=status.status if status.valid else None,
+        max_units=max_units,
+        max_elapsed_minutes=max_elapsed_minutes,
+        units_attempted=units_attempted,
+        units_succeeded=units_succeeded,
+        last_unit=last_unit,
+        child_task_id=child_task_id,
+        stop_code=stop_code,
+        progress_path=status.progress_path,
+        final_branch=final_branch,
+        final_commit=final_commit,
+        errors=list(errors or []),
+        warnings=list(warnings or []),
+        message=message,
+    )
+
+
 def cmd_delivery_finalize(args: argparse.Namespace, cfg: dict) -> None:
     from core.delivery_finalize import finalize_delivery_plan, preview_delivery_finalize, render_delivery_finalize
 
@@ -2276,12 +2792,28 @@ def _blocked_budget_split_preparation(
     )
 
 
+def _bounded_delivery_run_snapshot_issue(
+    unit_ids: frozenset[str] | None,
+    unit: Any,
+) -> DeliveryPlanIssue | None:
+    from core.delivery_run import DELIVERY_RUN_SNAPSHOT_EXHAUSTED
+
+    if unit_ids is None or unit.id in unit_ids:
+        return None
+    return DeliveryPlanIssue(
+        "error",
+        DELIVERY_RUN_SNAPSHOT_EXHAUSTED,
+        "The next delivery unit was added after this bounded run started; start another delivery run invocation.",
+    )
+
+
 def _run_next_delivery_unit(
     args: argparse.Namespace,
     cfg: dict,
     context: DeliveryRunNextContext,
     *,
     project_root: Path | None,
+    bounded_run_unit_ids: frozenset[str] | None = None,
 ):
     from core.delivery_plan import DeliveryPlanIssue
     from core.delivery_progress import (
@@ -2373,6 +2905,17 @@ def _run_next_delivery_unit(
             )
         running_units = _running_delivery_units(status)
         if len(running_units) == 1:
+            snapshot_issue = _bounded_delivery_run_snapshot_issue(bounded_run_unit_ids, running_units[0])
+            if snapshot_issue is not None:
+                return _execution_result_from_status(
+                    status,
+                    ran=False,
+                    selected_unit=running_units[0],
+                    progress_path=str(progress_path),
+                    events_path=str(events_path),
+                    errors=[*errors, snapshot_issue],
+                    message=snapshot_issue.message,
+                )
             return _handle_running_delivery_unit(
                 args=args,
                 cfg=cfg,
@@ -2442,6 +2985,18 @@ def _run_next_delivery_unit(
                 events_path=str(events_path),
                 errors=errors,
                 message=message,
+            )
+
+        snapshot_issue = _bounded_delivery_run_snapshot_issue(bounded_run_unit_ids, selected_unit)
+        if snapshot_issue is not None:
+            return _execution_result_from_status(
+                status,
+                ran=False,
+                selected_unit=selected_unit,
+                progress_path=str(progress_path),
+                events_path=str(events_path),
+                errors=[*errors, snapshot_issue],
+                message=snapshot_issue.message,
             )
 
         dependency_handoffs, handoff_errors = _load_dependency_handoffs(status, selected_unit, root)

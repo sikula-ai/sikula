@@ -279,13 +279,15 @@ running the first unit:
 
 ```bash
 sikula delivery check .sikula/delivery/<slug>/plan.yaml
+sikula delivery run .sikula/delivery/<slug>/plan.yaml --dry-run
+sikula delivery run .sikula/delivery/<slug>/plan.yaml
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --dry-run
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml
 ```
 
 The tracked source artifacts live under `.sikula/delivery/<slug>/`. Runtime
-parent progress, created only by execution commands such as `run-next`, lives
-under `.sikula/state/delivery/<plan-id>/`.
+parent progress, created only by execution commands such as `run` and
+`run-next`, lives under `.sikula/state/delivery/<plan-id>/`.
 
 ## Prepare JSON Output
 
@@ -525,6 +527,45 @@ idempotent.
 Unlike `check` and `status`, `run-next` loads project runtime config because it
 uses the same project settings as `sikula run`.
 
+Run a bounded sequence of units through the same one-unit execution path:
+
+```bash
+sikula delivery run .sikula/delivery/<slug>/plan.yaml --dry-run
+sikula delivery run .sikula/delivery/<slug>/plan.yaml
+sikula delivery run .sikula/delivery/<slug>/plan.yaml --max-units 3
+sikula delivery run .sikula/delivery/<slug>/plan.yaml \
+  --max-elapsed-minutes 60 --json
+sikula delivery run .sikula/delivery/<slug>/plan.yaml --reset-failed
+```
+
+`delivery run` is a thin coordinator over `delivery run-next`. It reloads the
+durable plan status after every child and runs only one child at a time through
+the normal Sikula pipeline. By default, one invocation can attempt at most the
+active units that exist when it starts; units added by a later amendment wait
+for another invocation. `--max-units` can lower that bound. The optional
+`--max-elapsed-minutes` limit is soft: Sikula checks it only between child runs
+and never terminates an active child.
+
+The coordinator stops immediately when a unit fails, waits, exceeds its budget,
+or encounters an assembly or reconciliation blocker. Each explicit
+`delivery run --reset-failed` invocation retries the current failed child once
+and continues normal bounded execution only after that retry succeeds. The
+permission is consumed by that retry: a later failed unit stops again and
+requires another explicit invocation. The flag does not bypass planner budget
+stops, prepare or apply amendments, split units, or skip blocked work. Operators
+use the existing `status`, `run-next`, and amendment commands for other recovery
+decisions, then rerun `delivery run`.
+
+Reaching a unit or elapsed limit is a successful resumable stop, not a failed
+plan. A plan that becomes `done` is finalized automatically through the same
+finalization engine as `delivery finalize`. Rerunning an already current
+finalized plan is idempotent and does not append another finalization event.
+`--dry-run` previews the next unit or finalization preflight without creating
+state, worktrees, commits, or refs. `--json` emits one compact aggregate
+document; child JSON is kept on stderr rather than nested into the public
+result. Runtime agent model, provider, and timeout overrides are forwarded to
+each child in the same way as `run-next`.
+
 Preview final delivery branch creation after every unit is done:
 
 ```bash
@@ -673,20 +714,22 @@ can coordinate cross-repo branches, locks, validation, and result sets.
 ## Privacy
 
 `delivery prepare --json`, `delivery check --json`, `delivery status --json`,
-`delivery run-next --json`, and `delivery finalize --json` return allowlisted
-metadata such as written artifact paths, plan validation status, unit readiness,
-plan metadata, validation issues, unit paths, compact progress fields, selected
-child task IDs, handoff schema/fingerprint references, assembly/final branch metadata,
-and branch/commit pointers when
-available. They do not embed child task state, source task bodies, unit task file bodies, prompts,
-provider output, diffs, logs, validation output, credentials, tokens, or source excerpts.
-Privacy-safe projections such as `delivery prepare --json`, `delivery status --json`,
-and `delivery run-next --json` use project-relative paths for local delivery artifacts
-where possible. Operator/audit commands such as `delivery check --json` and
-`delivery finalize --json` may include local plan, progress, or events paths. The
-parent plan path stored in the child task state is saved as a project-relative path
-(`delivery_plan_path`). This metadata is strictly allowlisted state metadata and
-does not expose raw prompts, provider output, diffs, logs, or source excerpts.
+`delivery run-next --json`, `delivery run --json`, and
+`delivery finalize --json` return allowlisted metadata such as written artifact
+paths, plan validation status, unit readiness, plan metadata, validation issues,
+unit paths, compact progress fields, selected child task IDs, handoff
+schema/fingerprint references, assembly/final branch metadata, and branch/commit
+pointers when available. They do not embed child task state, source task bodies,
+unit task file bodies, prompts, provider output, diffs, logs, validation output,
+credentials, tokens, or source excerpts. Privacy-safe projections such as
+`delivery prepare --json`, `delivery status --json`, `delivery run-next --json`,
+and `delivery run --json` use project-relative paths for local delivery
+artifacts where possible. Operator/audit commands such as
+`delivery check --json` and `delivery finalize --json` may include local plan,
+progress, or events paths. The parent plan path stored in the child task state
+is saved as a project-relative path (`delivery_plan_path`). This metadata is
+strictly allowlisted state metadata and does not expose raw prompts, provider
+output, diffs, logs, or source excerpts.
 Unsafe free-form delivery metadata is replaced with `<redacted>` in public text
 and JSON projections. Unsafe identity values and their graph references use the
 same stable opaque fingerprint, preserving correlation without exposing the

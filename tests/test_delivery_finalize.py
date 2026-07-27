@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
@@ -237,6 +238,180 @@ def test_finalize_delivery_plan_creates_branch_and_records_progress(tmp_path: Pa
     status = get_delivery_status(plan_path, project_root=tmp_path)
     assert status.final_commit == second_commit
     assert status.next_action == "review finalized delivery branch"
+
+
+def test_finalize_delivery_plan_is_idempotent_after_prior_finalization(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    commit = _git_commit(tmp_path, "unit-1.txt", "unit 1\n")
+    plan_path = _write_plan(tmp_path, unit_count=1)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-unit", "status": "done", "commit": commit}],
+    )
+
+    first = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    progress_path = delivery_progress_path(tmp_path, "delivery-finalize-demo")
+    events_path = delivery_events_path(tmp_path, "delivery-finalize-demo")
+    first_progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    first_events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+
+    subprocess.run(
+        ["git", "checkout", "-q", "sikula/delivery/final"],
+        cwd=tmp_path,
+        check=True,
+    )
+    second = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    second_progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    second_events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+
+    assert first.finalized is True
+    assert second.finalized is True
+    assert second.final_commit == first.final_commit
+    assert second_progress["finalized_at"] == first_progress["finalized_at"]
+    assert second_events == first_events
+    assert sum(event["event_type"] == "plan.finalized" for event in second_events) == 1
+
+
+def test_finalize_delivery_plan_repairs_missing_finalized_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _git_init(tmp_path)
+    commit = _git_commit(tmp_path, "unit-1.txt", "unit 1\n")
+    plan_path = _write_plan(tmp_path, unit_count=1)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-unit", "status": "done", "commit": commit}],
+    )
+    append_event = delivery_finalize_module.append_delivery_progress_event
+
+    def fail_finalized_event(path, event):
+        if event.event_type == "plan.finalized":
+            raise OSError("interrupted finalization event write")
+        append_event(path, event)
+
+    monkeypatch.setattr(
+        delivery_finalize_module,
+        "append_delivery_progress_event",
+        fail_finalized_event,
+    )
+    with pytest.raises(OSError, match="interrupted finalization event write"):
+        finalize_delivery_plan(plan_path, project_root=tmp_path)
+
+    progress = json.loads(delivery_progress_path(tmp_path, "delivery-finalize-demo").read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        delivery_finalize_module,
+        "append_delivery_progress_event",
+        append_event,
+    )
+    subprocess.run(
+        ["git", "checkout", "-q", "sikula/delivery/final"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    result = finalize_delivery_plan(plan_path, project_root=tmp_path)
+
+    events = [
+        json.loads(line)
+        for line in delivery_events_path(tmp_path, "delivery-finalize-demo").read_text(encoding="utf-8").splitlines()
+    ]
+    finalized_events = [event for event in events if event["event_type"] == "plan.finalized"]
+    assert result.finalized is True
+    assert finalized_events == [
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-finalize-demo",
+            "event_type": "plan.finalized",
+            "timestamp": progress["finalized_at"],
+            "branch": "sikula/delivery/final",
+            "commit": commit,
+        }
+    ]
+
+
+def test_finalize_delivery_plan_rechecks_current_finalization_under_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _git_init(tmp_path)
+    commit = _git_commit(tmp_path, "unit-1.txt", "unit 1\n")
+    plan_path = _write_plan(tmp_path, unit_count=1)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-unit", "status": "done", "commit": commit}],
+    )
+    first = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    assert first.finalized is True
+    progress_path = delivery_progress_path(tmp_path, "delivery-finalize-demo")
+    events_path = delivery_events_path(tmp_path, "delivery-finalize-demo")
+    first_progress = progress_path.read_text(encoding="utf-8")
+    first_events = events_path.read_text(encoding="utf-8")
+
+    get_status = delivery_finalize_module.get_delivery_status
+    current_status = get_status(plan_path, project_root=tmp_path)
+    statuses = iter([replace(current_status, finalized_at=None)])
+
+    def status_with_stale_initial_snapshot(*args, **kwargs):
+        try:
+            return next(statuses)
+        except StopIteration:
+            return get_status(*args, **kwargs)
+
+    monkeypatch.setattr(
+        delivery_finalize_module,
+        "get_delivery_status",
+        status_with_stale_initial_snapshot,
+    )
+
+    second = finalize_delivery_plan(plan_path, project_root=tmp_path)
+
+    assert second.finalized is True
+    assert progress_path.read_text(encoding="utf-8") == first_progress
+    assert events_path.read_text(encoding="utf-8") == first_events
+
+
+def test_finalize_delivery_plan_rejects_symbolic_ref_after_finalization(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    commit = _git_commit(tmp_path, "unit-1.txt", "unit 1\n")
+    main_branch = _current_branch(tmp_path)
+    plan_path = _write_plan(tmp_path, unit_count=1)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-unit", "status": "done", "commit": commit}],
+    )
+    first = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    assert first.finalized is True
+    subprocess.run(
+        ["git", "symbolic-ref", "refs/heads/sikula/delivery/final", f"refs/heads/{main_branch}"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    second = finalize_delivery_plan(plan_path, project_root=tmp_path)
+
+    assert second.finalized is False
+    assert second.ready is False
+    assert [issue.code for issue in second.errors] == ["delivery.assembly_branch_symbolic"]
+
+
+def test_finalize_delivery_plan_rejects_new_pending_unit_after_finalization(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    commit = _git_commit(tmp_path, "unit-1.txt", "unit 1\n")
+    plan_path = _write_plan(tmp_path, unit_count=1)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-unit", "status": "done", "commit": commit}],
+    )
+    first = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    assert first.finalized is True
+    _write_plan(tmp_path, unit_count=2)
+
+    second = finalize_delivery_plan(plan_path, project_root=tmp_path)
+
+    assert second.finalized is False
+    assert second.ready is False
+    assert [issue.code for issue in second.errors] == ["delivery.not_done"]
 
 
 def test_finalize_delivery_plan_uses_head_when_plan_order_lists_dependent_first(tmp_path: Path) -> None:
