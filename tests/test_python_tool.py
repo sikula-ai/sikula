@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -9,6 +10,8 @@ import pytest
 
 from tools.base_tool import Sandbox
 from tools.python_tool import PythonTool, _BUILD_CONFIG_FILES
+
+_SHELL_RUNNER = "tools.python_tool.run_windows_shell_process" if os.name == "nt" else "tools.python_tool.subprocess.run"
 
 
 def _make_tool(root: Path, compile_command: str = "ruff check .", test_command: str = "pytest") -> PythonTool:
@@ -27,7 +30,7 @@ def _mock_run(returncode: int = 0, stdout: str = "", stderr: str = "") -> MagicM
 class TestPythonToolRun:
     def test_success_returns_combined_output(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.python_tool.subprocess.run", return_value=_mock_run(stdout="ok\n", stderr="warn\n")):
+        with patch(_SHELL_RUNNER, return_value=_mock_run(stdout="ok\n", stderr="warn\n")):
             result = tool.compile_check()
         assert result.success
         assert "ok" in result.output
@@ -35,7 +38,7 @@ class TestPythonToolRun:
 
     def test_nonzero_returncode_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.python_tool.subprocess.run", return_value=_mock_run(returncode=1, stderr="error")):
+        with patch(_SHELL_RUNNER, return_value=_mock_run(returncode=1, stderr="error")):
             result = tool.compile_check()
         assert not result.success
         assert "error" in result.error
@@ -43,7 +46,7 @@ class TestPythonToolRun:
     def test_stdout_only_failure_captured_in_error(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
         with patch(
-            "tools.python_tool.subprocess.run",
+            _SHELL_RUNNER,
             return_value=_mock_run(returncode=1, stdout="FAILED test_foo.py::test_bar", stderr=""),
         ):
             result = tool.run_tests()
@@ -52,27 +55,27 @@ class TestPythonToolRun:
 
     def test_exit_code_5_treated_as_success(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.python_tool.subprocess.run", return_value=_mock_run(returncode=5)):
+        with patch(_SHELL_RUNNER, return_value=_mock_run(returncode=5)):
             result = tool.run_tests()
         assert result.success
 
     def test_timeout_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.python_tool.subprocess.run", side_effect=__import__("subprocess").TimeoutExpired("cmd", 1)):
+        with patch(_SHELL_RUNNER, side_effect=__import__("subprocess").TimeoutExpired("cmd", 1)):
             result = tool.compile_check()
         assert not result.success
         assert "timed out" in result.error
 
     def test_unexpected_exception_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.python_tool.subprocess.run", side_effect=OSError("no such file")):
+        with patch(_SHELL_RUNNER, side_effect=OSError("no such file")):
             result = tool.compile_check()
         assert not result.success
         assert "no such file" in result.error
 
     def test_custom_timeout_passed_to_subprocess(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.python_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("lint", {"command": "ruff check .", "timeout": 42})
         _, kwargs = mock.call_args
         assert kwargs["timeout"] == 42
@@ -83,7 +86,7 @@ class TestPythonToolRun:
             project_root=tmp_path,
             timeout=999,
         )
-        with patch("tools.python_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.compile_check()
         _, kwargs = mock.call_args
         assert kwargs["timeout"] == 999
@@ -92,21 +95,21 @@ class TestPythonToolRun:
 class TestPythonToolCompileCheck:
     def test_replaces_undecodable_output_with_locale_encoding(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.python_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.compile_check()
         assert mock.call_args.kwargs["errors"] == "replace"
         assert "encoding" not in mock.call_args.kwargs
 
     def test_uses_configured_compile_command(self, tmp_path: Path):
         tool = _make_tool(tmp_path, compile_command="mypy .")
-        with patch("tools.python_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.compile_check()
         args, _ = mock.call_args
         assert args[0] == "mypy ."
 
     def test_runs_in_project_root(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.python_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.compile_check()
         _, kwargs = mock.call_args
         assert kwargs["cwd"] == tmp_path.resolve()
@@ -115,7 +118,7 @@ class TestPythonToolCompileCheck:
 class TestPythonToolRunTests:
     def test_uses_configured_test_command(self, tmp_path: Path):
         tool = _make_tool(tmp_path, test_command="python3 -m pytest tests/ -v")
-        with patch("tools.python_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_tests()
         args, _ = mock.call_args
         assert args[0] == "python3 -m pytest tests/ -v"
@@ -124,21 +127,21 @@ class TestPythonToolRunTests:
 class TestPythonToolRunCheck:
     def test_uses_command_from_task_config(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.python_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("ruff-format", {"command": "ruff format --check ."})
         args, _ = mock.call_args
         assert args[0] == "ruff format --check ."
 
     def test_falls_back_to_name_when_no_command(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.python_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("detekt", {})
         args, _ = mock.call_args
         assert args[0] == "detekt"
 
     def test_timeout_from_task_config(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.python_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("lint", {"command": "ruff .", "timeout": "120"})
         _, kwargs = mock.call_args
         assert kwargs["timeout"] == 120

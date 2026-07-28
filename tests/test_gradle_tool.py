@@ -14,6 +14,8 @@ from tools.base_tool import Sandbox
 from tools.gradle_android_tool import AndroidGradleTool
 from tools.gradle_tool import GradleBaseTool, _BUILD_CONFIG_DIRS, _BUILD_CONFIG_SUFFIXES
 
+_SHELL_RUNNER = "tools.gradle_tool.run_windows_shell_process" if os.name == "nt" else "tools.gradle_tool.subprocess.run"
+
 
 def _make_tool(root: Path, **kwargs) -> AndroidGradleTool:
     sandbox = Sandbox(project_root=root, allowed_write_paths=["."], allowed_read_paths=["."])
@@ -329,21 +331,21 @@ class TestAndroidGradleToolEnvFiles:
 class TestGradleBaseToolRunShell:
     def test_success_returns_output(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", return_value=_mock_run(stdout="ok")):
+        with patch(_SHELL_RUNNER, return_value=_mock_run(stdout="ok")):
             result = tool.run_check("lint", {"command": "./gradlew lintDebug"})
         assert result.success
         assert "ok" in result.output
 
     def test_replaces_undecodable_output_with_locale_encoding(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("lint", {"command": "./gradlew lintDebug"})
         assert mock.call_args.kwargs["errors"] == "replace"
         assert "encoding" not in mock.call_args.kwargs
 
     def test_nonzero_returncode_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", return_value=_mock_run(returncode=1, stderr="FAILED")):
+        with patch(_SHELL_RUNNER, return_value=_mock_run(returncode=1, stderr="FAILED")):
             result = tool.run_check("lint", {"command": "./gradlew lintDebug"})
         assert not result.success
         assert "FAILED" in result.error
@@ -351,7 +353,7 @@ class TestGradleBaseToolRunShell:
     def test_timeout_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
         with patch(
-            "tools.gradle_tool.subprocess.run",
+            _SHELL_RUNNER,
             side_effect=__import__("subprocess").TimeoutExpired("cmd", 1),
         ):
             result = tool.run_check("lint", {"command": "./gradlew lintDebug"})
@@ -360,7 +362,7 @@ class TestGradleBaseToolRunShell:
 
     def test_unexpected_exception_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", side_effect=OSError("not found")):
+        with patch(_SHELL_RUNNER, side_effect=OSError("not found")):
             result = tool.run_check("lint", {"command": "./gradlew lintDebug"})
         assert not result.success
         assert "not found" in result.error

@@ -12,6 +12,8 @@ from core.subprocess_utils import resolve_windows_batch_command
 from tools.base_tool import BuildTool, Sandbox
 from tools.maven_tool import MavenTool, _BUILD_CONFIG_DIRS, _BUILD_CONFIG_FILES
 
+_SHELL_RUNNER = "tools.maven_tool.run_windows_shell_process" if os.name == "nt" else "tools.maven_tool.subprocess.run"
+
 
 @pytest.fixture(autouse=True)
 def _avoid_host_maven_batch_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -64,11 +66,14 @@ class TestMavenToolMvnwDetection:
     def test_explicit_compile_command_overrides_detection(self, tmp_path: Path):
         (tmp_path / "mvnw").write_text("")
         tool = _make_tool(tmp_path, compile_command="mvn compile -P prod")
-        with patch("tools.maven_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.compile_check()
         args, _ = mock.call_args
         assert args[0] == "mvn compile -P prod"
-        assert mock.call_args.kwargs["shell"] is True
+        if os.name == "nt":
+            assert "shell" not in mock.call_args.kwargs
+        else:
+            assert mock.call_args.kwargs["shell"] is True
 
     def test_windows_uses_mvnw_cmd(self, tmp_path: Path):
         wrapper = tmp_path / "mvnw.cmd"
@@ -224,21 +229,21 @@ class TestMavenToolPresyncClean:
 class TestMavenToolRunCheck:
     def test_uses_command_from_config(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.maven_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("checkstyle", {"command": "./mvnw checkstyle:check"})
         args, _ = mock.call_args
         assert args[0] == "./mvnw checkstyle:check"
 
     def test_falls_back_to_name_when_no_command(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.maven_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("spotbugs", {})
         args, _ = mock.call_args
         assert args[0] == "spotbugs"
 
     def test_timeout_from_config(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.maven_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("checkstyle", {"command": "./mvnw checkstyle:check", "timeout": "120"})
         _, kwargs = mock.call_args
         assert kwargs["timeout"] == 120
