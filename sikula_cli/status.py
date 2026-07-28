@@ -12,6 +12,7 @@ from pathlib import Path
 import sys
 
 from core.state import JsonStateStore
+from core.subprocess_utils import windows_pid_running
 from sikula_cli.config import _resolve_state_dir
 
 
@@ -55,6 +56,9 @@ def register_parser(subparsers) -> tuple[argparse.ArgumentParser, argparse.Argum
 
 
 def _pid_running(pid: int) -> bool:
+    windows_running = windows_pid_running(pid)
+    if windows_running is not None:
+        return windows_running
     try:
         os.kill(pid, 0)
         return True

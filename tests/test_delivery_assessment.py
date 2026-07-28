@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -849,7 +850,8 @@ def test_cmd_delivery_assess_rejects_control_characters_in_task_display_path(
     control: str,
 ) -> None:
     task_file = f"tasks/unsafe{control}name.md"
-    _write_task(tmp_path, task_file)
+    if os.name != "nt":
+        _write_task(tmp_path, task_file)
     calls: list[dict] = []
     monkeypatch.chdir(tmp_path)
 

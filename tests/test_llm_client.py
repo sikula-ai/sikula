@@ -13,7 +13,7 @@ import threading
 import time
 from io import StringIO
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -42,6 +42,7 @@ from core.llm_client import (
     _antigravity_require_supported_version,
     _antigravity_redact_diagnostic,
     _antigravity_result_error,
+    _antigravity_sanitize_readonly_output,
     _antigravity_snapshot_changed,
     _antigravity_validate_workspace_symlink,
     _antigravity_validate_workspace_symlinks,
@@ -60,11 +61,22 @@ from core.llm_client import (
     _run_agent_subprocess_streaming,
     _opencode_agent_env,
     _opencode_parse_text,
+    _run_provider_cli,
     _run_opencode_streaming,
     _terminate_process,
     create_llm_client,
 )
 from core.llm_client import AntigravityClient, ClaudeClient, CodexClient, GeminiClient, OpenCodeClient
+from core.subprocess_utils import (
+    _resume_windows_process,
+    _windows_batch_argument,
+    attach_windows_process_job,
+    release_windows_process_job,
+    resolve_windows_batch_command,
+    run_windows_shell_process,
+    start_windows_process_job,
+    terminate_windows_process_tree,
+)
 
 
 class TestCreateLlmClient:
@@ -391,6 +403,7 @@ class TestStreamingProcessHelpers:
         process.kill.assert_called_once()
         assert process.wait.call_count == 2
 
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group signaling")
     def test_terminate_process_group_escalates_after_main_process_exited(self):
         process = MagicMock()
         process.poll.return_value = 0
@@ -409,6 +422,113 @@ class TestStreamingProcessHelpers:
         process.terminate.assert_not_called()
         process.kill.assert_not_called()
 
+    def test_windows_process_group_uses_taskkill(self):
+        process = MagicMock(pid=1234)
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        taskkill_result = MagicMock(returncode=0)
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils.subprocess.run", return_value=taskkill_result) as run,
+        ):
+            assert terminate_windows_process_tree(process) is True
+
+        process.send_signal.assert_not_called()
+        run.assert_called_once_with(
+            ["taskkill", "/PID", "1234", "/T", "/F"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+
+    def test_windows_process_job_cleans_up_after_leader_exits(self):
+        process = MagicMock(pid=1234)
+        process._sikula_windows_job_handle = 42
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        kernel32 = MagicMock()
+        kernel32.TerminateJobObject.return_value = True
+        kernel32.CloseHandle.return_value = True
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils._windows_kernel32", return_value=kernel32),
+            patch("core.subprocess_utils.subprocess.run") as run,
+        ):
+            assert terminate_windows_process_tree(process) is True
+
+        assert kernel32.TerminateJobObject.call_args.args[0].value == 42
+        assert kernel32.CloseHandle.call_args.args[0].value == 42
+        assert process._sikula_windows_job_handle is None
+        process.wait.assert_called_once_with(timeout=5)
+        run.assert_not_called()
+
+    def test_windows_process_job_is_attached_and_released(self):
+        process = MagicMock(pid=1234, _handle=5678)
+        kernel32 = MagicMock()
+        kernel32.CreateJobObjectW.return_value = 42
+        kernel32.SetInformationJobObject.return_value = True
+        kernel32.AssignProcessToJobObject.return_value = True
+        kernel32.CloseHandle.return_value = True
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils._windows_kernel32", return_value=kernel32),
+        ):
+            assert attach_windows_process_job(process) is True
+            assert process._sikula_windows_job_handle == 42
+            assert release_windows_process_job(process) is True
+
+        assert process._sikula_windows_job_handle is None
+        assert kernel32.AssignProcessToJobObject.call_args.args[1].value == 5678
+        assert kernel32.TerminateJobObject.call_args.args[0].value == 42
+        assert kernel32.CloseHandle.call_args.args[0].value == 42
+
+    def test_windows_suspended_process_resumes_primary_thread(self):
+        process = MagicMock(pid=1234)
+        kernel32 = MagicMock()
+        kernel32.CreateToolhelp32Snapshot.return_value = 42
+        kernel32.OpenThread.return_value = 43
+        kernel32.ResumeThread.return_value = 1
+
+        def first_thread(_snapshot, entry_pointer):
+            entry_pointer._obj.th32OwnerProcessID = 1234
+            entry_pointer._obj.th32ThreadID = 5678
+            return True
+
+        kernel32.Thread32First.side_effect = first_thread
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils._windows_kernel32", return_value=kernel32),
+        ):
+            assert _resume_windows_process(process) is True
+
+        kernel32.OpenThread.assert_called_once_with(0x0002, False, 5678)
+        kernel32.ResumeThread.assert_called_once_with(43)
+        assert kernel32.CloseHandle.call_args_list == [call(43), call(42)]
+
+    def test_windows_process_job_attaches_before_resume(self):
+        process = MagicMock(_handle=1234)
+        events: list[str] = []
+
+        with (
+            patch(
+                "core.subprocess_utils.attach_windows_process_job",
+                side_effect=lambda _process: events.append("attach") or True,
+            ),
+            patch(
+                "core.subprocess_utils._resume_windows_process",
+                side_effect=lambda _process: events.append("resume") or True,
+            ),
+        ):
+            assert start_windows_process_job(process) is True
+
+        assert events == ["attach", "resume"]
+
     def test_streaming_agent_popen_environment_os_error_is_fatal(self, tmp_path: Path):
         with (
             patch(
@@ -424,6 +544,153 @@ class TestStreamingProcessHelpers:
                 timeout=30,
                 provider="provider",
             )
+
+    def test_streaming_agent_resolves_windows_batch_wrapper(self, tmp_path: Path):
+        resolved = r"C:\Tools\provider.CMD"
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils.shutil.which", return_value=resolved),
+            patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}),
+            patch("core.llm_client.subprocess.Popen", side_effect=FileNotFoundError) as popen,
+            pytest.raises(LLMConfigurationError, match="provider CLI not found"),
+        ):
+            _run_agent_subprocess_streaming(
+                ["provider", "agent"],
+                cwd=tmp_path,
+                env=None,
+                timeout=30,
+                provider="provider",
+            )
+
+        assert popen.call_args.args[0].endswith(r'/c "%_SIKULA_BATCH_COMMAND% %_SIKULA_BATCH_ARG_0%"')
+        assert popen.call_args.kwargs["executable"] == r"C:\Windows\System32\cmd.exe"
+        assert popen.call_args.kwargs["creationflags"] == 0x00000204
+        assert popen.call_args.kwargs["env"]["_SIKULA_BATCH_COMMAND"] == r"C:\Tools\provider.CMD"
+        assert popen.call_args.kwargs["env"]["_SIKULA_BATCH_ARG_0"] == "agent"
+
+    def test_streaming_agent_pins_utf8_pipe_encoding(self, tmp_path: Path):
+        # The prompt is written to stdin on the streaming path; the pipe must use
+        # UTF-8 so a locale codec (e.g. cp1250) cannot fail to encode the prompt.
+        with (
+            patch("core.llm_client.subprocess.Popen", side_effect=FileNotFoundError) as popen,
+            pytest.raises(LLMConfigurationError),
+        ):
+            _run_agent_subprocess_streaming(
+                ["provider", "agent"],
+                cwd=tmp_path,
+                env=None,
+                timeout=30,
+                provider="provider",
+            )
+        assert popen.call_args.kwargs["encoding"] == "utf-8"
+        assert popen.call_args.kwargs["errors"] == "replace"
+        assert popen.call_args.kwargs["text"] is True
+
+    def test_streaming_windows_process_starts_job_before_prompt(self, tmp_path: Path):
+        class RecordingStdin:
+            def __init__(self) -> None:
+                self.writes: list[str] = []
+
+            def write(self, value: str) -> int:
+                self.writes.append(value)
+                return len(value)
+
+            def close(self) -> None:
+                return None
+
+        process = MagicMock(returncode=0)
+        process.stdin = RecordingStdin()
+        process.stdout = StringIO()
+        process.stderr = StringIO()
+        process.poll.return_value = 0
+        resolved = r"C:\Tools\provider.CMD"
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils.shutil.which", return_value=resolved),
+            patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}),
+            patch("core.llm_client.subprocess.Popen", return_value=process),
+            patch("core.llm_client.start_windows_process_job", return_value=True) as start_job,
+            patch("core.llm_client.release_windows_process_job", return_value=True),
+        ):
+            result = _run_agent_subprocess_streaming(
+                ["provider", "agent"],
+                cwd=tmp_path,
+                env=None,
+                timeout=30,
+                provider="provider",
+                stdin_text="prompt",
+            )
+
+        assert result.returncode == 0
+        start_job.assert_called_once_with(process)
+        assert process.stdin.writes == ["prompt"]
+
+    def test_streaming_windows_native_process_starts_job(self, tmp_path: Path):
+        process = MagicMock(returncode=0)
+        process.stdin = StringIO()
+        process.stdout = StringIO()
+        process.stderr = StringIO()
+        process.poll.return_value = 0
+
+        with (
+            patch("core.llm_client.os.name", "nt"),
+            patch("core.subprocess_utils.shutil.which", return_value=r"C:\Tools\provider.exe"),
+            patch("core.llm_client.subprocess.Popen", return_value=process) as popen,
+            patch("core.llm_client.start_windows_process_job", return_value=True) as start_job,
+        ):
+            result = _run_agent_subprocess_streaming(
+                ["provider", "agent"],
+                cwd=tmp_path,
+                env=None,
+                timeout=30,
+                provider="provider",
+            )
+
+        assert result.returncode == 0
+        assert popen.call_args.kwargs["creationflags"] == 0x00000204
+        start_job.assert_called_once_with(process)
+
+    @pytest.mark.skipif(os.name != "nt", reason="requires Windows job objects")
+    def test_streaming_native_completion_terminates_descendant_after_leader_exits(self, tmp_path: Path):
+        started = tmp_path / "child-started"
+        survived = tmp_path / "child-survived"
+        child_script = tmp_path / "child.py"
+        child_script.write_text(
+            "import pathlib, sys, time\n"
+            "pathlib.Path(sys.argv[1]).write_text('started')\n"
+            "time.sleep(3)\n"
+            "pathlib.Path(sys.argv[2]).write_text('survived')\n",
+            encoding="utf-8",
+        )
+        parent_script = tmp_path / "parent.py"
+        parent_script.write_text(
+            "import pathlib, subprocess, sys, time\n"
+            "subprocess.Popen(\n"
+            "    [sys.executable, sys.argv[1], sys.argv[2], sys.argv[3]],\n"
+            "    stdin=subprocess.DEVNULL,\n"
+            "    stdout=subprocess.DEVNULL,\n"
+            "    stderr=subprocess.DEVNULL,\n"
+            ")\n"
+            "started = pathlib.Path(sys.argv[2])\n"
+            "deadline = time.monotonic() + 2\n"
+            "while not started.exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.01)\n",
+            encoding="utf-8",
+        )
+
+        result = _run_agent_subprocess_streaming(
+            [sys.executable, str(parent_script), str(child_script), str(started), str(survived)],
+            cwd=tmp_path,
+            env=None,
+            timeout=5,
+            provider="provider",
+        )
+
+        assert result.returncode == 0
+        assert started.exists()
+        time.sleep(2.5)
+        assert not survived.exists()
 
     def test_streaming_agent_timeout_terminates_process(self, tmp_path: Path):
         class HangingProcess:
@@ -467,6 +734,28 @@ class TestStreamingProcessHelpers:
             )
 
         assert processes[0].terminated is True
+
+    def test_streaming_agent_interruption_terminates_process_group(self, tmp_path: Path):
+        process = MagicMock(returncode=None)
+        process.stdin = StringIO()
+        process.stdout = StringIO()
+        process.stderr = StringIO()
+
+        with (
+            patch("core.llm_client.subprocess.Popen", return_value=process),
+            patch("core.llm_client.time.monotonic", side_effect=KeyboardInterrupt),
+            patch("core.llm_client._terminate_process") as terminate,
+            pytest.raises(KeyboardInterrupt),
+        ):
+            _run_agent_subprocess_streaming(
+                ["provider", "agent"],
+                cwd=tmp_path,
+                env=None,
+                timeout=30,
+                provider="provider",
+            )
+
+        terminate.assert_called_once_with(process, process_group=True)
 
     def test_streaming_agent_timeout_applies_while_stdin_write_blocks(self, tmp_path: Path):
         class BlockingStdin:
@@ -678,6 +967,72 @@ class TestStreamingProcessHelpers:
             )
 
         assert time.monotonic() - started_at < 1
+
+    @pytest.mark.skipif(os.name != "nt", reason="requires Windows process groups")
+    def test_streaming_timeout_terminates_windows_descendant(self, tmp_path: Path):
+        started = tmp_path / "child-started"
+        survived = tmp_path / "child-survived"
+        child_script = (
+            "import pathlib, sys, time\n"
+            "pathlib.Path(sys.argv[1]).write_text('started')\n"
+            "time.sleep(3)\n"
+            "pathlib.Path(sys.argv[2]).write_text('survived')\n"
+        )
+        parent_script = (
+            "import pathlib, subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, '-c', {child_script!r}, {str(started)!r}, {str(survived)!r}])\n"
+            f"started = pathlib.Path({str(started)!r})\n"
+            "deadline = time.monotonic() + 2\n"
+            "while not started.exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.01)\n"
+            "time.sleep(30)\n"
+        )
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            _run_agent_subprocess_streaming(
+                [sys.executable, "-c", parent_script],
+                cwd=tmp_path,
+                env=None,
+                timeout=1,
+                provider="provider",
+            )
+
+        assert started.exists()
+        time.sleep(2.5)
+        assert not survived.exists()
+
+    @pytest.mark.skipif(os.name != "nt", reason="requires Windows job objects")
+    def test_streaming_completion_terminates_descendant_after_parent_exits(self, tmp_path: Path):
+        started = tmp_path / "child-started"
+        survived = tmp_path / "child-survived"
+        child_script = (
+            "import pathlib, sys, time\n"
+            "pathlib.Path(sys.argv[1]).write_text('started')\n"
+            "time.sleep(3)\n"
+            "pathlib.Path(sys.argv[2]).write_text('survived')\n"
+        )
+        parent_script = (
+            "import pathlib, subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, '-c', {child_script!r}, {str(started)!r}, {str(survived)!r}], "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            f"started = pathlib.Path({str(started)!r})\n"
+            "deadline = time.monotonic() + 2\n"
+            "while not started.exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.01)\n"
+        )
+
+        result = _run_agent_subprocess_streaming(
+            [sys.executable, "-c", parent_script],
+            cwd=tmp_path,
+            env=None,
+            timeout=5,
+            provider="provider",
+        )
+
+        assert result.returncode == 0
+        assert started.exists()
+        time.sleep(2.5)
+        assert not survived.exists()
 
     def test_streaming_agent_propagates_non_pipe_stdin_write_errors(self, tmp_path: Path):
         class FailingStdin:
@@ -2056,6 +2411,276 @@ class TestOpenCodeClientCommands:
             client.run_readonly_agent("prompt", tmp_path)
 
 
+class TestResolveWindowsBatchCommand:
+    def test_preserves_command_outside_windows(self):
+        command = ["claude", "--version"]
+
+        with patch("core.subprocess_utils.os.name", "posix"):
+            assert resolve_windows_batch_command(command) == (command, None, None)
+
+    def test_windows_shell_process_uses_comspec_and_job_backed_runner(self):
+        result = MagicMock()
+
+        with (
+            patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}),
+            patch("core.subprocess_utils.run_windows_batch_process", return_value=result) as run,
+        ):
+            actual = run_windows_shell_process(
+                "mvn test && echo done",
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        assert actual is result
+        run.assert_called_once_with(
+            "mvn test && echo done",
+            executable=r"C:\Windows\System32\cmd.exe",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    @pytest.mark.parametrize("resolved", [None, r"C:\Tools\claude.exe"])
+    def test_preserves_native_or_unresolved_windows_command(self, resolved):
+        command = ["claude", "--version"]
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils.shutil.which", return_value=resolved),
+        ):
+            assert resolve_windows_batch_command(command) == (command, None, None)
+
+    @pytest.mark.parametrize("suffix", ["cmd", "CMD", "bat", "BAT"])
+    def test_routes_windows_batch_wrapper_through_comspec(self, suffix):
+        resolved = rf"C:\Program Files\Claude\claude.{suffix}"
+        command = ["claude", "-p", "--model", "claude-sonnet-4-6"]
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils.shutil.which", return_value=resolved),
+            patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}),
+        ):
+            args, executable, batch_env = resolve_windows_batch_command(command)
+
+        assert executable == r"C:\Windows\System32\cmd.exe"
+        assert args == (
+            r"C:\Windows\System32\cmd.exe /e:on /v:off /d /c "
+            r'"%_SIKULA_BATCH_COMMAND% %_SIKULA_BATCH_ARG_0% %_SIKULA_BATCH_ARG_1% '
+            r'%_SIKULA_BATCH_ARG_2%"'
+        )
+        assert batch_env is not None
+        assert batch_env["_SIKULA_BATCH_COMMAND"] == f'"{resolved}"'
+        assert [batch_env[f"_SIKULA_BATCH_ARG_{index}"] for index in range(3)] == [
+            "-p",
+            "--model",
+            "claude-sonnet-4-6",
+        ]
+
+    def test_escapes_percent_signs_in_windows_batch_wrapper_path(self):
+        resolved = r"C:\src\%TEMP%\provider.cmd"
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils.shutil.which", return_value=resolved),
+            patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}),
+        ):
+            args, executable, batch_env = resolve_windows_batch_command([resolved, "--version"])
+
+        assert executable == r"C:\Windows\System32\cmd.exe"
+        assert args == (
+            r"C:\Windows\System32\cmd.exe /e:on /v:off /d /c "
+            r'"%_SIKULA_BATCH_COMMAND% %_SIKULA_BATCH_ARG_0%"'
+        )
+        assert batch_env is not None
+        assert batch_env["_SIKULA_BATCH_COMMAND"] == r'"C:\src\%TEMP%\provider.cmd"'
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("plain", "plain"),
+            ("two words", '"two words"'),
+            ("value&whoami", '"value&whoami"'),
+            ("value|more", '"value|more"'),
+            ('say "hello"', '"say ""hello"""'),
+            ("%PATH%", '"%PATH%"'),
+            ("trailing\\", '"trailing\\\\"'),
+        ],
+    )
+    def test_quotes_windows_batch_arguments(self, value, expected):
+        assert _windows_batch_argument(value) == expected
+
+    @pytest.mark.parametrize("value", ["bad\0value", "bad\rvalue", "bad\nvalue"])
+    def test_rejects_unrepresentable_windows_batch_arguments(self, value):
+        with pytest.raises(ValueError, match="cannot contain"):
+            _windows_batch_argument(value)
+
+    def test_run_provider_cli_uses_resolved_batch_executable(self):
+        resolved = r"C:\Users\developer\AppData\Roaming\npm\claude.CMD"
+        process = MagicMock(returncode=0)
+        process.communicate.return_value = ("", "")
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils.shutil.which", return_value=resolved),
+            patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}),
+            patch("core.subprocess_utils.subprocess.Popen", return_value=process) as popen,
+            patch("core.subprocess_utils.start_windows_process_job", return_value=True) as start_job,
+        ):
+            result = _run_provider_cli(["claude", "--version"], text=True)
+
+        assert result.returncode == 0
+        start_job.assert_called_once_with(process)
+        assert popen.call_args.kwargs["executable"] == r"C:\Windows\System32\cmd.exe"
+        assert popen.call_args.kwargs["creationflags"] == 0x00000204
+        assert popen.call_args.args[0].endswith(r'/c "%_SIKULA_BATCH_COMMAND% %_SIKULA_BATCH_ARG_0%"')
+        assert popen.call_args.kwargs["env"]["_SIKULA_BATCH_COMMAND"] == resolved
+        process.communicate.assert_called_once_with(None, timeout=None)
+
+    def test_batch_provider_timeout_terminates_process_group(self):
+        resolved = r"C:\Users\developer\AppData\Roaming\npm\claude.CMD"
+        process = MagicMock(returncode=-1)
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired("claude", 10),
+            ("partial output", "partial error"),
+        ]
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils.shutil.which", return_value=resolved),
+            patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}),
+            patch("core.subprocess_utils.subprocess.Popen", return_value=process),
+            patch("core.subprocess_utils.start_windows_process_job", return_value=True),
+            patch("core.subprocess_utils.terminate_windows_process_tree", return_value=True) as terminate,
+            pytest.raises(subprocess.TimeoutExpired) as exc_info,
+        ):
+            _run_provider_cli(
+                ["claude", "-p"],
+                capture_output=True,
+                input="prompt",
+                text=True,
+                timeout=10,
+            )
+
+        terminate.assert_called_once_with(process)
+        assert exc_info.value.output == "partial output"
+        assert exc_info.value.stderr == "partial error"
+
+    def test_batch_provider_interruption_terminates_process_group(self):
+        resolved = r"C:\Users\developer\AppData\Roaming\npm\claude.CMD"
+        process = MagicMock(returncode=None)
+        process.communicate.side_effect = KeyboardInterrupt
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils.shutil.which", return_value=resolved),
+            patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}),
+            patch("core.subprocess_utils.subprocess.Popen", return_value=process),
+            patch("core.subprocess_utils.start_windows_process_job", return_value=True),
+            patch("core.subprocess_utils.terminate_windows_process_tree", return_value=True) as terminate,
+            pytest.raises(KeyboardInterrupt),
+        ):
+            _run_provider_cli(
+                ["claude", "-p"],
+                capture_output=True,
+                input="prompt",
+                text=True,
+                timeout=10,
+            )
+
+        terminate.assert_called_once_with(process)
+
+    def test_missing_provider_has_clear_error(self):
+        with patch("core.llm_client.subprocess.run", side_effect=FileNotFoundError):
+            with pytest.raises(LLMConfigurationError, match="claude CLI not found"):
+                _run_provider_cli(["claude", "--version"])
+
+    def test_run_provider_cli_pins_utf8_for_text_mode(self):
+        # The prompt is passed via input= in text mode; the pipe must use UTF-8 so
+        # characters outside the process locale codec (e.g. cp1250) do not raise.
+        result = MagicMock(returncode=0)
+        with patch("core.llm_client.subprocess.run", return_value=result) as mock_run:
+            _run_provider_cli(["claude", "-p"], text=True, input="arrow → dash —")
+        assert mock_run.call_args.kwargs["encoding"] == "utf-8"
+        assert mock_run.call_args.kwargs["errors"] == "replace"
+
+    def test_run_provider_cli_leaves_byte_mode_untouched(self):
+        result = MagicMock(returncode=0)
+        with patch("core.llm_client.subprocess.run", return_value=result) as mock_run:
+            _run_provider_cli(["claude", "--version"])
+        assert "encoding" not in mock_run.call_args.kwargs
+        assert "errors" not in mock_run.call_args.kwargs
+
+    def test_run_provider_cli_respects_explicit_encoding(self):
+        result = MagicMock(returncode=0)
+        with patch("core.llm_client.subprocess.run", return_value=result) as mock_run:
+            _run_provider_cli(["claude", "-p"], text=True, encoding="latin-1")
+        assert mock_run.call_args.kwargs["encoding"] == "latin-1"
+
+    @pytest.mark.skipif(os.name != "nt", reason="requires the Windows command processor")
+    @pytest.mark.parametrize("suffix", ["cmd", "bat"])
+    def test_windows_batch_wrapper_round_trips_arguments(self, tmp_path, suffix):
+        wrapper = tmp_path / f"provider.{suffix}"
+        wrapper.write_text(
+            f'@echo off\r\n"{sys.executable}" -c "import json,sys; print(json.dumps(sys.argv[1:]))" %*\r\n',
+            encoding="utf-8",
+        )
+        arguments = [
+            "two words",
+            "value&whoami",
+            "value|more",
+            'say "hello"',
+            "%PATH%",
+            "trailing\\",
+        ]
+
+        result = _run_provider_cli(
+            [str(wrapper), *arguments],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+
+        assert json.loads(result.stdout) == arguments
+
+    @pytest.mark.skipif(os.name != "nt", reason="requires the Windows command processor")
+    @pytest.mark.parametrize("suffix", ["cmd", "bat"])
+    def test_windows_batch_wrapper_round_trips_utf8_stdin(self, tmp_path, suffix):
+        wrapper = tmp_path / f"provider.{suffix}"
+        wrapper.write_text(
+            f'@echo off\r\n"{sys.executable}" -c "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"\r\n',
+            encoding="utf-8",
+        )
+        prompt = "Připrav změnu uživatelského profilu → hotovo — bez chyb"
+
+        result = _run_provider_cli(
+            [str(wrapper)],
+            capture_output=True,
+            check=True,
+            input=prompt,
+            text=True,
+        )
+
+        assert result.stdout == prompt
+
+    @pytest.mark.skipif(os.name != "nt", reason="requires the Windows command processor")
+    def test_windows_batch_wrapper_executes_from_percent_path(self, tmp_path):
+        wrapper_dir = tmp_path / "%TEMP%"
+        wrapper_dir.mkdir()
+        wrapper = wrapper_dir / "provider.cmd"
+        wrapper.write_text("@echo off\r\necho percent-path-ok\r\n", encoding="utf-8")
+
+        result = _run_provider_cli(
+            [str(wrapper)],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+
+        assert result.stdout.strip() == "percent-path-ok"
+
+
 class TestClaudeWriteSettings:
     def test_git_exclude_file_returns_none_outside_git_repo(self, tmp_path):
         assert _git_exclude_file(tmp_path) is None
@@ -2136,6 +2761,53 @@ class TestClaudeWriteSettings:
         assert "review this" not in cmd
         assert mock_run.call_args.kwargs["input"] == "review this"
         mock_setup.assert_called_once_with(tmp_path)
+
+    def test_run_readonly_agent_wraps_windows_cmd_installation(self, tmp_path):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        process = MagicMock(returncode=0)
+        process.communicate.return_value = ("analysis done", "")
+        resolved = r"C:\Users\developer\AppData\Roaming\npm\claude.CMD"
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils.shutil.which", return_value=resolved),
+            patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}),
+            patch("core.subprocess_utils.subprocess.Popen", return_value=process) as popen,
+            patch("core.subprocess_utils.start_windows_process_job", return_value=True),
+            patch("core.llm_client._claude_write_settings"),
+        ):
+            assert client.run_readonly_agent("review this", tmp_path) == "analysis done"
+
+        command_line = popen.call_args.args[0]
+        assert command_line.startswith(r"C:\Windows\System32\cmd.exe /e:on /v:off /d /c ")
+        assert popen.call_args.kwargs["env"]["_SIKULA_BATCH_COMMAND"] == resolved
+        assert "acceptEdits" in popen.call_args.kwargs["env"].values()
+        assert popen.call_args.kwargs["executable"] == r"C:\Windows\System32\cmd.exe"
+        assert popen.call_args.kwargs["creationflags"] == 0x00000204
+        process.communicate.assert_called_once_with("review this", timeout=1800)
+
+    def test_generate_wraps_windows_cmd_installation(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        process = MagicMock(returncode=0)
+        process.communicate.return_value = ("refined task", "")
+        resolved = r"C:\Users\developer\AppData\Roaming\npm\claude.CMD"
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils.shutil.which", return_value=resolved),
+            patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}),
+            patch("core.subprocess_utils.subprocess.Popen", return_value=process) as popen,
+            patch("core.subprocess_utils.start_windows_process_job", return_value=True),
+        ):
+            assert client.generate("system", "task") == "refined task"
+
+        assert popen.call_args.args[0].startswith(r"C:\Windows\System32\cmd.exe /e:on /v:off /d /c ")
+        assert popen.call_args.kwargs["env"]["_SIKULA_BATCH_COMMAND"] == resolved
+        assert popen.call_args.kwargs["executable"] == r"C:\Windows\System32\cmd.exe"
+        assert popen.call_args.kwargs["creationflags"] == 0x00000204
+        process.communicate.assert_called_once_with("system\n\ntask", timeout=1800)
 
     def test_generate_uses_agent_timeout(self):
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6", agent_timeout=123)
@@ -2758,6 +3430,45 @@ class TestGeminiClientCommands:
         assert "input" not in mock_run.call_args.kwargs
         assert "--approval-mode" not in cmd
 
+    def test_generate_uses_stdin_for_windows_batch_wrapper(self):
+        client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro"))
+        resolved = r"C:\Users\developer\AppData\Roaming\npm\gemini.CMD"
+        process = MagicMock(returncode=0)
+        process.communicate.return_value = (json.dumps({"response": "ok"}), "")
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils.shutil.which", return_value=resolved),
+            patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}),
+            patch("core.subprocess_utils.subprocess.Popen", return_value=process) as popen,
+            patch("core.subprocess_utils.start_windows_process_job", return_value=True),
+        ):
+            assert client.generate("system", "user") == "ok"
+
+        command_line = popen.call_args.args[0]
+        assert command_line.startswith(r"C:\Windows\System32\cmd.exe /e:on /v:off /d /c ")
+        assert popen.call_args.kwargs["env"]["_SIKULA_BATCH_COMMAND"] == resolved
+        assert popen.call_args.kwargs["env"]["_SIKULA_BATCH_ARG_3"] == "-p"
+        assert popen.call_args.kwargs["env"]["_SIKULA_BATCH_ARG_4"] == '""'
+        assert "system\n\nuser" not in popen.call_args.kwargs["env"].values()
+        process.communicate.assert_called_once_with("system\n\nuser", timeout=1800)
+
+    @pytest.mark.parametrize("extra", [None, ["--approval-mode", "yolo"]])
+    def test_windows_batch_invocation_keeps_headless_prompt_flag(self, extra):
+        client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro"))
+
+        with patch(
+            "core.llm_client.windows_batch_command_path",
+            return_value=r"C:\Users\developer\AppData\Roaming\npm\gemini.CMD",
+        ):
+            command, stdin_text = client._invocation("prompt", extra)
+
+        assert command[command.index("-p") + 1] == ""
+        assert stdin_text == "prompt"
+        assert "prompt" not in command
+        if extra is not None:
+            assert command[command.index("--approval-mode") + 1] == "yolo"
+
     def test_generate_failure_is_classified(self):
         client = GeminiClient(LLMConfig(provider="gemini", model="gemini-nope"))
         result = MagicMock(returncode=1, stdout="", stderr="invalid model")
@@ -2853,7 +3564,7 @@ class TestGeminiClientCommands:
         assert cmd[:3] == ["gemini", "--skip-trust", "--model"]
         assert "-p" in cmd
         assert cmd[cmd.index("-p") + 1] == "prompt"
-        assert "stdin_text" not in mock_run.call_args.kwargs
+        assert mock_run.call_args.kwargs["stdin_text"] is None
         assert cmd[cmd.index("--approval-mode") + 1] == "yolo"
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
         assert changed == []
@@ -2923,6 +3634,30 @@ class TestAntigravityClientCommands:
         with patch("core.llm_client._antigravity_require_supported_version"):
             yield
 
+    def test_readonly_output_sanitizes_standard_windows_file_uri(self):
+        workspace = MagicMock(spec=Path)
+        workspace.__str__.return_value = r"C:\Users\runner\AppData\Local\Temp\sikula-workspace"
+        workspace.as_posix.return_value = "C:/Users/runner/AppData/Local/Temp/sikula-workspace"
+        workspace.resolve.return_value = workspace
+        output = "See [client](file:///C:/Users/runner/AppData/Local/Temp/sikula-workspace/core/llm_client.py#L12)."
+
+        with patch("core.llm_client.os.name", "nt"):
+            sanitized = _antigravity_sanitize_readonly_output(output, workspace)
+
+        assert sanitized == "See [client](core/llm_client.py#L12)."
+
+    def test_readonly_output_sanitizes_encoded_windows_file_uri(self):
+        workspace = MagicMock(spec=Path)
+        workspace.__str__.return_value = r"C:\Users\Jane Doe\AppData\Local\Temp\sikula-workspace"
+        workspace.as_posix.return_value = "C:/Users/Jane Doe/AppData/Local/Temp/sikula-workspace"
+        workspace.resolve.return_value = workspace
+        output = "See [client](file:///C:/Users/Jane%20Doe/AppData/Local/Temp/sikula-workspace/core/llm_client.py#L12)."
+
+        with patch("core.llm_client.os.name", "nt"):
+            sanitized = _antigravity_sanitize_readonly_output(output, workspace)
+
+        assert sanitized == "See [client](core/llm_client.py#L12)."
+
     @staticmethod
     def _run_result(text: str = "ok"):
         return subprocess.CompletedProcess(["agy"], 0, text, "")
@@ -2951,7 +3686,14 @@ class TestAntigravityClientCommands:
         ) as mock_run:
             _antigravity_require_supported_version()
 
-        mock_run.assert_called_once_with(["agy", "--version"], capture_output=True, text=True, timeout=10)
+        mock_run.assert_called_once_with(
+            ["agy", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            encoding="utf-8",
+            errors="replace",
+        )
 
     def test_require_supported_version_rejects_old_version(self):
         with (
@@ -3625,7 +4367,7 @@ class TestAntigravityClientCommands:
         stdin_text = mock_run.call_args.kwargs["stdin_text"]
         assert "ANTIGRAVITY WORKSPACE BOUNDARY" in stdin_text
         assert stdin_text.count("ANTIGRAVITY WORKSPACE BOUNDARY") == 1
-        assert f"The only project root for this task is: {workspace}" in stdin_text
+        assert f"The only project root for this task is: {workspace.as_posix()}" in stdin_text
         assert "Do not search for, inspect, or modify any other checkout or repository path" in stdin_text
         assert stdin_text.endswith("prompt")
         assert changed == ["src/app.ts"]
@@ -3705,7 +4447,7 @@ class TestAntigravityClientCommands:
         node_modules = repo / "node_modules"
         node_modules.mkdir()
         try:
-            (node_modules / "hack").symlink_to("/tmp/antigravity-outside-target")
+            (node_modules / "hack").symlink_to(tmp_path.parent / "antigravity-outside-target")
         except OSError as exc:
             pytest.skip(f"symlinks are not available: {exc}")
         subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)

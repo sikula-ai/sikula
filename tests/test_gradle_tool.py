@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -10,6 +13,8 @@ import pytest
 from tools.base_tool import Sandbox
 from tools.gradle_android_tool import AndroidGradleTool
 from tools.gradle_tool import GradleBaseTool, _BUILD_CONFIG_DIRS, _BUILD_CONFIG_SUFFIXES
+
+_SHELL_RUNNER = "tools.gradle_tool.run_windows_shell_process" if os.name == "nt" else "tools.gradle_tool.subprocess.run"
 
 
 def _make_tool(root: Path, **kwargs) -> AndroidGradleTool:
@@ -64,6 +69,132 @@ class TestGradleBaseToolRun:
         _, kwargs = mock.call_args
         assert kwargs["cwd"] == tmp_path.resolve()
 
+    def test_replaces_undecodable_output_with_locale_encoding(self, tmp_path: Path):
+        tool = _make_tool(tmp_path)
+        with patch("tools.gradle_tool.subprocess.run", return_value=_mock_run()) as mock:
+            tool.compile_check()
+        assert mock.call_args.kwargs["errors"] == "replace"
+        assert "encoding" not in mock.call_args.kwargs
+
+    def test_windows_invokes_gradlew_bat(self, tmp_path: Path):
+        resolved = str(tmp_path.resolve() / "gradlew.bat")
+        with (
+            patch("tools.gradle_tool.os.name", "nt"),
+            patch("core.subprocess_utils.shutil.which", return_value=resolved),
+            patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}),
+            patch("tools.gradle_tool.run_windows_batch_process", return_value=_mock_run()) as run,
+        ):
+            tool = _make_tool(tmp_path)
+            tool.compile_check()
+
+        assert str(tool._gradlew).endswith("gradlew.bat")
+        assert run.call_args.args[0].endswith(r'/c "%_SIKULA_BATCH_COMMAND% %_SIKULA_BATCH_ARG_0%"')
+        assert run.call_args.kwargs["executable"] == r"C:\Windows\System32\cmd.exe"
+        assert run.call_args.kwargs["env"]["_SIKULA_BATCH_COMMAND"] == resolved
+        assert run.call_args.kwargs["env"]["_SIKULA_BATCH_ARG_0"] == "compileDebugKotlin"
+        assert run.call_args.kwargs["timeout"] == 1800
+
+    def test_posix_invokes_extensionless_gradlew(self, tmp_path: Path):
+        with (
+            patch("tools.gradle_tool.os.name", "posix"),
+            patch("tools.gradle_tool.subprocess.run", return_value=_mock_run()) as mock,
+        ):
+            tool = _make_tool(tmp_path)
+            tool.compile_check()
+
+        assert str(tool._gradlew).endswith("gradlew")
+        assert not str(tool._gradlew).endswith(".bat")
+        assert mock.call_args.args[0][0].endswith("gradlew")
+        assert "executable" not in mock.call_args.kwargs
+
+    @pytest.mark.skipif(os.name != "nt", reason="requires the Windows command processor")
+    def test_windows_gradle_batch_wrapper_executes(self, tmp_path: Path):
+        wrapper = tmp_path / "gradlew.bat"
+        wrapper.write_text("@echo off\r\necho TASK:%1\r\n", encoding="utf-8")
+        tool = _make_tool(tmp_path)
+
+        result = tool._run("classes")
+
+        assert result.success
+        assert "TASK:classes" in result.output
+
+    @pytest.mark.skipif(os.name != "nt", reason="requires Windows process groups")
+    def test_windows_gradle_timeout_terminates_descendant(self, tmp_path: Path):
+        started = tmp_path / "child-started"
+        survived = tmp_path / "child-survived"
+        child_script = tmp_path / "child.py"
+        child_script.write_text(
+            "import pathlib, sys, time\n"
+            "pathlib.Path(sys.argv[1]).write_text('started')\n"
+            "time.sleep(3)\n"
+            "pathlib.Path(sys.argv[2]).write_text('survived')\n",
+            encoding="utf-8",
+        )
+        parent_script = tmp_path / "parent.py"
+        parent_script.write_text(
+            "import pathlib, subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, {str(child_script)!r}, {str(started)!r}, {str(survived)!r}])\n"
+            f"started = pathlib.Path({str(started)!r})\n"
+            "deadline = time.monotonic() + 2\n"
+            "while not started.exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.01)\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        wrapper = tmp_path / "gradlew.bat"
+        wrapper.write_text(
+            f'@echo off\r\n"{sys.executable}" "{parent_script}"\r\n',
+            encoding="utf-8",
+        )
+        tool = _make_tool(tmp_path)
+
+        result = tool._run("classes", timeout=1)
+
+        assert not result.success
+        assert started.exists()
+        time.sleep(2.5)
+        assert not survived.exists()
+
+    @pytest.mark.skipif(os.name != "nt", reason="requires Windows job objects")
+    def test_windows_gradle_completion_terminates_descendant_after_wrapper_exits(self, tmp_path: Path):
+        started = tmp_path / "child-started"
+        survived = tmp_path / "child-survived"
+        child_script = tmp_path / "child.py"
+        child_script.write_text(
+            "import pathlib, sys, time\n"
+            "pathlib.Path(sys.argv[1]).write_text('started')\n"
+            "time.sleep(3)\n"
+            "pathlib.Path(sys.argv[2]).write_text('survived')\n",
+            encoding="utf-8",
+        )
+        parent_script = tmp_path / "parent.py"
+        parent_script.write_text(
+            "import pathlib, subprocess, sys, time\n"
+            "subprocess.Popen(\n"
+            "    [sys.executable, sys.argv[1], sys.argv[2], sys.argv[3]],\n"
+            "    stdout=subprocess.DEVNULL,\n"
+            "    stderr=subprocess.DEVNULL,\n"
+            ")\n"
+            "started = pathlib.Path(sys.argv[2])\n"
+            "deadline = time.monotonic() + 2\n"
+            "while not started.exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.01)\n",
+            encoding="utf-8",
+        )
+        wrapper = tmp_path / "gradlew.bat"
+        wrapper.write_text(
+            f'@echo off\r\n"{sys.executable}" "{parent_script}" "{child_script}" "{started}" "{survived}"\r\n',
+            encoding="utf-8",
+        )
+        tool = _make_tool(tmp_path)
+
+        result = tool._run("classes", timeout=5)
+
+        assert result.success
+        assert started.exists()
+        time.sleep(2.5)
+        assert not survived.exists()
+
 
 class TestAndroidGradleToolTasks:
     def test_compile_check_uses_configured_task(self, tmp_path: Path):
@@ -98,21 +229,21 @@ class TestAndroidGradleToolTasks:
 class TestGradleBaseToolRunCheck:
     def test_uses_command_from_config(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("detekt", {"command": "./gradlew detektMain"})
         args, _ = mock.call_args
         assert args[0] == "./gradlew detektMain"
 
     def test_falls_back_to_name_when_no_command(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("lint", {})
         args, _ = mock.call_args
         assert args[0] == "lint"
 
     def test_timeout_from_config(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("detekt", {"command": "./gradlew detekt", "timeout": "300"})
         _, kwargs = mock.call_args
         assert kwargs["timeout"] == 300
@@ -200,14 +331,21 @@ class TestAndroidGradleToolEnvFiles:
 class TestGradleBaseToolRunShell:
     def test_success_returns_output(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", return_value=_mock_run(stdout="ok")):
+        with patch(_SHELL_RUNNER, return_value=_mock_run(stdout="ok")):
             result = tool.run_check("lint", {"command": "./gradlew lintDebug"})
         assert result.success
         assert "ok" in result.output
 
+    def test_replaces_undecodable_output_with_locale_encoding(self, tmp_path: Path):
+        tool = _make_tool(tmp_path)
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
+            tool.run_check("lint", {"command": "./gradlew lintDebug"})
+        assert mock.call_args.kwargs["errors"] == "replace"
+        assert "encoding" not in mock.call_args.kwargs
+
     def test_nonzero_returncode_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", return_value=_mock_run(returncode=1, stderr="FAILED")):
+        with patch(_SHELL_RUNNER, return_value=_mock_run(returncode=1, stderr="FAILED")):
             result = tool.run_check("lint", {"command": "./gradlew lintDebug"})
         assert not result.success
         assert "FAILED" in result.error
@@ -215,7 +353,7 @@ class TestGradleBaseToolRunShell:
     def test_timeout_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
         with patch(
-            "tools.gradle_tool.subprocess.run",
+            _SHELL_RUNNER,
             side_effect=__import__("subprocess").TimeoutExpired("cmd", 1),
         ):
             result = tool.run_check("lint", {"command": "./gradlew lintDebug"})
@@ -224,7 +362,7 @@ class TestGradleBaseToolRunShell:
 
     def test_unexpected_exception_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", side_effect=OSError("not found")):
+        with patch(_SHELL_RUNNER, side_effect=OSError("not found")):
             result = tool.run_check("lint", {"command": "./gradlew lintDebug"})
         assert not result.success
         assert "not found" in result.error

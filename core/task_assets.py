@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
 import mimetypes
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import subprocess
 from typing import Any, Iterable
@@ -1447,11 +1447,12 @@ def _normalize_asset_path_candidate(raw_path: str) -> str | None:
     candidate = candidate.rstrip(".,;:")
     if not candidate or candidate.startswith("#"):
         return None
-    parsed = urlsplit(candidate)
-    if parsed.scheme and parsed.scheme.lower() not in {"file"}:
-        return None
-    if parsed.scheme.lower() == "file":
-        candidate = parsed.path
+    if not PureWindowsPath(candidate).is_absolute():
+        parsed = urlsplit(candidate)
+        if parsed.scheme and parsed.scheme.lower() not in {"file"}:
+            return None
+        if parsed.scheme.lower() == "file":
+            candidate = parsed.path
     if not _asset_candidate_has_supported_extension(candidate):
         return None
     if not _asset_candidate_has_directory(candidate):
@@ -1519,12 +1520,17 @@ def _asset_reference_metadata(
     declared_sha256: str | None = None,
 ) -> dict[str, Any] | None:
     requested_path = Path(path_text)
-    candidate_path = requested_path if requested_path.is_absolute() else project_root / requested_path
-    resolved_path = candidate_path.resolve(strict=False)
-    try:
-        project_path = resolved_path.relative_to(project_root.resolve()).as_posix()
-    except ValueError:
+    foreign_windows_absolute = PureWindowsPath(path_text).is_absolute() and not requested_path.is_absolute()
+    if foreign_windows_absolute:
+        resolved_path = None
         project_path = ""
+    else:
+        candidate_path = requested_path if requested_path.is_absolute() else project_root / requested_path
+        resolved_path = candidate_path.resolve(strict=False)
+        try:
+            project_path = resolved_path.relative_to(project_root.resolve()).as_posix()
+        except ValueError:
+            project_path = ""
     raw_paths = [raw_path] if raw_path and raw_path != path_text else []
     requested_target = requested_target or ""
     source_license = source_license or ""
@@ -1544,6 +1550,7 @@ def _asset_reference_metadata(
             declared_sha256=declared_sha256,
         ).to_dict(include_internal=True)
 
+    assert resolved_path is not None
     if not resolved_path.exists():
         return AssetReference(
             path=path_text,

@@ -11,6 +11,8 @@ from pathlib import Path
 import pytest
 import sikula_cli.status as status_cli
 
+from core.subprocess_utils import windows_pid_running
+
 cmd_status = status_cli.cmd_status
 _pid_running = status_cli._pid_running
 
@@ -143,6 +145,46 @@ class TestPidRunning:
 
     def test_nonexistent_pid_returns_false(self):
         assert _pid_running(999999999) is False
+
+    def test_windows_probe_does_not_call_os_kill(self):
+        from unittest.mock import patch
+
+        with (
+            patch("sikula_cli.status.windows_pid_running", return_value=False) as probe,
+            patch("sikula_cli.status.os.kill") as kill,
+        ):
+            assert _pid_running(1234) is False
+
+        probe.assert_called_once_with(1234)
+        kill.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("exit_code", "expected"),
+        [
+            (259, True),
+            (0, False),
+        ],
+    )
+    def test_windows_probe_uses_process_exit_code(self, exit_code: int, expected: bool):
+        from unittest.mock import MagicMock, patch
+
+        kernel32 = MagicMock()
+        kernel32.OpenProcess.return_value = 42
+
+        def set_exit_code(_handle, exit_code_pointer):
+            exit_code_pointer._obj.value = exit_code
+            return True
+
+        kernel32.GetExitCodeProcess.side_effect = set_exit_code
+
+        with (
+            patch("core.subprocess_utils.os.name", "nt"),
+            patch("core.subprocess_utils._windows_kernel32", return_value=kernel32),
+        ):
+            assert windows_pid_running(1234) is expected
+
+        kernel32.OpenProcess.assert_called_once_with(0x1000, False, 1234)
+        kernel32.CloseHandle.assert_called_once_with(42)
 
 
 class TestCmdStatusInterrupted:

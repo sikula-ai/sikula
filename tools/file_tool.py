@@ -15,7 +15,7 @@ class FileTool(BaseTool):
         try:
             self.sandbox.check_read(p)
             full = (self._root / p).resolve()
-            return ToolResult(success=True, output=full.read_text())
+            return ToolResult(success=True, output=full.read_text(encoding="utf-8"))
         except Exception as e:
             return ToolResult(success=False, output="", error=str(e))
 
@@ -25,7 +25,7 @@ class FileTool(BaseTool):
             self.sandbox.check_write(p)
             full = (self._root / p).resolve()
             full.parent.mkdir(parents=True, exist_ok=True)
-            full.write_text(content)
+            full.write_text(content, encoding="utf-8")
             return ToolResult(success=True, output=f"Written: {path}")
         except Exception as e:
             return ToolResult(success=False, output="", error=str(e))

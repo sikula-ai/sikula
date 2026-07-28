@@ -25,7 +25,7 @@
 | `GradleBaseTool` | `tools/gradle_tool.py` | Shared Gradle mechanics (`_run`, `run_check`, `is_build_config_file`); subclassed by Android and JVM variants |
 | `AndroidGradleTool` | `tools/gradle_android_tool.py` | `BuildTool` implementation for Android / Gradle |
 | `JvmGradleTool` | `tools/gradle_jvm_tool.py` | `BuildTool` implementation for JVM backends (Spring Boot, Quarkus, Micronaut, …) |
-| `MavenTool` | `tools/maven_tool.py` | `BuildTool` implementation for Maven projects; auto-detects `./mvnw` |
+| `MavenTool` | `tools/maven_tool.py` | `BuildTool` implementation for Maven projects; auto-detects `mvnw` or `mvnw.cmd` |
 | `NodeTool` | `tools/node_tool.py` | `BuildTool` implementation for Node.js / TypeScript / JavaScript projects; detects npm/pnpm/yarn/bun |
 | `PythonTool` | `tools/python_tool.py` | `BuildTool` implementation for Python / pytest |
 | `CargoTool` | `tools/cargo_tool.py` | `BuildTool` implementation for Rust / Cargo; failed `cargo test` output is reduced with Cargo-aware failure-block extraction before generic diagnostic truncation |
@@ -1816,7 +1816,9 @@ Sikula processes at once is still unsupported.
 The orchestrator loop calls a small fixed interface on the registered `"build"` tool.
 `env_files()` is a static method called by `cmd_run()` in `sikula_cli/run.py` and `cmd_review --fix` in `sikula_cli/review.py` when creating a worktree.
 Everything else (assemble, …) are platform-specific extras on the subclass. BuildTool methods
-return `ToolResult`.
+return `ToolResult`. Text subprocess output keeps the platform-default decoder and uses
+replacement error handling so malformed or mismatched bytes cannot turn a completed build
+command into a decoding failure.
 
 | Method | Contract | AndroidGradleTool impl |
 |---|---|---|
@@ -1989,16 +1991,22 @@ All keys live under `build:` in `.sikula/config.yaml`.
 | `test_timeout` | `600` | Timeout in seconds for `run_tests()` |
 | `checks` | `[]` | Named quality checks — same structure as AndroidGradleTool |
 
+On Windows, Gradle-based tools select `gradlew.bat` and Maven selects `mvnw.cmd`;
+both route wrappers through the shared batch-command resolver. On other platforms
+they continue to execute the extensionless wrappers directly. Python dependency
+sync invokes the active interpreter as an argument vector so interpreter paths with
+spaces remain valid.
+
 #### `build` config keys — MavenTool (`project.build_tool: maven`)
 
 All keys live under `build:` in `.sikula/config.yaml`.
 
 | Key | Default | Description |
 |---|---|---|
-| `compile_command` | `./mvnw compile` (or `mvn compile`) | Shell command run by `compile_check()`. Auto-detects `./mvnw`; falls back to `mvn` on PATH. |
-| `test_command` | `./mvnw test` | Shell command run by `run_tests()` |
-| `sync_command` | `./mvnw dependency:resolve --batch-mode` | Shell command run by `sync()` |
-| `presync_command` | `./mvnw generate-sources --batch-mode` | Shell command run by `generate_sources()` (presync phase) |
+| `compile_command` | platform wrapper `compile` (or `mvn compile`) | Optional shell-command override for `compile_check()`. The default auto-detects `mvnw` or `mvnw.cmd` and otherwise uses `mvn` from PATH. |
+| `test_command` | platform wrapper `test` | Optional shell-command override for `run_tests()` |
+| `sync_command` | platform wrapper `dependency:resolve --batch-mode` | Optional shell-command override for `sync()` |
+| `presync_command` | platform wrapper `generate-sources --batch-mode` | Optional shell-command override for `generate_sources()` (presync phase) |
 | `presync_clean` | `false` | Run `mvn clean` before `presync_command` |
 | `sync_timeout` | `300` | Timeout in seconds for `sync()` and `generate_sources()` |
 | `compile_timeout` | `600` | Timeout in seconds for `compile_check()` |
@@ -2211,6 +2219,17 @@ CLI-backed providers should pass large prompts through stdin or another non-argv
 when the provider CLI supports that mode. Reviewer, analyst, and implementation prompts can
 exceed operating-system command-line argument limits on large tasks. If a provider CLI requires
 the prompt as an option value for non-interactive mode, preserve that provider contract.
+
+CLI providers and platform tools use the shared batch-command resolver in
+`core/subprocess_utils.py`. On Windows, commands resolved to `.cmd` or `.bat` wrappers are
+invoked through the configured command processor with encoded wrapper paths and arguments,
+including literal percent signs, and without a general `shell=True` fallback. Native
+executables and non-Windows commands retain direct subprocess execution. Provider text-mode
+stdin and stdout use UTF-8 independently of the process locale. Streaming provider calls use
+a Windows process group plus a Job Object for both native executables and batch wrappers.
+Batch-backed one-shot provider calls and Windows shell-backed build-tool calls use the same
+job-backed lifecycle. These paths terminate the managed process tree on timeout, caller
+interruption, detected fatal provider errors, or completion while descendants remain.
 
 CLI-backed agent calls use `_run_agent_subprocess_streaming()` for subprocess lifecycle
 management. It starts stdout/stderr reader threads, reads real provider pipes with non-line

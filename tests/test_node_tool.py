@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -23,6 +24,8 @@ from tools.node_tool import (
     node_tsc_command,
     read_node_package_scripts,
 )
+
+_SHELL_RUNNER = "tools.node_tool.run_windows_shell_process" if os.name == "nt" else "tools.node_tool.subprocess.run"
 
 
 def _make_tool(root: Path, **kwargs) -> NodeTool:
@@ -147,7 +150,7 @@ class TestNodeToolCommands:
     def test_sync_uses_npm_ci_when_lockfile_exists(self, tmp_path: Path):
         (tmp_path / "package-lock.json").write_text("")
         tool = _make_tool(tmp_path)
-        with patch("tools.node_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.sync()
         args, _ = mock.call_args
         assert args[0] == "npm ci"
@@ -155,7 +158,7 @@ class TestNodeToolCommands:
     def test_sync_uses_pnpm_install_when_lockfile_exists(self, tmp_path: Path):
         (tmp_path / "pnpm-lock.yaml").write_text("")
         tool = _make_tool(tmp_path)
-        with patch("tools.node_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.sync()
         args, _ = mock.call_args
         assert args[0] == "pnpm install --frozen-lockfile"
@@ -163,7 +166,7 @@ class TestNodeToolCommands:
     def test_sync_uses_non_frozen_install_when_package_manager_field_has_no_lockfile(self, tmp_path: Path):
         _write_package_json(tmp_path, '{"packageManager": "pnpm@9.0.0"}')
         tool = _make_tool(tmp_path)
-        with patch("tools.node_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.sync()
         args, _ = mock.call_args
         assert args[0] == "pnpm install"
@@ -171,7 +174,7 @@ class TestNodeToolCommands:
     def test_sync_uses_non_frozen_yarn_install_without_lockfile(self, tmp_path: Path):
         _write_package_json(tmp_path, '{"packageManager": "yarn@4.0.0"}')
         tool = _make_tool(tmp_path)
-        with patch("tools.node_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.sync()
         args, _ = mock.call_args
         assert args[0] == "yarn install"
@@ -190,7 +193,7 @@ class TestNodeToolCommands:
 
     def test_compile_check_runs_configured_command(self, tmp_path: Path):
         tool = _make_tool(tmp_path, compile_command="npm run typecheck")
-        with patch("tools.node_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.compile_check()
         args, _ = mock.call_args
         assert args[0] == "npm run typecheck"
@@ -198,37 +201,44 @@ class TestNodeToolCommands:
     def test_run_tests_runs_default_test_script(self, tmp_path: Path):
         _write_package_json(tmp_path, '{"scripts": {"test": "vitest run"}}')
         tool = _make_tool(tmp_path)
-        with patch("tools.node_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_tests()
         args, _ = mock.call_args
         assert args[0] == "npm test"
 
     def test_run_check_uses_command_from_task_config(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.node_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("lint", {"command": "npm run lint"})
         args, _ = mock.call_args
         assert args[0] == "npm run lint"
 
     def test_run_check_uses_custom_timeout(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.node_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("lint", {"command": "npm run lint", "timeout": "30"})
         _, kwargs = mock.call_args
         assert kwargs["timeout"] == 30
 
     def test_runs_in_project_root(self, tmp_path: Path):
         tool = _make_tool(tmp_path, compile_command="npm run build")
-        with patch("tools.node_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.compile_check()
         _, kwargs = mock.call_args
         assert kwargs["cwd"] == tmp_path.resolve()
+
+    def test_replaces_undecodable_output_with_locale_encoding(self, tmp_path: Path):
+        tool = _make_tool(tmp_path, compile_command="npm run build")
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
+            tool.compile_check()
+        assert mock.call_args.kwargs["errors"] == "replace"
+        assert "encoding" not in mock.call_args.kwargs
 
 
 class TestNodeToolResults:
     def test_success_returns_combined_output(self, tmp_path: Path):
         tool = _make_tool(tmp_path, compile_command="npm run build")
-        with patch("tools.node_tool.subprocess.run", return_value=_mock_run(stdout="ok\n", stderr="warn\n")):
+        with patch(_SHELL_RUNNER, return_value=_mock_run(stdout="ok\n", stderr="warn\n")):
             result = tool.compile_check()
         assert result.success
         assert "ok" in result.output
@@ -236,7 +246,7 @@ class TestNodeToolResults:
 
     def test_nonzero_returncode_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path, compile_command="npm run build")
-        with patch("tools.node_tool.subprocess.run", return_value=_mock_run(returncode=1, stderr="TS2322 type error")):
+        with patch(_SHELL_RUNNER, return_value=_mock_run(returncode=1, stderr="TS2322 type error")):
             result = tool.compile_check()
         assert not result.success
         assert "TS2322" in result.error
@@ -244,7 +254,7 @@ class TestNodeToolResults:
     def test_timeout_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path, compile_command="npm run build")
         with patch(
-            "tools.node_tool.subprocess.run",
+            _SHELL_RUNNER,
             side_effect=__import__("subprocess").TimeoutExpired("cmd", 1),
         ):
             result = tool.compile_check()
@@ -253,7 +263,7 @@ class TestNodeToolResults:
 
     def test_unexpected_exception_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path, compile_command="npm run build")
-        with patch("tools.node_tool.subprocess.run", side_effect=OSError("npm not found")):
+        with patch(_SHELL_RUNNER, side_effect=OSError("npm not found")):
             result = tool.compile_check()
         assert not result.success
         assert "npm not found" in result.error

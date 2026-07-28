@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -9,6 +10,8 @@ import pytest
 
 from tools.base_tool import Sandbox
 from tools.cargo_tool import CargoTool, _BUILD_CONFIG_FILES
+
+_SHELL_RUNNER = "tools.cargo_tool.run_windows_shell_process" if os.name == "nt" else "tools.cargo_tool.subprocess.run"
 
 
 def _make_tool(
@@ -38,7 +41,7 @@ def _mock_run(returncode: int = 0, stdout: str = "", stderr: str = "") -> MagicM
 class TestCargoToolRun:
     def test_success_returns_combined_output(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run(stdout="ok\n", stderr="warn\n")):
+        with patch(_SHELL_RUNNER, return_value=_mock_run(stdout="ok\n", stderr="warn\n")):
             result = tool.compile_check()
         assert result.success
         assert "ok" in result.output
@@ -46,9 +49,7 @@ class TestCargoToolRun:
 
     def test_nonzero_returncode_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch(
-            "tools.cargo_tool.subprocess.run", return_value=_mock_run(returncode=1, stderr="error: type mismatch")
-        ):
+        with patch(_SHELL_RUNNER, return_value=_mock_run(returncode=1, stderr="error: type mismatch")):
             result = tool.compile_check()
         assert not result.success
         assert "error: type mismatch" in result.error
@@ -56,7 +57,7 @@ class TestCargoToolRun:
     def test_stdout_only_failure_captured_in_error(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
         with patch(
-            "tools.cargo_tool.subprocess.run",
+            _SHELL_RUNNER,
             return_value=_mock_run(returncode=101, stdout="test test_foo ... FAILED", stderr=""),
         ):
             result = tool.run_tests()
@@ -75,7 +76,7 @@ class TestCargoToolRun:
             + "error: test failed, to rerun pass `-p example_crate --test validation_tests`\n"
         )
         with patch(
-            "tools.cargo_tool.subprocess.run",
+            _SHELL_RUNNER,
             return_value=_mock_run(returncode=101, stdout=output, stderr=""),
         ):
             result = tool.run_tests()
@@ -113,7 +114,7 @@ class TestCargoToolRun:
             + "".join(f"     Running post_failure_noise_{i}\n" for i in range(180))
         )
         with patch(
-            "tools.cargo_tool.subprocess.run",
+            _SHELL_RUNNER,
             return_value=_mock_run(returncode=101, stdout=output, stderr=""),
         ):
             result = tool.run_tests()
@@ -126,24 +127,31 @@ class TestCargoToolRun:
 
     def test_timeout_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.cargo_tool.subprocess.run", side_effect=__import__("subprocess").TimeoutExpired("cmd", 1)):
+        with patch(_SHELL_RUNNER, side_effect=__import__("subprocess").TimeoutExpired("cmd", 1)):
             result = tool.compile_check()
         assert not result.success
         assert "timed out" in result.error
 
     def test_unexpected_exception_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.cargo_tool.subprocess.run", side_effect=OSError("cargo not found")):
+        with patch(_SHELL_RUNNER, side_effect=OSError("cargo not found")):
             result = tool.compile_check()
         assert not result.success
         assert "cargo not found" in result.error
 
     def test_runs_in_project_root(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.compile_check()
         _, kwargs = mock.call_args
         assert kwargs["cwd"] == tmp_path.resolve()
+
+    def test_replaces_undecodable_output_with_locale_encoding(self, tmp_path: Path):
+        tool = _make_tool(tmp_path)
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
+            tool.compile_check()
+        assert mock.call_args.kwargs["errors"] == "replace"
+        assert "encoding" not in mock.call_args.kwargs
 
     def test_default_timeout_used(self, tmp_path: Path):
         tool = CargoTool(
@@ -151,7 +159,7 @@ class TestCargoToolRun:
             project_root=tmp_path,
             timeout=999,
         )
-        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.compile_check()
         _, kwargs = mock.call_args
         assert kwargs["timeout"] == 999
@@ -160,7 +168,7 @@ class TestCargoToolRun:
 class TestCargoToolCompileCheck:
     def test_uses_configured_compile_command(self, tmp_path: Path):
         tool = _make_tool(tmp_path, compile_command="cargo check --workspace")
-        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.compile_check()
         args, _ = mock.call_args
         assert args[0] == "cargo check --workspace"
@@ -169,7 +177,7 @@ class TestCargoToolCompileCheck:
 class TestCargoToolRunTests:
     def test_uses_configured_test_command(self, tmp_path: Path):
         tool = _make_tool(tmp_path, test_command="cargo test --workspace")
-        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_tests()
         args, _ = mock.call_args
         assert args[0] == "cargo test --workspace"
@@ -179,7 +187,7 @@ class TestCargoToolSync:
     def test_runs_locked_sync_when_lockfile_exists(self, tmp_path: Path):
         (tmp_path / "Cargo.lock").write_text("# lock\n")
         tool = _make_tool(tmp_path)
-        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             result = tool.sync()
         assert result.success
         args, _ = mock.call_args
@@ -193,7 +201,7 @@ class TestCargoToolSync:
         (workspace / "Cargo.lock").write_text("# workspace lock\n")
         (member / "Cargo.toml").write_text('[package]\nname = "app"\n')
         tool = _make_tool(member)
-        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             result = tool.sync()
         assert result.success
         args, _ = mock.call_args
@@ -206,7 +214,7 @@ class TestCargoToolSync:
             returncode=101,
             stderr="error: the lock file /tmp/Cargo.lock needs to be updated but --locked was passed",
         )
-        with patch("tools.cargo_tool.subprocess.run", side_effect=[locked_failure, _mock_run()]) as mock:
+        with patch(_SHELL_RUNNER, side_effect=[locked_failure, _mock_run()]) as mock:
             result = tool.sync()
         assert result.success
         assert [call.args[0] for call in mock.call_args_list] == ["cargo fetch --locked", "cargo fetch"]
@@ -226,7 +234,7 @@ class TestCargoToolSync:
         )
         retry_failure = _mock_run(returncode=101, stderr="error: failed to download package")
 
-        with patch("tools.cargo_tool.subprocess.run", side_effect=[locked_failure, retry_failure]):
+        with patch(_SHELL_RUNNER, side_effect=[locked_failure, retry_failure]):
             result = tool.sync()
 
         assert not result.success
@@ -237,7 +245,7 @@ class TestCargoToolSync:
         (tmp_path / "Cargo.lock").write_text("# lock\n")
         tool = _make_tool(tmp_path)
         with patch(
-            "tools.cargo_tool.subprocess.run",
+            _SHELL_RUNNER,
             return_value=_mock_run(returncode=101, stderr="error: failed to download package"),
         ) as mock:
             result = tool.sync()
@@ -248,7 +256,7 @@ class TestCargoToolSync:
 
     def test_runs_unlocked_sync_when_lockfile_is_missing(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             result = tool.sync()
         assert result.success
         args, _ = mock.call_args
@@ -261,7 +269,7 @@ class TestCargoToolSync:
         (workspace / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/app"]\n')
         (member / "Cargo.toml").write_text('[package]\nname = "app"\n')
         tool = _make_tool(member)
-        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             result = tool.sync()
         assert result.success
         args, _ = mock.call_args
@@ -269,7 +277,7 @@ class TestCargoToolSync:
 
     def test_uses_configured_sync_command(self, tmp_path: Path):
         tool = _make_tool(tmp_path, sync_command="cargo generate-lockfile --offline")
-        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             result = tool.sync()
         assert result.success
         args, _ = mock.call_args
@@ -278,7 +286,7 @@ class TestCargoToolSync:
     def test_configured_locked_sync_command_does_not_retry(self, tmp_path: Path):
         tool = _make_tool(tmp_path, sync_command="cargo fetch --locked")
         with patch(
-            "tools.cargo_tool.subprocess.run",
+            _SHELL_RUNNER,
             return_value=_mock_run(
                 returncode=101,
                 stderr="error: the lock file /tmp/Cargo.lock needs to be updated but --locked was passed",
@@ -294,21 +302,21 @@ class TestCargoToolSync:
 class TestCargoToolRunCheck:
     def test_uses_command_from_task_config(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("clippy", {"command": "cargo clippy -- -D warnings"})
         args, _ = mock.call_args
         assert args[0] == "cargo clippy -- -D warnings"
 
     def test_falls_back_to_name_when_no_command(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("cargo clippy", {})
         args, _ = mock.call_args
         assert args[0] == "cargo clippy"
 
     def test_custom_timeout_from_task_config(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.cargo_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("fmt", {"command": "cargo fmt --check", "timeout": "30"})
         _, kwargs = mock.call_args
         assert kwargs["timeout"] == 30

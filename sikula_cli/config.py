@@ -187,4 +187,4 @@ def load_config(path: Path) -> dict:
     if not path.exists():
         print(f"Config not found: {path}")
         sys.exit(1)
-    return yaml.safe_load(path.read_text())
+    return yaml.safe_load(path.read_text(encoding="utf-8"))

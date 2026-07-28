@@ -67,6 +67,13 @@ class TestXcodeToolRun:
         _, kwargs = mock.call_args
         assert kwargs["cwd"] == tmp_path.resolve()
 
+    def test_replaces_undecodable_output_with_locale_encoding(self, tmp_path: Path):
+        tool = _make_tool(tmp_path)
+        with patch("tools.xcode_tool.subprocess.run", return_value=_mock_run()) as mock:
+            tool.compile_check()
+        assert mock.call_args.kwargs["errors"] == "replace"
+        assert "encoding" not in mock.call_args.kwargs
+
 
 class TestXcodeToolProjectArgs:
     def test_uses_xcworkspace_when_present(self, tmp_path: Path):
@@ -141,8 +148,10 @@ class TestXcodeToolTasks:
 
     def test_run_tests_uses_xcresult_failure_details(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
+        run_kwargs = []
 
         def fake_run(cmd, **kwargs):
+            run_kwargs.append(kwargs)
             if cmd[0] == "xcodebuild":
                 bundle_path = Path(cmd[cmd.index("-resultBundlePath") + 1])
                 bundle_path.mkdir(parents=True)
@@ -188,6 +197,8 @@ class TestXcodeToolTasks:
         assert "CountriesAppTests.testWiring()" in result.error
         assert "/tmp/AppTests.swift:42" in result.error
         assert "Expected CountriesListView" in result.error
+        assert all(kwargs["errors"] == "replace" for kwargs in run_kwargs)
+        assert all("encoding" not in kwargs for kwargs in run_kwargs)
 
     def test_run_tests_falls_back_when_xcresult_unavailable(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
@@ -220,6 +231,8 @@ class TestXcodeToolRunCheck:
             tool.run_check("swiftlint", {"command": "swiftlint lint"})
         args, _ = mock.call_args
         assert args[0] == "swiftlint lint"
+        assert mock.call_args.kwargs["errors"] == "replace"
+        assert "encoding" not in mock.call_args.kwargs
 
     def test_falls_back_to_name_when_no_command(self, tmp_path: Path):
         tool = _make_tool(tmp_path)

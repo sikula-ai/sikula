@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from pathlib import Path
 
+from core.subprocess_utils import (
+    resolve_windows_batch_command,
+    run_windows_batch_process,
+    run_windows_shell_process,
+)
 from tools.base_tool import BuildTool, Sandbox, ToolResult, tool_error_excerpt
 
 log = logging.getLogger(__name__)
@@ -39,7 +45,9 @@ class GradleBaseTool(BuildTool):
     ) -> None:
         super().__init__(sandbox)
         self._root = project_root.resolve()
-        self._gradlew = self._root / "gradlew"
+        # Windows cannot execute the extensionless POSIX wrapper (WinError 193);
+        # Gradle ships gradlew.bat alongside it for the command processor.
+        self._gradlew = self._root / ("gradlew.bat" if os.name == "nt" else "gradlew")
         self._sync_timeout = sync_timeout
         self._compile_timeout = compile_timeout
         self._test_timeout = test_timeout
@@ -47,13 +55,22 @@ class GradleBaseTool(BuildTool):
     def _run(self, *args: str, timeout: int = 300) -> ToolResult:
         log.info(f"$ {self._gradlew} {' '.join(args)}  [cwd: {self._root}]  (timeout {timeout}s)")
         try:
-            r = subprocess.run(
-                [str(self._gradlew), *args],
-                capture_output=True,
-                text=True,
-                cwd=self._root,
-                timeout=timeout,
-            )
+            command, executable, batch_env = resolve_windows_batch_command([str(self._gradlew), *args])
+            run_kwargs = {
+                "capture_output": True,
+                "text": True,
+                "errors": "replace",
+                "cwd": self._root,
+                "timeout": timeout,
+            }
+            if executable is not None:
+                run_kwargs["env"] = batch_env
+                r = run_windows_batch_process(command, executable=executable, **run_kwargs)
+            else:
+                r = subprocess.run(
+                    command,
+                    **run_kwargs,
+                )
             output = r.stdout + r.stderr
             if r.returncode != 0:
                 return ToolResult(success=False, output=output, error=tool_error_excerpt(output))
@@ -66,14 +83,17 @@ class GradleBaseTool(BuildTool):
     def _run_shell(self, command: str, timeout: int = 300) -> ToolResult:
         log.info(f"$ {command}  [cwd: {self._root}]  (timeout {timeout}s)")
         try:
-            r = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                cwd=self._root,
-                timeout=timeout,
-            )
+            run_kwargs = {
+                "capture_output": True,
+                "text": True,
+                "errors": "replace",
+                "cwd": self._root,
+                "timeout": timeout,
+            }
+            if os.name == "nt":
+                r = run_windows_shell_process(command, **run_kwargs)
+            else:
+                r = subprocess.run(command, shell=True, **run_kwargs)
             output = r.stdout + r.stderr
             if r.returncode != 0:
                 return ToolResult(success=False, output=output, error=tool_error_excerpt(output))

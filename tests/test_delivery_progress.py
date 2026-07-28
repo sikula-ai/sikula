@@ -623,25 +623,26 @@ def test_delivery_status_projects_paths_relative_to_project_root(tmp_path: Path)
     assert data["progress_path"] == ".sikula/state/delivery/delivery-status-demo/progress.json"
 
 
-def test_delivery_status_result_to_dict_relativizes_plan_paths() -> None:
+def test_delivery_status_result_to_dict_relativizes_plan_paths(tmp_path: Path) -> None:
     from core.delivery_progress import DeliveryStatusResult
     from core.delivery_plan import DeliveryPlan, DeliveryRepository, DeliveryComponent
 
+    project_root = tmp_path / "project"
     plan = DeliveryPlan(
         schema_version=1,
         plan_id="plan",
         title="title",
         final_branch="branch",
-        repositories=[DeliveryRepository(id="main", root="/opt/project/main_repo")],
+        repositories=[DeliveryRepository(id="main", root=str(project_root / "main_repo"))],
         stream_ids={"app"},
-        components=[DeliveryComponent(id="api", label="API", path="/opt/project/apps/api", stream="app")],
+        components=[DeliveryComponent(id="api", label="API", path=str(project_root / "apps" / "api"), stream="app")],
         units=[],
     )
 
     result = DeliveryStatusResult(
-        plan_path="/opt/project/plan.yaml",
-        project_root="/opt/project",
-        progress_path="/opt/project/progress.json",
+        plan_path=str(project_root / "plan.yaml"),
+        project_root=str(project_root),
+        progress_path=str(project_root / "progress.json"),
         progress_exists=True,
         status="pending",
         errors=[],
@@ -1752,27 +1753,27 @@ def test_project_relative_path(tmp_path: Path) -> None:
     assert _project_relative_path(str(file_path), str(tmp_path)) == "sub/file.txt"
 
 
-def test_sanitize_issue() -> None:
+def test_sanitize_issue(tmp_path: Path) -> None:
     from core.delivery_plan import DeliveryPlanIssue
     from core.delivery_progress import _sanitize_issue
 
-    issue = DeliveryPlanIssue(
-        "error", "code", "Issue in /opt/project/plan.yaml and /opt/project/progress.json", "/opt/project/plan.yaml"
-    )
+    project_root = tmp_path / "project"
+    plan_path = str(project_root / "plan.yaml")
+    progress_path = str(project_root / "progress.json")
+    issue = DeliveryPlanIssue("error", "code", f"Issue in {plan_path} and {progress_path}", plan_path)
 
     # Without project root, returns unchanged
-    assert _sanitize_issue(issue, None, "/opt/project/plan.yaml", "/opt/project/progress.json") is issue
-    assert _sanitize_issue(issue, ".", "/opt/project/plan.yaml", "/opt/project/progress.json") is issue
+    assert _sanitize_issue(issue, None, plan_path, progress_path) is issue
+    assert _sanitize_issue(issue, ".", plan_path, progress_path) is issue
 
     # Sanitizes absolute paths inside messages and path
-    sanitized = _sanitize_issue(issue, "/opt/project", "/opt/project/plan.yaml", "/opt/project/progress.json")
+    sanitized = _sanitize_issue(issue, str(project_root), plan_path, progress_path)
     assert sanitized.message == "Issue in plan.yaml and progress.json"
     assert sanitized.path == "plan.yaml"
 
     # Sanitizes project root strings not caught by exact plan/progress matches
-    issue2 = DeliveryPlanIssue(
-        "error", "code", "Error loading /opt/project/some/other/file.txt", "/opt/project/some/other/file.txt"
-    )
-    sanitized2 = _sanitize_issue(issue2, "/opt/project", "/opt/project/plan.yaml", "/opt/project/progress.json")
+    other_path = str(project_root / "some" / "other" / "file.txt")
+    issue2 = DeliveryPlanIssue("error", "code", f"Error loading {other_path}", other_path)
+    sanitized2 = _sanitize_issue(issue2, str(project_root), plan_path, progress_path)
     assert sanitized2.message == "Error loading some/other/file.txt"
     assert sanitized2.path == "some/other/file.txt"

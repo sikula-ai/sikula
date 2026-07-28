@@ -200,6 +200,30 @@ def test_detect_asset_references_accepts_structured_path_label_outside_task_asse
     assert references["designs/login-spacing.png"]["status"] == "available"
 
 
+def test_detect_asset_references_treats_windows_absolute_path_as_outside_on_every_host(tmp_path: Path):
+    path = r"C:\Users\designer\assets\login-spacing.png"
+    markdown = f"""# Fix login spacing
+
+## Assets
+
+### Reference assets
+
+- Path: `{path}`
+  - Usage: reference only.
+"""
+
+    references = detect_asset_references(
+        markdown,
+        source_path=tmp_path / ".sikula" / "tasks" / "task.md",
+        project_config=_project_config(tmp_path),
+    )
+
+    assert len(references) == 1
+    assert references[0]["path"] == path
+    assert references[0]["status"] == "outside_project"
+    assert "project_path" not in references[0]
+
+
 def test_detect_asset_references_treats_first_h1_asset_manifest_as_document_title(tmp_path: Path):
     markdown = """# Asset manifest
 

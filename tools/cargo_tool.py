@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import difflib
 import logging
+import os
 import re
 import subprocess
 from pathlib import Path
 
 from core.diagnostics import cargo_test_failure_excerpt
+from core.subprocess_utils import run_windows_shell_process
 from tools.base_tool import BuildTool, Sandbox, ToolResult, tool_error_excerpt
 
 log = logging.getLogger(__name__)
@@ -292,14 +294,17 @@ class CargoTool(BuildTool):
         t = timeout or self._timeout
         log.info(f"$ {command}  [cwd: {self._root}]  (timeout {t}s)")
         try:
-            r = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                cwd=self._root,
-                timeout=t,
-            )
+            run_kwargs = {
+                "capture_output": True,
+                "text": True,
+                "errors": "replace",
+                "cwd": self._root,
+                "timeout": t,
+            }
+            if os.name == "nt":
+                r = run_windows_shell_process(command, **run_kwargs)
+            else:
+                r = subprocess.run(command, shell=True, **run_kwargs)
             output = r.stdout + r.stderr
             if r.returncode != 0:
                 return ToolResult(success=False, output=output, error=_cargo_error_excerpt(command, output))
