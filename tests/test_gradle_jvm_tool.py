@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools.base_tool import Sandbox
 from tools.gradle_jvm_tool import JvmGradleTool
 from tools.gradle_tool import GradleBaseTool
+
+_SHELL_RUNNER = "tools.gradle_tool.run_windows_shell_process" if os.name == "nt" else "tools.gradle_tool.subprocess.run"
 
 
 def _make_tool(root: Path, **kwargs) -> JvmGradleTool:
@@ -127,14 +130,14 @@ class TestJvmGradleToolPresyncClean:
 class TestJvmGradleToolRunCheck:
     def test_uses_command_from_config(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("detekt", {"command": "./gradlew detekt"})
         args, _ = mock.call_args
         assert args[0] == "./gradlew detekt"
 
     def test_falls_back_to_name_when_no_command(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("checkstyle", {})
         args, _ = mock.call_args
         assert args[0] == "checkstyle"

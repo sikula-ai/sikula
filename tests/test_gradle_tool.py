@@ -229,21 +229,21 @@ class TestAndroidGradleToolTasks:
 class TestGradleBaseToolRunCheck:
     def test_uses_command_from_config(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("detekt", {"command": "./gradlew detektMain"})
         args, _ = mock.call_args
         assert args[0] == "./gradlew detektMain"
 
     def test_falls_back_to_name_when_no_command(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("lint", {})
         args, _ = mock.call_args
         assert args[0] == "lint"
 
     def test_timeout_from_config(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
-        with patch("tools.gradle_tool.subprocess.run", return_value=_mock_run()) as mock:
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.run_check("detekt", {"command": "./gradlew detekt", "timeout": "300"})
         _, kwargs = mock.call_args
         assert kwargs["timeout"] == 300
