@@ -10,7 +10,8 @@ from core.subprocess_utils import (
     run_windows_batch_process,
     run_windows_shell_process,
 )
-from tools.base_tool import BuildTool, Sandbox, ToolResult, tool_error_excerpt
+from core.diagnostics import validation_error_excerpt
+from tools.base_tool import BuildTool, Sandbox, ToolResult
 
 log = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ class GradleBaseTool(BuildTool):
                 )
             output = r.stdout + r.stderr
             if r.returncode != 0:
-                return ToolResult(success=False, output=output, error=tool_error_excerpt(output))
+                return ToolResult(success=False, output=output, error=validation_error_excerpt(output, limit=8000))
             return ToolResult(success=True, output=output)
         except subprocess.TimeoutExpired:
             return ToolResult(success=False, output="", error="Gradle timed out")
@@ -96,7 +97,7 @@ class GradleBaseTool(BuildTool):
                 r = subprocess.run(command, shell=True, **run_kwargs)
             output = r.stdout + r.stderr
             if r.returncode != 0:
-                return ToolResult(success=False, output=output, error=tool_error_excerpt(output))
+                return ToolResult(success=False, output=output, error=validation_error_excerpt(output, limit=8000))
             return ToolResult(success=True, output=output)
         except subprocess.TimeoutExpired:
             return ToolResult(success=False, output="", error=f"Command timed out: {command}")

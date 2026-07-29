@@ -48,6 +48,7 @@ from core.llm_client import (
     _antigravity_validate_workspace_symlinks,
     _antigravity_write_agent_prompt,
     _call_with_retry,
+    _claude_result_envelope,
     _claude_write_settings,
     _codex_parse_text,
     _codex_stream_error,
@@ -2682,6 +2683,27 @@ class TestResolveWindowsBatchCommand:
 
 
 class TestClaudeWriteSettings:
+    @staticmethod
+    def _result(
+        text: str = "",
+        *,
+        is_error: bool = False,
+        subtype: str = "success",
+        errors: list[str] | None = None,
+        api_error_status: int | None = None,
+    ) -> str:
+        payload: dict[str, object] = {
+            "type": "result",
+            "subtype": subtype,
+            "is_error": is_error,
+            "result": text,
+        }
+        if errors is not None:
+            payload["errors"] = errors
+        if api_error_status is not None:
+            payload["api_error_status"] = api_error_status
+        return json.dumps(payload)
+
     def test_git_exclude_file_returns_none_outside_git_repo(self, tmp_path):
         assert _git_exclude_file(tmp_path) is None
 
@@ -2746,7 +2768,7 @@ class TestClaudeWriteSettings:
         def fake_run(cmd, **kwargs):
             m = MagicMock()
             m.returncode = 0
-            m.stdout = "analysis done"
+            m.stdout = self._result("analysis done")
             m.stderr = ""
             return m
 
@@ -2758,6 +2780,7 @@ class TestClaudeWriteSettings:
 
         cmd = mock_run.call_args.args[0]
         assert cmd[:2] == ["claude", "-p"]
+        assert cmd[2:4] == ["--output-format", "json"]
         assert "review this" not in cmd
         assert mock_run.call_args.kwargs["input"] == "review this"
         mock_setup.assert_called_once_with(tmp_path)
@@ -2766,7 +2789,7 @@ class TestClaudeWriteSettings:
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
         client = ClaudeClient(cfg)
         process = MagicMock(returncode=0)
-        process.communicate.return_value = ("analysis done", "")
+        process.communicate.return_value = (self._result("analysis done"), "")
         resolved = r"C:\Users\developer\AppData\Roaming\npm\claude.CMD"
 
         with (
@@ -2791,7 +2814,7 @@ class TestClaudeWriteSettings:
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
         client = ClaudeClient(cfg)
         process = MagicMock(returncode=0)
-        process.communicate.return_value = ("refined task", "")
+        process.communicate.return_value = (self._result("refined task"), "")
         resolved = r"C:\Users\developer\AppData\Roaming\npm\claude.CMD"
 
         with (
@@ -2812,7 +2835,7 @@ class TestClaudeWriteSettings:
     def test_generate_uses_agent_timeout(self):
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6", agent_timeout=123)
         client = ClaudeClient(cfg)
-        result = MagicMock(returncode=0, stdout="ok\n", stderr="")
+        result = MagicMock(returncode=0, stdout=self._result("ok"), stderr="")
 
         with patch("core.llm_client.subprocess.run", return_value=result) as mock_run:
             assert client.generate("system", "user") == "ok"
@@ -2820,33 +2843,53 @@ class TestClaudeWriteSettings:
         assert mock_run.call_args.kwargs["timeout"] == 123
 
     def test_generate_failure_is_classified(self):
-        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6", retry_observer=MagicMock())
         client = ClaudeClient(cfg)
-        result = MagicMock(returncode=1, stdout="", stderr="not authenticated")
+        result = MagicMock(
+            returncode=1,
+            stdout=self._result(
+                is_error=True,
+                subtype="error_during_execution",
+                errors=["authentication failed while connecting"],
+                api_error_status=401,
+            ),
+            stderr="managed policy warning",
+        )
 
         with (
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
-            pytest.raises(LLMAuthError, match="not authenticated"),
+            pytest.raises(LLMAuthError, match="authentication failed") as exc_info,
         ):
             client.generate("system", "user")
 
+        assert "not authenticated" not in str(exc_info.value)
         assert mock_run.call_count == 1
         sleep.assert_not_called()
+        cfg.retry_observer.assert_not_called()
 
     def test_run_readonly_agent_failure_is_classified(self, tmp_path):
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
         client = ClaudeClient(cfg)
-        result = MagicMock(returncode=1, stdout="invalid model", stderr="")
+        result = MagicMock(
+            returncode=1,
+            stdout=self._result(
+                is_error=True,
+                subtype="error_during_execution",
+                errors=["invalid model claude-nope"],
+            ),
+            stderr="",
+        )
 
         with (
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
             patch("core.llm_client._claude_write_settings"),
-            pytest.raises(LLMConfigurationError, match="invalid model"),
+            pytest.raises(LLMConfigurationError, match="configuration invalid") as exc_info,
         ):
             client.run_readonly_agent("review this", tmp_path)
 
+        assert "invalid model" not in str(exc_info.value)
         assert mock_run.call_count == 1
         sleep.assert_not_called()
 
@@ -2857,7 +2900,7 @@ class TestClaudeWriteSettings:
         with (
             patch(
                 "core.llm_client._run_agent_subprocess_streaming",
-                return_value=subprocess.CompletedProcess([], 0, "done", ""),
+                return_value=subprocess.CompletedProcess([], 0, self._result("done"), ""),
             ) as mock_run,
             patch("core.llm_client._git_snapshot", return_value={}),
             patch("core.llm_client._claude_write_settings") as mock_setup,
@@ -2866,6 +2909,7 @@ class TestClaudeWriteSettings:
 
         cmd = mock_run.call_args.args[0]
         assert cmd[:2] == ["claude", "-p"]
+        assert cmd[2:4] == ["--output-format", "json"]
         assert "implement this" not in cmd
         assert mock_run.call_args.kwargs["stdin_text"] == "implement this"
         mock_setup.assert_called_once_with(tmp_path)
@@ -2873,19 +2917,391 @@ class TestClaudeWriteSettings:
     def test_run_agent_nonzero_exit_is_classified(self, tmp_path):
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
         client = ClaudeClient(cfg)
-        result = subprocess.CompletedProcess([], 1, "", "unsupported model")
+        result = subprocess.CompletedProcess(
+            [],
+            1,
+            self._result(
+                is_error=True,
+                subtype="error_during_execution",
+                errors=["unsupported model claude-nope"],
+            ),
+            "",
+        )
 
         with (
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client._run_agent_subprocess_streaming", return_value=result) as mock_run,
             patch("core.llm_client._git_snapshot", return_value={}),
             patch("core.llm_client._claude_write_settings"),
-            pytest.raises(LLMConfigurationError, match="unsupported model"),
+            pytest.raises(LLMConfigurationError, match="configuration invalid") as exc_info,
         ):
             client.run_agent("implement this", tmp_path)
 
+        assert "unsupported model" not in str(exc_info.value)
         assert mock_run.call_count == 1
         sleep.assert_not_called()
+
+    def test_run_agent_preserves_only_structured_failure_signals(self, tmp_path):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6", retry_observer=MagicMock())
+        client = ClaudeClient(cfg)
+        result = subprocess.CompletedProcess(
+            [],
+            1,
+            self._result(
+                is_error=True,
+                subtype="error_during_execution",
+                errors=["connection reset for alice@example.com with token=secret"],
+                api_error_status=500,
+            ),
+            "Permission allow rule from managed policy settings was ignored",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client._run_agent_subprocess_streaming", return_value=result) as mock_run,
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client._claude_write_settings"),
+            pytest.raises(LLMTransientError, match="connection reset") as exc_info,
+        ):
+            client.run_agent("implement this", tmp_path)
+
+        message = str(exc_info.value)
+        assert "connection reset" in message
+        assert "alice@example.com" not in message
+        assert "token=secret" not in message
+        assert "managed policy" not in message
+        assert mock_run.call_count == 4
+        assert cfg.retry_observer.call_count == 3
+
+    def test_generate_accepts_verbose_json_result_array(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        output = json.dumps(
+            [
+                {"type": "assistant", "message": {"content": "partial"}},
+                json.loads(self._result("final answer")),
+            ]
+        )
+
+        with patch("core.llm_client.subprocess.run", return_value=MagicMock(returncode=0, stdout=output, stderr="")):
+            assert client.generate("system", "user") == "final answer"
+
+    def test_generate_classifies_api_status_from_provider_error_record(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=1,
+            stdout=self._result(
+                is_error=True,
+                subtype="error_during_execution",
+                errors=['API Error: 403 {"error":{"message":"organization policy"}}'],
+            ),
+            stderr="managed policy warning",
+        )
+
+        with (
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMAuthError, match=r"authentication failed \(HTTP 403"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 1
+
+    def test_generate_does_not_classify_partial_result_text(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=1,
+            stdout=self._result(
+                "Document invalid model handling for the API.",
+                is_error=True,
+                subtype="error_during_execution",
+                errors=["connection reset"],
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMTransientError, match="connection reset"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 4
+
+    def test_generate_classifies_allowlisted_result_only_login_failure(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=1,
+            stdout=self._result(
+                "Not logged in \u00b7 Please run /login",
+                is_error=True,
+                subtype="error_during_execution",
+                errors=[],
+            ),
+            stderr="managed policy warning",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMAuthError, match="authentication failed"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    @pytest.mark.parametrize("status", [408, 409, 429])
+    def test_generate_retries_transient_http_client_error(self, status):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=1,
+            stdout=self._result(
+                is_error=True,
+                subtype="error_during_execution",
+                errors=[f"API Error: {status}"],
+                api_error_status=status,
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMTransientError, match=rf"HTTP {status}"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 4
+
+    @pytest.mark.parametrize("status", [400, 413, 422])
+    def test_generate_does_not_retry_terminal_http_client_error(self, status):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=1,
+            stdout=self._result(
+                "The request was rejected.",
+                is_error=True,
+                subtype="error_during_execution",
+                errors=[],
+                api_error_status=status,
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMConfigurationError, match=rf"configuration invalid.*HTTP {status}"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_generate_does_not_retry_model_not_found(self):
+        cfg = LLMConfig(provider="claude", model="claude-does-not-exist")
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=1,
+            stdout=self._result(
+                "The selected model may not exist or you may not have access to it.",
+                is_error=True,
+                subtype="error_during_execution",
+                errors=[],
+                api_error_status=404,
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMConfigurationError, match=r"configuration invalid.*HTTP 404"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "error: unknown option '--output-format'\nUsage: claude [options]",
+            "unrecognized argument '--permission-mode'",
+            "error: Found argument '--settings' which wasn't expected",
+        ],
+    )
+    def test_generate_does_not_retry_rejected_required_cli_option(self, stderr):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=2,
+            stdout="",
+            stderr=stderr,
+        )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMConfigurationError, match="rejected a required option") as exc_info,
+        ):
+            client.generate("system", "user")
+
+        assert "--output-format" not in str(exc_info.value)
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_generate_does_not_trust_unstructured_pre_envelope_stderr(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr="Managed policy warning: invalid option in a permission rule for alice@example.com",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMTransientError, match="invalid JSON result envelope") as exc_info,
+        ):
+            client.generate("system", "user")
+
+        assert "alice@example.com" not in str(exc_info.value)
+        assert mock_run.call_count == 4
+
+    def test_generate_does_not_derive_status_from_partial_result_text(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=1,
+            stdout=self._result(
+                "API Error: 403 is documented in the requested example.",
+                is_error=True,
+                subtype="error_during_execution",
+                errors=["connection reset"],
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMTransientError, match="connection reset"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 4
+
+    @pytest.mark.parametrize(
+        ("message", "expected_error", "expected_message"),
+        [
+            ("Credit balance is too low", LLMQuotaExceeded, "quota exhausted"),
+            ("Invalid model claude-nope", LLMConfigurationError, "configuration invalid"),
+        ],
+    )
+    def test_generate_classifies_result_when_api_status_proves_provider_error(
+        self,
+        message,
+        expected_error,
+        expected_message,
+    ):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=1,
+            stdout=self._result(
+                message,
+                is_error=True,
+                subtype="success",
+                errors=[],
+                api_error_status=400,
+            ),
+            stderr="managed policy warning",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(expected_error, match=expected_message),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_generate_does_not_retry_terminal_limit_subtype(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=1,
+            stdout=self._result(
+                is_error=True,
+                subtype="error_max_turns",
+                errors=["Reached maximum number of turns"],
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMConfigurationError, match="max turns"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_generate_treats_zero_exit_error_envelope_as_failure(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=0,
+            stdout=self._result(
+                is_error=True,
+                subtype="error_during_execution",
+                errors=["quota exceeded"],
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMQuotaExceeded, match="quota exhausted"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 1
+
+    def test_generate_retries_unrecognized_json_without_classifying_assistant_text(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(returncode=1, stdout='{"error":"invalid model in task prose"}', stderr="")
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMTransientError, match="invalid JSON result envelope"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 4
+
+    @pytest.mark.parametrize("output", ["{", "42"])
+    def test_result_envelope_rejects_malformed_or_non_object_json(self, output):
+        assert _claude_result_envelope(output) is None
+
+    @pytest.mark.parametrize("error", [ValueError("oversized integer"), RecursionError("nested JSON")])
+    def test_result_envelope_degrades_on_json_decoder_failures(self, error):
+        with patch("core.llm_client.json.loads", side_effect=error):
+            assert _claude_result_envelope("{}") is None
 
     def test_run_agent_timeout_is_retried(self, tmp_path):
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6", retry_observer=MagicMock())
@@ -2895,7 +3311,10 @@ class TestClaudeWriteSettings:
             patch("core.llm_client.time.sleep"),
             patch(
                 "core.llm_client._run_agent_subprocess_streaming",
-                side_effect=[subprocess.TimeoutExpired("claude", 30), subprocess.CompletedProcess([], 0, "done", "")],
+                side_effect=[
+                    subprocess.TimeoutExpired("claude", 30),
+                    subprocess.CompletedProcess([], 0, self._result("done"), ""),
+                ],
             ) as mock_run,
             patch("core.llm_client._git_snapshot", return_value={}),
             patch("core.llm_client._claude_write_settings"),

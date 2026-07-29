@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from core.diagnostics import cargo_test_failure_excerpt, diagnostic_excerpt, diagnostic_summary_lines
+from core.diagnostics import (
+    cargo_test_failure_excerpt,
+    diagnostic_excerpt,
+    diagnostic_summary_lines,
+    validation_error_excerpt,
+)
 
 
 class TestDiagnosticExcerpt:
@@ -78,6 +83,50 @@ class TestDiagnosticExcerpt:
         assert "error: marker 4" in excerpt
         assert "error: marker 5" in excerpt
         assert "... [diagnostic output omitted] ..." in excerpt
+
+    def test_gradle_excerpt_marks_omitted_middle_failure_blocks(self):
+        output = "".join(
+            f"* What went wrong:\n> Failure {index} " + ("detail " * 20) + "\n* Try:\n" for index in range(6)
+        )
+
+        excerpt = validation_error_excerpt(output, limit=1000)
+
+        assert "> Failure 0" in excerpt
+        assert "> Failure 1" in excerpt
+        assert "> Failure 4" in excerpt
+        assert "> Failure 5" in excerpt
+        assert "... [diagnostic output omitted] ..." in excerpt
+
+    def test_gradle_excerpt_distributes_limit_across_failure_blocks(self):
+        output = (
+            "* What went wrong:\n"
+            + ("first failure detail\n" * 30)
+            + "* Try:\n"
+            + "* What went wrong:\n"
+            + ("second failure detail\n" * 30)
+            + "* Try:\n"
+        )
+
+        excerpt = validation_error_excerpt(output, limit=240)
+
+        assert len(excerpt) <= 240
+        assert "first failure" in excerpt
+        assert "second failure" in excerpt
+        assert "... [truncated] ..." in excerpt
+
+    def test_gradle_excerpt_handles_limit_smaller_than_separators(self):
+        output = "".join(f"* What went wrong:\n> Failure {index}\n* Try:\n" for index in range(6))
+
+        excerpt = validation_error_excerpt(output, limit=20)
+
+        assert len(excerpt) <= 20
+
+    def test_gradle_excerpt_respects_small_shared_block_budget(self):
+        output = "".join(f"* What went wrong:\n> Failure {index}\n* Try:\n" for index in range(2))
+
+        excerpt = validation_error_excerpt(output, limit=40)
+
+        assert len(excerpt) <= 40
 
     def test_keeps_primary_compiler_diagnostic_among_many_noisy_ranges(self):
         # Realistic verbose Gradle log: many low-signal "> Task ... FAILED" ranges

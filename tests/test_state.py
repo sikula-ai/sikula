@@ -311,6 +311,69 @@ class TestJsonStateStore:
         assert len(record["error_excerpt"]) == 1000
         assert "diagnostic_summary" not in record
 
+    def test_validation_record_preserves_gradle_failure_block_in_private_excerpt(self):
+        state = TaskState(task_id="v1", task_description="validation task")
+        error = (
+            "configuration noise\n" * 200
+            + "FAILURE: Build failed with an exception.\n"
+            + "* What went wrong:\n"
+            + "Execution failed for task ':library:presync'.\n"
+            + "> Could not create directory 'C:\\workspace\\generated'.\n"
+            + "> java.nio.file.FileSystemException: filename too long\n"
+            + "* Try:\n"
+            + "Run with --stacktrace option to get the stack trace.\n"
+            + "trailing noise\n" * 200
+        )
+
+        state.record_validation("build", "failed", error=error)
+
+        excerpt = state.validation_cycle_records[0]["error_excerpt"]
+        assert "configuration noise" in excerpt
+        assert "* What went wrong:" in excerpt
+        assert "> Could not create directory 'C:\\workspace\\generated'." in excerpt
+        assert "> java.nio.file.FileSystemException: filename too long" in excerpt
+
+    def test_validation_record_keeps_diagnostics_before_short_gradle_footer(self):
+        state = TaskState(task_id="v1", task_description="validation task")
+        error = (
+            "src/main/kotlin/App.kt:42: error: unresolved reference\n"
+            "assertion failed before Gradle footer\n"
+            "* What went wrong:\n"
+            "Execution failed for task ':app:compile'.\n"
+            "> Compilation failed; see compiler error output.\n"
+            "* Try:\n"
+            "Run with --stacktrace.\n"
+        )
+
+        state.record_validation("build", "failed", error=error)
+
+        assert state.validation_cycle_records[0]["error_excerpt"] == error
+
+    def test_validation_record_preserves_multiple_gradle_failure_blocks(self):
+        state = TaskState(task_id="v1", task_description="validation task")
+        error = (
+            "FAILURE: Build completed with 2 failures.\n"
+            "* What went wrong:\n"
+            "Execution failed for task ':app:compile'.\n"
+            "> Compilation failed for module app.\n"
+            "* Try:\n"
+            "Run with --stacktrace.\n"
+            "\n"
+            "* What went wrong:\n"
+            "Execution failed for task ':library:test'.\n"
+            "> There were failing tests.\n"
+            "* Try:\n"
+            "Run with --scan.\n"
+        )
+
+        state.record_validation("build", "failed", error=error)
+
+        excerpt = state.validation_cycle_records[0]["error_excerpt"]
+        assert "Execution failed for task ':app:compile'." in excerpt
+        assert "> Compilation failed for module app." in excerpt
+        assert "Execution failed for task ':library:test'." in excerpt
+        assert "> There were failing tests." in excerpt
+
     def test_validation_record_captures_metadata(self):
         state = TaskState(task_id="v1", task_description="validation task")
 
