@@ -51,6 +51,7 @@ from core.llm_client import (
     _claude_result_envelope,
     _claude_write_settings,
     _codex_parse_text,
+    _codex_reported_tokens,
     _codex_stream_error,
     _codex_subprocess_error,
     _git_exclude_file,
@@ -144,6 +145,58 @@ class TestCallWithRetry:
         assert event["error"] == "fail"
         assert event["error_type"] == "LLMTransientError"
 
+    def test_records_each_provider_attempt_without_error_content(self):
+        events = []
+        cfg = LLMConfig(
+            provider="codex",
+            model="gpt-5.3-codex",
+            usage_observer=events.append,
+        )
+        fn = MagicMock(side_effect=[LLMTransientError("PRIVATE_PROVIDER_ERROR"), "ok"])
+
+        with patch("core.llm_client.time.sleep"):
+            assert _call_with_retry("test", fn, cfg, "generate", input_chars=42) == "ok"
+
+        assert [event["attempt"] for event in events] == [1, 2]
+        assert [event["outcome"] for event in events] == ["retryable_error", "success"]
+        assert all(event["input_chars"] == 42 for event in events)
+        assert events[0]["error_type"] == "LLMTransientError"
+        assert events[1]["output_chars"] == 2
+        assert "PRIVATE_PROVIDER_ERROR" not in json.dumps(events)
+
+    def test_records_fatal_attempt_without_retrying(self):
+        events = []
+        cfg = LLMConfig(provider="codex", usage_observer=events.append)
+        fn = MagicMock(side_effect=LLMQuotaExceeded("quota exhausted"))
+
+        with pytest.raises(LLMQuotaExceeded, match="quota exhausted"):
+            _call_with_retry("test", fn, cfg, "generate", input_chars=5)
+
+        assert fn.call_count == 1
+        assert len(events) == 1
+        assert events[0]["outcome"] == "fatal_error"
+        assert events[0]["error_type"] == "LLMQuotaExceeded"
+
+    def test_records_timeout_and_retry_as_separate_attempts(self):
+        events = []
+        cfg = LLMConfig(provider="codex", usage_observer=events.append)
+        fn = MagicMock(side_effect=[subprocess.TimeoutExpired("codex", 10), "ok"])
+
+        with patch("core.llm_client.time.sleep"):
+            assert _call_with_retry("test", fn, cfg, "generate", input_chars=5) == "ok"
+
+        assert [event["outcome"] for event in events] == ["timeout", "success"]
+        assert [event["attempt"] for event in events] == [1, 2]
+        assert events[0]["error_type"] == "TimeoutExpired"
+
+    def test_usage_observer_failure_does_not_change_provider_result(self):
+        def broken_observer(event):
+            raise RuntimeError("observer failed")
+
+        cfg = LLMConfig(provider="codex", usage_observer=broken_observer)
+
+        assert _call_with_retry("test", lambda: "ok", cfg, "generate", input_chars=1) == "ok"
+
     def test_retry_observer_error_keeps_head_and_tail_when_truncated(self):
         observer = MagicMock()
         cfg = LLMConfig(provider="codex", model="gpt-5.3-codex", retry_observer=observer)
@@ -227,6 +280,18 @@ class TestCallWithRetry:
 
         assert fn.call_count == 1
         sleep.assert_not_called()
+
+    def test_local_environment_os_error_is_observed_as_fatal(self):
+        events = []
+        cfg = LLMConfig(provider="codex", usage_observer=events.append)
+        fn = MagicMock(side_effect=PermissionError(errno.EACCES, "Permission denied", "codex"))
+
+        with pytest.raises(LLMEnvironmentError, match="local environment error"):
+            _call_with_retry("generate", fn, cfg, "generate")
+
+        assert fn.call_count == 1
+        assert events[0]["outcome"] == "fatal_error"
+        assert events[0]["error_type"] == "LLMEnvironmentError"
 
     def test_other_os_error_is_not_reclassified(self):
         fn = MagicMock(side_effect=OSError(errno.EINVAL, "bad file descriptor"))
@@ -1141,10 +1206,13 @@ class TestOpenCodeClientCommands:
         return json.dumps(event)
 
     @classmethod
-    def _run_result(cls, text: str = "ok"):
+    def _run_result(cls, text: str = "ok", token_steps: list[dict[str, object]] | None = None):
+        lines = [cls._line({"type": "text", "part": {"text": text}})]
+        for tokens in token_steps or []:
+            lines.append(cls._line({"type": "step_finish", "part": {"tokens": tokens}}))
         return MagicMock(
             returncode=0,
-            stdout=cls._line({"type": "text", "part": {"text": text}}),
+            stdout="\n".join(lines),
             stderr="",
         )
 
@@ -1174,6 +1242,103 @@ class TestOpenCodeClientCommands:
         assert cmd[cmd.index("--log-level") + 1] == "ERROR"
         assert mock_run.call_args.kwargs["timeout"] == 123
         assert mock_run.call_args.kwargs["input"] == "system\n\nuser"
+
+    def test_generate_reports_aggregated_step_usage(self):
+        events = []
+        client = OpenCodeClient(
+            LLMConfig(
+                provider="opencode",
+                model="openai/gpt-5.3-codex",
+                usage_observer=events.append,
+            )
+        )
+        result = self._run_result(
+            token_steps=[
+                {"input": 10, "output": 2, "cache": {"read": 4, "write": 1}},
+                {"input": 5, "output": 3, "cache": {"read": 2, "write": 0}},
+                {"input": -1, "output": True, "cache": {"read": "invalid"}},
+            ]
+        )
+
+        with patch("core.llm_client.subprocess.run", return_value=result):
+            assert client.generate("system", "user") == "ok"
+
+        assert events[0]["reported_tokens"] == {
+            "input_tokens": 15,
+            "output_tokens": 5,
+            "cached_input_tokens": 6,
+            "cache_creation_input_tokens": 1,
+        }
+
+    def test_readonly_and_write_agents_report_step_usage(self, tmp_path):
+        tokens = {"input": 7, "output": 3, "cache": {"read": 2, "write": 1}}
+        expected = {
+            "input_tokens": 7,
+            "output_tokens": 3,
+            "cached_input_tokens": 2,
+            "cache_creation_input_tokens": 1,
+        }
+        readonly_events = []
+        readonly = OpenCodeClient(
+            LLMConfig(
+                provider="opencode",
+                model="openai/gpt-5.3-codex",
+                usage_observer=readonly_events.append,
+            )
+        )
+        write_events = []
+        write = OpenCodeClient(
+            LLMConfig(
+                provider="opencode",
+                model="openai/gpt-5.3-codex",
+                usage_observer=write_events.append,
+            )
+        )
+
+        with (
+            patch("core.llm_client.subprocess.run", return_value=self._run_result(token_steps=[tokens])),
+            patch("core.llm_client._opencode_agent_env") as agent_env,
+        ):
+            agent_env.return_value.__enter__.return_value = {}
+            assert readonly.run_readonly_agent("review", tmp_path) == "ok"
+
+        with (
+            patch("core.llm_client._run_opencode_streaming", return_value=self._run_result(token_steps=[tokens])),
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client._opencode_agent_env") as agent_env,
+        ):
+            agent_env.return_value.__enter__.return_value = {}
+            assert write.run_agent("implement", tmp_path) == ([], "ok")
+
+        assert readonly_events[0]["reported_tokens"] == expected
+        assert write_events[0]["reported_tokens"] == expected
+
+    def test_failed_generate_reports_completed_step_usage(self):
+        events = []
+        client = OpenCodeClient(
+            LLMConfig(
+                provider="opencode",
+                model="openai/gpt-5.3-codex",
+                usage_observer=events.append,
+            )
+        )
+        result = self._run_result(token_steps=[{"input": 7, "output": 2}])
+        result.returncode = 1
+        result.stderr = json.dumps(
+            {
+                "responseHeaders": {"x-codex-credits-has-credits": "False"},
+                "responseBody": {"error": {"type": "usage_limit_reached"}},
+            }
+        )
+
+        with (
+            patch("core.llm_client.subprocess.run", return_value=result),
+            pytest.raises(LLMQuotaExceeded),
+        ):
+            client.generate("system", "user")
+
+        assert events[0]["outcome"] == "fatal_error"
+        assert events[0]["reported_tokens"] == {"input_tokens": 7, "output_tokens": 2}
 
     def test_generate_uses_sanitized_session_title_when_set(self):
         client = OpenCodeClient(
@@ -1320,7 +1485,14 @@ class TestOpenCodeClientCommands:
         assert '"type": "tool_use"' not in message
 
     def test_run_agent_no_text_with_changes_returns_diagnostic_for_audit(self, tmp_path: Path):
-        client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
+        usage_events = []
+        client = OpenCodeClient(
+            LLMConfig(
+                provider="opencode",
+                model="openai/gpt-5.3-codex",
+                usage_observer=usage_events.append,
+            )
+        )
         result = MagicMock(
             returncode=0,
             stdout=self._line({"type": "message", "sessionID": "ses_123"}),
@@ -1338,6 +1510,7 @@ class TestOpenCodeClientCommands:
         assert "returned no text output" in output
         assert "safe diagnostic" in output
         assert "provider returned no content" not in output
+        assert usage_events[0]["output_chars"] == 0
 
     def test_run_agent_no_text_does_not_persist_raw_stdout_events(self, tmp_path: Path):
         client = OpenCodeClient(LLMConfig(provider="opencode", model="openai/gpt-5.3-codex"))
@@ -2691,6 +2864,7 @@ class TestClaudeWriteSettings:
         subtype: str = "success",
         errors: list[str] | None = None,
         api_error_status: int | None = None,
+        usage: dict[str, object] | None = None,
     ) -> str:
         payload: dict[str, object] = {
             "type": "result",
@@ -2702,6 +2876,8 @@ class TestClaudeWriteSettings:
             payload["errors"] = errors
         if api_error_status is not None:
             payload["api_error_status"] = api_error_status
+        if usage is not None:
+            payload["usage"] = usage
         return json.dumps(payload)
 
     def test_git_exclude_file_returns_none_outside_git_repo(self, tmp_path):
@@ -2842,16 +3018,91 @@ class TestClaudeWriteSettings:
 
         assert mock_run.call_args.kwargs["timeout"] == 123
 
+    def test_generate_reports_structured_usage_without_changing_result(self):
+        events = []
+        cfg = LLMConfig(
+            provider="claude",
+            model="claude-sonnet-4-6",
+            usage_observer=events.append,
+        )
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=0,
+            stdout=self._result(
+                "ok",
+                usage={
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "cache_read_input_tokens": 4,
+                    "cache_creation_input_tokens": 3,
+                    "total_cost_usd": 0.01,
+                },
+            ),
+            stderr="",
+        )
+
+        with patch("core.llm_client.subprocess.run", return_value=result):
+            assert client.generate("system", "user") == "ok"
+
+        assert events[0]["output_chars"] == 2
+        assert events[0]["reported_tokens"] == {
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "cached_input_tokens": 4,
+            "cache_creation_input_tokens": 3,
+        }
+
+    def test_readonly_and_write_agents_report_structured_usage(self, tmp_path):
+        usage = {"input_tokens": 7, "output_tokens": 3}
+        readonly_events = []
+        readonly = ClaudeClient(
+            LLMConfig(provider="claude", model="claude-sonnet-4-6", usage_observer=readonly_events.append)
+        )
+        write_events = []
+        write = ClaudeClient(
+            LLMConfig(provider="claude", model="claude-sonnet-4-6", usage_observer=write_events.append)
+        )
+
+        with (
+            patch(
+                "core.llm_client.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout=self._result("review", usage=usage), stderr=""),
+            ),
+            patch("core.llm_client._claude_write_settings"),
+        ):
+            assert readonly.run_readonly_agent("review this", tmp_path) == "review"
+
+        with (
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                return_value=subprocess.CompletedProcess([], 0, self._result("done", usage=usage), ""),
+            ),
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch("core.llm_client._claude_write_settings"),
+        ):
+            assert write.run_agent("implement this", tmp_path) == ([], "done")
+
+        assert readonly_events[0]["reported_tokens"] == usage
+        assert write_events[0]["reported_tokens"] == usage
+
     def test_generate_failure_is_classified(self):
-        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6", retry_observer=MagicMock())
+        usage_events = []
+        cfg = LLMConfig(
+            provider="claude",
+            model="claude-sonnet-4-6",
+            retry_observer=MagicMock(),
+            usage_observer=usage_events.append,
+        )
         client = ClaudeClient(cfg)
         result = MagicMock(
             returncode=1,
             stdout=self._result(
+                "partial",
                 is_error=True,
                 subtype="error_during_execution",
                 errors=["authentication failed while connecting"],
                 api_error_status=401,
+                usage={"input_tokens": 10, "output_tokens": 2},
             ),
             stderr="managed policy warning",
         )
@@ -2867,6 +3118,9 @@ class TestClaudeWriteSettings:
         assert mock_run.call_count == 1
         sleep.assert_not_called()
         cfg.retry_observer.assert_not_called()
+        assert usage_events[0]["outcome"] == "fatal_error"
+        assert usage_events[0]["output_chars"] == len("partial")
+        assert usage_events[0]["reported_tokens"] == {"input_tokens": 10, "output_tokens": 2}
 
     def test_run_readonly_agent_failure_is_classified(self, tmp_path):
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
@@ -3417,6 +3671,36 @@ class TestCodexParseText:
         )
         assert _codex_parse_text(lines) == "Hello."
 
+    def test_extracts_only_explicit_final_usage(self):
+        lines = "\n".join(
+            [
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 5}}),
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {"type": "token_count", "info": {"total_tokens": 999}},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {
+                            "input_tokens": 20,
+                            "output_tokens": 8,
+                            "cached_input_tokens": 6,
+                            "unsafe": "PRIVATE_PROVIDER_OUTPUT",
+                        },
+                    }
+                ),
+            ]
+        )
+
+        assert _codex_reported_tokens(lines) == {
+            "input_tokens": 20,
+            "output_tokens": 8,
+            "cached_input_tokens": 6,
+        }
+
     def test_concatenates_multiple_agent_messages(self):
         lines = "\n".join([self._item_line("Part one."), self._item_line("Part two.")])
         assert _codex_parse_text(lines) == "Part one.\nPart two."
@@ -3608,6 +3892,31 @@ class TestCodexClientCommands:
         assert "system\n\nuser" not in cmd
         assert mock_run.call_args.kwargs["input"] == "system\n\nuser"
         assert mock_run.call_args.kwargs["timeout"] == 123
+
+    def test_generate_reports_structured_usage_without_changing_result(self):
+        events = []
+        client = CodexClient(
+            LLMConfig(
+                provider="codex",
+                model="gpt-5.3-codex",
+                usage_observer=events.append,
+            )
+        )
+        stdout = "\n".join(
+            [
+                json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 2}}),
+            ]
+        )
+
+        with patch("core.llm_client.subprocess.run", return_value=MagicMock(returncode=0, stdout=stdout, stderr="")):
+            assert client.generate("system", "user") == "ok"
+
+        assert len(events) == 1
+        assert events[0]["outcome"] == "success"
+        assert events[0]["input_chars"] == len("system\n\nuser")
+        assert events[0]["output_chars"] == 2
+        assert events[0]["reported_tokens"] == {"input_tokens": 10, "output_tokens": 2}
 
     def test_generate_failure_reports_stdout_json_error(self):
         client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))
@@ -3908,8 +4217,13 @@ class TestGeminiParseResponse:
 
 class TestGeminiClientCommands:
     @staticmethod
-    def _run_result(text: str = "ok"):
-        return MagicMock(returncode=0, stdout=json.dumps({"response": text}), stderr="")
+    def _run_result(text: str = "ok", model_tokens: dict[str, dict[str, object]] | None = None):
+        payload: dict[str, object] = {"response": text}
+        if model_tokens is not None:
+            payload["stats"] = {
+                "models": {model: {"tokens": tokens} for model, tokens in model_tokens.items()},
+            }
+        return MagicMock(returncode=0, stdout=json.dumps(payload), stderr="")
 
     def test_generate_skips_workspace_trust_check(self):
         client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro", agent_timeout=123))
@@ -3923,6 +4237,122 @@ class TestGeminiClientCommands:
         assert mock_run.call_args.kwargs["timeout"] == 123
         assert "input" not in mock_run.call_args.kwargs
         assert "--approval-mode" not in cmd
+
+    def test_generate_reports_aggregated_model_usage(self):
+        events = []
+        client = GeminiClient(
+            LLMConfig(
+                provider="gemini",
+                model="gemini-2.5-pro",
+                usage_observer=events.append,
+            )
+        )
+        result = self._run_result(
+            model_tokens={
+                "gemini-2.5-pro": {
+                    "input": 10,
+                    "candidates": 2,
+                    "cached": 4,
+                    "total": 18,
+                },
+                "gemini-2.5-flash": {
+                    "input": 5,
+                    "candidates": 3,
+                    "cached": 0,
+                    "total": 9,
+                },
+                "invalid": {
+                    "input": -1,
+                    "candidates": True,
+                    "cached": "invalid",
+                    "total": None,
+                },
+            }
+        )
+
+        with patch("core.llm_client.subprocess.run", return_value=result):
+            assert client.generate("system", "user") == "ok"
+
+        assert events[0]["reported_tokens"] == {
+            "input_tokens": 15,
+            "output_tokens": 5,
+            "cached_input_tokens": 4,
+            "total_tokens": 27,
+        }
+
+    def test_readonly_and_write_agents_report_model_usage(self, tmp_path):
+        model_tokens = {
+            "gemini-2.5-pro": {
+                "input": 7,
+                "candidates": 3,
+                "cached": 2,
+                "total": 12,
+            }
+        }
+        expected = {
+            "input_tokens": 7,
+            "output_tokens": 3,
+            "cached_input_tokens": 2,
+            "total_tokens": 12,
+        }
+        readonly_events = []
+        readonly = GeminiClient(
+            LLMConfig(provider="gemini", model="gemini-2.5-pro", usage_observer=readonly_events.append)
+        )
+        write_events = []
+        write = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro", usage_observer=write_events.append))
+
+        with (
+            patch("core.llm_client._gemini_write_settings"),
+            patch("core.llm_client.subprocess.run", return_value=self._run_result(model_tokens=model_tokens)),
+        ):
+            assert readonly.run_readonly_agent("review", tmp_path) == "ok"
+
+        with (
+            patch("core.llm_client._gemini_write_settings"),
+            patch("core.llm_client._git_snapshot", return_value={}),
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                return_value=self._run_result(model_tokens=model_tokens),
+            ),
+        ):
+            assert write.run_agent("implement", tmp_path) == ([], "ok")
+
+        assert readonly_events[0]["reported_tokens"] == expected
+        assert write_events[0]["reported_tokens"] == expected
+
+    def test_error_response_reports_model_usage(self):
+        events = []
+        client = GeminiClient(
+            LLMConfig(
+                provider="gemini",
+                model="gemini-2.5-pro",
+                usage_observer=events.append,
+            )
+        )
+        result = MagicMock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "error": {"message": "quota exceeded"},
+                    "stats": {"models": {"gemini-2.5-pro": {"tokens": {"input": 7, "candidates": 2, "total": 9}}}},
+                }
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.subprocess.run", return_value=result),
+            pytest.raises(LLMQuotaExceeded),
+        ):
+            client.generate("system", "user")
+
+        assert events[0]["outcome"] == "fatal_error"
+        assert events[0]["reported_tokens"] == {
+            "input_tokens": 7,
+            "output_tokens": 2,
+            "total_tokens": 9,
+        }
 
     def test_generate_uses_stdin_for_windows_batch_wrapper(self):
         client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro"))

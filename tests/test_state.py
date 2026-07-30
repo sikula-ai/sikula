@@ -69,6 +69,34 @@ class TestTaskStateRecord:
         state.record("implementer", "implement", "done")
         assert len(state.history) == 2
 
+    def test_llm_usage_record_is_content_free_and_bounded(self):
+        state = TaskState(task_id="t1", task_description="task")
+
+        state.record_llm_usage(
+            "planner",
+            {
+                "provider": "codex",
+                "model": "gpt-5.3-codex",
+                "operation": "generate",
+                "attempt": 1,
+                "max_attempts": 4,
+                "outcome": "success",
+                "elapsed_s": 0.5,
+                "input_chars": 100,
+                "output_chars": 20,
+                "prompt": "PRIVATE_PROMPT",
+                "output": "PRIVATE_PROVIDER_OUTPUT",
+            },
+        )
+
+        assert len(state.llm_usage_records) == 1
+        record = state.llm_usage_records[0]
+        assert record["agent"] == "planner"
+        assert record["input_chars"] == 100
+        assert "recorded_at" in record
+        assert "prompt" not in record
+        assert "output" not in record
+
     def test_delivery_budget_stop_records_structured_audit(self):
         state = TaskState(task_id="t1", task_description="task")
 
@@ -182,6 +210,7 @@ class TestJsonStateStore:
         data = json.loads(path.read_text())
         data.pop("step_file_tracking_enabled")
         data.pop("step_files_changed")
+        data.pop("llm_usage_records")
         path.write_text(json.dumps(data))
 
         loaded = store.load(state.task_id)
@@ -189,6 +218,7 @@ class TestJsonStateStore:
         assert loaded is not None
         assert loaded.step_file_tracking_enabled is False
         assert loaded.step_files_changed == []
+        assert loaded.llm_usage_records == []
 
     def test_step_file_tracking_round_trips_for_resume(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
@@ -1196,6 +1226,20 @@ class TestJsonStateStore:
             ]
         )
         state.record("test_writer", "llm_retry", "temporary failure")
+        state.record_llm_usage(
+            "test_writer",
+            {
+                "provider": "codex",
+                "model": "gpt-5.3-codex",
+                "operation": "run_agent",
+                "attempt": 1,
+                "max_attempts": 4,
+                "outcome": "success",
+                "elapsed_s": 1.5,
+                "input_chars": 100,
+                "output_chars": 20,
+            },
+        )
         state.record_validation("build", "success", elapsed_s=2.0)
         store.save(state)
 
@@ -1221,6 +1265,9 @@ class TestJsonStateStore:
         assert loaded.final_summary["implementation_asset_target_warnings_count"] == 1
         assert loaded.final_summary["planner_retries_count"] == 0
         assert loaded.final_summary["llm_retries"] == 1
+        assert loaded.final_summary["llm_usage"]["attempts"] == 1
+        assert loaded.final_summary["llm_usage"]["input_chars"] == 100
+        assert loaded.final_summary["llm_usage_by_agent"]["test_writer"]["attempts"] == 1
 
     @pytest.mark.parametrize("field_name", _REVIEW_DELIVERY_FIELDS)
     def test_final_summary_includes_empty_review_delivery_metadata(self, tmp_path: Path, field_name: str):

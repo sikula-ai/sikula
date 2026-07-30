@@ -10,9 +10,10 @@ from core.state import StateStore, TaskState
 
 @contextmanager
 def llm_retry_history(agent, agent_name: str, state: TaskState, store: StateStore) -> Iterator[None]:
-    """Record provider retry callbacks from an agent's LLM client into state history."""
+    """Record provider retry and usage callbacks from an agent's LLM client."""
     llm = getattr(agent, "llm", None)
     previous_retry_observer = None
+    previous_usage_observer = None
 
     def _record_llm_retry(event: dict[str, object]) -> None:
         result = str(event.get("error") or "LLM retry")
@@ -30,10 +31,18 @@ def llm_retry_history(agent, agent_name: str, state: TaskState, store: StateStor
         )
         store.save(state)
 
+    def _record_llm_usage(event: dict[str, object]) -> None:
+        state.record_llm_usage(agent_name, event)
+        store.save(state)
+
     if llm is not None and hasattr(llm, "set_retry_observer"):
         previous_retry_observer = llm.set_retry_observer(_record_llm_retry)
+    if llm is not None and hasattr(llm, "set_usage_observer"):
+        previous_usage_observer = llm.set_usage_observer(_record_llm_usage)
     try:
         yield
     finally:
+        if llm is not None and hasattr(llm, "set_usage_observer"):
+            llm.set_usage_observer(previous_usage_observer)
         if llm is not None and hasattr(llm, "set_retry_observer"):
             llm.set_retry_observer(previous_retry_observer)

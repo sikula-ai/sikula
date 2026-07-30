@@ -351,15 +351,30 @@ def cmd_delivery_check(args: argparse.Namespace, cfg: dict) -> None:
 
 
 def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
-    from core.delivery_progress import get_delivery_status, render_delivery_status
+    from core.delivery_progress import get_delivery_status, render_delivery_status, with_delivery_llm_usage
 
     result = get_delivery_status(args.plan_file)
+    project_root = Path(result.project_root).resolve() if result.project_root else None
+    task_state_dir = _configured_delivery_task_state_dir(cfg, project_root)
+    result = with_delivery_llm_usage(result, task_state_dir=task_state_dir)
     if args.json:
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
     else:
         print(render_delivery_status(result), end="")
     if not result.valid:
         sys.exit(1)
+
+
+def _configured_delivery_task_state_dir(cfg: dict, project_root: Path | None) -> Path | None:
+    if not isinstance(cfg, dict):
+        return None
+    configured_root_raw = cfg.get("project", {}).get("root_path")
+    if not configured_root_raw:
+        return None
+    configured_root = Path(configured_root_raw).resolve()
+    if project_root is not None and configured_root != project_root.resolve():
+        return None
+    return _resolve_state_dir(cfg)
 
 
 @dataclass(frozen=True)

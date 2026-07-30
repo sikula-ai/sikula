@@ -3377,6 +3377,35 @@ class TestCmdRunStateStore:
         state.done = True
         state.build_iterations = 2
         state.record("test_writer", "test_write", "files changed", elapsed_s=193.2)
+        state.record_llm_usage(
+            "test_writer",
+            {
+                "provider": "codex",
+                "model": "gpt-5.3-codex",
+                "operation": "run_agent",
+                "attempt": 1,
+                "max_attempts": 4,
+                "outcome": "success",
+                "elapsed_s": 1.25,
+                "input_chars": 100,
+                "output_chars": 20,
+                "reported_tokens": {"input_tokens": 25, "output_tokens": 5},
+            },
+        )
+        state.record_llm_usage(
+            "reviewer",
+            {
+                "provider": "claude",
+                "model": "claude-sonnet-4-6",
+                "operation": "run_readonly_agent",
+                "attempt": 1,
+                "max_attempts": 4,
+                "outcome": "retryable_error",
+                "elapsed_s": 0.75,
+                "input_chars": 50,
+                "error_type": "LLMTransientError",
+            },
+        )
         state.worktree_path = str(tmp_path / "missing-wt")
         state.worktree_base = str(tmp_path / "missing-wt")
         state.worktree_branch = "sikula/task-abc123"
@@ -3402,6 +3431,9 @@ class TestCmdRunStateStore:
         assert "Previous run:" in out
         assert "Longest phase:" in out
         assert "Build attempts:  2 total (max 10/loop)" in out
+        assert "LLM attempts:    2 total, 1 failed (2.000s provider time)" in out
+        assert "LLM characters:  input=150, output=20 (output known for 1/2 attempts)" in out
+        assert "Reported tokens: input_tokens=25, output_tokens=5 (1/2 attempts)" in out
         assert "Total time:" not in out
 
     def test_terminal_done_prints_audit_warnings_without_failing(self, tmp_path: Path, capsys):

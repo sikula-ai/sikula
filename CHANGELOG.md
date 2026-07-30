@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Delivery Usage Observability**: Task completion and delivery status now report provider invocation attempts, failed attempts, measured provider time, content-free input/output sizes, and explicit provider-reported token usage when available, without estimating missing tokens or monetary cost.
 - **Bounded Delivery Execution**: Added `sikula delivery run` to execute current plan units one at a time through the existing `run-next` path, optionally retry the current failed child once with explicit `--reset-failed`, stop safely at explicit unit or elapsed limits and operational blockers, and automatically finalize completed plans.
 - **Delivery Mode Assessment**: Added `sikula delivery assess` to recommend a standard run, delivery plan, or further task clarification from project-aware, platform-neutral evidence without starting implementation or writing delivery artifacts.
 - **Delivery Branch Assembly**: `delivery run-next` now assembles completed unit result commits into the plan's final branch in dependency order, starts later child worktrees from that assembled commit, preserves original result SHA ancestry, and records resumable fail-closed conflict metadata without changing the operator checkout. `delivery finalize` reconciles legacy or interrupted completed plans through the same assembly engine.

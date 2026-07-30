@@ -3551,8 +3551,16 @@ def main() -> None:
         cmd_init(args)
         return
 
-    if args.command == "delivery" and args.delivery_command in {None, "check", "status"}:
+    if args.command == "delivery" and args.delivery_command in {None, "check"}:
         cfg = {}
+    elif args.command == "delivery" and args.delivery_command == "status":
+        if args.config:
+            cfg = _load_runtime_config(args.config, required=False)
+        else:
+            try:
+                cfg = _load_runtime_config(None, required=False)
+            except (AttributeError, KeyError, OSError, TypeError, ValueError, yaml.YAMLError):
+                cfg = {}
     else:
         cfg = _load_runtime_config(
             args.config,

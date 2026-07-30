@@ -22,6 +22,7 @@ from typing import Optional
 
 from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
 from core.diagnostics import diagnostic_excerpt, diagnostic_summary_lines, validation_error_excerpt
+from core.llm_usage import aggregate_llm_usage, aggregate_llm_usage_by_agent, sanitize_llm_usage_record
 from core.version import sikula_version
 
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -303,6 +304,8 @@ def _final_summary(state: "TaskState") -> dict:
         "delivery_handoff_schema_version": state.delivery_handoff_schema_version,
         "delivery_dependency_handoffs_count": len(state.delivery_dependency_handoffs),
         "llm_retries": sum(1 for entry in state.history if entry.get("action") == "llm_retry"),
+        "llm_usage": aggregate_llm_usage(state.llm_usage_records),
+        "llm_usage_by_agent": aggregate_llm_usage_by_agent(state.llm_usage_records),
         "history_events_count": len(state.history),
         "created_at": state.created_at,
         "finished_at": state.finished_at,
@@ -411,7 +414,8 @@ class TaskState:
     fixer_changed_code: bool = (
         False  # set when fixer writes files; cleared after build validates; guards resume skip condition
     )
-    # Structured observability records — one entry per agent invocation; never read for pipeline decisions
+    # Structured observability records; never read for pipeline decisions.
+    llm_usage_records: list[dict] = field(default_factory=list)
     planner_retry_records: list[dict] = field(default_factory=list)
     implement_cycle_records: list[dict] = field(default_factory=list)
     review_cycle_records: list[dict] = field(default_factory=list)
@@ -467,6 +471,13 @@ class TaskState:
         if error:
             entry["error"] = error
         self.history.append(entry)
+
+    def record_llm_usage(self, agent: str, event: dict[str, object]) -> None:
+        record = sanitize_llm_usage_record(event, agent=agent)
+        if record is None:
+            return
+        record["recorded_at"] = _now()
+        self.llm_usage_records.append(record)
 
     def record_implementation_assets(self, records: list[dict]) -> None:
         sanitized = []

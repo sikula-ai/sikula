@@ -12,6 +12,8 @@ import shutil
 import sys
 import time
 
+from core.llm_usage import aggregate_llm_usage
+
 
 def register_parser(
     subparsers,
@@ -488,6 +490,28 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
     if longest_s > 0:
         print(f"Longest phase:   {longest_label} ({context.fmt_time(longest_s)})")
     print(f"Build attempts:  {state.build_iterations} total (max {max_iter}/loop)")
+    llm_usage = aggregate_llm_usage(getattr(state, "llm_usage_records", []))
+    print(
+        "LLM attempts:    "
+        f"{llm_usage['attempts']} total, "
+        f"{llm_usage['failed_attempts']} failed "
+        f"({llm_usage['elapsed_s']:.3f}s provider time)"
+    )
+    if llm_usage["attempts"]:
+        known_outputs = llm_usage["output_chars_known_attempts"]
+        output_chars = str(llm_usage["output_chars"]) if known_outputs else "unknown"
+        print(
+            "LLM characters:  "
+            f"input={llm_usage['input_chars']}, output={output_chars} "
+            f"(output known for {known_outputs}/{llm_usage['attempts']} attempts)"
+        )
+    if llm_usage["reported_token_attempts"]:
+        token_detail = ", ".join(f"{key}={value}" for key, value in sorted(llm_usage["reported_tokens"].items()))
+        print(
+            f"Reported tokens: {token_detail} ({llm_usage['reported_token_attempts']}/{llm_usage['attempts']} attempts)"
+        )
+    else:
+        print("Reported tokens: unknown")
     print(f"Total phases:    {len(state.history)}")
     if state.worktree_branch:
         print(f"Branch:          {state.worktree_branch}")
