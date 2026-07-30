@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
-from core.diagnostics import diagnostic_excerpt, diagnostic_summary_lines
+from core.diagnostics import diagnostic_excerpt, diagnostic_summary_lines, validation_error_excerpt
 from core.version import sikula_version
 
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -680,7 +680,7 @@ class TaskState:
             entry["check_name"] = check_name
         if elapsed_s is not None:
             entry["elapsed_s"] = round(elapsed_s, 1)
-        error_excerpt = _short_text(error)
+        error_excerpt = validation_error_excerpt(error, limit=1000)
         if error_excerpt:
             entry["error_excerpt"] = error_excerpt
         diagnostic_summary = diagnostic_summary_lines(error)

@@ -430,6 +430,218 @@ def _run_provider_cli(command: list[str], **kwargs: Any) -> subprocess.Completed
         ) from exc
 
 
+_CLAUDE_API_ERROR_STATUS_RE = re.compile(r"^\s*API Error:\s*(?P<status>[1-5]\d{2})\b", re.IGNORECASE)
+_CLAUDE_RESULT_LOGIN_RE = re.compile(
+    r"^\s*not logged in\s*(?:\u00b7|[-:])?\s*please run /login[.!]?\s*$",
+    re.IGNORECASE,
+)
+_CLAUDE_TERMINAL_LIMIT_SUBTYPES = frozenset(
+    {
+        "error_max_budget_usd",
+        "error_max_structured_output_retries",
+        "error_max_turns",
+    }
+)
+_CLAUDE_RESULT_SUBTYPES = _CLAUDE_TERMINAL_LIMIT_SUBTYPES | {
+    "error_during_execution",
+    "success",
+}
+_CLAUDE_RETRYABLE_CLIENT_STATUSES = frozenset({408, 409, 429})
+_CLAUDE_CLI_ARGUMENT_ERROR_RE = re.compile(
+    r"^(?:error:\s*)?(?:"
+    r"(?:invalid|unknown|unrecognized|unsupported|unexpected)\s+(?:argument|option|flag)\b"
+    r"|(?:found\s+)?(?:argument|option|flag)\b.{0,200}\b(?:was not|wasn't)\s+expected\b"
+    r")",
+    re.IGNORECASE,
+)
+_CLAUDE_QUOTA_MARKERS = (
+    "credit balance is too low",
+    "insufficient_quota",
+    "out of credits",
+    "quota exceeded",
+    "usage limit has been reached",
+    "usage_limit_reached",
+)
+_CLAUDE_AUTH_MARKERS = (
+    "authentication failed",
+    "invalid api key",
+    "invalid key",
+    "invalid token",
+    "login required",
+    "missing api key",
+    "missing key",
+    "missing token",
+    "not authenticated",
+    "not logged in",
+    "unauthenticated",
+    "unauthorized",
+)
+_CLAUDE_CONFIG_MARKERS = (
+    "billing disabled",
+    "invalid configuration",
+    "invalid model",
+    "model not supported",
+    "not enabled for this account",
+    "unknown model",
+    "unsupported model",
+)
+_CLAUDE_TRANSIENT_MARKERS = (
+    ("connection reset", "connection reset"),
+    ("connection refused", "connection refused"),
+    ("timed out", "request timed out"),
+    ("timeout", "request timed out"),
+)
+
+
+@dataclass(frozen=True)
+class _ClaudeResultEnvelope:
+    subtype: str
+    is_error: bool
+    result: str
+    errors: tuple[str, ...]
+    api_error_status: int | None
+
+
+def _claude_result_envelope(output: str) -> _ClaudeResultEnvelope | None:
+    """Parse Claude's documented JSON result event, including verbose arrays."""
+    try:
+        payload = json.loads(output)
+    except (ValueError, RecursionError, TypeError):
+        return None
+
+    if isinstance(payload, dict):
+        candidates = [payload]
+    elif isinstance(payload, list):
+        candidates = [item for item in payload if isinstance(item, dict)]
+    else:
+        return None
+    event = next((item for item in reversed(candidates) if item.get("type") == "result"), None)
+    if event is None or not isinstance(event.get("is_error"), bool):
+        return None
+
+    raw_subtype = event.get("subtype")
+    subtype = raw_subtype if isinstance(raw_subtype, str) and raw_subtype in _CLAUDE_RESULT_SUBTYPES else "unknown"
+    raw_result = event.get("result")
+    result = raw_result if isinstance(raw_result, str) else ""
+    raw_errors = event.get("errors")
+    errors = tuple(item for item in raw_errors[:8] if isinstance(item, str)) if isinstance(raw_errors, list) else ()
+    raw_status = event.get("api_error_status")
+    status = (
+        raw_status
+        if isinstance(raw_status, int) and not isinstance(raw_status, bool) and 100 <= raw_status <= 599
+        else None
+    )
+    return _ClaudeResultEnvelope(
+        subtype=subtype,
+        is_error=event["is_error"],
+        result=result,
+        errors=errors,
+        api_error_status=status,
+    )
+
+
+def _claude_error_signal(envelope: _ClaudeResultEnvelope, *, include_result: bool = False) -> str:
+    fields = list(envelope.errors)
+    if include_result and envelope.result:
+        fields.append(envelope.result)
+    return "\n".join(field[:1000] for field in fields[:8] if field).lower()
+
+
+def _claude_error_status(envelope: _ClaudeResultEnvelope) -> int | None:
+    if envelope.api_error_status is not None:
+        return envelope.api_error_status
+    for field in envelope.errors:
+        match = _CLAUDE_API_ERROR_STATUS_RE.search(field[:1000])
+        if match:
+            return int(match.group("status"))
+    return None
+
+
+def _claude_process_error(
+    operation: str,
+    envelope: _ClaudeResultEnvelope | None,
+) -> LLMProviderError:
+    """Classify only Claude-owned result fields and expose safe diagnostics."""
+    if envelope is None:
+        return LLMTransientError(f"claude {operation} error: invalid JSON result envelope")
+
+    signal = _claude_error_signal(envelope)
+    status = _claude_error_status(envelope)
+    if envelope.subtype in _CLAUDE_TERMINAL_LIMIT_SUBTYPES:
+        error_type: type[LLMProviderError] = LLMConfigurationError
+        reason = envelope.subtype.removeprefix("error_").replace("_", " ")
+    elif status in {401, 403}:
+        error_type = LLMAuthError
+        reason = "authentication failed"
+    elif status == 402:
+        error_type = LLMQuotaExceeded
+        reason = "quota exhausted"
+    elif any(marker in signal for marker in _CLAUDE_AUTH_MARKERS) or _CLAUDE_RESULT_LOGIN_RE.fullmatch(envelope.result):
+        error_type = LLMAuthError
+        reason = "authentication failed"
+    elif any(marker in signal for marker in _CLAUDE_QUOTA_MARKERS):
+        error_type = LLMQuotaExceeded
+        reason = "quota exhausted"
+    elif any(marker in signal for marker in _CLAUDE_CONFIG_MARKERS):
+        error_type = LLMConfigurationError
+        reason = "configuration invalid"
+    elif status in _CLAUDE_RETRYABLE_CLIENT_STATUSES or (status is not None and 500 <= status < 600):
+        error_type = LLMTransientError
+        reason = next(
+            (label for marker, label in _CLAUDE_TRANSIENT_MARKERS if marker in signal),
+            "provider execution failed",
+        )
+    elif status is not None and 400 <= status < 500:
+        client_signal = _claude_error_signal(envelope, include_result=True)
+        if any(marker in client_signal for marker in _CLAUDE_QUOTA_MARKERS):
+            error_type = LLMQuotaExceeded
+            reason = "quota exhausted"
+        elif any(marker in client_signal for marker in _CLAUDE_AUTH_MARKERS):
+            error_type = LLMAuthError
+            reason = "authentication failed"
+        else:
+            error_type = LLMConfigurationError
+            reason = "configuration invalid"
+    else:
+        error_type = LLMTransientError
+        reason = next(
+            (label for marker, label in _CLAUDE_TRANSIENT_MARKERS if marker in signal),
+            "provider execution failed",
+        )
+
+    context: list[str] = []
+    if status is not None:
+        context.append(f"HTTP {status}")
+    if envelope.subtype not in {"success", "unknown"}:
+        context.append(envelope.subtype)
+    suffix = f" ({', '.join(context)})" if context else ""
+    return error_type(f"claude {operation} error: {reason}{suffix}")
+
+
+def _claude_cli_startup_error(operation: str, stderr: str) -> LLMConfigurationError | None:
+    """Recognize a bounded CLI argument-parser failure without exposing stderr."""
+    for line in stderr[:4096].splitlines()[:32]:
+        if _CLAUDE_CLI_ARGUMENT_ERROR_RE.match(line[:500].strip()):
+            return LLMConfigurationError(
+                f"claude {operation} error: Claude CLI rejected a required option; update Claude CLI"
+            )
+    return None
+
+
+def _claude_result_text(
+    result: subprocess.CompletedProcess[str],
+    operation: str,
+) -> str:
+    envelope = _claude_result_envelope(result.stdout or "")
+    if envelope is None and result.returncode != 0:
+        startup_error = _claude_cli_startup_error(operation, result.stderr or "")
+        if startup_error is not None:
+            raise startup_error
+    if result.returncode != 0 or envelope is None or envelope.is_error:
+        raise _claude_process_error(operation, envelope)
+    return envelope.result.strip()
+
+
 class ClaudeClient(LLMClient):
     """Calls Claude via the `claude -p` CLI. Requires Claude Code to be installed and authenticated."""
 
@@ -442,15 +654,13 @@ class ClaudeClient(LLMClient):
 
         def _call():
             result = _run_provider_cli(
-                ["claude", "-p", "--model", self._config.model],
+                ["claude", "-p", "--output-format", "json", "--model", self._config.model],
                 capture_output=True,
                 input=prompt,
                 text=True,
                 timeout=self._config.agent_timeout,
             )
-            if result.returncode != 0:
-                raise _provider_error("claude", "CLI", result.stderr.strip() or "non-zero exit")
-            return result.stdout.strip()
+            return _claude_result_text(result, "CLI")
 
         return _call_with_retry("generate", _call, self._config, "generate")
 
@@ -464,6 +674,8 @@ class ClaudeClient(LLMClient):
                 [
                     "claude",
                     "-p",
+                    "--output-format",
+                    "json",
                     "--model",
                     self._config.model,
                     "--permission-mode",
@@ -479,10 +691,7 @@ class ClaudeClient(LLMClient):
                 cwd=cwd,
                 timeout=self._config.agent_timeout,
             )
-            if result.returncode != 0:
-                err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
-                raise _provider_error("claude", "agent", err)
-            return result.stdout.strip()
+            return _claude_result_text(result, "agent")
 
         return _call_with_retry("read-only agent", _call, self._config, "run_readonly_agent")
 
@@ -500,6 +709,8 @@ class ClaudeClient(LLMClient):
                     [
                         "claude",
                         "-p",
+                        "--output-format",
+                        "json",
                         "--model",
                         self._config.model,
                         # acceptEdits: auto-approves file edits; --settings passes Sikula's
@@ -519,12 +730,10 @@ class ClaudeClient(LLMClient):
                     provider="claude",
                     stdin_text=prompt,
                 )
-                if result.returncode != 0:
-                    err = result.stderr.strip() or result.stdout.strip() or "non-zero exit"
-                    raise _provider_error("claude", "agent", err)
+                output = _claude_result_text(result, "agent")
                 after = _git_snapshot(cwd)
                 changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
-                return changed, result.stdout.strip()
+                return changed, output
             except subprocess.TimeoutExpired as exc:
                 last_exc = LLMTimeoutError(f"claude agent timed out after {exc.timeout}s")
                 if delay is None:

@@ -45,6 +45,41 @@ class TestGradleBaseToolRun:
         assert not result.success
         assert "BUILD FAILED" in result.error
 
+    def test_failure_preserves_gradle_footer_before_tool_result_truncation(self, tmp_path: Path):
+        output_parts = []
+        for index in range(3):
+            output_parts.append(
+                f"src/pre{index}/File.kt:{index + 1}: error: compiler failure before footer\n"
+                + ("pre-footer noise\n" * 150)
+            )
+        output_parts.append(
+            "FAILURE: Build failed with an exception.\n"
+            "* What went wrong:\n"
+            "Execution failed for task ':app:compile'.\n"
+            "> Could not create directory 'C:\\workspace\\generated'.\n"
+            "> java.nio.file.FileSystemException: filename too long\n"
+            "* Try:\n"
+            "Run with --stacktrace.\n" + ("footer noise\n" * 150)
+        )
+        for index in range(3):
+            output_parts.append(
+                f"src/post{index}/File.kt:{index + 1}: error: compiler failure after footer\n"
+                + ("post-footer noise\n" * 150)
+            )
+        output = "".join(output_parts)
+        tool = _make_tool(tmp_path)
+
+        with patch(
+            "tools.gradle_tool.subprocess.run",
+            return_value=_mock_run(returncode=1, stderr=output),
+        ):
+            result = tool.compile_check()
+
+        assert not result.success
+        assert len(result.error) <= 8000
+        assert "* What went wrong:" in result.error
+        assert "java.nio.file.FileSystemException: filename too long" in result.error
+
     def test_timeout_returns_failure(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
         with patch(

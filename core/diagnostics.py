@@ -43,6 +43,9 @@ _NOISY_DIAGNOSTIC_RE = re.compile(
     r"|^\s*Execution failed for task ",
     re.IGNORECASE,
 )
+_GRADLE_WHAT_WENT_WRONG_RE = re.compile(r"^\s*\*\s+What went wrong:\s*$", re.IGNORECASE)
+_GRADLE_SECTION_RE = re.compile(r"^\s*\*\s+[^:]+:\s*$")
+_MAX_GRADLE_FAILURE_BLOCKS = 4
 _CARGO_TEST_RERUN_RE = re.compile(r"^error: test failed, to rerun pass `.*`", re.IGNORECASE)
 _RELATIVE_PATH_LOCATION_RE = re.compile(
     r"(?:^|\s)(?:\.{1,2}[/\\])?"
@@ -119,6 +122,82 @@ def diagnostic_excerpt(text: str | None, limit: int = DEFAULT_DIAGNOSTIC_LIMIT, 
         return _compose_diagnostic_excerpt(text, diagnostic, limit)
 
     return _head_tail(text, limit)
+
+
+def validation_error_excerpt(text: str | None, limit: int = DEFAULT_DIAGNOSTIC_LIMIT) -> str:
+    """Preserve generic evidence and add bounded Gradle failure blocks when needed."""
+    if not text or limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+
+    generic_excerpt = diagnostic_excerpt(text, limit=limit)
+    lines = text.splitlines(keepends=True)
+    blocks = _gradle_failure_blocks(lines)
+    if not blocks:
+        return generic_excerpt
+
+    gradle_excerpt = _bounded_gradle_failure_blocks(blocks, limit)
+    if gradle_excerpt in generic_excerpt:
+        return generic_excerpt
+
+    separator = _DIAGNOSTIC_OMITTED
+    generic_budget = (limit - len(separator)) // 2
+    gradle_budget = limit - len(separator) - generic_budget
+    if generic_budget <= 0 or gradle_budget <= 0:
+        return generic_excerpt
+    generic_excerpt = diagnostic_excerpt(text, limit=generic_budget)
+    gradle_excerpt = _bounded_gradle_failure_blocks(blocks, gradle_budget)
+    return generic_excerpt + separator + gradle_excerpt
+
+
+def _gradle_failure_blocks(lines: list[str]) -> list[str]:
+    blocks: list[str] = []
+    index = 0
+    while index < len(lines):
+        normalized = _ANSI_RE.sub("", lines[index]).strip()
+        if not _GRADLE_WHAT_WENT_WRONG_RE.match(normalized):
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines):
+            normalized = _ANSI_RE.sub("", lines[end]).strip()
+            if _GRADLE_SECTION_RE.match(normalized) or normalized.upper().startswith("BUILD FAILED"):
+                break
+            end += 1
+        blocks.append("".join(lines[index:end]))
+        index = end
+    return blocks
+
+
+def _bounded_gradle_failure_blocks(blocks: list[str], limit: int) -> str:
+    selected = blocks
+    omitted_middle = len(blocks) > _MAX_GRADLE_FAILURE_BLOCKS
+    if omitted_middle:
+        selected = [*blocks[:2], *blocks[-2:]]
+
+    separators = ["\n"] * (len(selected) - 1)
+    if omitted_middle:
+        separators[1] = _DIAGNOSTIC_OMITTED
+    complete_parts = [selected[0]]
+    for separator, block in zip(separators, selected[1:]):
+        complete_parts.extend((separator, block))
+    complete = "".join(complete_parts)
+    if len(complete) <= limit:
+        return complete
+
+    separator_budget = sum(len(separator) for separator in separators)
+    if separator_budget >= limit:
+        return _head_tail("".join(selected), limit)
+    available = limit - separator_budget
+    if available < len(selected):
+        return _head_tail(complete, limit)
+    block_budget, remainder = divmod(available, len(selected))
+    bounded = [_head_tail(block, block_budget + (index < remainder)) for index, block in enumerate(selected)]
+    parts = [bounded[0]]
+    for separator, block in zip(separators, bounded[1:]):
+        parts.extend((separator, block))
+    return "".join(parts)
 
 
 def diagnostic_summary_lines(
