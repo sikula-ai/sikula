@@ -576,6 +576,15 @@ def _claude_process_error(
     elif status == 402:
         error_type = LLMQuotaExceeded
         reason = "quota exhausted"
+    elif any(marker in signal for marker in _CLAUDE_AUTH_MARKERS) or _CLAUDE_RESULT_LOGIN_RE.fullmatch(envelope.result):
+        error_type = LLMAuthError
+        reason = "authentication failed"
+    elif any(marker in signal for marker in _CLAUDE_QUOTA_MARKERS):
+        error_type = LLMQuotaExceeded
+        reason = "quota exhausted"
+    elif any(marker in signal for marker in _CLAUDE_CONFIG_MARKERS):
+        error_type = LLMConfigurationError
+        reason = "configuration invalid"
     elif status in _CLAUDE_RETRYABLE_CLIENT_STATUSES or (status is not None and 500 <= status < 600):
         error_type = LLMTransientError
         reason = next(
@@ -593,15 +602,6 @@ def _claude_process_error(
         else:
             error_type = LLMConfigurationError
             reason = "configuration invalid"
-    elif any(marker in signal for marker in _CLAUDE_AUTH_MARKERS) or _CLAUDE_RESULT_LOGIN_RE.fullmatch(envelope.result):
-        error_type = LLMAuthError
-        reason = "authentication failed"
-    elif any(marker in signal for marker in _CLAUDE_QUOTA_MARKERS):
-        error_type = LLMQuotaExceeded
-        reason = "quota exhausted"
-    elif any(marker in signal for marker in _CLAUDE_CONFIG_MARKERS):
-        error_type = LLMConfigurationError
-        reason = "configuration invalid"
     else:
         error_type = LLMTransientError
         reason = next(

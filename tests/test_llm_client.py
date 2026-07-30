@@ -3128,6 +3128,30 @@ class TestClaudeWriteSettings:
 
         assert mock_run.call_count == 4
 
+    def test_generate_does_not_retry_quota_exhausted_rate_limit(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=1,
+            stdout=self._result(
+                is_error=True,
+                subtype="error_during_execution",
+                errors=["API Error: 429 quota exceeded"],
+                api_error_status=429,
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMQuotaExceeded, match=r"quota exhausted.*HTTP 429"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+
     @pytest.mark.parametrize("status", [400, 413, 422])
     def test_generate_does_not_retry_terminal_http_client_error(self, status):
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
