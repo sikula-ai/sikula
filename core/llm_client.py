@@ -430,7 +430,6 @@ def _run_provider_cli(command: list[str], **kwargs: Any) -> subprocess.Completed
         ) from exc
 
 
-_CLAUDE_RESULT_SUBTYPE_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
 _CLAUDE_API_ERROR_STATUS_RE = re.compile(r"^\s*API Error:\s*(?P<status>[1-5]\d{2})\b", re.IGNORECASE)
 _CLAUDE_RESULT_LOGIN_RE = re.compile(
     r"^\s*not logged in\s*(?:\u00b7|[-:])?\s*please run /login[.!]?\s*$",
@@ -443,6 +442,10 @@ _CLAUDE_TERMINAL_LIMIT_SUBTYPES = frozenset(
         "error_max_turns",
     }
 )
+_CLAUDE_RESULT_SUBTYPES = _CLAUDE_TERMINAL_LIMIT_SUBTYPES | {
+    "error_during_execution",
+    "success",
+}
 _CLAUDE_RETRYABLE_CLIENT_STATUSES = frozenset({408, 409, 429})
 _CLAUDE_CLI_ARGUMENT_ERROR_RE = re.compile(
     r"^(?:error:\s*)?(?:"
@@ -517,9 +520,7 @@ def _claude_result_envelope(output: str) -> _ClaudeResultEnvelope | None:
         return None
 
     raw_subtype = event.get("subtype")
-    subtype = (
-        raw_subtype if isinstance(raw_subtype, str) and _CLAUDE_RESULT_SUBTYPE_RE.fullmatch(raw_subtype) else "unknown"
-    )
+    subtype = raw_subtype if isinstance(raw_subtype, str) and raw_subtype in _CLAUDE_RESULT_SUBTYPES else "unknown"
     raw_result = event.get("result")
     result = raw_result if isinstance(raw_result, str) else ""
     raw_errors = event.get("errors")
@@ -539,9 +540,9 @@ def _claude_result_envelope(output: str) -> _ClaudeResultEnvelope | None:
     )
 
 
-def _claude_error_signal(envelope: _ClaudeResultEnvelope) -> str:
+def _claude_error_signal(envelope: _ClaudeResultEnvelope, *, include_result: bool = False) -> str:
     fields = list(envelope.errors)
-    if envelope.api_error_status is not None and envelope.result:
+    if include_result and envelope.result:
         fields.append(envelope.result)
     return "\n".join(field[:1000] for field in fields[:8] if field).lower()
 
@@ -569,19 +570,36 @@ def _claude_process_error(
     if envelope.subtype in _CLAUDE_TERMINAL_LIMIT_SUBTYPES:
         error_type: type[LLMProviderError] = LLMConfigurationError
         reason = envelope.subtype.removeprefix("error_").replace("_", " ")
-    elif (
-        status in {401, 403}
-        or any(marker in signal for marker in _CLAUDE_AUTH_MARKERS)
-        or _CLAUDE_RESULT_LOGIN_RE.fullmatch(envelope.result)
-    ):
+    elif status in {401, 403}:
         error_type = LLMAuthError
         reason = "authentication failed"
-    elif status == 402 or any(marker in signal for marker in _CLAUDE_QUOTA_MARKERS):
+    elif status == 402:
         error_type = LLMQuotaExceeded
         reason = "quota exhausted"
-    elif (status is not None and 400 <= status < 500 and status not in _CLAUDE_RETRYABLE_CLIENT_STATUSES) or any(
-        marker in signal for marker in _CLAUDE_CONFIG_MARKERS
-    ):
+    elif status in _CLAUDE_RETRYABLE_CLIENT_STATUSES or (status is not None and 500 <= status < 600):
+        error_type = LLMTransientError
+        reason = next(
+            (label for marker, label in _CLAUDE_TRANSIENT_MARKERS if marker in signal),
+            "provider execution failed",
+        )
+    elif status is not None and 400 <= status < 500:
+        client_signal = _claude_error_signal(envelope, include_result=True)
+        if any(marker in client_signal for marker in _CLAUDE_QUOTA_MARKERS):
+            error_type = LLMQuotaExceeded
+            reason = "quota exhausted"
+        elif any(marker in client_signal for marker in _CLAUDE_AUTH_MARKERS):
+            error_type = LLMAuthError
+            reason = "authentication failed"
+        else:
+            error_type = LLMConfigurationError
+            reason = "configuration invalid"
+    elif any(marker in signal for marker in _CLAUDE_AUTH_MARKERS) or _CLAUDE_RESULT_LOGIN_RE.fullmatch(envelope.result):
+        error_type = LLMAuthError
+        reason = "authentication failed"
+    elif any(marker in signal for marker in _CLAUDE_QUOTA_MARKERS):
+        error_type = LLMQuotaExceeded
+        reason = "quota exhausted"
+    elif any(marker in signal for marker in _CLAUDE_CONFIG_MARKERS):
         error_type = LLMConfigurationError
         reason = "configuration invalid"
     else:

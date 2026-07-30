@@ -3030,6 +3030,55 @@ class TestClaudeWriteSettings:
 
         assert mock_run.call_count == 4
 
+    def test_generate_does_not_emit_unknown_result_subtype(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        secret_subtype = "sk-abcdefghijklmnopqrstuvwxyz"
+        result = MagicMock(
+            returncode=1,
+            stdout=self._result(
+                is_error=True,
+                subtype=secret_subtype,
+                errors=["connection reset"],
+                api_error_status=500,
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMTransientError, match="connection reset") as exc_info,
+        ):
+            client.generate("system", "user")
+
+        assert secret_subtype not in str(exc_info.value)
+        assert mock_run.call_count == 4
+
+    def test_generate_does_not_classify_partial_result_text_for_server_error(self):
+        cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
+        client = ClaudeClient(cfg)
+        result = MagicMock(
+            returncode=1,
+            stdout=self._result(
+                "Document invalid model handling for the API.",
+                is_error=True,
+                subtype="error_during_execution",
+                errors=["connection reset"],
+                api_error_status=500,
+            ),
+            stderr="",
+        )
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
+            pytest.raises(LLMTransientError, match=r"connection reset.*HTTP 500"),
+        ):
+            client.generate("system", "user")
+
+        assert mock_run.call_count == 4
+
     def test_generate_classifies_allowlisted_result_only_login_failure(self):
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
         client = ClaudeClient(cfg)
@@ -3061,6 +3110,7 @@ class TestClaudeWriteSettings:
         result = MagicMock(
             returncode=1,
             stdout=self._result(
+                "Document invalid model handling for the API.",
                 is_error=True,
                 subtype="error_during_execution",
                 errors=[f"API Error: {status}"],
@@ -3203,6 +3253,7 @@ class TestClaudeWriteSettings:
         ("message", "expected_error", "expected_message"),
         [
             ("Credit balance is too low", LLMQuotaExceeded, "quota exhausted"),
+            ("Invalid API key", LLMAuthError, "authentication failed"),
             ("Invalid model claude-nope", LLMConfigurationError, "configuration invalid"),
         ],
     )
