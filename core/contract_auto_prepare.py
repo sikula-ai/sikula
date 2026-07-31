@@ -276,18 +276,25 @@ def _json_containers(text: str) -> list[_JsonContainer]:
     containers: list[_JsonContainer] = []
     stack: list[int] = []
     in_string = False
+    prose_string = False
     escaped = False
     for position, char in enumerate(text):
         if in_string:
-            if escaped:
+            if prose_string and char in "\r\n":
+                in_string = False
+                prose_string = False
+                escaped = False
+            elif escaped:
                 escaped = False
             elif char == "\\":
                 escaped = True
             elif char == '"':
                 in_string = False
+                prose_string = False
             continue
-        if char == '"' and stack:
+        if char == '"':
             in_string = True
+            prose_string = not stack
         elif char in "[{":
             parent = stack[-1] if stack else None
             containers.append(_JsonContainer(opener=char, start=position, parent=parent))

@@ -40,6 +40,8 @@ from core.contract_auto_prepare import (
         ('The parser searches for `[` before decoding.\n{"value": {"nested": true}}'),
         ("[" * 1_000 + '\n{"value": {"nested": true}}'),
         ('The source ends with function refresh() {\n{"value": {"nested": true}}'),
+        ('The JSON object starts with "{". Response: {"value": {"nested": true}}'),
+        ('The truncated literal starts with "{\n{"value": {"nested": true}}'),
     ],
     ids=[
         "raw",
@@ -69,6 +71,8 @@ from core.contract_auto_prepare import (
         "unmatched-preamble-bracket",
         "many-unmatched-preamble-brackets",
         "unmatched-source-brace",
+        "quoted-prose-brace",
+        "unclosed-quoted-prose-brace",
     ],
 )
 def test_load_auto_json_object_accepts_supported_response_formats(output: str):
