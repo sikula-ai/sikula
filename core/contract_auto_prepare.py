@@ -269,7 +269,8 @@ def _is_fence_close(line: str, marker: str) -> bool:
 
 def _is_response_fence(text: str, fence: _MarkdownFence) -> bool:
     whole_output = fence.closed and not text[: fence.start].strip() and not text[fence.end :].strip()
-    if whole_output or fence.info.casefold() == "json":
+    language = fence.info.split(maxsplit=1)[0].casefold() if fence.info else ""
+    if whole_output or language == "json":
         return True
     if fence.info:
         return False
