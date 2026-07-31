@@ -215,7 +215,11 @@ def load_auto_json_object(
         unmatched_object_ancestor.append(
             parent is not None
             and (
-                (containers[parent].opener == "{" and containers[parent].end is None)
+                (
+                    containers[parent].opener == "{"
+                    and containers[parent].end is None
+                    and _looks_like_json_object(text, containers[parent].start)
+                )
                 or unmatched_object_ancestor[parent]
             )
         )
@@ -224,7 +228,7 @@ def load_auto_json_object(
         if matched_ancestor[index] or unmatched_object_ancestor[index]:
             continue
         if container.end is None:
-            if container.opener == "{":
+            if container.opener == "{" and _looks_like_json_object(text, container.start):
                 remainder = text[container.start :]
                 if any(pattern.search(remainder) for pattern in key_patterns):
                     raise ValueError("auto LLM output is not valid JSON") from None
@@ -259,6 +263,13 @@ def load_auto_json_object(
     if len(matches) > 1:
         raise ValueError("auto LLM output contains multiple JSON objects")
     return matches[0]
+
+
+def _looks_like_json_object(text: str, start: int) -> bool:
+    position = start + 1
+    while position < len(text) and text[position].isspace():
+        position += 1
+    return position < len(text) and text[position] in {'"', "}"}
 
 
 def _json_containers(text: str) -> list[_JsonContainer]:
