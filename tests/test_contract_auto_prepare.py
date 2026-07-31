@@ -27,6 +27,7 @@ from core.contract_auto_prepare import (
         ('```javascript\nconst fixture = {"value": "source"};\n```\n{"value": {"nested": true}}'),
         ('```\nrefresh()\n```\n{"value": {"nested": true}}\n```\nif (stale) { refresh() }\n```'),
         ('~~~javascript\nconst fixture = {"value": "source"};\n~~~~\n{"value": {"nested": true}}'),
+        ('```javascript\nfunction refresh() {\n    ```\n\t```\n}\n```\n{"value": {"nested": true}}'),
     ],
     ids=[
         "raw",
@@ -43,6 +44,7 @@ from core.contract_auto_prepare import (
         "source-fence-before-raw-response",
         "unlabelled-source-fences-around-raw-response",
         "tilde-source-fence-before-raw-response",
+        "indented-markers-inside-source-fence",
     ],
 )
 def test_load_auto_json_object_accepts_supported_response_formats(output: str):

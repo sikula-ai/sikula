@@ -46,7 +46,7 @@ class ContractAutoPrepareResult:
 ContractAutoAnswerProvider = Callable[[ContractAutoPrepareRequest], ContractAutoAnswerBatch]
 AutoPreparationAuditRecorder = Callable[[dict[str, Any]], None]
 
-_FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(?P<marker>`{3,}|~{3,})(?P<info>.*)$")
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})(?P<info>.*)$")
 
 
 @dataclass(frozen=True)
@@ -258,7 +258,9 @@ def _markdown_fences(text: str) -> list[_MarkdownFence]:
 
 
 def _is_fence_close(line: str, marker: str) -> bool:
-    stripped = line.lstrip(" \t")
+    stripped = line.lstrip(" ")
+    if len(line) - len(stripped) > 3 or stripped.startswith("\t"):
+        return False
     marker_end = 0
     while marker_end < len(stripped) and stripped[marker_end] == marker[0]:
         marker_end += 1
