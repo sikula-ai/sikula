@@ -30,6 +30,23 @@ def test_parse_task_auto_refine_output_accepts_fenced_json():
     assert draft.warnings == ["scope still needs confirmation"]
 
 
+def test_parse_task_auto_refine_output_skips_source_brace_before_json():
+    draft = parse_task_auto_refine_output(
+        """The existing callback uses `onSuccess { result -> ... }` before rendering the updated state.
+
+{
+  "task_markdown": "# Preserve refresh behavior\\n\\nKeep refresh available after an error.",
+  "input_language": "en",
+  "normalized_to_english": false,
+  "warnings": []
+}
+"""
+    )
+
+    assert draft.task_markdown.startswith("# Preserve refresh behavior")
+    assert draft.input_language == "en"
+
+
 def test_parse_task_auto_refine_output_rejects_missing_markdown_or_generated_markers():
     with pytest.raises(ValueError, match="non-empty task_markdown"):
         parse_task_auto_refine_output('{"task_markdown": ""}')

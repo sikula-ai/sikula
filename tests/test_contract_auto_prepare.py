@@ -5,8 +5,98 @@ import pytest
 from core.contract_auto_prepare import (
     ContractAutoAnswerBatch,
     auto_prepare_implementation_contract,
+    load_auto_json_object,
     parse_contract_auto_answer_output,
 )
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        '{"value": {"nested": true}}',
+        'Here is the response:\n{"value": {"nested": true}}\nDone.',
+        '```json\n{"value": {"nested": true}}\n```',
+        'Here is the response:\n```json\n{"value": {"nested": true}}\n```\nDone.',
+        'Here is the response:\n```JSON\n{"value": {"nested": true}}\n```',
+        'Here is the response:\n```\n{"value": {"nested": true}}\n```',
+        'Here is the response:\n~~~json\n{"value": {"nested": true}}\n~~~',
+        'Here is the response:\r\n```json\r\n{"value": {"nested": true}}\r\n```\r\nDone.',
+        'The source uses `config { "mode" to currentMode }`.\n{"value": {"nested": true}}',
+        'The source uses ``config { "mode" to currentMode }``.\n{"value": {"nested": true}}',
+        ('```kotlin\nconfig { "mode" to currentMode }\n```\n```json\n{"value": {"nested": true}}\n```'),
+        ('```javascript\nconst fixture = {"value": "source"};\n```\n{"value": {"nested": true}}'),
+        ('```\nrefresh()\n```\n{"value": {"nested": true}}\n```\nif (stale) { refresh() }\n```'),
+        ('~~~javascript\nconst fixture = {"value": "source"};\n~~~~\n{"value": {"nested": true}}'),
+    ],
+    ids=[
+        "raw",
+        "raw-after-prose",
+        "whole-json-fence",
+        "json-fence-after-prose",
+        "case-insensitive-json-fence",
+        "unlabelled-fence-after-prose",
+        "tilde-json-fence-after-prose",
+        "crlf-json-fence-after-prose",
+        "inline-source-code",
+        "double-backtick-source-code",
+        "source-fence-before-response-fence",
+        "source-fence-before-raw-response",
+        "unlabelled-source-fences-around-raw-response",
+        "tilde-source-fence-before-raw-response",
+    ],
+)
+def test_load_auto_json_object_accepts_supported_response_formats(output: str):
+    assert load_auto_json_object(output) == {"value": {"nested": True}}
+
+
+@pytest.mark.parametrize(
+    ("output", "error"),
+    [
+        ("", "empty"),
+        ("No structured response.", "did not contain"),
+        ("{not json", "not valid JSON"),
+        ('{"wrapper": {"value": true}', "not valid JSON"),
+        ('{"value": invalid} {"value": true}', "not valid JSON"),
+        ('{"value": true} {"value": false}', "multiple JSON objects"),
+        (
+            '```json\n{"value": true}\n```\n```json\n{"value": false}\n```',
+            "multiple JSON objects",
+        ),
+        ('```json\n{"value": true} {"value": false}\n```', "multiple JSON objects"),
+        (
+            '{"value": true}\n```json\n{"value": false}\n```',
+            "multiple JSON objects",
+        ),
+        ('Here is the response:\n```json\n{"value": invalid}\n```', "not valid JSON"),
+        ('Here is the response:\n```json\n{"value": true}', "not valid JSON"),
+        ('```json\n{"value": true}\ntrailing prose\n```', "not valid JSON"),
+        ('```json\n["not", "an", "object"]\n```', "must be a JSON object"),
+        ('Broken `example {"value": invalid}\n{"value": true}', "not valid JSON"),
+        ('Broken `example {"value": invalid}``\n{"value": true}', "not valid JSON"),
+        ('Here is the response:\n~~~json\n{"value": true}', "not valid JSON"),
+    ],
+    ids=[
+        "empty",
+        "missing-object",
+        "malformed",
+        "malformed-parent-with-valid-child",
+        "balanced-malformed-before-valid",
+        "multiple-raw-objects",
+        "multiple-response-fences",
+        "multiple-objects-in-response-fence",
+        "raw-and-fenced-responses",
+        "malformed-response-fence",
+        "unclosed-response-fence",
+        "prose-inside-response-fence",
+        "non-object-response-fence",
+        "unclosed-inline-code",
+        "mismatched-inline-code-runs",
+        "unclosed-tilde-response-fence",
+    ],
+)
+def test_load_auto_json_object_rejects_invalid_or_ambiguous_formats(output: str, error: str):
+    with pytest.raises(ValueError, match=error):
+        load_auto_json_object(output)
 
 
 def test_parse_contract_auto_answer_output_accepts_fenced_json_and_filters_unknown_ids():
@@ -44,8 +134,86 @@ def test_parse_contract_auto_answer_output_rejects_malformed_or_ambiguous_json()
     with pytest.raises(ValueError, match="not valid JSON"):
         parse_contract_auto_answer_output("{not json", {"acceptance.criteria"})
 
+    with pytest.raises(ValueError, match="not valid JSON"):
+        parse_contract_auto_answer_output(
+            '{"wrapper": {"answers": {}}',
+            {"acceptance.criteria"},
+        )
+
+    with pytest.raises(ValueError, match="not valid JSON"):
+        parse_contract_auto_answer_output(
+            '{"answers": invalid} {"answers": {}}',
+            {"acceptance.criteria"},
+        )
+
+    with pytest.raises(ValueError, match="not valid JSON"):
+        parse_contract_auto_answer_output(
+            'Broken `example {"answers": invalid}\n{"answers": {}}',
+            {"acceptance.criteria"},
+        )
+
     with pytest.raises(ValueError, match="multiple JSON objects"):
         parse_contract_auto_answer_output('{"answers": {}} {"answers": {}}', {"acceptance.criteria"})
+
+
+def test_parse_contract_auto_answer_output_skips_source_brace_before_json():
+    batch = parse_contract_auto_answer_output(
+        """I have enough grounding. The `error?.let { ... return }` early return explains the behavior.
+
+{
+  "answers": {
+    "reviewer.focus": {
+      "answer": "Verify that refresh remains available while an error is shown.",
+      "notes": "Supported by the current screen behavior."
+    }
+  },
+  "unanswered": [],
+  "warnings": []
+}
+""",
+        {"reviewer.focus"},
+    )
+
+    assert batch.answers == {
+        "reviewer.focus": {
+            "answer": "Verify that refresh remains available while an error is shown.",
+            "notes": "Supported by the current screen behavior.",
+        }
+    }
+
+
+def test_parse_contract_auto_answer_output_skips_json_like_source_brace_before_json():
+    batch = parse_contract_auto_answer_output(
+        """The Kotlin mapping uses `config { "mode" to currentMode }` in the existing implementation.
+
+{"answers": {}, "unanswered": [], "warnings": []}
+""",
+        {"reviewer.focus"},
+    )
+
+    assert batch.answers == {}
+    assert batch.unanswered == []
+
+
+def test_parse_contract_auto_answer_output_skips_fenced_source_brace_before_json():
+    batch = parse_contract_auto_answer_output(
+        """The existing implementation uses this mapping:
+```kotlin
+config { "mode" to currentMode }
+```
+
+The fixture is also relevant:
+```javascript
+const fixture = {"answers": {"example": "not the response"}};
+```
+
+{"answers": {}, "unanswered": [], "warnings": []}
+""",
+        {"reviewer.focus"},
+    )
+
+    assert batch.answers == {}
+    assert batch.unanswered == []
 
 
 def test_auto_prepare_implementation_contract_stops_after_no_progress():
