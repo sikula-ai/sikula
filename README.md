@@ -199,6 +199,10 @@ Each explicit `delivery run --reset-failed` invocation retries the current
 failed child once and continues only after that retry succeeds; a later failure
 stops again and requires another explicit invocation.
 `run-next` remains available for explicit one-unit execution and recovery.
+Task completion output and `delivery status` report provider invocation counts,
+failed attempts, measured provider time, content-free input/output sizes, and
+explicit provider-reported token usage when available. Unavailable token data
+remains unknown; Sikula does not estimate token counts or monetary cost.
 See [Delivery Plans](docs/delivery-plans.md).
 
 **Run a task into a branch**
@@ -254,6 +258,7 @@ delivery safety checks pass.
 - Independent review and security review records.
 - Tests written or updated within configured test paths.
 - Build/test/check validation records and recovered diagnostics.
+- Content-free LLM invocation and available usage aggregates by task and agent.
 - A task state file inspectable with `sikula show <task-id>`.
 
 ## Example Projects

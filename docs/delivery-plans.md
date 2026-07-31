@@ -359,6 +359,15 @@ sikula delivery status .sikula/delivery/<slug>/plan.yaml --json
 ```
 
 `delivery status` evaluates the execution state and marks running and failed units with their actionable next steps. In JSON output, each unit includes `run_next_available` (boolean), `run_next_action` (`"resume_or_reconcile"`, `"retry_failed"`, or omitted), and `run_next_blocked_reason` (`"missing_child_task_id"`, `"unit_budget_exceeded"`, or omitted).
+It also reports a numeric `llm_usage` aggregate for the plan and for each unit.
+These aggregates are loaded best-effort from linked child task state and include
+invocation attempts, outcomes, measured provider time, character counts, and
+explicit provider-reported token counts when available. Missing or legacy child
+state contributes zero attempts and unknown token usage; status never estimates
+tokens or cost and never copies prompts or provider output into the delivery
+projection. When valid project configuration is discovered or supplied with
+`--config`, status honors `tasks.state_dir`; without usable implicit
+configuration it retains the `.sikula/state` default.
 For example, running units with linked child task IDs are marked as recoverable (`resume` or `reconcile` action) by `delivery run-next`, which will resume a non-terminal child or reconcile a terminal child after metadata validation. A running unit without a child task ID is a fail-safe condition marked as `block`: `run-next` blocks and does not select pending work. Failed units with linked child task IDs are marked as retryable (`retry` action) with `delivery run-next --reset-failed`. Failed units without linked child task IDs are not retryable through `run-next`.
 Budget-stopped units are the exception: they are marked with
 `run_next_blocked_reason: unit_budget_exceeded` and require an amend/split even

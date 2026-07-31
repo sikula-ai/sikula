@@ -30,8 +30,10 @@ from core.delivery_progress import (
     render_delivery_status,
     select_next_delivery_unit,
     upsert_delivery_unit_progress,
+    with_delivery_llm_usage,
     write_delivery_progress,
 )
+from core.state import JsonStateStore, TaskState
 from sikula import main
 from sikula_cli.delivery import cmd_delivery_status
 
@@ -1701,6 +1703,162 @@ def test_delivery_status_json_is_privacy_safe(tmp_path: Path, capsys: pytest.Cap
     assert "Unit body should stay private" not in payload_text
 
 
+def test_delivery_status_aggregates_linked_child_llm_usage(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {"unit_id": "01-foundation", "status": "done", "child_task_id": "child-one"},
+                {"unit_id": "02-feature", "status": "running", "child_task_id": "child-two"},
+            ],
+        },
+    )
+    store = JsonStateStore(tmp_path / ".sikula" / "state")
+    first = TaskState(task_id="child-one", task_description="PRIVATE_TASK")
+    first.record_llm_usage(
+        "implementer",
+        {
+            "provider": "codex",
+            "model": "gpt-5.3-codex",
+            "operation": "run_agent",
+            "attempt": 1,
+            "max_attempts": 4,
+            "outcome": "success",
+            "elapsed_s": 2.0,
+            "input_chars": 100,
+            "output_chars": 20,
+            "reported_tokens": {"input_tokens": 25, "output_tokens": 5},
+        },
+    )
+    second = TaskState(task_id="child-two", task_description="PRIVATE_TASK")
+    second.record_llm_usage(
+        "reviewer",
+        {
+            "provider": "claude",
+            "model": "claude-sonnet-4-6",
+            "operation": "run_readonly_agent",
+            "attempt": 1,
+            "max_attempts": 4,
+            "outcome": "timeout",
+            "elapsed_s": 3.0,
+            "input_chars": 80,
+        },
+    )
+    store.save(first)
+    store.save(second)
+
+    with patch("core.delivery_progress.JsonStateStore.load") as load_child_state:
+        control_status = get_delivery_status(plan_path)
+
+    load_child_state.assert_not_called()
+    assert control_status.llm_usage["attempts"] == 0
+    result = with_delivery_llm_usage(control_status)
+    payload = result.to_dict()
+    rendered = render_delivery_status(result)
+
+    assert payload["units"][0]["llm_usage"]["attempts"] == 1
+    assert payload["units"][1]["llm_usage"]["timeout_attempts"] == 1
+    assert payload["llm_usage"]["attempts"] == 2
+    assert payload["llm_usage"]["failed_attempts"] == 1
+    assert payload["llm_usage"]["input_chars"] == 180
+    assert payload["llm_usage"]["reported_tokens"] == {"input_tokens": 25, "output_tokens": 5}
+    assert "LLM usage: 2 attempt(s), 1 failed" in rendered
+    assert "LLM characters: input=180, output=20 (output known for 1/2 attempt(s))" in rendered
+    assert "llm_attempts=1" in rendered
+    assert "PRIVATE_TASK" not in json.dumps(payload)
+    assert "PRIVATE_TASK" not in rendered
+
+
+def test_delivery_status_cli_uses_configured_task_state_dir(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {"unit_id": "01-foundation", "status": "done", "child_task_id": "custom-state-child"},
+            ],
+        },
+    )
+    state_dir = tmp_path / ".private-task-state"
+    store = JsonStateStore(state_dir)
+    child = TaskState(task_id="custom-state-child", task_description="PRIVATE_TASK")
+    child.record_llm_usage(
+        "implementer",
+        {
+            "provider": "codex",
+            "model": "gpt-5.3-codex",
+            "operation": "run_agent",
+            "attempt": 1,
+            "max_attempts": 4,
+            "outcome": "success",
+            "elapsed_s": 2.0,
+            "input_chars": 100,
+            "output_chars": 20,
+        },
+    )
+    store.save(child)
+    cfg = {
+        "project": {"root_path": str(tmp_path)},
+        "tasks": {"state_dir": ".private-task-state"},
+    }
+
+    cmd_delivery_status(argparse.Namespace(plan_file=str(plan_path), json=True), cfg)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["llm_usage"]["attempts"] == 1
+    assert payload["units"][0]["llm_usage"]["attempts"] == 1
+    assert "PRIVATE_TASK" not in json.dumps(payload)
+
+
+def test_delivery_status_treats_missing_legacy_and_malformed_child_usage_as_unknown(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {"unit_id": "01-foundation", "status": "done", "child_task_id": "legacy-child"},
+                {"unit_id": "02-feature", "status": "running", "child_task_id": "missing-child"},
+                {"unit_id": "03-followup", "status": "pending", "child_task_id": "malformed-child"},
+            ],
+        },
+    )
+    store = JsonStateStore(tmp_path / ".sikula" / "state")
+    legacy = TaskState(task_id="legacy-child", task_description="legacy")
+    store.save(legacy)
+    legacy_path = tmp_path / ".sikula" / "state" / "legacy-child.json"
+    legacy_data = json.loads(legacy_path.read_text(encoding="utf-8"))
+    legacy_data.pop("llm_usage_records")
+    legacy_path.write_text(json.dumps(legacy_data), encoding="utf-8")
+    malformed = TaskState(task_id="malformed-child", task_description="malformed")
+    store.save(malformed)
+    malformed_path = tmp_path / ".sikula" / "state" / "malformed-child.json"
+    malformed_data = json.loads(malformed_path.read_text(encoding="utf-8"))
+    malformed_data["llm_usage_records"] = None
+    malformed_path.write_text(json.dumps(malformed_data), encoding="utf-8")
+
+    result = with_delivery_llm_usage(get_delivery_status(plan_path))
+
+    assert result.llm_usage["attempts"] == 0
+    assert all(unit.llm_usage["attempts"] == 0 for unit in result.units)
+    assert "Reported tokens: unknown" in render_delivery_status(result)
+
+
 def test_delivery_status_cli_exits_nonzero_for_invalid_status(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1714,7 +1872,7 @@ def test_delivery_status_cli_exits_nonzero_for_invalid_status(
     assert "Status: invalid" in capsys.readouterr().out
 
 
-def test_main_dispatches_delivery_status_without_loading_project_config(tmp_path: Path) -> None:
+def test_main_dispatches_delivery_status_with_optional_project_config(tmp_path: Path) -> None:
     plan_path = tmp_path / "plan.yaml"
     plan_path.write_text("schema_version: 1\n", encoding="utf-8")
 
@@ -1723,8 +1881,26 @@ def test_main_dispatches_delivery_status_without_loading_project_config(tmp_path
             with patch("sikula.cmd_delivery_status") as delivery_status:
                 main()
 
-    load_config.assert_not_called()
+    load_config.assert_called_once_with(None, required=False)
     delivery_status.assert_called_once()
+
+
+def test_main_delivery_status_ignores_implicitly_discovered_config_without_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path = tmp_path / "plan.yaml"
+    plan_path.write_text("schema_version: 1\n", encoding="utf-8")
+    config_dir = tmp_path / ".sikula"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with patch("sys.argv", ["sikula", "delivery", "status", str(plan_path)]):
+        with patch("sikula.cmd_delivery_status") as delivery_status:
+            main()
+
+    assert delivery_status.call_args.args[1] == {}
 
 
 def test_main_dispatches_delivery_run_next_through_runtime_config(tmp_path: Path) -> None:

@@ -151,6 +151,30 @@ class RetryReportingAgent:
         return AgentResult(success=True, message="ok", data={"files_written": []})
 
 
+class UsageReportingAgent:
+    def __init__(self) -> None:
+        self.llm = StubLLMClient()
+
+    def run(self, state: TaskState) -> AgentResult:
+        self.llm._usage_observer(
+            {
+                "provider": "codex",
+                "model": "gpt-5.3-codex",
+                "operation": "run_agent",
+                "attempt": 1,
+                "max_attempts": 4,
+                "outcome": "success",
+                "elapsed_s": 1.25,
+                "input_chars": 200,
+                "output_chars": 20,
+                "reported_tokens": {"input_tokens": 50, "output_tokens": 5},
+                "prompt": "PRIVATE_PROMPT",
+            }
+        )
+        state.record("implementer", "implement", "done")
+        return AgentResult(success=True, message="ok", data={"files_written": []})
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -639,6 +663,23 @@ class TestOrchestratorLoop:
         assert retry["delay_s"] == 30
         assert retry["error_type"] == "RuntimeError"
         assert state.history[1]["action"] == "test_write"
+
+    def test_agent_llm_usage_is_recorded_in_structured_state(self, tmp_path: Path):
+        orch, _, _ = _make_orchestrator(tmp_path)
+        state = TaskState(task_id="t1", task_description="test")
+        orch._agents["implementer"] = UsageReportingAgent()  # type: ignore[assignment]
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success
+        assert len(state.llm_usage_records) == 1
+        record = state.llm_usage_records[0]
+        assert record["agent"] == "implementer"
+        assert record["provider"] == "codex"
+        assert record["operation"] == "run_agent"
+        assert record["reported_tokens"] == {"input_tokens": 50, "output_tokens": 5}
+        assert "prompt" not in record
+        assert "recorded_at" in record
 
     def test_analyze_phase_skipped_when_prompt_exists(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path, run_build=False)

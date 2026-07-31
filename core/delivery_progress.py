@@ -15,6 +15,8 @@ from core.delivery_public_metadata import (
     sanitize_delivery_public_metadata,
 )
 from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE, DeliveryUnitBudget
+from core.llm_usage import aggregate_llm_usage, empty_llm_usage_summary, merge_llm_usage_summaries
+from core.state import JsonStateStore
 
 SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION = 1
 DELIVERY_UNIT_STATUSES = {"pending", "running", "done", "failed", "canceled", "waiting"}
@@ -243,6 +245,7 @@ class DeliveryStatusUnit:
     started_at: str | None = None
     completed_at: str | None = None
     updated_at: str | None = None
+    llm_usage: dict[str, Any] = field(default_factory=empty_llm_usage_summary)
 
     @property
     def run_next_available(self) -> bool:
@@ -281,6 +284,7 @@ class DeliveryStatusUnit:
             "depends_on": [project_delivery_public_identity(value) for value in self.depends_on],
             "blocked_by": [project_delivery_public_identity(value) for value in self.blocked_by],
             "run_next_available": self.run_next_available,
+            "llm_usage": dict(self.llm_usage),
         }
         for key in (
             "title",
@@ -353,6 +357,7 @@ class DeliveryStatusResult:
     final_branch: str | None = None
     final_commit: str | None = None
     finalized_at: str | None = None
+    llm_usage: dict[str, Any] = field(default_factory=empty_llm_usage_summary)
 
     @property
     def valid(self) -> bool:
@@ -383,6 +388,7 @@ class DeliveryStatusResult:
                 for issue in self.warnings
             ],
             "units": [unit.to_dict() for unit in self.units],
+            "llm_usage": dict(self.llm_usage),
         }
         if self.next_action:
             data["next_action"] = sanitize_delivery_public_metadata(self.next_action)
@@ -702,7 +708,11 @@ def select_next_delivery_unit(status: DeliveryStatusResult, reset_failed: bool =
     return next((unit for unit in status.units if unit.eligible), None)
 
 
-def get_delivery_status(path: str | Path, *, project_root: Path | None = None) -> DeliveryStatusResult:
+def get_delivery_status(
+    path: str | Path,
+    *,
+    project_root: Path | None = None,
+) -> DeliveryStatusResult:
     check_result = check_delivery_plan_file(path, project_root=project_root)
     errors = list(check_result.errors)
     warnings = list(check_result.warnings)
@@ -770,6 +780,36 @@ def get_delivery_status(path: str | Path, *, project_root: Path | None = None) -
         final_commit=final_commit,
         finalized_at=finalized_at,
     )
+
+
+def with_delivery_llm_usage(
+    status: DeliveryStatusResult,
+    *,
+    task_state_dir: Path | None = None,
+) -> DeliveryStatusResult:
+    """Return a status projection enriched from linked child audit state."""
+    if not status.project_root or not status.units:
+        return status
+    state_dir = task_state_dir or Path(status.project_root) / ".sikula" / "state"
+    units = _with_child_llm_usage(status.units, state_dir)
+    llm_usage = merge_llm_usage_summaries([unit.llm_usage for unit in units])
+    return replace(status, units=units, llm_usage=llm_usage)
+
+
+def _with_child_llm_usage(units: list[DeliveryStatusUnit], state_dir: Path) -> list[DeliveryStatusUnit]:
+    store = JsonStateStore(state_dir)
+    projected = []
+    for unit in units:
+        usage = empty_llm_usage_summary()
+        if unit.child_task_id:
+            try:
+                child_state = store.load(unit.child_task_id)
+            except (AttributeError, OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+                child_state = None
+            if child_state is not None and isinstance(child_state.llm_usage_records, list):
+                usage = aggregate_llm_usage(child_state.llm_usage_records)
+        projected.append(replace(unit, llm_usage=usage))
+    return projected
 
 
 def _validate_amendment_progress(
@@ -1023,6 +1063,31 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
         if projection.get("finalized_at"):
             lines.append(f"Finalized at: {projection['finalized_at']}")
 
+    llm_usage = projection["llm_usage"]
+    lines.append(
+        "LLM usage: "
+        f"{llm_usage['attempts']} attempt(s), "
+        f"{llm_usage['failed_attempts']} failed, "
+        f"{llm_usage['elapsed_s']:.3f}s provider time"
+    )
+    if llm_usage["attempts"]:
+        known_outputs = llm_usage["output_chars_known_attempts"]
+        output_chars = str(llm_usage["output_chars"]) if known_outputs else "unknown"
+        lines.append(
+            "LLM characters: "
+            f"input={llm_usage['input_chars']}, output={output_chars} "
+            f"(output known for {known_outputs}/{llm_usage['attempts']} attempt(s))"
+        )
+    if llm_usage["reported_token_attempts"]:
+        token_detail = ", ".join(f"{key}={value}" for key, value in sorted(llm_usage["reported_tokens"].items()))
+        lines.append(
+            "Reported tokens: "
+            f"{token_detail} "
+            f"({llm_usage['reported_token_attempts']}/{llm_usage['attempts']} attempt(s))"
+        )
+    else:
+        lines.append("Reported tokens: unknown")
+
     if result.units:
         lines.append("")
         lines.append("Units:")
@@ -1059,6 +1124,8 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
                 detail += f" size={unit.estimated_size}"
             if unit.risk_tags:
                 detail += f" risk={','.join(unit.risk_tags)}"
+            if unit.llm_usage["attempts"]:
+                detail += f" llm_attempts={unit.llm_usage['attempts']}"
             safe_title = unit_data.get("title")
             title = f" — {safe_title}" if safe_title else ""
             lines.append(f"- {unit_data['id']}: {detail}{title}")
