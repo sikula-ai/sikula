@@ -245,9 +245,26 @@ def test_parse_task_auto_answer_output_selects_answers_root_object():
     assert batch.answers == {"scope.boundaries": {"answer": "Add invite creation only.", "notes": ""}}
 
 
+def test_parse_task_auto_answer_output_ignores_generic_preamble_object():
+    batch = parse_task_auto_answer_output(
+        '{"unanswered": [{"id": "source.fixture"}]}\n'
+        '{"answers": {"scope.boundaries": {"answer": "Add invite creation only."}}}',
+        {"scope.boundaries"},
+    )
+
+    assert batch.answers == {"scope.boundaries": {"answer": "Add invite creation only.", "notes": ""}}
+
+
 def test_parse_task_auto_answer_output_rejects_missing_answers_object():
     with pytest.raises(ValueError, match="answers object"):
         parse_task_auto_answer_output('{"answers": []}', {"scope.boundaries"})
+
+
+def test_parse_task_auto_answer_output_accepts_warning_only_no_progress():
+    batch = parse_task_auto_answer_output('{"warnings": ["no answer envelope"]}', {"scope.boundaries"})
+
+    assert batch.answers == {}
+    assert batch.warnings == ["no answer envelope"]
 
 
 def test_auto_refine_task_description_runs_deterministic_recheck():

@@ -168,6 +168,15 @@ def test_parse_contract_auto_answer_output_accepts_json_after_same_line_prose():
     assert batch.answers == {"reviewer.focus": {"answer": "Check refresh.", "notes": ""}}
 
 
+def test_parse_contract_auto_answer_output_ignores_generic_preamble_object():
+    batch = parse_contract_auto_answer_output(
+        '{"warnings": ["source diagnostic"]}\n{"answers": {"reviewer.focus": {"answer": "Check refresh."}}}',
+        {"reviewer.focus"},
+    )
+
+    assert batch.answers == {"reviewer.focus": {"answer": "Check refresh.", "notes": ""}}
+
+
 def test_parse_contract_auto_answer_output_rejects_malformed_or_ambiguous_json():
     with pytest.raises(ValueError, match="not valid JSON"):
         parse_contract_auto_answer_output("{not json", {"acceptance.criteria"})
@@ -192,6 +201,13 @@ def test_parse_contract_auto_answer_output_rejects_malformed_or_ambiguous_json()
 
     with pytest.raises(ValueError, match="multiple JSON objects"):
         parse_contract_auto_answer_output('{"answers": {}} {"answers": {}}', {"acceptance.criteria"})
+
+
+def test_parse_contract_auto_answer_output_accepts_warning_only_no_progress():
+    batch = parse_contract_auto_answer_output('{"warnings": ["no answer envelope"]}', {"acceptance.criteria"})
+
+    assert batch.answers == {}
+    assert batch.warnings == ["no answer envelope"]
 
 
 def test_parse_contract_auto_answer_output_skips_source_brace_before_json():

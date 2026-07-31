@@ -58,7 +58,11 @@ class _JsonContainer:
 def parse_contract_auto_answer_output(output: str, active_question_ids: set[str]) -> ContractAutoAnswerBatch:
     """Parse read-only LLM answer JSON for active contract questions."""
 
-    payload = load_auto_json_object(output, required_keys=frozenset({"answers", "unanswered", "warnings"}))
+    payload = load_auto_json_object(
+        output,
+        required_keys=frozenset({"answers"}),
+        fallback_keys=frozenset({"unanswered", "warnings"}),
+    )
     raw_answers = payload.get("answers", {})
     if raw_answers is None:
         raw_answers = {}
@@ -186,13 +190,21 @@ def auto_prepare_implementation_contract(
     )
 
 
-def load_auto_json_object(output: str, *, required_keys: frozenset[str]) -> dict[str, Any]:
+def load_auto_json_object(
+    output: str,
+    *,
+    required_keys: frozenset[str],
+    fallback_keys: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     text = output.strip()
     if not text:
         raise ValueError("auto LLM output is empty")
     decoder = json.JSONDecoder()
     matches: list[dict[str, Any]] = []
+    fallback_matches: list[dict[str, Any]] = []
     key_patterns = [re.compile(rf"{re.escape(json.dumps(key))}\s*:") for key in required_keys]
+    fallback_key_patterns = [re.compile(rf"{re.escape(json.dumps(key))}\s*:") for key in fallback_keys]
+    malformed_fallback = False
     decoded_object = False
     containers = _json_containers(text)
     matched_ancestor: list[bool] = []
@@ -212,8 +224,12 @@ def load_auto_json_object(output: str, *, required_keys: frozenset[str]) -> dict
         if matched_ancestor[index] or unmatched_object_ancestor[index]:
             continue
         if container.end is None:
-            if container.opener == "{" and any(pattern.search(text[container.start :]) for pattern in key_patterns):
-                raise ValueError("auto LLM output is not valid JSON") from None
+            if container.opener == "{":
+                remainder = text[container.start :]
+                if any(pattern.search(remainder) for pattern in key_patterns):
+                    raise ValueError("auto LLM output is not valid JSON") from None
+                if any(pattern.search(remainder) for pattern in fallback_key_patterns):
+                    malformed_fallback = True
             continue
         candidate = text[container.start : container.end]
         try:
@@ -221,13 +237,21 @@ def load_auto_json_object(output: str, *, required_keys: frozenset[str]) -> dict
         except (json.JSONDecodeError, ValueError, RecursionError):
             if any(pattern.search(candidate) for pattern in key_patterns):
                 raise ValueError("auto LLM output is not valid JSON") from None
+            if any(pattern.search(candidate) for pattern in fallback_key_patterns):
+                malformed_fallback = True
             continue
         if end != len(candidate) or not isinstance(payload, dict):
             continue
         decoded_object = True
         if required_keys.intersection(payload):
             matches.append(payload)
+        elif fallback_keys.intersection(payload):
+            fallback_matches.append(payload)
 
+    if not matches:
+        if malformed_fallback:
+            raise ValueError("auto LLM output is not valid JSON")
+        matches = fallback_matches
     if not matches:
         if text.startswith("{") and not decoded_object:
             raise ValueError("auto LLM output is not valid JSON")

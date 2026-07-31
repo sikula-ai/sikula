@@ -91,7 +91,11 @@ def parse_task_auto_refine_output(output: str) -> TaskAutoRefineDraft:
 def parse_task_auto_answer_output(output: str, active_question_ids: set[str]) -> TaskAutoAnswerBatch:
     """Parse read-only LLM answer JSON for active product task-refinement questions."""
 
-    payload = load_auto_json_object(output, required_keys=frozenset({"answers", "unanswered", "warnings"}))
+    payload = load_auto_json_object(
+        output,
+        required_keys=frozenset({"answers"}),
+        fallback_keys=frozenset({"unanswered", "warnings"}),
+    )
     raw_answers = payload.get("answers", {})
     if raw_answers is None:
         raw_answers = {}
