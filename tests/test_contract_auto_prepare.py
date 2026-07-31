@@ -14,7 +14,9 @@ from core.contract_auto_prepare import (
     "output",
     [
         '{"value": {"nested": true}}',
+        'Here is the response: {"value": {"nested": true}}',
         'Here is the response:\n{"value": {"nested": true}}\nDone.',
+        'Here is the response:\n    {"value": {"nested": true}}\nDone.',
         '```json\n{"value": {"nested": true}}\n```',
         'Here is the response:\n```json\n{"value": {"nested": true}}\n```\nDone.',
         'Here is the response:\n```JSON\n{"value": {"nested": true}}\n```',
@@ -25,14 +27,24 @@ from core.contract_auto_prepare import (
         'The source uses `config { "mode" to currentMode }`.\n{"value": {"nested": true}}',
         'The source uses ``config { "mode" to currentMode }``.\n{"value": {"nested": true}}',
         ('```kotlin\nconfig { "mode" to currentMode }\n```\n```json\n{"value": {"nested": true}}\n```'),
-        ('```javascript\nconst fixture = {"value": "source"};\n```\n{"value": {"nested": true}}'),
+        ('```javascript\nconst fixture = {"fixture": "source"};\n```\n{"value": {"nested": true}}'),
+        ('```json\n{"fixture": "source"}\n```\n{"value": {"nested": true}}'),
         ('```\nrefresh()\n```\n{"value": {"nested": true}}\n```\nif (stale) { refresh() }\n```'),
-        ('~~~javascript\nconst fixture = {"value": "source"};\n~~~~\n{"value": {"nested": true}}'),
+        ('~~~javascript\nconst fixture = {"fixture": "source"};\n~~~~\n{"value": {"nested": true}}'),
         ('```javascript\nfunction refresh() {\n    ```\n\t```\n}\n```\n{"value": {"nested": true}}'),
+        ('```\n{ result -> render(result) }\n```\n{"value": {"nested": true}}'),
+        ('    config { "mode": currentMode }\n{"value": {"nested": true}}'),
+        ('Here is the response:\n```json\n{"value": {"nested": true}}'),
+        ('```json\n{"value": {"nested": true}}\ntrailing prose\n```'),
+        ('Here is the response:\n~~~json\n{"value": {"nested": true}}'),
+        ('The parser searches for `[` before decoding.\n{"value": {"nested": true}}'),
+        ("[" * 1_000 + '\n{"value": {"nested": true}}'),
     ],
     ids=[
         "raw",
+        "same-line-prose",
         "raw-after-prose",
+        "indented-raw-after-prose",
         "whole-json-fence",
         "json-fence-after-prose",
         "case-insensitive-json-fence",
@@ -44,13 +56,21 @@ from core.contract_auto_prepare import (
         "double-backtick-source-code",
         "source-fence-before-response-fence",
         "source-fence-before-raw-response",
+        "schema-distinguishes-json-source-fixture",
         "unlabelled-source-fences-around-raw-response",
         "tilde-source-fence-before-raw-response",
         "indented-markers-inside-source-fence",
+        "brace-led-callback-before-raw-response",
+        "indented-source-block-before-raw-response",
+        "unclosed-json-fence",
+        "trailing-prose-inside-fence",
+        "unclosed-tilde-fence",
+        "unmatched-preamble-bracket",
+        "many-unmatched-preamble-brackets",
     ],
 )
 def test_load_auto_json_object_accepts_supported_response_formats(output: str):
-    assert load_auto_json_object(output) == {"value": {"nested": True}}
+    assert load_auto_json_object(output, required_keys=frozenset({"value"})) == {"value": {"nested": True}}
 
 
 @pytest.mark.parametrize(
@@ -58,6 +78,9 @@ def test_load_auto_json_object_accepts_supported_response_formats(output: str):
     [
         ("", "empty"),
         ("No structured response.", "did not contain"),
+        ('{"fixture": true}', "required JSON object"),
+        ('{"wrapper": {"value": true}}', "required JSON object"),
+        ('[{"fixture": true}, {"value": true}]', "required JSON object"),
         ("{not json", "not valid JSON"),
         ('{"wrapper": {"value": true}', "not valid JSON"),
         ('{"value": invalid} {"value": true}', "not valid JSON"),
@@ -72,16 +95,16 @@ def test_load_auto_json_object_accepts_supported_response_formats(output: str):
             "multiple JSON objects",
         ),
         ('Here is the response:\n```json\n{"value": invalid}\n```', "not valid JSON"),
-        ('Here is the response:\n```json\n{"value": true}', "not valid JSON"),
-        ('```json\n{"value": true}\ntrailing prose\n```', "not valid JSON"),
-        ('```json\n["not", "an", "object"]\n```', "must be a JSON object"),
+        ('```json\n["not", "an", "object"]\n```', "required JSON object"),
         ('Broken `example {"value": invalid}\n{"value": true}', "not valid JSON"),
         ('Broken `example {"value": invalid}``\n{"value": true}', "not valid JSON"),
-        ('Here is the response:\n~~~json\n{"value": true}', "not valid JSON"),
     ],
     ids=[
         "empty",
         "missing-object",
+        "object-without-required-key",
+        "nested-object-with-required-key",
+        "array-with-required-object",
         "malformed",
         "malformed-parent-with-valid-child",
         "balanced-malformed-before-valid",
@@ -90,17 +113,19 @@ def test_load_auto_json_object_accepts_supported_response_formats(output: str):
         "multiple-objects-in-response-fence",
         "raw-and-fenced-responses",
         "malformed-response-fence",
-        "unclosed-response-fence",
-        "prose-inside-response-fence",
         "non-object-response-fence",
         "unclosed-inline-code",
         "mismatched-inline-code-runs",
-        "unclosed-tilde-response-fence",
     ],
 )
 def test_load_auto_json_object_rejects_invalid_or_ambiguous_formats(output: str, error: str):
     with pytest.raises(ValueError, match=error):
-        load_auto_json_object(output)
+        load_auto_json_object(output, required_keys=frozenset({"value"}))
+
+
+def test_load_auto_json_object_rejects_unbalanced_object_remainder():
+    with pytest.raises(ValueError, match="not valid JSON"):
+        load_auto_json_object("{" * 1_000, required_keys=frozenset({"value"}))
 
 
 def test_parse_contract_auto_answer_output_accepts_fenced_json_and_filters_unknown_ids():
@@ -132,6 +157,15 @@ def test_parse_contract_auto_answer_output_accepts_fenced_json_and_filters_unkno
     assert batch.unanswered == [{"id": "privacy.data_handling", "reason": "Needs human policy."}]
     assert "ignored answer for inactive question id: unknown.question" in batch.warnings
     assert "partial" in batch.warnings
+
+
+def test_parse_contract_auto_answer_output_accepts_json_after_same_line_prose():
+    batch = parse_contract_auto_answer_output(
+        'Here is the response: {"answers": {"reviewer.focus": {"answer": "Check refresh."}}}',
+        {"reviewer.focus"},
+    )
+
+    assert batch.answers == {"reviewer.focus": {"answer": "Check refresh.", "notes": ""}}
 
 
 def test_parse_contract_auto_answer_output_rejects_malformed_or_ambiguous_json():
@@ -208,7 +242,7 @@ config { "mode" to currentMode }
 
 The fixture is also relevant:
 ```javascript
-const fixture = {"answers": {"example": "not the response"}};
+const fixture = {"fixture": {"example": "not the response"}};
 ```
 
 {"answers": {}, "unanswered": [], "warnings": []}

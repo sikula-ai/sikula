@@ -46,24 +46,19 @@ class ContractAutoPrepareResult:
 ContractAutoAnswerProvider = Callable[[ContractAutoPrepareRequest], ContractAutoAnswerBatch]
 AutoPreparationAuditRecorder = Callable[[dict[str, Any]], None]
 
-_FENCE_OPEN_RE = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})(?P<info>.*)$")
 
-
-@dataclass(frozen=True)
-class _MarkdownFence:
+@dataclass
+class _JsonContainer:
+    opener: str
     start: int
-    body_start: int
-    body_end: int
-    end: int
-    info: str
-    marker: str
-    closed: bool
+    parent: int | None
+    end: int | None = None
 
 
 def parse_contract_auto_answer_output(output: str, active_question_ids: set[str]) -> ContractAutoAnswerBatch:
     """Parse read-only LLM answer JSON for active contract questions."""
 
-    payload = load_auto_json_object(output)
+    payload = load_auto_json_object(output, required_keys=frozenset({"answers", "unanswered", "warnings"}))
     raw_answers = payload.get("answers", {})
     if raw_answers is None:
         raw_answers = {}
@@ -191,161 +186,86 @@ def auto_prepare_implementation_contract(
     )
 
 
-def load_auto_json_object(output: str) -> dict[str, Any]:
+def load_auto_json_object(output: str, *, required_keys: frozenset[str]) -> dict[str, Any]:
     text = output.strip()
     if not text:
         raise ValueError("auto LLM output is empty")
-    fences = _markdown_fences(text)
-    response_fences = [fence for fence in fences if _is_response_fence(text, fence)]
-    if any(not fence.closed for fence in response_fences):
-        raise ValueError("auto LLM output is not valid JSON")
-    if len(response_fences) > 1:
-        raise ValueError("auto LLM output contains multiple JSON objects")
-
-    visible_text = _without_markdown_code(text, fences)
-    raw_start = visible_text.find("{")
-    if response_fences:
-        if raw_start != -1:
-            raise ValueError("auto LLM output contains multiple JSON objects")
-        fence = response_fences[0]
-        return _decode_fenced_json_object(text[fence.body_start : fence.body_end])
-    if raw_start == -1:
-        raise ValueError("auto LLM output did not contain a JSON object")
-    return _decode_unfenced_json_object(text, visible_text, raw_start)
-
-
-def _markdown_fences(text: str) -> list[_MarkdownFence]:
-    fences: list[_MarkdownFence] = []
-    open_fence: tuple[int, int, str, str] | None = None
-    offset = 0
-    for line in text.splitlines(keepends=True):
-        content = line.rstrip("\r\n")
-        if open_fence is not None:
-            start, body_start, marker, info = open_fence
-            if _is_fence_close(content, marker):
-                fences.append(
-                    _MarkdownFence(
-                        start=start,
-                        body_start=body_start,
-                        body_end=offset,
-                        end=offset + len(line),
-                        info=info,
-                        marker=marker,
-                        closed=True,
-                    )
-                )
-                open_fence = None
-        else:
-            match = _FENCE_OPEN_RE.fullmatch(content)
-            if match:
-                marker = match.group("marker")
-                open_fence = (offset, offset + len(line), marker, match.group("info").strip())
-        offset += len(line)
-    if open_fence is not None:
-        start, body_start, marker, info = open_fence
-        fences.append(
-            _MarkdownFence(
-                start=start,
-                body_start=body_start,
-                body_end=len(text),
-                end=len(text),
-                info=info,
-                marker=marker,
-                closed=False,
+    decoder = json.JSONDecoder()
+    matches: list[dict[str, Any]] = []
+    key_patterns = [re.compile(rf"{re.escape(json.dumps(key))}\s*:") for key in required_keys]
+    decoded_object = False
+    containers = _json_containers(text)
+    matched_ancestor: list[bool] = []
+    unmatched_object_ancestor: list[bool] = []
+    for container in containers:
+        parent = container.parent
+        matched_ancestor.append(parent is not None and (containers[parent].end is not None or matched_ancestor[parent]))
+        unmatched_object_ancestor.append(
+            parent is not None
+            and (
+                (containers[parent].opener == "{" and containers[parent].end is None)
+                or unmatched_object_ancestor[parent]
             )
         )
-    return fences
 
-
-def _is_fence_close(line: str, marker: str) -> bool:
-    stripped = line.lstrip(" ")
-    if len(line) - len(stripped) > 3 or stripped.startswith("\t"):
-        return False
-    marker_end = 0
-    while marker_end < len(stripped) and stripped[marker_end] == marker[0]:
-        marker_end += 1
-    return marker_end >= len(marker) and not stripped[marker_end:].strip()
-
-
-def _is_response_fence(text: str, fence: _MarkdownFence) -> bool:
-    whole_output = fence.closed and not text[: fence.start].strip() and not text[fence.end :].strip()
-    language = fence.info.split(maxsplit=1)[0].casefold() if fence.info else ""
-    if whole_output or language == "json":
-        return True
-    if fence.info:
-        return False
-    return text[fence.body_start : fence.body_end].lstrip().startswith("{")
-
-
-def _without_markdown_code(text: str, fences: list[_MarkdownFence]) -> str:
-    masked = [False] * len(text)
-    for fence in fences:
-        masked[fence.start : fence.end] = [True] * (fence.end - fence.start)
-
-    line_start = 0
-    while line_start < len(text):
-        line_end = text.find("\n", line_start)
-        if line_end == -1:
-            line_end = len(text)
-        _mask_inline_code(text, masked, line_start, line_end)
-        line_start = line_end + 1
-    return "".join(" " if is_masked and char not in "\r\n" else char for char, is_masked in zip(text, masked))
-
-
-def _mask_inline_code(text: str, masked: list[bool], start: int, end: int) -> None:
-    position = start
-    while position < end:
-        if masked[position] or text[position] != "`":
-            position += 1
+    for index, container in enumerate(containers):
+        if matched_ancestor[index] or unmatched_object_ancestor[index]:
             continue
-        marker_end = position
-        while marker_end < end and text[marker_end] == "`":
-            marker_end += 1
-        marker = text[position:marker_end]
-        close = _find_inline_code_close(text, marker, marker_end, end)
-        if close == -1:
-            position = marker_end
+        if container.end is None:
+            if container.opener == "{" and any(pattern.search(text[container.start :]) for pattern in key_patterns):
+                raise ValueError("auto LLM output is not valid JSON") from None
             continue
-        masked[position : close + len(marker)] = [True] * (close + len(marker) - position)
-        position = close + len(marker)
+        candidate = text[container.start : container.end]
+        try:
+            payload, end = decoder.raw_decode(candidate)
+        except (json.JSONDecodeError, ValueError, RecursionError):
+            if any(pattern.search(candidate) for pattern in key_patterns):
+                raise ValueError("auto LLM output is not valid JSON") from None
+            continue
+        if end != len(candidate) or not isinstance(payload, dict):
+            continue
+        decoded_object = True
+        if required_keys.intersection(payload):
+            matches.append(payload)
 
-
-def _find_inline_code_close(text: str, marker: str, start: int, end: int) -> int:
-    position = text.find(marker, start, end)
-    while position != -1:
-        after = position + len(marker)
-        if text[position - 1] != "`" and (after == end or text[after] != "`"):
-            return position
-        position = text.find(marker, after, end)
-    return -1
-
-
-def _decode_fenced_json_object(text: str) -> dict[str, Any]:
-    candidate = text.strip()
-    try:
-        payload, end = json.JSONDecoder().raw_decode(candidate)
-    except (json.JSONDecodeError, ValueError, RecursionError):
-        raise ValueError("auto LLM output is not valid JSON") from None
-    trailing = candidate[end:].strip()
-    if trailing:
-        if "{" in trailing:
-            raise ValueError("auto LLM output contains multiple JSON objects")
-        raise ValueError("auto LLM output is not valid JSON")
-    if not isinstance(payload, dict):
-        raise ValueError("auto LLM output must be a JSON object")
-    return payload
-
-
-def _decode_unfenced_json_object(text: str, visible_text: str, start: int) -> dict[str, Any]:
-    try:
-        payload, end = json.JSONDecoder().raw_decode(text[start:])
-    except (json.JSONDecodeError, ValueError, RecursionError):
-        raise ValueError("auto LLM output is not valid JSON") from None
-    if not isinstance(payload, dict):
-        raise ValueError("auto LLM output must be a JSON object")
-    if "{" in visible_text[start + end :]:
+    if not matches:
+        if text.startswith("{") and not decoded_object:
+            raise ValueError("auto LLM output is not valid JSON")
+        raise ValueError("auto LLM output did not contain the required JSON object")
+    if len(matches) > 1:
         raise ValueError("auto LLM output contains multiple JSON objects")
-    return payload
+    return matches[0]
+
+
+def _json_containers(text: str) -> list[_JsonContainer]:
+    containers: list[_JsonContainer] = []
+    stack: list[int] = []
+    in_string = False
+    escaped = False
+    for position, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"' and stack:
+            in_string = True
+        elif char in "[{":
+            parent = stack[-1] if stack else None
+            containers.append(_JsonContainer(opener=char, start=position, parent=parent))
+            stack.append(len(containers) - 1)
+        elif char in "]}":
+            expected = "[" if char == "]" else "{"
+            while stack and containers[stack[-1]].opener != expected:
+                stack.pop()
+            if not stack:
+                continue
+            container_index = stack.pop()
+            containers[container_index].end = position + 1
+    return containers
 
 
 def _normalize_answer_entry(raw_answer: Any) -> dict[str, str] | None:

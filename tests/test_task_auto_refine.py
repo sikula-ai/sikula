@@ -47,6 +47,26 @@ def test_parse_task_auto_refine_output_skips_source_brace_before_json():
     assert draft.input_language == "en"
 
 
+def test_parse_task_auto_refine_output_accepts_json_after_same_line_prose():
+    draft = parse_task_auto_refine_output(
+        'Here is the response: {"task_markdown": "# Preserve refresh behavior\\n\\nKeep refresh available."}'
+    )
+
+    assert draft.task_markdown.startswith("# Preserve refresh behavior")
+
+
+def test_parse_task_auto_refine_output_selects_task_markdown_root_object():
+    draft = parse_task_auto_refine_output(
+        """A source fixture uses another structured shape:
+{"answers": {"example": "source context"}}
+
+{"task_markdown": "# Preserve refresh behavior\\n\\nKeep refresh available after an error."}
+"""
+    )
+
+    assert draft.task_markdown.startswith("# Preserve refresh behavior")
+
+
 def test_parse_task_auto_refine_output_rejects_missing_markdown_or_generated_markers():
     with pytest.raises(ValueError, match="non-empty task_markdown"):
         parse_task_auto_refine_output('{"task_markdown": ""}')
@@ -210,6 +230,19 @@ def test_parse_task_auto_answer_output_accepts_active_answers_and_warns_for_inac
     assert batch.unanswered == [{"id": "acceptance.criteria", "reason": "Needs human confirmation."}]
     assert "ignored answer for inactive question id: inactive.id" in batch.warnings
     assert "one answer left open" in batch.warnings
+
+
+def test_parse_task_auto_answer_output_selects_answers_root_object():
+    batch = parse_task_auto_answer_output(
+        """A source fixture uses another structured shape:
+{"task_markdown": "# Source fixture"}
+
+{"answers": {"scope.boundaries": {"answer": "Add invite creation only."}}}
+""",
+        {"scope.boundaries"},
+    )
+
+    assert batch.answers == {"scope.boundaries": {"answer": "Add invite creation only.", "notes": ""}}
 
 
 def test_parse_task_auto_answer_output_rejects_missing_answers_object():
