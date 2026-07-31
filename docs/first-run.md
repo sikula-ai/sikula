@@ -118,7 +118,7 @@ sikula run .sikula/tasks/my-task.md --no-isolate
 sikula run .sikula/tasks/my-task.md
 ```
 
-Sikula creates a branch named `sikula/<task-stem>-<task-id>`, runs the configured delivery pipeline, commits successful changes to that branch, and removes the temporary worktree.
+Sikula creates a branch named `sikula/<task-stem>-<task-id>`, runs the configured delivery pipeline, commits successful changes to that branch, and removes the temporary worktree. Known workflow suffixes such as `.refined`, `.contract`, and `.vN` are omitted from `<task-stem>`, so `my-task.refined.md` and `my-task.contract.md` both use `my-task`.
 
 ## Inspect Results
 

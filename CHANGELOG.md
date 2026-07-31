@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Review Fix Current Branch**: Added `sikula review --fix --current-branch` so operators can apply review fixes to the currently checked-out branch while Sikula keeps write-capable agent work in an isolated worktree, delivers by local fast-forward only after safety checks pass, and never pushes or opens pull requests.
 
 ### Changed
+- **Task Branch Names**: New isolated runs omit known `.refined`, `.contract`, and `.vN` workflow suffixes from the task stem used in `sikula/<task-stem>-<task-id>` branches.
 - **Test Writer Context**: During multi-step runs, per-step TestWriter passes now use the active step's changed files and focused diff instead of the full accumulated task diff; the final full-task pass still receives the integrated change.
 - **Self-hosting Write Scope**: Expanded the repository's self-hosted Sikula write scope to include user-facing documentation and `CHANGELOG.md` while keeping configuration, agent guidance, contributing docs, generated guidelines, and package metadata maintainer-owned.
 
