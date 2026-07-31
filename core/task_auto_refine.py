@@ -65,7 +65,7 @@ TaskAutoAnswerProvider = Callable[[TaskAutoAnswerRequest], TaskAutoAnswerBatch]
 def parse_task_auto_refine_output(output: str) -> TaskAutoRefineDraft:
     """Parse read-only LLM output for product task-description normalization."""
 
-    payload = load_auto_json_object(output)
+    payload = load_auto_json_object(output, required_keys=frozenset({"task_markdown"}))
     raw_markdown = payload.get("task_markdown")
     if not isinstance(raw_markdown, str) or not raw_markdown.strip():
         raise ValueError("auto task refine output must contain non-empty task_markdown")
@@ -91,7 +91,11 @@ def parse_task_auto_refine_output(output: str) -> TaskAutoRefineDraft:
 def parse_task_auto_answer_output(output: str, active_question_ids: set[str]) -> TaskAutoAnswerBatch:
     """Parse read-only LLM answer JSON for active product task-refinement questions."""
 
-    payload = load_auto_json_object(output)
+    payload = load_auto_json_object(
+        output,
+        required_keys=frozenset({"answers"}),
+        fallback_keys=frozenset({"unanswered", "warnings"}),
+    )
     raw_answers = payload.get("answers", {})
     if raw_answers is None:
         raw_answers = {}

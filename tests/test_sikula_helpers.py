@@ -320,7 +320,20 @@ class TestBranchStem:
         assert _branch_stem("my_task.md") == "my-task"
 
     def test_dots_become_dashes(self):
-        assert _branch_stem("my.task.refined.md") == "my-task-refined"
+        assert _branch_stem("my.task.notes.md") == "my-task-notes"
+
+    @pytest.mark.parametrize(
+        "task_file",
+        [
+            "example.refined.md",
+            "example.contract.md",
+            "example.v2.contract.md",
+            "example.contract.v3.md",
+            "Example.REFINED.V4.md",
+        ],
+    )
+    def test_known_workflow_suffixes_are_removed(self, task_file):
+        assert _branch_stem(task_file) == "example"
 
     def test_mixed_punctuation_collapses_to_single_dash(self):
         assert _branch_stem("my...task__v1.2!!.md") == "my-task-v1-2"
