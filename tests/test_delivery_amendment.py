@@ -195,6 +195,18 @@ def _write_plan(root: Path) -> Path:
     return plan_path
 
 
+def _add_plan_component(plan_path: Path, component_id: str) -> None:
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan["components"] = [
+        {
+            "id": component_id,
+            "path": "src",
+            "stream": "core",
+        }
+    ]
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+
+
 def _write_progress(root: Path, first_commit: str, second_commit: str, *, target_status: str = "pending") -> Path:
     target: dict[str, str] = {
         "unit_id": "c",
@@ -361,6 +373,34 @@ def test_pending_middle_split_preserves_progress_and_rewires_to_all_leaves(tmp_p
     ]
     assert events[-1]["replacement_ids"] == ["c-1", "c-2", "c-3"]
     assert events[-1]["rewired_unit_ids"] == ["d"]
+
+
+def test_prepare_stores_componentless_replacements_without_component_metadata(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+
+    proposal, proposal_path = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    payload = json.loads(proposal_path.read_text(encoding="utf-8"))
+    assert [unit.component for unit in proposal.replacement_units] == [None, None, None]
+    assert all("component" not in unit for unit in payload["replacement_units"])
+
+
+def test_prepare_stores_replacement_with_declared_component(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    _add_plan_component(plan_path, "ApiV2")
+    draft = _draft()
+    draft.replacement_units[0] = replace(draft.replacement_units[0], component="ApiV2")
+
+    proposal, proposal_path = create_delivery_amendment_proposal(
+        plan_path, "c", draft, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    payload = json.loads(proposal_path.read_text(encoding="utf-8"))
+    assert proposal.replacement_units[0].component == "ApiV2"
+    assert payload["replacement_units"][0]["component"] == "ApiV2"
+    assert all("component" not in unit for unit in payload["replacement_units"][1:])
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions")
@@ -884,10 +924,22 @@ def test_prepare_rejects_replacement_contract_with_uncovered_validation(tmp_path
     assert not list(proposal_root.rglob("*.json"))
 
 
-def test_prepare_rejects_invalid_amended_plan_before_publishing_proposal(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("field", "value", "error_code"),
+    [
+        ("stream", "unknown-stream", "units.stream_unknown"),
+        ("component", "unknown-component", "units.component_unknown"),
+    ],
+)
+def test_prepare_rejects_invalid_amended_plan_before_publishing_proposal(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    error_code: str,
+) -> None:
     plan_path, _, proposal_root = _setup(tmp_path)
     draft = _draft()
-    draft.replacement_units[0] = replace(draft.replacement_units[0], stream="unknown-stream")
+    draft.replacement_units[0] = replace(draft.replacement_units[0], **{field: value})
 
     with pytest.raises(DeliveryAmendmentError) as exc_info:
         create_delivery_amendment_proposal(
@@ -898,7 +950,7 @@ def test_prepare_rejects_invalid_amended_plan_before_publishing_proposal(tmp_pat
             proposal_root=proposal_root,
         )
 
-    assert exc_info.value.issue.code == "units.stream_unknown"
+    assert exc_info.value.issue.code == error_code
     assert not list(proposal_root.rglob("*.json"))
 
 
@@ -1533,6 +1585,8 @@ def test_amend_prepare_cli_stores_allowlisted_proposal_projection(
     assert payload["proposal_path"].startswith(".sikula/contract-reports/delivery-amendments/amend-demo/")
     assert payload["audit_path"] == ".sikula/contract-reports/amend.auto-llm.jsonl"
     assert "task_markdown" not in json.dumps(payload)
+    assert "component_ids" not in payload
+    assert "components" not in payload
     assert len(calls) == 1
     assert calls[0]["target"].target.id == "c"
     assert not delivery_events_path(tmp_path, "amend-demo").exists()
@@ -1708,6 +1762,7 @@ def test_main_amend_authoring_adapter_attaches_audit_path(
         def author_delivery_amendment(self, **kwargs):
             assert kwargs["target_unit_id"] == "c"
             assert kwargs["downstream_units"][0]["id"] == "d"
+            assert kwargs["component_ids"] == []
             kwargs["audit_recorder"]({"phase": "test"})
             return _draft()
 
@@ -1744,12 +1799,18 @@ def test_main_amend_authoring_adapter_preserves_raw_plan_references(
     }
     plan_data = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
     plan_data["streams"] = [legacy_metadata["stream"]]
+    extra_component_id = "CaseSensitive.Component"
     plan_data["components"] = [
         {
             "id": legacy_metadata["component"],
             "path": ".",
             "stream": legacy_metadata["stream"],
-        }
+        },
+        {
+            "id": extra_component_id,
+            "path": "src",
+            "stream": legacy_metadata["stream"],
+        },
     ]
     for unit in plan_data["units"]:
         unit.update(legacy_metadata)
@@ -1766,6 +1827,7 @@ def test_main_amend_authoring_adapter_preserves_raw_plan_references(
 
     class Agent:
         def author_delivery_amendment(self, **kwargs):
+            assert kwargs["component_ids"] == [legacy_metadata["component"], extra_component_id]
             for key, value in legacy_metadata.items():
                 assert kwargs["target_unit"][key] == value
                 assert kwargs["downstream_units"][0][key] == value
@@ -1840,6 +1902,12 @@ def test_main_amend_authoring_adapter_attaches_audit_path_to_failure(
         )
 
     assert exc_info.value.audit_path == ".sikula/contract-reports/amend-audit.jsonl"
+
+
+def test_main_run_next_context_uses_shared_amend_authoring_adapter() -> None:
+    context = sikula._delivery_run_next_context()
+
+    assert context.run_amendment_authoring is sikula._run_delivery_amend_prepare_authoring
 
 
 def test_amend_prepare_cli_reports_git_execution_failure(

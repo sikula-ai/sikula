@@ -290,6 +290,11 @@ task Markdown passes the same contract-readiness and configured
 validation-coverage gate as ordinary delivery preparation. Proposal files use
 atomic no-overwrite publication. Directory fsync is best effort, matching the
 other Sikula state writers.
+Amendment authoring receives the parsed source plan's exact components[].id
+values as the component vocabulary: component-less plans require replacement
+units to omit component, while component-bearing plans allow omission or an
+exact declared ID; deterministic amended-plan validation remains the enforcement
+boundary and still rejects unknown IDs with units.component_unknown.
 Amendment destinations reject Git metadata and Sikula runtime, worktree, and
 report roots at any depth below the project root, including configured task
 state and contract-report roots. Derived replacement task paths are subject to
@@ -476,7 +481,8 @@ and linked-child plan/unit identity, a failed child state, a planner-phase stop,
 and matching allowlisted values across parent progress, the child budget stop,
 the child budget snapshot, and the current unit budget. Deterministic code binds
 `unit_budget_exceeded` and the verified limit/actual values into the proposal;
-conflicting model output is rejected. The nested
+conflicting model output is rejected. `--prepare-budget-split` uses the same
+component-constrained amendment authoring path. The nested
 `budget_split_preparation` JSON/text projection contains
 only allowlisted identifiers, project-relative local artifact paths, replacement
 ids, sanitized issues, and budget values. It never includes child prompts,

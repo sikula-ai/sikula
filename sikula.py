@@ -3436,6 +3436,7 @@ def _run_delivery_amend_prepare_authoring(
     )
     agent = _create_delivery_preparation_agent(args, cfg)
     safe_audit_path = _contract_preflight_path(audit_path, project_root)
+    component_ids = [component.id for component in target.plan.components]
     downstream_by_id = {unit.id: unit for unit in target.plan.units}
     try:
         draft = agent.author_delivery_amendment(
@@ -3446,6 +3447,7 @@ def _run_delivery_amend_prepare_authoring(
             downstream_units=[downstream_by_id[unit_id].to_authoring_dict() for unit_id in target.downstream_unit_ids],
             project_root=project_root,
             project_context=_prepare_project_context_from_config(cfg),
+            component_ids=component_ids,
             amend_reason=amend_reason,
             budget_exceeded=budget_exceeded.to_dict() if budget_exceeded else None,
             audit_recorder=audit_recorder,

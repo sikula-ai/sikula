@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
@@ -260,6 +261,9 @@ Plan id: {plan_id}
 Target unit id: {target_unit_id_json}
 Project stack: {project_stack}
 
+Source-plan component guidance:
+{component_guidance}
+
 Verified recovery metadata supplied by deterministic Sikula code:
 ```json
 {recovery_metadata_json}
@@ -324,7 +328,6 @@ Return this JSON shape:
       "title": "Short replacement title",
       "depends_on": [],
       "stream": "optional non-empty string",
-      "component": "optional non-empty string",
       "phase": "optional non-empty string",
       "kind": "optional non-empty string",
       "platform": "optional non-empty string",
@@ -466,11 +469,29 @@ class DeliveryPreparationAgent:
         downstream_units: list[dict[str, Any]],
         project_root: str | Path,
         project_context: dict[str, Any] | None = None,
+        component_ids: Sequence[str] = (),
         amend_reason: str | None = None,
         budget_exceeded: dict[str, Any] | None = None,
         audit_recorder: DeliveryPreparationAuditRecorder | None = None,
     ) -> DeliveryAmendmentAuthoringDraft:
         root = Path(project_root).resolve()
+        component_id_list = list(component_ids)
+        if component_id_list:
+            component_guidance = (
+                "The source plan declares these component IDs as the complete allowlist. "
+                "Preserve case and spelling exactly:\n"
+                "```json\n"
+                "{component_ids_json}\n"
+                "```\n"
+                "Replacement units may omit component or set it to exactly one of the listed IDs. "
+                "Do not invent, normalize, lowercase, or otherwise alter component IDs."
+            ).format(component_ids_json=json.dumps(component_id_list, indent=2))
+        else:
+            component_guidance = (
+                "The source plan declares no top-level components. No component IDs are allowed for replacements. "
+                "Every replacement unit MUST omit the component field entirely. Do not emit component: null and do "
+                "not invent component IDs."
+            )
         prompt = read_only_agent_prompt(
             AGENT_SECURITY_PREFIX
             + _DELIVERY_AMENDMENT_PROMPT.format(
@@ -486,6 +507,7 @@ class DeliveryPreparationAgent:
                 ),
                 amend_reason_json=json.dumps(amend_reason),
                 budget_exceeded_json=json.dumps(budget_exceeded, sort_keys=True),
+                component_guidance=component_guidance,
                 target_unit_json=json.dumps(target_unit, indent=2, sort_keys=True),
                 downstream_units_json=json.dumps(downstream_units, indent=2, sort_keys=True),
                 guidelines_files=guidelines_files(self.project_config),
