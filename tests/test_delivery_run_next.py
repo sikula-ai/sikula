@@ -3996,6 +3996,9 @@ def test_cmd_delivery_run_next_prepares_existing_budget_split_after_lock_release
     proposal = json.loads((tmp_path / preparation["proposal_path"]).read_text(encoding="utf-8"))
     assert proposal["amend_reason"] == "unit_budget_exceeded"
     assert proposal["budget_exceeded"] == budget.to_dict()
+    assert all("component" not in unit for unit in proposal["replacement_units"])
+    assert "component_ids" not in preparation
+    assert "components" not in preparation
     assert plan_path.read_bytes() == plan_before
     assert progress_path.read_bytes() == progress_before
     assert "PRIVATE PLANNER" not in json.dumps(payload)
@@ -4122,6 +4125,9 @@ def test_cmd_delivery_run_next_prepares_fresh_budget_split_after_child_failure(
     assert lock_was_available is True
     assert payload["unit_status"] == "failed"
     assert payload["budget_split_preparation"]["prepared"] is True
+    proposal_path = tmp_path / payload["budget_split_preparation"]["proposal_path"]
+    proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
+    assert all("component" not in unit for unit in proposal["replacement_units"])
     events = [
         json.loads(line) for line in delivery_events_path(tmp_path, "delivery-run-next-demo").read_text().splitlines()
     ]

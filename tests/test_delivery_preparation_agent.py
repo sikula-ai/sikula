@@ -299,6 +299,7 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert '"estimated_size": "small"' in prompt
     assert '"risk_tags": ["cli_surface"]' in prompt
     assert '"budget": {"max_planner_steps": 1, "max_changed_files": 8}' in prompt
+    assert '"component": "optional non-empty string"' in prompt
     assert "Design every unit for a single implementation pass" in prompt
     assert "Never set max_planner_steps to 3 or more" in prompt
     assert "Add team invite authoring without exposing raw task text." in prompt
@@ -339,6 +340,12 @@ def test_author_delivery_amendment_uses_plain_generation_and_records_audit(tmp_p
     assert "amend_reason must be omitted, null, or a stable code" in prompt
     assert '"amend_reason": null' in prompt
     assert "Verified recovery metadata supplied by deterministic Sikula code:\n```json\nnull" in prompt
+    assert (
+        "The source plan declares no top-level components. No component IDs are allowed for replacements. "
+        "Every replacement unit MUST omit the component field entirely. Do not emit component: null and do "
+        "not invent component IDs."
+    ) in prompt
+    assert '"component": "optional non-empty string"' not in prompt
     assert "optional stable reason" not in prompt
     assert '"id": "oversized"' in prompt
     assert "Split the oversized invite behavior" in prompt
@@ -366,6 +373,35 @@ def test_author_delivery_amendment_includes_verified_recovery_metadata(tmp_path:
     assert '"amend_reason": "unit_budget_exceeded"' in prompt
     assert '"actual": 5' in prompt
     assert '"limit": 2' in prompt
+
+
+def test_author_delivery_amendment_renders_component_allowlist_with_exact_ids(tmp_path: Path) -> None:
+    component_ids = ("API", 'Web"UI', "mobile-client")
+    llm = CapturingLLM(_amendment_output())
+    agent = DeliveryPreparationAgent(llm=llm)
+
+    agent.author_delivery_amendment(
+        plan_id="team-invites",
+        target_unit_id="oversized",
+        target_task_description="Split the selected unit.",
+        target_unit={"id": "oversized", "depends_on": []},
+        downstream_units=[],
+        project_root=tmp_path,
+        component_ids=component_ids,
+    )
+
+    prompt = llm.prompts[0]
+    assert (
+        "The source plan declares these component IDs as the complete allowlist. Preserve case and spelling exactly:"
+    ) in prompt
+    assert f"```json\n{json.dumps(list(component_ids), indent=2)}\n```" in prompt
+    assert (
+        "Replacement units may omit component or set it to exactly one of the listed IDs. "
+        "Do not invent, normalize, lowercase, or otherwise alter component IDs."
+    ) in prompt
+    assert 'Web\\"UI' in prompt
+    assert 'web"ui' not in prompt
+    assert "The source plan declares no top-level components." not in prompt
 
 
 def test_author_delivery_amendment_json_escapes_plan_valid_target_id(tmp_path: Path) -> None:

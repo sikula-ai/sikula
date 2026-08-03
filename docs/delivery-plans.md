@@ -194,6 +194,11 @@ and timeout overrides as `delivery prepare`. The assistant returns only new
 replacement units; deterministic code derives task paths, makes replacement
 roots inherit the target's upstream dependencies, identifies replacement
 leaves, and determines which direct downstream units need rewiring.
+Replacement unit component metadata is constrained by the source plan: when the
+plan has no top-level components, replacements must omit component; when
+components exist, replacements may omit it or use only an exact declared
+component ID. Omitted values keep the existing target-inheritance behavior, and
+unknown IDs still fail deterministic validation with units.component_unknown.
 
 Prepare stores a normalized, content-addressed proposal under
 `.sikula/contract-reports/delivery-amendments/<plan-id>/`. The proposal includes
