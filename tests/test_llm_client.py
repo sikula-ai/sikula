@@ -4938,7 +4938,7 @@ class TestAntigravityClientCommands:
             )
             return subprocess.CompletedProcess(cmd, 0, output, "")
 
-        with patch("core.llm_client.subprocess.run", side_effect=_fake_run):
+        with patch("core.llm_client._run_provider_cli", side_effect=_fake_run):
             output = client.run_readonly_agent("prompt", tmp_path)
 
         cmd = seen["cmd"]
@@ -4968,12 +4968,12 @@ class TestAntigravityClientCommands:
 
         with (
             patch("core.llm_client.time.sleep"),
-            patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run,
+            patch("core.llm_client._run_provider_cli", side_effect=_fake_run) as mock_provider,
             pytest.raises(LLMTransientError, match="disposable workspace"),
         ):
             client.run_readonly_agent("prompt", tmp_path)
 
-        assert mock_run.call_count == 4
+        assert mock_provider.call_count == 4
         assert (tmp_path / "repo.txt").read_text() == "source"
 
     def test_run_readonly_agent_rejects_new_soft_ignored_directories(self, tmp_path: Path):
@@ -4988,12 +4988,12 @@ class TestAntigravityClientCommands:
 
         with (
             patch("core.llm_client.time.sleep"),
-            patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run,
+            patch("core.llm_client._run_provider_cli", side_effect=_fake_run) as mock_provider,
             pytest.raises(LLMTransientError, match="disposable workspace"),
         ):
             client.run_readonly_agent("prompt", tmp_path)
 
-        assert mock_run.call_count == 4
+        assert mock_provider.call_count == 4
         assert not (tmp_path / "node_modules").exists()
 
     def test_run_readonly_agent_preserves_tracked_files_in_ignored_dirs(self, tmp_path: Path):
@@ -5165,12 +5165,12 @@ class TestAntigravityClientCommands:
 
         with (
             patch("core.llm_client.time.sleep") as sleep,
-            patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run,
+            patch("core.llm_client._run_provider_cli", side_effect=_fake_run) as mock_provider,
             pytest.raises(LLMConfigurationError, match="unsupported model"),
         ):
             client.run_readonly_agent("prompt", tmp_path)
 
-        assert mock_run.call_count == 1
+        assert mock_provider.call_count == 1
         sleep.assert_not_called()
         assert (tmp_path / "repo.txt").read_text() == "source"
 
@@ -5187,12 +5187,12 @@ class TestAntigravityClientCommands:
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
 
         with (
-            patch("core.llm_client.subprocess.run") as mock_run,
+            patch("core.llm_client._run_provider_cli") as mock_provider,
             pytest.raises(LLMConfigurationError, match="external symlink external-link.txt"),
         ):
             client.run_readonly_agent("prompt", repo)
 
-        mock_run.assert_not_called()
+        mock_provider.assert_not_called()
         assert external.read_text() == "outside"
 
     def test_run_readonly_agent_prunes_ignored_top_level_symlink_before_copying(self, tmp_path: Path):
@@ -5212,11 +5212,11 @@ class TestAntigravityClientCommands:
             assert not (workspace / "node_modules").exists()
             return subprocess.CompletedProcess(cmd, 0, "reviewed", "")
 
-        with patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run:
+        with patch("core.llm_client._run_provider_cli", side_effect=_fake_run) as mock_provider:
             output = client.run_readonly_agent("prompt", repo)
 
         assert output == "reviewed"
-        assert mock_run.called
+        assert mock_provider.called
 
     def test_run_readonly_agent_prunes_gitignored_symlink_before_copying(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -5264,11 +5264,11 @@ class TestAntigravityClientCommands:
             assert not (workspace / ".venv").exists()
             return subprocess.CompletedProcess(cmd, 0, "reviewed", "")
 
-        with patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run:
+        with patch("core.llm_client._run_provider_cli", side_effect=_fake_run) as mock_provider:
             output = client.run_readonly_agent("prompt", repo)
 
         assert output == "reviewed"
-        assert mock_run.called
+        assert mock_provider.called
 
     def test_run_agent_adds_workspace_and_detects_changed_files(self, tmp_path: Path):
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
