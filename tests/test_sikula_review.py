@@ -143,7 +143,12 @@ def _cfg(tmp_path: Path) -> dict:
 
 
 def _run_review(
-    tmp_path: Path, *, reviewer_approved: bool, security_approved: bool = True, run_security_review: bool = True
+    tmp_path: Path,
+    *,
+    reviewer_approved: bool,
+    security_approved: bool = True,
+    run_security_review: bool = True,
+    args_overrides: dict | None = None,
 ):
     cfg = _cfg(tmp_path)
     cfg["run_security_review"] = run_security_review
@@ -179,7 +184,7 @@ def _run_review(
         patch("agents.security_reviewer_agent.SecurityReviewerAgent", return_value=mock_security),
         patch("sys.exit"),
     ):
-        cmd_review(_args(), cfg)
+        cmd_review(_args(**(args_overrides or {})), cfg)
 
     from core.state import JsonStateStore
 
@@ -331,6 +336,8 @@ class TestCmdReviewReportOnlyState:
         assert state.review_base_branch == "main"
         assert state.test_status == "skipped"
         assert state.check_status == "skipped"
+        assert state.run_invocation_schema_version == 1
+        assert [record["config_snapshot"] for record in state.run_invocation_records] == [state.config_snapshot]
 
     def test_rejected_review_sets_failed(self, tmp_path: Path):
         state = _run_review(tmp_path, reviewer_approved=False)
@@ -392,6 +399,8 @@ class TestCmdReviewReportOnlyState:
         assert state.worktree_path is None
         assert state.worktree_base is None
         assert state.worktree_branch == "feat/x"
+        assert state.run_invocation_schema_version is None
+        assert state.run_invocation_records == []
         assert [entry["action"] for entry in state.history] == ["review_failed", "cleanup"]
         remove_worktree.assert_called_once_with(worktree_base, tmp_path, force=False)
 
@@ -404,6 +413,23 @@ class TestCmdReviewReportOnlyState:
         state = _run_review(tmp_path, reviewer_approved=True)
         assert state.config_snapshot["progress"] == {
             "heartbeat_interval_seconds": 60,
+        }
+
+    def test_config_snapshot_contains_effective_agent_overrides(self, tmp_path: Path):
+        state = _run_review(
+            tmp_path,
+            reviewer_approved=True,
+            args_overrides={
+                "agent_provider": ["reviewer=claude"],
+                "agent_model": ["reviewer=claude-sonnet-4-5"],
+                "agent_timeout": ["reviewer=1200"],
+            },
+        )
+
+        assert state.config_snapshot["agents"]["reviewer"] == {
+            "provider": "claude",
+            "model": "claude-sonnet-4-5",
+            "agent_timeout": 1200,
         }
 
     def test_heartbeat_interval_treats_zero_as_disabled(self):

@@ -258,7 +258,7 @@ class TestOrchestratorLoop:
         monkeypatch.setattr(orch, "_loop", lambda _state: None)
 
         orch._config_snapshot = {"run_build": True}
-        orch.run(task_id=state.task_id)
+        orch.run(task_id=state.task_id, complete_invocation_history=True)
         orch._config_snapshot = {"run_build": False}
         orch.run(task_id=state.task_id)
 
@@ -269,6 +269,15 @@ class TestOrchestratorLoop:
             {"run_build": True},
             {"run_build": False},
         ]
+
+    def test_task_description_marks_first_invocation_history_complete(self, tmp_path: Path, monkeypatch):
+        orch, _, _ = _make_orchestrator(tmp_path)
+        monkeypatch.setattr(orch, "_loop", lambda _state: None)
+
+        state = orch.run(task_description="test task")
+
+        assert state.run_invocation_schema_version == 1
+        assert len(state.run_invocation_records) == 1
 
     def test_legacy_resume_records_partial_history_without_claiming_complete_evidence(
         self, tmp_path: Path, monkeypatch

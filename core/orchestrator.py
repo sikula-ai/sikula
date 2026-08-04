@@ -433,20 +433,26 @@ class Orchestrator:
         task_id: Optional[str] = None,
         task_description: Optional[str] = None,
         label: Optional[str] = None,
+        complete_invocation_history: bool = False,
     ) -> TaskState:
+        created_state = False
         if task_id:
             state = self._store.load(task_id)
             if state is None:
                 raise ValueError(f"Task not found: {task_id}")
         elif task_description:
             state = self._store.create(task_description)
+            created_state = True
         else:
             raise ValueError("Provide task_id or task_description")
 
         display = label or state.task_description.splitlines()[0][:60]
         log.info("Task %s — %s", state.task_id, display)
         if not state.done and not state.failed:
-            state.record_run_invocation(self._config_snapshot)
+            state.record_run_invocation(
+                self._config_snapshot,
+                complete_history_from_creation=(created_state or complete_invocation_history),
+            )
         state.clear_active_operation()
         state.pid = os.getpid()
         self._store.save(state)

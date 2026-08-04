@@ -3137,9 +3137,15 @@ def _run_report_only_review(
         agents_cfg = cfg.get("agents", {})
 
         def _review_agent_snapshot(name: str) -> dict:
+            effective_agent_cfg = {
+                **agents_cfg.get(name, {}).get("llm", {}),
+                **agent_llm_overrides.get(name, {}),
+            }
+            llm_config = _make_llm_config(base_llm_cfg, effective_agent_cfg)
             snap: dict = {
-                "provider": _make_llm_config(base_llm_cfg, agents_cfg.get(name, {}).get("llm", {})).provider,
-                "model": _make_llm_config(base_llm_cfg, agents_cfg.get(name, {}).get("llm", {})).model,
+                "provider": llm_config.provider,
+                "model": llm_config.model,
+                "agent_timeout": llm_config.agent_timeout,
             }
             extra_rules = cfg.get(name, {}).get("extra_rules")
             if extra_rules:
@@ -3160,6 +3166,10 @@ def _run_report_only_review(
             "test_writer": cfg.get("test_writer", {}),
             "agents": {name: _review_agent_snapshot(name) for name in ("reviewer", "security_reviewer")},
         }
+        state.record_run_invocation(
+            state.config_snapshot,
+            complete_history_from_creation=True,
+        )
         store.save(state)
 
         def _llm(name: str):

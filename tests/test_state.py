@@ -114,6 +114,28 @@ class TestTaskStateRecord:
                 },
             }
         ]
+        assert state.run_invocation_schema_version is None
+
+    def test_first_run_invocation_record_can_mark_history_complete(self):
+        state = TaskState(task_id="t1", task_description="task")
+
+        state.record_run_invocation(
+            {"run_build": True},
+            complete_history_from_creation=True,
+        )
+
+        assert state.run_invocation_schema_version == state_module.RUN_INVOCATION_SCHEMA_VERSION
+        assert len(state.run_invocation_records) == 1
+
+    def test_partial_history_cannot_later_be_marked_complete(self):
+        state = TaskState(task_id="t1", task_description="task")
+        state.record_run_invocation({"run_build": True})
+
+        with pytest.raises(ValueError, match="can only be marked on the first record"):
+            state.record_run_invocation(
+                {"run_build": False},
+                complete_history_from_creation=True,
+            )
 
     def test_delivery_budget_stop_records_structured_audit(self):
         state = TaskState(task_id="t1", task_description="task")
@@ -144,7 +166,7 @@ class TestJsonStateStore:
         state = store.create("add feature")
         assert state.task_description == "add feature"
         assert len(state.task_id) == 32  # uuid4().hex
-        assert state.run_invocation_schema_version == state_module.RUN_INVOCATION_SCHEMA_VERSION
+        assert state.run_invocation_schema_version is None
         assert state.run_invocation_records == []
         assert (tmp_path / f"{state.task_id}.json").exists()
 

@@ -482,13 +482,24 @@ class TaskState:
         record["recorded_at"] = _now()
         self.llm_usage_records.append(record)
 
-    def record_run_invocation(self, config_snapshot: dict) -> None:
+    def record_run_invocation(
+        self,
+        config_snapshot: dict,
+        *,
+        complete_history_from_creation: bool = False,
+    ) -> None:
+        if complete_history_from_creation and (
+            self.run_invocation_schema_version is not None or self.run_invocation_records
+        ):
+            raise ValueError("complete run-invocation history can only be marked on the first record")
         self.run_invocation_records.append(
             {
                 "started_at": _now(),
                 "config_snapshot": copy.deepcopy(config_snapshot),
             }
         )
+        if complete_history_from_creation:
+            self.run_invocation_schema_version = RUN_INVOCATION_SCHEMA_VERSION
 
     def record_implementation_assets(self, records: list[dict]) -> None:
         sanitized = []
@@ -803,7 +814,6 @@ class StateStore:
         state = TaskState(
             task_id=task_id,
             task_description=task_description,
-            run_invocation_schema_version=RUN_INVOCATION_SCHEMA_VERSION,
             delivery_plan_id=delivery_plan_id,
             delivery_unit_id=delivery_unit_id,
             delivery_plan_path=delivery_plan_path,
