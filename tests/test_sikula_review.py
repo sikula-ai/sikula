@@ -420,12 +420,17 @@ class TestCmdReviewReportOnlyState:
             tmp_path,
             reviewer_approved=True,
             args_overrides={
-                "agent_provider": ["reviewer=claude"],
-                "agent_model": ["reviewer=claude-sonnet-4-5"],
-                "agent_timeout": ["reviewer=1200"],
+                "agent_provider": ["analyst=gemini", "reviewer=claude"],
+                "agent_model": ["analyst=gemini-2.5-pro", "reviewer=claude-sonnet-4-5"],
+                "agent_timeout": ["analyst=900", "reviewer=1200"],
             },
         )
 
+        assert state.config_snapshot["agents"]["analyst"] == {
+            "provider": "gemini",
+            "model": "gemini-2.5-pro",
+            "agent_timeout": 900,
+        }
         assert state.config_snapshot["agents"]["reviewer"] == {
             "provider": "claude",
             "model": "claude-sonnet-4-5",
@@ -549,6 +554,7 @@ class TestCmdReviewReportOnlyState:
     def test_config_snapshot_omits_extra_rules_when_not_configured(self, tmp_path: Path):
         state = _run_review(tmp_path, reviewer_approved=True)
         agents_snap = state.config_snapshot["agents"]
+        assert "extra_rules" not in agents_snap["analyst"]
         assert "extra_rules" not in agents_snap["reviewer"]
         assert "extra_rules" not in agents_snap["security_reviewer"]
 
@@ -1534,6 +1540,30 @@ def _mock_orchestrator():
 
 
 class TestCmdReviewDesignFileEnrichment:
+    def test_enrichment_uses_effective_analyst_override(self, tmp_path: Path):
+        state = MagicMock()
+        store = MagicMock()
+        enrichment_llm = MagicMock()
+
+        with (
+            patch("core.llm_client.create_llm_client", return_value=enrichment_llm) as create_llm,
+            patch("sikula._enrich_prompt_with_referenced_files", return_value=""),
+        ):
+            _sikula._enrich_review_state_prompt(
+                state,
+                store,
+                "Review description",
+                {"provider": "codex", "model": "gpt-5.3-codex", "agent_timeout": 1800},
+                _cfg(tmp_path),
+                tmp_path,
+                {"provider": "gemini", "model": "gemini-2.5-pro", "agent_timeout": 900},
+            )
+
+        llm_config = create_llm.call_args.args[0]
+        assert llm_config.provider == "gemini"
+        assert llm_config.model == "gemini-2.5-pro"
+        assert llm_config.agent_timeout == 900
+
     def test_report_only_enriches_prompt_when_files_found(self, tmp_path: Path):
         cfg = _cfg(tmp_path)
         subprocess_results = [

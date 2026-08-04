@@ -309,11 +309,24 @@ def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | Non
     heartbeat_interval_seconds = context.heartbeat_interval_seconds(cfg)
 
     base_llm_cfg = cfg.get("llm", {})
+    agent_llm_overrides = context.parse_agent_llm_overrides(
+        getattr(args, "agent_model", None),
+        getattr(args, "agent_provider", None),
+        getattr(args, "agent_timeout", None),
+    )
 
     if args.fix:
         # Analyst is skipped in review mode. Enrich the prompt with referenced files
         # before the orchestrator starts so reviewer and fixer have that context.
-        context.enrich_review_state_prompt(state, store, description, base_llm_cfg, cfg, worktree_project_root)
+        context.enrich_review_state_prompt(
+            state,
+            store,
+            description,
+            base_llm_cfg,
+            cfg,
+            worktree_project_root,
+            agent_llm_overrides.get("analyst"),
+        )
 
         cfg["project"]["root_path"] = str(worktree_project_root)
 
@@ -321,11 +334,7 @@ def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | Non
             "run_planner": False,
             "run_review": True,
             "run_security_review": run_security_review,
-            "agent_llms": context.parse_agent_llm_overrides(
-                getattr(args, "agent_model", None),
-                getattr(args, "agent_provider", None),
-                getattr(args, "agent_timeout", None),
-            ),
+            "agent_llms": agent_llm_overrides,
         }
         orch = context.build_orchestrator(cfg, overrides, state_store=store)
         state = orch.run(
@@ -364,7 +373,6 @@ def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | Non
             context.logger.info("Worktree preserved for inspection/resume: %s", worktree_base)
     else:
         total_s = context.run_report_only_review(
-            args=args,
             cfg=cfg,
             state=state,
             store=store,
@@ -375,6 +383,7 @@ def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | Non
             base_branch=base_branch,
             files_changed=files_changed,
             base_llm_cfg=base_llm_cfg,
+            agent_llm_overrides=agent_llm_overrides,
             run_security_review=run_security_review,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
             worktree_project_root=worktree_project_root,
