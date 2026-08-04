@@ -831,6 +831,9 @@ def test_delivery_run_next_prepares_budget_split_with_fake_llm(
             "1. Add the first independent behavior.\n"
             "2. Add the second independent behavior.\n"
             "3. Wire the final independent behavior.",
+            "1. Add the first independent behavior.\n"
+            "2. Add the second independent behavior.\n"
+            "3. Wire the final independent behavior.",
             _budget_split_authoring_output(),
         ]
     )
