@@ -143,6 +143,12 @@ def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | Non
         print("Error: review description is empty.")
         sys.exit(1)
 
+    agent_llm_overrides = context.parse_agent_llm_overrides(
+        getattr(args, "agent_model", None),
+        getattr(args, "agent_provider", None),
+        getattr(args, "agent_timeout", None),
+    )
+
     current_branch_mode = getattr(args, "current_branch", False)
     branch = args.branch
     base_branch = args.base_branch
@@ -309,25 +315,8 @@ def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | Non
     heartbeat_interval_seconds = context.heartbeat_interval_seconds(cfg)
 
     base_llm_cfg = cfg.get("llm", {})
-    agent_llm_overrides = context.parse_agent_llm_overrides(
-        getattr(args, "agent_model", None),
-        getattr(args, "agent_provider", None),
-        getattr(args, "agent_timeout", None),
-    )
 
     if args.fix:
-        # Analyst is skipped in review mode. Enrich the prompt with referenced files
-        # before the orchestrator starts so reviewer and fixer have that context.
-        context.enrich_review_state_prompt(
-            state,
-            store,
-            description,
-            base_llm_cfg,
-            cfg,
-            worktree_project_root,
-            agent_llm_overrides.get("analyst"),
-        )
-
         cfg["project"]["root_path"] = str(worktree_project_root)
 
         overrides = {
@@ -337,10 +326,25 @@ def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | Non
             "agent_llms": agent_llm_overrides,
         }
         orch = context.build_orchestrator(cfg, overrides, state_store=store)
+
+        def _enrich_before_pipeline(run_state) -> None:
+            # Review mode skips the Analyst phase, but reviewers and fixers still
+            # need referenced file context after invocation evidence is persisted.
+            context.enrich_review_state_prompt(
+                run_state,
+                store,
+                description,
+                base_llm_cfg,
+                cfg,
+                worktree_project_root,
+                agent_llm_overrides.get("analyst"),
+            )
+
         state = orch.run(
             task_id=task_id,
             label=task_label,
             complete_invocation_history=True,
+            before_pipeline=_enrich_before_pipeline,
         )
         total_s = time.time() - t_start
 

@@ -279,6 +279,30 @@ class TestOrchestratorLoop:
         assert state.run_invocation_schema_version == 1
         assert len(state.run_invocation_records) == 1
 
+    def test_before_pipeline_interruption_preserves_invocation_evidence(self, tmp_path: Path, monkeypatch):
+        orch, _, _ = _make_orchestrator(tmp_path)
+        state = orch._store.create("test task")
+        orch._config_snapshot = {"run_build": True}
+        pipeline_calls: list[TaskState] = []
+        monkeypatch.setattr(orch, "_loop", pipeline_calls.append)
+
+        def interrupt_before_pipeline(_run_state: TaskState) -> None:
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            orch.run(
+                task_id=state.task_id,
+                complete_invocation_history=True,
+                before_pipeline=interrupt_before_pipeline,
+            )
+
+        persisted = orch._store.load(state.task_id)
+        assert persisted is not None
+        assert persisted.config_snapshot == {"run_build": True}
+        assert persisted.run_invocation_schema_version == 1
+        assert [record["config_snapshot"] for record in persisted.run_invocation_records] == [{"run_build": True}]
+        assert pipeline_calls == []
+
     def test_legacy_resume_records_partial_history_without_claiming_complete_evidence(
         self, tmp_path: Path, monkeypatch
     ):
@@ -298,12 +322,15 @@ class TestOrchestratorLoop:
     def test_run_does_not_record_terminal_no_op_invocations(self, tmp_path: Path, done: bool, failed: bool):
         orch, _, _ = _make_orchestrator(tmp_path)
         state = _save_state(orch, done=done, failed=failed)
+        hook_calls: list[TaskState] = []
 
-        orch.run(task_id=state.task_id)
+        orch.run(task_id=state.task_id, before_pipeline=hook_calls.append)
 
         loaded = orch._store.load(state.task_id)
         assert loaded is not None
+        assert loaded.config_snapshot == {}
         assert loaded.run_invocation_records == []
+        assert hook_calls == []
 
     def test_run_agent_records_active_operation_while_agent_runs(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path, heartbeat_interval_seconds=60)

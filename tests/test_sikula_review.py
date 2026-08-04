@@ -606,6 +606,33 @@ class TestCmdReviewDescriptionValidation:
         assert not find_git_root.called
         assert "either --description or --description-file" in capsys.readouterr().out
 
+    @pytest.mark.parametrize(
+        ("args_overrides", "expected_message"),
+        [
+            ({"agent_model": ["unknown=model"]}, "Unknown agent 'unknown'"),
+            ({"agent_provider": ["reviewer"]}, "Invalid --agent-provider value"),
+            ({"agent_timeout": ["reviewer=slow"]}, "Invalid --agent-timeout value"),
+        ],
+    )
+    def test_rejects_invalid_agent_overrides_before_creating_resources(
+        self,
+        tmp_path: Path,
+        capsys,
+        args_overrides: dict,
+        expected_message: str,
+    ):
+        with (
+            patch("sikula._find_git_root") as find_git_root,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(_args(**args_overrides), _cfg(tmp_path))
+
+        assert exc_info.value.code == 1
+        assert not find_git_root.called
+        assert not (tmp_path / "state").exists()
+        assert not (tmp_path / ".sikula" / "worktrees").exists()
+        assert expected_message in capsys.readouterr().out
+
 
 class TestEnsureGitignore:
     def test_writes_to_git_info_exclude_not_gitignore(self, tmp_path: Path):
@@ -1647,15 +1674,22 @@ class TestCmdReviewDesignFileEnrichment:
         state = store.load(store.list_tasks()[0])
         assert state.implementation_prompt == "Simple review"
 
-    def test_fix_mode_enriches_prompt_before_orchestrator(self, tmp_path: Path):
+    def test_fix_mode_enriches_prompt_before_pipeline(self, tmp_path: Path):
         cfg = _cfg(tmp_path)
         captured: dict = {}
 
         def capture_orch(cfg_arg, overrides=None, state_store=None):
-            tasks = state_store.list_tasks()
-            if tasks:
-                captured["prompt"] = state_store.load(tasks[0]).implementation_prompt
-            return _mock_orchestrator()
+            mock = _mock_orchestrator()
+            result = mock.run.return_value
+
+            def run(*, task_id, before_pipeline, **_kwargs):
+                run_state = state_store.load(task_id)
+                before_pipeline(run_state)
+                captured["prompt"] = state_store.load(task_id).implementation_prompt
+                return result
+
+            mock.run.side_effect = run
+            return mock
 
         with (
             patch("sikula._find_git_root", return_value=tmp_path),
