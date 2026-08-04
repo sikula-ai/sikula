@@ -9,11 +9,10 @@ core. The LLM never writes Markdown directly.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import json
-import re
 from typing import Any, Callable
 
 from core.contract_check import ContractPrepareResult, prepare_implementation_contract
+from core.structured_output import load_schema_json_object
 
 
 @dataclass(frozen=True)
@@ -45,14 +44,6 @@ class ContractAutoPrepareResult:
 
 ContractAutoAnswerProvider = Callable[[ContractAutoPrepareRequest], ContractAutoAnswerBatch]
 AutoPreparationAuditRecorder = Callable[[dict[str, Any]], None]
-
-
-@dataclass
-class _JsonContainer:
-    opener: str
-    start: int
-    parent: int | None
-    end: int | None = None
 
 
 def parse_contract_auto_answer_output(output: str, active_question_ids: set[str]) -> ContractAutoAnswerBatch:
@@ -196,118 +187,12 @@ def load_auto_json_object(
     required_keys: frozenset[str],
     fallback_keys: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
-    text = output.strip()
-    if not text:
-        raise ValueError("auto LLM output is empty")
-    decoder = json.JSONDecoder()
-    matches: list[dict[str, Any]] = []
-    fallback_matches: list[dict[str, Any]] = []
-    key_patterns = [re.compile(rf"{re.escape(json.dumps(key))}\s*:") for key in required_keys]
-    fallback_key_patterns = [re.compile(rf"{re.escape(json.dumps(key))}\s*:") for key in fallback_keys]
-    malformed_fallback = False
-    decoded_object = False
-    containers = _json_containers(text)
-    matched_ancestor: list[bool] = []
-    unmatched_object_ancestor: list[bool] = []
-    for container in containers:
-        parent = container.parent
-        matched_ancestor.append(parent is not None and (containers[parent].end is not None or matched_ancestor[parent]))
-        unmatched_object_ancestor.append(
-            parent is not None
-            and (
-                (
-                    containers[parent].opener == "{"
-                    and containers[parent].end is None
-                    and _looks_like_json_object(text, containers[parent].start)
-                )
-                or unmatched_object_ancestor[parent]
-            )
-        )
-
-    for index, container in enumerate(containers):
-        if matched_ancestor[index] or unmatched_object_ancestor[index]:
-            continue
-        if container.end is None:
-            if container.opener == "{" and _looks_like_json_object(text, container.start):
-                remainder = text[container.start :]
-                if any(pattern.search(remainder) for pattern in key_patterns):
-                    raise ValueError("auto LLM output is not valid JSON") from None
-                if any(pattern.search(remainder) for pattern in fallback_key_patterns):
-                    malformed_fallback = True
-            continue
-        candidate = text[container.start : container.end]
-        try:
-            payload, end = decoder.raw_decode(candidate)
-        except (json.JSONDecodeError, ValueError, RecursionError):
-            if any(pattern.search(candidate) for pattern in key_patterns):
-                raise ValueError("auto LLM output is not valid JSON") from None
-            if any(pattern.search(candidate) for pattern in fallback_key_patterns):
-                malformed_fallback = True
-            continue
-        if end != len(candidate) or not isinstance(payload, dict):
-            continue
-        decoded_object = True
-        if required_keys.intersection(payload):
-            matches.append(payload)
-        elif fallback_keys.intersection(payload):
-            fallback_matches.append(payload)
-
-    if not matches:
-        if malformed_fallback:
-            raise ValueError("auto LLM output is not valid JSON")
-        matches = fallback_matches
-    if not matches:
-        if text.startswith("{") and not decoded_object:
-            raise ValueError("auto LLM output is not valid JSON")
-        raise ValueError("auto LLM output did not contain the required JSON object")
-    if len(matches) > 1:
-        raise ValueError("auto LLM output contains multiple JSON objects")
-    return matches[0]
-
-
-def _looks_like_json_object(text: str, start: int) -> bool:
-    position = start + 1
-    while position < len(text) and text[position].isspace():
-        position += 1
-    return position < len(text) and text[position] in {'"', "}"}
-
-
-def _json_containers(text: str) -> list[_JsonContainer]:
-    containers: list[_JsonContainer] = []
-    stack: list[int] = []
-    in_string = False
-    prose_string = False
-    escaped = False
-    for position, char in enumerate(text):
-        if in_string:
-            if prose_string and char in "\r\n":
-                in_string = False
-                prose_string = False
-                escaped = False
-            elif escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-                prose_string = False
-            continue
-        if char == '"':
-            in_string = True
-            prose_string = not stack
-        elif char in "[{":
-            parent = stack[-1] if stack else None
-            containers.append(_JsonContainer(opener=char, start=position, parent=parent))
-            stack.append(len(containers) - 1)
-        elif char in "]}":
-            expected = "[" if char == "]" else "{"
-            while stack and containers[stack[-1]].opener != expected:
-                stack.pop()
-            if not stack:
-                continue
-            container_index = stack.pop()
-            containers[container_index].end = position + 1
-    return containers
+    return load_schema_json_object(
+        output,
+        required_keys=required_keys,
+        fallback_keys=fallback_keys,
+        output_name="auto LLM output",
+    )
 
 
 def _normalize_answer_entry(raw_answer: Any) -> dict[str, str] | None:

@@ -18,6 +18,7 @@ from core.delivery_unit_metadata import (
 from core.delivery_plan import MAX_DELIVERY_UNIT_ID_LENGTH
 from core.delivery_public_metadata import is_safe_delivery_public_metadata
 from core.markdown_headings import MarkdownHeading, MarkdownHeadingScanner, normalize_heading
+from core.structured_output import load_schema_json_object
 from core.validation_coverage import extract_validation_commands
 
 _DELIVERY_AUTHORING_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -76,6 +77,7 @@ _AMENDMENT_TOP_LEVEL_FIELDS = {
     "warnings",
 }
 _ASSESSMENT_TOP_LEVEL_FIELDS = {"recommended_mode", "reason_codes", "units"}
+_ASSESSMENT_SCHEMA_KEYS = frozenset({"recommended_mode", "reason_codes"})
 _ASSESSMENT_UNIT_FIELDS = {"id", "title", "depends_on", "stream", "component", "platform"}
 _UNIT_FIELDS = {
     "id",
@@ -92,6 +94,8 @@ _UNIT_FIELDS = {
     "risk_tags",
     "budget",
 }
+_AUTHORING_SCHEMA_KEYS = frozenset({"plan_id", "title", "units"})
+_AMENDMENT_SCHEMA_KEYS = frozenset({"plan_id", "target_unit_id", "replacement_units"})
 _UNIT_PATH_FIELDS = {
     "task_path",
     "path",
@@ -225,7 +229,7 @@ class DeliveryAuthoringParseError(ValueError):
 
 
 def parse_delivery_assessment_output(output: str) -> DeliveryAssessmentDraft:
-    data = _parse_output_object(output)
+    data = _parse_output_object(output, schema_keys=_ASSESSMENT_SCHEMA_KEYS)
     _reject_unknown_fields(data, _ASSESSMENT_TOP_LEVEL_FIELDS, "assessment top-level")
 
     recommended_mode = _require_string(data, "recommended_mode", "recommended_mode")
@@ -264,7 +268,7 @@ def parse_delivery_authoring_output(
 ) -> DeliveryAuthoringDraft:
     root = _resolve_project_root(project_root)
     selected_plan_id = _expected_plan_id(expected_plan_id, output_dir=output_dir, project_root=root)
-    data = _parse_output_object(output)
+    data = _parse_output_object(output, schema_keys=_AUTHORING_SCHEMA_KEYS)
     _reject_unknown_fields(data, _TOP_LEVEL_FIELDS, "top-level")
 
     plan_id = _require_string(data, "plan_id", "plan_id")
@@ -301,7 +305,7 @@ def parse_delivery_amendment_authoring_output(
     project_root: str | Path,
 ) -> DeliveryAmendmentAuthoringDraft:
     root = _resolve_project_root(project_root)
-    data = _parse_output_object(output)
+    data = _parse_output_object(output, schema_keys=_AMENDMENT_SCHEMA_KEYS)
     _reject_unknown_fields(data, _AMENDMENT_TOP_LEVEL_FIELDS, "top-level")
 
     plan_id = _require_string(data, "plan_id", "plan_id")
@@ -409,7 +413,7 @@ def derive_delivery_authoring_paths(
     )
 
 
-def _parse_output_object(output: str) -> dict[str, Any]:
+def _parse_output_object(output: str, *, schema_keys: frozenset[str]) -> dict[str, Any]:
     if not isinstance(output, str) or not output.strip():
         raise DeliveryAuthoringParseError(
             "delivery_authoring.empty_output",
@@ -418,15 +422,7 @@ def _parse_output_object(output: str) -> dict[str, Any]:
 
     stripped = output.strip()
     fence_match = _FENCED_JSON_RE.fullmatch(stripped)
-    if stripped.startswith(("```", "~~~")):
-        if fence_match is None:
-            raise DeliveryAuthoringParseError(
-                "delivery_authoring.output_invalid_envelope",
-                "Delivery authoring output must be exactly one fenced json block or one JSON object.",
-            )
-        json_text = fence_match.group("content").strip()
-    else:
-        json_text = stripped
+    json_text = fence_match.group("content").strip() if fence_match is not None else stripped
 
     try:
         value = json.loads(
@@ -434,11 +430,24 @@ def _parse_output_object(output: str) -> dict[str, Any]:
             object_pairs_hook=_object_pairs_without_duplicates,
             parse_constant=_reject_json_constant,
         )
-    except (JSONDecodeError, ValueError) as exc:
-        raise DeliveryAuthoringParseError(
-            "delivery_authoring.json_invalid",
-            "Delivery authoring output must contain exactly one valid JSON object.",
-        ) from exc
+    except (JSONDecodeError, ValueError):
+        try:
+            value = load_schema_json_object(
+                stripped,
+                required_keys=schema_keys,
+                object_pairs_hook=_object_pairs_without_duplicates,
+                parse_constant=_reject_json_constant,
+            )
+        except ValueError as exc:
+            code = (
+                "delivery_authoring.output_invalid_envelope"
+                if stripped.startswith(("```", "~~~"))
+                else "delivery_authoring.json_invalid"
+            )
+            message = (
+                "Delivery authoring output must contain one unambiguous JSON object, optionally surrounded by prose."
+            )
+            raise DeliveryAuthoringParseError(code, message) from exc
 
     if not isinstance(value, dict):
         raise DeliveryAuthoringParseError(

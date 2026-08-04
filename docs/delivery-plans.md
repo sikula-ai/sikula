@@ -113,8 +113,10 @@ records; ordinary text and JSON output expose only project-relative,
 allowlisted metadata such as written paths, plan validation status, and unit
 readiness status.
 
-The assistant output accepted by `delivery prepare` is exactly one JSON object,
-optionally wrapped in one fenced `json` block. Top-level fields are `plan_id`,
+The assistant output accepted by `delivery prepare` contains exactly one
+schema-matching top-level JSON object. The object may be raw, fenced, or
+surrounded by incidental model prose; malformed, nested, and multiple response
+objects are rejected. Top-level fields are `plan_id`,
 `title`, `planning_mode`, `warnings`, and `units`; unknown fields are rejected.
 `planning_mode`, when present, must be `fixed_window`. `units` must be a
 non-empty list of objects with `id`, `title`, `depends_on`, `task_markdown`,
@@ -190,7 +192,9 @@ sikula delivery amend apply .sikula/delivery/<slug>/plan.yaml \
 
 `amend prepare` is the only model-assisted phase. It uses the existing
 `delivery_preparer` configuration and accepts the same scoped model, provider,
-and timeout overrides as `delivery prepare`. The assistant returns only new
+and timeout overrides as `delivery prepare`. Incidental prose around one
+schema-matching top-level JSON object is tolerated, while malformed, nested,
+or multiple response objects are rejected. The assistant returns only new
 replacement units; deterministic code derives task paths, makes replacement
 roots inherit the target's upstream dependencies, identifies replacement
 leaves, and determines which direct downstream units need rewiring.

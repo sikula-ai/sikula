@@ -14,6 +14,7 @@ from core.contract_auto_prepare import (
     "output",
     [
         '{"value": {"nested": true}}',
+        '{"val\\u0075e": {"nested": true}}',
         'Here is the response: {"value": {"nested": true}}',
         'Here is the response:\n{"value": {"nested": true}}\nDone.',
         'Here is the response:\n    {"value": {"nested": true}}\nDone.',
@@ -38,13 +39,13 @@ from core.contract_auto_prepare import (
         ('```json\n{"value": {"nested": true}}\ntrailing prose\n```'),
         ('Here is the response:\n~~~json\n{"value": {"nested": true}}'),
         ('The parser searches for `[` before decoding.\n{"value": {"nested": true}}'),
-        ("[" * 1_000 + '\n{"value": {"nested": true}}'),
         ('The source ends with function refresh() {\n{"value": {"nested": true}}'),
         ('The JSON object starts with "{". Response: {"value": {"nested": true}}'),
         ('The truncated literal starts with "{\n{"value": {"nested": true}}'),
     ],
     ids=[
         "raw",
+        "escaped-schema-key",
         "same-line-prose",
         "raw-after-prose",
         "indented-raw-after-prose",
@@ -69,7 +70,6 @@ from core.contract_auto_prepare import (
         "trailing-prose-inside-fence",
         "unclosed-tilde-fence",
         "unmatched-preamble-bracket",
-        "many-unmatched-preamble-brackets",
         "unmatched-source-brace",
         "quoted-prose-brace",
         "unclosed-quoted-prose-brace",
@@ -77,6 +77,14 @@ from core.contract_auto_prepare import (
 )
 def test_load_auto_json_object_accepts_supported_response_formats(output: str):
     assert load_auto_json_object(output, required_keys=frozenset({"value"})) == {"value": {"nested": True}}
+
+
+def test_load_auto_json_object_requires_the_complete_schema_signature() -> None:
+    output = '{"plan_id": "source-example"}\n{"plan_id": "delivery", "units": []}'
+
+    payload = load_auto_json_object(output, required_keys=frozenset({"plan_id", "units"}))
+
+    assert payload == {"plan_id": "delivery", "units": []}
 
 
 @pytest.mark.parametrize(
@@ -90,6 +98,7 @@ def test_load_auto_json_object_accepts_supported_response_formats(output: str):
         ("{not json", "not valid JSON"),
         ('{"wrapper": {"value": true}', "not valid JSON"),
         ('{"value": invalid} {"value": true}', "not valid JSON"),
+        ('{"val\\u0075e": invalid} {"value": true}', "not valid JSON"),
         ('{"value": true} {"value": false}', "multiple JSON objects"),
         (
             '```json\n{"value": true}\n```\n```json\n{"value": false}\n```',
@@ -104,6 +113,8 @@ def test_load_auto_json_object_accepts_supported_response_formats(output: str):
         ('```json\n["not", "an", "object"]\n```', "required JSON object"),
         ('Broken `example {"value": invalid}\n{"value": true}', "not valid JSON"),
         ('Broken `example {"value": invalid}``\n{"value": true}', "not valid JSON"),
+        ('[{"value": true}', "not valid JSON"),
+        ("[" * 1_000 + '\n{"value": {"nested": true}}', "not valid JSON"),
     ],
     ids=[
         "empty",
@@ -114,6 +125,7 @@ def test_load_auto_json_object_accepts_supported_response_formats(output: str):
         "malformed",
         "malformed-parent-with-valid-child",
         "balanced-malformed-before-valid",
+        "escaped-key-malformed-before-valid",
         "multiple-raw-objects",
         "multiple-response-fences",
         "multiple-objects-in-response-fence",
@@ -122,6 +134,8 @@ def test_load_auto_json_object_accepts_supported_response_formats(output: str):
         "non-object-response-fence",
         "unclosed-inline-code",
         "mismatched-inline-code-runs",
+        "unclosed-array-response",
+        "many-unclosed-array-ancestors",
     ],
 )
 def test_load_auto_json_object_rejects_invalid_or_ambiguous_formats(output: str, error: str):

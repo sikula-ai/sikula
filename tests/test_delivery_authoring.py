@@ -12,6 +12,7 @@ from core.delivery_authoring import (
     DeliveryAuthoringParseError,
     DeliveryAuthoringUnitDraft,
     derive_delivery_authoring_paths,
+    parse_delivery_assessment_output,
     parse_delivery_amendment_authoring_output,
     parse_delivery_authoring_output,
 )
@@ -130,6 +131,30 @@ def _draft_data() -> dict[str, Any]:
     }
 
 
+def _amendment_data() -> dict[str, Any]:
+    return {
+        "plan_id": "team-invites",
+        "target_unit_id": "oversized",
+        "amend_reason": None,
+        "budget_exceeded": None,
+        "warnings": [],
+        "replacement_units": [
+            {
+                "id": "split-a",
+                "title": "Split A",
+                "depends_on": [],
+                "task_markdown": _unit_markdown("Split A"),
+            },
+            {
+                "id": "split-b",
+                "title": "Split B",
+                "depends_on": ["split-a"],
+                "task_markdown": _unit_markdown("Split B"),
+            },
+        ],
+    }
+
+
 def _parse(output: object, tmp_path: Path) -> DeliveryAuthoringDraft:
     return parse_delivery_authoring_output(
         output,
@@ -189,6 +214,64 @@ def test_parse_delivery_authoring_output_accepts_single_fenced_json_block(tmp_pa
 
     assert draft.plan_id == "team-invites"
     assert [unit.id for unit in draft.units] == ["foundation", "cli"]
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        lambda: f"Prepared plan: {json.dumps(_draft_data())}",
+        lambda: f"Prepared plan:\n```json\n{json.dumps(_draft_data())}\n```",
+        lambda: f"Prepared plan:\n~~~JSON\n{json.dumps(_draft_data())}\n~~~\nDone.",
+        lambda: f"The source uses config {{ mode }}.\n{json.dumps(_draft_data())}",
+    ],
+    ids=["same-line-prose", "fenced-after-prose", "tilde-fence-with-trailing-prose", "source-brace-preamble"],
+)
+def test_parse_delivery_authoring_output_accepts_one_schema_object_surrounded_by_prose(
+    tmp_path: Path,
+    output: Callable[[], str],
+) -> None:
+    draft = _parse(output(), tmp_path)
+
+    assert draft.plan_id == "team-invites"
+    assert [unit.id for unit in draft.units] == ["foundation", "cli"]
+
+
+def test_parse_delivery_assessment_output_accepts_fenced_schema_object_after_prose() -> None:
+    payload = {
+        "recommended_mode": "single_run",
+        "reason_codes": ["single_cohesive_surface"],
+        "units": [],
+    }
+
+    draft = parse_delivery_assessment_output(f"Assessment follows:\n```json\n{json.dumps(payload)}\n```")
+
+    assert draft.recommended_mode == "single_run"
+
+
+def test_parse_delivery_assessment_output_ignores_incomplete_schema_object_in_prose() -> None:
+    payload = {
+        "recommended_mode": "single_run",
+        "reason_codes": ["single_cohesive_surface"],
+        "units": [],
+    }
+    output = f'Example: {{"recommended_mode": "delivery_plan"}}\n{json.dumps(payload)}'
+
+    draft = parse_delivery_assessment_output(output)
+
+    assert draft.recommended_mode == "single_run"
+
+
+def test_parse_delivery_assessment_output_rejects_schema_object_in_unclosed_array() -> None:
+    payload = {
+        "recommended_mode": "single_run",
+        "reason_codes": ["single_cohesive_surface"],
+        "units": [],
+    }
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        parse_delivery_assessment_output(f"Response: [{json.dumps(payload)}")
+
+    assert exc_info.value.code == "delivery_authoring.json_invalid"
 
 
 @pytest.mark.parametrize(
@@ -269,29 +352,7 @@ def test_parse_delivery_authoring_output_accepts_text_heading_equivalents(tmp_pa
 
 
 def test_parse_delivery_amendment_authoring_output_accepts_null_amend_reason(tmp_path: Path) -> None:
-    output = json.dumps(
-        {
-            "plan_id": "team-invites",
-            "target_unit_id": "oversized",
-            "amend_reason": None,
-            "budget_exceeded": None,
-            "warnings": [],
-            "replacement_units": [
-                {
-                    "id": "split-a",
-                    "title": "Split A",
-                    "depends_on": [],
-                    "task_markdown": _unit_markdown("Split A"),
-                },
-                {
-                    "id": "split-b",
-                    "title": "Split B",
-                    "depends_on": ["split-a"],
-                    "task_markdown": _unit_markdown("Split B"),
-                },
-            ],
-        }
-    )
+    output = json.dumps(_amendment_data())
 
     draft = parse_delivery_amendment_authoring_output(
         output,
@@ -302,6 +363,88 @@ def test_parse_delivery_amendment_authoring_output_accepts_null_amend_reason(tmp
 
     assert draft.amend_reason is None
     assert [unit.id for unit in draft.replacement_units] == ["split-a", "split-b"]
+
+
+def test_parse_delivery_amendment_authoring_output_accepts_fenced_schema_object_after_prose(tmp_path: Path) -> None:
+    output = (
+        "Based on the target unit, I will split it into two smaller units.\n\n"
+        f"```json\n{json.dumps(_amendment_data())}\n```"
+    )
+
+    draft = parse_delivery_amendment_authoring_output(
+        output,
+        expected_plan_id="team-invites",
+        expected_target_unit_id="oversized",
+        project_root=tmp_path,
+    )
+
+    assert [unit.id for unit in draft.replacement_units] == ["split-a", "split-b"]
+
+
+def test_parse_delivery_amendment_authoring_output_ignores_incomplete_schema_object_in_prose(
+    tmp_path: Path,
+) -> None:
+    incomplete = {
+        "target_unit_id": "oversized",
+        "replacement_units": [],
+    }
+    output = f"Example: {json.dumps(incomplete)}\n{json.dumps(_amendment_data())}"
+
+    draft = parse_delivery_amendment_authoring_output(
+        output,
+        expected_plan_id="team-invites",
+        expected_target_unit_id="oversized",
+        project_root=tmp_path,
+    )
+
+    assert [unit.id for unit in draft.replacement_units] == ["split-a", "split-b"]
+
+
+def test_parse_delivery_authoring_output_ignores_incomplete_schema_object_in_prose(tmp_path: Path) -> None:
+    incomplete = {"plan_id": "example", "units": []}
+
+    draft = _parse(f"Example: {json.dumps(incomplete)}\n{json.dumps(_draft_data())}", tmp_path)
+
+    assert draft.plan_id == "team-invites"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        lambda: f"{json.dumps(_draft_data())}\n{json.dumps(_draft_data())}",
+        lambda: f"Wrapped response: {json.dumps([{'fixture': True}, _draft_data()])}",
+        lambda: f"[{json.dumps(_draft_data())}",
+        lambda: f'{{"plan_id":"team-invites","title":"Team invites","units": invalid}}\n{json.dumps(_draft_data())}',
+        lambda: (
+            f'{{"plan\\u005fid":"team-invites","title":"Team invites","units": invalid}}\n{json.dumps(_draft_data())}'
+        ),
+        lambda: (
+            'Draft: {"plan_id":"team-invites","plan_id":"team-invites",'
+            f'"title":"Team invites","units":[]}}\n{json.dumps(_draft_data())}'
+        ),
+        lambda: (
+            'Draft: {"plan_id":"team-invites","plan\\u005fid":"other-plan",'
+            f'"title":"Team invites","units":[]}}\n{json.dumps(_draft_data())}'
+        ),
+    ],
+    ids=[
+        "multiple-schema-objects",
+        "schema-object-inside-array",
+        "schema-object-inside-unclosed-array",
+        "malformed-before-valid",
+        "escaped-key-malformed-before-valid",
+        "duplicate-key-before-valid",
+        "escaped-duplicate-key-before-valid",
+    ],
+)
+def test_parse_delivery_authoring_output_rejects_ambiguous_or_nested_schema_objects(
+    tmp_path: Path,
+    output: Callable[[], str],
+) -> None:
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        _parse(output(), tmp_path)
+
+    assert exc_info.value.code == "delivery_authoring.json_invalid"
 
 
 @pytest.mark.parametrize(
@@ -398,9 +541,9 @@ def test_parse_delivery_amendment_authoring_output_rejects_invalid_metadata(
         pytest.param(lambda root: "{}{}", "delivery_authoring.json_invalid", id="multiple_json_objects"),
         pytest.param(lambda root: "Assistant draft:\n{}", "delivery_authoring.json_invalid", id="leading_prose"),
         pytest.param(
-            lambda root: f"```json\n{json.dumps(_draft_data())}\n```\nextra",
+            lambda root: '```json\n{"plan_id":"team-invites","units": invalid}\n```',
             "delivery_authoring.output_invalid_envelope",
-            id="fenced_extra_prose",
+            id="malformed_fenced_response",
         ),
         pytest.param(
             lambda root: _output_with(lambda data: data.pop("plan_id")),

@@ -34,6 +34,7 @@
 | `LLMClient` | `core/llm_client.py` | Abstract interface: `generate()` for single-shot text; `run_readonly_agent()` for read-only autonomous agents; `run_agent()` for autonomous file-editing agents; built-in clients emit content-free invocation-attempt observations without changing provider execution |
 | `LLMUsage` helpers | `core/llm_usage.py` | Provider-neutral validation and aggregation for bounded invocation counts, elapsed time, character counts, outcomes, and optional provider-reported token usage |
 | `ContractCheck` helpers | `core/contract_check.py` | Deterministic implementation-contract readiness checks for Markdown/plain-text task files; `sikula run` stores a warning-only state snapshot and `sikula contract check --write-report` explicitly writes report artifacts |
+| `StructuredOutput` helpers | `core/structured_output.py` | Side-effect-free schema-aware extraction of one unambiguous top-level JSON object from LLM output while rejecting malformed, nested, or multiple response candidates |
 | `DeliveryAuthoring` helpers | `core/delivery_authoring.py` | Side-effect-free parser and derived-path helpers for delivery prepare authoring drafts |
 | `DeliveryPrepareWriter` helpers | `core/delivery_prepare_writer.py` | Deterministic source-artifact writer for parsed delivery authoring drafts; renders `plan.yaml` and unit task files with readiness checks, plan validation, overwrite guards, and rollback |
 | `DeliveryAmendment` helpers | `core/delivery_amendment.py` | Fingerprinted split proposals, immutable-unit and dependency guards, no-write preview, transactional plan/unit writing, and append-only amendment events |
@@ -257,8 +258,10 @@ source task and output paths, derives the selected plan ID, validates
 `delivery_preparer` model/provider/timeout overrides, then calls
 `DeliveryPreparationAgent`, which uses `LLMClient.generate()` with a
 command-free prompt assembled from the task and checked-in project context.
-The assistant must return one strict structured draft, which
-`core/delivery_authoring.py` parses without side effects. Public plan and unit
+The assistant must return one strict structured draft. The parser tolerates
+incidental prose around one schema-matching top-level JSON object while
+rejecting malformed, nested, or multiple response candidates, then
+`core/delivery_authoring.py` validates the draft without side effects. Public plan and unit
 metadata is bounded, single-line, and rejects absolute local paths while
 preserving explicit HTTP routes such as `GET /users`.
 `core/delivery_prepare_writer.py` then derives artifact
@@ -288,8 +291,10 @@ security, or validation gates.
 **Delivery plan amendment commands:** `sikula delivery amend prepare PLAN_FILE
 --split-unit UNIT_ID` reuses `DeliveryPreparationAgent` and the
 `delivery_preparer` configuration to author only a replacement-unit graph. The
-strict amendment parser in `core/delivery_authoring.py` rejects whole-plan and
-writer-path output. `core/delivery_amendment.py` normalizes replacement paths and
+strict amendment parser accepts one unambiguous schema-matching object even
+when incidental model prose surrounds it, and rejects malformed, nested,
+multiple, whole-plan, and writer-path output. `core/delivery_amendment.py`
+normalizes replacement paths and
 root dependencies, snapshots the source plan, target task contract, and
 sanitized parent progress before model authoring, rejects drafts when those
 inputs change during authoring, validates the resulting amended plan, and
