@@ -3123,32 +3123,7 @@ def _run_report_only_review(
 ) -> float:
     try:
         agents_cfg = cfg.get("agents", {})
-        _enrich_review_state_prompt(
-            state,
-            store,
-            description,
-            base_llm_cfg,
-            cfg,
-            worktree_project_root,
-            agent_llm_overrides.get("analyst"),
-        )
-
-        from agents.reviewer_agent import ReviewerAgent
-        from agents.security_reviewer_agent import SecurityReviewerAgent
-        from core.llm_client import create_llm_client
-        from tools.base_tool import Sandbox
-        from tools.file_tool import FileTool
-        from tools.git_tool import GitTool
-
         sandbox_cfg = cfg.get("sandbox", {})
-        sandbox = Sandbox(
-            project_root=worktree_project_root,
-            allowed_write_paths=sandbox_cfg.get("allowed_write_paths", []),
-            allowed_read_paths=sandbox_cfg.get("allowed_read_paths", ["."]),
-        )
-        file_tool = FileTool(sandbox=sandbox, project_root=worktree_project_root)
-        git_tool = GitTool(sandbox=sandbox, project_root=worktree_project_root)
-        tools = {"file": file_tool, "git": git_tool}
 
         def _agent_snapshot(name: str) -> dict:
             effective_agent_cfg = {
@@ -3185,6 +3160,32 @@ def _run_report_only_review(
             complete_history_from_creation=True,
         )
         store.save(state)
+
+        _enrich_review_state_prompt(
+            state,
+            store,
+            description,
+            base_llm_cfg,
+            cfg,
+            worktree_project_root,
+            agent_llm_overrides.get("analyst"),
+        )
+
+        from agents.reviewer_agent import ReviewerAgent
+        from agents.security_reviewer_agent import SecurityReviewerAgent
+        from core.llm_client import create_llm_client
+        from tools.base_tool import Sandbox
+        from tools.file_tool import FileTool
+        from tools.git_tool import GitTool
+
+        sandbox = Sandbox(
+            project_root=worktree_project_root,
+            allowed_write_paths=sandbox_cfg.get("allowed_write_paths", []),
+            allowed_read_paths=sandbox_cfg.get("allowed_read_paths", ["."]),
+        )
+        file_tool = FileTool(sandbox=sandbox, project_root=worktree_project_root)
+        git_tool = GitTool(sandbox=sandbox, project_root=worktree_project_root)
+        tools = {"file": file_tool, "git": git_tool}
 
         def _llm(name: str):
             yaml_agent = agents_cfg.get(name, {}).get("llm", {})

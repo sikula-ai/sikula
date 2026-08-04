@@ -374,6 +374,8 @@ class TestCmdReviewReportOnlyState:
             state = JsonStateStore(tmp_path / "state").load("task123")
             assert state is not None
             assert state.pid == os.getpid()
+            assert state.run_invocation_schema_version == 1
+            assert [record["config_snapshot"] for record in state.run_invocation_records] == [state.config_snapshot]
             raise KeyboardInterrupt
 
         with (
@@ -399,8 +401,8 @@ class TestCmdReviewReportOnlyState:
         assert state.worktree_path is None
         assert state.worktree_base is None
         assert state.worktree_branch == "feat/x"
-        assert state.run_invocation_schema_version is None
-        assert state.run_invocation_records == []
+        assert state.run_invocation_schema_version == 1
+        assert [record["config_snapshot"] for record in state.run_invocation_records] == [state.config_snapshot]
         assert [entry["action"] for entry in state.history] == ["review_failed", "cleanup"]
         remove_worktree.assert_called_once_with(worktree_base, tmp_path, force=False)
 
