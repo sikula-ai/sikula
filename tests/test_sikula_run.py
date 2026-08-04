@@ -2512,6 +2512,8 @@ class TestCmdRunStateStore:
         assert state.contract_gate_blocked
         assert state.worktree_path is None
         assert state.implementation_contract["status"] == "not_ready"
+        assert state.run_invocation_schema_version is None
+        assert state.run_invocation_records == []
         assert any(entry["action"] == "contract_gate_failed" for entry in state.history)
 
     def test_task_file_contract_ready_gate_aborts_before_isolated_worktree(self, tmp_path: Path, capsys):

@@ -96,6 +96,17 @@ cmd_run()
          └─ idempotency guards in each phase skip already-completed phases
 ```
 
+Each non-terminal `Orchestrator.run()` invocation appends its effective config
+snapshot to `state.run_invocation_records` before pipeline work starts. The
+first tracked invocation of a new state sets
+`run_invocation_schema_version = 1` in the same persisted update, which proves
+that the audit history is complete from that invocation. A fresh state blocked
+before its first tracked invocation and legacy states both keep a null marker;
+later resume records do not promote legacy partial history to complete
+evidence. Report-only review records its equivalent effective snapshot before
+its first agent starts. Terminal no-op `run --task-id` calls do not append
+records.
+
 **`--reset-failed`** (requires `--task-id`): clears `state.failed`, resets iteration counters, clears error blobs, and auto-populates `state.files_changed` from `git diff` if empty (recovers from false-negative change detection).
 
 **`--no-isolate`**: skips worktree creation; changes land as uncommitted working-tree modifications in the original project root. No branch is created. A git repository is still required — git is used to detect which files the agent changed.
@@ -1736,6 +1747,8 @@ Sikula processes at once is still unsupported.
 | `delivery_handoff_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Opt-in schema marker set on newly created delivery children. Legacy children keep `None`, so terminal reconciliation does not fabricate or require a handoff for state created by older versions. |
 | `delivery_dependency_handoffs` | `list[dict]` | `delivery run-next` / `cmd_run()` | Validated, fingerprinted, allowlisted snapshots from the child unit's completed dependency closure. `AnalystAgent` consumes them as supporting evidence; malformed resume-state entries are ignored and recorded as warnings rather than injected into prompts. |
 | `config_snapshot` | `dict` | `cmd_run()` / Orchestrator | Effective run configuration captured on first run before agents start (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `planner.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. It is also saved for contract-gate failures that exit before `Orchestrator.run()`. Visible in `show <task_id>`. |
+| `run_invocation_schema_version` | `int \| None` | Orchestrator / report-only review | Set to `1` only with the first invocation record for a newly created state, proving that the audit is complete from that invocation. Fresh states blocked before tracked execution and legacy states keep `None`; later resume records never promote legacy partial history. This marker is audit-only and never drives pipeline behavior. |
+| `run_invocation_records` | `list[dict]` | Orchestrator / report-only review | Append-only record for each non-terminal `Orchestrator.run()` call, or the equivalent report-only review execution, containing `started_at` and the effective `config_snapshot` used by that invocation. It preserves configuration changes across resume for audit and external metrics projection. Terminal no-op calls are omitted, and records never drive pipeline behavior. |
 | `implementation_contract` | `dict` | `cmd_run()` in `sikula_cli/run.py` | Implementation-contract snapshot for fresh task-file runs: task path/format/hash, readiness status/score, gap metadata, clarifying question IDs, and validation coverage counts. By default it is warning-only additive metadata. Fresh `run TASK_FILE` can opt into pre-agent gating with `--require-contract-ready` or `--min-contract-score N`; resume/review flows do not recompute or re-gate it. |
 | `implementation_asset_records` | `list[dict]` | `cmd_run()` in `sikula_cli/run.py` | Sanitized, non-blocking asset metadata snapshot for fresh task-file runs, copied from the implementation-contract preflight asset references. Contains path/kind/status/project path/hash/declared hash/size/MIME/git status/requested target/provenance metadata only; no raw asset content, OCR text, binary data, internal parser fields, or source excerpts. Used for audit and terminal summary counts, not for run/resume/review control-flow decisions. |
 | `implementation_asset_drift_records` | `list[dict]` | `cmd_run()` in `sikula_cli/run.py` | Sanitized, non-blocking asset drift audit entries recorded when a prepared contract's Asset manifest hash differs from the current file at fresh run start, or when resume/worktree startup sees current asset files differ from the saved `implementation_asset_records` snapshot. Contains path/kind/phase/status/expected hash/current hash/current status/git status/size/MIME metadata only. It is warning-only audit data and must not drive run/resume/review control-flow decisions. |

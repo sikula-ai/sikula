@@ -203,6 +203,9 @@ Task completion output and `delivery status` report provider invocation counts,
 failed attempts, measured provider time, content-free input/output sizes, and
 explicit provider-reported token usage when available. Unavailable token data
 remains unknown; Sikula does not estimate token counts or monetary cost.
+Task state also keeps the effective configuration of each actual run or resume
+invocation so later audit tooling can distinguish unchanged and mixed-config
+execution without changing resume behavior.
 See [Delivery Plans](docs/delivery-plans.md).
 
 **Run a task into a branch**

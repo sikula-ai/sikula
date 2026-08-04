@@ -97,6 +97,46 @@ class TestTaskStateRecord:
         assert "prompt" not in record
         assert "output" not in record
 
+    def test_run_invocation_record_preserves_an_independent_config_snapshot(self):
+        state = TaskState(task_id="t1", task_description="task")
+        config = {"run_build": True, "agents": {"implementer": {"model": "model-a"}}}
+
+        state.record_run_invocation(config)
+        config["run_build"] = False
+        config["agents"]["implementer"]["model"] = "model-b"
+
+        assert state.run_invocation_records == [
+            {
+                "started_at": state.run_invocation_records[0]["started_at"],
+                "config_snapshot": {
+                    "run_build": True,
+                    "agents": {"implementer": {"model": "model-a"}},
+                },
+            }
+        ]
+        assert state.run_invocation_schema_version is None
+
+    def test_first_run_invocation_record_can_mark_history_complete(self):
+        state = TaskState(task_id="t1", task_description="task")
+
+        state.record_run_invocation(
+            {"run_build": True},
+            complete_history_from_creation=True,
+        )
+
+        assert state.run_invocation_schema_version == state_module.RUN_INVOCATION_SCHEMA_VERSION
+        assert len(state.run_invocation_records) == 1
+
+    def test_partial_history_cannot_later_be_marked_complete(self):
+        state = TaskState(task_id="t1", task_description="task")
+        state.record_run_invocation({"run_build": True})
+
+        with pytest.raises(ValueError, match="can only be marked on the first record"):
+            state.record_run_invocation(
+                {"run_build": False},
+                complete_history_from_creation=True,
+            )
+
     def test_delivery_budget_stop_records_structured_audit(self):
         state = TaskState(task_id="t1", task_description="task")
 
@@ -126,6 +166,8 @@ class TestJsonStateStore:
         state = store.create("add feature")
         assert state.task_description == "add feature"
         assert len(state.task_id) == 32  # uuid4().hex
+        assert state.run_invocation_schema_version is None
+        assert state.run_invocation_records == []
         assert (tmp_path / f"{state.task_id}.json").exists()
 
     def test_create_persists_delivery_unit_budget_snapshot(self, tmp_path: Path):
@@ -211,6 +253,8 @@ class TestJsonStateStore:
         data.pop("step_file_tracking_enabled")
         data.pop("step_files_changed")
         data.pop("llm_usage_records")
+        data.pop("run_invocation_schema_version")
+        data.pop("run_invocation_records")
         path.write_text(json.dumps(data))
 
         loaded = store.load(state.task_id)
@@ -219,6 +263,8 @@ class TestJsonStateStore:
         assert loaded.step_file_tracking_enabled is False
         assert loaded.step_files_changed == []
         assert loaded.llm_usage_records == []
+        assert loaded.run_invocation_schema_version is None
+        assert loaded.run_invocation_records == []
 
     def test_step_file_tracking_round_trips_for_resume(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)

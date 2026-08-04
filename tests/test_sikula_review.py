@@ -143,7 +143,12 @@ def _cfg(tmp_path: Path) -> dict:
 
 
 def _run_review(
-    tmp_path: Path, *, reviewer_approved: bool, security_approved: bool = True, run_security_review: bool = True
+    tmp_path: Path,
+    *,
+    reviewer_approved: bool,
+    security_approved: bool = True,
+    run_security_review: bool = True,
+    args_overrides: dict | None = None,
 ):
     cfg = _cfg(tmp_path)
     cfg["run_security_review"] = run_security_review
@@ -179,7 +184,7 @@ def _run_review(
         patch("agents.security_reviewer_agent.SecurityReviewerAgent", return_value=mock_security),
         patch("sys.exit"),
     ):
-        cmd_review(_args(), cfg)
+        cmd_review(_args(**(args_overrides or {})), cfg)
 
     from core.state import JsonStateStore
 
@@ -331,6 +336,8 @@ class TestCmdReviewReportOnlyState:
         assert state.review_base_branch == "main"
         assert state.test_status == "skipped"
         assert state.check_status == "skipped"
+        assert state.run_invocation_schema_version == 1
+        assert [record["config_snapshot"] for record in state.run_invocation_records] == [state.config_snapshot]
 
     def test_rejected_review_sets_failed(self, tmp_path: Path):
         state = _run_review(tmp_path, reviewer_approved=False)
@@ -367,6 +374,8 @@ class TestCmdReviewReportOnlyState:
             state = JsonStateStore(tmp_path / "state").load("task123")
             assert state is not None
             assert state.pid == os.getpid()
+            assert state.run_invocation_schema_version == 1
+            assert [record["config_snapshot"] for record in state.run_invocation_records] == [state.config_snapshot]
             raise KeyboardInterrupt
 
         with (
@@ -392,6 +401,8 @@ class TestCmdReviewReportOnlyState:
         assert state.worktree_path is None
         assert state.worktree_base is None
         assert state.worktree_branch == "feat/x"
+        assert state.run_invocation_schema_version == 1
+        assert [record["config_snapshot"] for record in state.run_invocation_records] == [state.config_snapshot]
         assert [entry["action"] for entry in state.history] == ["review_failed", "cleanup"]
         remove_worktree.assert_called_once_with(worktree_base, tmp_path, force=False)
 
@@ -404,6 +415,28 @@ class TestCmdReviewReportOnlyState:
         state = _run_review(tmp_path, reviewer_approved=True)
         assert state.config_snapshot["progress"] == {
             "heartbeat_interval_seconds": 60,
+        }
+
+    def test_config_snapshot_contains_effective_agent_overrides(self, tmp_path: Path):
+        state = _run_review(
+            tmp_path,
+            reviewer_approved=True,
+            args_overrides={
+                "agent_provider": ["analyst=gemini", "reviewer=claude"],
+                "agent_model": ["analyst=gemini-2.5-pro", "reviewer=claude-sonnet-4-5"],
+                "agent_timeout": ["analyst=900", "reviewer=1200"],
+            },
+        )
+
+        assert state.config_snapshot["agents"]["analyst"] == {
+            "provider": "gemini",
+            "model": "gemini-2.5-pro",
+            "agent_timeout": 900,
+        }
+        assert state.config_snapshot["agents"]["reviewer"] == {
+            "provider": "claude",
+            "model": "claude-sonnet-4-5",
+            "agent_timeout": 1200,
         }
 
     def test_heartbeat_interval_treats_zero_as_disabled(self):
@@ -523,6 +556,7 @@ class TestCmdReviewReportOnlyState:
     def test_config_snapshot_omits_extra_rules_when_not_configured(self, tmp_path: Path):
         state = _run_review(tmp_path, reviewer_approved=True)
         agents_snap = state.config_snapshot["agents"]
+        assert "extra_rules" not in agents_snap["analyst"]
         assert "extra_rules" not in agents_snap["reviewer"]
         assert "extra_rules" not in agents_snap["security_reviewer"]
 
@@ -571,6 +605,33 @@ class TestCmdReviewDescriptionValidation:
         assert exc_info.value.code == 1
         assert not find_git_root.called
         assert "either --description or --description-file" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        ("args_overrides", "expected_message"),
+        [
+            ({"agent_model": ["unknown=model"]}, "Unknown agent 'unknown'"),
+            ({"agent_provider": ["reviewer"]}, "Invalid --agent-provider value"),
+            ({"agent_timeout": ["reviewer=slow"]}, "Invalid --agent-timeout value"),
+        ],
+    )
+    def test_rejects_invalid_agent_overrides_before_creating_resources(
+        self,
+        tmp_path: Path,
+        capsys,
+        args_overrides: dict,
+        expected_message: str,
+    ):
+        with (
+            patch("sikula._find_git_root") as find_git_root,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(_args(**args_overrides), _cfg(tmp_path))
+
+        assert exc_info.value.code == 1
+        assert not find_git_root.called
+        assert not (tmp_path / "state").exists()
+        assert not (tmp_path / ".sikula" / "worktrees").exists()
+        assert expected_message in capsys.readouterr().out
 
 
 class TestEnsureGitignore:
@@ -1508,6 +1569,30 @@ def _mock_orchestrator():
 
 
 class TestCmdReviewDesignFileEnrichment:
+    def test_enrichment_uses_effective_analyst_override(self, tmp_path: Path):
+        state = MagicMock()
+        store = MagicMock()
+        enrichment_llm = MagicMock()
+
+        with (
+            patch("core.llm_client.create_llm_client", return_value=enrichment_llm) as create_llm,
+            patch("sikula._enrich_prompt_with_referenced_files", return_value=""),
+        ):
+            _sikula._enrich_review_state_prompt(
+                state,
+                store,
+                "Review description",
+                {"provider": "codex", "model": "gpt-5.3-codex", "agent_timeout": 1800},
+                _cfg(tmp_path),
+                tmp_path,
+                {"provider": "gemini", "model": "gemini-2.5-pro", "agent_timeout": 900},
+            )
+
+        llm_config = create_llm.call_args.args[0]
+        assert llm_config.provider == "gemini"
+        assert llm_config.model == "gemini-2.5-pro"
+        assert llm_config.agent_timeout == 900
+
     def test_report_only_enriches_prompt_when_files_found(self, tmp_path: Path):
         cfg = _cfg(tmp_path)
         subprocess_results = [
@@ -1589,15 +1674,22 @@ class TestCmdReviewDesignFileEnrichment:
         state = store.load(store.list_tasks()[0])
         assert state.implementation_prompt == "Simple review"
 
-    def test_fix_mode_enriches_prompt_before_orchestrator(self, tmp_path: Path):
+    def test_fix_mode_enriches_prompt_before_pipeline(self, tmp_path: Path):
         cfg = _cfg(tmp_path)
         captured: dict = {}
 
         def capture_orch(cfg_arg, overrides=None, state_store=None):
-            tasks = state_store.list_tasks()
-            if tasks:
-                captured["prompt"] = state_store.load(tasks[0]).implementation_prompt
-            return _mock_orchestrator()
+            mock = _mock_orchestrator()
+            result = mock.run.return_value
+
+            def run(*, task_id, before_pipeline, **_kwargs):
+                run_state = state_store.load(task_id)
+                before_pipeline(run_state)
+                captured["prompt"] = state_store.load(task_id).implementation_prompt
+                return result
+
+            mock.run.side_effect = run
+            return mock
 
         with (
             patch("sikula._find_git_root", return_value=tmp_path),

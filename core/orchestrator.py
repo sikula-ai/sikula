@@ -42,7 +42,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from agents.analyst_agent import AnalystAgent
 from agents.fixer_agent import FixerAgent
@@ -433,21 +433,36 @@ class Orchestrator:
         task_id: Optional[str] = None,
         task_description: Optional[str] = None,
         label: Optional[str] = None,
+        complete_invocation_history: bool = False,
+        before_pipeline: Optional[Callable[[TaskState], None]] = None,
     ) -> TaskState:
+        created_state = False
         if task_id:
             state = self._store.load(task_id)
             if state is None:
                 raise ValueError(f"Task not found: {task_id}")
         elif task_description:
             state = self._store.create(task_description)
+            created_state = True
         else:
             raise ValueError("Provide task_id or task_description")
 
         display = label or state.task_description.splitlines()[0][:60]
         log.info("Task %s — %s", state.task_id, display)
+        active_invocation = not state.done and not state.failed
+        if active_invocation:
+            state.record_run_invocation(
+                self._config_snapshot,
+                complete_history_from_creation=(created_state or complete_invocation_history),
+            )
         state.clear_active_operation()
         state.pid = os.getpid()
+        # Capture effective config on first run before any pre-pipeline work.
+        if active_invocation and not state.config_snapshot and self._config_snapshot:
+            state.config_snapshot = self._config_snapshot
         self._store.save(state)
+        if active_invocation and before_pipeline is not None:
+            before_pipeline(state)
         self._loop(state)
         return state
 
@@ -476,12 +491,6 @@ class Orchestrator:
                 "done",
             )
             return
-
-        # Capture effective config on first run; never overwritten on resume so the
-        # original run settings are always visible in the state JSON.
-        if not state.config_snapshot and self._config_snapshot:
-            state.config_snapshot = self._config_snapshot
-            self._store.save(state)
 
         if self._abort_on_validation_coverage_gaps(state):
             return

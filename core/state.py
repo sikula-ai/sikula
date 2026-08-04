@@ -316,6 +316,7 @@ def _final_summary(state: "TaskState") -> dict:
 
 
 SCHEMA_VERSION = 2
+RUN_INVOCATION_SCHEMA_VERSION = 1
 
 
 def _without_reviewer_field(record: dict) -> dict:
@@ -360,6 +361,8 @@ class TaskState:
     task_description: str
     schema_version: int = SCHEMA_VERSION
     config_snapshot: dict = field(default_factory=dict)
+    run_invocation_schema_version: Optional[int] = None
+    run_invocation_records: list[dict] = field(default_factory=list)
     implementation_contract: dict = field(default_factory=dict)
     implementation_asset_records: list[dict] = field(default_factory=list)
     implementation_asset_drift_records: list[dict] = field(default_factory=list)
@@ -478,6 +481,25 @@ class TaskState:
             return
         record["recorded_at"] = _now()
         self.llm_usage_records.append(record)
+
+    def record_run_invocation(
+        self,
+        config_snapshot: dict,
+        *,
+        complete_history_from_creation: bool = False,
+    ) -> None:
+        if complete_history_from_creation and (
+            self.run_invocation_schema_version is not None or self.run_invocation_records
+        ):
+            raise ValueError("complete run-invocation history can only be marked on the first record")
+        self.run_invocation_records.append(
+            {
+                "started_at": _now(),
+                "config_snapshot": copy.deepcopy(config_snapshot),
+            }
+        )
+        if complete_history_from_creation:
+            self.run_invocation_schema_version = RUN_INVOCATION_SCHEMA_VERSION
 
     def record_implementation_assets(self, records: list[dict]) -> None:
         sanitized = []

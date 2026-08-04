@@ -333,7 +333,11 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             cfg["project"]["root_path"] = str(worktree_project_root)
 
         orch = context.build_orchestrator(cfg, overrides, state_store=store)
-        state = orch.run(task_id=state.task_id, label=Path(args.task_file).name)
+        state = orch.run(
+            task_id=state.task_id,
+            label=Path(args.task_file).name,
+            complete_invocation_history=True,
+        )
 
     elif args.task_id:
         state = store.load(args.task_id)
