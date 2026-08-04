@@ -316,6 +316,7 @@ def _final_summary(state: "TaskState") -> dict:
 
 
 SCHEMA_VERSION = 2
+RUN_INVOCATION_SCHEMA_VERSION = 1
 
 
 def _without_reviewer_field(record: dict) -> dict:
@@ -360,6 +361,8 @@ class TaskState:
     task_description: str
     schema_version: int = SCHEMA_VERSION
     config_snapshot: dict = field(default_factory=dict)
+    run_invocation_schema_version: Optional[int] = None
+    run_invocation_records: list[dict] = field(default_factory=list)
     implementation_contract: dict = field(default_factory=dict)
     implementation_asset_records: list[dict] = field(default_factory=list)
     implementation_asset_drift_records: list[dict] = field(default_factory=list)
@@ -478,6 +481,14 @@ class TaskState:
             return
         record["recorded_at"] = _now()
         self.llm_usage_records.append(record)
+
+    def record_run_invocation(self, config_snapshot: dict) -> None:
+        self.run_invocation_records.append(
+            {
+                "started_at": _now(),
+                "config_snapshot": copy.deepcopy(config_snapshot),
+            }
+        )
 
     def record_implementation_assets(self, records: list[dict]) -> None:
         sanitized = []
@@ -792,6 +803,7 @@ class StateStore:
         state = TaskState(
             task_id=task_id,
             task_description=task_description,
+            run_invocation_schema_version=RUN_INVOCATION_SCHEMA_VERSION,
             delivery_plan_id=delivery_plan_id,
             delivery_unit_id=delivery_unit_id,
             delivery_plan_path=delivery_plan_path,

@@ -445,6 +445,8 @@ class Orchestrator:
 
         display = label or state.task_description.splitlines()[0][:60]
         log.info("Task %s — %s", state.task_id, display)
+        if not state.done and not state.failed:
+            state.record_run_invocation(self._config_snapshot)
         state.clear_active_operation()
         state.pid = os.getpid()
         self._store.save(state)

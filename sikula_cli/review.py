@@ -105,7 +105,12 @@ def _review_context(context: ReviewContext | None = None) -> ReviewContext:
 
 def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | None = None) -> None:
     """Checkout an existing branch in a worktree and run code + security review."""
-    from core.state import JsonStateStore, TaskState, runtime_metadata_snapshot
+    from core.state import (
+        RUN_INVOCATION_SCHEMA_VERSION,
+        JsonStateStore,
+        TaskState,
+        runtime_metadata_snapshot,
+    )
 
     context = _review_context(context)
 
@@ -285,6 +290,7 @@ def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | Non
     state = TaskState(
         task_id=task_id,
         task_description=description,
+        run_invocation_schema_version=RUN_INVOCATION_SCHEMA_VERSION,
         implementation_prompt=description,
         files_changed=files_changed,
         review_diff=review_diff,
