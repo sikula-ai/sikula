@@ -183,9 +183,12 @@ in task or contract Markdown rather than these public metadata fields; full
 Prepared units use `budget.max_planner_steps: 1` by default. A limit of `2` is
 allowed only for tightly coupled work; limits of `3` or more are rejected.
 During `run-next`, planner output that exceeds the unit budget stops before
-implementation. The unit must then be split through a delivery amendment;
-`--reset-failed` cannot bypass this stop. With `--prepare-budget-split`,
-`run-next` can prepare, but not apply, a verified split proposal.
+implementation. The planner receives the effective limit and gets one bounded
+re-evaluation opportunity to consolidate the complete unit safely. If the unit
+still requires more steps, the oversized result is preserved and the unit must
+be split through a delivery amendment; `--reset-failed` cannot bypass this stop.
+With `--prepare-budget-split`, `run-next` can prepare, but not apply, a verified
+split proposal.
 
 Successful new units produce fingerprinted handoffs for dependent units.
 `run-next` assembles completed result commits into `final_branch` in dependency

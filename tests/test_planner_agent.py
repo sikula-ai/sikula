@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agents.base_agent import AGENT_SECURITY_PREFIX
 from agents.planner_agent import PlannerAgent, _parse_plan
 from core.state import TaskState
@@ -134,6 +136,7 @@ class TestPlannerAgentRun:
         assert "Each numbered item must be exactly one physical line" in system_prompt
         assert "Do not emit numbered sub-items" in system_prompt
         assert "complete compile-safe implementation step" in system_prompt
+        assert "Delivery unit planner-step budget" not in stub_llm.generate_calls[0][1]
 
     def test_over_max_steps_retries_and_accepts_valid_plan(self):
         llm = SequentialGenerateLLM(
@@ -180,8 +183,13 @@ class TestPlannerAgentRun:
         assert len(llm.generate_calls) == 2
         assert len(state.planner_retry_records) == 1
 
-    def test_delivery_unit_preserves_oversized_plan_without_retry(self):
-        llm = SequentialGenerateLLM(["1. A\n2. B\n3. C\n4. D"])
+    def test_delivery_unit_retries_once_then_preserves_oversized_plan(self):
+        llm = SequentialGenerateLLM(
+            [
+                "1. A\n2. B\n3. C\n4. D",
+                "1. Combined A and B\n2. Combined C and D\n3. Final integration",
+            ]
+        )
         state = TaskState(
             task_id="t1",
             task_description="task",
@@ -190,17 +198,106 @@ class TestPlannerAgentRun:
             delivery_unit_id="unit-1",
             delivery_unit_budget={"max_planner_steps": 1},
         )
-        config = {"planner": {"max_steps": 3}}
+        config = {"planner": {"max_steps": 2}}
 
         result = _make_agent(llm, project_config=config).run(state)
 
         assert result.success
-        assert state.plan == ["A", "B", "C", "D"]
+        assert state.plan == ["Combined A and B", "Combined C and D", "Final integration"]
         assert state.plan_decided is True
-        assert len(llm.generate_calls) == 1
-        assert state.planner_retry_records == []
-        assert state.planner_output == "1. A\n2. B\n3. C\n4. D"
+        assert len(llm.generate_calls) == 2
+        assert "max_planner_steps=1" in llm.generate_calls[0][1]
+        assert "SINGLE_PASS counts as one step" in llm.generate_calls[0][1]
+        assert (
+            "numbered list with 2 or more items; exceed the unit budget only as an honest delivery split signal"
+            in llm.generate_calls[0][0]
+        )
+        assert "numbered list with 2–2 items" not in llm.generate_calls[0][0]
+        assert "even when that exceeds planner.max_steps" in llm.generate_calls[0][1]
+        assert "Re-evaluate the unit once" in llm.generate_calls[1][1]
+        assert "Do not omit scope" in llm.generate_calls[1][1]
+        assert len(state.planner_retry_records) == 1
+        retry = state.planner_retry_records[0]
+        assert retry["reason"] == ("planner output parsed as 4 steps, exceeding delivery unit max_planner_steps=1")
+        assert retry["max_steps"] == 1
+        assert retry["parsed_step_count"] == 4
+        assert retry["will_retry"] is True
+        assert state.planner_output == "1. Combined A and B\n2. Combined C and D\n3. Final integration"
         assert any(record["action"] == "plan" for record in state.history)
+
+    @pytest.mark.parametrize(
+        ("retry_output", "parsed_step_count"),
+        [
+            ("", 0),
+            ("I could not produce a safe revised plan.", 0),
+            ("1. One incomplete item", 1),
+        ],
+    )
+    def test_delivery_unit_invalid_retry_preserves_first_oversized_plan(
+        self, retry_output: str, parsed_step_count: int
+    ):
+        first_output = "1. A\n2. B\n3. C"
+        llm = SequentialGenerateLLM([first_output, retry_output])
+        state = TaskState(
+            task_id="t1",
+            task_description="task",
+            implementation_prompt="do x",
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 1},
+        )
+
+        result = _make_agent(llm).run(state)
+
+        assert result.success
+        assert state.plan == ["A", "B", "C"]
+        assert state.plan_decided is True
+        assert state.planner_output == retry_output
+        assert len(state.planner_retry_records) == 2
+        final_retry = state.planner_retry_records[1]
+        assert final_retry["will_retry"] is False
+        assert final_retry["parsed_step_count"] == parsed_step_count
+        assert final_retry["output"] == retry_output
+        assert "preserving oversized plan" in final_retry["reason"]
+
+    def test_delivery_unit_retry_can_consolidate_to_single_pass(self):
+        llm = SequentialGenerateLLM(["1. A\n2. B\n3. C", "SINGLE_PASS"])
+        state = TaskState(
+            task_id="t1",
+            task_description="task",
+            implementation_prompt="do x",
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 1},
+        )
+
+        result = _make_agent(llm).run(state)
+
+        assert result.success
+        assert state.plan == []
+        assert state.plan_decided is True
+        assert len(llm.generate_calls) == 2
+        assert len(state.planner_retry_records) == 1
+
+    def test_delivery_unit_retry_can_consolidate_to_two_step_budget(self):
+        llm = SequentialGenerateLLM(["1. A\n2. B\n3. C", "1. Combined A and B\n2. C"])
+        state = TaskState(
+            task_id="t1",
+            task_description="task",
+            implementation_prompt="do x",
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 2},
+        )
+
+        result = _make_agent(llm).run(state)
+
+        assert result.success
+        assert state.plan == ["Combined A and B", "C"]
+        assert state.plan_decided is True
+        assert len(llm.generate_calls) == 2
+        assert "SINGLE_PASS or exactly 2 steps" in llm.generate_calls[1][1]
+        assert state.planner_retry_records[0]["max_steps"] == 2
 
     def test_delivery_unit_accepts_plan_within_explicit_two_step_budget(self, stub_llm: StubLLMClient):
         stub_llm.generate_result = "1. A\n2. B"

@@ -58,11 +58,11 @@ If splitting:
   changes in one step
 - If a compile-safe split would be awkward or unclear, choose SINGLE_PASS instead of
   forcing a multi-step plan
-- Aim for 2–{max_steps} steps; do not invent steps just to have more of them
+- {step_count_guidance}
 - Do not include test changes — a dedicated agent handles tests separately
 
 Output format contract:
-- Output exactly SINGLE_PASS, or a numbered list with 2–{max_steps} items
+- Output exactly SINGLE_PASS, or {numbered_list_contract}
 - Each numbered item must be exactly one physical line
 - Do not emit numbered sub-items, outline sections, headings, bullets, or continuation lines
 - Do not split one implementation phase into separate dependency/setup/detail sub-steps
@@ -83,6 +83,18 @@ Implementation prompt:
 Analyze the prompt and output SINGLE_PASS or a numbered list of steps.\
 """
 
+_DELIVERY_UNIT_PLAN_GUIDANCE = """\
+
+Delivery unit planner-step budget:
+- This task is one delivery unit with max_planner_steps={unit_limit}; SINGLE_PASS counts as one step.
+- {within_budget_guidance}
+- Consolidate tightly coupled work only when the complete unit remains coherent and compile-safe.
+- Do not omit scope, acceptance criteria, validation, or required dependencies merely to fit the budget.
+- If the complete unit cannot fit safely, return the smallest honest numbered plan with 2 or more
+  compile-safe steps, even when that exceeds planner.max_steps. An oversized result is an intentional
+  signal that the unit must be split before implementation.
+"""
+
 _USER_PLAN_RETRY = """\
 Implementation prompt:
 {implementation_prompt}
@@ -97,6 +109,22 @@ Return exactly SINGLE_PASS or a new numbered list with 2–{max_steps} complete
 compile-safe implementation steps. Each step must be exactly one physical line.
 Do not output numbered sub-items, headings, bullets, continuation lines, or text before
 or after the plan.\
+"""
+
+_USER_DELIVERY_PLAN_RETRY = """\
+Implementation prompt:
+{implementation_prompt}
+
+Your previous planner output parsed as {parsed_step_count} steps, exceeding this delivery unit's
+max_planner_steps={unit_limit}. Re-evaluate the unit once.
+
+- {within_budget_guidance}
+- Consolidate only if the entire unit remains coherent, complete, and compile-safe.
+- Do not omit scope, acceptance criteria, validation, or required dependencies to fit the budget.
+- If the unit genuinely cannot fit, return the smallest honest numbered plan with 2 or more compile-safe
+  steps, even when that exceeds planner.max_steps, so Sikula can stop and require a delivery split.
+- Output only SINGLE_PASS or the numbered list. Each numbered item must be exactly one physical line.
+\
 """
 
 
@@ -138,12 +166,33 @@ class PlannerAgent(BaseAgent):
             return None
         return max_steps
 
-    def _build_system_prompt(self, max_steps: int, file_tool) -> str:
+    def _build_system_prompt(self, max_steps: int, file_tool, *, delivery_unit: bool = False) -> str:
+        if delivery_unit:
+            step_count_guidance = (
+                "Follow the delivery-unit budget in the user prompt; if it cannot be met safely, "
+                "return the smallest honest oversized plan."
+            )
+            numbered_list_contract = (
+                "a numbered list with 2 or more items; exceed the unit budget only as an honest delivery split signal"
+            )
+        else:
+            step_count_guidance = f"Aim for 2–{max_steps} steps; do not invent steps just to have more of them"
+            numbered_list_contract = f"a numbered list with 2–{max_steps} items"
         return (
             AGENT_SECURITY_PREFIX
-            + _SYSTEM_PLAN.format(tech_stack=_tech_stack(self.project_config), max_steps=max_steps)
+            + _SYSTEM_PLAN.format(
+                tech_stack=_tech_stack(self.project_config),
+                step_count_guidance=step_count_guidance,
+                numbered_list_contract=numbered_list_contract,
+            )
             + _load_extra_rules(self.project_config, self.name, file_tool)
         )
+
+    @staticmethod
+    def _delivery_within_budget_guidance(unit_limit: int) -> str:
+        if unit_limit == 1:
+            return "Prefer exactly SINGLE_PASS when the complete unit can be implemented safely in one pass."
+        return "Prefer SINGLE_PASS or exactly 2 steps when the complete unit fits safely within the budget."
 
     def _accept_plan_decision(self, state: TaskState, decision: _PlanDecision) -> AgentResult:
         if decision.single_pass:
@@ -184,10 +233,19 @@ class PlannerAgent(BaseAgent):
             state.record(self.name, "plan_failed", msg)
             return AgentResult(success=False, message=msg)
 
-        system = self._build_system_prompt(max_steps, file_tool)
+        unit_limit = None
+        if state.delivery_plan_id and state.delivery_unit_id:
+            unit_limit = delivery_unit_planner_step_limit(state.delivery_unit_budget)
+        system = self._build_system_prompt(max_steps, file_tool, delivery_unit=unit_limit is not None)
         user = _USER_PLAN.format(implementation_prompt=state.implementation_prompt)
+        if unit_limit is not None:
+            user += _DELIVERY_UNIT_PLAN_GUIDANCE.format(
+                unit_limit=unit_limit,
+                within_budget_guidance=self._delivery_within_budget_guidance(unit_limit),
+            )
         state.planner_prompt = system + "\n\n" + user
 
+        preserved_delivery_decision: _PlanDecision | None = None
         for attempt in range(1, _MAX_PLANNER_OUTPUT_ATTEMPTS + 1):
             try:
                 output = self.llm.generate(system, user)
@@ -198,16 +256,61 @@ class PlannerAgent(BaseAgent):
 
             state.planner_output = output
             if not output:
+                if preserved_delivery_decision is not None and unit_limit is not None:
+                    reason = "delivery unit re-evaluation produced empty output; preserving oversized plan"
+                    state.record_planner_retry(
+                        attempt,
+                        reason,
+                        output,
+                        max_steps=unit_limit,
+                        parsed_step_count=0,
+                        will_retry=False,
+                    )
+                    return self._accept_plan_decision(state, preserved_delivery_decision)
                 return AgentResult(success=False, message="Planner produced empty output")
 
             if _is_single_pass(output):
                 return self._accept_plan_decision(state, _PlanDecision(single_pass=True, steps=[]))
 
             steps = _parse_plan(output)
-            if state.delivery_plan_id and state.delivery_unit_id:
-                unit_limit = delivery_unit_planner_step_limit(state.delivery_unit_budget)
-                if len(steps) > unit_limit:
+            if preserved_delivery_decision is not None and unit_limit is not None and len(steps) < 2:
+                reason = "delivery unit re-evaluation did not produce an explicit valid plan; preserving oversized plan"
+                state.record_planner_retry(
+                    attempt,
+                    reason,
+                    output,
+                    max_steps=unit_limit,
+                    parsed_step_count=len(steps),
+                    will_retry=False,
+                )
+                return self._accept_plan_decision(state, preserved_delivery_decision)
+            if unit_limit is not None and len(steps) > unit_limit:
+                if attempt >= _MAX_PLANNER_OUTPUT_ATTEMPTS:
                     return self._accept_plan_decision(state, _PlanDecision(single_pass=False, steps=steps))
+                preserved_delivery_decision = _PlanDecision(single_pass=False, steps=steps)
+                reason = (
+                    f"planner output parsed as {len(steps)} steps, exceeding delivery unit "
+                    f"max_planner_steps={unit_limit}"
+                )
+                retry_user = _USER_DELIVERY_PLAN_RETRY.format(
+                    implementation_prompt=state.implementation_prompt,
+                    parsed_step_count=len(steps),
+                    unit_limit=unit_limit,
+                    within_budget_guidance=self._delivery_within_budget_guidance(unit_limit),
+                )
+                retry_prompt = system + "\n\n" + retry_user
+                state.record_planner_retry(
+                    attempt,
+                    reason,
+                    output,
+                    max_steps=unit_limit,
+                    parsed_step_count=len(steps),
+                    will_retry=True,
+                    retry_prompt=retry_prompt,
+                )
+                log.warning("Planner output exceeded delivery unit budget; re-evaluating once: %s", reason)
+                user = retry_user
+                continue
             if len(steps) <= max_steps:
                 return self._accept_plan_decision(state, _PlanDecision(single_pass=False, steps=steps))
 

@@ -1066,7 +1066,7 @@ dependency in the same step. If that makes the split unclear, planner should cho
 **Output written to state:**
 - `state.planner_prompt` — full assembled prompt sent to the planner LLM (system + user sections); stored before the LLM call
 - `state.planner_output` — latest raw planner response; kept in local task state for audit and never copied into parent delivery progress
-- `state.planner_retry_records` — rejected over-limit planner outputs, including parsed step count, configured max, rejected output, and retry prompt when another attempt follows
+- `state.planner_retry_records` — rejected over-limit planner outputs, including parsed step count, active global or delivery-unit limit, rejected output, and retry prompt when another attempt follows
 - `state.plan_decided = True` — set after every successful decision; guards re-run on resume
 - `state.plan` — list of step description strings (only set when splitting; stays empty for SINGLE_PASS)
 - `state.current_step = 0` — reset to start (only when splitting)
@@ -1077,10 +1077,14 @@ For ordinary tasks, if the output parses into more than `planner.max_steps`
 steps, Sikula rejects the output and retries once with a stricter format prompt.
 If the retry is still over the limit, `plan_decided` remains false and the
 orchestrator fails before implementation starts. For delivery children, the
-first valid parsed plan is preserved without a format retry; the orchestrator
-compares its size with `delivery_unit_budget.max_planner_steps` and records a
-terminal `unit_budget_exceeded` stop before implementation when oversized.
-That stop requires a delivery amend/split and cannot be reset directly.
+initial prompt includes the effective `delivery_unit_budget.max_planner_steps`
+limit. An oversized result gets one bounded re-evaluation that may consolidate
+steps only when the whole unit remains complete, coherent, and compile-safe. A
+second oversized result is preserved as the planner's honest split signal; the
+original valid oversized plan is retained instead when the re-evaluation output
+is invalid. The orchestrator then records a terminal `unit_budget_exceeded` stop
+before implementation. That stop requires a delivery amend/split and cannot be
+reset directly.
 
 ---
 
@@ -1777,7 +1781,7 @@ Sikula processes at once is still unsupported.
 | `security_review_iterations` | `int` | Orchestrator | Security fix attempt counter for the current cycle (counts completed security-review→implement pairs); independent of `review_iterations`; resets to 0 on step transitions and fixer passes; guarded by `config.max_security_review_iterations` |
 | `analyst_warnings` | `list[str]` | AnalystAgent | Warnings produced by the analyst (e.g. ambiguous task scope, missing context); logged for visibility, never block the pipeline |
 | `analyst_retry_records` | `list[dict]` | AnalystAgent | Append-only records for analyst outputs rejected before `implementation_prompt` is stored, including attempt number, reason, whether another retry follows, timestamp, the rejected output, and the retry prompt when another attempt follows. These records are audit-only and never drive pipeline control flow. |
-| `planner_retry_records` | `list[dict]` | PlannerAgent | Append-only records for planner outputs rejected because the parsed step count exceeded `planner.max_steps`, including attempt number, reason, max step count, parsed step count, whether another retry follows, timestamp, the rejected output, and the retry prompt when another attempt follows. These records are audit-only and never drive pipeline control flow. |
+| `planner_retry_records` | `list[dict]` | PlannerAgent | Append-only records for planner outputs rejected because the parsed step count exceeded the active global or delivery-unit planner limit, including attempt number, reason, active step limit, parsed step count, whether another retry follows, timestamp, the rejected output, and the retry prompt when another attempt follows. These records are audit-only and never drive pipeline control flow. |
 | `llm_usage_records` | `list[dict]` | `core/retry_history.py` / built-in LLM clients | Append-only, content-free record for each physical provider invocation attempt made while an agent is attached to task state. Records contain bounded agent/provider/model/operation identifiers, attempt relationship, outcome, elapsed time, input/output character counts when measurable, and optional structured provider-reported token counts. They never contain prompts, provider output, source excerpts, paths, credentials, or estimated tokens/costs, and never drive pipeline behavior. |
 | `review_diff` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / Orchestrator | PR-style diff passed to ReviewerAgent and SecurityReviewerAgent; initially set to `git diff base...branch` (three-dot) in `sikula review` mode; refreshed in `"review_fix"` mode before reviewer/security-reviewer calls so uncommitted fixes are included; `None` in standard `sikula run` flow (agents fall back to `GitTool.diff_head()`) |
 | `review_mode` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` | Review task kind: `"review_report"` for report-only review (not reset or resumable) or `"review_fix"` for `sikula review --fix` (resumable via `sikula run --task-id`) |
