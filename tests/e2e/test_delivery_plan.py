@@ -755,19 +755,23 @@ def test_delivery_run_executes_and_finalizes_two_unit_plan(
     )
 
 
-def test_delivery_run_next_prepares_budget_split_with_fake_llm(
+def test_delivery_budget_split_applies_to_assembly_and_runs_replacement(
     git_project: Path,
     seq_fake_llm,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    project_root = git_project / "apps" / "service"
+    project_root.mkdir(parents=True)
+    for name in ("src", "tests_proj", "pyproject.toml"):
+        (git_project / name).rename(project_root / name)
     unit_path = _write_delivery_unit(
-        git_project,
+        project_root,
         "01-foundation.md",
         "# Foundation\n\nImplement the requested foundation behavior.\n",
     )
     plan_path = _write_delivery_plan(
-        git_project,
+        project_root,
         {
             "schema_version": 1,
             "plan_id": "delivery-budget-split-smoke",
@@ -784,7 +788,7 @@ def test_delivery_run_next_prepares_budget_split_with_fake_llm(
             ],
         },
     )
-    config_path = git_project / ".sikula" / "config.yaml"
+    config_path = project_root / ".sikula" / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
             {
@@ -810,7 +814,7 @@ def test_delivery_run_next_prepares_budget_split_with_fake_llm(
                 "build": {"test_command": "python3 -m pytest tests_proj/", "timeout": 30},
                 "planner": {"max_steps": 6},
                 "run_planner": False,
-                "run_build": False,
+                "run_build": True,
                 "run_review": False,
                 "run_security_review": False,
                 "run_test_writing": False,
@@ -821,12 +825,19 @@ def test_delivery_run_next_prepares_budget_split_with_fake_llm(
         ),
         encoding="utf-8",
     )
-    (git_project / ".gitignore").write_text(
+    (project_root / ".gitignore").write_text(
         ".sikula/state/\n.sikula/worktrees/\n.sikula/contract-reports/\n",
         encoding="utf-8",
     )
     _git_commit_all(git_project, "add budget split smoke fixture")
-    fake = seq_fake_llm(
+    operator_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=git_project,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    authoring_fake = seq_fake_llm(
         generate_responses=[
             "1. Add the first independent behavior.\n"
             "2. Add the second independent behavior.\n"
@@ -837,16 +848,21 @@ def test_delivery_run_next_prepares_budget_split_with_fake_llm(
             _budget_split_authoring_output(),
         ]
     )
-    monkeypatch.chdir(git_project)
+    execution_fake = seq_fake_llm(
+        agent_responses=[
+            {"src/calculator.py": ("def add(a, b):\n    return a + b\n\ndef subtract(a, b):\n    return a - b\n")}
+        ]
+    )
+    monkeypatch.chdir(project_root)
 
-    with patch("core.llm_client.create_llm_client", return_value=fake):
+    with patch("core.llm_client.create_llm_client", return_value=authoring_fake):
         with patch(
             "sys.argv",
             [
                 "sikula",
                 "delivery",
                 "run-next",
-                plan_path.relative_to(git_project).as_posix(),
+                plan_path.relative_to(project_root).as_posix(),
                 "--prepare-budget-split",
                 "--json",
             ],
@@ -861,8 +877,8 @@ def test_delivery_run_next_prepares_budget_split_with_fake_llm(
     assert preparation["prepared"] is True
     assert preparation["budget_exceeded"] == {"name": "max_planner_steps", "limit": 1, "actual": 3}
     assert preparation["next_action"] == "delivery_amend_apply"
-    assert (git_project / preparation["proposal_path"]).is_file()
-    assert (git_project / preparation["audit_path"]).is_file()
+    assert (project_root / preparation["proposal_path"]).is_file()
+    assert (project_root / preparation["audit_path"]).is_file()
     assert (
         subprocess.run(
             ["git", "status", "--porcelain"],
@@ -872,6 +888,103 @@ def test_delivery_run_next_prepares_budget_split_with_fake_llm(
             text=True,
         ).stdout
         == ""
+    )
+
+    with patch("core.llm_client.create_llm_client", return_value=execution_fake):
+        with patch(
+            "sys.argv",
+            [
+                "sikula",
+                "delivery",
+                "amend",
+                "apply",
+                plan_path.relative_to(project_root).as_posix(),
+                "--proposal",
+                preparation["proposal_id"],
+                "--json",
+            ],
+        ):
+            main()
+
+        apply_payload = json.loads(capsys.readouterr().out)
+        assert apply_payload["applied"] is True
+        assert apply_payload["replacement_ids"] == ["foundation-a", "foundation-b"]
+        amendment_commit = subprocess.run(
+            ["git", "rev-parse", "refs/heads/sikula/delivery/delivery-budget-split-smoke"],
+            cwd=git_project,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert amendment_commit != operator_head
+        assert (
+            subprocess.run(
+                [
+                    "git",
+                    "cat-file",
+                    "-e",
+                    f"{amendment_commit}:apps/service/{preparation['proposal_path']}",
+                ],
+                cwd=git_project,
+                capture_output=True,
+            ).returncode
+            != 0
+        )
+        assert (
+            subprocess.run(
+                [
+                    "git",
+                    "cat-file",
+                    "-e",
+                    f"{amendment_commit}:apps/service/.sikula/delivery/demo/units/foundation-a.md",
+                ],
+                cwd=git_project,
+                capture_output=True,
+            ).returncode
+            == 0
+        )
+        committed_plan = yaml.safe_load(
+            subprocess.run(
+                ["git", "show", f"{amendment_commit}:apps/service/.sikula/delivery/demo/plan.yaml"],
+                cwd=git_project,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )
+        assert committed_plan["units"][0]["superseded_by"] == ["foundation-a", "foundation-b"]
+
+        with patch(
+            "sys.argv",
+            ["sikula", "delivery", "run-next", plan_path.relative_to(project_root).as_posix(), "--json"],
+        ):
+            main()
+
+    replacement_payload = json.loads(capsys.readouterr().out)
+    replacement_state = JsonStateStore(project_root / ".sikula" / "state").load(replacement_payload["child_task_id"])
+    assert replacement_payload["succeeded"] is True
+    assert replacement_payload["selected_unit"]["id"] == "foundation-a"
+    assert replacement_state is not None
+    assert replacement_state.result_commit
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", f"{replacement_state.result_commit}^"],
+            cwd=git_project,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == amendment_commit
+    )
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_project,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == operator_head
     )
 
 

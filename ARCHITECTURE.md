@@ -37,9 +37,9 @@
 | `StructuredOutput` helpers | `core/structured_output.py` | Side-effect-free schema-aware extraction of one unambiguous top-level JSON object from LLM output while rejecting malformed, nested, or multiple response candidates |
 | `DeliveryAuthoring` helpers | `core/delivery_authoring.py` | Side-effect-free parser and derived-path helpers for delivery prepare authoring drafts |
 | `DeliveryPrepareWriter` helpers | `core/delivery_prepare_writer.py` | Deterministic source-artifact writer for parsed delivery authoring drafts; renders `plan.yaml` and unit task files with readiness checks, plan validation, overwrite guards, and rollback |
-| `DeliveryAmendment` helpers | `core/delivery_amendment.py` | Fingerprinted split proposals, immutable-unit and dependency guards, no-write preview, transactional plan/unit writing, and append-only amendment events |
+| `DeliveryAmendment` helpers | `core/delivery_amendment.py` | Fingerprinted split proposals, assembly-based dependency guards, no-write preview, transactional plan/unit and assembly publication, idempotent recovery, and append-only amendment events |
 | `DeliveryHandoff` helpers | `core/delivery_handoff.py` | Versioned, fingerprinted, privacy-safe unit handoff artifacts consumed by later dependency units |
-| `DeliveryAssembly` helpers | `core/delivery_assembly.py` | Dependency-ordered result-commit integration with ancestry-preserving fast-forward/merge outcomes and compare-and-swap ref updates |
+| `DeliveryAssembly` helpers | `core/delivery_assembly.py` | Dependency-ordered result integration plus bounded delivery-owned artifact commits, with ancestry-preserving outcomes, temporary-index tree construction, and compare-and-swap direct-ref updates |
 | `TaskAsset` helpers | `core/task_assets.py` | Deterministic local task-asset parsing, path canonicalization, answer mapping, and asset-manifest line rendering used by contract preparation |
 | `Worktree` helpers | `core/worktree.py` | Shared low-level git/worktree operations used by run, review, cleanup/delete, and init CLI surfaces; command-specific state mutation stays in the owning command layer |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
@@ -295,9 +295,9 @@ strict amendment parser accepts one unambiguous schema-matching object even
 when incidental model prose surrounds it, and rejects malformed, nested,
 multiple, whole-plan, and writer-path output. `core/delivery_amendment.py`
 normalizes replacement paths and
-root dependencies, snapshots the source plan, target task contract, and
-sanitized parent progress before model authoring, rejects drafts when those
-inputs change during authoring, validates the resulting amended plan, and
+root dependencies, snapshots the source plan, target task contract, sanitized
+parent progress, and delivery assembly head before model authoring, rejects
+drafts when those inputs change during authoring, validates the resulting amended plan, and
 rechecks source fingerprints and replacement path availability before and after
 publication. A proposal made stale during publication is removed before prepare
 reports failure. The immutable local proposal is bound to the project-relative
@@ -316,8 +316,10 @@ report roots at any depth below the project root, including configured task
 state and contract-report roots. Derived replacement task paths are subject to
 the same configured private-root boundary. Prepare also rejects target task
 sources resolving into those private trees before reading content or
-invoking the model. The authoring read validates location before and after the
-read and must match the captured task fingerprint. It does not change the
+invoking the model. Completed dependency commits are validated against the
+assembled delivery head instead of the operator checkout. The authoring read
+validates location before and after the read and must match the captured task
+fingerprint. It does not change the
 tracked plan, unit task files, progress, events, child state, worktrees, or Git
 refs.
 
@@ -332,7 +334,27 @@ publishes new replacement task files atomically without overwrite, rechecks
 source fingerprints, and replaces the plan with Sikula's standard
 temporary-file plus `os.replace` pattern. It validates the written plan and
 rechecks target-task, progress, and published replacement fingerprints before
-recording allowlisted append-only amendment events. Failed plan rollback
+creating a bounded amendment artifact commit directly on `final_branch` with a
+temporary Git index and direct-ref compare-and-swap. The commit contains only
+changes required to make the branch contain the updated plan and every contract
+referenced by it. Artifact content uses clean conversion from the assembly
+parent's `.gitattributes`, independent of the operator checkout. The proposal
+retains the resulting canonical source-plan blob ID for interruption recovery,
+and existing parent entries retain their Git file modes. Named Git `filter`
+attributes are rejected before any external filter command can run; built-in
+`text` and `eol` conversion remains supported. Apply then advances
+the parent assembly checkpoint and records the branch and commit in the
+append-only `plan.amended` event without changing the operator checkout or index. Failed
+apply restores progress, files, and the event suffix, and restores the ref when
+its compare-and-swap guard still permits that update; otherwise it fails closed
+without overwriting the competing ref. Proposal-bound commit and content
+verification makes repeated apply idempotent, completes integration of exact
+locally published artifacts after interruption, and repairs an interrupted
+checkpoint or success-event write without duplicating the commit. Missing
+progress is reconstructed only when the proposal originally had no progress and
+the latest durable event is that proposal's `plan.amend_started`; later delivery
+activity makes reconstruction fail closed.
+Failed plan rollback
 retains replacement tasks needed by the still-published plan. Lock filesystem
 failures return a structured blocked result. External checkout mutation during
 mutating apply is unsupported; the lock serializes Sikula operations. A

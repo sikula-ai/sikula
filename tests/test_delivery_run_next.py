@@ -3912,6 +3912,7 @@ def test_cmd_delivery_run_next_prepares_existing_budget_split_after_lock_release
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _git_init(tmp_path)
+    _git_commit(tmp_path)
     plan_path = _write_plan(tmp_path)
     cfg = _budget_split_cfg(tmp_path)
     plan_rel = plan_path.relative_to(tmp_path).as_posix()
@@ -4073,6 +4074,7 @@ def test_cmd_delivery_run_next_prepares_fresh_budget_split_after_child_failure(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _git_init(tmp_path)
+    _git_commit(tmp_path)
     plan_path = _write_plan(tmp_path)
     cfg = _budget_split_cfg(tmp_path)
     budget = DeliveryBudgetExceeded(name="max_planner_steps", limit=1, actual=3)
@@ -4140,6 +4142,7 @@ def test_cmd_delivery_run_next_budget_split_rejects_mismatched_child_stop_before
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _git_init(tmp_path)
+    _git_commit(tmp_path)
     plan_path = _write_plan(tmp_path)
     cfg = _budget_split_cfg(tmp_path)
     parent_budget = DeliveryBudgetExceeded(name="max_planner_steps", limit=1, actual=3)

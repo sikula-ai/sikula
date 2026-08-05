@@ -3,20 +3,31 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import tempfile
 from typing import Any
 
 import yaml
 
 from core.contract_check import check_contract
+from core.delivery_assembly import (
+    DeliveryAssemblyArtifact,
+    assemble_delivery_artifacts,
+    delivery_artifact_filter_issue,
+    delivery_artifact_content_id,
+    delivery_branch_commit,
+    delivery_commit_is_ancestor,
+    find_delivery_artifact_commit,
+    preview_delivery_artifacts,
+    preview_delivery_assembly,
+    rollback_delivery_artifacts,
+)
 from core.delivery_authoring import (
     DeliveryAmendmentAuthoringDraft,
     DeliveryAuthoringParseError,
@@ -36,6 +47,7 @@ from core.delivery_public_metadata import (
     sanitize_delivery_public_metadata,
 )
 from core.delivery_progress import (
+    DeliveryProgress,
     DeliveryProgressLockError,
     DeliveryProgressEvent,
     DeliveryStatusResult,
@@ -45,12 +57,16 @@ from core.delivery_progress import (
     delivery_events_path,
     delivery_progress_path,
     get_delivery_status,
+    mark_delivery_assembly,
     read_delivery_progress,
+    write_delivery_progress,
 )
+from core.worktree import resolve_git_commit
 
 SUPPORTED_DELIVERY_AMENDMENT_PROPOSAL_SCHEMA_VERSION = 1
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_GIT_OBJECT_ID_RE = re.compile(r"^[0-9a-f]{40,64}$")
 _FORBIDDEN_PLAN_ROOTS = (
     (".git",),
     (".sikula", "state"),
@@ -117,10 +133,15 @@ class DeliveryAmendmentProposal:
     target_unit_id: str
     source_plan_path: str
     source_plan_fingerprint: str
+    source_plan_blob_id: str
     target_task_fingerprint: str
     progress_fingerprint: str
+    source_assembly_base_commit: str
+    source_assembled_commit: str
     created_at: str
     replacement_units: list[DeliveryAmendmentProposalUnit]
+    amended_plan_fingerprint: str | None = None
+    rewired_unit_ids: list[str] = field(default_factory=list)
     amend_reason: str | None = None
     budget_exceeded: DeliveryBudgetExceeded | None = None
 
@@ -136,11 +157,18 @@ class DeliveryAmendmentProposal:
             "target_unit_id": self.target_unit_id,
             "source_plan_path": self.source_plan_path,
             "source_plan_fingerprint": self.source_plan_fingerprint,
+            "source_plan_blob_id": self.source_plan_blob_id,
             "target_task_fingerprint": self.target_task_fingerprint,
             "progress_fingerprint": self.progress_fingerprint,
             "created_at": self.created_at,
             "replacement_units": [unit.to_dict() for unit in self.replacement_units],
         }
+        data["source_assembly_base_commit"] = self.source_assembly_base_commit
+        data["source_assembled_commit"] = self.source_assembled_commit
+        if self.amended_plan_fingerprint:
+            data["amended_plan_fingerprint"] = self.amended_plan_fingerprint
+        if self.rewired_unit_ids:
+            data["rewired_unit_ids"] = list(self.rewired_unit_ids)
         if self.amend_reason:
             data["amend_reason"] = self.amend_reason
         if self.budget_exceeded:
@@ -157,13 +185,19 @@ class DeliveryAmendmentTarget:
     status: DeliveryStatusResult
     target: DeliveryPlanUnit
     downstream_unit_ids: list[str]
+    assembly_base_commit: str
+    assembled_commit: str
+    recorded_assembled_commit: str | None
 
 
 @dataclass(frozen=True)
 class DeliveryAmendmentSourceSnapshot:
     source_plan_fingerprint: str
+    source_plan_blob_id: str
     target_task_fingerprint: str
     progress_fingerprint: str
+    assembly_base_commit: str
+    assembled_commit: str
 
 
 @dataclass(frozen=True)
@@ -217,6 +251,19 @@ class _AmendmentPreflight:
     proposal: DeliveryAmendmentProposal | None = None
     target: DeliveryAmendmentTarget | None = None
     plan_data: dict[str, Any] | None = None
+    artifacts_applied: bool = False
+    amendment_commit: str | None = None
+
+
+@dataclass(frozen=True)
+class _AppliedAssemblyRecovery:
+    amendment_commit: str | None
+    current_commit: str | None
+    expected_commit: str | None
+
+    @property
+    def mutation_required(self) -> bool:
+        return self.amendment_commit is None
 
 
 @dataclass(frozen=True)
@@ -267,6 +314,11 @@ def inspect_delivery_amendment_target(
         root,
         private_artifact_roots=private_artifact_roots,
     )
+    _validate_amendment_source_contracts(
+        status.plan,
+        root,
+        private_artifact_roots=private_artifact_roots,
+    )
     status_by_id = {unit.id: unit for unit in status.units}
     target_status = status_by_id[target_unit_id].status
     if target.superseded or target_status == "superseded":
@@ -304,6 +356,10 @@ def inspect_delivery_amendment_target(
                 f"Downstream unit {unit.id} is {unit_status}; only pending downstream units may be rewired.",
             )
 
+    assembly_base_commit, assembled_commit = _resolve_amendment_assembly(
+        root,
+        status,
+    )
     context = DeliveryAmendmentTarget(
         plan_path=status.plan_path,
         project_root=status.project_root,
@@ -312,6 +368,9 @@ def inspect_delivery_amendment_target(
         status=status,
         target=target,
         downstream_unit_ids=[unit.id for unit in downstream],
+        assembly_base_commit=assembly_base_commit,
+        assembled_commit=assembled_commit,
+        recorded_assembled_commit=status.assembled_commit,
     )
     commit_errors = _completed_dependency_commit_errors(context)
     if commit_errors:
@@ -365,16 +424,40 @@ def create_delivery_amendment_proposal(
     budget_exceeded = _budget_exceeded_from_mapping(draft.budget_exceeded)
     amend_reason = _optional_stable_code(draft.amend_reason, "amend_reason")
     source_plan_path = _project_relative_plan_path(plan_path, root)
+    preliminary = DeliveryAmendmentProposal(
+        proposal_id="pending",
+        plan_id=context.plan.plan_id,
+        target_unit_id=target_unit_id,
+        source_plan_path=source_plan_path,
+        source_plan_fingerprint=source_snapshot.source_plan_fingerprint,
+        source_plan_blob_id=source_snapshot.source_plan_blob_id,
+        target_task_fingerprint=source_snapshot.target_task_fingerprint,
+        progress_fingerprint=source_snapshot.progress_fingerprint,
+        source_assembly_base_commit=source_snapshot.assembly_base_commit,
+        source_assembled_commit=source_snapshot.assembled_commit,
+        created_at=timestamp,
+        replacement_units=replacement_units,
+        amend_reason=amend_reason,
+        budget_exceeded=budget_exceeded,
+    )
+    amended_plan, rewired_ids = _amended_plan_data(plan_path, context, preliminary)
+    amended_plan_content = yaml.safe_dump(amended_plan, sort_keys=False, allow_unicode=True).encode("utf-8")
     proposal_payload = {
         "plan_id": context.plan.plan_id,
         "target_unit_id": target_unit_id,
         "source_plan_path": source_plan_path,
         "source_plan_fingerprint": source_snapshot.source_plan_fingerprint,
+        "source_plan_blob_id": source_snapshot.source_plan_blob_id,
         "target_task_fingerprint": source_snapshot.target_task_fingerprint,
         "progress_fingerprint": source_snapshot.progress_fingerprint,
+        "source_assembly_base_commit": source_snapshot.assembly_base_commit,
+        "source_assembled_commit": source_snapshot.assembled_commit,
         "created_at": timestamp,
         "replacement_units": [unit.to_dict() for unit in replacement_units],
+        "amended_plan_fingerprint": hashlib.sha256(amended_plan_content).hexdigest(),
     }
+    if rewired_ids:
+        proposal_payload["rewired_unit_ids"] = rewired_ids
     if amend_reason:
         proposal_payload["amend_reason"] = amend_reason
     if budget_exceeded:
@@ -386,15 +469,19 @@ def create_delivery_amendment_proposal(
         target_unit_id=target_unit_id,
         source_plan_path=source_plan_path,
         source_plan_fingerprint=proposal_payload["source_plan_fingerprint"],
+        source_plan_blob_id=proposal_payload["source_plan_blob_id"],
         target_task_fingerprint=proposal_payload["target_task_fingerprint"],
         progress_fingerprint=proposal_payload["progress_fingerprint"],
+        source_assembly_base_commit=proposal_payload["source_assembly_base_commit"],
+        source_assembled_commit=proposal_payload["source_assembled_commit"],
         created_at=timestamp,
         replacement_units=replacement_units,
+        amended_plan_fingerprint=proposal_payload["amended_plan_fingerprint"],
+        rewired_unit_ids=rewired_ids,
         amend_reason=amend_reason,
         budget_exceeded=budget_exceeded,
     )
     proposal_path = delivery_amendment_proposal_path(proposal_root, proposal.plan_id, proposal.proposal_id)
-    amended_plan, _ = _amended_plan_data(plan_path, context, proposal)
     validation = check_delivery_plan_data(
         amended_plan,
         project_root=root,
@@ -409,6 +496,20 @@ def create_delivery_amendment_proposal(
         root=root,
         private_artifact_roots=context.private_artifact_roots,
     )
+    artifact_issue = delivery_artifact_filter_issue(
+        root,
+        parent_commit=context.assembled_commit,
+        artifacts=_proposal_assembly_artifacts(
+            proposal,
+            amended_plan_content,
+            project_root=root,
+            plan=validation.plan,
+            private_artifact_roots=context.private_artifact_roots,
+            enforce_parent_state=True,
+        ),
+    )
+    if artifact_issue is not None:
+        raise DeliveryAmendmentError(artifact_issue.code, artifact_issue.message, artifact_issue.path)
     _assert_proposal_source_fingerprints_current(context, proposal)
     _write_new_proposal(proposal_path, proposal)
     try:
@@ -516,6 +617,24 @@ def apply_delivery_amendment(
         proposal = refreshed.proposal
         events_path = delivery_events_path(root, proposal.plan_id)
         timestamp = _utc_now()
+        if refreshed.artifacts_applied and refreshed.target is not None:
+            try:
+                _reconcile_applied_amendment(
+                    root,
+                    refreshed.target,
+                    proposal,
+                    amendment_commit=refreshed.amendment_commit,
+                    events_path=events_path,
+                    rewired_ids=refreshed.result.rewired_unit_ids,
+                    timestamp=timestamp,
+                )
+            except DeliveryAmendmentError as exc:
+                return _blocked_result(refreshed.result, exc.issue)
+            return replace(
+                refreshed.result,
+                applied=True,
+                message="Delivery plan amendment is applied and its assembly audit is current.",
+            )
         if refreshed.target is None or not refreshed.result.ready or refreshed.plan_data is None:
             try:
                 append_delivery_progress_events(
@@ -698,6 +817,17 @@ def _preflight_amendment(
                 "delivery_amend.proposal_plan_mismatch",
                 "Proposal was prepared for a different delivery plan path.",
             )
+        applied = _preflight_applied_amendment(
+            plan_check.plan,
+            Path(plan_path),
+            Path(root_text),
+            proposal,
+            project_config=project_config,
+            dry_run=dry_run,
+            base=base,
+        )
+        if applied is not None:
+            return applied
         target = inspect_delivery_amendment_target(
             plan_path,
             proposal.target_unit_id,
@@ -717,6 +847,36 @@ def _preflight_amendment(
             raise DeliveryAmendmentError(
                 "delivery_amend.progress_stale", "Delivery progress changed after the proposal was prepared."
             )
+        if target.assembly_base_commit != proposal.source_assembly_base_commit:
+            raise DeliveryAmendmentError(
+                "delivery_amend.assembly_stale", "Delivery assembly base changed after the proposal was prepared."
+            )
+        if target.assembled_commit != proposal.source_assembled_commit:
+            raise DeliveryAmendmentError(
+                "delivery_amend.assembly_stale", "Delivery assembly changed after the proposal was prepared."
+            )
+        mutation_expected_commit = target.recorded_assembled_commit
+        if mutation_expected_commit is None:
+            try:
+                current_branch_commit = delivery_branch_commit(Path(root_text), target.plan.final_branch)
+            except OSError:
+                current_branch_commit = None
+            if current_branch_commit == target.assembled_commit:
+                mutation_expected_commit = current_branch_commit
+        mutation_preview = preview_delivery_assembly(
+            Path(root_text),
+            branch=target.plan.final_branch,
+            base_commit=target.assembly_base_commit,
+            expected_commit=mutation_expected_commit,
+            units=[],
+        )
+        if not mutation_preview.success:
+            issue = mutation_preview.error or DeliveryPlanIssue(
+                "error",
+                "delivery.assembly_failed",
+                "Delivery assembly is not ready for amendment.",
+            )
+            raise DeliveryAmendmentError(issue.code, issue.message, issue.path)
         _validate_loaded_replacement_contracts(
             proposal.plan_id,
             proposal.target_unit_id,
@@ -738,6 +898,15 @@ def _preflight_amendment(
                 target=target,
             )
         plan_data, rewired_ids = _amended_plan_data(Path(plan_path), target, proposal)
+        plan_content = yaml.safe_dump(plan_data, sort_keys=False, allow_unicode=True).encode("utf-8")
+        if (
+            hashlib.sha256(plan_content).hexdigest() != proposal.amended_plan_fingerprint
+            or rewired_ids != proposal.rewired_unit_ids
+        ):
+            raise DeliveryAmendmentError(
+                "delivery_amend.proposal_output_mismatch",
+                "Recomputed amendment output no longer matches the proposal; prepare a new proposal.",
+            )
         validation = check_delivery_plan_data(
             plan_data,
             project_root=Path(root_text),
@@ -751,6 +920,26 @@ def _preflight_amendment(
                 target=target,
                 plan_data=plan_data,
             )
+        artifact_preview = preview_delivery_artifacts(
+            Path(root_text),
+            branch=target.plan.final_branch,
+            parent_commit=target.assembled_commit,
+            artifacts=_proposal_assembly_artifacts(
+                proposal,
+                plan_content,
+                project_root=Path(root_text),
+                plan=validation.plan,
+                private_artifact_roots=target.private_artifact_roots,
+                enforce_parent_state=True,
+            ),
+        )
+        if not artifact_preview.success:
+            issue = artifact_preview.error or DeliveryPlanIssue(
+                "error",
+                "delivery.assembly_artifact_git_failed",
+                "Git could not validate delivery amendment artifacts.",
+            )
+            raise DeliveryAmendmentError(issue.code, issue.message, issue.path)
         result = DeliveryAmendmentApplyResult(
             plan_path=plan_path,
             project_root=root_text,
@@ -807,10 +996,15 @@ def load_delivery_amendment_proposal(
         "target_unit_id",
         "source_plan_path",
         "source_plan_fingerprint",
+        "source_plan_blob_id",
         "target_task_fingerprint",
         "progress_fingerprint",
+        "source_assembly_base_commit",
+        "source_assembled_commit",
         "created_at",
         "replacement_units",
+        "amended_plan_fingerprint",
+        "rewired_unit_ids",
         "amend_reason",
         "budget_exceeded",
     }
@@ -825,9 +1019,14 @@ def load_delivery_amendment_proposal(
     target_unit_id = _required_string(data, "target_unit_id")
     source_plan_path = _required_string(data, "source_plan_path")
     source_fingerprint = _required_hash(data, "source_plan_fingerprint")
+    source_plan_blob_id = _required_object_id(data, "source_plan_blob_id")
     target_task_fingerprint = _required_hash(data, "target_task_fingerprint")
     progress_fingerprint = _required_hash(data, "progress_fingerprint")
+    source_assembly_base_commit = _required_object_id(data, "source_assembly_base_commit")
+    source_assembled_commit = _required_object_id(data, "source_assembled_commit")
     created_at = _required_string(data, "created_at")
+    amended_plan_fingerprint = _required_hash(data, "amended_plan_fingerprint")
+    rewired_unit_ids = _optional_id_list(data.get("rewired_unit_ids"), "rewired_unit_ids")
     amend_reason = _optional_stable_code(data.get("amend_reason"), "amend_reason")
     budget_exceeded = _budget_exceeded_from_mapping(data.get("budget_exceeded"))
     raw_units = data.get("replacement_units")
@@ -842,10 +1041,15 @@ def load_delivery_amendment_proposal(
         target_unit_id=target_unit_id,
         source_plan_path=source_plan_path,
         source_plan_fingerprint=source_fingerprint,
+        source_plan_blob_id=source_plan_blob_id,
         target_task_fingerprint=target_task_fingerprint,
         progress_fingerprint=progress_fingerprint,
+        source_assembly_base_commit=source_assembly_base_commit,
+        source_assembled_commit=source_assembled_commit,
         created_at=created_at,
         replacement_units=units,
+        amended_plan_fingerprint=amended_plan_fingerprint,
+        rewired_unit_ids=rewired_unit_ids,
         amend_reason=amend_reason,
         budget_exceeded=budget_exceeded,
     )
@@ -858,6 +1062,246 @@ def load_delivery_amendment_proposal(
             "Proposal content does not match its proposal id.",
         )
     return proposal
+
+
+def _preflight_applied_amendment(
+    plan: DeliveryPlan,
+    plan_path: Path,
+    root: Path,
+    proposal: DeliveryAmendmentProposal,
+    *,
+    project_config: dict | None,
+    dry_run: bool,
+    base: DeliveryAmendmentApplyResult,
+) -> _AmendmentPreflight | None:
+    status = get_delivery_status(plan_path, project_root=root)
+    if not status.valid or status.plan is None:
+        issue = (
+            status.errors[0]
+            if status.errors
+            else DeliveryPlanIssue(
+                "error", "delivery_amend.plan_invalid", "Applied delivery amendment plan is invalid."
+            )
+        )
+        return _blocked_applied_preflight(base, proposal, issue.code, issue.message, issue.path)
+    if _plan_fingerprint(plan_path) != proposal.amended_plan_fingerprint:
+        return None
+    target = next((unit for unit in plan.units if unit.id == proposal.target_unit_id), None)
+    if target is None or target.superseded_by != proposal.replacement_ids:
+        return None
+    private_artifact_roots = _configured_private_artifact_roots(root, project_config)
+    source_context = DeliveryAmendmentTarget(
+        plan_path=str(plan_path),
+        project_root=str(root),
+        private_artifact_roots=private_artifact_roots,
+        plan=plan,
+        status=status,
+        target=target,
+        downstream_unit_ids=list(proposal.rewired_unit_ids),
+        assembly_base_commit=proposal.source_assembly_base_commit,
+        assembled_commit=proposal.source_assembled_commit,
+        recorded_assembled_commit=status.assembled_commit,
+    )
+    if _target_task_fingerprint(source_context) != proposal.target_task_fingerprint:
+        return _blocked_applied_preflight(
+            base,
+            proposal,
+            "delivery_amend.target_task_stale",
+            "Target unit task changed after the proposal was prepared.",
+        )
+    for unit in proposal.replacement_units:
+        path = root / unit.task_path
+        try:
+            if path.is_symlink() or path.read_bytes() != unit.task_markdown.encode("utf-8"):
+                return _blocked_applied_preflight(
+                    base,
+                    proposal,
+                    "delivery_amend.replacement_task_stale",
+                    "An applied amendment replacement task is missing or changed.",
+                )
+        except OSError:
+            return _blocked_applied_preflight(
+                base,
+                proposal,
+                "delivery_amend.replacement_task_stale",
+                "An applied amendment replacement task is missing or changed.",
+            )
+    readiness_errors = _replacement_contract_readiness_errors(
+        proposal.replacement_units,
+        project_config=project_config,
+    )
+    if readiness_errors:
+        return _AmendmentPreflight(
+            result=_replace_errors(base, readiness_errors),
+            proposal=proposal,
+            artifacts_applied=True,
+        )
+    try:
+        artifacts = _proposal_assembly_artifacts(
+            proposal,
+            plan_path.read_bytes(),
+            project_root=root,
+            plan=status.plan,
+            private_artifact_roots=private_artifact_roots,
+        )
+    except DeliveryAmendmentError as exc:
+        return _blocked_applied_preflight(base, proposal, exc.issue.code, exc.issue.message, exc.issue.path)
+    if status.assembly_status == "failed":
+        try:
+            _raise_unresolved_assembly_failure(status.assembly_error_code)
+        except DeliveryAmendmentError as exc:
+            return _blocked_applied_preflight(base, proposal, exc.issue.code, exc.issue.message)
+    try:
+        recovery = _inspect_applied_assembly_recovery(root, plan, proposal, artifacts, status)
+    except DeliveryAmendmentError as exc:
+        return _blocked_applied_preflight(base, proposal, exc.issue.code, exc.issue.message, exc.issue.path)
+    if recovery.mutation_required:
+        progress_path = delivery_progress_path(root, proposal.plan_id)
+        if not progress_path.exists() and proposal.progress_fingerprint != hashlib.sha256(b"null").hexdigest():
+            return _blocked_applied_preflight(
+                base,
+                proposal,
+                "delivery_amend.progress_invalid",
+                "Delivery progress is missing during amendment assembly recovery.",
+            )
+        if _progress_fingerprint(source_context) != proposal.progress_fingerprint:
+            return _blocked_applied_preflight(
+                base,
+                proposal,
+                "delivery_amend.progress_stale",
+                "Delivery progress changed before amendment assembly recovery.",
+            )
+    assembly = preview_delivery_assembly(
+        root,
+        branch=plan.final_branch,
+        base_commit=proposal.source_assembly_base_commit,
+        expected_commit=recovery.expected_commit,
+        units=[],
+        allow_checked_out=not recovery.mutation_required,
+    )
+    if not assembly.success or assembly.assembled_commit is None:
+        issue = assembly.error or DeliveryPlanIssue(
+            "error", "delivery.assembly_failed", "Applied delivery amendment assembly is invalid."
+        )
+        return _blocked_applied_preflight(base, proposal, issue.code, issue.message, issue.path)
+    assembly_base = assembly.base_commit
+    assembled_commit = assembly.assembled_commit
+    amendment_commit = recovery.amendment_commit
+    branch_commit = recovery.current_commit
+    effective_branch_commit = branch_commit or assembled_commit
+    if assembled_commit != effective_branch_commit:
+        return _blocked_applied_preflight(
+            base,
+            proposal,
+            "delivery_amend.assembly_artifact_missing",
+            "The applied amendment artifact commit is missing from the delivery assembly.",
+        )
+    context = replace(
+        source_context,
+        assembly_base_commit=assembly_base,
+        assembled_commit=effective_branch_commit,
+    )
+    plan_data = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    if not isinstance(plan_data, dict):
+        return None
+    result = replace(
+        base,
+        rewired_unit_ids=list(proposal.rewired_unit_ids),
+        ready=True,
+        applied=False,
+        errors=[],
+        message=(
+            "Delivery plan amendment is already applied; dry-run found no pending changes."
+            if dry_run and amendment_commit is not None
+            else "Delivery plan amendment artifacts are ready for assembly integration."
+            if dry_run
+            else "Delivery plan amendment is already applied and ready for audit reconciliation."
+        ),
+    )
+    return _AmendmentPreflight(
+        result=result,
+        proposal=proposal,
+        target=context,
+        plan_data=plan_data,
+        artifacts_applied=True,
+        amendment_commit=amendment_commit,
+    )
+
+
+def _inspect_applied_assembly_recovery(
+    root: Path,
+    plan: DeliveryPlan,
+    proposal: DeliveryAmendmentProposal,
+    artifacts: list[DeliveryAssemblyArtifact],
+    status: DeliveryStatusResult,
+) -> _AppliedAssemblyRecovery:
+    source_commit = proposal.source_assembled_commit
+    try:
+        current_commit = delivery_branch_commit(root, plan.final_branch)
+    except OSError:
+        raise DeliveryAmendmentError(
+            "delivery.assembly_branch_diverged",
+            "Delivery assembly branch could not be verified during amendment recovery.",
+        ) from None
+    amendment_commit, lookup_commit = find_delivery_artifact_commit(
+        root,
+        branch=plan.final_branch,
+        parent_commit=source_commit,
+        proposal_id=proposal.proposal_id,
+        artifacts=artifacts,
+    )
+    if lookup_commit != current_commit:
+        raise DeliveryAmendmentError(
+            "delivery_amend.assembly_artifact_missing",
+            "Delivery assembly branch changed while amendment recovery was inspected.",
+        )
+    if amendment_commit is not None:
+        return _AppliedAssemblyRecovery(
+            amendment_commit=amendment_commit,
+            current_commit=current_commit,
+            expected_commit=status.assembled_commit or source_commit,
+        )
+    if current_commit is None:
+        return _AppliedAssemblyRecovery(None, None, status.assembled_commit)
+    try:
+        branch_is_source_or_behind = current_commit == source_commit or delivery_commit_is_ancestor(
+            root, current_commit, source_commit
+        )
+        source_is_behind_branch = delivery_commit_is_ancestor(root, source_commit, current_commit)
+    except OSError:
+        raise DeliveryAmendmentError(
+            "delivery_amend.git_check_failed",
+            "Delivery assembly could not be verified with Git.",
+        ) from None
+    if branch_is_source_or_behind:
+        return _AppliedAssemblyRecovery(
+            amendment_commit=None,
+            current_commit=current_commit,
+            expected_commit=status.assembled_commit or current_commit,
+        )
+    if source_is_behind_branch:
+        raise DeliveryAmendmentError(
+            "delivery_amend.assembly_artifact_missing",
+            "The delivery assembly advanced without the exact applied amendment artifacts.",
+        )
+    raise DeliveryAmendmentError(
+        "delivery.assembly_branch_diverged",
+        "Delivery assembly branch diverged from the amendment source assembly.",
+    )
+
+
+def _blocked_applied_preflight(
+    base: DeliveryAmendmentApplyResult,
+    proposal: DeliveryAmendmentProposal,
+    code: str,
+    message: str,
+    path: str | None = None,
+) -> _AmendmentPreflight:
+    return _AmendmentPreflight(
+        result=_blocked_result(base, DeliveryPlanIssue("error", code, message, path)),
+        proposal=proposal,
+        artifacts_applied=True,
+    )
 
 
 def _normalize_replacements(
@@ -1086,6 +1530,10 @@ def _write_amended_artifacts(
     created_dirs: list[Path] = []
     published_tasks: list[_PublishedArtifact] = []
     plan_published = False
+    progress_path = delivery_progress_path(root, proposal.plan_id)
+    progress_backup = _backup(progress_path)
+    assembly_commit: str | None = None
+    previous_branch_commit: str | None = None
     try:
         source_mode = _default_source_file_mode()
         for path, content in task_targets:
@@ -1112,8 +1560,73 @@ def _write_amended_artifacts(
             )
         _assert_proposal_non_plan_fingerprints_current(source_context, proposal)
         _assert_published_artifacts_current(published_tasks, root)
-        _append_success_events(events_path, proposal, rewired_ids, timestamp=timestamp)
+        assembly = assemble_delivery_artifacts(
+            root,
+            plan_id=proposal.plan_id,
+            proposal_id=proposal.proposal_id,
+            branch=source_context.plan.final_branch,
+            parent_commit=source_context.assembled_commit,
+            artifacts=_proposal_assembly_artifacts(
+                proposal,
+                plan_content,
+                project_root=root,
+                plan=validation.plan,
+                private_artifact_roots=source_context.private_artifact_roots,
+                enforce_parent_state=True,
+            ),
+            created_at=proposal.created_at,
+        )
+        if not assembly.success or assembly.assembled_commit is None:
+            issue = assembly.error or DeliveryPlanIssue(
+                "error",
+                "delivery.assembly_artifact_git_failed",
+                "Git could not integrate delivery amendment artifacts.",
+            )
+            raise DeliveryAmendmentError(issue.code, issue.message, issue.path)
+        assembly_commit = assembly.assembled_commit
+        previous_branch_commit = assembly.previous_commit
+        try:
+            current_branch_commit = delivery_branch_commit(root, source_context.plan.final_branch)
+        except OSError:
+            current_branch_commit = None
+        if current_branch_commit != assembly_commit:
+            raise DeliveryAmendmentError(
+                "delivery.assembly_branch_diverged",
+                "Delivery assembly branch changed while amendment artifacts were integrated.",
+            )
+        if _plan_fingerprint(plan_path) != hashlib.sha256(plan_content).hexdigest():
+            raise DeliveryAmendmentError(
+                "delivery_amend.plan_stale",
+                "Delivery plan changed while amendment artifacts were being integrated.",
+            )
+        _assert_proposal_non_plan_fingerprints_current(source_context, proposal)
+        _assert_published_artifacts_current(published_tasks, root)
+        _write_amendment_assembly_progress(
+            progress_path,
+            source_context,
+            assembled_commit=assembly_commit,
+            timestamp=timestamp,
+        )
+        _append_success_events(
+            events_path,
+            proposal,
+            rewired_ids,
+            branch=source_context.plan.final_branch,
+            commit=assembly_commit,
+            timestamp=timestamp,
+        )
     except BaseException:
+        ref_rollback_failed = assembly_commit is not None and not rollback_delivery_artifacts(
+            root,
+            branch=source_context.plan.final_branch,
+            assembled_commit=assembly_commit,
+            previous_commit=previous_branch_commit,
+        )
+        progress_rollback_failed = False
+        try:
+            _restore_backup(progress_backup)
+        except Exception:
+            progress_rollback_failed = True
         rollback_failed = _rollback_amended_artifacts(
             plan_backup,
             project_root=root,
@@ -1126,10 +1639,11 @@ def _write_amended_artifacts(
             _restore_appended_events(events_path, existed=event_log_existed, size=event_log_size)
         except Exception:
             rollback_failed = True
-        if rollback_failed:
+        if ref_rollback_failed or rollback_failed or progress_rollback_failed:
             raise DeliveryAmendmentError(
                 "delivery_amend.rollback_failed",
-                "Delivery amendment failed and its artifacts or events could not be fully restored; inspect the plan state.",
+                "Delivery amendment failed and its assembly ref, artifacts, or events could not be fully restored; "
+                "inspect the plan state.",
             ) from None
         raise
 
@@ -1139,8 +1653,24 @@ def _append_success_events(
     proposal: DeliveryAmendmentProposal,
     rewired_ids: list[str],
     *,
+    branch: str,
+    commit: str,
     timestamp: str,
 ) -> None:
+    append_delivery_progress_events(
+        path,
+        _success_events(proposal, rewired_ids, branch=branch, commit=commit, timestamp=timestamp),
+    )
+
+
+def _success_events(
+    proposal: DeliveryAmendmentProposal,
+    rewired_ids: list[str],
+    *,
+    branch: str,
+    commit: str,
+    timestamp: str,
+) -> list[DeliveryProgressEvent]:
     events = [
         _amendment_event(proposal, "unit.split_recommended", timestamp=timestamp),
         _amendment_event(proposal, "unit.superseded", timestamp=timestamp),
@@ -1170,9 +1700,376 @@ def _append_success_events(
             rewired_unit_ids=rewired_ids,
             amend_reason=proposal.amend_reason,
             budget_exceeded=proposal.budget_exceeded,
+            branch=branch,
+            commit=commit,
         )
     )
-    append_delivery_progress_events(path, events)
+    return events
+
+
+def _reconcile_applied_amendment(
+    root: Path,
+    context: DeliveryAmendmentTarget,
+    proposal: DeliveryAmendmentProposal,
+    *,
+    amendment_commit: str | None,
+    events_path: Path,
+    rewired_ids: list[str],
+    timestamp: str,
+) -> None:
+    assembly_head = context.assembled_commit
+    progress_path = delivery_progress_path(root, proposal.plan_id)
+    try:
+        progress_backup = _backup(progress_path)
+        event_log_existed = events_path.exists()
+        event_log_size = events_path.stat().st_size if event_log_existed else 0
+    except OSError:
+        raise DeliveryAmendmentError(
+            "delivery_amend.progress_invalid",
+            "Delivery amendment recovery state could not be backed up.",
+        ) from None
+    recovery_commit: str | None = None
+    previous_branch_commit: str | None = None
+    try:
+        if amendment_commit is None:
+            plan_path = Path(context.plan_path)
+            assembly = assemble_delivery_artifacts(
+                root,
+                plan_id=proposal.plan_id,
+                proposal_id=proposal.proposal_id,
+                branch=context.plan.final_branch,
+                parent_commit=proposal.source_assembled_commit,
+                artifacts=_proposal_assembly_artifacts(
+                    proposal,
+                    plan_path.read_bytes(),
+                    project_root=root,
+                    plan=context.plan,
+                    private_artifact_roots=context.private_artifact_roots,
+                    enforce_parent_state=True,
+                ),
+                created_at=proposal.created_at,
+            )
+            if not assembly.success or assembly.assembled_commit is None:
+                issue = assembly.error or DeliveryPlanIssue(
+                    "error",
+                    "delivery.assembly_artifact_git_failed",
+                    "Git could not integrate recovered delivery amendment artifacts.",
+                )
+                raise DeliveryAmendmentError(issue.code, issue.message, issue.path)
+            amendment_commit = assembly.assembled_commit
+            recovery_commit = assembly.assembled_commit
+            previous_branch_commit = assembly.previous_commit
+            try:
+                current_branch_commit = delivery_branch_commit(root, context.plan.final_branch)
+            except OSError:
+                current_branch_commit = None
+            if current_branch_commit != amendment_commit:
+                raise DeliveryAmendmentError(
+                    "delivery.assembly_branch_diverged",
+                    "Delivery assembly branch changed while recovered amendment artifacts were integrated.",
+                )
+            assembly_head = amendment_commit
+
+        if progress_path.exists():
+            progress, errors = read_delivery_progress(progress_path, plan_id=proposal.plan_id)
+        else:
+            progress, errors = None, []
+        if errors or (progress is None and not _missing_progress_recovery_is_current(events_path, proposal)):
+            raise DeliveryAmendmentError(
+                "delivery_amend.progress_invalid",
+                "Delivery progress is missing or invalid during amendment recovery.",
+            )
+        if progress is None:
+            progress = DeliveryProgress(schema_version=1, plan_id=proposal.plan_id)
+        if not (
+            progress.assembly_base_commit == context.assembly_base_commit
+            and progress.assembled_commit == assembly_head
+            and progress.assembly_status == "ready"
+        ):
+            _write_amendment_assembly_progress(
+                progress_path,
+                context,
+                assembled_commit=assembly_head,
+                timestamp=timestamp,
+            )
+        expected = _success_events(
+            proposal,
+            rewired_ids,
+            branch=context.plan.final_branch,
+            commit=amendment_commit,
+            timestamp=timestamp,
+        )
+        existing_keys = _amendment_event_keys(events_path, proposal.proposal_id)
+        missing = [event for event in expected if (event.event_type, event.unit_id) not in existing_keys]
+        try:
+            append_delivery_progress_events(events_path, missing)
+        except OSError:
+            raise DeliveryAmendmentError(
+                "delivery_amend.event_write_failed",
+                "Delivery amendment is applied but its audit events could not be reconciled.",
+            ) from None
+    except BaseException as exc:
+        rollback_failed = recovery_commit is not None and not rollback_delivery_artifacts(
+            root,
+            branch=context.plan.final_branch,
+            assembled_commit=recovery_commit,
+            previous_commit=previous_branch_commit,
+        )
+        try:
+            _restore_backup(progress_backup)
+            _restore_appended_events(events_path, existed=event_log_existed, size=event_log_size)
+        except Exception:
+            rollback_failed = True
+        if rollback_failed:
+            raise DeliveryAmendmentError(
+                "delivery_amend.rollback_failed",
+                "Delivery amendment recovery failed and its assembly ref, progress, or events could not be restored; "
+                "inspect the plan state.",
+            ) from None
+        if isinstance(exc, DeliveryAmendmentError):
+            raise
+        if isinstance(exc, Exception):
+            raise DeliveryAmendmentError(
+                "delivery_amend.write_failed",
+                "Delivery amendment recovery failed while reading or writing local artifacts; previous state was "
+                "restored.",
+            ) from None
+        raise
+
+
+def _amendment_event_keys(path: Path, proposal_id: str) -> set[tuple[str, str | None]]:
+    if not path.exists():
+        return set()
+    keys: set[tuple[str, str | None]] = set()
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            data = json.loads(line)
+            if not isinstance(data, dict) or data.get("proposal_id") != proposal_id:
+                continue
+            event_type = data.get("event_type")
+            unit_id = data.get("unit_id")
+            if isinstance(event_type, str) and (unit_id is None or isinstance(unit_id, str)):
+                keys.add((event_type, unit_id))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise DeliveryAmendmentError(
+            "delivery_amend.events_invalid",
+            "Delivery amendment event history is unavailable or malformed.",
+        ) from None
+    return keys
+
+
+def _missing_progress_recovery_is_current(
+    path: Path,
+    proposal: DeliveryAmendmentProposal,
+) -> bool:
+    if proposal.progress_fingerprint != hashlib.sha256(b"null").hexdigest() or not path.is_file():
+        return False
+    try:
+        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not lines:
+            return False
+        event = json.loads(lines[-1])
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(event, dict)
+        and event.get("plan_id") == proposal.plan_id
+        and event.get("event_type") == "plan.amend_started"
+        and event.get("proposal_id") == proposal.proposal_id
+    )
+
+
+def _write_amendment_assembly_progress(
+    path: Path,
+    context: DeliveryAmendmentTarget,
+    *,
+    assembled_commit: str,
+    timestamp: str,
+) -> None:
+    if path.exists():
+        progress, errors = read_delivery_progress(path, plan_id=context.plan.plan_id)
+        if progress is None or errors:
+            raise DeliveryAmendmentError(
+                "delivery_amend.progress_invalid",
+                "Delivery progress is invalid.",
+            )
+        if progress.assembly_status == "failed":
+            _raise_unresolved_assembly_failure(progress.assembly_error_code)
+    else:
+        progress = DeliveryProgress(schema_version=1, plan_id=context.plan.plan_id)
+    updated = mark_delivery_assembly(
+        progress,
+        base_commit=context.assembly_base_commit,
+        assembled_commit=assembled_commit,
+        status="ready",
+        timestamp=timestamp,
+    )
+    write_delivery_progress(path, updated)
+
+
+def _proposal_assembly_artifacts(
+    proposal: DeliveryAmendmentProposal,
+    plan_content: bytes,
+    *,
+    project_root: Path,
+    plan: DeliveryPlan | None,
+    private_artifact_roots: tuple[Path, ...],
+    enforce_parent_state: bool = False,
+) -> list[DeliveryAssemblyArtifact]:
+    if plan is None:
+        raise DeliveryAmendmentError(
+            "delivery_amend.plan_invalid",
+            "Amended delivery plan is unavailable for assembly publication.",
+        )
+    replacement_content = {
+        _canonical_assembly_task_destination(
+            project_root,
+            unit.task_path,
+            private_artifact_roots=private_artifact_roots,
+        ): unit.task_markdown.encode("utf-8")
+        for unit in proposal.replacement_units
+    }
+    artifacts_by_path = {
+        proposal.source_plan_path: DeliveryAssemblyArtifact(
+            proposal.source_plan_path,
+            plan_content,
+            expected_object_id=proposal.source_plan_blob_id if enforce_parent_state else None,
+        )
+    }
+    for unit in plan.units:
+        task_path = _canonical_assembly_task_destination(
+            project_root,
+            unit.task_path,
+            private_artifact_roots=private_artifact_roots,
+        )
+        content = replacement_content.get(task_path)
+        replacement = content is not None
+        if content is None:
+            task_path = _canonical_assembly_task_path(
+                project_root,
+                unit.task_path,
+                private_artifact_roots=private_artifact_roots,
+            )
+            content = _read_assembly_contract(
+                project_root,
+                unit.task_path,
+                private_artifact_roots=private_artifact_roots,
+            )
+        artifact = DeliveryAssemblyArtifact(
+            task_path,
+            content,
+            expected_content=(content if enforce_parent_state and not replacement else None),
+            must_not_exist=enforce_parent_state and replacement,
+        )
+        existing = artifacts_by_path.get(task_path)
+        if existing is not None:
+            if existing.content != artifact.content:
+                raise DeliveryAmendmentError(
+                    "delivery_amend.contract_path_ambiguous",
+                    "Delivery plan references one contract path with conflicting content.",
+                    task_path,
+                )
+            continue
+        artifacts_by_path[task_path] = artifact
+    return list(artifacts_by_path.values())
+
+
+def _validate_amendment_source_contracts(
+    plan: DeliveryPlan,
+    root: Path,
+    *,
+    private_artifact_roots: tuple[Path, ...],
+) -> None:
+    for unit in plan.units:
+        path = root / unit.task_path
+        try:
+            _validate_amendment_target_task_source(
+                unit.task_path,
+                root,
+                private_artifact_roots=private_artifact_roots,
+            )
+            _validate_new_task_target(path, root, private_artifact_roots=private_artifact_roots)
+            if not path.is_file():
+                raise OSError("contract is not a regular file")
+        except (DeliveryAmendmentError, OSError, RuntimeError, ValueError):
+            raise DeliveryAmendmentError(
+                "delivery_amend.source_contract_unsafe",
+                "Every contract referenced by the delivery plan must be a stable project-local file.",
+                unit.task_path,
+            ) from None
+
+
+def _canonical_assembly_task_destination(
+    root: Path,
+    task_path: str,
+    *,
+    private_artifact_roots: tuple[Path, ...],
+) -> str:
+    _validate_amendment_target_task_source(
+        task_path,
+        root,
+        private_artifact_roots=private_artifact_roots,
+    )
+    target = root / task_path
+    _validate_new_task_target(target, root, private_artifact_roots=private_artifact_roots)
+    try:
+        return target.resolve(strict=False).relative_to(root.resolve()).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        raise DeliveryAmendmentError(
+            "delivery_amend.source_contract_unsafe",
+            "Every contract referenced by the amended delivery plan must be a stable project-local file.",
+            task_path,
+        ) from None
+
+
+def _canonical_assembly_task_path(
+    root: Path,
+    task_path: str,
+    *,
+    private_artifact_roots: tuple[Path, ...],
+) -> str:
+    _validate_amendment_target_task_source(
+        task_path,
+        root,
+        private_artifact_roots=private_artifact_roots,
+    )
+    try:
+        return (root / task_path).resolve(strict=True).relative_to(root.resolve()).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        raise DeliveryAmendmentError(
+            "delivery_amend.source_contract_unsafe",
+            "Every contract referenced by the amended delivery plan must be a stable project-local file.",
+            task_path,
+        ) from None
+
+
+def _read_assembly_contract(
+    root: Path,
+    task_path: str,
+    *,
+    private_artifact_roots: tuple[Path, ...],
+) -> bytes:
+    _validate_amendment_target_task_source(
+        task_path,
+        root,
+        private_artifact_roots=private_artifact_roots,
+    )
+    path = root / task_path
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise OSError("contract is not a regular file")
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root.resolve())
+        content = resolved.read_bytes()
+        if path.resolve(strict=True) != resolved:
+            raise OSError("contract changed while it was read")
+    except (OSError, RuntimeError, ValueError):
+        raise DeliveryAmendmentError(
+            "delivery_amend.source_contract_unsafe",
+            "Every contract referenced by the amended delivery plan must be a stable project-local file.",
+            task_path,
+        ) from None
+    return content
 
 
 def _amendment_event(
@@ -1385,39 +2282,88 @@ def _completed_dependency_commit_errors(context: DeliveryAmendmentTarget) -> lis
         if unit:
             stack.extend(unit.depends_on)
     status_by_id = {unit.id: unit for unit in context.status.units}
-    root = Path(context.project_root)
     errors: list[DeliveryPlanIssue] = []
     for unit_id in sorted(closure):
         unit = status_by_id.get(unit_id)
         if unit is None or unit.status != "done" or not unit.commit:
             continue
-        if not _commit_is_applied(root, unit.commit):
+        try:
+            applied = delivery_commit_is_ancestor(Path(context.project_root), unit.commit, context.assembled_commit)
+        except OSError:
+            raise DeliveryAmendmentError(
+                "delivery_amend.git_check_failed",
+                "Completed dependency commits could not be verified with Git.",
+            ) from None
+        if not applied:
             errors.append(
                 DeliveryPlanIssue(
                     "error",
                     "delivery.unit_commit_unapplied",
-                    f"Completed dependency {unit_id} result commit is not applied to the current checkout.",
+                    f"Completed dependency {unit_id} result commit is not applied to the delivery assembly.",
                 )
             )
     return errors
 
 
-def _commit_is_applied(root: Path, commit: str) -> bool:
+def _resolve_amendment_assembly(
+    root: Path,
+    status: DeliveryStatusResult,
+) -> tuple[str, str]:
+    if status.plan is None:
+        raise DeliveryAmendmentError("delivery_amend.plan_invalid", "Delivery plan is invalid.")
+    if status.assembly_status == "failed":
+        _raise_unresolved_assembly_failure(status.assembly_error_code)
+    base_commit = status.assembly_base_commit
+    expected_commit = status.assembled_commit
+    if base_commit is None:
+        try:
+            base_commit, _ = resolve_git_commit(root, "HEAD")
+            branch_commit = delivery_branch_commit(root, status.plan.final_branch)
+            if (
+                base_commit is not None
+                and branch_commit is not None
+                and delivery_commit_is_ancestor(root, base_commit, branch_commit)
+            ):
+                expected_commit = branch_commit
+        except OSError:
+            raise DeliveryAmendmentError(
+                "delivery_amend.git_check_failed",
+                "Delivery assembly could not be verified with Git.",
+            ) from None
+    if base_commit is None:
+        raise DeliveryAmendmentError(
+            "delivery.assembly_base_missing",
+            "Delivery assembly base commit is missing.",
+        )
     try:
-        resolved = subprocess.run(
-            ["git", "rev-parse", "--verify", f"{commit}^{{commit}}"], cwd=root, capture_output=True, text=True
+        preview = preview_delivery_assembly(
+            root,
+            branch=status.plan.final_branch,
+            base_commit=base_commit,
+            expected_commit=expected_commit,
+            units=[],
+            allow_checked_out=True,
         )
-        if resolved.returncode != 0:
-            return False
-        ancestor = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", commit, "HEAD"], cwd=root, capture_output=True, text=True
-        )
-        return ancestor.returncode == 0
     except OSError:
         raise DeliveryAmendmentError(
             "delivery_amend.git_check_failed",
-            "Completed dependency commits could not be verified with Git.",
+            "Delivery assembly could not be verified with Git.",
         ) from None
+    if not preview.success or preview.assembled_commit is None:
+        issue = preview.error or DeliveryPlanIssue(
+            "error",
+            "delivery.assembly_failed",
+            "Delivery assembly could not be validated for amendment.",
+        )
+        raise DeliveryAmendmentError(issue.code, issue.message, issue.path)
+    return preview.base_commit, preview.assembled_commit
+
+
+def _raise_unresolved_assembly_failure(error_code: str | None) -> None:
+    raise DeliveryAmendmentError(
+        error_code or "delivery.assembly_failed",
+        "Delivery assembly has an unresolved recorded failure; reconcile it before amending the plan.",
+    )
 
 
 def _plan_fingerprint(path: Path) -> str:
@@ -1437,10 +2383,30 @@ def _project_relative_plan_path(path: Path, root: Path) -> str:
 def capture_delivery_amendment_source_snapshot(
     context: DeliveryAmendmentTarget,
 ) -> DeliveryAmendmentSourceSnapshot:
+    root = Path(context.project_root)
+    plan_path = Path(context.plan_path)
+    assembly_base_commit, assembled_commit = _resolve_amendment_assembly(
+        root,
+        context.status,
+    )
+    source_plan_blob_id = delivery_artifact_content_id(
+        root,
+        parent_commit=assembled_commit,
+        path=_project_relative_plan_path(plan_path, root),
+        content=plan_path.read_bytes(),
+    )
+    if source_plan_blob_id is None:
+        raise DeliveryAmendmentError(
+            "delivery_amend.git_check_failed",
+            "Delivery plan content could not be canonicalized with the delivery assembly's Git attributes.",
+        )
     return DeliveryAmendmentSourceSnapshot(
-        source_plan_fingerprint=_plan_fingerprint(Path(context.plan_path)),
+        source_plan_fingerprint=_plan_fingerprint(plan_path),
+        source_plan_blob_id=source_plan_blob_id,
         target_task_fingerprint=_target_task_fingerprint(context),
         progress_fingerprint=_progress_fingerprint(context),
+        assembly_base_commit=assembly_base_commit,
+        assembled_commit=assembled_commit,
     )
 
 
@@ -1515,6 +2481,16 @@ def _assert_proposal_source_fingerprints_current(
             "delivery_amend.progress_stale",
             "Delivery progress changed after the proposal was prepared.",
         )
+    if current.assembly_base_commit != proposal.source_assembly_base_commit:
+        raise DeliveryAmendmentError(
+            "delivery_amend.assembly_stale",
+            "Delivery assembly base changed after the proposal was prepared.",
+        )
+    if current.assembled_commit != proposal.source_assembled_commit:
+        raise DeliveryAmendmentError(
+            "delivery_amend.assembly_stale",
+            "Delivery assembly changed after the proposal was prepared.",
+        )
 
 
 def _assert_proposal_non_plan_fingerprints_current(
@@ -1530,6 +2506,16 @@ def _assert_proposal_non_plan_fingerprints_current(
         raise DeliveryAmendmentError(
             "delivery_amend.progress_stale",
             "Delivery progress changed after the proposal was prepared.",
+        )
+    if context.assembly_base_commit != proposal.source_assembly_base_commit:
+        raise DeliveryAmendmentError(
+            "delivery_amend.assembly_stale",
+            "Delivery assembly base changed after the proposal was prepared.",
+        )
+    if context.assembled_commit != proposal.source_assembled_commit:
+        raise DeliveryAmendmentError(
+            "delivery_amend.assembly_stale",
+            "Delivery assembly changed after the proposal was prepared.",
         )
 
 
@@ -1738,6 +2724,19 @@ def _backup(path: Path) -> _Backup:
         return _Backup(path, False, None, None)
     stat = path.stat()
     return _Backup(path, True, path.read_bytes(), stat.st_mode)
+
+
+def _restore_backup(backup: _Backup) -> None:
+    if backup.existed:
+        if backup.content is None:
+            raise OSError("artifact backup is missing")
+        backup.path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(backup.path, backup.content)
+        if backup.mode is not None:
+            os.chmod(backup.path, backup.mode)
+        return
+    if backup.path.exists() or backup.path.is_symlink():
+        backup.path.unlink()
 
 
 def _ensure_parent(path: Path, root: Path) -> list[Path]:
@@ -2010,6 +3009,23 @@ def _required_hash(data: dict[str, Any], key: str) -> str:
     if not _HASH_RE.fullmatch(value):
         raise DeliveryAmendmentError("delivery_amend.proposal_invalid", f"Proposal {key} is invalid.")
     return value
+
+
+def _required_object_id(data: dict[str, Any], key: str) -> str:
+    value = _required_string(data, key)
+    if not _GIT_OBJECT_ID_RE.fullmatch(value):
+        raise DeliveryAmendmentError("delivery_amend.proposal_invalid", f"Proposal {key} is invalid.")
+    return value
+
+
+def _optional_id_list(value: Any, key: str) -> list[str]:
+    if value is None:
+        return []
+    data = {key: value}
+    result = _string_list(data, key)
+    if any(not _ID_RE.fullmatch(item) for item in result):
+        raise DeliveryAmendmentError("delivery_amend.proposal_invalid", f"Proposal {key} is invalid.")
+    return result
 
 
 def _string_list(data: dict[str, Any], key: str, *, optional: bool = False) -> list[str]:

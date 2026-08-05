@@ -157,7 +157,7 @@ def git_project(tmp_path: Path) -> Path:
     (tmp_path / "src" / "calculator.py").write_text("def add(a, b):\n    return a + b\n")
     (tmp_path / "tests_proj").mkdir()
     (tmp_path / "tests_proj" / "test_calculator.py").write_text(
-        "from calculator import add\n\ndef test_add():\n    assert add(1, 2) == 3\n"
+        "from calculator import add\n\n\ndef test_add():\n    assert add(1, 2) == 3\n"
     )
     (tmp_path / "pyproject.toml").write_text('[tool.pytest.ini_options]\npythonpath = ["src"]\n')
 
