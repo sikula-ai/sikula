@@ -353,6 +353,19 @@ def test_author_delivery_amendment_uses_plain_generation_and_records_audit(tmp_p
     assert audit_records[0]["parsed"]["replacement_ids"] == ["invite-storage", "invite-cli"]
 
 
+def test_author_delivery_amendment_accepts_fenced_output_after_prose(tmp_path: Path) -> None:
+    raw_json = _amendment_output()
+    llm = CapturingLLM(f"I split the target into two focused units.\n\n```json\n{raw_json}\n```")
+    agent = DeliveryPreparationAgent(llm=llm)
+    audit_records: list[dict] = []
+
+    draft = _author_delivery_amendment(agent, tmp_path=tmp_path, audit_records=audit_records)
+
+    assert [unit.id for unit in draft.replacement_units] == ["invite-storage", "invite-cli"]
+    assert audit_records[0]["raw_output"] == llm.output
+    assert audit_records[0]["parsed"]["status"] == "parsed"
+
+
 def test_author_delivery_amendment_includes_verified_recovery_metadata(tmp_path: Path) -> None:
     llm = CapturingLLM(_amendment_output())
     agent = DeliveryPreparationAgent(llm=llm)

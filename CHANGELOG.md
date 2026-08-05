@@ -27,6 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Self-hosting Write Scope**: Expanded the repository's self-hosted Sikula write scope to include user-facing documentation and `CHANGELOG.md` while keeping configuration, agent guidance, contributing docs, generated guidelines, and package metadata maintainer-owned.
 
 ### Fixed
+- **Delivery Authoring Output Parsing:** Delivery assessment, plan preparation, and amendment preparation now recover one unambiguous schema-matching JSON object from otherwise valid model output surrounded by incidental prose, while malformed, nested, duplicate-key, non-finite, and multiple response objects still fail closed.
 - **Delivery Amendment Components:** delivery amend prepare and delivery run-next --prepare-budget-split now constrain authored replacement component metadata to exact source-plan component IDs and require omission when the source plan declares no components.
 - **Automatic Task Preparation**: Task refinement and contract preparation now select the single schema-matching JSON object from model output, tolerating source-code braces in preambles while rejecting malformed or ambiguous response objects.
 - **Failure Diagnostics**: Claude calls now use structured CLI result output so persistent stderr warnings no longer hide provider-owned failure status or change retry classification; retry and task history keep only safe categorized failure messages. Long Gradle validation output preserves multiple bounded raw `What went wrong` blocks in private validation state.
