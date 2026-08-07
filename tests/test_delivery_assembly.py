@@ -259,6 +259,46 @@ def test_assemble_delivery_artifacts_applies_git_content_filters(tmp_path: Path)
     )
 
 
+def test_preview_delivery_artifacts_honors_safe_core_autocrlf(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    subprocess.run(["git", "config", "core.autocrlf", "true"], cwd=tmp_path, check=True)
+    contract = tmp_path / "units" / "a.md"
+    contract.parent.mkdir()
+    contract.write_bytes(b"# A\r\n")
+    subprocess.run(["git", "add", "units/a.md"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "normalized contract"], cwd=tmp_path, check=True, capture_output=True)
+    parent = _rev_parse(tmp_path, "HEAD")
+    parent_blob = subprocess.run(
+        ["git", "rev-parse", "HEAD:units/a.md"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    content_id = delivery_artifact_content_id(
+        tmp_path,
+        parent_commit=parent,
+        path="units/a.md",
+        content=contract.read_bytes(),
+    )
+    preview = preview_delivery_artifacts(
+        tmp_path,
+        branch="sikula/delivery/demo",
+        parent_commit=parent,
+        artifacts=[
+            DeliveryAssemblyArtifact(
+                "units/a.md",
+                b"# Updated\r\n",
+                expected_content=contract.read_bytes(),
+            )
+        ],
+    )
+
+    assert content_id == parent_blob
+    assert preview.success is True
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires a POSIX filter driver")
 def test_preview_delivery_artifacts_rejects_external_filter_without_execution(tmp_path: Path) -> None:
     _git_init(tmp_path)

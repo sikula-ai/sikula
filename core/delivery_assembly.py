@@ -382,13 +382,13 @@ def preview_delivery_artifacts(
     return DeliveryArtifactAssemblyResult(True, branch, parent, None, current)
 
 
-def delivery_artifact_filter_issue(
+def delivery_artifact_compatibility_issue(
     project_root: Path,
     *,
     parent_commit: str,
     artifacts: list[DeliveryAssemblyArtifact],
 ) -> DeliveryPlanIssue | None:
-    """Return an issue when artifact paths use unsupported Git content filters."""
+    """Validate artifact paths and expected content against their parent tree."""
     root = project_root.resolve()
     try:
         parent, _ = resolve_git_commit(root, parent_commit)
@@ -403,12 +403,7 @@ def delivery_artifact_filter_issue(
     git_artifacts, artifact_issue = _artifacts_relative_to_git_root(root, artifacts, parent_commit=parent)
     if artifact_issue is not None:
         return artifact_issue
-    with tempfile.TemporaryDirectory(prefix="sikula-delivery-filter-") as temp_dir:
-        context = _parent_filter_context(root, parent, Path(temp_dir))
-        if context is None:
-            return _artifact_git_issue()
-        filter_root, env = context
-        return _artifact_external_filter_issue(filter_root, git_artifacts, env=env)
+    return _artifact_parent_compatibility_issue(root, parent, git_artifacts)
 
 
 def rollback_delivery_artifacts(
@@ -760,6 +755,14 @@ def _artifact_preflight_issue(
             "delivery.assembly_branch_diverged",
             "Delivery assembly branch changed before amendment artifacts were integrated.",
         )
+    return _artifact_parent_compatibility_issue(root, parent_commit, artifacts)
+
+
+def _artifact_parent_compatibility_issue(
+    root: Path,
+    parent_commit: str,
+    artifacts: list[DeliveryAssemblyArtifact],
+) -> DeliveryPlanIssue | None:
     issue = _artifact_paths_issue(artifacts)
     if issue is not None:
         return issue
@@ -1051,6 +1054,9 @@ def _parent_filter_context(
     parent_commit: str,
     temp_dir: Path,
 ) -> tuple[Path, dict[str, str]] | None:
+    autocrlf_valid, autocrlf = _safe_core_autocrlf(root)
+    if not autocrlf_valid:
+        return None
     try:
         git_root_result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -1111,6 +1117,8 @@ def _parent_filter_context(
         ("core.bare", "false"),
         ("core.attributesFile", str(empty_attributes)),
     ]
+    if autocrlf is not None:
+        config_values.append(("core.autocrlf", autocrlf))
     if object_format_result.stdout.strip() == "sha256":
         config_values.append(("extensions.objectFormat", "sha256"))
     try:
@@ -1202,6 +1210,35 @@ def _parent_filter_context(
         except OSError:
             return None
     return worktree, env
+
+
+def _safe_core_autocrlf(root: Path) -> tuple[bool, str | None]:
+    try:
+        result = subprocess.run(
+            ["git", "config", "--get", "core.autocrlf"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False, None
+    if result.returncode == 1 and not result.stdout:
+        return True, None
+    if result.returncode != 0:
+        return False, None
+    value = result.stdout.strip().casefold()
+    normalized = {
+        "1": "true",
+        "yes": "true",
+        "on": "true",
+        "true": "true",
+        "0": "false",
+        "no": "false",
+        "off": "false",
+        "false": "false",
+        "input": "input",
+    }.get(value)
+    return (True, normalized) if normalized is not None else (False, None)
 
 
 def _tree_artifact_entry(root: Path, commit: str, path: str) -> tuple[str, str] | None:

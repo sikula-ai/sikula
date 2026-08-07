@@ -175,14 +175,14 @@ def _publish_amendment_locally(
 ) -> None:
     context = inspect_delivery_amendment_target(plan_path, proposal.target_unit_id, project_root=project_root)
     amended_plan, _ = delivery_amendment_module._amended_plan_data(plan_path, context, proposal)
-    plan_path.write_text(yaml.safe_dump(amended_plan, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    plan_path.write_bytes(yaml.safe_dump(amended_plan, sort_keys=False, allow_unicode=True).encode("utf-8"))
     for unit in proposal.replacement_units:
         if unit.id == omit_unit_id:
             continue
         path = project_root / unit.task_path
         path.parent.mkdir(parents=True, exist_ok=True)
         content = "changed replacement\n" if unit.id == changed_unit_id else unit.task_markdown
-        path.write_text(content, encoding="utf-8")
+        path.write_bytes(content.encode("utf-8"))
 
 
 def _project_config(root: Path) -> dict:
@@ -898,6 +898,7 @@ def test_repeated_apply_compares_canonical_source_plan_blob(tmp_path: Path) -> N
         assembly_updated_at="2026-07-20T10:02:00Z",
     )
     progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    plan_path.write_bytes(plan_path.read_text(encoding="utf-8").replace("\r\n", "\n").encode("utf-8"))
     source_bytes = plan_path.read_bytes()
     filtered_source = subprocess.run(
         [
@@ -1431,7 +1432,7 @@ def test_repeated_apply_rejects_malformed_event_history(tmp_path: Path) -> None:
     assert [issue.code for issue in result.errors] == ["delivery_amend.events_invalid"]
 
 
-def test_apply_rejects_replacement_path_already_present_only_in_final_branch(tmp_path: Path) -> None:
+def test_prepare_rejects_replacement_path_already_present_only_in_final_branch(tmp_path: Path) -> None:
     plan_path, progress_path, proposal_root = _setup(tmp_path)
     operator_branch = subprocess.run(
         ["git", "branch", "--show-current"], cwd=tmp_path, check=True, capture_output=True, text=True
@@ -1477,24 +1478,15 @@ def test_apply_rejects_replacement_path_already_present_only_in_final_branch(tmp
         assembly_updated_at="2026-07-20T10:01:30Z",
     )
     progress_path.write_text(json.dumps(progress), encoding="utf-8")
-    proposal, _ = create_delivery_amendment_proposal(
-        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
-    )
     plan_before = plan_path.read_bytes()
 
-    preview = preview_delivery_amendment(
-        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
-    )
-    result = apply_delivery_amendment(
-        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
-    )
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        create_delivery_amendment_proposal(plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root)
 
-    assert preview.ready is False
-    assert [issue.code for issue in preview.errors] == ["delivery.assembly_artifact_conflict"]
-    assert result.applied is False
-    assert [issue.code for issue in result.errors] == ["delivery.assembly_artifact_conflict"]
+    assert exc_info.value.issue.code == "delivery.assembly_artifact_conflict"
     assert plan_path.read_bytes() == plan_before
     assert not conflict_path.exists()
+    assert not list(proposal_root.rglob("*.json"))
     assert (
         subprocess.run(
             ["git", "rev-parse", "sikula/delivery/amend-demo"],
@@ -1507,7 +1499,8 @@ def test_apply_rejects_replacement_path_already_present_only_in_final_branch(tmp
     )
 
 
-def test_preview_rejects_stale_source_plan_in_final_branch(tmp_path: Path) -> None:
+@pytest.mark.parametrize("stale_artifact", ["plan", "retained_contract"])
+def test_prepare_rejects_stale_source_artifact_in_final_branch(tmp_path: Path, stale_artifact: str) -> None:
     plan_path, progress_path, proposal_root = _setup(tmp_path)
     operator_branch = subprocess.run(
         ["git", "branch", "--show-current"], cwd=tmp_path, check=True, capture_output=True, text=True
@@ -1530,11 +1523,16 @@ def test_preview_rejects_stale_source_plan_in_final_branch(tmp_path: Path) -> No
         check=True,
         capture_output=True,
     )
-    stale_plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
-    stale_plan["title"] = "Stale assembly plan"
-    plan_path.write_text(yaml.safe_dump(stale_plan, sort_keys=False), encoding="utf-8")
+    if stale_artifact == "plan":
+        stale_path = plan_path
+        stale_plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+        stale_plan["title"] = "Stale assembly plan"
+        stale_path.write_text(yaml.safe_dump(stale_plan, sort_keys=False), encoding="utf-8")
+    else:
+        stale_path = plan_path.parent / "units" / "a.md"
+        stale_path.write_text("stale retained contract\n", encoding="utf-8")
     subprocess.run(
-        ["git", "add", plan_path.relative_to(tmp_path).as_posix()],
+        ["git", "add", stale_path.relative_to(tmp_path).as_posix()],
         cwd=tmp_path,
         check=True,
         capture_output=True,
@@ -1557,18 +1555,14 @@ def test_preview_rejects_stale_source_plan_in_final_branch(tmp_path: Path) -> No
         assembly_updated_at="2026-07-20T10:01:30Z",
     )
     progress_path.write_text(json.dumps(progress), encoding="utf-8")
-    proposal, _ = create_delivery_amendment_proposal(
-        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
-    )
     plan_before = plan_path.read_bytes()
 
-    preview = preview_delivery_amendment(
-        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
-    )
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        create_delivery_amendment_proposal(plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root)
 
-    assert preview.ready is False
-    assert [issue.code for issue in preview.errors] == ["delivery.assembly_artifact_stale"]
+    assert exc_info.value.issue.code == "delivery.assembly_artifact_stale"
     assert plan_path.read_bytes() == plan_before
+    assert not list(proposal_root.rglob("*.json"))
     assert (
         subprocess.run(
             ["git", "rev-parse", "sikula/delivery/amend-demo"],

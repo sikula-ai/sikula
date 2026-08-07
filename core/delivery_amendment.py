@@ -19,7 +19,7 @@ from core.contract_check import check_contract
 from core.delivery_assembly import (
     DeliveryAssemblyArtifact,
     assemble_delivery_artifacts,
-    delivery_artifact_filter_issue,
+    delivery_artifact_compatibility_issue,
     delivery_artifact_content_id,
     delivery_branch_commit,
     delivery_commit_is_ancestor,
@@ -496,7 +496,7 @@ def create_delivery_amendment_proposal(
         root=root,
         private_artifact_roots=context.private_artifact_roots,
     )
-    artifact_issue = delivery_artifact_filter_issue(
+    artifact_issue = delivery_artifact_compatibility_issue(
         root,
         parent_commit=context.assembled_commit,
         artifacts=_proposal_assembly_artifacts(
