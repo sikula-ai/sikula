@@ -1735,8 +1735,7 @@ def _reconcile_applied_amendment(
     progress_path = delivery_progress_path(root, proposal.plan_id)
     try:
         progress_backup = _backup(progress_path)
-        event_log_existed = events_path.exists()
-        event_log_size = events_path.stat().st_size if event_log_existed else 0
+        event_log_backup = _backup(events_path)
     except OSError:
         raise DeliveryAmendmentError(
             "delivery_amend.progress_invalid",
@@ -1813,7 +1812,9 @@ def _reconcile_applied_amendment(
             commit=amendment_commit,
             timestamp=timestamp,
         )
-        existing_keys = _amendment_event_keys(events_path, proposal.proposal_id)
+        existing_keys, repair = _amendment_event_keys(events_path, proposal.proposal_id)
+        if repair is not None:
+            _repair_amendment_event_suffix(events_path, *repair)
         missing = [event for event in expected if (event.event_type, event.unit_id) not in existing_keys]
         try:
             append_delivery_progress_events(events_path, missing)
@@ -1831,7 +1832,7 @@ def _reconcile_applied_amendment(
         )
         try:
             _restore_backup(progress_backup)
-            _restore_appended_events(events_path, existed=event_log_existed, size=event_log_size)
+            _restore_backup(event_log_backup)
         except Exception:
             rollback_failed = True
         if rollback_failed:
@@ -1851,25 +1852,57 @@ def _reconcile_applied_amendment(
         raise
 
 
-def _amendment_event_keys(path: Path, proposal_id: str) -> set[tuple[str, str | None]]:
+def _amendment_event_keys(
+    path: Path,
+    proposal_id: str,
+) -> tuple[set[tuple[str, str | None]], tuple[int | None, bool] | None]:
     if not path.exists():
-        return set()
+        return set(), None
     keys: set[tuple[str, str | None]] = set()
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            data = json.loads(line)
+        content = path.read_bytes()
+        lines = content.splitlines(keepends=True)
+        offset = 0
+        for index, line in enumerate(lines):
+            complete = line.endswith(b"\n")
+            payload = line[:-1].removesuffix(b"\r") if complete else line
+            try:
+                data = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                if index == len(lines) - 1 and not complete:
+                    return keys, (offset, False)
+                raise
             if not isinstance(data, dict) or data.get("proposal_id") != proposal_id:
+                offset += len(line)
                 continue
             event_type = data.get("event_type")
             unit_id = data.get("unit_id")
             if isinstance(event_type, str) and (unit_id is None or isinstance(unit_id, str)):
                 keys.add((event_type, unit_id))
+            offset += len(line)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         raise DeliveryAmendmentError(
             "delivery_amend.events_invalid",
             "Delivery amendment event history is unavailable or malformed.",
         ) from None
-    return keys
+    return keys, ((None, True) if content and not content.endswith(b"\n") else None)
+
+
+def _repair_amendment_event_suffix(path: Path, truncate_to: int | None, append_newline: bool) -> None:
+    try:
+        with path.open("r+b") as handle:
+            if truncate_to is not None:
+                handle.truncate(truncate_to)
+            if append_newline:
+                handle.seek(0, os.SEEK_END)
+                handle.write(b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        raise DeliveryAmendmentError(
+            "delivery_amend.event_write_failed",
+            "Delivery amendment is applied but its truncated audit event could not be repaired.",
+        ) from None
 
 
 def _missing_progress_recovery_is_current(

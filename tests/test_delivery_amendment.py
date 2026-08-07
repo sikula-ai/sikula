@@ -1438,7 +1438,8 @@ def test_repeated_apply_reports_success_event_reconciliation_failure(
     assert [issue.code for issue in result.errors] == ["delivery_amend.event_write_failed"]
 
 
-def test_repeated_apply_rejects_malformed_event_history(tmp_path: Path) -> None:
+@pytest.mark.parametrize("malformed_history", [b"\xff\n", b"\xff\n{"])
+def test_repeated_apply_rejects_malformed_event_history(tmp_path: Path, malformed_history: bytes) -> None:
     plan_path, _, proposal_root = _setup(tmp_path)
     proposal, _ = create_delivery_amendment_proposal(
         plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
@@ -1447,7 +1448,7 @@ def test_repeated_apply_rejects_malformed_event_history(tmp_path: Path) -> None:
         plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
     )
     assert first.applied is True
-    delivery_events_path(tmp_path, proposal.plan_id).write_bytes(b"\xff")
+    delivery_events_path(tmp_path, proposal.plan_id).write_bytes(malformed_history)
 
     result = apply_delivery_amendment(
         plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
@@ -1455,6 +1456,59 @@ def test_repeated_apply_rejects_malformed_event_history(tmp_path: Path) -> None:
 
     assert result.applied is False
     assert [issue.code for issue in result.errors] == ["delivery_amend.events_invalid"]
+
+
+def test_repeated_apply_recovers_truncated_final_success_event(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    first = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+    assert first.applied is True
+    events_path = delivery_events_path(tmp_path, proposal.plan_id)
+    lines = events_path.read_bytes().splitlines(keepends=True)
+    events_path.write_bytes(b"".join(lines[:-1]) + lines[-1][: len(lines[-1]) // 2])
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is True
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["event_type"] for event in events].count("plan.amended") == 1
+    assert events_path.read_bytes().endswith(b"\n")
+
+
+def test_repeated_apply_restores_truncated_event_when_reconciliation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    first = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+    assert first.applied is True
+    events_path = delivery_events_path(tmp_path, proposal.plan_id)
+    lines = events_path.read_bytes().splitlines(keepends=True)
+    truncated = b"".join(lines[:-1]) + lines[-1][: len(lines[-1]) // 2]
+    events_path.write_bytes(truncated)
+
+    def fail_events(*_args, **_kwargs):
+        raise OSError("event log unavailable")
+
+    monkeypatch.setattr(delivery_amendment_module, "append_delivery_progress_events", fail_events)
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.event_write_failed"]
+    assert events_path.read_bytes() == truncated
 
 
 def test_prepare_rejects_replacement_path_already_present_only_in_final_branch(tmp_path: Path) -> None:
