@@ -104,6 +104,15 @@ def _git_with_identity(*args: str) -> list[str]:
     ]
 
 
+def _filtered_commit_content(root: Path, commit: str, path: str) -> bytes:
+    return subprocess.run(
+        ["git", "cat-file", "--filters", f"--path={path}", f"{commit}:{path}"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    ).stdout
+
+
 def _commit(root: Path, name: str, body: str) -> str:
     path = root / name
     path.write_text(body, encoding="utf-8")
@@ -417,12 +426,7 @@ def test_pending_middle_split_preserves_progress_and_rewires_to_all_leaves(tmp_p
     assembled_commit = progress_after["assembled_commit"]
     for unit in plan["units"]:
         task_path = unit["task_path"]
-        committed = subprocess.run(
-            ["git", "show", f"{assembled_commit}:{task_path}"],
-            cwd=tmp_path,
-            check=True,
-            capture_output=True,
-        ).stdout
+        committed = _filtered_commit_content(tmp_path, assembled_commit, task_path)
         assert committed == (tmp_path / task_path).read_bytes()
 
 
@@ -2066,7 +2070,7 @@ def test_prepare_rejects_preexisting_replacement_task_path(
     assert not list(proposal_root.rglob("*.json"))
 
 
-@pytest.mark.parametrize("changed_source", ["plan", "target_task", "progress"])
+@pytest.mark.parametrize("changed_source", ["plan", "target_task", "retained_contract", "progress"])
 def test_prepare_rechecks_source_fingerprints_at_publish_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2074,6 +2078,7 @@ def test_prepare_rechecks_source_fingerprints_at_publish_boundary(
 ) -> None:
     plan_path, progress_path, proposal_root = _setup(tmp_path)
     target_task = plan_path.parent / "units" / "c.md"
+    retained_contract = plan_path.parent / "units" / "a.md"
     real_readiness = delivery_amendment_module._replacement_contract_readiness_errors
 
     def check_readiness_then_edit(*args, **kwargs):
@@ -2085,6 +2090,11 @@ def test_prepare_rechecks_source_fingerprints_at_publish_boundary(
         elif changed_source == "target_task":
             target_task.write_text(
                 target_task.read_text(encoding="utf-8") + "\n- Changed during proposal preparation.\n",
+                encoding="utf-8",
+            )
+        elif changed_source == "retained_contract":
+            retained_contract.write_text(
+                retained_contract.read_text(encoding="utf-8") + "\n- Changed during proposal preparation.\n",
                 encoding="utf-8",
             )
         else:
@@ -2112,6 +2122,7 @@ def test_prepare_rechecks_source_fingerprints_at_publish_boundary(
     expected_code = {
         "plan": "delivery_amend.plan_stale",
         "target_task": "delivery_amend.target_task_stale",
+        "retained_contract": "delivery_amend.retained_contract_stale",
         "progress": "delivery_amend.progress_stale",
     }[changed_source]
     assert exc_info.value.issue.code == expected_code
@@ -2577,6 +2588,31 @@ def test_preview_rejects_stale_target_task_fingerprint(tmp_path: Path) -> None:
     assert [issue.code for issue in result.errors] == ["delivery_amend.target_task_stale"]
 
 
+def test_preview_rejects_changed_parent_missing_retained_contract(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    retained_contract = plan_path.parent / "units" / "a.md"
+    retained_contract.write_bytes(retained_contract.read_bytes() + b"\n- Added after prepare.\n")
+
+    result = preview_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.ready is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.retained_contract_stale"]
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "refs/heads/sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+
+
 def test_mutating_apply_records_failed_event_for_stale_progress(tmp_path: Path) -> None:
     plan_path, progress_path, proposal_root = _setup(tmp_path)
     proposal, _ = create_delivery_amendment_proposal(
@@ -2670,6 +2706,7 @@ def test_repeated_apply_is_idempotent_without_duplicate_success_events(tmp_path:
     "missing_field",
     [
         "source_plan_blob_id",
+        "retained_contract_fingerprints",
         "source_assembly_base_commit",
         "source_assembled_commit",
         "amended_plan_fingerprint",
@@ -2715,15 +2752,7 @@ def test_apply_normalizes_and_deduplicates_shared_contract_paths(tmp_path: Path)
     assembled_commit = json.loads(delivery_progress_path(tmp_path, proposal.plan_id).read_text(encoding="utf-8"))[
         "assembled_commit"
     ]
-    assert (
-        subprocess.run(
-            ["git", "show", f"{assembled_commit}:{shared_path}"],
-            cwd=tmp_path,
-            check=True,
-            capture_output=True,
-        ).stdout
-        == (tmp_path / shared_path).read_bytes()
-    )
+    assert _filtered_commit_content(tmp_path, assembled_commit, shared_path) == (tmp_path / shared_path).read_bytes()
 
 
 def test_amendment_anchors_legacy_branch_behind_head_to_head(tmp_path: Path) -> None:

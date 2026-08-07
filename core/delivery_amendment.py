@@ -135,6 +135,7 @@ class DeliveryAmendmentProposal:
     source_plan_fingerprint: str
     source_plan_blob_id: str
     target_task_fingerprint: str
+    retained_contract_fingerprints: dict[str, str]
     progress_fingerprint: str
     source_assembly_base_commit: str
     source_assembled_commit: str
@@ -159,6 +160,7 @@ class DeliveryAmendmentProposal:
             "source_plan_fingerprint": self.source_plan_fingerprint,
             "source_plan_blob_id": self.source_plan_blob_id,
             "target_task_fingerprint": self.target_task_fingerprint,
+            "retained_contract_fingerprints": dict(self.retained_contract_fingerprints),
             "progress_fingerprint": self.progress_fingerprint,
             "created_at": self.created_at,
             "replacement_units": [unit.to_dict() for unit in self.replacement_units],
@@ -195,6 +197,7 @@ class DeliveryAmendmentSourceSnapshot:
     source_plan_fingerprint: str
     source_plan_blob_id: str
     target_task_fingerprint: str
+    retained_contract_fingerprints: dict[str, str]
     progress_fingerprint: str
     assembly_base_commit: str
     assembled_commit: str
@@ -432,6 +435,7 @@ def create_delivery_amendment_proposal(
         source_plan_fingerprint=source_snapshot.source_plan_fingerprint,
         source_plan_blob_id=source_snapshot.source_plan_blob_id,
         target_task_fingerprint=source_snapshot.target_task_fingerprint,
+        retained_contract_fingerprints=source_snapshot.retained_contract_fingerprints,
         progress_fingerprint=source_snapshot.progress_fingerprint,
         source_assembly_base_commit=source_snapshot.assembly_base_commit,
         source_assembled_commit=source_snapshot.assembled_commit,
@@ -449,6 +453,7 @@ def create_delivery_amendment_proposal(
         "source_plan_fingerprint": source_snapshot.source_plan_fingerprint,
         "source_plan_blob_id": source_snapshot.source_plan_blob_id,
         "target_task_fingerprint": source_snapshot.target_task_fingerprint,
+        "retained_contract_fingerprints": source_snapshot.retained_contract_fingerprints,
         "progress_fingerprint": source_snapshot.progress_fingerprint,
         "source_assembly_base_commit": source_snapshot.assembly_base_commit,
         "source_assembled_commit": source_snapshot.assembled_commit,
@@ -471,6 +476,7 @@ def create_delivery_amendment_proposal(
         source_plan_fingerprint=proposal_payload["source_plan_fingerprint"],
         source_plan_blob_id=proposal_payload["source_plan_blob_id"],
         target_task_fingerprint=proposal_payload["target_task_fingerprint"],
+        retained_contract_fingerprints=proposal_payload["retained_contract_fingerprints"],
         progress_fingerprint=proposal_payload["progress_fingerprint"],
         source_assembly_base_commit=proposal_payload["source_assembly_base_commit"],
         source_assembled_commit=proposal_payload["source_assembled_commit"],
@@ -843,6 +849,7 @@ def _preflight_amendment(
                 "delivery_amend.target_task_stale",
                 "Target unit task changed after the proposal was prepared.",
             )
+        _assert_retained_contract_fingerprints_current(target, proposal)
         if _progress_fingerprint(target) != proposal.progress_fingerprint:
             raise DeliveryAmendmentError(
                 "delivery_amend.progress_stale", "Delivery progress changed after the proposal was prepared."
@@ -998,6 +1005,7 @@ def load_delivery_amendment_proposal(
         "source_plan_fingerprint",
         "source_plan_blob_id",
         "target_task_fingerprint",
+        "retained_contract_fingerprints",
         "progress_fingerprint",
         "source_assembly_base_commit",
         "source_assembled_commit",
@@ -1021,6 +1029,7 @@ def load_delivery_amendment_proposal(
     source_fingerprint = _required_hash(data, "source_plan_fingerprint")
     source_plan_blob_id = _required_object_id(data, "source_plan_blob_id")
     target_task_fingerprint = _required_hash(data, "target_task_fingerprint")
+    retained_contract_fingerprints = _required_fingerprint_map(data, "retained_contract_fingerprints")
     progress_fingerprint = _required_hash(data, "progress_fingerprint")
     source_assembly_base_commit = _required_object_id(data, "source_assembly_base_commit")
     source_assembled_commit = _required_object_id(data, "source_assembled_commit")
@@ -1043,6 +1052,7 @@ def load_delivery_amendment_proposal(
         source_plan_fingerprint=source_fingerprint,
         source_plan_blob_id=source_plan_blob_id,
         target_task_fingerprint=target_task_fingerprint,
+        retained_contract_fingerprints=retained_contract_fingerprints,
         progress_fingerprint=progress_fingerprint,
         source_assembly_base_commit=source_assembly_base_commit,
         source_assembled_commit=source_assembled_commit,
@@ -1109,6 +1119,10 @@ def _preflight_applied_amendment(
             "delivery_amend.target_task_stale",
             "Target unit task changed after the proposal was prepared.",
         )
+    try:
+        _assert_retained_contract_fingerprints_current(source_context, proposal)
+    except DeliveryAmendmentError as exc:
+        return _blocked_applied_preflight(base, proposal, exc.issue.code, exc.issue.message, exc.issue.path)
     for unit in proposal.replacement_units:
         path = root / unit.task_path
         try:
@@ -2404,6 +2418,7 @@ def capture_delivery_amendment_source_snapshot(
         source_plan_fingerprint=_plan_fingerprint(plan_path),
         source_plan_blob_id=source_plan_blob_id,
         target_task_fingerprint=_target_task_fingerprint(context),
+        retained_contract_fingerprints=_retained_contract_fingerprints(context),
         progress_fingerprint=_progress_fingerprint(context),
         assembly_base_commit=assembly_base_commit,
         assembled_commit=assembled_commit,
@@ -2476,6 +2491,11 @@ def _assert_proposal_source_fingerprints_current(
             "delivery_amend.target_task_stale",
             "Target unit task changed after the proposal was prepared.",
         )
+    if current.retained_contract_fingerprints != proposal.retained_contract_fingerprints:
+        raise DeliveryAmendmentError(
+            "delivery_amend.retained_contract_stale",
+            "A retained unit contract changed after the proposal was prepared.",
+        )
     if current.progress_fingerprint != proposal.progress_fingerprint:
         raise DeliveryAmendmentError(
             "delivery_amend.progress_stale",
@@ -2502,6 +2522,7 @@ def _assert_proposal_non_plan_fingerprints_current(
             "delivery_amend.target_task_stale",
             "Target unit task changed after the proposal was prepared.",
         )
+    _assert_retained_contract_fingerprints_current(context, proposal)
     if _progress_fingerprint(context) != proposal.progress_fingerprint:
         raise DeliveryAmendmentError(
             "delivery_amend.progress_stale",
@@ -2522,6 +2543,44 @@ def _assert_proposal_non_plan_fingerprints_current(
 def _target_task_fingerprint(context: DeliveryAmendmentTarget) -> str:
     _, task_text = read_delivery_amendment_target_task(context)
     return hashlib.sha256(task_text.encode("utf-8")).hexdigest()
+
+
+def _retained_contract_fingerprints(
+    context: DeliveryAmendmentTarget,
+    *,
+    excluded_unit_ids: set[str] | None = None,
+) -> dict[str, str]:
+    root = Path(context.project_root)
+    excluded = set(excluded_unit_ids or ())
+    excluded.add(context.target.id)
+    fingerprints: dict[str, str] = {}
+    for unit in context.plan.units:
+        if unit.id in excluded:
+            continue
+        task_path = _canonical_assembly_task_path(
+            root,
+            unit.task_path,
+            private_artifact_roots=context.private_artifact_roots,
+        )
+        content = _read_assembly_contract(
+            root,
+            unit.task_path,
+            private_artifact_roots=context.private_artifact_roots,
+        )
+        fingerprints[task_path] = hashlib.sha256(content).hexdigest()
+    return dict(sorted(fingerprints.items()))
+
+
+def _assert_retained_contract_fingerprints_current(
+    context: DeliveryAmendmentTarget,
+    proposal: DeliveryAmendmentProposal,
+) -> None:
+    current = _retained_contract_fingerprints(context, excluded_unit_ids=set(proposal.replacement_ids))
+    if current != proposal.retained_contract_fingerprints:
+        raise DeliveryAmendmentError(
+            "delivery_amend.retained_contract_stale",
+            "A retained unit contract changed after the proposal was prepared.",
+        )
 
 
 def _progress_fingerprint(context: DeliveryAmendmentTarget) -> str:
@@ -3009,6 +3068,20 @@ def _required_hash(data: dict[str, Any], key: str) -> str:
     if not _HASH_RE.fullmatch(value):
         raise DeliveryAmendmentError("delivery_amend.proposal_invalid", f"Proposal {key} is invalid.")
     return value
+
+
+def _required_fingerprint_map(data: dict[str, Any], key: str) -> dict[str, str]:
+    value = data.get(key)
+    if not isinstance(value, dict) or any(
+        not isinstance(path, str)
+        or not path.strip()
+        or path != path.strip()
+        or not isinstance(fingerprint, str)
+        or not _HASH_RE.fullmatch(fingerprint)
+        for path, fingerprint in value.items()
+    ):
+        raise DeliveryAmendmentError("delivery_amend.proposal_invalid", f"Proposal {key} is invalid.")
+    return dict(value)
 
 
 def _required_object_id(data: dict[str, Any], key: str) -> str:
