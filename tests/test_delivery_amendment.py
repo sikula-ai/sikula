@@ -104,13 +104,28 @@ def _git_with_identity(*args: str) -> list[str]:
     ]
 
 
-def _filtered_commit_content(root: Path, commit: str, path: str) -> bytes:
+def _commit_content_id(root: Path, commit: str, path: str) -> str:
     return subprocess.run(
-        ["git", "cat-file", "--filters", f"--path={path}", f"{commit}:{path}"],
+        ["git", "rev-parse", f"{commit}:{path}"],
         cwd=root,
         check=True,
         capture_output=True,
-    ).stdout
+        text=True,
+    ).stdout.strip()
+
+
+def _filtered_content_id(root: Path, path: str, content: bytes) -> str:
+    return (
+        subprocess.run(
+            ["git", "hash-object", f"--path={path}", "--stdin"],
+            cwd=root,
+            check=True,
+            input=content,
+            capture_output=True,
+        )
+        .stdout.decode("ascii")
+        .strip()
+    )
 
 
 def _commit(root: Path, name: str, body: str) -> str:
@@ -350,6 +365,10 @@ def _snapshot(root: Path) -> dict[str, bytes]:
 
 def test_pending_middle_split_preserves_progress_and_rewires_to_all_leaves(tmp_path: Path) -> None:
     plan_path, progress_path, proposal_root = _setup(tmp_path)
+    subprocess.run(["git", "config", "core.autocrlf", "true"], cwd=tmp_path, check=True)
+    retained_contract = plan_path.parent / "units" / "a.md"
+    retained_lf = retained_contract.read_bytes().replace(b"\r\n", b"\n")
+    retained_contract.write_bytes(retained_lf.replace(b"\n", b"\r\n"))
     progress_before = json.loads(progress_path.read_text(encoding="utf-8"))
     events_path = delivery_events_path(tmp_path, "amend-demo")
     events_path.write_text(
@@ -426,8 +445,10 @@ def test_pending_middle_split_preserves_progress_and_rewires_to_all_leaves(tmp_p
     assembled_commit = progress_after["assembled_commit"]
     for unit in plan["units"]:
         task_path = unit["task_path"]
-        committed = _filtered_commit_content(tmp_path, assembled_commit, task_path)
-        assert committed == (tmp_path / task_path).read_bytes()
+        worktree_content = (tmp_path / task_path).read_bytes()
+        assert _commit_content_id(tmp_path, assembled_commit, task_path) == _filtered_content_id(
+            tmp_path, task_path, worktree_content
+        )
 
 
 def test_prepare_stores_componentless_replacements_without_component_metadata(tmp_path: Path) -> None:
@@ -2752,7 +2773,9 @@ def test_apply_normalizes_and_deduplicates_shared_contract_paths(tmp_path: Path)
     assembled_commit = json.loads(delivery_progress_path(tmp_path, proposal.plan_id).read_text(encoding="utf-8"))[
         "assembled_commit"
     ]
-    assert _filtered_commit_content(tmp_path, assembled_commit, shared_path) == (tmp_path / shared_path).read_bytes()
+    assert _commit_content_id(tmp_path, assembled_commit, shared_path) == _filtered_content_id(
+        tmp_path, shared_path, (tmp_path / shared_path).read_bytes()
+    )
 
 
 def test_amendment_anchors_legacy_branch_behind_head_to_head(tmp_path: Path) -> None:
