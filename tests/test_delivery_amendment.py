@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,10 +14,12 @@ import pytest
 import yaml
 
 import core.delivery_amendment as delivery_amendment_module
+import core.worktree as worktree_module
 import sikula
 from core.delivery_amendment import (
     DeliveryAmendmentApplyResult,
     DeliveryAmendmentError,
+    DeliveryAmendmentProposal,
     apply_delivery_amendment,
     capture_delivery_amendment_source_snapshot,
     create_delivery_amendment_proposal,
@@ -29,6 +32,7 @@ from core.delivery_authoring import (
     DeliveryAuthoringParseError,
     DeliveryAuthoringUnitDraft,
 )
+from core.delivery_assembly import DeliveryArtifactAssemblyResult
 from core.delivery_finalize import preview_delivery_finalize
 from core.delivery_plan import DeliveryBudgetExceeded, DeliveryPlanIssue, check_delivery_plan_file
 from core.delivery_progress import (
@@ -87,6 +91,41 @@ def test_automatic_amendment_metadata_rejects_model_conflict() -> None:
 
 def _git_init(root: Path) -> None:
     subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+
+
+def _git_with_identity(*args: str) -> list[str]:
+    return [
+        "git",
+        "-c",
+        "user.name=Sikula Test",
+        "-c",
+        "user.email=sikula@example.test",
+        *args,
+    ]
+
+
+def _commit_content_id(root: Path, commit: str, path: str) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", f"{commit}:{path}"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _filtered_content_id(root: Path, path: str, content: bytes) -> str:
+    return (
+        subprocess.run(
+            ["git", "hash-object", f"--path={path}", "--stdin"],
+            cwd=root,
+            check=True,
+            input=content,
+            capture_output=True,
+        )
+        .stdout.decode("ascii")
+        .strip()
+    )
 
 
 def _commit(root: Path, name: str, body: str) -> str:
@@ -148,6 +187,26 @@ The behavior is delivered independently.
 
 - `python3 -m pytest tests/test_delivery_amendment.py`
 """
+
+
+def _publish_amendment_locally(
+    plan_path: Path,
+    project_root: Path,
+    proposal: DeliveryAmendmentProposal,
+    *,
+    omit_unit_id: str | None = None,
+    changed_unit_id: str | None = None,
+) -> None:
+    context = inspect_delivery_amendment_target(plan_path, proposal.target_unit_id, project_root=project_root)
+    amended_plan, _ = delivery_amendment_module._amended_plan_data(plan_path, context, proposal)
+    plan_path.write_bytes(yaml.safe_dump(amended_plan, sort_keys=False, allow_unicode=True).encode("utf-8"))
+    for unit in proposal.replacement_units:
+        if unit.id == omit_unit_id:
+            continue
+        path = project_root / unit.task_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        content = "changed replacement\n" if unit.id == changed_unit_id else unit.task_markdown
+        path.write_bytes(content.encode("utf-8"))
 
 
 def _project_config(root: Path) -> dict:
@@ -306,7 +365,11 @@ def _snapshot(root: Path) -> dict[str, bytes]:
 
 def test_pending_middle_split_preserves_progress_and_rewires_to_all_leaves(tmp_path: Path) -> None:
     plan_path, progress_path, proposal_root = _setup(tmp_path)
-    progress_before = progress_path.read_bytes()
+    subprocess.run(["git", "config", "core.autocrlf", "true"], cwd=tmp_path, check=True)
+    retained_contract = plan_path.parent / "units" / "a.md"
+    retained_lf = retained_contract.read_bytes().replace(b"\r\n", b"\n")
+    retained_contract.write_bytes(retained_lf.replace(b"\n", b"\r\n"))
+    progress_before = json.loads(progress_path.read_text(encoding="utf-8"))
     events_path = delivery_events_path(tmp_path, "amend-demo")
     events_path.write_text(
         json.dumps(
@@ -333,7 +396,11 @@ def test_pending_middle_split_preserves_progress_and_rewires_to_all_leaves(tmp_p
 
     assert result.applied is True
     assert result.rewired_unit_ids == ["d"]
-    assert progress_path.read_bytes() == progress_before
+    progress_after = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert progress_after["units"] == progress_before["units"]
+    assert progress_after["assembly_status"] == "ready"
+    assert progress_after["assembly_base_commit"] == proposal.source_assembly_base_commit
+    assert progress_after["assembled_commit"] != proposal.source_assembled_commit
     plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
     by_id = {unit["id"]: unit for unit in plan["units"]}
     assert by_id["a"]["depends_on"] == []
@@ -373,6 +440,15 @@ def test_pending_middle_split_preserves_progress_and_rewires_to_all_leaves(tmp_p
     ]
     assert events[-1]["replacement_ids"] == ["c-1", "c-2", "c-3"]
     assert events[-1]["rewired_unit_ids"] == ["d"]
+    assert events[-1]["branch"] == "sikula/delivery/amend-demo"
+    assert events[-1]["commit"] == progress_after["assembled_commit"]
+    assembled_commit = progress_after["assembled_commit"]
+    for unit in plan["units"]:
+        task_path = unit["task_path"]
+        worktree_content = (tmp_path / task_path).read_bytes()
+        assert _commit_content_id(tmp_path, assembled_commit, task_path) == _filtered_content_id(
+            tmp_path, task_path, worktree_content
+        )
 
 
 def test_prepare_stores_componentless_replacements_without_component_metadata(tmp_path: Path) -> None:
@@ -385,6 +461,29 @@ def test_prepare_stores_componentless_replacements_without_component_metadata(tm
     payload = json.loads(proposal_path.read_text(encoding="utf-8"))
     assert [unit.component for unit in proposal.replacement_units] == [None, None, None]
     assert all("component" not in unit for unit in payload["replacement_units"])
+
+
+def test_proposal_without_downstream_rewiring_round_trips_and_applies(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    draft = DeliveryAmendmentAuthoringDraft(
+        plan_id="amend-demo",
+        target_unit_id="d",
+        replacement_units=[
+            DeliveryAuthoringUnitDraft("d-1", "D1", [], _task_markdown("D1")),
+            DeliveryAuthoringUnitDraft("d-2", "D2", ["d-1"], _task_markdown("D2")),
+        ],
+    )
+
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "d", draft, project_root=tmp_path, proposal_root=proposal_root
+    )
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert proposal.rewired_unit_ids == []
+    assert result.applied is True
+    assert result.rewired_unit_ids == []
 
 
 def test_prepare_stores_replacement_with_declared_component(tmp_path: Path) -> None:
@@ -455,6 +554,1106 @@ def test_prepare_rejects_unapplied_completed_dependency_commit(tmp_path: Path) -
     assert exc_info.value.issue.code == "delivery.unit_commit_unapplied"
 
 
+@pytest.mark.parametrize("recorded_assembly", [False, True])
+def test_prepare_and_apply_use_assembly_without_changing_operator_checkout(
+    tmp_path: Path,
+    recorded_assembly: bool,
+) -> None:
+    _git_init(tmp_path)
+    base_commit = _commit(tmp_path, "base.txt", "base\n")
+    completed_commit = _commit(tmp_path, "completed.txt", "completed\n")
+    subprocess.run(
+        ["git", "branch", "sikula/delivery/amend-demo", completed_commit],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "-b", "operator-plan", base_commit],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    plan_path = _write_plan(tmp_path)
+    progress_path = _write_progress(tmp_path, base_commit, completed_commit)
+    if recorded_assembly:
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        progress.update(
+            assembly_base_commit=base_commit,
+            assembled_commit=completed_commit,
+            assembly_status="ready",
+            assembly_updated_at="2026-07-20T10:01:30Z",
+        )
+        progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    proposal_root = tmp_path / ".sikula" / "contract-reports"
+    head_before = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path,
+        "c",
+        _draft(),
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+    )
+    result = apply_delivery_amendment(
+        plan_path,
+        proposal.proposal_id,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+    )
+
+    assert result.applied is True
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        == head_before
+    )
+    assert subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=tmp_path, check=False).returncode == 0
+    final_commit = subprocess.run(
+        ["git", "rev-parse", "sikula/delivery/amend-demo"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert final_commit != completed_commit
+    assert (
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", completed_commit, final_commit], cwd=tmp_path, check=False
+        ).returncode
+        == 0
+    )
+    plan_in_branch = subprocess.run(
+        ["git", "show", f"{final_commit}:{plan_path.relative_to(tmp_path).as_posix()}"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert plan_in_branch == plan_path.read_bytes()
+    for unit in proposal.replacement_units:
+        task_in_branch = subprocess.run(
+            ["git", "show", f"{final_commit}:{unit.task_path}"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        ).stdout
+        assert task_in_branch == unit.task_markdown.encode("utf-8")
+
+
+def test_repeated_apply_repairs_missing_progress_and_terminal_event(tmp_path: Path) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    first = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+    assert first.applied is True
+    events_path = delivery_events_path(tmp_path, proposal.plan_id)
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    events_path.write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in events if event["event_type"] != "plan.amended")
+        + json.dumps(
+            {
+                "schema_version": 1,
+                "plan_id": proposal.plan_id,
+                "event_type": "unrelated.event",
+                "timestamp": "2026-08-05T10:00:00Z",
+                "proposal_id": "other",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    for key in ("assembly_base_commit", "assembled_commit", "assembly_status", "assembly_updated_at"):
+        progress.pop(key, None)
+    progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    branch_before = subprocess.run(
+        ["git", "rev-parse", "sikula/delivery/amend-demo"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "rev-parse", f"{branch_before}^{{tree}}"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    branch_after = subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Sikula Test",
+            "-c",
+            "user.email=sikula@example.test",
+            "commit-tree",
+            tree,
+            "-p",
+            branch_before,
+            "-m",
+            "later delivery work",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "update-ref", "refs/heads/sikula/delivery/amend-demo", branch_after, branch_before],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    repaired = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert repaired.applied is True
+    repaired_progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert repaired_progress["assembled_commit"] == branch_after
+    repaired_events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["event_type"] for event in repaired_events].count("plan.amended") == 1
+    assert next(event for event in repaired_events if event["event_type"] == "plan.amended")["commit"] == branch_before
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == branch_after
+    )
+
+
+def test_repeated_apply_integrates_exact_locally_published_artifacts(tmp_path: Path) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+
+    preview = preview_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+    assert preview.ready is True
+    assert preview.applied is False
+    assert "assembly integration" in preview.message
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "refs/heads/sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is True
+    assembled_commit = subprocess.run(
+        ["git", "rev-parse", "sikula/delivery/amend-demo"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert progress["assembled_commit"] == assembled_commit
+    events = [json.loads(line) for line in delivery_events_path(tmp_path, "amend-demo").read_text().splitlines()]
+    assert next(event for event in events if event["event_type"] == "plan.amended")["commit"] == assembled_commit
+
+
+def test_repeated_apply_rejects_changed_target_task_before_recovery_assembly(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+    target_task = plan_path.parent / "units" / "c.md"
+    target_task.write_text(target_task.read_text(encoding="utf-8") + "\nChanged after prepare.\n", encoding="utf-8")
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.target_task_stale"]
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "refs/heads/sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+
+
+def test_repeated_apply_rechecks_replacement_readiness_before_recovery_assembly(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    draft = _draft()
+    draft.replacement_units[0] = replace(
+        draft.replacement_units[0],
+        task_markdown=draft.replacement_units[0].task_markdown.replace(
+            "python3 -m pytest tests/test_delivery_amendment.py",
+            "npm test",
+        ),
+    )
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", draft, project_root=tmp_path, proposal_root=proposal_root
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+
+    result = apply_delivery_amendment(
+        plan_path,
+        proposal.proposal_id,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.replacement_contract_not_ready"]
+    assert result.errors[0].path == ".sikula/delivery/demo/units/c-1.md"
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "refs/heads/sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+
+
+@pytest.mark.parametrize("replacement_status", ["running", "done"])
+def test_repeated_apply_rejects_replacement_progress_before_recovery_assembly(
+    tmp_path: Path,
+    replacement_status: str,
+) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    replacement_progress = {
+        "unit_id": "c-1",
+        "status": replacement_status,
+        "child_task_id": "task-c-1",
+        "started_at": "2026-07-20T11:00:00Z",
+        "updated_at": "2026-07-20T11:30:00Z",
+    }
+    if replacement_status == "done":
+        replacement_progress.update(
+            branch="sikula/c-1",
+            commit=proposal.source_assembled_commit,
+            completed_at="2026-07-20T11:30:00Z",
+        )
+    progress["units"].append(replacement_progress)
+    progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    progress_before = progress_path.read_bytes()
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.progress_stale"]
+    assert progress_path.read_bytes() == progress_before
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "refs/heads/sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+    events = [json.loads(line) for line in delivery_events_path(tmp_path, proposal.plan_id).read_text().splitlines()]
+    assert "plan.amended" not in [event["event_type"] for event in events]
+
+
+def test_repeated_apply_compares_canonical_source_plan_blob(tmp_path: Path) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    (tmp_path / ".gitattributes").write_text("*.yaml text eol=crlf\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", ".gitattributes", str(plan_path.parent.relative_to(tmp_path))],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        _git_with_identity("commit", "-m", "track delivery sources"),
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "branch", "sikula/delivery/amend-demo", source_commit],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress.update(
+        assembly_base_commit=progress["units"][0]["commit"],
+        assembled_commit=source_commit,
+        assembly_status="ready",
+        assembly_updated_at="2026-07-20T10:02:00Z",
+    )
+    progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    plan_path.write_bytes(plan_path.read_text(encoding="utf-8").replace("\r\n", "\n").encode("utf-8"))
+    source_bytes = plan_path.read_bytes()
+    filtered_source = subprocess.run(
+        [
+            "git",
+            "cat-file",
+            "--filters",
+            f"--path={plan_path.relative_to(tmp_path).as_posix()}",
+            f"{source_commit}:{plan_path.relative_to(tmp_path).as_posix()}",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert b"\r\n" not in source_bytes
+    assert b"\r\n" in filtered_source
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path,
+        "c",
+        _draft(),
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+
+    result = apply_delivery_amendment(
+        plan_path,
+        proposal.proposal_id,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+    )
+
+    assert result.applied is True
+
+
+@pytest.mark.parametrize(
+    ("mode", "error_code"),
+    [
+        ("missing", "units.task_path_missing"),
+        ("changed", "delivery_amend.replacement_task_stale"),
+    ],
+)
+def test_repeated_apply_rejects_incomplete_locally_published_artifacts(
+    tmp_path: Path,
+    mode: str,
+    error_code: str,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    affected_unit = proposal.replacement_units[0].id
+    _publish_amendment_locally(
+        plan_path,
+        tmp_path,
+        proposal,
+        omit_unit_id=affected_unit if mode == "missing" else None,
+        changed_unit_id=affected_unit if mode == "changed" else None,
+    )
+
+    result = preview_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.ready is False
+    assert [issue.code for issue in result.errors] == [error_code]
+
+
+def test_repeated_apply_rejects_assembly_advanced_without_artifact_commit(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    advanced = _commit(tmp_path, "unrelated.txt", "unrelated delivery work\n")
+    subprocess.run(["git", "branch", "sikula/delivery/amend-demo", advanced], cwd=tmp_path, check=True)
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+
+    result = preview_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.ready is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.assembly_artifact_missing"]
+
+
+def test_repeated_apply_rejects_assembly_change_during_artifact_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+    monkeypatch.setattr(
+        delivery_amendment_module,
+        "find_delivery_artifact_commit",
+        lambda *_args, **_kwargs: (None, "a" * 40),
+    )
+
+    result = preview_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.ready is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.assembly_artifact_missing"]
+
+
+def test_repeated_apply_recovers_missing_progress_after_local_publication(tmp_path: Path) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    progress_path.unlink()
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    assert proposal.progress_fingerprint == hashlib.sha256(b"null").hexdigest()
+    delivery_amendment_module.append_delivery_progress_event(
+        delivery_events_path(tmp_path, proposal.plan_id),
+        delivery_amendment_module._amendment_event(
+            proposal,
+            "plan.amend_started",
+            timestamp="2026-07-20T10:02:30Z",
+        ),
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is True
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert (
+        progress["assembled_commit"]
+        == subprocess.run(
+            ["git", "rev-parse", "sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+
+
+def test_repeated_apply_does_not_recreate_progress_deleted_after_success(tmp_path: Path) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    progress_path.unlink()
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    delivery_amendment_module.append_delivery_progress_event(
+        delivery_events_path(tmp_path, proposal.plan_id),
+        delivery_amendment_module._amendment_event(
+            proposal,
+            "plan.amend_started",
+            timestamp="2026-07-20T10:02:30Z",
+        ),
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+    first = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+    assert first.applied is True
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress["units"] = [
+        {
+            "unit_id": "c-1",
+            "status": "done",
+            "child_task_id": "task-c-1",
+            "branch": "sikula/c-1",
+            "commit": proposal.source_assembled_commit,
+            "started_at": "2026-07-20T11:00:00Z",
+            "completed_at": "2026-07-20T11:30:00Z",
+            "updated_at": "2026-07-20T11:30:00Z",
+        }
+    ]
+    progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    delivery_amendment_module.append_delivery_progress_event(
+        delivery_events_path(tmp_path, proposal.plan_id),
+        delivery_amendment_module.DeliveryProgressEvent(
+            plan_id=proposal.plan_id,
+            event_type="unit.done",
+            timestamp="2026-07-20T11:30:00Z",
+            unit_id="c-1",
+        ),
+    )
+    progress_path.unlink()
+    branch_before = subprocess.run(
+        ["git", "rev-parse", "sikula/delivery/amend-demo"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    repeated = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert repeated.applied is False
+    assert [issue.code for issue in repeated.errors] == ["delivery_amend.progress_invalid"]
+    assert not progress_path.exists()
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == branch_before
+    )
+
+
+def test_repeated_apply_converts_recovery_io_failure_to_blocked_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+    progress_before = progress_path.read_bytes()
+
+    def fail_assembly(*_args, **_kwargs):
+        raise OSError("simulated assembly I/O failure")
+
+    monkeypatch.setattr(delivery_amendment_module, "assemble_delivery_artifacts", fail_assembly)
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.write_failed"]
+    assert progress_path.read_bytes() == progress_before
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "refs/heads/sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+
+
+def test_repeated_apply_recovers_from_legacy_branch_behind_source(tmp_path: Path) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    previous_branch_commit = progress["units"][0]["commit"]
+    subprocess.run(
+        ["git", "branch", "sikula/delivery/amend-demo", previous_branch_commit],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    preview = preview_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert preview.ready is True
+    assert result.applied is True
+    amendment_commit = subprocess.run(
+        ["git", "rev-parse", "sikula/delivery/amend-demo"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", f"{amendment_commit}^"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == proposal.source_assembled_commit
+    )
+
+
+def test_repeated_apply_blocks_checked_out_branch_when_recovery_requires_commit(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+    subprocess.run(
+        ["git", "checkout", "-b", "sikula/delivery/amend-demo", proposal.source_assembled_commit],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    preview = preview_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert preview.ready is False
+    assert [issue.code for issue in preview.errors] == ["delivery.assembly_branch_checked_out"]
+
+
+def test_repeated_apply_allows_checked_out_branch_when_artifact_commit_is_current(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    first = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+    assert first.applied is True
+    worktree = tmp_path.parent / f"{tmp_path.name}-final-branch"
+    subprocess.run(
+        ["git", "worktree", "add", str(worktree), "sikula/delivery/amend-demo"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    try:
+        preview = preview_delivery_amendment(
+            plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+        )
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=tmp_path, check=True)
+
+    assert preview.ready is True
+    assert preview.errors == []
+
+
+def test_repeated_apply_rejects_descendant_that_changes_amendment_artifact(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    first = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+    assert first.applied is True
+    replacement = proposal.replacement_units[0]
+    worktree = tmp_path.parent / f"{tmp_path.name}-changed-final-branch"
+    subprocess.run(
+        ["git", "worktree", "add", str(worktree), "sikula/delivery/amend-demo"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    try:
+        changed_path = worktree / replacement.task_path
+        changed_path.write_text("changed after amendment\n", encoding="utf-8")
+        subprocess.run(["git", "add", "--", replacement.task_path], cwd=worktree, check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Sikula Test",
+                "-c",
+                "user.email=sikula@example.test",
+                "commit",
+                "-m",
+                "change amendment artifact",
+            ],
+            cwd=worktree,
+            check=True,
+            capture_output=True,
+        )
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=tmp_path, check=True)
+
+    preview = preview_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert preview.ready is False
+    assert [issue.code for issue in preview.errors] == ["delivery_amend.assembly_artifact_missing"]
+
+
+def test_repeated_apply_preserves_unresolved_assembly_failure(tmp_path: Path) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress.update(
+        assembly_status="failed",
+        assembly_base_commit=proposal.source_assembly_base_commit,
+        assembled_commit=proposal.source_assembled_commit,
+        assembly_unit_id="b",
+        assembly_error_code="delivery.assembly_conflict",
+        assembly_updated_at="2026-07-20T10:04:00Z",
+    )
+    progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    progress_before = progress_path.read_bytes()
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery.assembly_conflict"]
+    assert progress_path.read_bytes() == progress_before
+
+
+def test_repeated_apply_rejects_progress_lost_after_proposal(tmp_path: Path) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+    progress_path.unlink()
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.progress_invalid"]
+
+
+def test_repeated_apply_reports_recovery_assembly_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+    monkeypatch.setattr(
+        delivery_amendment_module,
+        "assemble_delivery_artifacts",
+        lambda *_args, **_kwargs: DeliveryArtifactAssemblyResult(
+            success=False,
+            branch="sikula/delivery/amend-demo",
+            parent_commit=proposal.source_assembled_commit,
+            assembled_commit=None,
+            error=DeliveryPlanIssue("error", "delivery.assembly_artifact_git_failed", "Git failed."),
+        ),
+    )
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery.assembly_artifact_git_failed"]
+
+
+@pytest.mark.parametrize("git_error", [False, True])
+def test_repeated_apply_rejects_branch_change_after_recovery_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    git_error: bool,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+
+    def branch_commit(*_args):
+        if git_error:
+            raise OSError("git unavailable")
+        return None
+
+    monkeypatch.setattr(delivery_amendment_module, "delivery_branch_commit", branch_commit)
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery.assembly_branch_diverged"]
+
+
+def test_repeated_apply_reports_success_event_reconciliation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    first = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+    assert first.applied is True
+    events_path = delivery_events_path(tmp_path, proposal.plan_id)
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    events_path.write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in events if event["event_type"] != "plan.amended"),
+        encoding="utf-8",
+    )
+
+    def fail_events(*_args, **_kwargs):
+        raise OSError("event log unavailable")
+
+    monkeypatch.setattr(delivery_amendment_module, "append_delivery_progress_events", fail_events)
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.event_write_failed"]
+
+
+@pytest.mark.parametrize("malformed_history", [b"\xff\n", b"\xff\n{"])
+def test_repeated_apply_rejects_malformed_event_history(tmp_path: Path, malformed_history: bytes) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    first = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+    assert first.applied is True
+    delivery_events_path(tmp_path, proposal.plan_id).write_bytes(malformed_history)
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.events_invalid"]
+
+
+def test_repeated_apply_recovers_truncated_final_success_event(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    first = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+    assert first.applied is True
+    events_path = delivery_events_path(tmp_path, proposal.plan_id)
+    lines = events_path.read_bytes().splitlines(keepends=True)
+    events_path.write_bytes(b"".join(lines[:-1]) + lines[-1][: len(lines[-1]) // 2])
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is True
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["event_type"] for event in events].count("plan.amended") == 1
+    assert events_path.read_bytes().endswith(b"\n")
+
+
+def test_repeated_apply_restores_truncated_event_when_reconciliation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    first = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+    assert first.applied is True
+    events_path = delivery_events_path(tmp_path, proposal.plan_id)
+    lines = events_path.read_bytes().splitlines(keepends=True)
+    truncated = b"".join(lines[:-1]) + lines[-1][: len(lines[-1]) // 2]
+    events_path.write_bytes(truncated)
+
+    def fail_events(*_args, **_kwargs):
+        raise OSError("event log unavailable")
+
+    monkeypatch.setattr(delivery_amendment_module, "append_delivery_progress_events", fail_events)
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.event_write_failed"]
+    assert events_path.read_bytes() == truncated
+
+
+def test_prepare_rejects_replacement_path_already_present_only_in_final_branch(tmp_path: Path) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    operator_branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", "-b", "sikula/delivery/amend-demo"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    conflict_path = plan_path.parent / "units" / "c-1.md"
+    conflict_path.write_text("existing assembly artifact\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", conflict_path.relative_to(tmp_path).as_posix()],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Sikula Test",
+            "-c",
+            "user.email=sikula@example.test",
+            "commit",
+            "-m",
+            "existing assembly artifact",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    branch_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", operator_branch], cwd=tmp_path, check=True, capture_output=True)
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress.update(
+        assembly_base_commit=progress["units"][0]["commit"],
+        assembled_commit=branch_commit,
+        assembly_status="ready",
+        assembly_updated_at="2026-07-20T10:01:30Z",
+    )
+    progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    plan_before = plan_path.read_bytes()
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        create_delivery_amendment_proposal(plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root)
+
+    assert exc_info.value.issue.code == "delivery.assembly_artifact_conflict"
+    assert plan_path.read_bytes() == plan_before
+    assert not conflict_path.exists()
+    assert not list(proposal_root.rglob("*.json"))
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == branch_commit
+    )
+
+
+@pytest.mark.parametrize("stale_artifact", ["plan", "retained_contract"])
+def test_prepare_rejects_stale_source_artifact_in_final_branch(tmp_path: Path, stale_artifact: str) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    operator_branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "add", plan_path.parent.relative_to(tmp_path).as_posix()],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        _git_with_identity("commit", "-m", "track delivery sources"),
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "-b", "sikula/delivery/amend-demo"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    if stale_artifact == "plan":
+        stale_path = plan_path
+        stale_plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+        stale_plan["title"] = "Stale assembly plan"
+        stale_path.write_text(yaml.safe_dump(stale_plan, sort_keys=False), encoding="utf-8")
+    else:
+        stale_path = plan_path.parent / "units" / "a.md"
+        stale_path.write_text("stale retained contract\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", stale_path.relative_to(tmp_path).as_posix()],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        _git_with_identity("commit", "-m", "change assembly plan"),
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    stale_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", operator_branch], cwd=tmp_path, check=True, capture_output=True)
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress.update(
+        assembly_base_commit=progress["units"][0]["commit"],
+        assembled_commit=stale_commit,
+        assembly_status="ready",
+        assembly_updated_at="2026-07-20T10:01:30Z",
+    )
+    progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    plan_before = plan_path.read_bytes()
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        create_delivery_amendment_proposal(plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root)
+
+    assert exc_info.value.issue.code == "delivery.assembly_artifact_stale"
+    assert plan_path.read_bytes() == plan_before
+    assert not list(proposal_root.rglob("*.json"))
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == stale_commit
+    )
+
+
 def test_prepare_rejects_non_pending_downstream_unit(tmp_path: Path) -> None:
     plan_path, progress_path, _ = _setup(tmp_path)
     progress = json.loads(progress_path.read_text(encoding="utf-8"))
@@ -472,6 +1671,26 @@ def test_prepare_rejects_non_pending_downstream_unit(tmp_path: Path) -> None:
         inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
 
     assert exc_info.value.issue.code == "delivery_amend.downstream_state_unsafe"
+
+
+def test_prepare_allows_checked_out_final_branch_but_apply_preview_blocks_mutation(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    subprocess.run(
+        ["git", "checkout", "-b", "sikula/delivery/amend-demo"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    preview = preview_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert preview.ready is False
+    assert [issue.code for issue in preview.errors] == ["delivery.assembly_branch_checked_out"]
 
 
 def test_prepare_rejects_unknown_target(tmp_path: Path) -> None:
@@ -613,6 +1832,125 @@ def test_amend_prepare_rejects_target_under_configured_private_root_before_autho
     assert author_called is False
     assert [issue["code"] for issue in payload["errors"]] == ["delivery_amend.target_task_forbidden"]
     assert "configured private task content" not in json.dumps(payload)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlink support")
+@pytest.mark.parametrize("unit_id", ["a", "c"])
+def test_amend_prepare_rejects_symlink_contract_before_authoring(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    unit_id: str,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    contract_path = plan_path.parent / "units" / f"{unit_id}.md"
+    source_path = contract_path.with_suffix(".source.md")
+    contract_path.rename(source_path)
+    contract_path.symlink_to(source_path.name)
+    author_called = False
+
+    def author(**kwargs):
+        nonlocal author_called
+        author_called = True
+        return _draft()
+
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        split_unit="c",
+        json=True,
+        agent_model=None,
+        agent_provider=None,
+        agent_timeout=None,
+    )
+    cfg = {
+        **_project_config(tmp_path),
+        "tasks": {"contract_report_dir": str(proposal_root)},
+    }
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_amend_prepare(args, cfg, DeliveryAmendPrepareContext(author))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert author_called is False
+    assert [issue["code"] for issue in payload["errors"]] == ["delivery_amend.source_contract_unsafe"]
+    assert not list(proposal_root.rglob("*.json"))
+
+
+@pytest.mark.parametrize(
+    "attribute_pattern",
+    [
+        ".sikula/delivery/demo/units/a.md",
+        ".sikula/delivery/demo/units/c-*.md",
+    ],
+)
+def test_amend_prepare_rejects_filtered_contract_before_storing_proposal(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    attribute_pattern: str,
+) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    (tmp_path / ".gitattributes").write_text(f"{attribute_pattern} filter=blocked\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", ".gitattributes", plan_path.parent.relative_to(tmp_path).as_posix()],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        _git_with_identity("commit", "-m", "track filtered delivery sources"),
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "branch", "sikula/delivery/amend-demo", source_commit],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress.update(
+        assembly_base_commit=progress["units"][0]["commit"],
+        assembled_commit=source_commit,
+        assembly_status="ready",
+        assembly_updated_at="2026-07-20T10:02:00Z",
+    )
+    progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    author_called = False
+
+    def author(**kwargs):
+        nonlocal author_called
+        author_called = True
+        return _draft()
+
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        split_unit="c",
+        json=True,
+        agent_model=None,
+        agent_provider=None,
+        agent_timeout=None,
+    )
+    cfg = {
+        **_project_config(tmp_path),
+        "tasks": {"contract_report_dir": str(proposal_root)},
+    }
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_amend_prepare(args, cfg, DeliveryAmendPrepareContext(author))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert author_called is True
+    assert [issue["code"] for issue in payload["errors"]] == ["delivery.assembly_artifact_filter_unsupported"]
+    assert not list(proposal_root.rglob("*.json"))
 
 
 def test_amend_prepare_rejects_target_symlink_race_before_model_read(
@@ -807,7 +2145,7 @@ def test_prepare_rejects_preexisting_replacement_task_path(
     assert not list(proposal_root.rglob("*.json"))
 
 
-@pytest.mark.parametrize("changed_source", ["plan", "target_task", "progress"])
+@pytest.mark.parametrize("changed_source", ["plan", "target_task", "retained_contract", "progress"])
 def test_prepare_rechecks_source_fingerprints_at_publish_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -815,6 +2153,7 @@ def test_prepare_rechecks_source_fingerprints_at_publish_boundary(
 ) -> None:
     plan_path, progress_path, proposal_root = _setup(tmp_path)
     target_task = plan_path.parent / "units" / "c.md"
+    retained_contract = plan_path.parent / "units" / "a.md"
     real_readiness = delivery_amendment_module._replacement_contract_readiness_errors
 
     def check_readiness_then_edit(*args, **kwargs):
@@ -826,6 +2165,11 @@ def test_prepare_rechecks_source_fingerprints_at_publish_boundary(
         elif changed_source == "target_task":
             target_task.write_text(
                 target_task.read_text(encoding="utf-8") + "\n- Changed during proposal preparation.\n",
+                encoding="utf-8",
+            )
+        elif changed_source == "retained_contract":
+            retained_contract.write_text(
+                retained_contract.read_text(encoding="utf-8") + "\n- Changed during proposal preparation.\n",
                 encoding="utf-8",
             )
         else:
@@ -853,6 +2197,7 @@ def test_prepare_rechecks_source_fingerprints_at_publish_boundary(
     expected_code = {
         "plan": "delivery_amend.plan_stale",
         "target_task": "delivery_amend.target_task_stale",
+        "retained_contract": "delivery_amend.retained_contract_stale",
         "progress": "delivery_amend.progress_stale",
     }[changed_source]
     assert exc_info.value.issue.code == expected_code
@@ -895,6 +2240,77 @@ def test_prepare_removes_proposal_when_inputs_change_during_publication(
         "replacement_path": "delivery_amend.replacement_task_conflict",
     }[changed_input]
     assert exc_info.value.issue.code == expected_code
+    assert not list(proposal_root.rglob("*.json"))
+
+
+def test_prepare_removes_proposal_when_assembly_advances_during_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    assembled_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "branch", "sikula/delivery/amend-demo", assembled_commit],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress.update(
+        assembly_status="ready",
+        assembly_base_commit=assembled_commit,
+        assembled_commit=assembled_commit,
+    )
+    progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    real_write = delivery_amendment_module._write_new_proposal
+
+    def write_then_advance_assembly(path, proposal):
+        real_write(path, proposal)
+        tree = subprocess.run(
+            ["git", "rev-parse", f"{assembled_commit}^{{tree}}"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        concurrent_commit = subprocess.run(
+            _git_with_identity("commit-tree", tree, "-p", assembled_commit, "-m", "concurrent assembly"),
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            [
+                "git",
+                "update-ref",
+                "refs/heads/sikula/delivery/amend-demo",
+                concurrent_commit,
+                assembled_commit,
+            ],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+
+    monkeypatch.setattr(delivery_amendment_module, "_write_new_proposal", write_then_advance_assembly)
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        create_delivery_amendment_proposal(
+            plan_path,
+            "c",
+            _draft(),
+            project_root=tmp_path,
+            proposal_root=proposal_root,
+        )
+
+    assert exc_info.value.issue.code == "delivery_amend.assembly_stale"
     assert not list(proposal_root.rglob("*.json"))
 
 
@@ -985,6 +2401,47 @@ def test_preview_rechecks_replacement_contract_readiness_with_current_config(tmp
     assert result.errors[0].path == ".sikula/delivery/demo/units/c-1.md"
 
 
+@pytest.mark.parametrize("changed_output", ["plan", "rewired_ids"])
+def test_apply_rejects_recomputed_output_that_differs_from_proposal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_output: str,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    plan_before = plan_path.read_bytes()
+    real_amended_plan_data = delivery_amendment_module._amended_plan_data
+
+    def changed_amended_plan_data(*args, **kwargs):
+        plan_data, rewired_ids = real_amended_plan_data(*args, **kwargs)
+        if changed_output == "plan":
+            plan_data["title"] = "Changed replay output"
+        else:
+            rewired_ids = [*rewired_ids, "unexpected-unit"]
+        return plan_data, rewired_ids
+
+    monkeypatch.setattr(delivery_amendment_module, "_amended_plan_data", changed_amended_plan_data)
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.proposal_output_mismatch"]
+    assert plan_path.read_bytes() == plan_before
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "refs/heads/sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+
+
 def test_apply_supports_plan_valid_target_id_with_spaces(tmp_path: Path) -> None:
     plan_path, progress_path, proposal_root = _setup(tmp_path)
     plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
@@ -1015,6 +2472,10 @@ def test_preview_is_no_write_and_uses_stored_exact_proposal(tmp_path: Path) -> N
         plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
     )
     before = _snapshot(tmp_path)
+    refs_before = subprocess.run(["git", "show-ref"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout
+    objects_before = subprocess.run(
+        ["git", "count-objects", "-v"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout
 
     result = preview_delivery_amendment(
         plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
@@ -1024,6 +2485,14 @@ def test_preview_is_no_write_and_uses_stored_exact_proposal(tmp_path: Path) -> N
     assert result.dry_run is True
     assert result.applied is False
     assert _snapshot(tmp_path) == before
+    assert (
+        subprocess.run(["git", "show-ref"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout
+        == refs_before
+    )
+    assert (
+        subprocess.run(["git", "count-objects", "-v"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout
+        == objects_before
+    )
     assert not delivery_events_path(tmp_path, "amend-demo").exists()
 
 
@@ -1194,6 +2663,31 @@ def test_preview_rejects_stale_target_task_fingerprint(tmp_path: Path) -> None:
     assert [issue.code for issue in result.errors] == ["delivery_amend.target_task_stale"]
 
 
+def test_preview_rejects_changed_parent_missing_retained_contract(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    retained_contract = plan_path.parent / "units" / "a.md"
+    retained_contract.write_bytes(retained_contract.read_bytes() + b"\n- Added after prepare.\n")
+
+    result = preview_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.ready is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.retained_contract_stale"]
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "refs/heads/sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+
+
 def test_mutating_apply_records_failed_event_for_stale_progress(tmp_path: Path) -> None:
     plan_path, progress_path, proposal_root = _setup(tmp_path)
     proposal, _ = create_delivery_amendment_proposal(
@@ -1261,7 +2755,7 @@ def test_mutating_apply_records_failed_event_when_target_becomes_running(tmp_pat
     assert events[-1]["failure_code"] == "delivery_amend.target_running"
 
 
-def test_repeated_apply_records_failure_without_duplicate_success_events(tmp_path: Path) -> None:
+def test_repeated_apply_is_idempotent_without_duplicate_success_events(tmp_path: Path) -> None:
     plan_path, _, proposal_root = _setup(tmp_path)
     proposal, _ = create_delivery_amendment_proposal(
         plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
@@ -1275,13 +2769,206 @@ def test_repeated_apply_records_failure_without_duplicate_success_events(tmp_pat
     )
 
     assert first.applied is True
-    assert second.applied is False
-    assert [issue.code for issue in second.errors] == ["delivery_amend.target_superseded"]
+    assert second.applied is True
+    assert second.errors == []
     events = [json.loads(line) for line in delivery_events_path(tmp_path, "amend-demo").read_text().splitlines()]
     event_types = [event["event_type"] for event in events]
     assert event_types.count("plan.amended") == 1
-    assert event_types[-2:] == ["plan.amend_started", "plan.amend_failed"]
-    assert events[-1]["failure_code"] == "delivery_amend.target_superseded"
+    assert event_types.count("plan.amend_started") == 1
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "source_plan_blob_id",
+        "retained_contract_fingerprints",
+        "source_assembly_base_commit",
+        "source_assembled_commit",
+        "amended_plan_fingerprint",
+    ],
+)
+def test_load_rejects_proposal_without_required_assembly_metadata(tmp_path: Path, missing_field: str) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    proposal, proposal_path = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    payload = json.loads(proposal_path.read_text(encoding="utf-8"))
+    payload.pop(missing_field)
+    proposal_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        delivery_amendment_module.load_delivery_amendment_proposal(
+            proposal_path,
+            expected_proposal_id=proposal.proposal_id,
+            project_root=tmp_path,
+        )
+
+    assert exc_info.value.issue.code == "delivery_amend.proposal_invalid"
+
+
+def test_apply_normalizes_and_deduplicates_shared_contract_paths(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    plan_data = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    shared_path = plan_data["units"][0]["task_path"]
+    plan_data["units"][-1]["task_path"] = f"./{shared_path}"
+    plan_path.write_text(yaml.safe_dump(plan_data, sort_keys=False), encoding="utf-8")
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    result = apply_delivery_amendment(
+        plan_path,
+        proposal.proposal_id,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+    )
+
+    assert result.applied is True
+    assembled_commit = json.loads(delivery_progress_path(tmp_path, proposal.plan_id).read_text(encoding="utf-8"))[
+        "assembled_commit"
+    ]
+    assert _commit_content_id(tmp_path, assembled_commit, shared_path) == _filtered_content_id(
+        tmp_path, shared_path, (tmp_path / shared_path).read_bytes()
+    )
+
+
+def test_amendment_anchors_legacy_branch_behind_head_to_head(tmp_path: Path) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    stale_branch_commit = progress["units"][0]["commit"]
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "branch", "sikula/delivery/amend-demo", stale_branch_commit],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path,
+        "c",
+        _draft(),
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+    )
+    result = apply_delivery_amendment(
+        plan_path,
+        proposal.proposal_id,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+    )
+
+    assert proposal.source_assembly_base_commit == head
+    assert proposal.source_assembled_commit == head
+    assert result.applied is True
+    amended_commit = subprocess.run(
+        ["git", "rev-parse", "sikula/delivery/amend-demo"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", f"{amended_commit}^"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == head
+    )
+
+
+def test_amendment_rejects_unrecorded_final_branch_with_unrelated_history(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    empty_tree = subprocess.run(
+        ["git", "mktree"],
+        cwd=tmp_path,
+        check=True,
+        input="",
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    unrelated_commit = subprocess.run(
+        _git_with_identity("commit-tree", empty_tree, "-m", "unrelated"),
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "branch", "sikula/delivery/amend-demo", unrelated_commit],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        create_delivery_amendment_proposal(
+            plan_path,
+            "c",
+            _draft(),
+            project_root=tmp_path,
+            proposal_root=proposal_root,
+        )
+
+    assert exc_info.value.issue.code == "delivery.assembly_branch_diverged"
+    assert not list(proposal_root.rglob("*.json"))
+
+
+def test_apply_preserves_unresolved_assembly_failure(tmp_path: Path) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path,
+        "c",
+        _draft(),
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "branch", "sikula/delivery/amend-demo", head],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress.update(
+        assembly_status="failed",
+        assembly_base_commit=head,
+        assembled_commit=head,
+        assembly_unit_id="b",
+        assembly_error_code="delivery.assembly_conflict",
+        assembly_updated_at="2026-07-20T10:04:00Z",
+    )
+    progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    progress_before = progress_path.read_bytes()
+    plan_before = plan_path.read_bytes()
+
+    result = apply_delivery_amendment(
+        plan_path,
+        proposal.proposal_id,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery.assembly_conflict"]
+    assert progress_path.read_bytes() == progress_before
+    assert plan_path.read_bytes() == plan_before
 
 
 @pytest.mark.parametrize(
@@ -1411,7 +3098,9 @@ def test_failed_target_child_state_remains_inspectable_after_supersession(tmp_pa
     )
 
     assert result.applied is True
-    assert json.loads(progress_path.read_text(encoding="utf-8")) == progress_before
+    progress_after = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert progress_after["units"] == progress_before["units"]
+    assert progress_after["assembly_status"] == "ready"
     target = next(unit for unit in get_delivery_status(plan_path).units if unit.id == "c")
     assert target.status == "superseded"
     assert target.child_task_id == "task-c"
@@ -1926,7 +3615,7 @@ def test_amend_prepare_cli_reports_git_execution_failure(
     def fail_git(*args, **kwargs):
         raise OSError("git executable unavailable")
 
-    monkeypatch.setattr(delivery_amendment_module.subprocess, "run", fail_git)
+    monkeypatch.setattr(worktree_module.subprocess, "run", fail_git)
     args = argparse.Namespace(
         plan_file=str(plan_path),
         split_unit="c",
@@ -2866,6 +4555,160 @@ def test_apply_restores_tracked_artifacts_when_success_event_batch_fails(
     assert plan_path.read_bytes() == plan_before
     assert progress_path.read_bytes() == progress_before
     assert not any((plan_path.parent / "units" / f"{unit_id}.md").exists() for unit_id in proposal.replacement_ids)
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "refs/heads/sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+    events = [json.loads(line) for line in delivery_events_path(tmp_path, "amend-demo").read_text().splitlines()]
+    assert [event["event_type"] for event in events] == ["plan.amend_started", "plan.amend_failed"]
+
+
+def test_apply_restores_legacy_branch_behind_parent_when_success_events_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    previous_branch_commit = progress["units"][0]["commit"]
+    subprocess.run(
+        ["git", "branch", "sikula/delivery/amend-demo", previous_branch_commit],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    plan_before = plan_path.read_bytes()
+    progress_before = progress_path.read_bytes()
+
+    def fail_events(*args, **kwargs):
+        raise OSError("simulated event write failure")
+
+    monkeypatch.setattr(delivery_amendment_module, "append_delivery_progress_events", fail_events)
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.write_failed"]
+    assert plan_path.read_bytes() == plan_before
+    assert progress_path.read_bytes() == progress_before
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == previous_branch_commit
+    )
+
+
+def test_recovery_restores_branch_progress_and_events_when_event_reconciliation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    _publish_amendment_locally(plan_path, tmp_path, proposal)
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    previous_branch_commit = progress["units"][0]["commit"]
+    subprocess.run(
+        ["git", "branch", "sikula/delivery/amend-demo", previous_branch_commit],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    progress_before = progress_path.read_bytes()
+    events_path = delivery_events_path(tmp_path, "amend-demo")
+
+    def fail_events(*args, **kwargs):
+        raise OSError("simulated event reconciliation failure")
+
+    monkeypatch.setattr(delivery_amendment_module, "append_delivery_progress_events", fail_events)
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.event_write_failed"]
+    assert progress_path.read_bytes() == progress_before
+    assert not events_path.exists()
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == previous_branch_commit
+    )
+
+
+def test_apply_rolls_back_when_final_branch_changes_after_artifact_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    plan_before = plan_path.read_bytes()
+    progress_before = progress_path.read_bytes()
+    monkeypatch.setattr(delivery_amendment_module, "delivery_branch_commit", lambda *_args: None)
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery.assembly_branch_diverged"]
+    assert plan_path.read_bytes() == plan_before
+    assert progress_path.read_bytes() == progress_before
+    assert not any((tmp_path / unit.task_path).exists() for unit in proposal.replacement_units)
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "refs/heads/sikula/delivery/amend-demo"],
+            cwd=tmp_path,
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+
+
+def test_apply_restores_local_artifacts_when_assembly_ref_rollback_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path)
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+    plan_before = plan_path.read_bytes()
+    progress_before = progress_path.read_bytes()
+    monkeypatch.setattr(delivery_amendment_module, "delivery_branch_commit", lambda *_args: None)
+    monkeypatch.setattr(delivery_amendment_module, "rollback_delivery_artifacts", lambda *_args, **_kwargs: False)
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is False
+    assert [issue.code for issue in result.errors] == ["delivery_amend.rollback_failed"]
+    assert plan_path.read_bytes() == plan_before
+    assert progress_path.read_bytes() == progress_before
+    assert not any((tmp_path / unit.task_path).exists() for unit in proposal.replacement_units)
     events = [json.loads(line) for line in delivery_events_path(tmp_path, "amend-demo").read_text().splitlines()]
     assert [event["event_type"] for event in events] == ["plan.amend_started", "plan.amend_failed"]
 
@@ -3012,13 +4855,15 @@ def test_run_next_after_amendment_without_existing_progress(
     assert apply_delivery_amendment(
         plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
     ).applied
-    assert progress_path.exists() is False
+    assert progress_path.exists() is True
+    amendment_commit = json.loads(progress_path.read_text(encoding="utf-8"))["assembled_commit"]
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True
     ).stdout.strip()
     state_dir = tmp_path / ".sikula" / "state"
 
     def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        assert run_args.worktree_start_ref == amendment_commit
         store = JsonStateStore(state_dir)
         state = store.create("replacement child")
         store.save(state)
@@ -3083,4 +4928,4 @@ def test_run_next_and_finalize_use_effective_amended_graph(tmp_path: Path) -> No
     assert next(unit for unit in status.units if unit.id == "c").status == "superseded"
     finalize = preview_delivery_finalize(plan_path, project_root=tmp_path)
     assert finalize.ready is True
-    assert finalize.final_commit == head
+    assert finalize.final_commit == progress["assembled_commit"]

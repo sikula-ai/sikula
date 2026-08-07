@@ -193,7 +193,10 @@ split proposal.
 Successful new units produce fingerprinted handoffs for dependent units.
 `run-next` assembles completed result commits into `final_branch` in dependency
 order and starts subsequent child worktrees from the assembled commit without
-changing the operator checkout. `delivery run` repeatedly invokes that same
+changing the operator checkout. Delivery amendments validate completed
+dependencies against that assembly and commit the updated plan and replacement
+contracts directly to `final_branch`, so prepare, apply, and continued execution
+do not require a helper checkout. `delivery run` repeatedly invokes that same
 one-unit path, stops on the first blocker or failure, and automatically
 finalizes a completed plan. By default it is bounded to the active units that
 exist when the command starts; `--max-units` and the between-unit soft

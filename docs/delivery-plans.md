@@ -208,8 +208,8 @@ Prepare stores a normalized, content-addressed proposal under
 `.sikula/contract-reports/delivery-amendments/<plan-id>/`. The proposal includes
 the project-relative source plan path, exact replacement definitions and task
 Markdown, plus fingerprints of the source plan, selected target task contract,
-and sanitized parent progress. Raw prompts and provider output stay in the
-separate local authoring audit. Sikula
+sanitized parent progress, and the exact delivery assembly base and head. Raw
+prompts and provider output stay in the separate local authoring audit. Sikula
 captures those fingerprints before invoking the assistant and discards the
 draft if any input changes before proposal storage. Prepare rechecks the source
 fingerprints and deterministic replacement paths before and after publication;
@@ -228,7 +228,9 @@ are read or sent to the authoring model. The authoring boundary validates the
 task location before and after reading and requires its bytes to match the
 captured snapshot before constructing the model request. Prepare does not modify
 the tracked plan, unit files, progress, events, child task state, worktrees,
-branches, or Git refs.
+branches, or Git refs. Completed prerequisite commits are checked against the
+plan's assembled `final_branch`, not the operator's current `HEAD`, so prepare
+does not require a helper branch containing earlier unit commits.
 
 `amend apply --dry-run` loads the exact stored proposal and performs the complete
 deterministic preflight in memory. It invokes no LLM and writes no proposal,
@@ -247,6 +249,33 @@ the delivery progress lock also returns a structured blocked result. External
 checkout mutation during mutating apply is unsupported; the delivery lock
 serializes cooperating Sikula operations.
 
+Successful apply creates one bounded artifact commit directly on
+`final_branch`. The commit is based on the validated assembled delivery head and
+changes only the paths needed to publish the updated plan and a complete,
+byte-verified snapshot of every contract referenced by that plan. Content is
+stored through clean conversion defined by the assembly parent's
+`.gitattributes`, not the operator checkout. The proposal records the canonical
+source-plan blob ID used by interrupted recovery, and existing tracked file
+modes are preserved. Named Git `filter` attributes are rejected before prepare,
+preview, or apply can execute an external filter command; built-in `text` and
+`eol` conversion remains supported. Git plumbing uses a temporary index and a
+compare-and-swap direct-ref update, so the
+operator's checkout, `HEAD`, and index are not changed. Parent progress records
+the resulting assembled commit before replacement work can start, and the
+`plan.amended` event records the branch and commit. A failed transaction restores
+progress, tracked artifacts, and newly appended events; it restores the ref only
+while the compare-and-swap guard proves that no competing update would be
+overwritten. Repeating apply for the same proposal is idempotent: Sikula verifies
+the exact local file bytes and proposal-specific artifact commit, completes a
+missing artifact integration, or repairs a missing assembly checkpoint or
+success event without creating a duplicate commit. Missing progress can be
+reconstructed only for an interruption immediately after the matching durable
+`plan.amend_started` event; any later delivery event makes recovery fail closed.
+Repeated contract references are resolved to canonical project-relative Git
+paths and coalesced.
+Dry-run performs the same
+preflight but creates no Git objects or refs.
+
 Completed units are immutable. Running units must first be resumed or
 reconciled. A failed unit may be superseded while its original progress,
 failure metadata, and child task link remain inspectable. The tracked plan keeps
@@ -255,7 +284,8 @@ adds `supersedes` to each replacement. Pending direct dependents are rewired fro
 the target to all replacement leaves. Replacement roots retain all active target
 prerequisites; persisted or imported amendment metadata that weakens that
 ordering is invalid. Missing references, cycles, path collisions, non-pending
-downstream state, unapplied completed prerequisite commits, and any
+downstream state, completed prerequisite commits absent from the delivery
+assembly, and any
 completed-unit change fail closed.
 
 Optional `amend_reason` and `budget_exceeded.name` metadata use stable codes,
