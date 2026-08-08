@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Antigravity Usage Metrics**: Antigravity calls now consume the CLI's structured JSON result and contribute explicit input, output, total, and cache-read token counts to provider-neutral usage records. The minimum supported Antigravity CLI version is now 1.1.8.
 - **Run Invocation Config Evidence**: New task states record the effective configuration of every actual run or resume invocation, while legacy states remain explicitly distinguishable so downstream audit and metrics tooling cannot treat partial configuration history as complete.
 - **Delivery Usage Observability**: Task completion and delivery status now report provider invocation attempts, failed attempts, measured provider time, content-free input/output sizes, and explicit provider-reported token usage when available, without estimating missing tokens or monetary cost.
 - **Bounded Delivery Execution**: Added `sikula delivery run` to execute current plan units one at a time through the existing `run-next` path, optionally retry the current failed child once with explicit `--reset-failed`, stop safely at explicit unit or elapsed limits and operational blockers, and automatically finalize completed plans.

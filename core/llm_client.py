@@ -2575,7 +2575,7 @@ _ANTIGRAVITY_GENERATED_SOURCE_SUFFIXES = (
 _ANTIGRAVITY_LOG_DIAGNOSTIC_BYTES = 65536
 _ANTIGRAVITY_LOG_DIAGNOSTIC_LINES = 6
 _ANTIGRAVITY_LOG_DIAGNOSTIC_LINE_CHARS = 500
-_ANTIGRAVITY_MIN_VERSION = (1, 0, 13)
+_ANTIGRAVITY_MIN_VERSION = (1, 1, 8)
 _ANTIGRAVITY_LOG_DIAGNOSTIC_MARKERS = (
     "401",
     "api key",
@@ -2670,11 +2670,84 @@ class _AntigravityCopyPolicy:
     gitlink_paths: frozenset[str]
 
 
-def _antigravity_parse_text(output: str, context: str) -> str:
-    text = output.strip()
-    if not text:
-        raise LLMTransientError(f"antigravity {context} error: returned no text output")
-    return text
+@dataclass(frozen=True)
+class _AntigravityResultEnvelope:
+    status: str
+    response: str
+    reported_tokens: dict[str, int] | None
+
+
+def _antigravity_reported_tokens(usage: object) -> dict[str, int]:
+    """Normalize explicit Antigravity usage into Sikula's shared token fields."""
+    if not isinstance(usage, dict):
+        return {}
+    reported: dict[str, int] = {}
+    for source_key, target_key in (
+        ("input_tokens", "input_tokens"),
+        ("output_tokens", "output_tokens"),
+        ("cache_read_tokens", "cached_input_tokens"),
+        ("total_tokens", "total_tokens"),
+    ):
+        value = usage.get(source_key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            reported[target_key] = value
+    return reported
+
+
+def _antigravity_result_payload(output: str) -> dict[str, object] | None:
+    try:
+        payload = json.loads(output)
+    except (ValueError, RecursionError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _antigravity_result_observation(output: str) -> tuple[int | None, dict[str, int] | None]:
+    payload = _antigravity_result_payload(output)
+    if payload is None:
+        return None, None
+    response = payload.get("response")
+    output_chars = len(response.strip()) if isinstance(response, str) else None
+    reported_tokens = _antigravity_reported_tokens(payload.get("usage"))
+    return output_chars, reported_tokens or None
+
+
+def _antigravity_result_envelope(
+    output: str,
+    context: str,
+    *,
+    allow_empty_response: bool = False,
+    log_diagnostic: str = "",
+) -> _AntigravityResultEnvelope:
+    payload = _antigravity_result_payload(output)
+    if payload is None:
+        raise LLMTransientError(f"antigravity {context} error: invalid JSON result envelope")
+
+    status = payload.get("status")
+    response = payload.get("response")
+    text = response.strip() if isinstance(response, str) else ""
+    reported_tokens = _antigravity_reported_tokens(payload.get("usage")) or None
+    if not isinstance(status, str) or status != "SUCCESS":
+        diagnostic = log_diagnostic.strip()
+        error = (
+            _provider_error("antigravity", context, f"log diagnostic:\n{diagnostic}")
+            if diagnostic
+            else LLMTransientError(f"antigravity {context} error: unsuccessful structured result")
+        )
+        error.output_chars = len(text)
+        error.reported_tokens = reported_tokens
+        raise error
+    if not text and (not allow_empty_response or not isinstance(response, str)):
+        raise LLMTransientError(
+            f"antigravity {context} error: returned no text output",
+            output_chars=0,
+            reported_tokens=reported_tokens,
+        )
+    return _AntigravityResultEnvelope(
+        status=status,
+        response=text,
+        reported_tokens=reported_tokens,
+    )
 
 
 def _antigravity_redact_diagnostic(text: str) -> str:
@@ -2791,6 +2864,13 @@ def _antigravity_result_error(
     operation: str,
     log_diagnostic: str = "",
 ) -> LLMProviderError:
+    output_chars, reported_tokens = _antigravity_result_observation(result.stdout or "")
+
+    def _observed(error: LLMProviderError) -> LLMProviderError:
+        error.output_chars = output_chars
+        error.reported_tokens = reported_tokens
+        return error
+
     stderr = (result.stderr or "").strip()
     log_diagnostic = log_diagnostic.strip()
     if stderr:
@@ -2800,13 +2880,15 @@ def _antigravity_result_error(
             combined_error = _provider_error("antigravity", operation, combined)
             stderr_error = _provider_error("antigravity", operation, safe_stderr)
             if isinstance(combined_error, LLMFatalError) and not isinstance(stderr_error, LLMFatalError):
-                return combined_error
-        return _provider_error("antigravity", operation, safe_stderr)
+                return _observed(combined_error)
+        return _observed(_provider_error("antigravity", operation, safe_stderr))
     if log_diagnostic:
-        return _provider_error("antigravity", operation, f"log diagnostic:\n{log_diagnostic}")
+        return _observed(_provider_error("antigravity", operation, f"log diagnostic:\n{log_diagnostic}"))
     if (result.stdout or "").strip():
-        return LLMTransientError(f"antigravity {operation} error: non-zero exit with stdout but no safe diagnostic")
-    return LLMTransientError(f"antigravity {operation} error: non-zero exit")
+        return _observed(
+            LLMTransientError(f"antigravity {operation} error: non-zero exit with stdout but no safe diagnostic")
+        )
+    return _observed(LLMTransientError(f"antigravity {operation} error: non-zero exit"))
 
 
 def _antigravity_git_paths(cwd: Path, args: list[str]) -> set[str] | None:
@@ -3218,7 +3300,7 @@ def _antigravity_require_supported_version() -> None:
 
 
 class AntigravityClient(LLMClient):
-    """Calls Antigravity via the `agy --print -` CLI.
+    """Calls Antigravity via the structured `agy --output-format json --print -` CLI.
 
     Antigravity CLI does not expose a verified non-interactive read-only mode.
     Read-only calls therefore run against a disposable workspace copy and reject
@@ -3260,6 +3342,8 @@ class AntigravityClient(LLMClient):
                 str(log_file),
                 "--print-timeout",
                 f"{timeout}s",
+                "--output-format",
+                "json",
                 "--print",
                 "-",
             ]
@@ -3292,7 +3376,16 @@ class AntigravityClient(LLMClient):
                 log_diagnostic = _antigravity_log_diagnostic(log_file)
             if result.returncode != 0:
                 raise _antigravity_result_error(result, "CLI", log_diagnostic)
-            return _antigravity_parse_text(result.stdout, "CLI")
+            envelope = _antigravity_result_envelope(
+                result.stdout,
+                "CLI",
+                log_diagnostic=log_diagnostic,
+            )
+            return _LLMCallValue(
+                envelope.response,
+                output_chars=len(envelope.response),
+                reported_tokens=envelope.reported_tokens,
+            )
 
         return _call_with_retry("generate", _call, self._config, "generate", input_chars=len(prompt))
 
@@ -3324,9 +3417,23 @@ class AntigravityClient(LLMClient):
                     raise _antigravity_result_error(result, "agent", log_diagnostic)
                 after = _antigravity_directory_snapshot(workspace, copy_policy)
                 if _antigravity_snapshot_changed(before, after):
-                    raise LLMTransientError("antigravity read-only agent attempted to modify its disposable workspace")
-                output = _antigravity_parse_text(result.stdout, "agent")
-                return _antigravity_sanitize_readonly_output(output, workspace)
+                    output_chars, reported_tokens = _antigravity_result_observation(result.stdout)
+                    raise LLMTransientError(
+                        "antigravity read-only agent attempted to modify its disposable workspace",
+                        output_chars=output_chars,
+                        reported_tokens=reported_tokens,
+                    )
+                envelope = _antigravity_result_envelope(
+                    result.stdout,
+                    "agent",
+                    log_diagnostic=log_diagnostic,
+                )
+                output = _antigravity_sanitize_readonly_output(envelope.response, workspace)
+                return _LLMCallValue(
+                    output,
+                    output_chars=len(output),
+                    reported_tokens=envelope.reported_tokens,
+                )
 
         return _call_with_retry(
             "read-only agent",
@@ -3368,8 +3475,17 @@ class AntigravityClient(LLMClient):
                 raise _antigravity_result_error(result, "agent", log_diagnostic)
             after = _git_snapshot(workspace)
             changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
-            output = result.stdout.strip()
-            return _LLMCallValue((changed, output), output_chars=len(output))
+            envelope = _antigravity_result_envelope(
+                result.stdout,
+                "agent",
+                allow_empty_response=True,
+                log_diagnostic=log_diagnostic,
+            )
+            return _LLMCallValue(
+                (changed, envelope.response),
+                output_chars=len(envelope.response),
+                reported_tokens=envelope.reported_tokens,
+            )
 
         total = len(_RETRY_DELAYS) + 1
         last_exc: Exception | None = None
