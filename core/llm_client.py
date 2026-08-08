@@ -2712,7 +2712,12 @@ def _antigravity_result_observation(output: str) -> tuple[int | None, dict[str, 
     return output_chars, reported_tokens or None
 
 
-def _antigravity_result_envelope(output: str, context: str) -> _AntigravityResultEnvelope:
+def _antigravity_result_envelope(
+    output: str,
+    context: str,
+    *,
+    allow_empty_response: bool = False,
+) -> _AntigravityResultEnvelope:
     payload = _antigravity_result_payload(output)
     if payload is None:
         raise LLMTransientError(f"antigravity {context} error: invalid JSON result envelope")
@@ -2727,7 +2732,7 @@ def _antigravity_result_envelope(output: str, context: str) -> _AntigravityResul
             output_chars=len(text),
             reported_tokens=reported_tokens,
         )
-    if not text:
+    if not text and (not allow_empty_response or not isinstance(response, str)):
         raise LLMTransientError(
             f"antigravity {context} error: returned no text output",
             output_chars=0,
@@ -3457,7 +3462,11 @@ class AntigravityClient(LLMClient):
                 raise _antigravity_result_error(result, "agent", log_diagnostic)
             after = _git_snapshot(workspace)
             changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
-            envelope = _antigravity_result_envelope(result.stdout, "agent")
+            envelope = _antigravity_result_envelope(
+                result.stdout,
+                "agent",
+                allow_empty_response=True,
+            )
             return _LLMCallValue(
                 (changed, envelope.response),
                 output_chars=len(envelope.response),

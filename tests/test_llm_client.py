@@ -5427,6 +5427,40 @@ class TestAntigravityClientCommands:
             "total_tokens": 15,
         }
 
+    @pytest.mark.parametrize("response", ["", " \r\n"])
+    def test_run_agent_accepts_empty_success_response(self, tmp_path: Path, response: str):
+        events = []
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                usage_observer=events.append,
+            )
+        )
+
+        with (
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {"src/app.ts": "hash"}]),
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                return_value=self._run_result(
+                    response,
+                    usage={"input_tokens": 12, "output_tokens": 0, "total_tokens": 12},
+                ),
+            ) as mock_run,
+        ):
+            changed, output = client.run_agent("prompt", tmp_path)
+
+        assert mock_run.call_count == 1
+        assert changed == ["src/app.ts"]
+        assert output == ""
+        assert events[0]["outcome"] == "success"
+        assert events[0]["output_chars"] == 0
+        assert events[0]["reported_tokens"] == {
+            "input_tokens": 12,
+            "output_tokens": 0,
+            "total_tokens": 12,
+        }
+
     def test_run_agent_rejects_external_symlinks_before_starting_provider(self, tmp_path: Path):
         repo = tmp_path / "repo"
         repo.mkdir()
