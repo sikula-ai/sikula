@@ -2717,6 +2717,7 @@ def _antigravity_result_envelope(
     context: str,
     *,
     allow_empty_response: bool = False,
+    log_diagnostic: str = "",
 ) -> _AntigravityResultEnvelope:
     payload = _antigravity_result_payload(output)
     if payload is None:
@@ -2727,11 +2728,15 @@ def _antigravity_result_envelope(
     text = response.strip() if isinstance(response, str) else ""
     reported_tokens = _antigravity_reported_tokens(payload.get("usage")) or None
     if not isinstance(status, str) or status != "SUCCESS":
-        raise LLMTransientError(
-            f"antigravity {context} error: unsuccessful structured result",
-            output_chars=len(text),
-            reported_tokens=reported_tokens,
+        diagnostic = log_diagnostic.strip()
+        error = (
+            _provider_error("antigravity", context, f"log diagnostic:\n{diagnostic}")
+            if diagnostic
+            else LLMTransientError(f"antigravity {context} error: unsuccessful structured result")
         )
+        error.output_chars = len(text)
+        error.reported_tokens = reported_tokens
+        raise error
     if not text and (not allow_empty_response or not isinstance(response, str)):
         raise LLMTransientError(
             f"antigravity {context} error: returned no text output",
@@ -3371,7 +3376,11 @@ class AntigravityClient(LLMClient):
                 log_diagnostic = _antigravity_log_diagnostic(log_file)
             if result.returncode != 0:
                 raise _antigravity_result_error(result, "CLI", log_diagnostic)
-            envelope = _antigravity_result_envelope(result.stdout, "CLI")
+            envelope = _antigravity_result_envelope(
+                result.stdout,
+                "CLI",
+                log_diagnostic=log_diagnostic,
+            )
             return _LLMCallValue(
                 envelope.response,
                 output_chars=len(envelope.response),
@@ -3414,7 +3423,11 @@ class AntigravityClient(LLMClient):
                         output_chars=output_chars,
                         reported_tokens=reported_tokens,
                     )
-                envelope = _antigravity_result_envelope(result.stdout, "agent")
+                envelope = _antigravity_result_envelope(
+                    result.stdout,
+                    "agent",
+                    log_diagnostic=log_diagnostic,
+                )
                 output = _antigravity_sanitize_readonly_output(envelope.response, workspace)
                 return _LLMCallValue(
                     output,
@@ -3466,6 +3479,7 @@ class AntigravityClient(LLMClient):
                 result.stdout,
                 "agent",
                 allow_empty_response=True,
+                log_diagnostic=log_diagnostic,
             )
             return _LLMCallValue(
                 (changed, envelope.response),

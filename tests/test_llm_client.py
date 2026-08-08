@@ -4747,6 +4747,31 @@ class TestAntigravityClientCommands:
         assert empty.value.output_chars == 0
         assert empty.value.reported_tokens == usage
 
+    @pytest.mark.parametrize(
+        ("diagnostic", "error_type"),
+        [
+            ("ERROR not authenticated", LLMAuthError),
+            ("ERROR quota exceeded", LLMQuotaExceeded),
+            ("ERROR unsupported model", LLMConfigurationError),
+        ],
+    )
+    def test_result_envelope_classifies_unsuccessful_log_diagnostic(
+        self,
+        diagnostic: str,
+        error_type: type[LLMProviderError],
+    ):
+        usage = {"input_tokens": 7, "output_tokens": 2}
+
+        with pytest.raises(error_type, match="log diagnostic") as exc_info:
+            _antigravity_result_envelope(
+                self._result("partial", status="ERROR", usage=usage),
+                "CLI",
+                log_diagnostic=diagnostic,
+            )
+
+        assert exc_info.value.output_chars == len("partial")
+        assert exc_info.value.reported_tokens == usage
+
     def test_diagnostic_helpers_cover_empty_long_json_and_log_limit(self, tmp_path: Path):
         assert _antigravity_marker_text("") is None
         assert _antigravity_marker_text("all good") is None
@@ -5657,6 +5682,42 @@ class TestAntigravityClientCommands:
             "cached_input_tokens": 4,
             "total_tokens": 12,
         }
+
+    def test_generate_classifies_unsuccessful_envelope_log_diagnostic(self):
+        events = []
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                usage_observer=events.append,
+            )
+        )
+        usage = {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+
+        def _fake_run(cmd, **kwargs):
+            log_file = Path(cmd[cmd.index("--log-file") + 1])
+            log_file.write_text("ERROR not authenticated token=supersecret")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                self._result("partial", status="ERROR", usage=usage),
+                "",
+            )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run,
+            pytest.raises(LLMAuthError) as exc_info,
+        ):
+            client.generate("system", "user")
+
+        assert "token=<redacted>" in str(exc_info.value)
+        assert "supersecret" not in str(exc_info.value)
+        assert mock_run.call_count == 1
+        sleep.assert_not_called()
+        assert events[0]["outcome"] == "fatal_error"
+        assert events[0]["output_chars"] == len("partial")
+        assert events[0]["reported_tokens"] == usage
 
     def test_generate_nonzero_exit_uses_antigravity_log_diagnostic(self):
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
