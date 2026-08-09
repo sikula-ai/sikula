@@ -61,6 +61,7 @@ from core.delivery_progress import (
     read_delivery_progress,
     write_delivery_progress,
 )
+from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_FIELDS
 from core.worktree import resolve_git_commit
 
 SUPPORTED_DELIVERY_AMENDMENT_PROPOSAL_SCHEMA_VERSION = 1
@@ -2225,6 +2226,14 @@ def _proposal_unit_from_dict(value: Any) -> DeliveryAmendmentProposalUnit:
         or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in budget.values())
     ):
         raise DeliveryAmendmentError("delivery_amend.proposal_invalid", "Replacement budget is invalid.")
+    normalized_budget = None
+    if budget:
+        normalized_budget = {
+            field_name: budget[field_name] for field_name in DELIVERY_UNIT_BUDGET_FIELDS if field_name in budget
+        }
+        normalized_budget.update(
+            (field_name, value) for field_name, value in budget.items() if field_name not in normalized_budget
+        )
     return DeliveryAmendmentProposalUnit(
         id=_required_id(value, "id"),
         title=_required_string(value, "title"),
@@ -2240,7 +2249,7 @@ def _proposal_unit_from_dict(value: Any) -> DeliveryAmendmentProposalUnit:
         scope_paths=scope_paths,
         estimated_size=_optional_string(value, "estimated_size"),
         risk_tags=risk_tags,
-        budget=dict(budget) if budget else None,
+        budget=normalized_budget,
     )
 
 

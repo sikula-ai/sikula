@@ -486,6 +486,29 @@ def test_proposal_without_downstream_rewiring_round_trips_and_applies(tmp_path: 
     assert result.rewired_unit_ids == []
 
 
+def test_proposal_with_multiple_budget_fields_round_trips_and_applies(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    draft = _draft()
+    draft.replacement_units[0] = replace(
+        draft.replacement_units[0],
+        budget=DeliveryUnitBudget(
+            max_planner_steps=1,
+            max_changed_files=2,
+            max_changed_modules=1,
+            max_generated_test_files=1,
+        ),
+    )
+
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", draft, project_root=tmp_path, proposal_root=proposal_root
+    )
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    assert result.applied is True
+
+
 def test_prepare_stores_replacement_with_declared_component(tmp_path: Path) -> None:
     plan_path, _, proposal_root = _setup(tmp_path)
     _add_plan_component(plan_path, "ApiV2")
