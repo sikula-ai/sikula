@@ -1212,11 +1212,20 @@ No file content is passed in the prompt.
   resolve outside the project root on paths kept by its Antigravity workspace policy.
   Untracked ignored local artifacts such as `.venv` and `node_modules` are pruned so
   ordinary dependency/runtime directories do not block runs; tracked or preserved paths
-  inside soft-ignored directories are still checked. Antigravity CLI does not expose a
-  verified non-interactive read-only permission mode, so read-only calls validate the
-  source project, run against a disposable temporary copy, reject the result if that copy
-  changes, and sanitize temporary paths back to project-relative paths. Write-capable calls
-  run against the task worktree after the same symlink preflight.
+  inside soft-ignored directories are still checked. Read-only calls require Antigravity
+  CLI 1.1.12 or newer. Before an agent turn, Sikula consumes the structured, zero-turn
+  `/hooks` result and fails closed when any workspace, plugin, or global hook is enabled or
+  the effective hook set cannot be verified. Hooks are excluded because their external
+  commands execute outside the plan-mode tool boundary. Sikula creates a disposable custom
+  primary agent with only `view_file`, `list_dir`, `find_by_name`, and `grep_search`, no
+  inherited MCP servers, subagent, skill dependency, plugin dependency, or shell capabilities, and
+  invokes it with `--sandbox --mode plan` without automatic permission approval. The call
+  still runs against a disposable temporary copy. Sikula rejects any retained-path change,
+  including one accompanying a timeout or non-zero exit, as a non-retryable
+  `LLMReadOnlyViolation`, and sanitizes temporary paths back to project-relative paths on
+  success. This preserves one usage observation for the rejected physical attempt without
+  spending tokens on equivalent retries. Write-capable calls run against the task worktree
+  after the same symlink preflight.
   Sikula also prepends an
   Antigravity-specific workspace-boundary instruction to write-capable prompts so
   the provider uses the task worktree rather than searching for a similar checkout.
@@ -1241,7 +1250,8 @@ No file content is passed in the prompt.
   from `tools.core`); prompt-level for write agents.
   For `OpenCodeClient`: technically enforced for read-only agents (`bash: deny`); prompt-level
   for write agents.
-  For `AntigravityClient`: read-only calls run in a disposable copy; write-agent
+  For `AntigravityClient`: read-only calls combine an active-hook preflight, a generated
+  read-tool-only agent, `--mode plan`, and disposable-copy mutation detection; write-agent
   command restrictions are prompt-level plus any provider behavior from `--sandbox`.
 - *No internet access* — all agent prompts include `AGENT_SECURITY_PREFIX`
   (defined in `agents/base_agent.py`), which instructs agents not to use network
