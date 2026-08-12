@@ -97,6 +97,10 @@ class LLMFatalError(LLMProviderError):
     """Non-retryable provider failure."""
 
 
+class LLMReadOnlyViolation(LLMFatalError):
+    """Provider violated an enforced read-only boundary."""
+
+
 class LLMQuotaExceeded(LLMFatalError):
     """Provider account quota, credits, or usage limit is exhausted."""
 
@@ -2575,7 +2579,14 @@ _ANTIGRAVITY_GENERATED_SOURCE_SUFFIXES = (
 _ANTIGRAVITY_LOG_DIAGNOSTIC_BYTES = 65536
 _ANTIGRAVITY_LOG_DIAGNOSTIC_LINES = 6
 _ANTIGRAVITY_LOG_DIAGNOSTIC_LINE_CHARS = 500
-_ANTIGRAVITY_MIN_VERSION = (1, 1, 8)
+_ANTIGRAVITY_MIN_VERSION = (1, 1, 12)
+_ANTIGRAVITY_HOOK_PREFLIGHT_TIMEOUT = 60
+_ANTIGRAVITY_READONLY_TOOLS = (
+    "view_file",
+    "list_dir",
+    "find_by_name",
+    "grep_search",
+)
 _ANTIGRAVITY_LOG_DIAGNOSTIC_MARKERS = (
     "401",
     "api key",
@@ -3299,12 +3310,95 @@ def _antigravity_require_supported_version() -> None:
         raise LLMConfigurationError(f"antigravity CLI {current} is unsupported; install agy {minimum} or newer")
 
 
+def _antigravity_require_no_active_hooks(workspace: Path, timeout: int) -> None:
+    """Fail closed when Antigravity could execute provider-configured commands."""
+    preflight_timeout = max(1, min(timeout, _ANTIGRAVITY_HOOK_PREFLIGHT_TIMEOUT))
+    try:
+        with _antigravity_log_file() as log_file:
+            result = _run_provider_cli(
+                [
+                    "agy",
+                    "--new-project",
+                    "--add-dir",
+                    str(workspace),
+                    "--log-file",
+                    str(log_file),
+                    "--print-timeout",
+                    f"{preflight_timeout}s",
+                    "--output-format",
+                    "json",
+                    "--print",
+                    "/hooks",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=workspace,
+                timeout=preflight_timeout,
+            )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        raise LLMConfigurationError(
+            "antigravity read-only hook preflight failed; verify the provider installation and configuration"
+        ) from exc
+
+    payload = _antigravity_result_payload(result.stdout or "")
+    command = payload.get("command") if payload is not None else None
+    data = command.get("data") if isinstance(command, dict) else None
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    valid = (
+        result.returncode == 0
+        and payload is not None
+        and payload.get("status") == "SUCCESS"
+        and isinstance(hooks, list)
+        and all(isinstance(hook, dict) and isinstance(hook.get("enabled"), bool) for hook in hooks)
+    )
+    if not valid:
+        raise LLMConfigurationError(
+            "antigravity read-only hook preflight returned an unverifiable result; "
+            "verify the provider installation and configuration"
+        )
+    if any(hook["enabled"] for hook in hooks):
+        raise LLMConfigurationError(
+            "antigravity read-only agents cannot run while Antigravity hooks are enabled; disable the hooks and retry"
+        )
+
+
+def _antigravity_write_readonly_agent(workspace: Path) -> str:
+    agents_dir = workspace / ".agents" / "agents"
+    try:
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        agent_dir = Path(tempfile.mkdtemp(prefix="sikula-readonly-", dir=agents_dir))
+        agent_name = agent_dir.name
+        tool_lines = "\n".join(f"  - {tool}" for tool in _ANTIGRAVITY_READONLY_TOOLS)
+        definition = (
+            "---\n"
+            f"name: {agent_name}\n"
+            "description: Sikula read-only repository inspection agent.\n"
+            "tools:\n"
+            f"{tool_lines}\n"
+            "mainAgent: true\n"
+            "subagent: false\n"
+            "inheritMcp: false\n"
+            "commandExecutionPolicy: off\n"
+            "mcpServers: []\n"
+            "skills: []\n"
+            "plugins: []\n"
+            "---\n\n"
+            "# Read-Only Repository Inspection\n\n"
+            "Inspect only the attached workspace with the listed read-only tools. "
+            "Never create, modify, delete, move, rename, or format files. "
+            "Do not invoke subagents, skills, plugins, MCP servers, shell commands, or network tools.\n"
+        )
+        (agent_dir / "agent.md").write_bytes(definition.encode("ascii"))
+    except OSError as exc:
+        raise LLMEnvironmentError("antigravity read-only agent configuration could not be created") from exc
+    return agent_name
+
+
 class AntigravityClient(LLMClient):
     """Calls Antigravity via the structured `agy --output-format json --print -` CLI.
 
-    Antigravity CLI does not expose a verified non-interactive read-only mode.
-    Read-only calls therefore run against a disposable workspace copy and reject
-    the provider output if that copy is modified.
+    Read-only calls combine Antigravity's plan mode with a generated tool-limited
+    agent, an active-hook preflight, and a disposable workspace snapshot.
     """
 
     def __init__(self, config: LLMConfig) -> None:
@@ -3327,10 +3421,16 @@ class AntigravityClient(LLMClient):
         timeout: int,
         log_file: Path,
         auto_approve_tools: bool,
+        agent: str | None = None,
+        mode: str | None = None,
     ) -> list[str]:
         cmd = ["agy", "--new-project"]
         if cwd is not None:
             cmd.extend(["--add-dir", str(cwd)])
+        if agent is not None:
+            cmd.extend(["--agent", agent])
+        if mode is not None:
+            cmd.extend(["--mode", mode])
         if auto_approve_tools:
             cmd.append("--dangerously-skip-permissions")
         cmd.extend(
@@ -3393,36 +3493,51 @@ class AntigravityClient(LLMClient):
         self._ensure_supported_version()
         log.info("Running Antigravity read-only agent (%s) — waiting for completion...", self._config.model)
 
-        def _call():
-            with tempfile.TemporaryDirectory(prefix="sikula-antigravity-readonly-") as tmp:
-                workspace = Path(tmp) / "workspace"
-                copy_policy = _antigravity_copy_workspace(cwd, workspace)
-                before = _antigravity_directory_snapshot(workspace, copy_policy)
+        with tempfile.TemporaryDirectory(prefix="sikula-antigravity-readonly-") as tmp:
+            workspace = Path(tmp) / "workspace"
+            copy_policy = _antigravity_copy_workspace(cwd, workspace)
+            _antigravity_require_no_active_hooks(workspace, self._config.agent_timeout)
+            agent_name = _antigravity_write_readonly_agent(workspace)
+            before = _antigravity_directory_snapshot(workspace, copy_policy)
+
+            def _call():
+                result: subprocess.CompletedProcess[str] | None = None
                 with _antigravity_log_file() as log_file:
-                    result = _run_provider_cli(
-                        self._cmd(
+                    try:
+                        result = _run_provider_cli(
+                            self._cmd(
+                                cwd=workspace,
+                                timeout=self._config.agent_timeout,
+                                log_file=log_file,
+                                auto_approve_tools=False,
+                                agent=agent_name,
+                                mode="plan",
+                            ),
+                            capture_output=True,
+                            input=prompt,
+                            text=True,
                             cwd=workspace,
                             timeout=self._config.agent_timeout,
-                            log_file=log_file,
-                            auto_approve_tools=True,
-                        ),
-                        capture_output=True,
-                        input=prompt,
-                        text=True,
-                        cwd=workspace,
-                        timeout=self._config.agent_timeout,
-                    )
+                        )
+                    except Exception as exc:
+                        after = _antigravity_directory_snapshot(workspace, copy_policy)
+                        if _antigravity_snapshot_changed(before, after):
+                            raise LLMReadOnlyViolation(
+                                "antigravity read-only boundary violation: disposable workspace changed"
+                            ) from exc
+                        raise
                     log_diagnostic = _antigravity_log_diagnostic(log_file)
-                if result.returncode != 0:
-                    raise _antigravity_result_error(result, "agent", log_diagnostic)
+
                 after = _antigravity_directory_snapshot(workspace, copy_policy)
                 if _antigravity_snapshot_changed(before, after):
-                    output_chars, reported_tokens = _antigravity_result_observation(result.stdout)
-                    raise LLMTransientError(
-                        "antigravity read-only agent attempted to modify its disposable workspace",
+                    output_chars, reported_tokens = _antigravity_result_observation(result.stdout or "")
+                    raise LLMReadOnlyViolation(
+                        "antigravity read-only boundary violation: disposable workspace changed",
                         output_chars=output_chars,
                         reported_tokens=reported_tokens,
                     )
+                if result.returncode != 0:
+                    raise _antigravity_result_error(result, "agent", log_diagnostic)
                 envelope = _antigravity_result_envelope(
                     result.stdout,
                     "agent",
@@ -3435,13 +3550,13 @@ class AntigravityClient(LLMClient):
                     reported_tokens=envelope.reported_tokens,
                 )
 
-        return _call_with_retry(
-            "read-only agent",
-            _call,
-            self._config,
-            "run_readonly_agent",
-            input_chars=len(prompt),
-        )
+            return _call_with_retry(
+                "read-only agent",
+                _call,
+                self._config,
+                "run_readonly_agent",
+                input_chars=len(prompt),
+            )
 
     def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
         self._ensure_supported_version()

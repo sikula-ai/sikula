@@ -25,6 +25,7 @@ from core.llm_client import (
     LLMEnvironmentError,
     LLMProviderError,
     LLMQuotaExceeded,
+    LLMReadOnlyViolation,
     LLMTransientError,
     LLMTimeoutError,
     _agent_text_or_empty,
@@ -39,6 +40,7 @@ from core.llm_client import (
     _antigravity_marker_text,
     _antigravity_parse_version,
     _antigravity_reported_tokens,
+    _antigravity_require_no_active_hooks,
     _antigravity_require_supported_version,
     _antigravity_redact_diagnostic,
     _antigravity_result_envelope,
@@ -4553,10 +4555,123 @@ class TestGeminiClientCommands:
         assert observer.call_args.args[0]["error_type"] == "LLMTimeoutError"
 
 
+class TestAntigravityHookPreflight:
+    @staticmethod
+    def _result(hooks: object) -> str:
+        return json.dumps(
+            {
+                "status": "SUCCESS",
+                "response": "",
+                "command": {"name": "hooks", "data": {"hooks": hooks}},
+            }
+        )
+
+    def test_accepts_empty_and_disabled_hook_sets(self, tmp_path: Path):
+        for hooks in ([], [{"name": "disabled", "enabled": False, "source": "/private/path"}]):
+            result = subprocess.CompletedProcess(["agy"], 0, self._result(hooks), "")
+            with patch("core.llm_client._run_provider_cli", return_value=result) as mock_run:
+                _antigravity_require_no_active_hooks(tmp_path, 120)
+
+            cmd = mock_run.call_args.args[0]
+            assert cmd[:4] == ["agy", "--new-project", "--add-dir", str(tmp_path)]
+            assert cmd[cmd.index("--print-timeout") + 1] == "60s"
+            assert cmd[cmd.index("--output-format") + 1] == "json"
+            assert cmd[cmd.index("--print") + 1] == "/hooks"
+            assert mock_run.call_args.kwargs["cwd"] == tmp_path
+            assert mock_run.call_args.kwargs["timeout"] == 60
+
+    def test_rejects_enabled_hooks_without_exposing_configuration(self, tmp_path: Path):
+        hooks = [
+            {
+                "name": "secret-hook-name",
+                "enabled": True,
+                "source": "/private/project/.agents/hooks.json",
+                "actions": [{"command": "upload SUPER_SECRET"}],
+            }
+        ]
+        result = subprocess.CompletedProcess(["agy"], 0, self._result(hooks), "")
+
+        with (
+            patch("core.llm_client._run_provider_cli", return_value=result),
+            pytest.raises(LLMConfigurationError, match="hooks are enabled") as exc_info,
+        ):
+            _antigravity_require_no_active_hooks(tmp_path, 30)
+
+        message = str(exc_info.value)
+        assert "secret-hook-name" not in message
+        assert "/private/project" not in message
+        assert "SUPER_SECRET" not in message
+
+    @pytest.mark.parametrize(
+        ("returncode", "output"),
+        [
+            (1, ""),
+            (0, "not json"),
+            (0, '{"status":"SUCCESS","command":{"data":{"hooks":{}}}}'),
+            (0, '{"status":"SUCCESS","command":{"data":{"hooks":[{}]}}}'),
+        ],
+    )
+    def test_rejects_unverifiable_results(self, tmp_path: Path, returncode: int, output: str):
+        result = subprocess.CompletedProcess(["agy"], returncode, output, "provider secret output")
+
+        with (
+            patch("core.llm_client._run_provider_cli", return_value=result),
+            pytest.raises(LLMConfigurationError, match="unverifiable result") as exc_info,
+        ):
+            _antigravity_require_no_active_hooks(tmp_path, 30)
+
+        assert "provider secret output" not in str(exc_info.value)
+
+    def test_converts_preflight_timeout_to_content_free_configuration_error(self, tmp_path: Path):
+        with (
+            patch(
+                "core.llm_client._run_provider_cli",
+                side_effect=subprocess.TimeoutExpired("agy secret prompt", 10, output="secret output"),
+            ),
+            pytest.raises(LLMConfigurationError, match="hook preflight failed") as exc_info,
+        ):
+            _antigravity_require_no_active_hooks(tmp_path, 10)
+
+        message = str(exc_info.value)
+        assert "secret prompt" not in message
+        assert "secret output" not in message
+
+    def test_client_blocks_enabled_hooks_before_observed_provider_attempt(self, tmp_path: Path):
+        (tmp_path / "repo.txt").write_text("source")
+        events = []
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                usage_observer=events.append,
+            )
+        )
+        result = subprocess.CompletedProcess(
+            ["agy"],
+            0,
+            self._result([{"name": "active", "enabled": True}]),
+            "",
+        )
+
+        with (
+            patch("core.llm_client._antigravity_require_supported_version"),
+            patch("core.llm_client._run_provider_cli", return_value=result) as mock_run,
+            pytest.raises(LLMConfigurationError, match="hooks are enabled"),
+        ):
+            client.run_readonly_agent("secret prompt", tmp_path)
+
+        assert mock_run.call_count == 1
+        assert events == []
+        assert (tmp_path / "repo.txt").read_text() == "source"
+
+
 class TestAntigravityClientCommands:
     @pytest.fixture(autouse=True)
     def _supported_antigravity_version(self):
-        with patch("core.llm_client._antigravity_require_supported_version"):
+        with (
+            patch("core.llm_client._antigravity_require_supported_version"),
+            patch("core.llm_client._antigravity_require_no_active_hooks"),
+        ):
             yield
 
     def test_readonly_output_sanitizes_standard_windows_file_uri(self):
@@ -4628,7 +4743,7 @@ class TestAntigravityClientCommands:
     def test_require_supported_version_accepts_minimum_version(self):
         with patch(
             "core.llm_client.subprocess.run",
-            return_value=subprocess.CompletedProcess(["agy", "--version"], 0, "1.1.8\n", ""),
+            return_value=subprocess.CompletedProcess(["agy", "--version"], 0, "1.1.12\n", ""),
         ) as mock_run:
             _antigravity_require_supported_version()
 
@@ -4645,9 +4760,9 @@ class TestAntigravityClientCommands:
         with (
             patch(
                 "core.llm_client.subprocess.run",
-                return_value=subprocess.CompletedProcess(["agy", "--version"], 0, "1.1.7\n", ""),
+                return_value=subprocess.CompletedProcess(["agy", "--version"], 0, "1.1.11\n", ""),
             ),
-            pytest.raises(LLMConfigurationError, match="agy 1.1.8 or newer"),
+            pytest.raises(LLMConfigurationError, match="agy 1.1.12 or newer"),
         ):
             _antigravity_require_supported_version()
 
@@ -5059,6 +5174,9 @@ class TestAntigravityClientCommands:
             seen["cwd"] = workspace
             seen["input"] = kwargs["input"]
             assert (workspace / "repo.txt").read_text() == "source"
+            agent_name = cmd[cmd.index("--agent") + 1]
+            agent_definition = (workspace / ".agents" / "agents" / agent_name / "agent.md").read_text()
+            seen["agent_definition"] = agent_definition
             output = (
                 f"See [sikula.py](file://{workspace.resolve()}/sikula.py#L12), "
                 f"{workspace}/core/llm_client.py, and /tmp/unrelated.py."
@@ -5079,7 +5197,9 @@ class TestAntigravityClientCommands:
         assert isinstance(workspace, Path)
         assert workspace != tmp_path
         assert cmd[cmd.index("--add-dir") + 1] == str(workspace)
-        assert "--dangerously-skip-permissions" in cmd
+        assert "--dangerously-skip-permissions" not in cmd
+        assert cmd[cmd.index("--mode") + 1] == "plan"
+        assert "--disable-slash-commands" not in cmd
         assert cmd[cmd.index("--output-format") + 1] == "json"
         assert cmd[cmd.index("--print") + 1] == "-"
         assert seen["input"] == "prompt"
@@ -5092,24 +5212,52 @@ class TestAntigravityClientCommands:
         assert "/tmp/unrelated.py" in output
         assert events[0]["output_chars"] == len(output)
         assert events[0]["reported_tokens"] == {"input_tokens": 9, "output_tokens": 4}
+        agent_definition = seen["agent_definition"]
+        assert isinstance(agent_definition, str)
+        assert "  - view_file\n" in agent_definition
+        assert "  - list_dir\n" in agent_definition
+        assert "  - find_by_name\n" in agent_definition
+        assert "  - grep_search\n" in agent_definition
+        assert "write_to_file" not in agent_definition
+        assert "run_command" not in agent_definition
+        assert "subagent: false\n" in agent_definition
+        assert "inheritMcp: false\n" in agent_definition
+        assert "commandExecutionPolicy: off\n" in agent_definition
+        assert "mcpServers: []\n" in agent_definition
 
     def test_run_readonly_agent_rejects_disposable_workspace_writes(self, tmp_path: Path):
         (tmp_path / "repo.txt").write_text("source")
-        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        events = []
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                usage_observer=events.append,
+            )
+        )
 
         def _fake_run(cmd, **kwargs):
             Path(kwargs["cwd"], "repo.txt").write_text("changed in copy")
-            return subprocess.CompletedProcess(cmd, 0, self._result("analysis"), "")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                self._result("analysis", usage={"input_tokens": 20, "output_tokens": 3}),
+                "",
+            )
 
         with (
             patch("core.llm_client.time.sleep"),
             patch("core.llm_client._run_provider_cli", side_effect=_fake_run) as mock_provider,
-            pytest.raises(LLMTransientError, match="disposable workspace"),
+            pytest.raises(LLMReadOnlyViolation, match="read-only boundary violation"),
         ):
             client.run_readonly_agent("prompt", tmp_path)
 
-        assert mock_provider.call_count == 4
+        assert mock_provider.call_count == 1
         assert (tmp_path / "repo.txt").read_text() == "source"
+        assert len(events) == 1
+        assert events[0]["outcome"] == "fatal_error"
+        assert events[0]["error_type"] == "LLMReadOnlyViolation"
+        assert events[0]["reported_tokens"] == {"input_tokens": 20, "output_tokens": 3}
 
     def test_run_readonly_agent_rejects_new_soft_ignored_directories(self, tmp_path: Path):
         (tmp_path / "repo.txt").write_text("source")
@@ -5124,12 +5272,51 @@ class TestAntigravityClientCommands:
         with (
             patch("core.llm_client.time.sleep"),
             patch("core.llm_client._run_provider_cli", side_effect=_fake_run) as mock_provider,
-            pytest.raises(LLMTransientError, match="disposable workspace"),
+            pytest.raises(LLMReadOnlyViolation, match="read-only boundary violation"),
         ):
             client.run_readonly_agent("prompt", tmp_path)
 
-        assert mock_provider.call_count == 4
+        assert mock_provider.call_count == 1
         assert not (tmp_path / "node_modules").exists()
+
+    def test_run_readonly_agent_retries_transient_failure_without_mutation(self, tmp_path: Path):
+        (tmp_path / "repo.txt").write_text("source")
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch(
+                "core.llm_client._run_provider_cli",
+                side_effect=[
+                    subprocess.CompletedProcess(["agy"], 0, "not json", ""),
+                    self._run_result("analysis"),
+                ],
+            ) as mock_provider,
+        ):
+            assert client.run_readonly_agent("prompt", tmp_path) == "analysis"
+
+        assert mock_provider.call_count == 2
+        sleep.assert_called_once_with(30)
+        assert (tmp_path / "repo.txt").read_text() == "source"
+
+    def test_run_readonly_agent_detects_mutation_after_timeout(self, tmp_path: Path):
+        (tmp_path / "repo.txt").write_text("source")
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        def _fake_run(cmd, **kwargs):
+            Path(kwargs["cwd"], "repo.txt").write_text("changed in copy")
+            raise subprocess.TimeoutExpired(cmd, 10)
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._run_provider_cli", side_effect=_fake_run) as mock_provider,
+            pytest.raises(LLMReadOnlyViolation, match="read-only boundary violation"),
+        ):
+            client.run_readonly_agent("prompt", tmp_path)
+
+        assert mock_provider.call_count == 1
+        sleep.assert_not_called()
+        assert (tmp_path / "repo.txt").read_text() == "source"
 
     def test_run_readonly_agent_preserves_tracked_files_in_ignored_dirs(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -5279,15 +5466,15 @@ class TestAntigravityClientCommands:
         with (
             patch("core.llm_client.time.sleep"),
             patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run,
-            pytest.raises(LLMTransientError, match="disposable workspace"),
+            pytest.raises(LLMReadOnlyViolation, match="read-only boundary violation"),
         ):
             client.run_readonly_agent("prompt", repo)
 
-        assert agy_calls == 4
+        assert agy_calls == 1
         assert mock_run.call_count >= agy_calls
         assert not (repo / "dist" / "generated.js").exists()
 
-    def test_run_readonly_agent_classifies_nonzero_before_workspace_mutation(self, tmp_path: Path):
+    def test_run_readonly_agent_prioritizes_workspace_mutation_after_nonzero_exit(self, tmp_path: Path):
         (tmp_path / "repo.txt").write_text("source")
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
 
@@ -5301,7 +5488,7 @@ class TestAntigravityClientCommands:
         with (
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client._run_provider_cli", side_effect=_fake_run) as mock_provider,
-            pytest.raises(LLMConfigurationError, match="unsupported model"),
+            pytest.raises(LLMReadOnlyViolation, match="read-only boundary violation"),
         ):
             client.run_readonly_agent("prompt", tmp_path)
 
