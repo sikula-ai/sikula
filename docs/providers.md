@@ -89,7 +89,7 @@ Provider-specific API-key or enterprise authentication should be configured acco
 
 Sikula runs locally in your repository. The configured provider determines what task, prompt, source, and diff context may be sent outside your machine. Choose a provider and authentication mode that matches your organization's data policy.
 
-Antigravity generation and read-only agent calls cannot run while workspace, plugin, or global Antigravity hooks are enabled. Disable those hooks before using Antigravity for planning, preparation, analysis, or review. See [Sandbox And Command Restrictions](sandbox.md) for provider-specific workspace protections.
+Antigravity calls cannot run while workspace, plugin, or global Antigravity hooks are enabled. Disable those hooks before using Antigravity through Sikula. See [Sandbox And Command Restrictions](sandbox.md) for provider-specific workspace protections.
 
 ## Adding A Provider
 

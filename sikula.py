@@ -360,12 +360,6 @@ def _ensure_project_gitignore_entry(project_root: Path, entry: str) -> None:
     core_worktree.ensure_project_gitignore_entry(project_root, entry)
 
 
-def _cleanup_provider_runtime_artifacts(project_root: Path) -> None:
-    from core.llm_client import _antigravity_cleanup_prompt_transports
-
-    _antigravity_cleanup_prompt_transports(project_root)
-
-
 def _ensure_sikula_gitignore(sikula_dir: Path) -> None:
     gitignore = sikula_dir / ".gitignore"
     existing = gitignore.read_text() if gitignore.exists() else ""
@@ -669,12 +663,6 @@ def _commit_worktree_changes(
     state: object,
     commit_msg: str | None = None,
 ) -> tuple[bool, bool, str | None, str | None]:
-    worktree_path = getattr(state, "worktree_path", None)
-    project_root = Path(worktree_path) if isinstance(worktree_path, (str, Path)) and worktree_path else worktree_base
-    try:
-        _cleanup_provider_runtime_artifacts(project_root)
-    except RuntimeError:
-        return False, False, None, "provider runtime artifact cleanup failed"
     subprocess.run(["git", "add", "-A"], cwd=worktree_base, check=False)
     status = subprocess.run(
         ["git", "status", "--porcelain"],
@@ -2902,7 +2890,6 @@ def _run_context() -> cli_run.RunContext:
         print_contract_readiness_gate_failure=_print_contract_readiness_gate_failure,
         branch_stem=_branch_stem,
         ensure_gitignore=_ensure_gitignore,
-        cleanup_provider_runtime_artifacts=_cleanup_provider_runtime_artifacts,
         create_worktree=_create_worktree,
         build_tool_class=_build_tool_class,
         record_snapshot_asset_drift=_record_snapshot_asset_drift,

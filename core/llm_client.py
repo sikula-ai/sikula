@@ -2581,8 +2581,6 @@ _ANTIGRAVITY_LOG_DIAGNOSTIC_LINES = 6
 _ANTIGRAVITY_LOG_DIAGNOSTIC_LINE_CHARS = 500
 _ANTIGRAVITY_MIN_VERSION = (1, 1, 12)
 _ANTIGRAVITY_HOOK_PREFLIGHT_TIMEOUT = 60
-_ANTIGRAVITY_PROMPT_RUNTIME_PATH = Path(".sikula/state/antigravity-prompts")
-_ANTIGRAVITY_PROMPT_GIT_EXCLUDE = "**/.sikula/state/antigravity-prompts/"
 _ANTIGRAVITY_READONLY_TOOLS = (
     "view_file",
     "list_dir",
@@ -3273,53 +3271,49 @@ def _antigravity_write_agent_prompt(prompt: str, cwd: Path) -> str:
 
 
 @contextmanager
-def _antigravity_prompt_transport(workspace: Path, prompt: str) -> Iterator[str]:
-    prompt_dir: Path | None = None
-    prompt_root = workspace / _ANTIGRAVITY_PROMPT_RUNTIME_PATH
+def _antigravity_prompt_transport(workspace: Path, prompt: str) -> Iterator[tuple[Path, str]]:
+    transport: tempfile.TemporaryDirectory[str] | None = None
     try:
-        prompt_root.mkdir(parents=True, exist_ok=True)
-        prompt_dir = Path(tempfile.mkdtemp(prefix="request-", dir=prompt_root))
-        prompt_path = prompt_dir / "request.md"
-        prompt_path.write_bytes(prompt.encode("utf-8", errors="replace"))
+        transport = tempfile.TemporaryDirectory(prefix="sikula-antigravity-prompt-")
+        prompt_dir = Path(transport.name).resolve()
+        resolved_workspace = workspace.resolve()
     except OSError as exc:
-        if prompt_dir is not None:
-            shutil.rmtree(prompt_dir, ignore_errors=True)
+        if transport is not None:
+            try:
+                transport.cleanup()
+            except OSError:
+                pass
         raise LLMEnvironmentError("antigravity prompt transport could not be created") from exc
 
-    relative_path = prompt_path.relative_to(workspace).as_posix()
+    if prompt_dir == resolved_workspace or resolved_workspace in prompt_dir.parents:
+        try:
+            transport.cleanup()
+        except OSError as exc:
+            raise LLMEnvironmentError("antigravity prompt transport could not be removed") from exc
+        raise LLMEnvironmentError("antigravity prompt transport must be outside the project workspace")
+
+    prompt_path = prompt_dir / "request.md"
+    try:
+        prompt_path.write_bytes(prompt.encode("utf-8", errors="replace"))
+    except OSError as exc:
+        try:
+            transport.cleanup()
+        except OSError:
+            pass
+        raise LLMEnvironmentError("antigravity prompt transport could not be created") from exc
+
     request = (
-        f"Read the complete Sikula request from the project-relative file `{relative_path}` and follow it. "
+        f"Read the complete Sikula request from the attached workspace path `{prompt_dir.name}/request.md` "
+        "and follow it. "
         "Treat that file as task input, not project content. Do not modify, quote, or mention the transport file."
     )
     try:
-        yield request
+        yield prompt_dir, request
     finally:
         try:
-            shutil.rmtree(prompt_dir)
+            transport.cleanup()
         except OSError as exc:
             raise LLMEnvironmentError("antigravity prompt transport could not be removed") from exc
-        try:
-            prompt_root.rmdir()
-        except OSError as exc:
-            if exc.errno not in {errno.ENOENT, errno.ENOTEMPTY}:
-                raise LLMEnvironmentError("antigravity prompt transport could not be removed") from exc
-        for parent in (prompt_root.parent, prompt_root.parent.parent):
-            try:
-                parent.rmdir()
-            except OSError as exc:
-                if exc.errno not in {errno.ENOENT, errno.ENOTEMPTY}:
-                    raise LLMEnvironmentError("antigravity prompt transport could not be removed") from exc
-
-
-def _antigravity_cleanup_prompt_transports(workspace: Path) -> None:
-    prompt_root = workspace / _ANTIGRAVITY_PROMPT_RUNTIME_PATH
-    try:
-        if prompt_root.is_symlink() or prompt_root.is_file():
-            prompt_root.unlink()
-        elif prompt_root.exists():
-            shutil.rmtree(prompt_root)
-    except OSError as exc:
-        raise LLMEnvironmentError("stale antigravity prompt transport could not be removed") from exc
 
 
 @contextmanager
@@ -3474,6 +3468,7 @@ class AntigravityClient(LLMClient):
         timeout: int,
         log_file: Path,
         auto_approve_tools: bool,
+        prompt_workspace: Path,
         print_prompt: str,
         agent: str | None = None,
         disable_slash_commands: bool = False,
@@ -3481,6 +3476,7 @@ class AntigravityClient(LLMClient):
         cmd = ["agy", "--new-project"]
         if cwd is not None:
             cmd.extend(["--add-dir", str(cwd)])
+        cmd.extend(["--add-dir", str(prompt_workspace)])
         if agent is not None:
             cmd.extend(["--agent", agent])
         if disable_slash_commands:
@@ -3520,7 +3516,7 @@ class AntigravityClient(LLMClient):
             agent_name = _antigravity_write_readonly_agent(workspace)
 
             def _call():
-                with _antigravity_prompt_transport(workspace, prompt) as print_prompt:
+                with _antigravity_prompt_transport(workspace, prompt) as (prompt_workspace, print_prompt):
                     with _antigravity_log_file() as log_file:
                         result = _run_provider_cli(
                             self._cmd(
@@ -3528,6 +3524,7 @@ class AntigravityClient(LLMClient):
                                 timeout=self._config.agent_timeout,
                                 log_file=log_file,
                                 auto_approve_tools=False,
+                                prompt_workspace=prompt_workspace,
                                 agent=agent_name,
                                 disable_slash_commands=True,
                                 print_prompt=print_prompt,
@@ -3567,7 +3564,7 @@ class AntigravityClient(LLMClient):
             def _call():
                 result: subprocess.CompletedProcess[str] | None = None
                 try:
-                    with _antigravity_prompt_transport(workspace, prompt) as print_prompt:
+                    with _antigravity_prompt_transport(workspace, prompt) as (prompt_workspace, print_prompt):
                         with _antigravity_log_file() as log_file:
                             result = _run_provider_cli(
                                 self._cmd(
@@ -3575,6 +3572,7 @@ class AntigravityClient(LLMClient):
                                     timeout=self._config.agent_timeout,
                                     log_file=log_file,
                                     auto_approve_tools=False,
+                                    prompt_workspace=prompt_workspace,
                                     print_prompt=print_prompt,
                                     agent=agent_name,
                                     disable_slash_commands=True,
@@ -3631,20 +3629,13 @@ class AntigravityClient(LLMClient):
             paths = ", ".join(sorted(policy.gitlink_paths))
             raise LLMConfigurationError(f"antigravity write agent does not support git submodules: {paths}")
         _antigravity_validate_workspace_symlinks(workspace, prune_ignored_paths=True, policy=policy)
-        try:
-            _add_git_exclude_entry(
-                workspace,
-                _ANTIGRAVITY_PROMPT_GIT_EXCLUDE,
-                "Sikula Antigravity prompt transport",
-            )
-        except OSError as exc:
-            raise LLMEnvironmentError("antigravity prompt runtime could not be excluded from Git") from exc
+        _antigravity_require_no_active_hooks(workspace, self._config.agent_timeout)
         prompt = self.prepare_agent_prompt(prompt, workspace)
         before = _git_snapshot(workspace)
         log.info("Running Antigravity agent (%s) — waiting for completion...", self._config.model)
 
         def _call():
-            with _antigravity_prompt_transport(workspace, prompt) as print_prompt:
+            with _antigravity_prompt_transport(workspace, prompt) as (prompt_workspace, print_prompt):
                 with _antigravity_log_file() as log_file:
                     result = _run_agent_subprocess_streaming(
                         self._cmd(
@@ -3652,6 +3643,7 @@ class AntigravityClient(LLMClient):
                             timeout=self._config.agent_timeout,
                             log_file=log_file,
                             auto_approve_tools=True,
+                            prompt_workspace=prompt_workspace,
                             print_prompt=print_prompt,
                         ),
                         cwd=workspace,
