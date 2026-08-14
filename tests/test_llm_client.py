@@ -39,6 +39,7 @@ from core.llm_client import (
     _antigravity_log_line_diagnostic,
     _antigravity_marker_text,
     _antigravity_parse_version,
+    _antigravity_prompt_transport,
     _antigravity_reported_tokens,
     _antigravity_require_no_active_hooks,
     _antigravity_require_supported_version,
@@ -4821,6 +4822,105 @@ class TestAntigravityClientCommands:
         assert output == "done"
         assert not seen["prompt_workspace"].exists()
 
+    def test_prompt_transport_wraps_temp_directory_creation_failure(self, tmp_path: Path):
+        with (
+            patch("core.llm_client.tempfile.TemporaryDirectory", side_effect=PermissionError),
+            pytest.raises(LLMEnvironmentError, match="could not be created"),
+        ):
+            with _antigravity_prompt_transport(tmp_path, "private prompt"):
+                pass
+
+    @pytest.mark.parametrize("cleanup_error", [None, PermissionError()])
+    def test_prompt_transport_cleans_up_after_path_resolution_failure(
+        self,
+        tmp_path: Path,
+        cleanup_error: OSError | None,
+    ):
+        transport = MagicMock(name="prompt_transport")
+        transport.name = str(tmp_path / "prompt")
+        transport.cleanup.side_effect = cleanup_error
+
+        with (
+            patch("core.llm_client.tempfile.TemporaryDirectory", return_value=transport),
+            patch("core.llm_client.Path.resolve", side_effect=PermissionError),
+            pytest.raises(LLMEnvironmentError, match="could not be created"),
+        ):
+            with _antigravity_prompt_transport(tmp_path, "private prompt"):
+                pass
+
+        transport.cleanup.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("cleanup_error", "message"),
+        [
+            (None, "must be outside the project workspace"),
+            (PermissionError(), "could not be removed"),
+        ],
+    )
+    def test_prompt_transport_rejects_a_directory_inside_the_workspace(
+        self,
+        tmp_path: Path,
+        cleanup_error: OSError | None,
+        message: str,
+    ):
+        workspace = tmp_path / "project"
+        prompt_workspace = workspace / "prompt"
+        transport = MagicMock(name="prompt_transport")
+        transport.name = str(prompt_workspace)
+        transport.cleanup.side_effect = cleanup_error
+
+        with (
+            patch("core.llm_client.tempfile.TemporaryDirectory", return_value=transport),
+            pytest.raises(LLMEnvironmentError, match=message),
+        ):
+            with _antigravity_prompt_transport(workspace, "private prompt"):
+                pass
+
+        transport.cleanup.assert_called_once()
+
+    @pytest.mark.parametrize("cleanup_error", [None, PermissionError()])
+    def test_prompt_transport_cleans_up_after_write_failure(
+        self,
+        tmp_path: Path,
+        cleanup_error: OSError | None,
+    ):
+        workspace = tmp_path / "project"
+        workspace.mkdir()
+        prompt_workspace = tmp_path / "prompt"
+        prompt_workspace.mkdir()
+        transport = MagicMock(name="prompt_transport")
+        transport.name = str(prompt_workspace)
+        transport.cleanup.side_effect = cleanup_error
+
+        with (
+            patch("core.llm_client.tempfile.TemporaryDirectory", return_value=transport),
+            patch("core.llm_client.Path.write_bytes", side_effect=PermissionError),
+            pytest.raises(LLMEnvironmentError, match="could not be created"),
+        ):
+            with _antigravity_prompt_transport(workspace, "private prompt"):
+                pass
+
+        transport.cleanup.assert_called_once()
+
+    def test_prompt_transport_wraps_cleanup_failure(self, tmp_path: Path):
+        workspace = tmp_path / "project"
+        workspace.mkdir()
+        prompt_workspace = tmp_path / "prompt"
+        prompt_workspace.mkdir()
+        transport = MagicMock(name="prompt_transport")
+        transport.name = str(prompt_workspace)
+        transport.cleanup.side_effect = PermissionError
+
+        with (
+            patch("core.llm_client.tempfile.TemporaryDirectory", return_value=transport),
+            pytest.raises(LLMEnvironmentError, match="could not be removed"),
+        ):
+            with _antigravity_prompt_transport(workspace, "private prompt") as (prompt_dir, request):
+                assert prompt_dir == prompt_workspace
+                assert prompt_workspace.name in request
+
+        transport.cleanup.assert_called_once()
+
     def test_parse_version_extracts_semver(self):
         assert _antigravity_parse_version("agy 1.0.13") == (1, 0, 13)
         assert _antigravity_parse_version("Antigravity CLI version 10.2.3") == (10, 2, 3)
@@ -5411,6 +5511,26 @@ class TestAntigravityClientCommands:
         sleep.assert_called_once_with(30)
         assert (tmp_path / "repo.txt").read_text() == "source"
 
+    def test_run_readonly_agent_retries_timeout_without_mutation(self, tmp_path: Path):
+        (tmp_path / "repo.txt").write_text("source")
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch(
+                "core.llm_client._run_provider_cli",
+                side_effect=[
+                    subprocess.TimeoutExpired(["agy"], 10),
+                    self._run_result("analysis"),
+                ],
+            ) as mock_provider,
+        ):
+            assert client.run_readonly_agent("prompt", tmp_path) == "analysis"
+
+        assert mock_provider.call_count == 2
+        sleep.assert_called_once_with(30)
+        assert (tmp_path / "repo.txt").read_text() == "source"
+
     def test_run_readonly_agent_detects_mutation_after_timeout(self, tmp_path: Path):
         (tmp_path / "repo.txt").write_text("source")
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
@@ -5601,6 +5721,26 @@ class TestAntigravityClientCommands:
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client._run_provider_cli", side_effect=_fake_run) as mock_provider,
             pytest.raises(LLMReadOnlyViolation, match="read-only boundary violation"),
+        ):
+            client.run_readonly_agent("prompt", tmp_path)
+
+        assert mock_provider.call_count == 1
+        sleep.assert_not_called()
+        assert (tmp_path / "repo.txt").read_text() == "source"
+
+    def test_run_readonly_agent_classifies_nonzero_exit_without_mutation(self, tmp_path: Path):
+        (tmp_path / "repo.txt").write_text("source")
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        def _fake_run(cmd, **kwargs):
+            log_file = Path(cmd[cmd.index("--log-file") + 1])
+            log_file.write_text("ERROR unsupported model: Gemini")
+            return subprocess.CompletedProcess(cmd, 1, "", "see log for details")
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._run_provider_cli", side_effect=_fake_run) as mock_provider,
+            pytest.raises(LLMConfigurationError, match="unsupported model"),
         ):
             client.run_readonly_agent("prompt", tmp_path)
 

@@ -3464,7 +3464,7 @@ class AntigravityClient(LLMClient):
     def _cmd(
         self,
         *,
-        cwd: Path | None,
+        cwd: Path,
         timeout: int,
         log_file: Path,
         auto_approve_tools: bool,
@@ -3474,8 +3474,7 @@ class AntigravityClient(LLMClient):
         disable_slash_commands: bool = False,
     ) -> list[str]:
         cmd = ["agy", "--new-project"]
-        if cwd is not None:
-            cmd.extend(["--add-dir", str(cwd)])
+        cmd.extend(["--add-dir", str(cwd)])
         cmd.extend(["--add-dir", str(prompt_workspace)])
         if agent is not None:
             cmd.extend(["--agent", agent])
