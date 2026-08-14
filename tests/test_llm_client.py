@@ -4723,6 +4723,16 @@ class TestAntigravityClientCommands:
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(["agy"], 0, cls._result(text, status=status, usage=usage), "")
 
+    @staticmethod
+    def _transport_prompt(workspace: Path, cmd: list[str]) -> str:
+        prompt_files = list(workspace.glob(".sikula-antigravity-prompt-*/request.md"))
+        assert len(prompt_files) == 1
+        relative_path = prompt_files[0].relative_to(workspace).as_posix()
+        print_prompt = cmd[cmd.index("--print") + 1]
+        assert relative_path in print_prompt
+        assert "Treat that file as task input, not project content" in print_prompt
+        return prompt_files[0].read_text()
+
     def test_parse_version_extracts_semver(self):
         assert _antigravity_parse_version("agy 1.0.13") == (1, 0, 13)
         assert _antigravity_parse_version("Antigravity CLI version 10.2.3") == (10, 2, 3)
@@ -5111,7 +5121,7 @@ class TestAntigravityClientCommands:
 
         assert _antigravity_write_agent_prompt(prompt, tmp_path) == prompt
 
-    def test_generate_uses_stdin_print_mode(self):
+    def test_generate_uses_bounded_prompt_file(self):
         events = []
         client = AntigravityClient(
             LLMConfig(
@@ -5129,25 +5139,38 @@ class TestAntigravityClientCommands:
             "total_tokens": 22,
         }
 
-        with patch(
-            "core.llm_client.subprocess.run",
-            return_value=self._run_result("answer", usage=usage),
-        ) as mock_run:
+        seen: dict[str, object] = {}
+
+        def _fake_run(cmd, **kwargs):
+            workspace = Path(kwargs["cwd"])
+            seen["cmd"] = cmd
+            seen["cwd"] = workspace
+            seen["prompt"] = self._transport_prompt(workspace, cmd)
+            return self._run_result("answer", usage=usage)
+
+        with patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run:
             assert client.generate("system", "user") == "answer"
 
-        cmd = mock_run.call_args.args[0]
+        cmd = seen["cmd"]
+        assert isinstance(cmd, list)
+        workspace = seen["cwd"]
+        assert isinstance(workspace, Path)
         assert cmd[:2] == ["agy", "--new-project"]
-        assert "--add-dir" not in cmd
+        assert cmd[cmd.index("--add-dir") + 1] == str(workspace)
+        assert "--agent" in cmd
         assert cmd[cmd.index("--model") + 1] == "Gemini 3.5 Flash (High)"
         assert "--sandbox" in cmd
         assert "--dangerously-skip-permissions" not in cmd
+        assert "--disable-slash-commands" in cmd
+        assert "--mode" not in cmd
         assert cmd[cmd.index("--print-timeout") + 1] == "123s"
         assert cmd[cmd.index("--output-format") + 1] == "json"
-        assert cmd[cmd.index("--print") + 1] == "-"
+        assert cmd[cmd.index("--print") + 1] != "-"
         assert cmd.index("--model") < cmd.index("--print")
-        assert mock_run.call_args.kwargs["input"] == "system\n\nuser"
+        assert "input" not in mock_run.call_args.kwargs
         assert mock_run.call_args.kwargs["timeout"] == 123
         assert "system\n\nuser" not in cmd
+        assert seen["prompt"] == "system\n\nuser"
         assert events[0]["output_chars"] == len("answer")
         assert events[0]["reported_tokens"] == {
             "input_tokens": 17,
@@ -5172,7 +5195,8 @@ class TestAntigravityClientCommands:
             workspace = Path(kwargs["cwd"])
             seen["cmd"] = cmd
             seen["cwd"] = workspace
-            seen["input"] = kwargs["input"]
+            seen["prompt"] = self._transport_prompt(workspace, cmd)
+            assert "input" not in kwargs
             assert (workspace / "repo.txt").read_text() == "source"
             agent_name = cmd[cmd.index("--agent") + 1]
             agent_definition = (workspace / ".agents" / "agents" / agent_name / "agent.md").read_text()
@@ -5189,7 +5213,7 @@ class TestAntigravityClientCommands:
             )
 
         with patch("core.llm_client._run_provider_cli", side_effect=_fake_run):
-            output = client.run_readonly_agent("prompt", tmp_path)
+            output = client.run_readonly_agent("readonly request", tmp_path)
 
         cmd = seen["cmd"]
         assert isinstance(cmd, list)
@@ -5198,11 +5222,11 @@ class TestAntigravityClientCommands:
         assert workspace != tmp_path
         assert cmd[cmd.index("--add-dir") + 1] == str(workspace)
         assert "--dangerously-skip-permissions" not in cmd
-        assert cmd[cmd.index("--mode") + 1] == "plan"
-        assert "--disable-slash-commands" not in cmd
+        assert "--disable-slash-commands" in cmd
+        assert "--mode" not in cmd
         assert cmd[cmd.index("--output-format") + 1] == "json"
-        assert cmd[cmd.index("--print") + 1] == "-"
-        assert seen["input"] == "prompt"
+        assert cmd[cmd.index("--print") + 1] != "-"
+        assert seen["prompt"] == "readonly request"
         assert (tmp_path / "repo.txt").read_text() == "source"
         assert str(workspace) not in output
         assert str(workspace.resolve()) not in output
@@ -5603,14 +5627,21 @@ class TestAntigravityClientCommands:
         )
         workspace = tmp_path.resolve()
 
+        seen: dict[str, object] = {}
+
+        def _fake_streaming(cmd, **kwargs):
+            seen["prompt"] = self._transport_prompt(workspace, cmd)
+            seen["kwargs"] = kwargs
+            return self._run_result(
+                "done",
+                usage={"input_tokens": 12, "output_tokens": 3, "total_tokens": 15},
+            )
+
         with (
             patch("core.llm_client._git_snapshot", side_effect=[{}, {"src/app.ts": "hash"}]),
             patch(
                 "core.llm_client._run_agent_subprocess_streaming",
-                return_value=self._run_result(
-                    "done",
-                    usage={"input_tokens": 12, "output_tokens": 3, "total_tokens": 15},
-                ),
+                side_effect=_fake_streaming,
             ) as mock_run,
         ):
             changed, output = client.run_agent("prompt", tmp_path)
@@ -5621,15 +5652,22 @@ class TestAntigravityClientCommands:
         assert cmd[cmd.index("--model") + 1] == "Gemini 3.5 Flash (High)"
         assert "--sandbox" in cmd
         assert "--dangerously-skip-permissions" in cmd
+        assert "--disable-slash-commands" not in cmd
+        assert "--mode" not in cmd
         assert cmd[cmd.index("--output-format") + 1] == "json"
-        assert cmd[cmd.index("--print") + 1] == "-"
-        assert mock_run.call_args.kwargs["cwd"] == workspace
-        stdin_text = mock_run.call_args.kwargs["stdin_text"]
-        assert "ANTIGRAVITY WORKSPACE BOUNDARY" in stdin_text
-        assert stdin_text.count("ANTIGRAVITY WORKSPACE BOUNDARY") == 1
-        assert f"The only project root for this task is: {workspace.as_posix()}" in stdin_text
-        assert "Do not search for, inspect, or modify any other checkout or repository path" in stdin_text
-        assert stdin_text.endswith("prompt")
+        assert cmd[cmd.index("--print") + 1] != "-"
+        kwargs = seen["kwargs"]
+        assert isinstance(kwargs, dict)
+        assert kwargs["cwd"] == workspace
+        assert "stdin_text" not in kwargs
+        transported_prompt = seen["prompt"]
+        assert isinstance(transported_prompt, str)
+        assert "ANTIGRAVITY WORKSPACE BOUNDARY" in transported_prompt
+        assert transported_prompt.count("ANTIGRAVITY WORKSPACE BOUNDARY") == 1
+        assert f"The only project root for this task is: {workspace.as_posix()}" in transported_prompt
+        assert "Do not search for, inspect, or modify any other checkout or repository path" in transported_prompt
+        assert transported_prompt.endswith("prompt")
+        assert not list(workspace.glob(".sikula-antigravity-prompt-*"))
         assert changed == ["src/app.ts"]
         assert output == "done"
         assert events[0]["output_chars"] == len("done")
@@ -5638,6 +5676,26 @@ class TestAntigravityClientCommands:
             "output_tokens": 3,
             "total_tokens": 15,
         }
+
+    def test_run_agent_replaces_unpaired_surrogates_in_prompt_transport(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        workspace = tmp_path.resolve()
+        seen: dict[str, str] = {}
+
+        def _fake_streaming(cmd, **kwargs):
+            seen["prompt"] = self._transport_prompt(workspace, cmd)
+            return self._run_result("done")
+
+        with (
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}]),
+            patch("core.llm_client._run_agent_subprocess_streaming", side_effect=_fake_streaming),
+        ):
+            changed, output = client.run_agent("before\udcffafter", tmp_path)
+
+        assert changed == []
+        assert output == "done"
+        assert seen["prompt"].endswith("before?after")
+        assert not list(workspace.glob(".sikula-antigravity-prompt-*"))
 
     @pytest.mark.parametrize("response", ["", " \r\n"])
     def test_run_agent_accepts_empty_success_response(self, tmp_path: Path, response: str):

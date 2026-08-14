@@ -3271,6 +3271,32 @@ def _antigravity_write_agent_prompt(prompt: str, cwd: Path) -> str:
 
 
 @contextmanager
+def _antigravity_prompt_transport(workspace: Path, prompt: str) -> Iterator[str]:
+    prompt_dir: Path | None = None
+    try:
+        prompt_dir = Path(tempfile.mkdtemp(prefix=".sikula-antigravity-prompt-", dir=workspace))
+        prompt_path = prompt_dir / "request.md"
+        prompt_path.write_bytes(prompt.encode("utf-8", errors="replace"))
+    except OSError as exc:
+        if prompt_dir is not None:
+            shutil.rmtree(prompt_dir, ignore_errors=True)
+        raise LLMEnvironmentError("antigravity prompt transport could not be created") from exc
+
+    relative_path = prompt_path.relative_to(workspace).as_posix()
+    request = (
+        f"Read the complete Sikula request from the project-relative file `{relative_path}` and follow it. "
+        "Treat that file as task input, not project content. Do not modify, quote, or mention the transport file."
+    )
+    try:
+        yield request
+    finally:
+        try:
+            shutil.rmtree(prompt_dir)
+        except OSError as exc:
+            raise LLMEnvironmentError("antigravity prompt transport could not be removed") from exc
+
+
+@contextmanager
 def _antigravity_log_file() -> Iterator[Path]:
     with tempfile.TemporaryDirectory(prefix="sikula-antigravity-log-") as tmp:
         yield Path(tmp) / "agy.log"
@@ -3395,10 +3421,11 @@ def _antigravity_write_readonly_agent(workspace: Path) -> str:
 
 
 class AntigravityClient(LLMClient):
-    """Calls Antigravity via the structured `agy --output-format json --print -` CLI.
+    """Calls Antigravity via the structured `agy --output-format json --print` CLI.
 
-    Read-only calls combine Antigravity's plan mode with a generated tool-limited
-    agent, an active-hook preflight, and a disposable workspace snapshot.
+    Prompts use a temporary task file because Antigravity print mode requires its prompt
+    as an argument. Read-only calls combine disabled slash expansion with a generated
+    tool-limited agent, an active-hook preflight, and a disposable workspace snapshot.
     """
 
     def __init__(self, config: LLMConfig) -> None:
@@ -3421,16 +3448,17 @@ class AntigravityClient(LLMClient):
         timeout: int,
         log_file: Path,
         auto_approve_tools: bool,
+        print_prompt: str,
         agent: str | None = None,
-        mode: str | None = None,
+        disable_slash_commands: bool = False,
     ) -> list[str]:
         cmd = ["agy", "--new-project"]
         if cwd is not None:
             cmd.extend(["--add-dir", str(cwd)])
         if agent is not None:
             cmd.extend(["--agent", agent])
-        if mode is not None:
-            cmd.extend(["--mode", mode])
+        if disable_slash_commands:
+            cmd.append("--disable-slash-commands")
         if auto_approve_tools:
             cmd.append("--dangerously-skip-permissions")
         cmd.extend(
@@ -3445,7 +3473,7 @@ class AntigravityClient(LLMClient):
                 "--output-format",
                 "json",
                 "--print",
-                "-",
+                print_prompt,
             ]
         )
         return cmd
@@ -3460,20 +3488,28 @@ class AntigravityClient(LLMClient):
         )
 
         def _call():
-            with _antigravity_log_file() as log_file:
-                result = _run_provider_cli(
-                    self._cmd(
-                        cwd=None,
-                        timeout=self._config.agent_timeout,
-                        log_file=log_file,
-                        auto_approve_tools=False,
-                    ),
-                    capture_output=True,
-                    input=prompt,
-                    text=True,
-                    timeout=self._config.agent_timeout,
-                )
-                log_diagnostic = _antigravity_log_diagnostic(log_file)
+            with tempfile.TemporaryDirectory(prefix="sikula-antigravity-generate-") as tmp:
+                workspace = Path(tmp) / "workspace"
+                workspace.mkdir()
+                agent_name = _antigravity_write_readonly_agent(workspace)
+                with _antigravity_prompt_transport(workspace, prompt) as print_prompt:
+                    with _antigravity_log_file() as log_file:
+                        result = _run_provider_cli(
+                            self._cmd(
+                                cwd=workspace,
+                                timeout=self._config.agent_timeout,
+                                log_file=log_file,
+                                auto_approve_tools=False,
+                                agent=agent_name,
+                                disable_slash_commands=True,
+                                print_prompt=print_prompt,
+                            ),
+                            capture_output=True,
+                            text=True,
+                            cwd=workspace,
+                            timeout=self._config.agent_timeout,
+                        )
+                        log_diagnostic = _antigravity_log_diagnostic(log_file)
             if result.returncode != 0:
                 raise _antigravity_result_error(result, "CLI", log_diagnostic)
             envelope = _antigravity_result_envelope(
@@ -3502,31 +3538,32 @@ class AntigravityClient(LLMClient):
 
             def _call():
                 result: subprocess.CompletedProcess[str] | None = None
-                with _antigravity_log_file() as log_file:
-                    try:
-                        result = _run_provider_cli(
-                            self._cmd(
+                try:
+                    with _antigravity_prompt_transport(workspace, prompt) as print_prompt:
+                        with _antigravity_log_file() as log_file:
+                            result = _run_provider_cli(
+                                self._cmd(
+                                    cwd=workspace,
+                                    timeout=self._config.agent_timeout,
+                                    log_file=log_file,
+                                    auto_approve_tools=False,
+                                    print_prompt=print_prompt,
+                                    agent=agent_name,
+                                    disable_slash_commands=True,
+                                ),
+                                capture_output=True,
+                                text=True,
                                 cwd=workspace,
                                 timeout=self._config.agent_timeout,
-                                log_file=log_file,
-                                auto_approve_tools=False,
-                                agent=agent_name,
-                                mode="plan",
-                            ),
-                            capture_output=True,
-                            input=prompt,
-                            text=True,
-                            cwd=workspace,
-                            timeout=self._config.agent_timeout,
-                        )
-                    except Exception as exc:
-                        after = _antigravity_directory_snapshot(workspace, copy_policy)
-                        if _antigravity_snapshot_changed(before, after):
-                            raise LLMReadOnlyViolation(
-                                "antigravity read-only boundary violation: disposable workspace changed"
-                            ) from exc
-                        raise
-                    log_diagnostic = _antigravity_log_diagnostic(log_file)
+                            )
+                            log_diagnostic = _antigravity_log_diagnostic(log_file)
+                except Exception as exc:
+                    after = _antigravity_directory_snapshot(workspace, copy_policy)
+                    if _antigravity_snapshot_changed(before, after):
+                        raise LLMReadOnlyViolation(
+                            "antigravity read-only boundary violation: disposable workspace changed"
+                        ) from exc
+                    raise
 
                 after = _antigravity_directory_snapshot(workspace, copy_policy)
                 if _antigravity_snapshot_changed(before, after):
@@ -3571,21 +3608,22 @@ class AntigravityClient(LLMClient):
         log.info("Running Antigravity agent (%s) — waiting for completion...", self._config.model)
 
         def _call():
-            with _antigravity_log_file() as log_file:
-                result = _run_agent_subprocess_streaming(
-                    self._cmd(
+            with _antigravity_prompt_transport(workspace, prompt) as print_prompt:
+                with _antigravity_log_file() as log_file:
+                    result = _run_agent_subprocess_streaming(
+                        self._cmd(
+                            cwd=workspace,
+                            timeout=self._config.agent_timeout,
+                            log_file=log_file,
+                            auto_approve_tools=True,
+                            print_prompt=print_prompt,
+                        ),
                         cwd=workspace,
+                        env=None,
                         timeout=self._config.agent_timeout,
-                        log_file=log_file,
-                        auto_approve_tools=True,
-                    ),
-                    cwd=workspace,
-                    env=None,
-                    timeout=self._config.agent_timeout,
-                    provider="antigravity",
-                    stdin_text=prompt,
-                )
-                log_diagnostic = _antigravity_log_diagnostic(log_file)
+                        provider="antigravity",
+                    )
+                    log_diagnostic = _antigravity_log_diagnostic(log_file)
             if result.returncode != 0:
                 raise _antigravity_result_error(result, "agent", log_diagnostic)
             after = _git_snapshot(workspace)

@@ -1206,8 +1206,11 @@ No file content is passed in the prompt.
   agent run, Sikula writes generated agent definitions to a temporary OpenCode config
   directory and passes it via `OPENCODE_CONFIG_DIR`, so generated OpenCode files are not
   written into either the task worktree or the original checkout.
-  For `AntigravityClient`, Sikula invokes the CLI with `--new-project`, `--add-dir`
-  set to the task project root, and prompts passed through stdin via `--print -`.
+  For `AntigravityClient`, Sikula invokes the CLI with `--new-project` and `--add-dir`
+  set to the task project root. Because Antigravity print mode requires an argument and
+  does not consume Sikula's stdin prompt, Sikula writes the complete request to a bounded,
+  project-relative temporary transport file and passes only a short file-reading request
+  through `--print`. The transport file is removed after each physical provider call.
   Before starting `agy`, Sikula rejects absolute symlinks and relative symlinks that
   resolve outside the project root on paths kept by its Antigravity workspace policy.
   Untracked ignored local artifacts such as `.venv` and `node_modules` are pruned so
@@ -1216,10 +1219,12 @@ No file content is passed in the prompt.
   CLI 1.1.12 or newer. Before an agent turn, Sikula consumes the structured, zero-turn
   `/hooks` result and fails closed when any workspace, plugin, or global hook is enabled or
   the effective hook set cannot be verified. Hooks are excluded because their external
-  commands execute outside the plan-mode tool boundary. Sikula creates a disposable custom
+  commands execute outside the generated agent's tool boundary. Sikula creates a
+  disposable custom
   primary agent with only `view_file`, `list_dir`, `find_by_name`, and `grep_search`, no
-  inherited MCP servers, subagent, skill dependency, plugin dependency, or shell capabilities, and
-  invokes it with `--sandbox --mode plan` without automatic permission approval. The call
+  inherited MCP servers, subagent, skill dependency, plugin dependency, or shell
+  capabilities, and invokes it with `--sandbox --disable-slash-commands` without
+  automatic permission approval. The call
   still runs against a disposable temporary copy. Sikula rejects any retained-path change,
   including one accompanying a timeout or non-zero exit, as a non-retryable
   `LLMReadOnlyViolation`, and sanitizes temporary paths back to project-relative paths on
@@ -1251,7 +1256,7 @@ No file content is passed in the prompt.
   For `OpenCodeClient`: technically enforced for read-only agents (`bash: deny`); prompt-level
   for write agents.
   For `AntigravityClient`: read-only calls combine an active-hook preflight, a generated
-  read-tool-only agent, `--mode plan`, and disposable-copy mutation detection; write-agent
+  read-tool-only agent, disabled slash expansion, and disposable-copy mutation detection; write-agent
   command restrictions are prompt-level plus any provider behavior from `--sandbox`.
 - *No internet access* — all agent prompts include `AGENT_SECURITY_PREFIX`
   (defined in `agents/base_agent.py`), which instructs agents not to use network
