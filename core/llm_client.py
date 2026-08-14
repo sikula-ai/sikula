@@ -3226,12 +3226,13 @@ def _antigravity_snapshot_changed(before: dict[str, str], after: dict[str, str])
     return any(before.get(path) != after.get(path) for path in before.keys() | after.keys())
 
 
-def _antigravity_sanitize_readonly_output(output: str, workspace: Path) -> str:
+def _antigravity_sanitize_readonly_output(output: str, *workspaces: Path) -> str:
     roots: list[str] = []
-    for root_path in (workspace, workspace.resolve()):
-        for root in (str(root_path).rstrip("/\\"), root_path.as_posix().rstrip("/")):
-            if root and root not in roots:
-                roots.append(root)
+    for workspace in workspaces:
+        for root_path in (workspace, workspace.resolve()):
+            for root in (str(root_path).rstrip("/\\"), root_path.as_posix().rstrip("/")):
+                if root and root not in roots:
+                    roots.append(root)
     uri_roots = list(roots)
     for root in roots:
         encoded_root = quote(root, safe="/:\\")
@@ -3544,9 +3545,14 @@ class AntigravityClient(LLMClient):
                     "CLI",
                     log_diagnostic=log_diagnostic,
                 )
-                return _LLMCallValue(
+                output = _antigravity_sanitize_readonly_output(
                     envelope.response,
-                    output_chars=len(envelope.response),
+                    workspace,
+                    prompt_workspace,
+                )
+                return _LLMCallValue(
+                    output,
+                    output_chars=len(output),
                     reported_tokens=envelope.reported_tokens,
                 )
 
@@ -3618,7 +3624,11 @@ class AntigravityClient(LLMClient):
                     "agent",
                     log_diagnostic=log_diagnostic,
                 )
-                output = _antigravity_sanitize_readonly_output(envelope.response, workspace)
+                output = _antigravity_sanitize_readonly_output(
+                    envelope.response,
+                    workspace,
+                    prompt_workspace,
+                )
                 return _LLMCallValue(
                     output,
                     output_chars=len(output),
@@ -3677,9 +3687,13 @@ class AntigravityClient(LLMClient):
                 allow_empty_response=True,
                 log_diagnostic=log_diagnostic,
             )
+            output = _antigravity_sanitize_readonly_output(
+                envelope.response,
+                prompt_workspace,
+            )
             return _LLMCallValue(
-                (changed, envelope.response),
-                output_chars=len(envelope.response),
+                (changed, output),
+                output_chars=len(output),
                 reported_tokens=envelope.reported_tokens,
             )
 

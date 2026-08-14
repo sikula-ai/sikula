@@ -4892,6 +4892,17 @@ class TestAntigravityClientCommands:
 
         assert sanitized == "See [client](core/llm_client.py#L12)."
 
+    def test_readonly_output_sanitizes_multiple_workspace_roots(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        prompt_workspace = tmp_path / "prompt"
+        output = f"See {workspace}/core/llm_client.py and {prompt_workspace}/request.md."
+
+        sanitized = _antigravity_sanitize_readonly_output(output, workspace, prompt_workspace)
+
+        assert str(workspace) not in sanitized
+        assert str(prompt_workspace) not in sanitized
+        assert sanitized == "See core/llm_client.py and request.md."
+
     @staticmethod
     def _result(
         text: str = "ok",
@@ -5464,13 +5475,17 @@ class TestAntigravityClientCommands:
 
         def _fake_run(cmd, **kwargs):
             workspace = Path(kwargs["cwd"])
+            add_dirs = [Path(cmd[index + 1]) for index, value in enumerate(cmd) if value == "--add-dir"]
+            prompt_workspace = add_dirs[1]
             seen["cmd"] = cmd
             seen["cwd"] = workspace
+            seen["prompt_workspace"] = prompt_workspace
             seen["prompt"] = self._transport_prompt(workspace, cmd)
-            return self._run_result("answer", usage=usage)
+            output = f"See {workspace}/generated.txt and {prompt_workspace}/request.md."
+            return self._run_result(output, usage=usage)
 
         with patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run:
-            assert client.generate("system", "user") == "answer"
+            output = client.generate("system", "user")
 
         cmd = seen["cmd"]
         assert isinstance(cmd, list)
@@ -5492,7 +5507,12 @@ class TestAntigravityClientCommands:
         assert mock_run.call_args.kwargs["timeout"] == 123
         assert "system\n\nuser" not in cmd
         assert seen["prompt"] == "system\n\nuser"
-        assert events[0]["output_chars"] == len("answer")
+        prompt_workspace = seen["prompt_workspace"]
+        assert isinstance(prompt_workspace, Path)
+        assert str(workspace) not in output
+        assert str(prompt_workspace) not in output
+        assert output == "See generated.txt and request.md."
+        assert events[0]["output_chars"] == len(output)
         assert events[0]["reported_tokens"] == {
             "input_tokens": 17,
             "output_tokens": 5,
@@ -5514,8 +5534,11 @@ class TestAntigravityClientCommands:
 
         def _fake_run(cmd, **kwargs):
             workspace = Path(kwargs["cwd"])
+            add_dirs = [Path(cmd[index + 1]) for index, value in enumerate(cmd) if value == "--add-dir"]
+            prompt_workspace = add_dirs[1]
             seen["cmd"] = cmd
             seen["cwd"] = workspace
+            seen["prompt_workspace"] = prompt_workspace
             seen["prompt"] = self._transport_prompt(workspace, cmd)
             assert "input" not in kwargs
             assert (workspace / "repo.txt").read_text() == "source"
@@ -5524,7 +5547,7 @@ class TestAntigravityClientCommands:
             seen["agent_definition"] = agent_definition
             output = (
                 f"See [sikula.py](file://{workspace.resolve()}/sikula.py#L12), "
-                f"{workspace}/core/llm_client.py, and /tmp/unrelated.py."
+                f"{workspace}/core/llm_client.py, {prompt_workspace}/request.md, and /tmp/unrelated.py."
             )
             return subprocess.CompletedProcess(
                 cmd,
@@ -5551,9 +5574,13 @@ class TestAntigravityClientCommands:
         assert (tmp_path / "repo.txt").read_text() == "source"
         assert str(workspace) not in output
         assert str(workspace.resolve()) not in output
+        prompt_workspace = seen["prompt_workspace"]
+        assert isinstance(prompt_workspace, Path)
+        assert str(prompt_workspace) not in output
         assert "file://" not in output
         assert "[sikula.py](sikula.py#L12)" in output
         assert "core/llm_client.py" in output
+        assert "request.md" in output
         assert "/tmp/unrelated.py" in output
         assert events[0]["output_chars"] == len(output)
         assert events[0]["reported_tokens"] == {"input_tokens": 9, "output_tokens": 4}
@@ -5991,10 +6018,13 @@ class TestAntigravityClientCommands:
         seen: dict[str, object] = {}
 
         def _fake_streaming(cmd, **kwargs):
+            add_dirs = [Path(cmd[index + 1]) for index, value in enumerate(cmd) if value == "--add-dir"]
+            prompt_workspace = add_dirs[1]
             seen["prompt"] = self._transport_prompt(workspace, cmd)
+            seen["prompt_workspace"] = prompt_workspace
             seen["kwargs"] = kwargs
             return self._run_result(
-                "done",
+                f"done {prompt_workspace}/request.md",
                 usage={"input_tokens": 12, "output_tokens": 3, "total_tokens": 15},
             )
 
@@ -6028,9 +6058,12 @@ class TestAntigravityClientCommands:
         assert f"The only project root for this task is: {workspace.as_posix()}" in transported_prompt
         assert "Do not search for, inspect, or modify any other checkout or repository path" in transported_prompt
         assert transported_prompt.endswith("prompt")
+        prompt_workspace = seen["prompt_workspace"]
+        assert isinstance(prompt_workspace, Path)
+        assert str(prompt_workspace) not in output
         assert changed == ["src/app.ts"]
-        assert output == "done"
-        assert events[0]["output_chars"] == len("done")
+        assert output == "done request.md"
+        assert events[0]["output_chars"] == len(output)
         assert events[0]["reported_tokens"] == {
             "input_tokens": 12,
             "output_tokens": 3,
