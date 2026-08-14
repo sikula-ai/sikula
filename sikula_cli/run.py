@@ -129,6 +129,7 @@ class RunContext:
     print_contract_readiness_gate_failure: Callable[[dict, list[str], str], None]
     branch_stem: Callable[[str], str]
     ensure_gitignore: Callable[[Path], None]
+    cleanup_provider_runtime_artifacts: Callable[[Path], None]
     create_worktree: Callable[..., tuple[bool, str]]
     build_tool_class: Callable[[dict], object]
     record_snapshot_asset_drift: Callable[..., None]
@@ -249,6 +250,8 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             else:
                 context.require_committed_config_for_isolated_run(cfg, git_root, overrides)
 
+        context.cleanup_provider_runtime_artifacts(original_project_root)
+
         description = task_path.read_text().strip()
         state = store.create(
             description,
@@ -332,6 +335,8 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             context.logger.info("Worktree created: %s (branch: %s)", worktree_base, branch)
             cfg["project"]["root_path"] = str(worktree_project_root)
 
+        if isolate:
+            context.cleanup_provider_runtime_artifacts(Path(cfg["project"]["root_path"]))
         orch = context.build_orchestrator(cfg, overrides, state_store=store)
         state = orch.run(
             task_id=state.task_id,
@@ -401,6 +406,10 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             project_root = Path(cfg.get("project", {}).get("root_path") or original_project_root)
             context.record_snapshot_asset_drift(state, project_root, store, phase="resume")
 
+        active_project_root = Path(
+            state.worktree_path or cfg.get("project", {}).get("root_path") or original_project_root
+        )
+        context.cleanup_provider_runtime_artifacts(active_project_root)
         if not current_branch_delivery_retry:
             orch = context.build_orchestrator(cfg, overrides, state_store=store)
             state = orch.run(task_id=args.task_id)

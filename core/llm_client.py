@@ -2581,6 +2581,8 @@ _ANTIGRAVITY_LOG_DIAGNOSTIC_LINES = 6
 _ANTIGRAVITY_LOG_DIAGNOSTIC_LINE_CHARS = 500
 _ANTIGRAVITY_MIN_VERSION = (1, 1, 12)
 _ANTIGRAVITY_HOOK_PREFLIGHT_TIMEOUT = 60
+_ANTIGRAVITY_PROMPT_RUNTIME_PATH = Path(".sikula/state/antigravity-prompts")
+_ANTIGRAVITY_PROMPT_GIT_EXCLUDE = "**/.sikula/state/antigravity-prompts/"
 _ANTIGRAVITY_READONLY_TOOLS = (
     "view_file",
     "list_dir",
@@ -3273,8 +3275,10 @@ def _antigravity_write_agent_prompt(prompt: str, cwd: Path) -> str:
 @contextmanager
 def _antigravity_prompt_transport(workspace: Path, prompt: str) -> Iterator[str]:
     prompt_dir: Path | None = None
+    prompt_root = workspace / _ANTIGRAVITY_PROMPT_RUNTIME_PATH
     try:
-        prompt_dir = Path(tempfile.mkdtemp(prefix=".sikula-antigravity-prompt-", dir=workspace))
+        prompt_root.mkdir(parents=True, exist_ok=True)
+        prompt_dir = Path(tempfile.mkdtemp(prefix="request-", dir=prompt_root))
         prompt_path = prompt_dir / "request.md"
         prompt_path.write_bytes(prompt.encode("utf-8", errors="replace"))
     except OSError as exc:
@@ -3294,6 +3298,28 @@ def _antigravity_prompt_transport(workspace: Path, prompt: str) -> Iterator[str]
             shutil.rmtree(prompt_dir)
         except OSError as exc:
             raise LLMEnvironmentError("antigravity prompt transport could not be removed") from exc
+        try:
+            prompt_root.rmdir()
+        except OSError as exc:
+            if exc.errno not in {errno.ENOENT, errno.ENOTEMPTY}:
+                raise LLMEnvironmentError("antigravity prompt transport could not be removed") from exc
+        for parent in (prompt_root.parent, prompt_root.parent.parent):
+            try:
+                parent.rmdir()
+            except OSError as exc:
+                if exc.errno not in {errno.ENOENT, errno.ENOTEMPTY}:
+                    raise LLMEnvironmentError("antigravity prompt transport could not be removed") from exc
+
+
+def _antigravity_cleanup_prompt_transports(workspace: Path) -> None:
+    prompt_root = workspace / _ANTIGRAVITY_PROMPT_RUNTIME_PATH
+    try:
+        if prompt_root.is_symlink() or prompt_root.is_file():
+            prompt_root.unlink()
+        elif prompt_root.exists():
+            shutil.rmtree(prompt_root)
+    except OSError as exc:
+        raise LLMEnvironmentError("stale antigravity prompt transport could not be removed") from exc
 
 
 @contextmanager
@@ -3605,6 +3631,14 @@ class AntigravityClient(LLMClient):
             paths = ", ".join(sorted(policy.gitlink_paths))
             raise LLMConfigurationError(f"antigravity write agent does not support git submodules: {paths}")
         _antigravity_validate_workspace_symlinks(workspace, prune_ignored_paths=True, policy=policy)
+        try:
+            _add_git_exclude_entry(
+                workspace,
+                _ANTIGRAVITY_PROMPT_GIT_EXCLUDE,
+                "Sikula Antigravity prompt transport",
+            )
+        except OSError as exc:
+            raise LLMEnvironmentError("antigravity prompt runtime could not be excluded from Git") from exc
         prompt = self.prepare_agent_prompt(prompt, workspace)
         before = _git_snapshot(workspace)
         log.info("Running Antigravity agent (%s) — waiting for completion...", self._config.model)

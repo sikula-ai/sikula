@@ -261,6 +261,39 @@ class TestFinalizeWorktree:
         remove_calls = [c for c in calls if "worktree" in c and "remove" in c]
         assert remove_calls == [["git", "worktree", "remove", str(tmp_path)]]
 
+    def test_removes_stale_antigravity_prompt_before_staging(self, tmp_path):
+        stale_prompt = tmp_path / ".sikula" / "state" / "antigravity-prompts" / "request-stale" / "request.md"
+        stale_prompt.parent.mkdir(parents=True)
+        stale_prompt.write_text("private prompt")
+        calls = []
+
+        def fake_run(cmd, **_):
+            calls.append(cmd)
+            if cmd == ["git", "add", "-A"]:
+                assert not stale_prompt.parent.parent.exists()
+            return _git_result()
+
+        state = self._state(worktree_path=str(tmp_path))
+        with patch("sikula.subprocess.run", side_effect=fake_run):
+            success, committed, commit_sha = _finalize_worktree(tmp_path, tmp_path, state)
+
+        assert success
+        assert not committed
+        assert commit_sha is None
+        assert calls[0] == ["git", "add", "-A"]
+
+    def test_stops_before_staging_when_prompt_cleanup_fails(self, tmp_path):
+        with (
+            patch("sikula._cleanup_provider_runtime_artifacts", side_effect=RuntimeError),
+            patch("sikula.subprocess.run") as run,
+        ):
+            success, committed, commit_sha = _finalize_worktree(tmp_path, tmp_path, self._state())
+
+        assert not success
+        assert not committed
+        assert commit_sha is None
+        run.assert_not_called()
+
     def test_falls_back_to_force_when_plain_remove_fails(self, tmp_path):
         calls = []
 
@@ -1797,6 +1830,9 @@ class TestIsolatedRunConfigGuard:
         config_path = self._init_repo_with_config(tmp_path, commit_config=False)
         task_file = tmp_path / "task.md"
         task_file.write_text("do something")
+        stale_prompt = tmp_path / ".sikula" / "state" / "antigravity-prompts" / "request-stale" / "request.md"
+        stale_prompt.parent.mkdir(parents=True)
+        stale_prompt.write_text("private prompt")
         cfg = _run_cfg(tmp_path)
         cfg["_config_path"] = str(config_path)
 
@@ -1817,6 +1853,7 @@ class TestIsolatedRunConfigGuard:
             cmd_run(_run_args(task_file=str(task_file), no_isolate=True), cfg)
 
         assert mock_orch.called
+        assert not stale_prompt.parent.parent.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -2388,6 +2425,9 @@ class TestCmdRunStateStore:
             }
         ]
         store.save(state)
+        stale_prompt = tmp_path / ".sikula" / "state" / "antigravity-prompts" / "request-stale" / "request.md"
+        stale_prompt.parent.mkdir(parents=True)
+        stale_prompt.write_text("private prompt")
 
         def capture_orch(cfg_arg, overrides=None, state_store=None):
             mock = MagicMock()
@@ -2413,6 +2453,7 @@ class TestCmdRunStateStore:
         assert drift["expected_source"] == "task_state_snapshot"
         assert drift["expected_sha256"] == expected_sha
         assert drift["current_sha256"] == current_sha
+        assert not stale_prompt.parent.parent.exists()
 
     def test_task_file_contract_preflight_uses_cli_phase_overrides(self, tmp_path: Path):
         task_file = tmp_path / "task.md"

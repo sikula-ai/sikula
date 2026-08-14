@@ -1208,9 +1208,11 @@ No file content is passed in the prompt.
   written into either the task worktree or the original checkout.
   For `AntigravityClient`, Sikula invokes the CLI with `--new-project` and `--add-dir`
   set to the task project root. Because Antigravity print mode requires an argument and
-  does not consume Sikula's stdin prompt, Sikula writes the complete request to a bounded,
-  project-relative temporary transport file and passes only a short file-reading request
-  through `--print`. The transport file is removed after each physical provider call.
+  does not consume Sikula's stdin prompt, Sikula writes the complete request under the
+  Git-excluded `.sikula/state/antigravity-prompts/` runtime path and passes only a short
+  project-relative file-reading request through `--print`. The transport file is removed
+  after each physical provider call. Fresh runs and resumes remove stale transports left by
+  interrupted processes, and worktree finalization repeats that cleanup before staging.
   Before starting `agy`, Sikula rejects absolute symlinks and relative symlinks that
   resolve outside the project root on paths kept by its Antigravity workspace policy.
   Untracked ignored local artifacts such as `.venv` and `node_modules` are pruned so

@@ -32,6 +32,7 @@ from core.llm_client import (
     _AntigravityCopyPolicy,
     _antigravity_copy_ignore,
     _antigravity_copy_policy,
+    _antigravity_cleanup_prompt_transports,
     _antigravity_directory_snapshot,
     _antigravity_git_paths,
     _antigravity_gitlink_paths,
@@ -4755,13 +4756,65 @@ class TestAntigravityClientCommands:
 
     @staticmethod
     def _transport_prompt(workspace: Path, cmd: list[str]) -> str:
-        prompt_files = list(workspace.glob(".sikula-antigravity-prompt-*/request.md"))
+        prompt_files = list(workspace.glob(".sikula/state/antigravity-prompts/request-*/request.md"))
         assert len(prompt_files) == 1
         relative_path = prompt_files[0].relative_to(workspace).as_posix()
         print_prompt = cmd[cmd.index("--print") + 1]
         assert relative_path in print_prompt
         assert "Treat that file as task input, not project content" in print_prompt
         return prompt_files[0].read_text()
+
+    def test_prompt_transport_uses_git_excluded_runtime_path(self, tmp_path: Path):
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        def _fake_streaming(cmd, **kwargs):
+            prompt_files = list(tmp_path.glob(".sikula/state/antigravity-prompts/request-*/request.md"))
+            assert len(prompt_files) == 1
+            prompt_path = prompt_files[0]
+            transported_prompt = prompt_path.read_text()
+            assert transported_prompt.startswith("ANTIGRAVITY WORKSPACE BOUNDARY:\n")
+            assert transported_prompt.endswith("private prompt")
+            assert prompt_path.relative_to(tmp_path).as_posix() in cmd[cmd.index("--print") + 1]
+            ignored = subprocess.run(
+                ["git", "check-ignore", "--quiet", str(prompt_path.relative_to(tmp_path))],
+                cwd=tmp_path,
+            )
+            assert ignored.returncode == 0
+            return self._run_result("done")
+
+        with (
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}]),
+            patch("core.llm_client._run_agent_subprocess_streaming", side_effect=_fake_streaming),
+        ):
+            changed, output = client.run_agent("private prompt", tmp_path)
+
+        assert changed == []
+        assert output == "done"
+        assert not (tmp_path / ".sikula" / "state" / "antigravity-prompts").exists()
+
+    def test_cleanup_removes_stale_prompt_transports(self, tmp_path: Path):
+        prompt_root = tmp_path / ".sikula" / "state" / "antigravity-prompts"
+        stale_dir = prompt_root / "request-stale"
+        stale_dir.mkdir(parents=True)
+        (stale_dir / "request.md").write_text("private prompt")
+
+        _antigravity_cleanup_prompt_transports(tmp_path)
+
+        assert not prompt_root.exists()
+
+    def test_run_agent_fails_before_prompt_when_git_exclude_cannot_be_written(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client._add_git_exclude_entry", side_effect=PermissionError),
+            patch("core.llm_client._run_agent_subprocess_streaming") as streaming,
+            pytest.raises(LLMEnvironmentError, match="could not be excluded from Git"),
+        ):
+            client.run_agent("private prompt", tmp_path)
+
+        streaming.assert_not_called()
+        assert not (tmp_path / ".sikula" / "state" / "antigravity-prompts").exists()
 
     def test_parse_version_extracts_semver(self):
         assert _antigravity_parse_version("agy 1.0.13") == (1, 0, 13)
@@ -5697,7 +5750,7 @@ class TestAntigravityClientCommands:
         assert f"The only project root for this task is: {workspace.as_posix()}" in transported_prompt
         assert "Do not search for, inspect, or modify any other checkout or repository path" in transported_prompt
         assert transported_prompt.endswith("prompt")
-        assert not list(workspace.glob(".sikula-antigravity-prompt-*"))
+        assert not (workspace / ".sikula" / "state" / "antigravity-prompts").exists()
         assert changed == ["src/app.ts"]
         assert output == "done"
         assert events[0]["output_chars"] == len("done")
@@ -5725,7 +5778,7 @@ class TestAntigravityClientCommands:
         assert changed == []
         assert output == "done"
         assert seen["prompt"].endswith("before?after")
-        assert not list(workspace.glob(".sikula-antigravity-prompt-*"))
+        assert not (workspace / ".sikula" / "state" / "antigravity-prompts").exists()
 
     @pytest.mark.parametrize("response", ["", " \r\n"])
     def test_run_agent_accepts_empty_success_response(self, tmp_path: Path, response: str):
