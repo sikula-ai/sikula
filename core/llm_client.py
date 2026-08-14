@@ -408,11 +408,14 @@ def _call_with_retry(
     operation: str | None = None,
     *,
     input_chars: int = 0,
+    before_attempt: Callable[[], None] | None = None,
 ):
     """Call fn() and retry only retryable LLM failures with exponential backoff."""
     total = len(_RETRY_DELAYS) + 1
     last_exc: Exception | None = None
     for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+        if before_attempt is not None:
+            before_attempt()
         try:
             if config is None:
                 return fn()
@@ -3547,7 +3550,17 @@ class AntigravityClient(LLMClient):
                     reported_tokens=envelope.reported_tokens,
                 )
 
-            return _call_with_retry("generate", _call, self._config, "generate", input_chars=len(prompt))
+            return _call_with_retry(
+                "generate",
+                _call,
+                self._config,
+                "generate",
+                input_chars=len(prompt),
+                before_attempt=lambda: _antigravity_require_no_active_hooks(
+                    workspace,
+                    self._config.agent_timeout,
+                ),
+            )
 
     def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
         self._ensure_supported_version()
@@ -3618,6 +3631,10 @@ class AntigravityClient(LLMClient):
                 self._config,
                 "run_readonly_agent",
                 input_chars=len(prompt),
+                before_attempt=lambda: _antigravity_require_no_active_hooks(
+                    workspace,
+                    self._config.agent_timeout,
+                ),
             )
 
     def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
@@ -3628,7 +3645,6 @@ class AntigravityClient(LLMClient):
             paths = ", ".join(sorted(policy.gitlink_paths))
             raise LLMConfigurationError(f"antigravity write agent does not support git submodules: {paths}")
         _antigravity_validate_workspace_symlinks(workspace, prune_ignored_paths=True, policy=policy)
-        _antigravity_require_no_active_hooks(workspace, self._config.agent_timeout)
         prompt = self.prepare_agent_prompt(prompt, workspace)
         before = _git_snapshot(workspace)
         log.info("Running Antigravity agent (%s) — waiting for completion...", self._config.model)
@@ -3670,6 +3686,7 @@ class AntigravityClient(LLMClient):
         total = len(_RETRY_DELAYS) + 1
         last_exc: Exception | None = None
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+            _antigravity_require_no_active_hooks(workspace, self._config.agent_timeout)
             try:
                 return _call_observed(
                     self._config,

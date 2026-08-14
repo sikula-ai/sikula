@@ -316,6 +316,29 @@ class TestCallWithRetry:
             _call_with_retry("test", fn)
         assert fn.call_count == 1
 
+    def test_runs_preflight_before_each_retry_without_observing_blocked_attempt(self):
+        events = []
+        config = LLMConfig(provider="antigravity", usage_observer=events.append)
+        fn = MagicMock(side_effect=LLMTransientError("temporary failure"))
+        before_attempt = MagicMock(side_effect=[None, LLMConfigurationError("antigravity hooks are enabled")])
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            pytest.raises(LLMConfigurationError, match="hooks are enabled"),
+        ):
+            _call_with_retry(
+                "test",
+                fn,
+                config,
+                "generate",
+                before_attempt=before_attempt,
+            )
+
+        assert before_attempt.call_count == 2
+        assert fn.call_count == 1
+        assert len(events) == 1
+        assert events[0]["error_type"] == "LLMTransientError"
+
 
 class TestProviderErrorClassification:
     @pytest.mark.parametrize(
@@ -4724,6 +4747,116 @@ class TestAntigravityHookPreflight:
         prompt_transport.assert_not_called()
         streaming.assert_not_called()
         assert events == []
+
+    def test_generate_rechecks_hooks_before_retry_transport(self, tmp_path: Path):
+        events = []
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                usage_observer=events.append,
+            )
+        )
+        blocked = LLMConfigurationError("antigravity hooks are enabled")
+
+        with (
+            patch("core.llm_client._antigravity_require_supported_version"),
+            patch(
+                "core.llm_client._antigravity_require_no_active_hooks",
+                side_effect=[None, None, None, blocked],
+            ) as hook_preflight,
+            patch(
+                "core.llm_client._antigravity_write_readonly_agent",
+                return_value="sikula-readonly",
+            ) as write_agent,
+            patch("core.llm_client._antigravity_prompt_transport") as prompt_transport,
+            patch(
+                "core.llm_client._run_provider_cli",
+                side_effect=[
+                    subprocess.CompletedProcess(["agy"], 0, "not json", ""),
+                    subprocess.CompletedProcess(["agy"], 0, "still not json", ""),
+                ],
+            ) as provider_call,
+            patch("core.llm_client.time.sleep"),
+            pytest.raises(LLMConfigurationError, match="hooks are enabled"),
+        ):
+            prompt_transport.return_value.__enter__.return_value = (tmp_path / "prompt", "bounded request")
+            client.generate("system", "user")
+
+        assert hook_preflight.call_count == 4
+        write_agent.assert_called_once()
+        assert prompt_transport.call_count == 2
+        assert provider_call.call_count == 2
+        assert len(events) == 2
+
+    def test_readonly_agent_rechecks_hooks_before_retry_transport(self, tmp_path: Path):
+        (tmp_path / "repo.txt").write_text("source")
+        events = []
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                usage_observer=events.append,
+            )
+        )
+        blocked = LLMConfigurationError("antigravity hooks are enabled")
+
+        with (
+            patch("core.llm_client._antigravity_require_supported_version"),
+            patch(
+                "core.llm_client._antigravity_require_no_active_hooks",
+                side_effect=[None, None, blocked],
+            ) as hook_preflight,
+            patch("core.llm_client._antigravity_prompt_transport") as prompt_transport,
+            patch(
+                "core.llm_client._run_provider_cli",
+                return_value=subprocess.CompletedProcess(["agy"], 0, "not json", ""),
+            ) as provider_call,
+            patch("core.llm_client.time.sleep"),
+            pytest.raises(LLMConfigurationError, match="hooks are enabled"),
+        ):
+            prompt_transport.return_value.__enter__.return_value = (tmp_path / "prompt", "bounded request")
+            client.run_readonly_agent("secret prompt", tmp_path)
+
+        assert hook_preflight.call_count == 3
+        prompt_transport.assert_called_once()
+        provider_call.assert_called_once()
+        assert len(events) == 1
+        assert (tmp_path / "repo.txt").read_text() == "source"
+
+    def test_write_agent_rechecks_hooks_before_retry_transport(self, tmp_path: Path):
+        events = []
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                usage_observer=events.append,
+            )
+        )
+        blocked = LLMConfigurationError("antigravity hooks are enabled")
+
+        with (
+            patch("core.llm_client._antigravity_require_supported_version"),
+            patch(
+                "core.llm_client._antigravity_require_no_active_hooks",
+                side_effect=[None, blocked],
+            ) as hook_preflight,
+            patch("core.llm_client._antigravity_prompt_transport") as prompt_transport,
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                return_value=subprocess.CompletedProcess(["agy"], 1, "partial output", ""),
+            ) as provider_call,
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}]),
+            patch("core.llm_client.time.sleep"),
+            pytest.raises(LLMConfigurationError, match="hooks are enabled"),
+        ):
+            prompt_transport.return_value.__enter__.return_value = (tmp_path / "prompt", "bounded request")
+            client.run_agent("secret prompt", tmp_path)
+
+        assert hook_preflight.call_count == 2
+        prompt_transport.assert_called_once()
+        provider_call.assert_called_once()
+        assert len(events) == 1
 
 
 class TestAntigravityClientCommands:
