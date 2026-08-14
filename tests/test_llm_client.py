@@ -4664,6 +4664,36 @@ class TestAntigravityHookPreflight:
         assert events == []
         assert (tmp_path / "repo.txt").read_text() == "source"
 
+    def test_generate_blocks_enabled_hooks_before_writing_prompt(self):
+        events = []
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                usage_observer=events.append,
+            )
+        )
+        result = subprocess.CompletedProcess(
+            ["agy"],
+            0,
+            self._result([{"name": "active", "enabled": True}]),
+            "",
+        )
+
+        with (
+            patch("core.llm_client._antigravity_require_supported_version"),
+            patch("core.llm_client._run_provider_cli", return_value=result) as mock_run,
+            patch("core.llm_client._antigravity_write_readonly_agent") as write_agent,
+            patch("core.llm_client._antigravity_prompt_transport") as prompt_transport,
+            pytest.raises(LLMConfigurationError, match="hooks are enabled"),
+        ):
+            client.generate("private system prompt", "private user prompt")
+
+        assert mock_run.call_count == 1
+        write_agent.assert_not_called()
+        prompt_transport.assert_not_called()
+        assert events == []
+
 
 class TestAntigravityClientCommands:
     @pytest.fixture(autouse=True)

@@ -30,15 +30,6 @@ llm:
   agent_timeout: 1800
 ```
 
-Antigravity's final structured result contributes explicit input, output, total,
-and cache-read token counts to Sikula's provider-neutral usage records when
-available. Cache reads are reported as `cached_input_tokens`; missing or invalid
-optional fields remain unknown, and Sikula does not estimate them.
-
-Sikula keeps complete Antigravity prompts out of command arguments by storing each
-request in a temporary project-relative transport file. The bounded `--print`
-argument tells the provider to read that file, which is removed after the call.
-
 ## Configure The Default Provider
 
 ```yaml
@@ -98,9 +89,7 @@ Provider-specific API-key or enterprise authentication should be configured acco
 
 Sikula runs locally in your repository. The configured provider determines what task, prompt, source, and diff context may be sent outside your machine. Choose a provider and authentication mode that matches your organization's data policy.
 
-Antigravity calls that attach a project first reject absolute symlinks and relative symlinks that resolve outside the project root on paths Sikula keeps under its workspace policy. Untracked ignored local artifacts such as `.venv` and `node_modules` are pruned so ordinary dependency/runtime directories do not block runs; tracked or preserved paths inside soft-ignored directories are still checked. Internal project-relative symlinks are allowed.
-
-Antigravity read-only agents require CLI 1.1.12 or newer and cannot run while workspace, plugin, or global Antigravity hooks are enabled. Sikula disables slash-command expansion and uses a read-tool-only custom agent together with a disposable workspace copy, rejecting any project-file mutation without retrying the same provider attempt. Write-capable permissions and changed-file detection are unchanged. Provider-owned state under the Antigravity user profile remains outside Sikula's project snapshot and may still change.
+Antigravity generation and read-only agent calls cannot run while workspace, plugin, or global Antigravity hooks are enabled. Disable those hooks before using Antigravity for planning, preparation, analysis, or review. See [Sandbox And Command Restrictions](sandbox.md) for provider-specific workspace protections.
 
 ## Adding A Provider
 

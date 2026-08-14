@@ -3487,11 +3487,13 @@ class AntigravityClient(LLMClient):
             len(prompt) // 4,
         )
 
-        def _call():
-            with tempfile.TemporaryDirectory(prefix="sikula-antigravity-generate-") as tmp:
-                workspace = Path(tmp) / "workspace"
-                workspace.mkdir()
-                agent_name = _antigravity_write_readonly_agent(workspace)
+        with tempfile.TemporaryDirectory(prefix="sikula-antigravity-generate-") as tmp:
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            _antigravity_require_no_active_hooks(workspace, self._config.agent_timeout)
+            agent_name = _antigravity_write_readonly_agent(workspace)
+
+            def _call():
                 with _antigravity_prompt_transport(workspace, prompt) as print_prompt:
                     with _antigravity_log_file() as log_file:
                         result = _run_provider_cli(
@@ -3510,20 +3512,20 @@ class AntigravityClient(LLMClient):
                             timeout=self._config.agent_timeout,
                         )
                         log_diagnostic = _antigravity_log_diagnostic(log_file)
-            if result.returncode != 0:
-                raise _antigravity_result_error(result, "CLI", log_diagnostic)
-            envelope = _antigravity_result_envelope(
-                result.stdout,
-                "CLI",
-                log_diagnostic=log_diagnostic,
-            )
-            return _LLMCallValue(
-                envelope.response,
-                output_chars=len(envelope.response),
-                reported_tokens=envelope.reported_tokens,
-            )
+                if result.returncode != 0:
+                    raise _antigravity_result_error(result, "CLI", log_diagnostic)
+                envelope = _antigravity_result_envelope(
+                    result.stdout,
+                    "CLI",
+                    log_diagnostic=log_diagnostic,
+                )
+                return _LLMCallValue(
+                    envelope.response,
+                    output_chars=len(envelope.response),
+                    reported_tokens=envelope.reported_tokens,
+                )
 
-        return _call_with_retry("generate", _call, self._config, "generate", input_chars=len(prompt))
+            return _call_with_retry("generate", _call, self._config, "generate", input_chars=len(prompt))
 
     def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
         self._ensure_supported_version()

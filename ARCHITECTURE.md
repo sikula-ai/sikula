@@ -1215,11 +1215,12 @@ No file content is passed in the prompt.
   resolve outside the project root on paths kept by its Antigravity workspace policy.
   Untracked ignored local artifacts such as `.venv` and `node_modules` are pruned so
   ordinary dependency/runtime directories do not block runs; tracked or preserved paths
-  inside soft-ignored directories are still checked. Read-only calls require Antigravity
-  CLI 1.1.12 or newer. Before an agent turn, Sikula consumes the structured, zero-turn
-  `/hooks` result and fails closed when any workspace, plugin, or global hook is enabled or
-  the effective hook set cannot be verified. Hooks are excluded because their external
-  commands execute outside the generated agent's tool boundary. Sikula creates a
+  inside soft-ignored directories are still checked. Generation and read-only calls require
+  Antigravity CLI 1.1.12 or newer. Before creating their prompt transport or starting an
+  agent turn, Sikula consumes the structured, zero-turn `/hooks` result and fails closed
+  when any workspace, plugin, or global hook is enabled or the effective hook set cannot be
+  verified. Hooks are excluded because their external commands execute outside the
+  generated agent's tool boundary. Sikula creates a
   disposable custom
   primary agent with only `view_file`, `list_dir`, `find_by_name`, and `grep_search`, no
   inherited MCP servers, subagent, skill dependency, plugin dependency, or shell
