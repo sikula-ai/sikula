@@ -2877,6 +2877,8 @@ def _antigravity_result_error(
     result: subprocess.CompletedProcess[str],
     operation: str,
     log_diagnostic: str = "",
+    *,
+    workspaces: tuple[Path, ...] = (),
 ) -> LLMProviderError:
     output_chars, reported_tokens = _antigravity_result_observation(result.stdout or "")
 
@@ -2885,8 +2887,8 @@ def _antigravity_result_error(
         error.reported_tokens = reported_tokens
         return error
 
-    stderr = (result.stderr or "").strip()
-    log_diagnostic = log_diagnostic.strip()
+    stderr = _antigravity_sanitize_readonly_output(result.stderr or "", *workspaces).strip()
+    log_diagnostic = _antigravity_sanitize_readonly_output(log_diagnostic, *workspaces).strip()
     if stderr:
         safe_stderr = _antigravity_provider_error_marker_text(stderr) or _antigravity_redact_diagnostic(stderr)
         if log_diagnostic:
@@ -3539,7 +3541,12 @@ class AntigravityClient(LLMClient):
                         )
                         log_diagnostic = _antigravity_log_diagnostic(log_file)
                 if result.returncode != 0:
-                    raise _antigravity_result_error(result, "CLI", log_diagnostic)
+                    raise _antigravity_result_error(
+                        result,
+                        "CLI",
+                        log_diagnostic,
+                        workspaces=(workspace, prompt_workspace),
+                    )
                 envelope = _antigravity_result_envelope(
                     result.stdout,
                     "CLI",
@@ -3618,7 +3625,12 @@ class AntigravityClient(LLMClient):
                         reported_tokens=reported_tokens,
                     )
                 if result.returncode != 0:
-                    raise _antigravity_result_error(result, "agent", log_diagnostic)
+                    raise _antigravity_result_error(
+                        result,
+                        "agent",
+                        log_diagnostic,
+                        workspaces=(workspace, prompt_workspace),
+                    )
                 envelope = _antigravity_result_envelope(
                     result.stdout,
                     "agent",
@@ -3678,7 +3690,12 @@ class AntigravityClient(LLMClient):
                     )
                     log_diagnostic = _antigravity_log_diagnostic(log_file)
             if result.returncode != 0:
-                raise _antigravity_result_error(result, "agent", log_diagnostic)
+                raise _antigravity_result_error(
+                    result,
+                    "agent",
+                    log_diagnostic,
+                    workspaces=(workspace, prompt_workspace),
+                )
             after = _git_snapshot(workspace)
             changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
             envelope = _antigravity_result_envelope(
