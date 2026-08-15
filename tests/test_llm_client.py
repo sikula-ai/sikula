@@ -39,6 +39,7 @@ from core.llm_client import (
     _antigravity_log_line_diagnostic,
     _antigravity_marker_text,
     _antigravity_parse_version,
+    _antigravity_prompt_transport,
     _antigravity_reported_tokens,
     _antigravity_require_no_active_hooks,
     _antigravity_require_supported_version,
@@ -314,6 +315,29 @@ class TestCallWithRetry:
         with pytest.raises(ValueError):
             _call_with_retry("test", fn)
         assert fn.call_count == 1
+
+    def test_runs_preflight_before_each_retry_without_observing_blocked_attempt(self):
+        events = []
+        config = LLMConfig(provider="antigravity", usage_observer=events.append)
+        fn = MagicMock(side_effect=LLMTransientError("temporary failure"))
+        before_attempt = MagicMock(side_effect=[None, LLMConfigurationError("antigravity hooks are enabled")])
+
+        with (
+            patch("core.llm_client.time.sleep"),
+            pytest.raises(LLMConfigurationError, match="hooks are enabled"),
+        ):
+            _call_with_retry(
+                "test",
+                fn,
+                config,
+                "generate",
+                before_attempt=before_attempt,
+            )
+
+        assert before_attempt.call_count == 2
+        assert fn.call_count == 1
+        assert len(events) == 1
+        assert events[0]["error_type"] == "LLMTransientError"
 
 
 class TestProviderErrorClassification:
@@ -4664,6 +4688,176 @@ class TestAntigravityHookPreflight:
         assert events == []
         assert (tmp_path / "repo.txt").read_text() == "source"
 
+    def test_generate_blocks_enabled_hooks_before_writing_prompt(self):
+        events = []
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                usage_observer=events.append,
+            )
+        )
+        result = subprocess.CompletedProcess(
+            ["agy"],
+            0,
+            self._result([{"name": "active", "enabled": True}]),
+            "",
+        )
+
+        with (
+            patch("core.llm_client._antigravity_require_supported_version"),
+            patch("core.llm_client._run_provider_cli", return_value=result) as mock_run,
+            patch("core.llm_client._antigravity_write_readonly_agent") as write_agent,
+            patch("core.llm_client._antigravity_prompt_transport") as prompt_transport,
+            pytest.raises(LLMConfigurationError, match="hooks are enabled"),
+        ):
+            client.generate("private system prompt", "private user prompt")
+
+        assert mock_run.call_count == 1
+        write_agent.assert_not_called()
+        prompt_transport.assert_not_called()
+        assert events == []
+
+    def test_write_agent_blocks_enabled_hooks_before_writing_prompt(self, tmp_path: Path):
+        events = []
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                usage_observer=events.append,
+            )
+        )
+        result = subprocess.CompletedProcess(
+            ["agy"],
+            0,
+            self._result([{"name": "active", "enabled": True}]),
+            "",
+        )
+
+        with (
+            patch("core.llm_client._antigravity_require_supported_version"),
+            patch("core.llm_client._run_provider_cli", return_value=result) as mock_run,
+            patch("core.llm_client._antigravity_prompt_transport") as prompt_transport,
+            patch("core.llm_client._run_agent_subprocess_streaming") as streaming,
+            pytest.raises(LLMConfigurationError, match="hooks are enabled"),
+        ):
+            client.run_agent("private implementation prompt", tmp_path)
+
+        assert mock_run.call_count == 1
+        prompt_transport.assert_not_called()
+        streaming.assert_not_called()
+        assert events == []
+
+    def test_generate_rechecks_hooks_before_retry_transport(self, tmp_path: Path):
+        events = []
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                usage_observer=events.append,
+            )
+        )
+        blocked = LLMConfigurationError("antigravity hooks are enabled")
+
+        with (
+            patch("core.llm_client._antigravity_require_supported_version"),
+            patch(
+                "core.llm_client._antigravity_require_no_active_hooks",
+                side_effect=[None, None, None, blocked],
+            ) as hook_preflight,
+            patch(
+                "core.llm_client._antigravity_write_readonly_agent",
+                return_value="sikula-readonly",
+            ) as write_agent,
+            patch("core.llm_client._antigravity_prompt_transport") as prompt_transport,
+            patch(
+                "core.llm_client._run_provider_cli",
+                side_effect=[
+                    subprocess.CompletedProcess(["agy"], 0, "not json", ""),
+                    subprocess.CompletedProcess(["agy"], 0, "still not json", ""),
+                ],
+            ) as provider_call,
+            patch("core.llm_client.time.sleep"),
+            pytest.raises(LLMConfigurationError, match="hooks are enabled"),
+        ):
+            prompt_transport.return_value.__enter__.return_value = (tmp_path / "prompt", "bounded request")
+            client.generate("system", "user")
+
+        assert hook_preflight.call_count == 4
+        write_agent.assert_called_once()
+        assert prompt_transport.call_count == 2
+        assert provider_call.call_count == 2
+        assert len(events) == 2
+
+    def test_readonly_agent_rechecks_hooks_before_retry_transport(self, tmp_path: Path):
+        (tmp_path / "repo.txt").write_text("source")
+        events = []
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                usage_observer=events.append,
+            )
+        )
+        blocked = LLMConfigurationError("antigravity hooks are enabled")
+
+        with (
+            patch("core.llm_client._antigravity_require_supported_version"),
+            patch(
+                "core.llm_client._antigravity_require_no_active_hooks",
+                side_effect=[None, None, blocked],
+            ) as hook_preflight,
+            patch("core.llm_client._antigravity_prompt_transport") as prompt_transport,
+            patch(
+                "core.llm_client._run_provider_cli",
+                return_value=subprocess.CompletedProcess(["agy"], 0, "not json", ""),
+            ) as provider_call,
+            patch("core.llm_client.time.sleep"),
+            pytest.raises(LLMConfigurationError, match="hooks are enabled"),
+        ):
+            prompt_transport.return_value.__enter__.return_value = (tmp_path / "prompt", "bounded request")
+            client.run_readonly_agent("secret prompt", tmp_path)
+
+        assert hook_preflight.call_count == 3
+        prompt_transport.assert_called_once()
+        provider_call.assert_called_once()
+        assert len(events) == 1
+        assert (tmp_path / "repo.txt").read_text() == "source"
+
+    def test_write_agent_rechecks_hooks_before_retry_transport(self, tmp_path: Path):
+        events = []
+        client = AntigravityClient(
+            LLMConfig(
+                provider="antigravity",
+                model="Gemini 3.5 Flash (High)",
+                usage_observer=events.append,
+            )
+        )
+        blocked = LLMConfigurationError("antigravity hooks are enabled")
+
+        with (
+            patch("core.llm_client._antigravity_require_supported_version"),
+            patch(
+                "core.llm_client._antigravity_require_no_active_hooks",
+                side_effect=[None, blocked],
+            ) as hook_preflight,
+            patch("core.llm_client._antigravity_prompt_transport") as prompt_transport,
+            patch(
+                "core.llm_client._run_agent_subprocess_streaming",
+                return_value=subprocess.CompletedProcess(["agy"], 1, "partial output", ""),
+            ) as provider_call,
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}]),
+            patch("core.llm_client.time.sleep"),
+            pytest.raises(LLMConfigurationError, match="hooks are enabled"),
+        ):
+            prompt_transport.return_value.__enter__.return_value = (tmp_path / "prompt", "bounded request")
+            client.run_agent("secret prompt", tmp_path)
+
+        assert hook_preflight.call_count == 2
+        prompt_transport.assert_called_once()
+        provider_call.assert_called_once()
+        assert len(events) == 1
+
 
 class TestAntigravityClientCommands:
     @pytest.fixture(autouse=True)
@@ -4698,6 +4892,52 @@ class TestAntigravityClientCommands:
 
         assert sanitized == "See [client](core/llm_client.py#L12)."
 
+    def test_readonly_output_sanitizes_bare_windows_workspace_roots(self):
+        workspace = MagicMock(spec=Path)
+        workspace.__str__.return_value = r"C:\Users\runner\AppData\Local\Temp\sikula-workspace"
+        workspace.as_posix.return_value = "C:/Users/runner/AppData/Local/Temp/sikula-workspace"
+        workspace.resolve.return_value = workspace
+        output = (
+            r"Failed C:\Users\runner\AppData\Local\Temp\sikula-workspace; "
+            "file:///C:/Users/runner/AppData/Local/Temp/sikula-workspace."
+        )
+
+        with patch("core.llm_client.os.name", "nt"):
+            sanitized = _antigravity_sanitize_readonly_output(output, workspace)
+
+        assert sanitized == "Failed <workspace>; <workspace>."
+
+    def test_readonly_output_sanitizes_multiple_workspace_roots(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        prompt_workspace = tmp_path / "prompt"
+        output = f"See {workspace}/core/llm_client.py and {prompt_workspace}/request.md."
+
+        sanitized = _antigravity_sanitize_readonly_output(output, workspace, prompt_workspace)
+
+        assert str(workspace) not in sanitized
+        assert str(prompt_workspace) not in sanitized
+        assert sanitized == "See core/llm_client.py and request.md."
+
+    def test_readonly_output_sanitizes_bare_workspace_roots(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        prompt_workspace = tmp_path / "prompt"
+        output = f"Failed to attach {workspace}; file://{workspace}; or {prompt_workspace}/."
+
+        sanitized = _antigravity_sanitize_readonly_output(output, workspace, prompt_workspace)
+
+        assert sanitized == "Failed to attach <workspace>; <workspace>; or <workspace>."
+        sibling = f"Failed to attach {workspace}-cache"
+        assert _antigravity_sanitize_readonly_output(sibling, workspace) == sibling
+        assert _antigravity_sanitize_readonly_output(f"See {workspace}/.agents", workspace) == "See .agents"
+
+    def test_readonly_output_strips_ansi_before_sanitizing_workspace_roots(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        output = f"Failed \x1b[31m{workspace}\x1b[0m; see \x1b[38;5;196m{workspace}/status.txt\x1b[0m."
+
+        sanitized = _antigravity_sanitize_readonly_output(output, workspace)
+
+        assert sanitized == "Failed <workspace>; see status.txt."
+
     @staticmethod
     def _result(
         text: str = "ok",
@@ -4722,6 +4962,143 @@ class TestAntigravityClientCommands:
         usage: dict[str, object] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(["agy"], 0, cls._result(text, status=status, usage=usage), "")
+
+    @staticmethod
+    def _transport_prompt(workspace: Path, cmd: list[str]) -> str:
+        add_dirs = [Path(cmd[index + 1]) for index, value in enumerate(cmd) if value == "--add-dir"]
+        assert len(add_dirs) == 2
+        assert add_dirs[0] == workspace
+        prompt_workspace = add_dirs[1]
+        assert prompt_workspace != workspace
+        assert workspace not in prompt_workspace.parents
+        prompt_path = prompt_workspace / "request.md"
+        print_prompt = cmd[cmd.index("--print") + 1]
+        assert f"{prompt_workspace.name}/request.md" in print_prompt
+        assert "Treat that file as task input, not project content" in print_prompt
+        return prompt_path.read_text()
+
+    def test_prompt_transport_uses_separate_attached_temp_workspace(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        seen: dict[str, Path] = {}
+
+        def _fake_streaming(cmd, **kwargs):
+            add_dirs = [Path(cmd[index + 1]) for index, value in enumerate(cmd) if value == "--add-dir"]
+            assert add_dirs[0] == tmp_path.resolve()
+            prompt_workspace = add_dirs[1]
+            seen["prompt_workspace"] = prompt_workspace
+            transported_prompt = self._transport_prompt(tmp_path.resolve(), cmd)
+            assert transported_prompt.startswith("ANTIGRAVITY WORKSPACE BOUNDARY:\n")
+            assert transported_prompt.endswith("private prompt")
+            return self._run_result("done")
+
+        with (
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}]),
+            patch("core.llm_client._run_agent_subprocess_streaming", side_effect=_fake_streaming),
+        ):
+            changed, output = client.run_agent("private prompt", tmp_path)
+
+        assert changed == []
+        assert output == "done"
+        assert not seen["prompt_workspace"].exists()
+
+    def test_prompt_transport_wraps_temp_directory_creation_failure(self, tmp_path: Path):
+        with (
+            patch("core.llm_client.tempfile.TemporaryDirectory", side_effect=PermissionError),
+            pytest.raises(LLMEnvironmentError, match="could not be created"),
+        ):
+            with _antigravity_prompt_transport(tmp_path, "private prompt"):
+                pass
+
+    @pytest.mark.parametrize("cleanup_error", [None, PermissionError()])
+    def test_prompt_transport_cleans_up_after_path_resolution_failure(
+        self,
+        tmp_path: Path,
+        cleanup_error: OSError | None,
+    ):
+        transport = MagicMock(name="prompt_transport")
+        transport.name = str(tmp_path / "prompt")
+        transport.cleanup.side_effect = cleanup_error
+
+        with (
+            patch("core.llm_client.tempfile.TemporaryDirectory", return_value=transport),
+            patch("core.llm_client.Path.resolve", side_effect=PermissionError),
+            pytest.raises(LLMEnvironmentError, match="could not be created"),
+        ):
+            with _antigravity_prompt_transport(tmp_path, "private prompt"):
+                pass
+
+        transport.cleanup.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("cleanup_error", "message"),
+        [
+            (None, "must be outside the project workspace"),
+            (PermissionError(), "could not be removed"),
+        ],
+    )
+    def test_prompt_transport_rejects_a_directory_inside_the_workspace(
+        self,
+        tmp_path: Path,
+        cleanup_error: OSError | None,
+        message: str,
+    ):
+        workspace = tmp_path / "project"
+        prompt_workspace = workspace / "prompt"
+        transport = MagicMock(name="prompt_transport")
+        transport.name = str(prompt_workspace)
+        transport.cleanup.side_effect = cleanup_error
+
+        with (
+            patch("core.llm_client.tempfile.TemporaryDirectory", return_value=transport),
+            pytest.raises(LLMEnvironmentError, match=message),
+        ):
+            with _antigravity_prompt_transport(workspace, "private prompt"):
+                pass
+
+        transport.cleanup.assert_called_once()
+
+    @pytest.mark.parametrize("cleanup_error", [None, PermissionError()])
+    def test_prompt_transport_cleans_up_after_write_failure(
+        self,
+        tmp_path: Path,
+        cleanup_error: OSError | None,
+    ):
+        workspace = tmp_path / "project"
+        workspace.mkdir()
+        prompt_workspace = tmp_path / "prompt"
+        prompt_workspace.mkdir()
+        transport = MagicMock(name="prompt_transport")
+        transport.name = str(prompt_workspace)
+        transport.cleanup.side_effect = cleanup_error
+
+        with (
+            patch("core.llm_client.tempfile.TemporaryDirectory", return_value=transport),
+            patch("core.llm_client.Path.write_bytes", side_effect=PermissionError),
+            pytest.raises(LLMEnvironmentError, match="could not be created"),
+        ):
+            with _antigravity_prompt_transport(workspace, "private prompt"):
+                pass
+
+        transport.cleanup.assert_called_once()
+
+    def test_prompt_transport_wraps_cleanup_failure(self, tmp_path: Path):
+        workspace = tmp_path / "project"
+        workspace.mkdir()
+        prompt_workspace = tmp_path / "prompt"
+        prompt_workspace.mkdir()
+        transport = MagicMock(name="prompt_transport")
+        transport.name = str(prompt_workspace)
+        transport.cleanup.side_effect = PermissionError
+
+        with (
+            patch("core.llm_client.tempfile.TemporaryDirectory", return_value=transport),
+            pytest.raises(LLMEnvironmentError, match="could not be removed"),
+        ):
+            with _antigravity_prompt_transport(workspace, "private prompt") as (prompt_dir, request):
+                assert prompt_dir == prompt_workspace
+                assert prompt_workspace.name in request
+
+        transport.cleanup.assert_called_once()
 
     def test_parse_version_extracts_semver(self):
         assert _antigravity_parse_version("agy 1.0.13") == (1, 0, 13)
@@ -4863,29 +5240,53 @@ class TestAntigravityClientCommands:
         assert empty.value.reported_tokens == usage
 
     @pytest.mark.parametrize(
-        ("diagnostic", "error_type"),
+        ("diagnostic", "error_type", "public_reason"),
         [
-            ("ERROR not authenticated", LLMAuthError),
-            ("ERROR quota exceeded", LLMQuotaExceeded),
-            ("ERROR unsupported model", LLMConfigurationError),
+            ("ERROR not authenticated", LLMAuthError, "authentication failed"),
+            ("ERROR quota exceeded", LLMQuotaExceeded, "quota exceeded"),
+            ("ERROR unsupported model", LLMConfigurationError, "configuration error"),
         ],
     )
     def test_result_envelope_classifies_unsuccessful_log_diagnostic(
         self,
         diagnostic: str,
         error_type: type[LLMProviderError],
+        public_reason: str,
     ):
         usage = {"input_tokens": 7, "output_tokens": 2}
 
-        with pytest.raises(error_type, match="log diagnostic") as exc_info:
+        with pytest.raises(error_type) as exc_info:
             _antigravity_result_envelope(
                 self._result("partial", status="ERROR", usage=usage),
                 "CLI",
                 log_diagnostic=diagnostic,
             )
 
+        assert str(exc_info.value) == f"antigravity CLI error: {public_reason}"
         assert exc_info.value.output_chars == len("partial")
         assert exc_info.value.reported_tokens == usage
+
+    def test_result_envelope_does_not_expose_private_log_diagnostic(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        prompt_workspace = tmp_path / "prompt"
+        diagnostic = (
+            f"ERROR unsupported model at {workspace}/core/llm_client.py; attachment {prompt_workspace}/request.md"
+        )
+
+        with pytest.raises(LLMConfigurationError) as exc_info:
+            _antigravity_result_envelope(
+                self._result("partial", status="ERROR"),
+                "CLI",
+                log_diagnostic=diagnostic,
+            )
+
+        message = str(exc_info.value)
+        assert message == "antigravity CLI error: configuration error"
+        assert "unsupported model" not in message
+        assert "core/llm_client.py" not in message
+        assert "request.md" not in message
+        assert str(workspace) not in message
+        assert str(prompt_workspace) not in message
 
     def test_diagnostic_helpers_cover_empty_long_json_and_log_limit(self, tmp_path: Path):
         assert _antigravity_marker_text("") is None
@@ -4937,8 +5338,7 @@ class TestAntigravityClientCommands:
             "ERROR failed upstream",
         )
         assert isinstance(stderr_error, LLMTransientError)
-        assert "temporary outage" in str(stderr_error)
-        assert "log diagnostic" not in str(stderr_error)
+        assert str(stderr_error) == "antigravity agent error: provider error"
 
     def test_result_error_classifies_long_stderr_before_truncating(self):
         error = _antigravity_result_error(
@@ -4953,12 +5353,13 @@ class TestAntigravityClientCommands:
 
         message = str(error)
         assert isinstance(error, LLMConfigurationError)
-        assert "unsupported model" in message
-        assert "token=<redacted>" in message
+        assert message == "antigravity agent error: configuration error"
+        assert "unsupported model" not in message
+        assert "token" not in message
         assert "secret" not in message
         assert "x" * 600 not in message
 
-    def test_result_error_redacts_multi_token_authorization_headers(self):
+    def test_result_error_does_not_expose_multi_token_authorization_headers(self):
         error = _antigravity_result_error(
             subprocess.CompletedProcess(
                 ["agy"],
@@ -4971,12 +5372,38 @@ class TestAntigravityClientCommands:
 
         message = str(error)
         assert isinstance(error, LLMProviderError)
-        assert "Authorization: <redacted>" in message
-        assert "Proxy-Authorization = <redacted>" in message
+        assert message == "antigravity agent error: provider error"
+        assert "Authorization" not in message
+        assert "Proxy-Authorization" not in message
         assert "Basic" not in message
         assert "dXNlcjpwYXNz" not in message
         assert "Digest" not in message
         assert "abc def" not in message
+
+    def test_result_error_classifies_without_exposing_private_diagnostic(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        prompt_workspace = tmp_path / "prompt"
+        result = subprocess.CompletedProcess(
+            ["agy"],
+            1,
+            "",
+            f"ERROR attachment failed at \x1b[31m{prompt_workspace}\x1b[0m",
+        )
+        log_diagnostic = f"ERROR unsupported model at \x1b[31m{workspace}\x1b[0m"
+
+        error = _antigravity_result_error(
+            result,
+            "agent",
+            log_diagnostic,
+        )
+
+        message = str(error)
+        assert isinstance(error, LLMConfigurationError)
+        assert message == "antigravity agent error: configuration error"
+        assert str(workspace) not in message
+        assert str(prompt_workspace) not in message
+        assert "unsupported model" not in message
+        assert "attachment failed" not in message
 
     def test_git_path_helpers_handle_failures_and_text_stdout(self, tmp_path: Path):
         with patch(
@@ -5111,7 +5538,7 @@ class TestAntigravityClientCommands:
 
         assert _antigravity_write_agent_prompt(prompt, tmp_path) == prompt
 
-    def test_generate_uses_stdin_print_mode(self):
+    def test_generate_uses_bounded_prompt_file(self):
         events = []
         client = AntigravityClient(
             LLMConfig(
@@ -5129,26 +5556,48 @@ class TestAntigravityClientCommands:
             "total_tokens": 22,
         }
 
-        with patch(
-            "core.llm_client.subprocess.run",
-            return_value=self._run_result("answer", usage=usage),
-        ) as mock_run:
-            assert client.generate("system", "user") == "answer"
+        seen: dict[str, object] = {}
 
-        cmd = mock_run.call_args.args[0]
+        def _fake_run(cmd, **kwargs):
+            workspace = Path(kwargs["cwd"])
+            add_dirs = [Path(cmd[index + 1]) for index, value in enumerate(cmd) if value == "--add-dir"]
+            prompt_workspace = add_dirs[1]
+            seen["cmd"] = cmd
+            seen["cwd"] = workspace
+            seen["prompt_workspace"] = prompt_workspace
+            seen["prompt"] = self._transport_prompt(workspace, cmd)
+            output = f"See {workspace}/generated.txt and {prompt_workspace}/request.md."
+            return self._run_result(output, usage=usage)
+
+        with patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run:
+            output = client.generate("system", "user")
+
+        cmd = seen["cmd"]
+        assert isinstance(cmd, list)
+        workspace = seen["cwd"]
+        assert isinstance(workspace, Path)
         assert cmd[:2] == ["agy", "--new-project"]
-        assert "--add-dir" not in cmd
+        assert cmd[cmd.index("--add-dir") + 1] == str(workspace)
+        assert "--agent" in cmd
         assert cmd[cmd.index("--model") + 1] == "Gemini 3.5 Flash (High)"
         assert "--sandbox" in cmd
         assert "--dangerously-skip-permissions" not in cmd
+        assert "--disable-slash-commands" in cmd
+        assert "--mode" not in cmd
         assert cmd[cmd.index("--print-timeout") + 1] == "123s"
         assert cmd[cmd.index("--output-format") + 1] == "json"
-        assert cmd[cmd.index("--print") + 1] == "-"
+        assert cmd[cmd.index("--print") + 1] != "-"
         assert cmd.index("--model") < cmd.index("--print")
-        assert mock_run.call_args.kwargs["input"] == "system\n\nuser"
+        assert "input" not in mock_run.call_args.kwargs
         assert mock_run.call_args.kwargs["timeout"] == 123
         assert "system\n\nuser" not in cmd
-        assert events[0]["output_chars"] == len("answer")
+        assert seen["prompt"] == "system\n\nuser"
+        prompt_workspace = seen["prompt_workspace"]
+        assert isinstance(prompt_workspace, Path)
+        assert str(workspace) not in output
+        assert str(prompt_workspace) not in output
+        assert output == "See generated.txt and request.md."
+        assert events[0]["output_chars"] == len(output)
         assert events[0]["reported_tokens"] == {
             "input_tokens": 17,
             "output_tokens": 5,
@@ -5170,16 +5619,20 @@ class TestAntigravityClientCommands:
 
         def _fake_run(cmd, **kwargs):
             workspace = Path(kwargs["cwd"])
+            add_dirs = [Path(cmd[index + 1]) for index, value in enumerate(cmd) if value == "--add-dir"]
+            prompt_workspace = add_dirs[1]
             seen["cmd"] = cmd
             seen["cwd"] = workspace
-            seen["input"] = kwargs["input"]
+            seen["prompt_workspace"] = prompt_workspace
+            seen["prompt"] = self._transport_prompt(workspace, cmd)
+            assert "input" not in kwargs
             assert (workspace / "repo.txt").read_text() == "source"
             agent_name = cmd[cmd.index("--agent") + 1]
             agent_definition = (workspace / ".agents" / "agents" / agent_name / "agent.md").read_text()
             seen["agent_definition"] = agent_definition
             output = (
                 f"See [sikula.py](file://{workspace.resolve()}/sikula.py#L12), "
-                f"{workspace}/core/llm_client.py, and /tmp/unrelated.py."
+                f"{workspace}/core/llm_client.py, {prompt_workspace}/request.md, and /tmp/unrelated.py."
             )
             return subprocess.CompletedProcess(
                 cmd,
@@ -5189,7 +5642,7 @@ class TestAntigravityClientCommands:
             )
 
         with patch("core.llm_client._run_provider_cli", side_effect=_fake_run):
-            output = client.run_readonly_agent("prompt", tmp_path)
+            output = client.run_readonly_agent("readonly request", tmp_path)
 
         cmd = seen["cmd"]
         assert isinstance(cmd, list)
@@ -5198,17 +5651,21 @@ class TestAntigravityClientCommands:
         assert workspace != tmp_path
         assert cmd[cmd.index("--add-dir") + 1] == str(workspace)
         assert "--dangerously-skip-permissions" not in cmd
-        assert cmd[cmd.index("--mode") + 1] == "plan"
-        assert "--disable-slash-commands" not in cmd
+        assert "--disable-slash-commands" in cmd
+        assert "--mode" not in cmd
         assert cmd[cmd.index("--output-format") + 1] == "json"
-        assert cmd[cmd.index("--print") + 1] == "-"
-        assert seen["input"] == "prompt"
+        assert cmd[cmd.index("--print") + 1] != "-"
+        assert seen["prompt"] == "readonly request"
         assert (tmp_path / "repo.txt").read_text() == "source"
         assert str(workspace) not in output
         assert str(workspace.resolve()) not in output
+        prompt_workspace = seen["prompt_workspace"]
+        assert isinstance(prompt_workspace, Path)
+        assert str(prompt_workspace) not in output
         assert "file://" not in output
         assert "[sikula.py](sikula.py#L12)" in output
         assert "core/llm_client.py" in output
+        assert "request.md" in output
         assert "/tmp/unrelated.py" in output
         assert events[0]["output_chars"] == len(output)
         assert events[0]["reported_tokens"] == {"input_tokens": 9, "output_tokens": 4}
@@ -5289,6 +5746,26 @@ class TestAntigravityClientCommands:
                 "core.llm_client._run_provider_cli",
                 side_effect=[
                     subprocess.CompletedProcess(["agy"], 0, "not json", ""),
+                    self._run_result("analysis"),
+                ],
+            ) as mock_provider,
+        ):
+            assert client.run_readonly_agent("prompt", tmp_path) == "analysis"
+
+        assert mock_provider.call_count == 2
+        sleep.assert_called_once_with(30)
+        assert (tmp_path / "repo.txt").read_text() == "source"
+
+    def test_run_readonly_agent_retries_timeout_without_mutation(self, tmp_path: Path):
+        (tmp_path / "repo.txt").write_text("source")
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch(
+                "core.llm_client._run_provider_cli",
+                side_effect=[
+                    subprocess.TimeoutExpired(["agy"], 10),
                     self._run_result("analysis"),
                 ],
             ) as mock_provider,
@@ -5496,6 +5973,42 @@ class TestAntigravityClientCommands:
         sleep.assert_not_called()
         assert (tmp_path / "repo.txt").read_text() == "source"
 
+    def test_run_readonly_agent_classifies_nonzero_exit_without_mutation(self, tmp_path: Path):
+        (tmp_path / "repo.txt").write_text("source")
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        seen: dict[str, Path] = {}
+
+        def _fake_run(cmd, **kwargs):
+            workspace = Path(kwargs["cwd"])
+            add_dirs = [Path(cmd[index + 1]) for index, value in enumerate(cmd) if value == "--add-dir"]
+            prompt_workspace = add_dirs[1]
+            seen["workspace"] = workspace
+            seen["prompt_workspace"] = prompt_workspace
+            log_file = Path(cmd[cmd.index("--log-file") + 1])
+            log_file.write_text(f"ERROR unsupported model at {workspace}/.agents/agent.md")
+            return subprocess.CompletedProcess(
+                cmd,
+                1,
+                "",
+                f"attachment failed at {prompt_workspace}/request.md",
+            )
+
+        with (
+            patch("core.llm_client.time.sleep") as sleep,
+            patch("core.llm_client._run_provider_cli", side_effect=_fake_run) as mock_provider,
+            pytest.raises(LLMConfigurationError) as exc_info,
+        ):
+            client.run_readonly_agent("prompt", tmp_path)
+
+        message = str(exc_info.value)
+        assert message == "antigravity agent error: configuration error"
+        assert "unsupported model" not in message
+        assert str(seen["workspace"]) not in message
+        assert str(seen["prompt_workspace"]) not in message
+        assert mock_provider.call_count == 1
+        sleep.assert_not_called()
+        assert (tmp_path / "repo.txt").read_text() == "source"
+
     def test_run_readonly_agent_rejects_external_symlinks_before_copying(self, tmp_path: Path):
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -5603,14 +6116,24 @@ class TestAntigravityClientCommands:
         )
         workspace = tmp_path.resolve()
 
+        seen: dict[str, object] = {}
+
+        def _fake_streaming(cmd, **kwargs):
+            add_dirs = [Path(cmd[index + 1]) for index, value in enumerate(cmd) if value == "--add-dir"]
+            prompt_workspace = add_dirs[1]
+            seen["prompt"] = self._transport_prompt(workspace, cmd)
+            seen["prompt_workspace"] = prompt_workspace
+            seen["kwargs"] = kwargs
+            return self._run_result(
+                f"done {prompt_workspace}/request.md",
+                usage={"input_tokens": 12, "output_tokens": 3, "total_tokens": 15},
+            )
+
         with (
             patch("core.llm_client._git_snapshot", side_effect=[{}, {"src/app.ts": "hash"}]),
             patch(
                 "core.llm_client._run_agent_subprocess_streaming",
-                return_value=self._run_result(
-                    "done",
-                    usage={"input_tokens": 12, "output_tokens": 3, "total_tokens": 15},
-                ),
+                side_effect=_fake_streaming,
             ) as mock_run,
         ):
             changed, output = client.run_agent("prompt", tmp_path)
@@ -5621,23 +6144,51 @@ class TestAntigravityClientCommands:
         assert cmd[cmd.index("--model") + 1] == "Gemini 3.5 Flash (High)"
         assert "--sandbox" in cmd
         assert "--dangerously-skip-permissions" in cmd
+        assert "--disable-slash-commands" not in cmd
+        assert "--mode" not in cmd
         assert cmd[cmd.index("--output-format") + 1] == "json"
-        assert cmd[cmd.index("--print") + 1] == "-"
-        assert mock_run.call_args.kwargs["cwd"] == workspace
-        stdin_text = mock_run.call_args.kwargs["stdin_text"]
-        assert "ANTIGRAVITY WORKSPACE BOUNDARY" in stdin_text
-        assert stdin_text.count("ANTIGRAVITY WORKSPACE BOUNDARY") == 1
-        assert f"The only project root for this task is: {workspace.as_posix()}" in stdin_text
-        assert "Do not search for, inspect, or modify any other checkout or repository path" in stdin_text
-        assert stdin_text.endswith("prompt")
+        assert cmd[cmd.index("--print") + 1] != "-"
+        kwargs = seen["kwargs"]
+        assert isinstance(kwargs, dict)
+        assert kwargs["cwd"] == workspace
+        assert "stdin_text" not in kwargs
+        transported_prompt = seen["prompt"]
+        assert isinstance(transported_prompt, str)
+        assert "ANTIGRAVITY WORKSPACE BOUNDARY" in transported_prompt
+        assert transported_prompt.count("ANTIGRAVITY WORKSPACE BOUNDARY") == 1
+        assert f"The only project root for this task is: {workspace.as_posix()}" in transported_prompt
+        assert "Do not search for, inspect, or modify any other checkout or repository path" in transported_prompt
+        assert transported_prompt.endswith("prompt")
+        prompt_workspace = seen["prompt_workspace"]
+        assert isinstance(prompt_workspace, Path)
+        assert str(prompt_workspace) not in output
         assert changed == ["src/app.ts"]
-        assert output == "done"
-        assert events[0]["output_chars"] == len("done")
+        assert output == "done request.md"
+        assert events[0]["output_chars"] == len(output)
         assert events[0]["reported_tokens"] == {
             "input_tokens": 12,
             "output_tokens": 3,
             "total_tokens": 15,
         }
+
+    def test_run_agent_replaces_unpaired_surrogates_in_prompt_transport(self, tmp_path: Path):
+        client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        workspace = tmp_path.resolve()
+        seen: dict[str, str] = {}
+
+        def _fake_streaming(cmd, **kwargs):
+            seen["prompt"] = self._transport_prompt(workspace, cmd)
+            return self._run_result("done")
+
+        with (
+            patch("core.llm_client._git_snapshot", side_effect=[{}, {}]),
+            patch("core.llm_client._run_agent_subprocess_streaming", side_effect=_fake_streaming),
+        ):
+            changed, output = client.run_agent("before\udcffafter", tmp_path)
+
+        assert changed == []
+        assert output == "done"
+        assert seen["prompt"].endswith("before?after")
 
     @pytest.mark.parametrize("response", ["", " \r\n"])
     def test_run_agent_accepts_empty_success_response(self, tmp_path: Path, response: str):
@@ -5855,10 +6406,11 @@ class TestAntigravityClientCommands:
         with (
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
-            pytest.raises(LLMConfigurationError, match="unsupported model"),
+            pytest.raises(LLMConfigurationError) as exc_info,
         ):
             client.generate("system", "user")
 
+        assert str(exc_info.value) == "antigravity CLI error: configuration error"
         assert mock_run.call_count == 1
         sleep.assert_not_called()
         assert events[0]["outcome"] == "fatal_error"
@@ -5898,7 +6450,7 @@ class TestAntigravityClientCommands:
         ):
             client.generate("system", "user")
 
-        assert "token=<redacted>" in str(exc_info.value)
+        assert str(exc_info.value) == "antigravity CLI error: authentication failed"
         assert "supersecret" not in str(exc_info.value)
         assert mock_run.call_count == 1
         sleep.assert_not_called()
@@ -5906,7 +6458,7 @@ class TestAntigravityClientCommands:
         assert events[0]["output_chars"] == len("partial")
         assert events[0]["reported_tokens"] == usage
 
-    def test_generate_nonzero_exit_uses_antigravity_log_diagnostic(self):
+    def test_generate_nonzero_exit_classifies_private_log_diagnostic(self):
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
 
         def _fake_run(cmd, **kwargs):
@@ -5930,15 +6482,15 @@ class TestAntigravityClientCommands:
             client.generate("system", "user")
 
         message = str(exc_info.value)
-        assert "log diagnostic" in message
-        assert "not authenticated" in message
-        assert "token=<redacted>" in message
-        assert 'api_key="<redacted>"' in message
-        assert "OPENAI_API_KEY=<redacted>" in message
-        assert "access_token=<redacted>" in message
-        assert 'refresh_token="<redacted>"' in message
-        assert '"token":"<redacted>"' in message
-        assert '"client_secret":"<redacted>"' in message
+        assert message == "antigravity CLI error: authentication failed"
+        assert "log diagnostic" not in message
+        assert "not authenticated" not in message
+        assert "token" not in message
+        assert "api_key" not in message
+        assert "OPENAI_API_KEY" not in message
+        assert "access_token" not in message
+        assert "refresh_token" not in message
+        assert "client_secret" not in message
         assert "supersecret" not in message
         assert "quotedsecret" not in message
         assert "envsecret" not in message
@@ -5949,25 +6501,38 @@ class TestAntigravityClientCommands:
         assert mock_run.call_count == 1
         sleep.assert_not_called()
 
-    def test_generate_nonzero_exit_redacts_antigravity_stderr(self):
+    def test_generate_nonzero_exit_does_not_expose_antigravity_stderr(self):
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
-        stderr = "ERROR not authenticated OPENAI_API_KEY=envsecret client_secret=clientsecret"
+        seen: dict[str, Path] = {}
+
+        def _fake_run(cmd, **kwargs):
+            workspace = Path(kwargs["cwd"])
+            add_dirs = [Path(cmd[index + 1]) for index, value in enumerate(cmd) if value == "--add-dir"]
+            prompt_workspace = add_dirs[1]
+            seen["workspace"] = workspace
+            seen["prompt_workspace"] = prompt_workspace
+            stderr = (
+                f"ERROR not authenticated at {workspace}/.agents/agent.md; "
+                f"attachment {prompt_workspace}/request.md; "
+                "OPENAI_API_KEY=envsecret client_secret=clientsecret"
+            )
+            return subprocess.CompletedProcess(cmd, 1, "", stderr)
 
         with (
             patch("core.llm_client.time.sleep") as sleep,
-            patch(
-                "core.llm_client.subprocess.run",
-                return_value=subprocess.CompletedProcess(["agy"], 1, "", stderr),
-            ) as mock_run,
+            patch("core.llm_client.subprocess.run", side_effect=_fake_run) as mock_run,
             pytest.raises(LLMAuthError) as exc_info,
         ):
             client.generate("system", "user")
 
         message = str(exc_info.value)
-        assert "OPENAI_API_KEY=<redacted>" in message
-        assert "client_secret=<redacted>" in message
+        assert message == "antigravity CLI error: authentication failed"
+        assert "OPENAI_API_KEY" not in message
+        assert "client_secret" not in message
         assert "envsecret" not in message
         assert "clientsecret" not in message
+        assert str(seen["workspace"]) not in message
+        assert str(seen["prompt_workspace"]) not in message
         assert mock_run.call_count == 1
         sleep.assert_not_called()
 
@@ -5987,9 +6552,10 @@ class TestAntigravityClientCommands:
             client.generate("system", "user")
 
         message = str(exc_info.value)
-        assert "see log for details" in message
-        assert "not authenticated" in message
-        assert "token=<redacted>" in message
+        assert message == "antigravity CLI error: authentication failed"
+        assert "see log for details" not in message
+        assert "not authenticated" not in message
+        assert "token" not in message
         assert "supersecret" not in message
         assert mock_run.call_count == 1
         sleep.assert_not_called()
@@ -6002,19 +6568,37 @@ class TestAntigravityClientCommands:
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client._git_snapshot", return_value={}),
             patch("core.llm_client._run_agent_subprocess_streaming", return_value=result) as mock_run,
-            pytest.raises(LLMConfigurationError, match="unsupported model"),
+            pytest.raises(LLMConfigurationError) as exc_info,
         ):
             client.run_agent("prompt", tmp_path)
 
+        assert str(exc_info.value) == "antigravity agent error: configuration error"
         assert mock_run.call_count == 1
         sleep.assert_not_called()
 
     def test_run_agent_nonzero_exit_uses_antigravity_log_diagnostic(self, tmp_path: Path):
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
+        seen: dict[str, Path] = {}
 
         def _fake_streaming(cmd, **kwargs):
+            workspace = Path(kwargs["cwd"])
+            add_dirs = [Path(cmd[index + 1]) for index, value in enumerate(cmd) if value == "--add-dir"]
+            prompt_workspace = add_dirs[1]
+            seen["workspace"] = workspace
+            seen["prompt_workspace"] = prompt_workspace
             log_file = Path(cmd[cmd.index("--log-file") + 1])
-            log_file.write_text('{"error": {"message": "unsupported model: Gemini"}}')
+            log_file.write_text(
+                json.dumps(
+                    {
+                        "error": {
+                            "message": (
+                                f"unsupported model at {workspace}/core/llm_client.py; "
+                                f"attachment {prompt_workspace}/request.md"
+                            )
+                        }
+                    }
+                )
+            )
             return subprocess.CompletedProcess(cmd, 1, "", "")
 
         with (
@@ -6025,7 +6609,11 @@ class TestAntigravityClientCommands:
         ):
             client.run_agent("prompt", tmp_path)
 
-        assert "unsupported model" in str(exc_info.value)
+        message = str(exc_info.value)
+        assert message == "antigravity agent error: configuration error"
+        assert "unsupported model" not in message
+        assert str(seen["workspace"]) not in message
+        assert str(seen["prompt_workspace"]) not in message
         assert mock_run.call_count == 1
         sleep.assert_not_called()
 
@@ -6038,16 +6626,21 @@ class TestAntigravityClientCommands:
                 retry_observer=observer,
             )
         )
+        prompt_workspaces: list[Path] = []
+
+        def _fake_streaming(cmd, **kwargs):
+            add_dirs = [Path(cmd[index + 1]) for index, value in enumerate(cmd) if value == "--add-dir"]
+            prompt_workspaces.append(add_dirs[1])
+            if len(prompt_workspaces) == 1:
+                raise subprocess.TimeoutExpired(cmd="agy", timeout=12)
+            return self._run_result("done")
 
         with (
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client._git_snapshot", side_effect=[{}, {}, {"src/app.ts": "hash"}]),
             patch(
                 "core.llm_client._run_agent_subprocess_streaming",
-                side_effect=[
-                    subprocess.TimeoutExpired(cmd="agy", timeout=12),
-                    self._run_result("done"),
-                ],
+                side_effect=_fake_streaming,
             ) as mock_run,
         ):
             changed, output = client.run_agent("prompt", tmp_path)
@@ -6055,6 +6648,8 @@ class TestAntigravityClientCommands:
         assert changed == ["src/app.ts"]
         assert output == "done"
         assert mock_run.call_count == 2
+        assert len(set(prompt_workspaces)) == 2
+        assert all(not path.exists() for path in prompt_workspaces)
         sleep.assert_called_once()
         assert observer.call_args.args[0]["error_type"] == "LLMTimeoutError"
 
@@ -6106,14 +6701,27 @@ class TestAntigravityClientCommands:
                 retry_observer=observer,
             )
         )
-        transient = subprocess.CompletedProcess(["agy"], 1, "partial stdout", "")
+        prompt_workspaces: list[Path] = []
+
+        def _fake_streaming(cmd, **kwargs):
+            add_dirs = [Path(cmd[index + 1]) for index, value in enumerate(cmd) if value == "--add-dir"]
+            prompt_workspace = add_dirs[1]
+            prompt_workspaces.append(prompt_workspace)
+            if len(prompt_workspaces) == 1:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    1,
+                    "",
+                    f"temporary outage at {prompt_workspace}/request.md token=supersecret",
+                )
+            return self._run_result("done")
 
         with (
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client._git_snapshot", side_effect=[{}, {}, {"src/app.ts": "hash"}]),
             patch(
                 "core.llm_client._run_agent_subprocess_streaming",
-                side_effect=[transient, self._run_result("done")],
+                side_effect=_fake_streaming,
             ) as mock_run,
         ):
             changed, output = client.run_agent("prompt", tmp_path)
@@ -6123,6 +6731,9 @@ class TestAntigravityClientCommands:
         assert mock_run.call_count == 2
         sleep.assert_called_once()
         assert observer.call_args.args[0]["error_type"] == "LLMTransientError"
+        assert observer.call_args.args[0]["error"] == "antigravity agent error: provider error"
+        assert "supersecret" not in observer.call_args.args[0]["error"]
+        assert str(prompt_workspaces[0]) not in observer.call_args.args[0]["error"]
 
     def test_run_agent_transient_error_stops_when_partial_changes_exist(self, tmp_path: Path):
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))

@@ -408,11 +408,14 @@ def _call_with_retry(
     operation: str | None = None,
     *,
     input_chars: int = 0,
+    before_attempt: Callable[[], None] | None = None,
 ):
     """Call fn() and retry only retryable LLM failures with exponential backoff."""
     total = len(_RETRY_DELAYS) + 1
     last_exc: Exception | None = None
     for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+        if before_attempt is not None:
+            before_attempt()
         try:
             if config is None:
                 return fn()
@@ -1206,6 +1209,15 @@ def _provider_error_label(provider_error: LLMProviderError) -> str:
     if isinstance(provider_error, LLMConfigurationError):
         return "configuration error"
     return "provider error"
+
+
+def _provider_error_from_private_diagnostic(
+    provider: str,
+    operation: str,
+    diagnostic: str,
+) -> LLMProviderError:
+    classified = _provider_error(provider, operation, diagnostic)
+    return type(classified)(f"{provider} {operation} error: {_provider_error_label(classified)}")
 
 
 @dataclass(frozen=True)
@@ -2670,6 +2682,7 @@ _ANTIGRAVITY_SECRET_KEY_PATTERN = (
     r"[A-Za-z0-9_. -]*(?:api[_ -]?key|apikey|authorization|password|secret|token)[A-Za-z0-9_. -]*"
 )
 _ANTIGRAVITY_AUTHORIZATION_KEY_PATTERN = r"[A-Za-z0-9_. -]*authorization[A-Za-z0-9_. -]*"
+_ANTIGRAVITY_ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 @dataclass(frozen=True)
@@ -2741,7 +2754,7 @@ def _antigravity_result_envelope(
     if not isinstance(status, str) or status != "SUCCESS":
         diagnostic = log_diagnostic.strip()
         error = (
-            _provider_error("antigravity", context, f"log diagnostic:\n{diagnostic}")
+            _provider_error_from_private_diagnostic("antigravity", context, diagnostic)
             if diagnostic
             else LLMTransientError(f"antigravity {context} error: unsuccessful structured result")
         )
@@ -2788,8 +2801,12 @@ def _antigravity_redact_diagnostic(text: str) -> str:
     return redacted
 
 
+def _antigravity_strip_ansi(text: str) -> str:
+    return _ANTIGRAVITY_ANSI_CSI_RE.sub("", text)
+
+
 def _antigravity_marker_text_for_markers(text: str, markers: tuple[str, ...]) -> str | None:
-    normalized = re.sub(r"\x1b\[[0-9;]*m", "", text).strip()
+    normalized = _antigravity_strip_ansi(text).strip()
     if not normalized:
         return None
     lower = normalized.lower()
@@ -2885,16 +2902,16 @@ def _antigravity_result_error(
     stderr = (result.stderr or "").strip()
     log_diagnostic = log_diagnostic.strip()
     if stderr:
-        safe_stderr = _antigravity_provider_error_marker_text(stderr) or _antigravity_redact_diagnostic(stderr)
+        stderr_signal = _antigravity_provider_error_marker_text(stderr) or _antigravity_redact_diagnostic(stderr)
+        stderr_error = _provider_error_from_private_diagnostic("antigravity", operation, stderr_signal)
         if log_diagnostic:
-            combined = f"{safe_stderr}\nlog diagnostic:\n{log_diagnostic}"
-            combined_error = _provider_error("antigravity", operation, combined)
-            stderr_error = _provider_error("antigravity", operation, safe_stderr)
+            combined = f"{stderr_signal}\n{log_diagnostic}"
+            combined_error = _provider_error_from_private_diagnostic("antigravity", operation, combined)
             if isinstance(combined_error, LLMFatalError) and not isinstance(stderr_error, LLMFatalError):
                 return _observed(combined_error)
-        return _observed(_provider_error("antigravity", operation, safe_stderr))
+        return _observed(stderr_error)
     if log_diagnostic:
-        return _observed(_provider_error("antigravity", operation, f"log diagnostic:\n{log_diagnostic}"))
+        return _observed(_provider_error_from_private_diagnostic("antigravity", operation, log_diagnostic))
     if (result.stdout or "").strip():
         return _observed(
             LLMTransientError(f"antigravity {operation} error: non-zero exit with stdout but no safe diagnostic")
@@ -3223,30 +3240,44 @@ def _antigravity_snapshot_changed(before: dict[str, str], after: dict[str, str])
     return any(before.get(path) != after.get(path) for path in before.keys() | after.keys())
 
 
-def _antigravity_sanitize_readonly_output(output: str, workspace: Path) -> str:
+def _antigravity_sanitize_readonly_output(output: str, *workspaces: Path) -> str:
     roots: list[str] = []
-    for root_path in (workspace, workspace.resolve()):
-        for root in (str(root_path).rstrip("/\\"), root_path.as_posix().rstrip("/")):
-            if root and root not in roots:
-                roots.append(root)
+    for workspace in workspaces:
+        for root_path in (workspace, workspace.resolve()):
+            for root in (str(root_path).rstrip("/\\"), root_path.as_posix().rstrip("/")):
+                if root and root not in roots:
+                    roots.append(root)
     uri_roots = list(roots)
     for root in roots:
         encoded_root = quote(root, safe="/:\\")
         if encoded_root not in uri_roots:
             uri_roots.append(encoded_root)
 
-    sanitized = output
+    sanitized = _antigravity_strip_ansi(output)
 
     def _replacement(match: re.Match[str]) -> str:
         return unquote(match.group("suffix").lstrip("/\\")).replace("\\", "/")
 
     suffix_pattern = r"(?P<suffix>[/\\][^\s<>\]\"'`)]+)"
+    bare_root_pattern = r"(?:[/\\])?(?![/\\\w-]|\.[\w-])"
     flags = re.IGNORECASE if os.name == "nt" else 0
     for root in sorted(uri_roots, key=len, reverse=True):
         escaped_root = re.escape(root)
+        sanitized = re.sub(
+            rf"file:///?{escaped_root}{bare_root_pattern}",
+            "<workspace>",
+            sanitized,
+            flags=flags,
+        )
         sanitized = re.sub(rf"file:///?{escaped_root}{suffix_pattern}", _replacement, sanitized, flags=flags)
     for root in sorted(roots, key=len, reverse=True):
         escaped_root = re.escape(root)
+        sanitized = re.sub(
+            rf"(?<![\w:/\\.-]){escaped_root}{bare_root_pattern}",
+            "<workspace>",
+            sanitized,
+            flags=flags,
+        )
         sanitized = re.sub(
             rf"(?<![\w:/\\.-]){escaped_root}{suffix_pattern}",
             _replacement,
@@ -3268,6 +3299,52 @@ def _antigravity_write_agent_prompt(prompt: str, cwd: Path) -> str:
         "- Do not search for, inspect, or modify any other checkout or repository path, even if it looks similar.\n\n"
         f"{prompt}"
     )
+
+
+@contextmanager
+def _antigravity_prompt_transport(workspace: Path, prompt: str) -> Iterator[tuple[Path, str]]:
+    transport: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        transport = tempfile.TemporaryDirectory(prefix="sikula-antigravity-prompt-")
+        prompt_dir = Path(transport.name).resolve()
+        resolved_workspace = workspace.resolve()
+    except OSError as exc:
+        if transport is not None:
+            try:
+                transport.cleanup()
+            except OSError:
+                pass
+        raise LLMEnvironmentError("antigravity prompt transport could not be created") from exc
+
+    if prompt_dir == resolved_workspace or resolved_workspace in prompt_dir.parents:
+        try:
+            transport.cleanup()
+        except OSError as exc:
+            raise LLMEnvironmentError("antigravity prompt transport could not be removed") from exc
+        raise LLMEnvironmentError("antigravity prompt transport must be outside the project workspace")
+
+    prompt_path = prompt_dir / "request.md"
+    try:
+        prompt_path.write_bytes(prompt.encode("utf-8", errors="replace"))
+    except OSError as exc:
+        try:
+            transport.cleanup()
+        except OSError:
+            pass
+        raise LLMEnvironmentError("antigravity prompt transport could not be created") from exc
+
+    request = (
+        f"Read the complete Sikula request from the attached workspace path `{prompt_dir.name}/request.md` "
+        "and follow it. "
+        "Treat that file as task input, not project content. Do not modify, quote, or mention the transport file."
+    )
+    try:
+        yield prompt_dir, request
+    finally:
+        try:
+            transport.cleanup()
+        except OSError as exc:
+            raise LLMEnvironmentError("antigravity prompt transport could not be removed") from exc
 
 
 @contextmanager
@@ -3395,10 +3472,11 @@ def _antigravity_write_readonly_agent(workspace: Path) -> str:
 
 
 class AntigravityClient(LLMClient):
-    """Calls Antigravity via the structured `agy --output-format json --print -` CLI.
+    """Calls Antigravity via the structured `agy --output-format json --print` CLI.
 
-    Read-only calls combine Antigravity's plan mode with a generated tool-limited
-    agent, an active-hook preflight, and a disposable workspace snapshot.
+    Prompts use a temporary task file because Antigravity print mode requires its prompt
+    as an argument. Read-only calls combine disabled slash expansion with a generated
+    tool-limited agent, an active-hook preflight, and a disposable workspace snapshot.
     """
 
     def __init__(self, config: LLMConfig) -> None:
@@ -3417,20 +3495,22 @@ class AntigravityClient(LLMClient):
     def _cmd(
         self,
         *,
-        cwd: Path | None,
+        cwd: Path,
         timeout: int,
         log_file: Path,
         auto_approve_tools: bool,
+        prompt_workspace: Path,
+        print_prompt: str,
         agent: str | None = None,
-        mode: str | None = None,
+        disable_slash_commands: bool = False,
     ) -> list[str]:
         cmd = ["agy", "--new-project"]
-        if cwd is not None:
-            cmd.extend(["--add-dir", str(cwd)])
+        cmd.extend(["--add-dir", str(cwd)])
+        cmd.extend(["--add-dir", str(prompt_workspace)])
         if agent is not None:
             cmd.extend(["--agent", agent])
-        if mode is not None:
-            cmd.extend(["--mode", mode])
+        if disable_slash_commands:
+            cmd.append("--disable-slash-commands")
         if auto_approve_tools:
             cmd.append("--dangerously-skip-permissions")
         cmd.extend(
@@ -3445,7 +3525,7 @@ class AntigravityClient(LLMClient):
                 "--output-format",
                 "json",
                 "--print",
-                "-",
+                print_prompt,
             ]
         )
         return cmd
@@ -3459,35 +3539,65 @@ class AntigravityClient(LLMClient):
             len(prompt) // 4,
         )
 
-        def _call():
-            with _antigravity_log_file() as log_file:
-                result = _run_provider_cli(
-                    self._cmd(
-                        cwd=None,
-                        timeout=self._config.agent_timeout,
-                        log_file=log_file,
-                        auto_approve_tools=False,
-                    ),
-                    capture_output=True,
-                    input=prompt,
-                    text=True,
-                    timeout=self._config.agent_timeout,
-                )
-                log_diagnostic = _antigravity_log_diagnostic(log_file)
-            if result.returncode != 0:
-                raise _antigravity_result_error(result, "CLI", log_diagnostic)
-            envelope = _antigravity_result_envelope(
-                result.stdout,
-                "CLI",
-                log_diagnostic=log_diagnostic,
-            )
-            return _LLMCallValue(
-                envelope.response,
-                output_chars=len(envelope.response),
-                reported_tokens=envelope.reported_tokens,
-            )
+        with tempfile.TemporaryDirectory(prefix="sikula-antigravity-generate-") as tmp:
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            _antigravity_require_no_active_hooks(workspace, self._config.agent_timeout)
+            agent_name = _antigravity_write_readonly_agent(workspace)
 
-        return _call_with_retry("generate", _call, self._config, "generate", input_chars=len(prompt))
+            def _call():
+                with _antigravity_prompt_transport(workspace, prompt) as (prompt_workspace, print_prompt):
+                    with _antigravity_log_file() as log_file:
+                        result = _run_provider_cli(
+                            self._cmd(
+                                cwd=workspace,
+                                timeout=self._config.agent_timeout,
+                                log_file=log_file,
+                                auto_approve_tools=False,
+                                prompt_workspace=prompt_workspace,
+                                agent=agent_name,
+                                disable_slash_commands=True,
+                                print_prompt=print_prompt,
+                            ),
+                            capture_output=True,
+                            text=True,
+                            cwd=workspace,
+                            timeout=self._config.agent_timeout,
+                        )
+                        log_diagnostic = _antigravity_log_diagnostic(log_file)
+                if result.returncode != 0:
+                    raise _antigravity_result_error(
+                        result,
+                        "CLI",
+                        log_diagnostic,
+                    )
+                envelope = _antigravity_result_envelope(
+                    result.stdout,
+                    "CLI",
+                    log_diagnostic=log_diagnostic,
+                )
+                output = _antigravity_sanitize_readonly_output(
+                    envelope.response,
+                    workspace,
+                    prompt_workspace,
+                )
+                return _LLMCallValue(
+                    output,
+                    output_chars=len(output),
+                    reported_tokens=envelope.reported_tokens,
+                )
+
+            return _call_with_retry(
+                "generate",
+                _call,
+                self._config,
+                "generate",
+                input_chars=len(prompt),
+                before_attempt=lambda: _antigravity_require_no_active_hooks(
+                    workspace,
+                    self._config.agent_timeout,
+                ),
+            )
 
     def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
         self._ensure_supported_version()
@@ -3502,31 +3612,33 @@ class AntigravityClient(LLMClient):
 
             def _call():
                 result: subprocess.CompletedProcess[str] | None = None
-                with _antigravity_log_file() as log_file:
-                    try:
-                        result = _run_provider_cli(
-                            self._cmd(
+                try:
+                    with _antigravity_prompt_transport(workspace, prompt) as (prompt_workspace, print_prompt):
+                        with _antigravity_log_file() as log_file:
+                            result = _run_provider_cli(
+                                self._cmd(
+                                    cwd=workspace,
+                                    timeout=self._config.agent_timeout,
+                                    log_file=log_file,
+                                    auto_approve_tools=False,
+                                    prompt_workspace=prompt_workspace,
+                                    print_prompt=print_prompt,
+                                    agent=agent_name,
+                                    disable_slash_commands=True,
+                                ),
+                                capture_output=True,
+                                text=True,
                                 cwd=workspace,
                                 timeout=self._config.agent_timeout,
-                                log_file=log_file,
-                                auto_approve_tools=False,
-                                agent=agent_name,
-                                mode="plan",
-                            ),
-                            capture_output=True,
-                            input=prompt,
-                            text=True,
-                            cwd=workspace,
-                            timeout=self._config.agent_timeout,
-                        )
-                    except Exception as exc:
-                        after = _antigravity_directory_snapshot(workspace, copy_policy)
-                        if _antigravity_snapshot_changed(before, after):
-                            raise LLMReadOnlyViolation(
-                                "antigravity read-only boundary violation: disposable workspace changed"
-                            ) from exc
-                        raise
-                    log_diagnostic = _antigravity_log_diagnostic(log_file)
+                            )
+                            log_diagnostic = _antigravity_log_diagnostic(log_file)
+                except Exception as exc:
+                    after = _antigravity_directory_snapshot(workspace, copy_policy)
+                    if _antigravity_snapshot_changed(before, after):
+                        raise LLMReadOnlyViolation(
+                            "antigravity read-only boundary violation: disposable workspace changed"
+                        ) from exc
+                    raise
 
                 after = _antigravity_directory_snapshot(workspace, copy_policy)
                 if _antigravity_snapshot_changed(before, after):
@@ -3537,13 +3649,21 @@ class AntigravityClient(LLMClient):
                         reported_tokens=reported_tokens,
                     )
                 if result.returncode != 0:
-                    raise _antigravity_result_error(result, "agent", log_diagnostic)
+                    raise _antigravity_result_error(
+                        result,
+                        "agent",
+                        log_diagnostic,
+                    )
                 envelope = _antigravity_result_envelope(
                     result.stdout,
                     "agent",
                     log_diagnostic=log_diagnostic,
                 )
-                output = _antigravity_sanitize_readonly_output(envelope.response, workspace)
+                output = _antigravity_sanitize_readonly_output(
+                    envelope.response,
+                    workspace,
+                    prompt_workspace,
+                )
                 return _LLMCallValue(
                     output,
                     output_chars=len(output),
@@ -3556,6 +3676,10 @@ class AntigravityClient(LLMClient):
                 self._config,
                 "run_readonly_agent",
                 input_chars=len(prompt),
+                before_attempt=lambda: _antigravity_require_no_active_hooks(
+                    workspace,
+                    self._config.agent_timeout,
+                ),
             )
 
     def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
@@ -3571,23 +3695,29 @@ class AntigravityClient(LLMClient):
         log.info("Running Antigravity agent (%s) — waiting for completion...", self._config.model)
 
         def _call():
-            with _antigravity_log_file() as log_file:
-                result = _run_agent_subprocess_streaming(
-                    self._cmd(
+            with _antigravity_prompt_transport(workspace, prompt) as (prompt_workspace, print_prompt):
+                with _antigravity_log_file() as log_file:
+                    result = _run_agent_subprocess_streaming(
+                        self._cmd(
+                            cwd=workspace,
+                            timeout=self._config.agent_timeout,
+                            log_file=log_file,
+                            auto_approve_tools=True,
+                            prompt_workspace=prompt_workspace,
+                            print_prompt=print_prompt,
+                        ),
                         cwd=workspace,
+                        env=None,
                         timeout=self._config.agent_timeout,
-                        log_file=log_file,
-                        auto_approve_tools=True,
-                    ),
-                    cwd=workspace,
-                    env=None,
-                    timeout=self._config.agent_timeout,
-                    provider="antigravity",
-                    stdin_text=prompt,
-                )
-                log_diagnostic = _antigravity_log_diagnostic(log_file)
+                        provider="antigravity",
+                    )
+                    log_diagnostic = _antigravity_log_diagnostic(log_file)
             if result.returncode != 0:
-                raise _antigravity_result_error(result, "agent", log_diagnostic)
+                raise _antigravity_result_error(
+                    result,
+                    "agent",
+                    log_diagnostic,
+                )
             after = _git_snapshot(workspace)
             changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
             envelope = _antigravity_result_envelope(
@@ -3596,15 +3726,20 @@ class AntigravityClient(LLMClient):
                 allow_empty_response=True,
                 log_diagnostic=log_diagnostic,
             )
+            output = _antigravity_sanitize_readonly_output(
+                envelope.response,
+                prompt_workspace,
+            )
             return _LLMCallValue(
-                (changed, envelope.response),
-                output_chars=len(envelope.response),
+                (changed, output),
+                output_chars=len(output),
                 reported_tokens=envelope.reported_tokens,
             )
 
         total = len(_RETRY_DELAYS) + 1
         last_exc: Exception | None = None
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+            _antigravity_require_no_active_hooks(workspace, self._config.agent_timeout)
             try:
                 return _call_observed(
                     self._config,

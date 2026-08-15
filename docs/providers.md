@@ -8,7 +8,7 @@ Sikula has built-in CLI integrations for Codex, Claude, Gemini, OpenCode, and An
 | `claude` | `claude -p` | Uses Claude Code Agent SDK behavior. |
 | `gemini` | `gemini` | Uses Gemini CLI. |
 | `opencode` | `opencode run` | Model must usually be in `provider/model` format. |
-| `antigravity` | `agy --output-format json --print -` | Uses Antigravity CLI 1.1.12 or newer. Model names are passed directly to `agy --model`; use the exact display names from `agy models`, for example `"Gemini 3.5 Flash (High)"`. |
+| `antigravity` | `agy --output-format json --print <request>` | Uses Antigravity CLI 1.1.12 or newer. Model names are passed directly to `agy --model`; use the exact display names from `agy models`, for example `"Gemini 3.5 Flash (High)"`. |
 
 Provider CLIs and model names change over time. Keep model examples in your project config current with the provider documentation you use.
 
@@ -29,11 +29,6 @@ llm:
   model: "Gemini 3.5 Flash (High)"
   agent_timeout: 1800
 ```
-
-Antigravity's final structured result contributes explicit input, output, total,
-and cache-read token counts to Sikula's provider-neutral usage records when
-available. Cache reads are reported as `cached_input_tokens`; missing or invalid
-optional fields remain unknown, and Sikula does not estimate them.
 
 ## Configure The Default Provider
 
@@ -94,9 +89,7 @@ Provider-specific API-key or enterprise authentication should be configured acco
 
 Sikula runs locally in your repository. The configured provider determines what task, prompt, source, and diff context may be sent outside your machine. Choose a provider and authentication mode that matches your organization's data policy.
 
-Antigravity calls that attach a project first reject absolute symlinks and relative symlinks that resolve outside the project root on paths Sikula keeps under its workspace policy. Untracked ignored local artifacts such as `.venv` and `node_modules` are pruned so ordinary dependency/runtime directories do not block runs; tracked or preserved paths inside soft-ignored directories are still checked. Internal project-relative symlinks are allowed.
-
-Antigravity read-only agents require CLI 1.1.12 or newer and cannot run while workspace, plugin, or global Antigravity hooks are enabled. Sikula uses Antigravity's read-only controls together with a disposable workspace copy and rejects any project-file mutation without retrying the same provider attempt. Write-capable Antigravity agents are unchanged. Provider-owned state under the Antigravity user profile remains outside Sikula's project snapshot and may still change.
+Antigravity calls cannot run while workspace, plugin, or global Antigravity hooks are enabled. Disable those hooks before using Antigravity through Sikula. See [Sandbox And Command Restrictions](sandbox.md) for provider-specific workspace protections.
 
 ## Adding A Provider
 
