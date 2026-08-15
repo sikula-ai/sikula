@@ -4930,6 +4930,14 @@ class TestAntigravityClientCommands:
         assert _antigravity_sanitize_readonly_output(sibling, workspace) == sibling
         assert _antigravity_sanitize_readonly_output(f"See {workspace}/.agents", workspace) == "See .agents"
 
+    def test_readonly_output_strips_ansi_before_sanitizing_workspace_roots(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        output = f"Failed \x1b[31m{workspace}\x1b[0m; see \x1b[38;5;196m{workspace}/status.txt\x1b[0m."
+
+        sanitized = _antigravity_sanitize_readonly_output(output, workspace)
+
+        assert sanitized == "Failed <workspace>; see status.txt."
+
     @staticmethod
     def _result(
         text: str = "ok",
@@ -5232,31 +5240,33 @@ class TestAntigravityClientCommands:
         assert empty.value.reported_tokens == usage
 
     @pytest.mark.parametrize(
-        ("diagnostic", "error_type"),
+        ("diagnostic", "error_type", "public_reason"),
         [
-            ("ERROR not authenticated", LLMAuthError),
-            ("ERROR quota exceeded", LLMQuotaExceeded),
-            ("ERROR unsupported model", LLMConfigurationError),
+            ("ERROR not authenticated", LLMAuthError, "authentication failed"),
+            ("ERROR quota exceeded", LLMQuotaExceeded, "quota exceeded"),
+            ("ERROR unsupported model", LLMConfigurationError, "configuration error"),
         ],
     )
     def test_result_envelope_classifies_unsuccessful_log_diagnostic(
         self,
         diagnostic: str,
         error_type: type[LLMProviderError],
+        public_reason: str,
     ):
         usage = {"input_tokens": 7, "output_tokens": 2}
 
-        with pytest.raises(error_type, match="log diagnostic") as exc_info:
+        with pytest.raises(error_type) as exc_info:
             _antigravity_result_envelope(
                 self._result("partial", status="ERROR", usage=usage),
                 "CLI",
                 log_diagnostic=diagnostic,
             )
 
+        assert str(exc_info.value) == f"antigravity CLI error: {public_reason}"
         assert exc_info.value.output_chars == len("partial")
         assert exc_info.value.reported_tokens == usage
 
-    def test_result_envelope_sanitizes_unsuccessful_log_diagnostic_workspaces(self, tmp_path: Path):
+    def test_result_envelope_does_not_expose_private_log_diagnostic(self, tmp_path: Path):
         workspace = tmp_path / "workspace"
         prompt_workspace = tmp_path / "prompt"
         diagnostic = (
@@ -5268,13 +5278,13 @@ class TestAntigravityClientCommands:
                 self._result("partial", status="ERROR"),
                 "CLI",
                 log_diagnostic=diagnostic,
-                workspaces=(workspace, prompt_workspace),
             )
 
         message = str(exc_info.value)
-        assert "unsupported model" in message
-        assert "core/llm_client.py" in message
-        assert "request.md" in message
+        assert message == "antigravity CLI error: configuration error"
+        assert "unsupported model" not in message
+        assert "core/llm_client.py" not in message
+        assert "request.md" not in message
         assert str(workspace) not in message
         assert str(prompt_workspace) not in message
 
@@ -5328,8 +5338,7 @@ class TestAntigravityClientCommands:
             "ERROR failed upstream",
         )
         assert isinstance(stderr_error, LLMTransientError)
-        assert "temporary outage" in str(stderr_error)
-        assert "log diagnostic" not in str(stderr_error)
+        assert str(stderr_error) == "antigravity agent error: provider error"
 
     def test_result_error_classifies_long_stderr_before_truncating(self):
         error = _antigravity_result_error(
@@ -5344,12 +5353,13 @@ class TestAntigravityClientCommands:
 
         message = str(error)
         assert isinstance(error, LLMConfigurationError)
-        assert "unsupported model" in message
-        assert "token=<redacted>" in message
+        assert message == "antigravity agent error: configuration error"
+        assert "unsupported model" not in message
+        assert "token" not in message
         assert "secret" not in message
         assert "x" * 600 not in message
 
-    def test_result_error_redacts_multi_token_authorization_headers(self):
+    def test_result_error_does_not_expose_multi_token_authorization_headers(self):
         error = _antigravity_result_error(
             subprocess.CompletedProcess(
                 ["agy"],
@@ -5362,36 +5372,38 @@ class TestAntigravityClientCommands:
 
         message = str(error)
         assert isinstance(error, LLMProviderError)
-        assert "Authorization: <redacted>" in message
-        assert "Proxy-Authorization = <redacted>" in message
+        assert message == "antigravity agent error: provider error"
+        assert "Authorization" not in message
+        assert "Proxy-Authorization" not in message
         assert "Basic" not in message
         assert "dXNlcjpwYXNz" not in message
         assert "Digest" not in message
         assert "abc def" not in message
 
-    def test_result_error_sanitizes_workspace_paths_before_classification(self, tmp_path: Path):
+    def test_result_error_classifies_without_exposing_private_diagnostic(self, tmp_path: Path):
         workspace = tmp_path / "workspace"
         prompt_workspace = tmp_path / "prompt"
         result = subprocess.CompletedProcess(
             ["agy"],
             1,
             "",
-            f"ERROR attachment failed at {prompt_workspace}",
+            f"ERROR attachment failed at \x1b[31m{prompt_workspace}\x1b[0m",
         )
-        log_diagnostic = f"ERROR unsupported model at {workspace}"
+        log_diagnostic = f"ERROR unsupported model at \x1b[31m{workspace}\x1b[0m"
 
         error = _antigravity_result_error(
             result,
             "agent",
             log_diagnostic,
-            workspaces=(workspace, prompt_workspace),
         )
 
         message = str(error)
         assert isinstance(error, LLMConfigurationError)
+        assert message == "antigravity agent error: configuration error"
         assert str(workspace) not in message
         assert str(prompt_workspace) not in message
-        assert "unsupported model at <workspace>" in message
+        assert "unsupported model" not in message
+        assert "attachment failed" not in message
 
     def test_git_path_helpers_handle_failures_and_text_stdout(self, tmp_path: Path):
         with patch(
@@ -5984,11 +5996,13 @@ class TestAntigravityClientCommands:
         with (
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client._run_provider_cli", side_effect=_fake_run) as mock_provider,
-            pytest.raises(LLMConfigurationError, match="unsupported model") as exc_info,
+            pytest.raises(LLMConfigurationError) as exc_info,
         ):
             client.run_readonly_agent("prompt", tmp_path)
 
         message = str(exc_info.value)
+        assert message == "antigravity agent error: configuration error"
+        assert "unsupported model" not in message
         assert str(seen["workspace"]) not in message
         assert str(seen["prompt_workspace"]) not in message
         assert mock_provider.call_count == 1
@@ -6392,10 +6406,11 @@ class TestAntigravityClientCommands:
         with (
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client.subprocess.run", return_value=result) as mock_run,
-            pytest.raises(LLMConfigurationError, match="unsupported model"),
+            pytest.raises(LLMConfigurationError) as exc_info,
         ):
             client.generate("system", "user")
 
+        assert str(exc_info.value) == "antigravity CLI error: configuration error"
         assert mock_run.call_count == 1
         sleep.assert_not_called()
         assert events[0]["outcome"] == "fatal_error"
@@ -6435,7 +6450,7 @@ class TestAntigravityClientCommands:
         ):
             client.generate("system", "user")
 
-        assert "token=<redacted>" in str(exc_info.value)
+        assert str(exc_info.value) == "antigravity CLI error: authentication failed"
         assert "supersecret" not in str(exc_info.value)
         assert mock_run.call_count == 1
         sleep.assert_not_called()
@@ -6443,7 +6458,7 @@ class TestAntigravityClientCommands:
         assert events[0]["output_chars"] == len("partial")
         assert events[0]["reported_tokens"] == usage
 
-    def test_generate_nonzero_exit_uses_antigravity_log_diagnostic(self):
+    def test_generate_nonzero_exit_classifies_private_log_diagnostic(self):
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
 
         def _fake_run(cmd, **kwargs):
@@ -6467,15 +6482,15 @@ class TestAntigravityClientCommands:
             client.generate("system", "user")
 
         message = str(exc_info.value)
-        assert "log diagnostic" in message
-        assert "not authenticated" in message
-        assert "token=<redacted>" in message
-        assert 'api_key="<redacted>"' in message
-        assert "OPENAI_API_KEY=<redacted>" in message
-        assert "access_token=<redacted>" in message
-        assert 'refresh_token="<redacted>"' in message
-        assert '"token":"<redacted>"' in message
-        assert '"client_secret":"<redacted>"' in message
+        assert message == "antigravity CLI error: authentication failed"
+        assert "log diagnostic" not in message
+        assert "not authenticated" not in message
+        assert "token" not in message
+        assert "api_key" not in message
+        assert "OPENAI_API_KEY" not in message
+        assert "access_token" not in message
+        assert "refresh_token" not in message
+        assert "client_secret" not in message
         assert "supersecret" not in message
         assert "quotedsecret" not in message
         assert "envsecret" not in message
@@ -6486,7 +6501,7 @@ class TestAntigravityClientCommands:
         assert mock_run.call_count == 1
         sleep.assert_not_called()
 
-    def test_generate_nonzero_exit_redacts_antigravity_stderr(self):
+    def test_generate_nonzero_exit_does_not_expose_antigravity_stderr(self):
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))
         seen: dict[str, Path] = {}
 
@@ -6511,8 +6526,9 @@ class TestAntigravityClientCommands:
             client.generate("system", "user")
 
         message = str(exc_info.value)
-        assert "OPENAI_API_KEY=<redacted>" in message
-        assert "client_secret=<redacted>" in message
+        assert message == "antigravity CLI error: authentication failed"
+        assert "OPENAI_API_KEY" not in message
+        assert "client_secret" not in message
         assert "envsecret" not in message
         assert "clientsecret" not in message
         assert str(seen["workspace"]) not in message
@@ -6536,9 +6552,10 @@ class TestAntigravityClientCommands:
             client.generate("system", "user")
 
         message = str(exc_info.value)
-        assert "see log for details" in message
-        assert "not authenticated" in message
-        assert "token=<redacted>" in message
+        assert message == "antigravity CLI error: authentication failed"
+        assert "see log for details" not in message
+        assert "not authenticated" not in message
+        assert "token" not in message
         assert "supersecret" not in message
         assert mock_run.call_count == 1
         sleep.assert_not_called()
@@ -6551,10 +6568,11 @@ class TestAntigravityClientCommands:
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client._git_snapshot", return_value={}),
             patch("core.llm_client._run_agent_subprocess_streaming", return_value=result) as mock_run,
-            pytest.raises(LLMConfigurationError, match="unsupported model"),
+            pytest.raises(LLMConfigurationError) as exc_info,
         ):
             client.run_agent("prompt", tmp_path)
 
+        assert str(exc_info.value) == "antigravity agent error: configuration error"
         assert mock_run.call_count == 1
         sleep.assert_not_called()
 
@@ -6592,7 +6610,8 @@ class TestAntigravityClientCommands:
             client.run_agent("prompt", tmp_path)
 
         message = str(exc_info.value)
-        assert "unsupported model" in message
+        assert message == "antigravity agent error: configuration error"
+        assert "unsupported model" not in message
         assert str(seen["workspace"]) not in message
         assert str(seen["prompt_workspace"]) not in message
         assert mock_run.call_count == 1
@@ -6682,14 +6701,27 @@ class TestAntigravityClientCommands:
                 retry_observer=observer,
             )
         )
-        transient = subprocess.CompletedProcess(["agy"], 1, "partial stdout", "")
+        prompt_workspaces: list[Path] = []
+
+        def _fake_streaming(cmd, **kwargs):
+            add_dirs = [Path(cmd[index + 1]) for index, value in enumerate(cmd) if value == "--add-dir"]
+            prompt_workspace = add_dirs[1]
+            prompt_workspaces.append(prompt_workspace)
+            if len(prompt_workspaces) == 1:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    1,
+                    "",
+                    f"temporary outage at {prompt_workspace}/request.md token=supersecret",
+                )
+            return self._run_result("done")
 
         with (
             patch("core.llm_client.time.sleep") as sleep,
             patch("core.llm_client._git_snapshot", side_effect=[{}, {}, {"src/app.ts": "hash"}]),
             patch(
                 "core.llm_client._run_agent_subprocess_streaming",
-                side_effect=[transient, self._run_result("done")],
+                side_effect=_fake_streaming,
             ) as mock_run,
         ):
             changed, output = client.run_agent("prompt", tmp_path)
@@ -6699,6 +6731,9 @@ class TestAntigravityClientCommands:
         assert mock_run.call_count == 2
         sleep.assert_called_once()
         assert observer.call_args.args[0]["error_type"] == "LLMTransientError"
+        assert observer.call_args.args[0]["error"] == "antigravity agent error: provider error"
+        assert "supersecret" not in observer.call_args.args[0]["error"]
+        assert str(prompt_workspaces[0]) not in observer.call_args.args[0]["error"]
 
     def test_run_agent_transient_error_stops_when_partial_changes_exist(self, tmp_path: Path):
         client = AntigravityClient(LLMConfig(provider="antigravity", model="Gemini 3.5 Flash (High)"))

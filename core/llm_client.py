@@ -1211,6 +1211,15 @@ def _provider_error_label(provider_error: LLMProviderError) -> str:
     return "provider error"
 
 
+def _provider_error_from_private_diagnostic(
+    provider: str,
+    operation: str,
+    diagnostic: str,
+) -> LLMProviderError:
+    classified = _provider_error(provider, operation, diagnostic)
+    return type(classified)(f"{provider} {operation} error: {_provider_error_label(classified)}")
+
+
 @dataclass(frozen=True)
 class _OpenCodeDiagnostic:
     public_message: str
@@ -2673,6 +2682,7 @@ _ANTIGRAVITY_SECRET_KEY_PATTERN = (
     r"[A-Za-z0-9_. -]*(?:api[_ -]?key|apikey|authorization|password|secret|token)[A-Za-z0-9_. -]*"
 )
 _ANTIGRAVITY_AUTHORIZATION_KEY_PATTERN = r"[A-Za-z0-9_. -]*authorization[A-Za-z0-9_. -]*"
+_ANTIGRAVITY_ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 @dataclass(frozen=True)
@@ -2732,7 +2742,6 @@ def _antigravity_result_envelope(
     *,
     allow_empty_response: bool = False,
     log_diagnostic: str = "",
-    workspaces: tuple[Path, ...] = (),
 ) -> _AntigravityResultEnvelope:
     payload = _antigravity_result_payload(output)
     if payload is None:
@@ -2743,9 +2752,9 @@ def _antigravity_result_envelope(
     text = response.strip() if isinstance(response, str) else ""
     reported_tokens = _antigravity_reported_tokens(payload.get("usage")) or None
     if not isinstance(status, str) or status != "SUCCESS":
-        diagnostic = _antigravity_sanitize_readonly_output(log_diagnostic, *workspaces).strip()
+        diagnostic = log_diagnostic.strip()
         error = (
-            _provider_error("antigravity", context, f"log diagnostic:\n{diagnostic}")
+            _provider_error_from_private_diagnostic("antigravity", context, diagnostic)
             if diagnostic
             else LLMTransientError(f"antigravity {context} error: unsuccessful structured result")
         )
@@ -2792,8 +2801,12 @@ def _antigravity_redact_diagnostic(text: str) -> str:
     return redacted
 
 
+def _antigravity_strip_ansi(text: str) -> str:
+    return _ANTIGRAVITY_ANSI_CSI_RE.sub("", text)
+
+
 def _antigravity_marker_text_for_markers(text: str, markers: tuple[str, ...]) -> str | None:
-    normalized = re.sub(r"\x1b\[[0-9;]*m", "", text).strip()
+    normalized = _antigravity_strip_ansi(text).strip()
     if not normalized:
         return None
     lower = normalized.lower()
@@ -2878,8 +2891,6 @@ def _antigravity_result_error(
     result: subprocess.CompletedProcess[str],
     operation: str,
     log_diagnostic: str = "",
-    *,
-    workspaces: tuple[Path, ...] = (),
 ) -> LLMProviderError:
     output_chars, reported_tokens = _antigravity_result_observation(result.stdout or "")
 
@@ -2888,19 +2899,19 @@ def _antigravity_result_error(
         error.reported_tokens = reported_tokens
         return error
 
-    stderr = _antigravity_sanitize_readonly_output(result.stderr or "", *workspaces).strip()
-    log_diagnostic = _antigravity_sanitize_readonly_output(log_diagnostic, *workspaces).strip()
+    stderr = (result.stderr or "").strip()
+    log_diagnostic = log_diagnostic.strip()
     if stderr:
-        safe_stderr = _antigravity_provider_error_marker_text(stderr) or _antigravity_redact_diagnostic(stderr)
+        stderr_signal = _antigravity_provider_error_marker_text(stderr) or _antigravity_redact_diagnostic(stderr)
+        stderr_error = _provider_error_from_private_diagnostic("antigravity", operation, stderr_signal)
         if log_diagnostic:
-            combined = f"{safe_stderr}\nlog diagnostic:\n{log_diagnostic}"
-            combined_error = _provider_error("antigravity", operation, combined)
-            stderr_error = _provider_error("antigravity", operation, safe_stderr)
+            combined = f"{stderr_signal}\n{log_diagnostic}"
+            combined_error = _provider_error_from_private_diagnostic("antigravity", operation, combined)
             if isinstance(combined_error, LLMFatalError) and not isinstance(stderr_error, LLMFatalError):
                 return _observed(combined_error)
-        return _observed(_provider_error("antigravity", operation, safe_stderr))
+        return _observed(stderr_error)
     if log_diagnostic:
-        return _observed(_provider_error("antigravity", operation, f"log diagnostic:\n{log_diagnostic}"))
+        return _observed(_provider_error_from_private_diagnostic("antigravity", operation, log_diagnostic))
     if (result.stdout or "").strip():
         return _observed(
             LLMTransientError(f"antigravity {operation} error: non-zero exit with stdout but no safe diagnostic")
@@ -3242,7 +3253,7 @@ def _antigravity_sanitize_readonly_output(output: str, *workspaces: Path) -> str
         if encoded_root not in uri_roots:
             uri_roots.append(encoded_root)
 
-    sanitized = output
+    sanitized = _antigravity_strip_ansi(output)
 
     def _replacement(match: re.Match[str]) -> str:
         return unquote(match.group("suffix").lstrip("/\\")).replace("\\", "/")
@@ -3559,13 +3570,11 @@ class AntigravityClient(LLMClient):
                         result,
                         "CLI",
                         log_diagnostic,
-                        workspaces=(workspace, prompt_workspace),
                     )
                 envelope = _antigravity_result_envelope(
                     result.stdout,
                     "CLI",
                     log_diagnostic=log_diagnostic,
-                    workspaces=(workspace, prompt_workspace),
                 )
                 output = _antigravity_sanitize_readonly_output(
                     envelope.response,
@@ -3644,13 +3653,11 @@ class AntigravityClient(LLMClient):
                         result,
                         "agent",
                         log_diagnostic,
-                        workspaces=(workspace, prompt_workspace),
                     )
                 envelope = _antigravity_result_envelope(
                     result.stdout,
                     "agent",
                     log_diagnostic=log_diagnostic,
-                    workspaces=(workspace, prompt_workspace),
                 )
                 output = _antigravity_sanitize_readonly_output(
                     envelope.response,
@@ -3710,7 +3717,6 @@ class AntigravityClient(LLMClient):
                     result,
                     "agent",
                     log_diagnostic,
-                    workspaces=(workspace, prompt_workspace),
                 )
             after = _git_snapshot(workspace)
             changed = sorted(p for p in (before.keys() | after.keys()) if before.get(p) != after.get(p))
@@ -3719,7 +3725,6 @@ class AntigravityClient(LLMClient):
                 "agent",
                 allow_empty_response=True,
                 log_diagnostic=log_diagnostic,
-                workspaces=(workspace, prompt_workspace),
             )
             output = _antigravity_sanitize_readonly_output(
                 envelope.response,
