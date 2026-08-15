@@ -4892,6 +4892,21 @@ class TestAntigravityClientCommands:
 
         assert sanitized == "See [client](core/llm_client.py#L12)."
 
+    def test_readonly_output_sanitizes_bare_windows_workspace_roots(self):
+        workspace = MagicMock(spec=Path)
+        workspace.__str__.return_value = r"C:\Users\runner\AppData\Local\Temp\sikula-workspace"
+        workspace.as_posix.return_value = "C:/Users/runner/AppData/Local/Temp/sikula-workspace"
+        workspace.resolve.return_value = workspace
+        output = (
+            r"Failed C:\Users\runner\AppData\Local\Temp\sikula-workspace; "
+            "file:///C:/Users/runner/AppData/Local/Temp/sikula-workspace."
+        )
+
+        with patch("core.llm_client.os.name", "nt"):
+            sanitized = _antigravity_sanitize_readonly_output(output, workspace)
+
+        assert sanitized == "Failed <workspace>; <workspace>."
+
     def test_readonly_output_sanitizes_multiple_workspace_roots(self, tmp_path: Path):
         workspace = tmp_path / "workspace"
         prompt_workspace = tmp_path / "prompt"
@@ -4902,6 +4917,18 @@ class TestAntigravityClientCommands:
         assert str(workspace) not in sanitized
         assert str(prompt_workspace) not in sanitized
         assert sanitized == "See core/llm_client.py and request.md."
+
+    def test_readonly_output_sanitizes_bare_workspace_roots(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        prompt_workspace = tmp_path / "prompt"
+        output = f"Failed to attach {workspace}; file://{workspace}; or {prompt_workspace}/."
+
+        sanitized = _antigravity_sanitize_readonly_output(output, workspace, prompt_workspace)
+
+        assert sanitized == "Failed to attach <workspace>; <workspace>; or <workspace>."
+        sibling = f"Failed to attach {workspace}-cache"
+        assert _antigravity_sanitize_readonly_output(sibling, workspace) == sibling
+        assert _antigravity_sanitize_readonly_output(f"See {workspace}/.agents", workspace) == "See .agents"
 
     @staticmethod
     def _result(
@@ -5349,9 +5376,9 @@ class TestAntigravityClientCommands:
             ["agy"],
             1,
             "",
-            f"ERROR attachment failed at {prompt_workspace}/request.md",
+            f"ERROR attachment failed at {prompt_workspace}",
         )
-        log_diagnostic = f"ERROR unsupported model at {workspace}/.agents/agent.md"
+        log_diagnostic = f"ERROR unsupported model at {workspace}"
 
         error = _antigravity_result_error(
             result,
@@ -5364,8 +5391,7 @@ class TestAntigravityClientCommands:
         assert isinstance(error, LLMConfigurationError)
         assert str(workspace) not in message
         assert str(prompt_workspace) not in message
-        assert "request.md" in message
-        assert ".agents/agent.md" in message
+        assert "unsupported model at <workspace>" in message
 
     def test_git_path_helpers_handle_failures_and_text_stdout(self, tmp_path: Path):
         with patch(

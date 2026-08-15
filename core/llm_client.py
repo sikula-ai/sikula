@@ -3248,12 +3248,25 @@ def _antigravity_sanitize_readonly_output(output: str, *workspaces: Path) -> str
         return unquote(match.group("suffix").lstrip("/\\")).replace("\\", "/")
 
     suffix_pattern = r"(?P<suffix>[/\\][^\s<>\]\"'`)]+)"
+    bare_root_pattern = r"(?:[/\\])?(?![/\\\w-]|\.[\w-])"
     flags = re.IGNORECASE if os.name == "nt" else 0
     for root in sorted(uri_roots, key=len, reverse=True):
         escaped_root = re.escape(root)
+        sanitized = re.sub(
+            rf"file:///?{escaped_root}{bare_root_pattern}",
+            "<workspace>",
+            sanitized,
+            flags=flags,
+        )
         sanitized = re.sub(rf"file:///?{escaped_root}{suffix_pattern}", _replacement, sanitized, flags=flags)
     for root in sorted(roots, key=len, reverse=True):
         escaped_root = re.escape(root)
+        sanitized = re.sub(
+            rf"(?<![\w:/\\.-]){escaped_root}{bare_root_pattern}",
+            "<workspace>",
+            sanitized,
+            flags=flags,
+        )
         sanitized = re.sub(
             rf"(?<![\w:/\\.-]){escaped_root}{suffix_pattern}",
             _replacement,
