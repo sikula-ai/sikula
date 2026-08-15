@@ -5229,6 +5229,28 @@ class TestAntigravityClientCommands:
         assert exc_info.value.output_chars == len("partial")
         assert exc_info.value.reported_tokens == usage
 
+    def test_result_envelope_sanitizes_unsuccessful_log_diagnostic_workspaces(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        prompt_workspace = tmp_path / "prompt"
+        diagnostic = (
+            f"ERROR unsupported model at {workspace}/core/llm_client.py; attachment {prompt_workspace}/request.md"
+        )
+
+        with pytest.raises(LLMConfigurationError) as exc_info:
+            _antigravity_result_envelope(
+                self._result("partial", status="ERROR"),
+                "CLI",
+                log_diagnostic=diagnostic,
+                workspaces=(workspace, prompt_workspace),
+            )
+
+        message = str(exc_info.value)
+        assert "unsupported model" in message
+        assert "core/llm_client.py" in message
+        assert "request.md" in message
+        assert str(workspace) not in message
+        assert str(prompt_workspace) not in message
+
     def test_diagnostic_helpers_cover_empty_long_json_and_log_limit(self, tmp_path: Path):
         assert _antigravity_marker_text("") is None
         assert _antigravity_marker_text("all good") is None

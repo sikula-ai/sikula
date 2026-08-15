@@ -2732,6 +2732,7 @@ def _antigravity_result_envelope(
     *,
     allow_empty_response: bool = False,
     log_diagnostic: str = "",
+    workspaces: tuple[Path, ...] = (),
 ) -> _AntigravityResultEnvelope:
     payload = _antigravity_result_payload(output)
     if payload is None:
@@ -2742,7 +2743,7 @@ def _antigravity_result_envelope(
     text = response.strip() if isinstance(response, str) else ""
     reported_tokens = _antigravity_reported_tokens(payload.get("usage")) or None
     if not isinstance(status, str) or status != "SUCCESS":
-        diagnostic = log_diagnostic.strip()
+        diagnostic = _antigravity_sanitize_readonly_output(log_diagnostic, *workspaces).strip()
         error = (
             _provider_error("antigravity", context, f"log diagnostic:\n{diagnostic}")
             if diagnostic
@@ -3551,6 +3552,7 @@ class AntigravityClient(LLMClient):
                     result.stdout,
                     "CLI",
                     log_diagnostic=log_diagnostic,
+                    workspaces=(workspace, prompt_workspace),
                 )
                 output = _antigravity_sanitize_readonly_output(
                     envelope.response,
@@ -3635,6 +3637,7 @@ class AntigravityClient(LLMClient):
                     result.stdout,
                     "agent",
                     log_diagnostic=log_diagnostic,
+                    workspaces=(workspace, prompt_workspace),
                 )
                 output = _antigravity_sanitize_readonly_output(
                     envelope.response,
@@ -3703,6 +3706,7 @@ class AntigravityClient(LLMClient):
                 "agent",
                 allow_empty_response=True,
                 log_diagnostic=log_diagnostic,
+                workspaces=(workspace, prompt_workspace),
             )
             output = _antigravity_sanitize_readonly_output(
                 envelope.response,
