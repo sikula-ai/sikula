@@ -3715,6 +3715,7 @@ class TestCodexParseText:
                             "input_tokens": 20,
                             "output_tokens": 8,
                             "cached_input_tokens": 6,
+                            "cache_write_input_tokens": 4,
                             "unsafe": "PRIVATE_PROVIDER_OUTPUT",
                         },
                     }
@@ -3726,7 +3727,24 @@ class TestCodexParseText:
             "input_tokens": 20,
             "output_tokens": 8,
             "cached_input_tokens": 6,
+            "cache_creation_input_tokens": 4,
         }
+
+    def test_ignores_invalid_cache_write_usage(self):
+        lines = "\n".join(
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "cache_write_input_tokens": value,
+                        "output_tokens": 2,
+                    },
+                }
+            )
+            for value in (True, -1, "4")
+        )
+
+        assert _codex_reported_tokens(lines) == {"output_tokens": 2}
 
     def test_concatenates_multiple_agent_messages(self):
         lines = "\n".join([self._item_line("Part one."), self._item_line("Part two.")])
@@ -3932,7 +3950,16 @@ class TestCodexClientCommands:
         stdout = "\n".join(
             [
                 json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}),
-                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 2}}),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 2,
+                            "cache_write_input_tokens": 3,
+                        },
+                    }
+                ),
             ]
         )
 
@@ -3943,7 +3970,11 @@ class TestCodexClientCommands:
         assert events[0]["outcome"] == "success"
         assert events[0]["input_chars"] == len("system\n\nuser")
         assert events[0]["output_chars"] == 2
-        assert events[0]["reported_tokens"] == {"input_tokens": 10, "output_tokens": 2}
+        assert events[0]["reported_tokens"] == {
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "cache_creation_input_tokens": 3,
+        }
 
     def test_generate_failure_reports_stdout_json_error(self):
         client = CodexClient(LLMConfig(provider="codex", model="gpt-5.3-codex"))

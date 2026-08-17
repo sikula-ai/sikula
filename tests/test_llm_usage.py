@@ -49,6 +49,9 @@ def test_sanitize_llm_usage_record_keeps_only_bounded_metadata() -> None:
             "reported_tokens": {
                 "input_tokens": 7,
                 "output_tokens": 3,
+                "cached_input_tokens": 2,
+                "cache_creation_input_tokens": 1,
+                "total_tokens": 13,
                 "secret": "PRIVATE_PROVIDER_OUTPUT",
             },
             "prompt": "PRIVATE_PROMPT",
@@ -68,7 +71,13 @@ def test_sanitize_llm_usage_record_keeps_only_bounded_metadata() -> None:
         "elapsed_s": 0.126,
         "input_chars": 20,
         "output_chars": 5,
-        "reported_tokens": {"input_tokens": 7, "output_tokens": 3},
+        "reported_tokens": {
+            "input_tokens": 7,
+            "output_tokens": 3,
+            "cached_input_tokens": 2,
+            "cache_creation_input_tokens": 1,
+            "total_tokens": 13,
+        },
     }
 
 

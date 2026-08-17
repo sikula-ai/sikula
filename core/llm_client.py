@@ -2222,10 +2222,16 @@ def _codex_reported_tokens(output: str) -> dict[str, int]:
         if not isinstance(usage, dict):
             continue
         candidate = {}
-        for key in ("input_tokens", "output_tokens", "cached_input_tokens", "total_tokens"):
-            value = usage.get(key)
+        for source_key, target_key in (
+            ("input_tokens", "input_tokens"),
+            ("output_tokens", "output_tokens"),
+            ("cached_input_tokens", "cached_input_tokens"),
+            ("cache_write_input_tokens", "cache_creation_input_tokens"),
+            ("total_tokens", "total_tokens"),
+        ):
+            value = usage.get(source_key)
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                candidate[key] = value
+                candidate[target_key] = value
         if candidate:
             reported = candidate
     return reported
