@@ -93,6 +93,7 @@ def _unit(
     estimated_size: str | None = None,
     risk_tags: list[str] | None = None,
     budget: DeliveryUnitBudget | None = None,
+    asset_paths: list[str] | None = None,
 ) -> DeliveryAuthoringUnitDraft:
     unit_title = title or f"{unit_id} title"
     return DeliveryAuthoringUnitDraft(
@@ -109,6 +110,7 @@ def _unit(
         estimated_size=estimated_size,
         risk_tags=risk_tags or [],
         budget=budget,
+        asset_paths=asset_paths or [],
     )
 
 
@@ -744,4 +746,101 @@ def test_write_delivery_prepare_artifacts_rejects_casefold_path_collisions(tmp_p
     assert result.failure_reason == "write_failed"
     assert result.errors[0].code == "delivery_prepare.path_collision"
     assert result.errors[0].path == ".sikula/delivery/team-invites/units/unit.md"
+    assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+def test_writer_preserves_assigned_source_asset_declaration(tmp_path: Path) -> None:
+    asset_path = ".sikula/task-assets/reference.png"
+    asset_file = tmp_path / asset_path
+    asset_file.parent.mkdir(parents=True)
+    asset_file.write_bytes(b"reference")
+    source = f"""# Source task
+
+## Assets
+
+- Reference asset: `{asset_path}`
+  - Usage: reference only.
+  - Notes: use the supplied layout exactly and preserve
+    its documented spacing.
+  - Do not copy this file into production assets.
+- Keep existing icons unchanged.
+"""
+
+    result = write_delivery_prepare_artifacts(
+        _draft(units=[_unit("visual", asset_paths=[asset_path])]),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+        source_task_description=source,
+    )
+
+    unit_path = tmp_path / ".sikula" / "delivery" / "team-invites" / "units" / "visual.md"
+    written = unit_path.read_text(encoding="utf-8")
+    assert result.status == "ready"
+    assert f"- Reference asset: `{asset_path}`" in written
+    assert "  - Notes: use the supplied layout exactly and preserve\n    its documented spacing." in written
+    assert "  - Do not copy this file into production assets." in written
+    assert "Keep existing icons unchanged" not in written
+
+
+def test_writer_ignores_asset_examples_in_standard_html_blocks(tmp_path: Path) -> None:
+    asset_path = ".sikula/task-assets/reference.png"
+    asset_file = tmp_path / asset_path
+    asset_file.parent.mkdir(parents=True)
+    asset_file.write_bytes(b"reference")
+    source = f"## Assets\n\n- Reference asset: `{asset_path}`\n  - Usage: reference only.\n"
+    task_markdown = (
+        _ready_task_markdown()
+        + """
+
+<div>
+## Assets
+- Asset: `assets/hidden.png`
+</div>
+"""
+    )
+
+    result = write_delivery_prepare_artifacts(
+        _draft(units=[_unit("visual", task_markdown=task_markdown, asset_paths=[asset_path])]),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+        source_task_description=source,
+    )
+
+    assert result.status == "ready"
+    written = (tmp_path / ".sikula" / "delivery" / "team-invites" / "units" / "visual.md").read_text(encoding="utf-8")
+    assert written.endswith(f"## Assets\n\n- Reference asset: `{asset_path}`\n  - Usage: reference only.\n")
+
+
+def test_writer_blocks_before_writing_when_source_asset_is_unassigned(tmp_path: Path) -> None:
+    source = "## Assets\n\n- Reference asset: `.sikula/task-assets/reference.png`\n"
+
+    result = write_delivery_prepare_artifacts(
+        _draft(units=[_unit("visual")]),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+        source_task_description=source,
+    )
+
+    assert result.status == "blocked"
+    assert result.errors[0].code == "delivery_prepare.source_asset_unassigned"
+    assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+def test_writer_blocks_before_writing_when_source_asset_is_remote(tmp_path: Path) -> None:
+    asset_url = "https://example.test/reference.png"
+    source = f"## Assets\n\n- Reference asset: `{asset_url}`\n"
+
+    result = write_delivery_prepare_artifacts(
+        _draft(units=[_unit("visual", asset_paths=[asset_url])]),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+        source_task_description=source,
+    )
+
+    assert result.status == "blocked"
+    assert result.errors[0].code == "delivery_prepare.source_asset_path_invalid"
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()

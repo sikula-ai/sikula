@@ -37,8 +37,8 @@ Hard rules:
 - Do not inspect external services, make network requests, or use network commands.
 - Do not include writer-facing path fields in unit objects, including task_path, path, unit_path,
   output_path, plan_path, units_dir, or output_dir.
-- Do not include raw prompts, raw provider output, source excerpts, task state, diffs, logs, secrets,
-  personal data, or absolute local paths in the JSON draft.
+- Do not include raw prompts, raw provider output, source excerpts, task state, diffs, logs,
+  secrets, personal data, or absolute local paths in the JSON draft.
 - Do not infer unsupported product, security, privacy, validation, platform, or release requirements
   beyond the source task and checked-in project context.
 - Return exactly one JSON object and no Markdown outside the JSON.
@@ -77,6 +77,9 @@ Delivery-plan constraints:
 - Optional metadata fields stream, component, phase, kind, and platform must be non-empty strings
   when present.
 - scope_paths must contain only project-relative paths that stay inside the project.
+- asset_paths must contain only paths declared in the source task's canonical direct-list
+  `## Assets` section or their project-relative equivalents. Assign every declared source asset
+  to at least one relevant unit and do not repeat a path within one unit.
 - estimated_size must be "small", "medium", or "large" when present.
 - risk_tags must use only supported tags: api_surface, audit_artifacts, auth_permissions,
   automation_behavior, build_pipeline, cli_surface, configuration, data_persistence,
@@ -93,7 +96,9 @@ Delivery-plan constraints:
   Out of scope, and Validation.
 - Validation sections must include explicit commands that match or are directly supported by the
   source task or configured validation commands.
-- Unit task Markdown must not include "## Asset manifest" or sikula:generated-* markers.
+- Unit task Markdown must not include an asset-root section (`## Assets`, `## Asset`,
+  `## Task assets`, or `## Task asset`), `## Asset manifest`, or sikula:generated-* markers.
+  Deterministic writer code renders assigned source declarations from asset_paths.
 - Paths for plan.yaml and unit task files are derived later from the output directory and unit IDs.
 
 Sizing and split guidance:
@@ -145,6 +150,7 @@ Return this JSON shape:
       "kind": "optional non-empty string",
       "platform": "optional non-empty string",
       "scope_paths": [],
+      "asset_paths": [],
       "estimated_size": "small",
       "risk_tags": ["cli_surface"],
       "budget": {{"max_planner_steps": 1, "max_changed_files": 8}},
@@ -312,6 +318,13 @@ Replacement constraints:
   exactly. Deterministic Sikula code rejects conflicting recovery metadata.
 - Every task_markdown must contain these exact headings: Goal, Current behavior, Desired behavior,
   Acceptance criteria, Security and privacy, Reviewer focus, Out of scope, and Validation.
+- For a selected unit containing structured `## Assets` or a prepared `## Asset manifest`,
+  assign every declared path to at least one relevant replacement through asset_paths. For an
+  absolute in-project declaration, use its project-relative equivalent. Do not repeat paths or
+  add unknown paths.
+- Replacement task_markdown must not include an asset-root section (`## Assets`, `## Asset`,
+  `## Task assets`, or `## Task asset`); deterministic Sikula code renders the assigned
+  declarations from the selected unit.
 - Keep acceptance criteria observable and validation commands supported by the source unit or
   configured project context.
 
@@ -332,6 +345,7 @@ Return this JSON shape:
       "kind": "optional non-empty string",
       "platform": "optional non-empty string",
       "scope_paths": [],
+      "asset_paths": [],
       "estimated_size": "small",
       "risk_tags": ["validation"],
       "budget": {{"max_planner_steps": 1}},

@@ -341,6 +341,7 @@ def test_cmd_delivery_prepare_writes_artifacts_after_authoring(
     assert not (tmp_path / ".sikula" / "state" / "delivery" / "team-invites").exists()
     assert len(calls) == 1
     assert calls[0]["task_path"] == (tmp_path / "tasks" / "Team Invites.md").resolve()
+    assert calls[0]["task_description"] == "# Team invites\n\nDo not echo this raw task body.\n"
     assert calls[0]["output_dir"] == (tmp_path / ".sikula" / "delivery" / "team-invites").resolve()
     assert calls[0]["selected_plan_id"] == "team-invites"
     assert calls[0]["project_root"] == tmp_path.resolve()
@@ -471,6 +472,7 @@ def test_run_delivery_prepare_authoring_records_audit_and_forwards_context(tmp_p
             args=args,
             cfg=cfg,
             task_path=task_path.resolve(),
+            task_description="# Team invites\n\nPRIVATE TASK BODY\n",
             output_dir=output_dir.resolve(),
             selected_plan_id="team-invites",
             project_root=tmp_path.resolve(),
@@ -534,6 +536,7 @@ def test_run_delivery_prepare_authoring_attaches_audit_path_to_failures(tmp_path
                 args=args,
                 cfg=cfg,
                 task_path=task_path.resolve(),
+                task_description="# Team invites\n\nPRIVATE TASK BODY\n",
                 output_dir=output_dir.resolve(),
                 selected_plan_id="team-invites",
                 project_root=tmp_path.resolve(),
@@ -737,6 +740,48 @@ def test_cmd_delivery_prepare_blocks_unit_readiness_failures_without_artifacts(
         == "Generated unit task contracts have blocking readiness gaps; no source artifacts were finalized."
     )
     assert "PRIVATE TASK BODY" not in payload_text
+    assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+def test_cmd_delivery_prepare_blocks_dropped_source_assets_without_exposing_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    private_asset_path = ".sikula/task-assets/private-design-reference.png"
+    _write_task(
+        tmp_path,
+        body=(
+            "# Team invites\n\n"
+            "## Assets\n\n"
+            "### Reference assets\n\n"
+            f"- Path: `{private_asset_path}`\n"
+            "  - Usage: reference only.\n"
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args("tasks/team-invites.md", json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(draft=_authoring_draft(unit_ids=["layout"])),
+    )
+
+    payload_text = json.dumps(payload)
+    assert payload["status"] == "blocked"
+    assert payload["prepared"] is False
+    assert [issue["code"] for issue in payload["errors"]] == [
+        "delivery_prepare.asset_preservation_blocked",
+        "delivery_prepare.source_asset_unassigned",
+    ]
+    assert payload["message"] == (
+        "Generated unit task contracts did not preserve source task asset declarations; "
+        "no source artifacts were finalized."
+    )
+    assert payload["written_artifacts"] == []
+    assert private_asset_path not in payload_text
+    assert str(tmp_path) not in payload_text
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
 
 

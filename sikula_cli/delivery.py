@@ -73,6 +73,10 @@ _DELIVERY_PREPARE_VALIDATION_FAILED_MESSAGE = (
 _DELIVERY_PREPARE_UNIT_READINESS_FAILED_MESSAGE = (
     "Generated unit task contracts have blocking readiness gaps; no source artifacts were finalized."
 )
+_DELIVERY_PREPARE_ASSET_PRESERVATION_FAILED_MESSAGE = (
+    "Generated unit task contracts did not preserve source task asset declarations; no source artifacts were finalized."
+)
+_DELIVERY_PREPARE_ASSET_PRESERVATION_FAILURE = "asset_preservation_blocked"
 _DELIVERY_PREPARE_UNIT_READINESS_FAILURE = "unit_readiness_blocked"
 _DELIVERY_PREPARE_PLAN_VALIDATION_FAILURE = "plan_validation_failed"
 _DELIVERY_ASSESSMENT_CONTEXT_MISSING_MESSAGE = "Delivery assessment requires the main Sikula command context."
@@ -1260,6 +1264,23 @@ def _run_delivery_prepare_authoring(
     output_path = project_root / output_dir
 
     try:
+        source_task_description = task_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return _delivery_prepare_blocked_result(
+            preflight,
+            code="delivery_prepare.task_not_utf8",
+            issue_message="Task file is not readable as UTF-8 text.",
+            result_message="Task file is not readable as UTF-8 text.",
+        )
+    except OSError:
+        return _delivery_prepare_blocked_result(
+            preflight,
+            code="delivery_prepare.task_unreadable",
+            issue_message="Task file could not be read.",
+            result_message="Task file could not be read.",
+        )
+
+    try:
         draft = context.run_authoring_assistant(
             args=args,
             cfg=cfg,
@@ -1267,6 +1288,7 @@ def _run_delivery_prepare_authoring(
             output_dir=output_path,
             selected_plan_id=selected_plan_id,
             project_root=project_root,
+            task_description=source_task_description,
         )
     except DeliveryAuthoringParseError as exc:
         return _delivery_prepare_blocked_result(
@@ -1313,6 +1335,8 @@ def _run_delivery_prepare_authoring(
         output_dir=output_dir,
         project_root=project_root,
         project_config=cfg,
+        source_task_description=source_task_description,
+        source_task_path=task_path,
         force=bool(getattr(args, "force", False)),
     )
     return _delivery_prepare_result_from_write_result(authoring_result, write_result)
@@ -1405,6 +1429,8 @@ def _delivery_prepare_issues_from_writer(issues: list[Any]) -> list[DeliveryPrep
 
 
 def _delivery_prepare_writer_failure(failure_reason: str | None) -> tuple[str, str]:
+    if failure_reason == _DELIVERY_PREPARE_ASSET_PRESERVATION_FAILURE:
+        return "delivery_prepare.asset_preservation_blocked", _DELIVERY_PREPARE_ASSET_PRESERVATION_FAILED_MESSAGE
     if failure_reason == _DELIVERY_PREPARE_UNIT_READINESS_FAILURE:
         return "delivery_prepare.unit_readiness_blocked", _DELIVERY_PREPARE_UNIT_READINESS_FAILED_MESSAGE
     if failure_reason == _DELIVERY_PREPARE_PLAN_VALIDATION_FAILURE:

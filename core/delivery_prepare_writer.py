@@ -16,6 +16,11 @@ from core.delivery_authoring import (
     DeliveryAuthoringUnitDraft,
     derive_delivery_authoring_paths,
 )
+from core.delivery_asset_assignment import (
+    DeliveryAssetAssignmentError,
+    DeliveryAssetAssignmentUnit,
+    render_delivery_asset_assignments,
+)
 from core.delivery_plan import (
     SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION,
     check_delivery_plan_file,
@@ -32,6 +37,7 @@ _PLAN_VALIDATION_INVALID = "invalid"
 _UNIT_READINESS_NOT_RUN = "not_run"
 _UNIT_READINESS_READY = "ready"
 _UNIT_READINESS_BLOCKED = "blocked"
+_FAILURE_ASSET_PRESERVATION_BLOCKED = "asset_preservation_blocked"
 _FAILURE_UNIT_READINESS_BLOCKED = "unit_readiness_blocked"
 _FAILURE_PLAN_VALIDATION_FAILED = "plan_validation_failed"
 _FAILURE_WRITE_FAILED = "write_failed"
@@ -245,6 +251,8 @@ def write_delivery_prepare_artifacts(
     output_dir: str | Path,
     project_root: str | Path,
     project_config: dict | None = None,
+    source_task_description: str = "",
+    source_task_path: str | Path | None = None,
     force: bool = False,
 ) -> DeliveryPrepareWriteResult:
     try:
@@ -373,6 +381,36 @@ def write_delivery_prepare_artifacts(
             failure_reason=_FAILURE_WRITE_FAILED,
             errors=exc.issues,
             written_artifacts=exc.written_artifacts,
+        )
+
+    try:
+        draft, asset_issues = _assign_source_assets(
+            draft,
+            unit_task_paths,
+            source_task_description=source_task_description,
+            source_task_path=source_task_path,
+            project_root=root,
+            project_config=project_config,
+        )
+    except (OSError, RuntimeError, ValueError, KeyError):
+        return _blocked_result(
+            paths,
+            unit_task_paths=unit_task_paths,
+            failure_reason=_FAILURE_WRITE_FAILED,
+            errors=[
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.asset_preservation_check_failed",
+                    "Delivery prepare failed while checking source task asset preservation.",
+                )
+            ],
+        )
+    if asset_issues:
+        return _blocked_result(
+            paths,
+            unit_task_paths=unit_task_paths,
+            failure_reason=_FAILURE_ASSET_PRESERVATION_BLOCKED,
+            errors=asset_issues,
         )
 
     try:
@@ -682,6 +720,39 @@ def _validate_artifact_paths(
                 rel_path,
             )
         target_keys.add(key)
+
+
+def _assign_source_assets(
+    draft: DeliveryAuthoringDraft,
+    unit_task_paths: dict[str, str],
+    *,
+    source_task_description: str,
+    source_task_path: str | Path | None,
+    project_root: Path,
+    project_config: dict | None,
+) -> tuple[DeliveryAuthoringDraft, list[DeliveryPrepareWriteIssue]]:
+    units = [DeliveryAssetAssignmentUnit(unit.id, unit.task_markdown, unit.asset_paths) for unit in draft.units]
+    try:
+        rendered = render_delivery_asset_assignments(
+            source_task_description,
+            units,
+            source_task_path=source_task_path,
+            project_root=project_root,
+            project_config=project_config,
+        )
+    except DeliveryAssetAssignmentError as exc:
+        path = unit_task_paths.get(exc.unit_id) if exc.unit_id else None
+        return draft, [
+            DeliveryPrepareWriteIssue(
+                "error",
+                f"delivery_prepare.{exc.code}",
+                exc.message,
+                path,
+            )
+        ]
+
+    rendered_units = [replace(unit, task_markdown=rendered[unit.id]) for unit in draft.units]
+    return replace(draft, units=rendered_units), []
 
 
 def _check_unit_readiness(

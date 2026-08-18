@@ -102,6 +102,29 @@ acceptance criteria, reviewer focus, security/privacy notes, out-of-scope notes,
 and verification expectations. They should not become file-by-file
 implementation scripts.
 
+When the source task contains canonical direct-list `## Assets` as described in
+[Writing Sikula Tasks](writing-tasks.md#task-assets), the authoring assistant
+assigns every declared path to at least one relevant unit through the unit's
+structured `asset_paths` list. A source asset may be assigned to multiple units.
+Assignment values may retain the source declaration's spelling; Sikula resolves
+them against canonical project paths for matching only.
+The deterministic writer rejects unknown or duplicate assignments, unassigned
+source assets, repeated canonical source paths, and generated unit Markdown
+containing its own asset declarations. It copies each selected declaration and
+its direct child metadata without rewriting their content, preserving
+classification, target, source/license, hash, and other constraints. Unterminated fenced blocks or HTML
+comments that could hide the appended section also block preparation. Other
+task asset syntax retains the existing readiness behavior.
+Amendment authoring uses the same `asset_paths` contract for replacement units
+and renders selected-unit declarations before proposal fingerprinting. When the
+selected unit is a prepared implementation contract, replacements retain its
+`## Asset manifest` form and merge compatible child constraints retained in the
+original `## Assets` declaration. Conflicting repeated constraints block the
+amendment instead of selecting one declaration. This keeps apply and recovery
+tied to the complete replacement task bytes.
+The later `## Asset manifest` remains reserved for prepared implementation
+contracts and is rejected as delivery-prepare source input.
+
 Sikula derives writer-facing paths from the output directory and unit IDs. Path
 fields from LLM output are rejected instead of trusted. Unit task contracts are
 checked for readiness before source artifacts are finalized, and the generated
@@ -150,8 +173,9 @@ inside the project, and must not contain parent-directory (`..`) traversal.
 Unit Markdown must include non-empty Goal, Current behavior,
 Desired behavior, Acceptance criteria, Security/privacy, Reviewer focus, Out of
 scope, and Verification sections; Verification must include explicit validation
-commands. `## Asset manifest` and `sikula:generated-*` markers are rejected
-before writing.
+commands. `## Assets`, `## Asset manifest`, and `sikula:generated-*` markers are
+rejected in assistant-authored unit Markdown; source task assets are assigned
+with `asset_paths` and rendered by the writer.
 
 Delivery authoring should prefer smaller units with one primary production
 surface each. Units should avoid combining unrelated risk surfaces. When

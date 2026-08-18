@@ -7,6 +7,8 @@ software and data referenced by the repository.
 
 | Component | License | Usage |
 |---|---|---|
+| markdown-it-py | MIT | CommonMark parsing for task and contract structure |
+| mdurl | MIT | URL parsing used by markdown-it-py |
 | PyYAML | MIT | YAML config parsing |
 | python-dotenv | BSD-3-Clause | Loading project `.env` files |
 

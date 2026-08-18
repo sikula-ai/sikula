@@ -268,6 +268,13 @@ Put per-asset metadata as nested bullets under that asset item. Same-level
 bullets are treated as separate task requirements, not as metadata for the
 previous asset.
 
+Delivery-plan preservation uses the canonical direct-list form shown above:
+each asset item starts at column zero with `- `, and each metadata item is a
+direct child indented by exactly two spaces. `sikula task attach --write` emits
+this form. Contract readiness may recognize other structured asset syntax, but
+delivery preparation blocks rather than guessing how to preserve a
+noncanonical declaration.
+
 You can also have Sikula copy a local file into the configured task asset
 directory and print the Markdown snippet:
 
@@ -297,6 +304,8 @@ boundary, hashed, and reported with lightweight metadata. A structured asset
 declaration is a bullet such as `Path: ...`, `Asset: ...`, `Reference asset:
 ...`, or `Delivery asset: ...`; bare path bullets and prose such as "use
 `.sikula/task-assets/foo.png` as a mockup" are not asset declarations.
+Declarations inside code, raw HTML, comments, block quotes, or other example
+containers are not active task asset declarations.
 
 `## Asset manifest` is reserved for prepared implementation contracts. In task
 descriptions, use `## Assets`; when Sikula validates task-description input,

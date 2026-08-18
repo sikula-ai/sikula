@@ -17,6 +17,7 @@ from core.markdown_headings import (
     MarkdownHeadingScanner,
     normalize_heading as _normalize_heading,
 )
+from core.markdown_document import parse_markdown_document
 
 
 class AssetKind(str, Enum):
@@ -78,9 +79,13 @@ class AssetReference:
 
 
 @dataclass(frozen=True)
-class _StructuredAssetDeclaration:
+class StructuredAssetDeclaration:
     path: str
     line: int
+    start_line: int
+    end_line: int
+    parent_start_line: int | None
+    source_lines: tuple[str, ...]
     kind: str = AssetKind.AMBIGUOUS.value
     raw_path: str = ""
     target_specified: bool = False
@@ -203,19 +208,24 @@ def supported_asset_extensions() -> set[str]:
     return set(_ASSET_EXTENSIONS)
 
 
+def parse_structured_asset_path_value(value: str) -> str | None:
+    """Return a local asset path recognized in a structured metadata value."""
+    return _structured_asset_path_value(value)
+
+
 def public_asset_reference(reference: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in reference.items() if not str(key).startswith("_")}
 
 
 def task_description_has_asset_manifest_section(markdown: str, *, ignore_fenced_blocks: bool = True) -> bool:
     """Return whether task-description Markdown contains the reserved implementation manifest section."""
-
-    scanner = MarkdownHeadingScanner(ignore_fenced_blocks=ignore_fenced_blocks)
-    for line in markdown.splitlines():
-        heading = scanner.match(line)
-        if heading is None or heading.is_document_title:
-            continue
-        if heading.normalized == "asset manifest":
+    if ignore_fenced_blocks:
+        headings = (heading for _line, heading in parse_markdown_document(markdown).headings)
+    else:
+        scanner = MarkdownHeadingScanner()
+        headings = filter(None, (scanner.match(line) for line in markdown.splitlines()))
+    for heading in headings:
+        if not heading.is_document_title and heading.normalized == "asset manifest":
             return True
     return False
 
@@ -965,7 +975,7 @@ def detect_asset_references(
     project_root = _asset_project_root(source_path, project_config)
     references_by_path: dict[str, dict[str, Any]] = {}
     reference_order: list[str] = []
-    for declaration in _parse_structured_asset_declarations(text, document_kind=document_kind):
+    for declaration in parse_structured_asset_declarations(text, document_kind=document_kind):
         reference = _asset_reference_metadata(
             declaration.path,
             project_root=project_root,
@@ -1005,10 +1015,13 @@ def detect_undeclared_asset_paths(
     paths: list[dict[str, Any]] = []
     seen: set[tuple[int, str]] = set()
     heading_stack: list[tuple[int, str]] = []
-    heading_scanner = MarkdownHeadingScanner()
-    lines = text.splitlines()
+    document = parse_markdown_document(text)
+    headings = document.headings_by_line()
+    lines = list(document.visible_lines)
     for line_index, line in enumerate(lines):
-        heading = heading_scanner.match(line)
+        if line_index in document.hidden_lines:
+            continue
+        heading = headings.get(line_index)
         if heading is not None:
             if heading.is_document_title:
                 continue
@@ -1063,13 +1076,23 @@ def _asset_line_is_bare_asset_path(line: str, normalized_path: str) -> bool:
     return _normalize_asset_path_candidate(cleaned) == normalized_path
 
 
-def _parse_structured_asset_declarations(text: str, *, document_kind: str = "all") -> list[_StructuredAssetDeclaration]:
-    declarations: list[_StructuredAssetDeclaration] = []
+def parse_structured_asset_declarations(
+    text: str,
+    *,
+    document_kind: str = "all",
+) -> list[StructuredAssetDeclaration]:
+    """Return active structured asset declarations with semantic data and source ranges."""
+    declarations: list[StructuredAssetDeclaration] = []
     heading_stack: list[tuple[int, str]] = []
-    heading_scanner = MarkdownHeadingScanner()
-    lines = text.splitlines()
+    document = parse_markdown_document(text)
+    headings = document.headings_by_line()
+    list_items = document.list_items_by_line()
+    lines = list(document.visible_lines)
+    source_lines = list(document.lines)
     for line_index, line in enumerate(lines):
-        heading = heading_scanner.match(line)
+        if line_index in document.hidden_lines:
+            continue
+        heading = headings.get(line_index)
         if heading is not None:
             if heading.is_document_title:
                 continue
@@ -1089,6 +1112,9 @@ def _parse_structured_asset_declarations(text: str, *, document_kind: str = "all
         if not _asset_heading_stack_has_structured_asset_root(heading_stack, document_kind=document_kind):
             continue
 
+        list_item = list_items.get(line_index)
+        if list_item is None:
+            continue
         bullet = _BULLET_RE.match(line)
         if not bullet:
             continue
@@ -1104,7 +1130,7 @@ def _parse_structured_asset_declarations(text: str, *, document_kind: str = "all
         if not path:
             continue
 
-        item_lines = _asset_reference_context_lines(lines, line_index)
+        item_lines = lines[line_index : list_item.end_line]
         metadata = _structured_asset_item_metadata(item_lines[1:])
         kind = _structured_asset_resolved_kind(
             _structured_asset_section_kind(heading_stack, document_kind=document_kind),
@@ -1115,9 +1141,13 @@ def _parse_structured_asset_declarations(text: str, *, document_kind: str = "all
         source_license = metadata.get("source_license", "")
         declared_sha256 = metadata.get("declared_sha256", "")
         declarations.append(
-            _StructuredAssetDeclaration(
+            StructuredAssetDeclaration(
                 path=path,
                 line=line_index + 1,
+                start_line=line_index,
+                end_line=list_item.end_line,
+                parent_start_line=list_item.parent_start_line,
+                source_lines=tuple(source_lines[line_index : list_item.end_line]),
                 kind=kind,
                 raw_path=raw_path or "",
                 target_specified=bool(requested_target),

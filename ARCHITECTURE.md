@@ -36,7 +36,7 @@
 | `ContractCheck` helpers | `core/contract_check.py` | Deterministic implementation-contract readiness checks for Markdown/plain-text task files; `sikula run` stores a warning-only state snapshot and `sikula contract check --write-report` explicitly writes report artifacts |
 | `StructuredOutput` helpers | `core/structured_output.py` | Side-effect-free schema-aware extraction of one unambiguous top-level JSON object from LLM output while rejecting malformed, nested, or multiple response candidates |
 | `DeliveryAuthoring` helpers | `core/delivery_authoring.py` | Side-effect-free parser and derived-path helpers for delivery prepare authoring drafts |
-| `DeliveryPrepareWriter` helpers | `core/delivery_prepare_writer.py` | Deterministic source-artifact writer for parsed delivery authoring drafts; renders `plan.yaml` and unit task files with readiness checks, plan validation, overwrite guards, and rollback |
+| `DeliveryPrepareWriter` helpers | `core/delivery_prepare_writer.py` | Deterministic source-artifact writer for parsed delivery authoring drafts; preserves source-task asset declarations across unit tasks and renders `plan.yaml` and unit task files with readiness checks, plan validation, overwrite guards, and rollback |
 | `DeliveryAmendment` helpers | `core/delivery_amendment.py` | Fingerprinted split proposals, assembly-based dependency guards, no-write preview, transactional plan/unit and assembly publication, idempotent recovery, and append-only amendment events |
 | `DeliveryHandoff` helpers | `core/delivery_handoff.py` | Versioned, fingerprinted, privacy-safe unit handoff artifacts consumed by later dependency units |
 | `DeliveryAssembly` helpers | `core/delivery_assembly.py` | Dependency-ordered result integration plus bounded delivery-owned artifact commits, with ancestry-preserving outcomes, temporary-index tree construction, and compare-and-swap direct-ref updates |
@@ -264,14 +264,36 @@ rejecting malformed, nested, or multiple response candidates, then
 `core/delivery_authoring.py` validates the draft without side effects. Public plan and unit
 metadata is bounded, single-line, and rejects absolute local paths while
 preserving explicit HTTP routes such as `GET /users`.
-`core/delivery_prepare_writer.py` then derives artifact
-paths, checks unit task readiness in memory, writes `plan.yaml` and
+`core/delivery_prepare_writer.py` then derives artifact paths and reads the source
+task's canonical direct-list `## Assets` declarations. Each unit draft assigns
+relevant source assets through bounded `asset_paths` aliases. Every source asset
+must be assigned to at least one unit; unknown, duplicate, and repeated canonical
+source paths are rejected. The shared task-asset parser owns declaration
+semantics and CommonMark source ranges; the delivery boundary requires a
+one-to-one match with its canonical source blocks. The writer copies each
+selected declaration and its direct child metadata without rewriting their
+content or asking the assistant to reproduce it, then reparses the rendered
+unit and verifies its path, classification, target, provenance, hash, and
+retained source block. Assistant-authored asset declarations
+and unterminated blocks that could hide appended declarations are rejected.
+Delivery amendment authoring applies the same assignment and rendering boundary
+to the selected unit before replacement tasks enter the persisted proposal, so
+apply and recovery operate on the complete deterministic task bytes. Prepared
+target contracts retain their `## Asset manifest`, and replacement readiness is
+checked with the same implementation-contract semantics used by `sikula run`.
+When the prepared contract also retains its original `## Assets` declaration,
+compatible source-only child constraints are merged into the manifest-backed
+replacement declaration; conflicting repeated constraints fail closed.
+Other task asset syntax remains governed by the existing readiness checks rather
+than this delivery-specific preservation boundary. The writer then checks the completed
+unit tasks for readiness in memory, writes `plan.yaml` and
 `units/<unit-id>.md` transactionally, validates the generated plan, and rolls
-back on readiness, metadata, validation, write, or filesystem failure. The
-writer repeats the public-metadata check before any filesystem mutation so
-typed drafts cannot bypass the parser boundary. Existing artifacts
-are refused by default; `--force` may replace ordinary plan/unit files inside
-the selected output directory, while absolute output paths, parent traversal,
+back on asset preservation, readiness, metadata, validation, write, or
+filesystem failure. The writer repeats the public-metadata check before any
+filesystem mutation so typed drafts cannot bypass the parser boundary.
+Existing artifacts are refused by default; `--force` may replace ordinary
+plan/unit files inside the selected output directory, while absolute output
+paths, parent traversal,
 symlink artifacts, symlink escapes, path collisions, outside-project writes,
 Git metadata, and Sikula runtime/debug artifact directories are rejected. `delivery prepare`
 is source-artifact-only: it does not create `TaskState`, worktrees, child runs,

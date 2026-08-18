@@ -6,6 +6,7 @@ from pathlib import Path
 from core.task_assets import (
     detect_asset_references,
     detect_undeclared_asset_paths,
+    parse_structured_asset_declarations,
     task_description_has_asset_manifest_section,
 )
 
@@ -36,6 +37,42 @@ def _undeclared_paths(markdown: str, tmp_path: Path, *, task_asset_dir: str = ".
         markdown,
         project_config=_project_config(tmp_path, task_asset_dir=task_asset_dir),
         asset_references=references,
+    )
+
+
+def test_structured_asset_declarations_expose_semantics_and_source_ranges() -> None:
+    markdown = """## Assets
+
+### Delivery assets
+
+- Path: `.sikula/task-assets/icon.svg`
+  - Source/license: provided by the product team and
+    approved for redistribution.
+  - Target: `app/assets/icon.svg`
+  - SHA-256: `sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef`
+- Keep existing icons unchanged.
+"""
+
+    declarations = parse_structured_asset_declarations(markdown, document_kind="task_description")
+
+    assert len(declarations) == 1
+    declaration = declarations[0]
+    assert declaration.path == ".sikula/task-assets/icon.svg"
+    assert declaration.kind == "delivery"
+    assert declaration.target_specified is True
+    assert declaration.requested_target == "app/assets/icon.svg"
+    assert declaration.provenance_specified is True
+    assert declaration.source_license == "provided by the product team and"
+    assert declaration.declared_sha256 == "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    assert declaration.start_line == 4
+    assert declaration.end_line == 9
+    assert declaration.parent_start_line is None
+    assert declaration.source_lines == (
+        "- Path: `.sikula/task-assets/icon.svg`",
+        "  - Source/license: provided by the product team and",
+        "    approved for redistribution.",
+        "  - Target: `app/assets/icon.svg`",
+        "  - SHA-256: `sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef`",
     )
 
 
@@ -72,6 +109,10 @@ Document assets.
 
 Asset manifest:
 
+- Path: `.sikula/task-assets/login-spacing.png`
+""",
+        """Asset manifest:
+Reference assets:
 - Path: `.sikula/task-assets/login-spacing.png`
 """,
         """This task was copied from a prepared contract.
@@ -177,6 +218,17 @@ def test_detect_asset_references_reads_structured_reference_and_delivery_assets(
     assert delivery["kind"] == "delivery"
     assert delivery["requested_target"] == "app/assets/success-check.svg"
     assert delivery["source_license"] == "provided by product team for this project."
+
+
+def test_detect_asset_references_keeps_declarations_before_inline_comments(tmp_path: Path) -> None:
+    markdown = """## Assets
+
+- Path: `.sikula/task-assets/reference.png` <!-- explanatory note -->
+"""
+
+    references = _references_by_path(markdown, tmp_path)
+
+    assert ".sikula/task-assets/reference.png" in references
 
 
 def test_detect_asset_references_accepts_structured_path_label_outside_task_asset_dir(tmp_path: Path):
