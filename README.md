@@ -179,6 +179,12 @@ progress, or update branches. Generated plan and unit metadata must be bounded,
 single-line, and free of absolute local paths. Slash-prefixed API routes belong
 in task or contract Markdown rather than these public metadata fields; full
 `https://` URLs remain valid metadata.
+Delivery preparation preserves canonical source-task asset declarations in the
+relevant unit tasks and blocks before writing when their assignment is
+incomplete or invalid. Delivery amendments preserve the same boundary when
+splitting an existing unit. See [Writing Sikula Tasks](docs/writing-tasks.md#task-assets)
+and [Delivery Plans](docs/delivery-plans.md) for the asset syntax and assignment
+rules.
 
 Prepared units use `budget.max_planner_steps: 1` by default. A limit of `2` is
 allowed only for tightly coupled work; limits of `3` or more are rejected.

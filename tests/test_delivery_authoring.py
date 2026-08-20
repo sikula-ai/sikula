@@ -114,6 +114,7 @@ def _draft_data() -> dict[str, Any]:
                 "kind": "feature",
                 "platform": "shared",
                 "scope_paths": ["core", "tests"],
+                "asset_paths": [".sikula/task-assets/invite-reference.png"],
                 "estimated_size": "small",
                 "risk_tags": ["validation"],
                 "budget": {"max_planner_steps": 2, "max_changed_files": 8},
@@ -143,6 +144,7 @@ def _amendment_data() -> dict[str, Any]:
                 "id": "split-a",
                 "title": "Split A",
                 "depends_on": [],
+                "asset_paths": [".sikula/task-assets/invite-reference.png"],
                 "task_markdown": _unit_markdown("Split A"),
             },
             {
@@ -198,10 +200,12 @@ def test_parse_delivery_authoring_output_accepts_valid_json_object(tmp_path: Pat
     assert draft.units[0].kind == "feature"
     assert draft.units[0].platform == "shared"
     assert draft.units[0].scope_paths == ["core", "tests"]
+    assert draft.units[0].asset_paths == [".sikula/task-assets/invite-reference.png"]
     assert draft.units[0].estimated_size == "small"
     assert draft.units[0].risk_tags == ["validation"]
     assert draft.units[0].budget == DeliveryUnitBudget(max_planner_steps=2, max_changed_files=8)
     assert draft.units[1].estimated_size == "medium"
+    assert draft.units[1].asset_paths == []
     assert draft.units[1].risk_tags == ["cli_surface"]
     assert draft.units[1].budget == DeliveryUnitBudget(max_planner_steps=1)
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
@@ -214,6 +218,57 @@ def test_parse_delivery_authoring_output_accepts_single_fenced_json_block(tmp_pa
 
     assert draft.plan_id == "team-invites"
     assert [unit.id for unit in draft.units] == ["foundation", "cli"]
+
+
+def test_parse_delivery_authoring_output_normalizes_asset_paths(tmp_path: Path) -> None:
+    data = _draft_data()
+    data["units"][0]["asset_paths"] = [".sikula\\task-assets\\invite-reference.png"]
+
+    draft = _parse(json.dumps(data), tmp_path)
+
+    assert draft.units[0].asset_paths == [".sikula/task-assets/invite-reference.png"]
+
+
+@pytest.mark.parametrize(
+    ("asset_paths", "expected_code"),
+    [
+        (".sikula/task-assets/reference.png", "delivery_authoring.asset_paths_invalid_type"),
+        ([""], "delivery_authoring.asset_path_invalid"),
+        (["assets/reference.png\nprivate"], "delivery_authoring.asset_path_invalid"),
+        (
+            [".sikula/task-assets/reference.png", "./.sikula/task-assets/reference.png"],
+            "delivery_authoring.asset_path_duplicate",
+        ),
+    ],
+)
+def test_parse_delivery_authoring_output_rejects_invalid_asset_paths(
+    tmp_path: Path,
+    asset_paths: object,
+    expected_code: str,
+) -> None:
+    data = _draft_data()
+    data["units"][0]["asset_paths"] = asset_paths
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        _parse(json.dumps(data), tmp_path)
+
+    assert exc_info.value.code == expected_code
+
+
+def test_parse_delivery_authoring_output_preserves_declared_asset_aliases(tmp_path: Path) -> None:
+    aliases = [
+        str(tmp_path / "assets" / "reference.png"),
+        "assets/nested/../reference.png",
+        r"C:\workspace\assets\reference.png",
+    ]
+
+    for alias in aliases:
+        data = _draft_data()
+        data["units"][0]["asset_paths"] = [alias]
+
+        draft = _parse(json.dumps(data), tmp_path)
+
+        assert draft.units[0].asset_paths == [alias]
 
 
 @pytest.mark.parametrize(
@@ -363,6 +418,27 @@ def test_parse_delivery_amendment_authoring_output_accepts_null_amend_reason(tmp
 
     assert draft.amend_reason is None
     assert [unit.id for unit in draft.replacement_units] == ["split-a", "split-b"]
+    assert draft.replacement_units[0].asset_paths == [".sikula/task-assets/invite-reference.png"]
+
+
+def test_parse_delivery_amendment_authoring_output_preserves_declared_asset_alias(tmp_path: Path) -> None:
+    aliases = [
+        str(tmp_path / "assets" / "invite-reference.png"),
+        r"C:\workspace\assets\invite-reference.png",
+    ]
+
+    for alias in aliases:
+        data = _amendment_data()
+        data["replacement_units"][0]["asset_paths"] = [alias]
+
+        draft = parse_delivery_amendment_authoring_output(
+            json.dumps(data),
+            expected_plan_id="team-invites",
+            expected_target_unit_id="oversized",
+            project_root=tmp_path,
+        )
+
+        assert draft.replacement_units[0].asset_paths == [alias]
 
 
 def test_parse_delivery_amendment_authoring_output_accepts_fenced_schema_object_after_prose(tmp_path: Path) -> None:

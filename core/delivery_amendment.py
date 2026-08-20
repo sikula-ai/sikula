@@ -34,6 +34,11 @@ from core.delivery_authoring import (
     DeliveryAuthoringUnitDraft,
     parse_delivery_amendment_authoring_output,
 )
+from core.delivery_asset_assignment import (
+    DeliveryAssetAssignmentError,
+    DeliveryAssetAssignmentUnit,
+    render_delivery_asset_assignments,
+)
 from core.delivery_plan import (
     DeliveryBudgetExceeded,
     DeliveryPlan,
@@ -419,7 +424,34 @@ def create_delivery_amendment_proposal(
 
     root = Path(context.project_root)
     plan_path = Path(context.plan_path)
-    replacement_units = _normalize_replacements(context, draft.replacement_units, root=root, plan_path=plan_path)
+    target_task_path, target_task_description = read_delivery_amendment_target_task(
+        context,
+        expected_fingerprint=source_snapshot.target_task_fingerprint,
+    )
+    assignment_units = [
+        DeliveryAssetAssignmentUnit(unit.id, unit.task_markdown, unit.asset_paths) for unit in draft.replacement_units
+    ]
+    try:
+        rendered_tasks = render_delivery_asset_assignments(
+            target_task_description,
+            assignment_units,
+            source_task_path=target_task_path,
+            project_root=root,
+            project_config=project_config,
+            allow_source_asset_manifest=True,
+        )
+    except DeliveryAssetAssignmentError as exc:
+        raise DeliveryAmendmentError(
+            f"delivery_amend.{exc.code}",
+            exc.message,
+        ) from None
+    except (OSError, RuntimeError, ValueError, KeyError):
+        raise DeliveryAmendmentError(
+            "delivery_amend.asset_assignment_check_failed",
+            "Delivery amendment asset assignments could not be validated.",
+        ) from None
+    rendered_drafts = [replace(unit, task_markdown=rendered_tasks[unit.id]) for unit in draft.replacement_units]
+    replacement_units = _normalize_replacements(context, rendered_drafts, root=root, plan_path=plan_path)
     readiness_errors = _replacement_contract_readiness_errors(replacement_units, project_config=project_config)
     if readiness_errors:
         issue = readiness_errors[0]
@@ -2294,6 +2326,7 @@ def _validate_loaded_replacement_contracts(
             expected_plan_id=plan_id,
             expected_target_unit_id=target_unit_id,
             project_root=project_root,
+            allow_asset_manifest=True,
         )
     except DeliveryAuthoringParseError as exc:
         raise DeliveryAmendmentError("delivery_amend.proposal_invalid", exc.message) from None
@@ -2658,7 +2691,7 @@ def _replacement_contract_readiness_errors(
                 source_path=unit.task_path,
                 source_format="markdown",
                 project_config=project_config,
-                document_kind="task_description",
+                document_kind="implementation_contract",
             )
         except (OSError, RuntimeError, ValueError, KeyError):
             errors.append(

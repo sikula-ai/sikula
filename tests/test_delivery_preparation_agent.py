@@ -109,6 +109,7 @@ def _authoring_output(*, planning_mode: str | None = "fixed_window", warnings: l
                 "depends_on": [],
                 "task_markdown": _unit_markdown("Foundation"),
                 "scope_paths": ["agents"],
+                "asset_paths": [".sikula/task-assets/invite-reference.png"],
                 "estimated_size": "small",
                 "risk_tags": ["automation_behavior"],
                 "budget": {"max_planner_steps": 1},
@@ -135,6 +136,7 @@ def _amendment_output(*, target_unit_id: str = "oversized") -> str:
                     "id": "invite-storage",
                     "title": "Invite storage",
                     "depends_on": [],
+                    "asset_paths": [".sikula/task-assets/invite-reference.png"],
                     "task_markdown": _unit_markdown("Invite storage"),
                     "estimated_size": "small",
                     "risk_tags": ["data_persistence"],
@@ -265,6 +267,7 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert draft.warnings == ["Review before writing artifacts."]
     assert [unit.id for unit in draft.units] == ["foundation"]
     assert draft.units[0].scope_paths == ["agents"]
+    assert draft.units[0].asset_paths == [".sikula/task-assets/invite-reference.png"]
     assert draft.units[0].estimated_size == "small"
     assert draft.units[0].risk_tags == ["automation_behavior"]
     assert draft.units[0].budget is not None
@@ -292,6 +295,10 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert "where applicable" not in prompt
     assert "must include all of these exact contract-ready section headings" in prompt
     assert "Validation sections must include explicit commands" in prompt
+    assert "asset_paths must contain only paths declared" in prompt
+    assert "least one relevant unit" in prompt
+    assert "must not include an asset-root section" in prompt
+    assert "Deterministic writer code renders assigned source declarations" in prompt
     assert "UI/API/CLI behavior" in prompt
     assert "data model or persistence changes" in prompt
     assert "automation or prompt-driven behavior" in prompt
@@ -330,6 +337,7 @@ def test_author_delivery_amendment_uses_plain_generation_and_records_audit(tmp_p
     assert draft.plan_id == "team-invites"
     assert draft.target_unit_id == "oversized"
     assert [unit.id for unit in draft.replacement_units] == ["invite-storage", "invite-cli"]
+    assert draft.replacement_units[0].asset_paths == [".sikula/task-assets/invite-reference.png"]
     assert llm.system_prompts == [""]
     assert llm.readonly_agent_calls == []
     assert llm.agent_calls == []
@@ -349,6 +357,9 @@ def test_author_delivery_amendment_uses_plain_generation_and_records_audit(tmp_p
     assert "optional stable reason" not in prompt
     assert '"id": "oversized"' in prompt
     assert "Split the oversized invite behavior" in prompt
+    assert "assign every declared path to at least one" in prompt
+    assert "absolute in-project declaration, use its project-relative equivalent" in prompt
+    assert "Replacement task_markdown must not include an asset-root section" in prompt
     assert audit_records[0]["phase"] == "delivery_amend_prepare_authoring"
     assert audit_records[0]["parsed"]["replacement_ids"] == ["invite-storage", "invite-cli"]
 

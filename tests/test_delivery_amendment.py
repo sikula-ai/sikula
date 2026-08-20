@@ -451,6 +451,220 @@ def test_pending_middle_split_preserves_progress_and_rewires_to_all_leaves(tmp_p
         )
 
 
+def test_amendment_preserves_assigned_target_assets_in_replacement_tasks(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    asset_path = ".sikula/task-assets/success-check.svg"
+    target_path = "app/assets/success-check.svg"
+    asset_file = tmp_path / asset_path
+    asset_file.parent.mkdir(parents=True)
+    asset_file.write_bytes(b"<svg />")
+    declared_hash = "sha256:" + hashlib.sha256(asset_file.read_bytes()).hexdigest()
+    target_task = plan_path.parent / "units" / "c.md"
+    target_task.write_text(
+        target_task.read_text(encoding="utf-8").rstrip()
+        + f"""
+
+## Assets
+
+- Delivery asset: `{asset_path}`
+  - Target: `{target_path}`
+  - Source/license: provided by product team.
+  - SHA-256: `{declared_hash}`
+""",
+        encoding="utf-8",
+    )
+    draft = _draft()
+    draft.replacement_units[0] = replace(
+        draft.replacement_units[0],
+        asset_paths=[asset_path],
+    )
+
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path,
+        "c",
+        draft,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+        project_config=_project_config(tmp_path),
+    )
+    result = apply_delivery_amendment(
+        plan_path,
+        proposal.proposal_id,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.applied is True
+    replacement = proposal.replacement_units[0].task_markdown
+    assert f"- Delivery asset: `{asset_path}`" in replacement
+    assert f"  - Target: `{target_path}`" in replacement
+    assert "  - Source/license: provided by product team." in replacement
+    assert f"  - SHA-256: `{declared_hash}`" in replacement
+    for unit in proposal.replacement_units[1:]:
+        assert asset_path not in unit.task_markdown
+    assert (tmp_path / proposal.replacement_units[0].task_path).read_text(encoding="utf-8") == replacement
+
+
+def test_amendment_preserves_prepared_asset_manifest_in_replacement_tasks(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    asset_path = ".sikula/task-assets/reference.png"
+    asset_file = tmp_path / asset_path
+    asset_file.parent.mkdir(parents=True)
+    asset_file.write_bytes(b"reference")
+    declared_hash = "sha256:" + hashlib.sha256(asset_file.read_bytes()).hexdigest()
+    target_task = plan_path.parent / "units" / "c.md"
+    target_task.write_text(
+        target_task.read_text(encoding="utf-8").rstrip()
+        + f"""
+
+## Assets
+
+- Reference asset: `{asset_path}`
+  - Usage: reference only.
+  - Notes: Preserve the original spacing shown in this reference.
+  - Do not modify or copy this source asset.
+
+## Asset manifest
+
+### Reference assets
+
+- Path: `{asset_path}`
+  - SHA-256: `{declared_hash}`
+  - Purpose: reference context for the implementation contract.
+  - Usage: reference only; do not copy this asset into production files.
+""",
+        encoding="utf-8",
+    )
+    draft = _draft()
+    draft.replacement_units[0] = replace(
+        draft.replacement_units[0],
+        asset_paths=[asset_path],
+    )
+
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path,
+        "c",
+        draft,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+        project_config=_project_config(tmp_path),
+    )
+    result = apply_delivery_amendment(
+        plan_path,
+        proposal.proposal_id,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.applied is True
+    replacement = proposal.replacement_units[0].task_markdown
+    assert "## Asset manifest" in replacement
+    assert f"- Path: `{asset_path}`" in replacement
+    assert f"  - SHA-256: `{declared_hash}`" in replacement
+    assert "  - Notes: Preserve the original spacing shown in this reference." in replacement
+    assert "  - Do not modify or copy this source asset." in replacement
+    for unit in proposal.replacement_units[1:]:
+        assert "## Asset manifest" not in unit.task_markdown
+
+
+def test_amendment_blocks_unassigned_target_asset(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    asset_path = ".sikula/task-assets/reference.png"
+    asset_file = tmp_path / asset_path
+    asset_file.parent.mkdir(parents=True)
+    asset_file.write_bytes(b"reference")
+    target_task = plan_path.parent / "units" / "c.md"
+    target_task.write_text(
+        target_task.read_text(encoding="utf-8").rstrip()
+        + f"""
+
+## Assets
+
+- Reference asset: `{asset_path}`
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        create_delivery_amendment_proposal(
+            plan_path,
+            "c",
+            _draft(),
+            project_root=tmp_path,
+            proposal_root=proposal_root,
+            project_config=_project_config(tmp_path),
+        )
+
+    assert exc_info.value.issue.code == "delivery_amend.source_asset_unassigned"
+    assert not proposal_root.exists()
+
+
+def test_amendment_blocks_assets_hidden_by_unterminated_replacement_block(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    asset_path = ".sikula/task-assets/reference.png"
+    asset_file = tmp_path / asset_path
+    asset_file.parent.mkdir(parents=True)
+    asset_file.write_bytes(b"reference")
+    target_task = plan_path.parent / "units" / "c.md"
+    target_task.write_text(
+        target_task.read_text(encoding="utf-8").rstrip()
+        + f"""
+
+## Assets
+
+- Reference asset: `{asset_path}`
+""",
+        encoding="utf-8",
+    )
+    draft = _draft()
+    draft.replacement_units[0] = replace(
+        draft.replacement_units[0],
+        task_markdown=draft.replacement_units[0].task_markdown.rstrip() + "\n\n<!--\n",
+        asset_paths=[asset_path],
+    )
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        create_delivery_amendment_proposal(
+            plan_path,
+            "c",
+            draft,
+            project_root=tmp_path,
+            proposal_root=proposal_root,
+            project_config=_project_config(tmp_path),
+        )
+
+    assert exc_info.value.issue.code == "delivery_amend.unit_asset_render_invalid"
+    assert not proposal_root.exists()
+
+
+def test_amendment_redacts_asset_assignment_check_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    private_detail = str(tmp_path / "private-asset.png")
+
+    def fail_assignment(*args, **kwargs):
+        raise OSError(private_detail)
+
+    monkeypatch.setattr(delivery_amendment_module, "render_delivery_asset_assignments", fail_assignment)
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        create_delivery_amendment_proposal(
+            plan_path,
+            "c",
+            _draft(),
+            project_root=tmp_path,
+            proposal_root=proposal_root,
+        )
+
+    assert exc_info.value.issue.code == "delivery_amend.asset_assignment_check_failed"
+    assert private_detail not in str(exc_info.value)
+    assert not proposal_root.exists()
+
+
 def test_prepare_stores_componentless_replacements_without_component_metadata(tmp_path: Path) -> None:
     plan_path, _, proposal_root = _setup(tmp_path)
 

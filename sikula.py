@@ -3399,15 +3399,15 @@ def _run_delivery_prepare_authoring(
     args: argparse.Namespace,
     cfg: dict,
     task_path: Path,
+    task_description: str,
     output_dir: Path,
     selected_plan_id: str,
     project_root: Path,
 ) -> DeliveryAuthoringDraft:
-    task_text = task_path.read_text(encoding="utf-8")
     audit_recorder, audit_path = _make_auto_preparation_audit_recorder(
         generated_by="sikula.delivery_prepare",
         source_path=task_path,
-        source_text=task_text,
+        source_text=task_description,
         output_path=output_dir,
         cfg=cfg,
     )
@@ -3415,7 +3415,7 @@ def _run_delivery_prepare_authoring(
     safe_audit_path = _contract_preflight_path(audit_path, project_root)
     try:
         draft = agent.author_delivery_plan(
-            task_description=task_text,
+            task_description=task_description,
             task_path=task_path,
             plan_id=selected_plan_id,
             project_root=project_root,
