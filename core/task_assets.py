@@ -1011,6 +1011,7 @@ def detect_undeclared_asset_paths(
     for reference in asset_references or []:
         declared_keys.update(_asset_path_match_keys(str(reference.get("path") or "")))
         declared_keys.update(_asset_path_match_keys(str(reference.get("project_path") or "")))
+        declared_keys.update(_asset_path_match_keys(str(reference.get("requested_target") or "")))
 
     paths: list[dict[str, Any]] = []
     seen: set[tuple[int, str]] = set()

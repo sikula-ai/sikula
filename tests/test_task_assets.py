@@ -476,3 +476,24 @@ def test_detect_undeclared_asset_paths_ignores_declared_asset_paths_reused_in_te
 """
 
     assert _undeclared_paths(markdown, tmp_path) == []
+
+
+def test_detect_undeclared_asset_paths_ignores_declared_targets_only(tmp_path: Path) -> None:
+    asset_path = tmp_path / ".sikula" / "task-assets" / "success-check.svg"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_text("<svg />", encoding="utf-8")
+    markdown = """# Add success visuals
+
+## Desired behavior
+
+- Render the supplied production icon from `app/assets/success-check.svg`.
+- Use `app/assets/fallback.svg` as a visual reference.
+
+## Assets
+
+- Delivery asset: `.sikula/task-assets/success-check.svg`
+  - Target: `app/assets/success-check.svg`
+  - Source/license: provided by product team.
+"""
+
+    assert _undeclared_paths(markdown, tmp_path) == [{"path": "app/assets/fallback.svg", "line": 6}]
