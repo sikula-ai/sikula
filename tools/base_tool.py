@@ -9,8 +9,9 @@ Implement it for each platform (AndroidGradleTool for Android, NodeTool for Node
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from core.diagnostics import diagnostic_excerpt
@@ -80,7 +81,8 @@ class BuildTool(BaseTool):
       1. Create tools/<platform>_tool.py — subclass BuildTool (or GradleBaseTool for
          Gradle variants); implement sync(), compile_check(), run_tests(), run_check(),
          is_build_config_file(); optionally override generate_sources(), env_files(),
-         is_sync_adoptable_file(), and is_test_only_change().
+         is_sync_adoptable_file(), is_ephemeral_build_path(), is_test_only_change(), and
+         requires_test_only_change_content().
       2. Register it in core/orchestrator.py (_build_tool()) and sikula.py
          (_build_tool_class(), _generate_config(), _SUPPORTED_BUILD_TOOLS).
       3. Add detection logic to tools/scanner.py (_SIGNATURES and path detection).
@@ -164,12 +166,38 @@ class BuildTool(BaseTool):
         """
         return False
 
+    def is_ephemeral_build_path(self, path: str) -> bool:
+        """Return True for ignored dependency caches or disposable build output.
+
+        Delivery scope auditing prunes these paths before filesystem enumeration.
+        Source-controlled files remain visible through Git even when they share a
+        platform output name, so implementations should classify path components
+        with _delivery_scope_path_parts().
+        """
+        return False
+
+    @staticmethod
+    def _delivery_scope_path_parts(path: str) -> tuple[str, ...]:
+        """Split an audit path without changing POSIX filesystem names."""
+        if os.name == "nt":
+            path = path.replace("\\", "/")
+        return tuple(part for part in PurePosixPath(path).parts if part not in {"", ".", "/"})
+
     def is_test_only_change(self, path: str, before: str | None, after: str | None) -> bool:
         """Return True when a production-looking path contains only test-only edits.
 
         This hook is used only as a narrow exception to the fixer's test-failure
         production-write guard. The default is conservative: platforms must opt in
         with syntax-aware logic for mixed source/test files.
+        """
+        return False
+
+    def requires_test_only_change_content(self, path: str) -> bool:
+        """Return True when is_test_only_change needs bounded before/after text.
+
+        The delivery scope audit otherwise retains hashes only. Platform tools must
+        opt in narrowly for mixed source/test files whose syntax-aware classification
+        requires file content.
         """
         return False
 

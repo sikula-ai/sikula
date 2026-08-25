@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
+from hashlib import sha256
 import json
 from pathlib import Path
 import subprocess
@@ -10,8 +12,12 @@ import pytest
 import yaml
 
 from core.delivery_plan import (
+    MAX_DELIVERY_CONSTRAINT_UNIT_IDS,
+    MAX_DELIVERY_CONSTRAINTS,
+    MAX_DELIVERY_UNIT_ID_LENGTH,
     DeliveryPlanIssue,
     check_delivery_plan_file,
+    delivery_unit_constraint_context,
     is_valid_delivery_branch_name,
     render_delivery_plan_check,
 )
@@ -41,6 +47,16 @@ def _write_plan(root: Path, data: dict) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     return path
+
+
+def _write_source_task(root: Path, text: str = "# Source task\n") -> dict[str, str]:
+    path = root / ".sikula" / "tasks" / "source-task.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return {
+        "path": path.relative_to(root).as_posix(),
+        "sha256": "sha256:" + sha256(text.encode("utf-8")).hexdigest(),
+    }
 
 
 def _base_plan(root: Path) -> dict:
@@ -141,6 +157,283 @@ def test_delivery_plan_check_accepts_valid_single_repo_plan(tmp_path: Path) -> N
     assert "Units: 2" in rendered
 
 
+def test_delivery_plan_constraint_limit_does_not_limit_existing_unit_capacity(tmp_path: Path) -> None:
+    data = _base_plan(tmp_path)
+    data["units"] = [
+        {
+            "id": f"unit-{index}",
+            "task_path": _write_unit(tmp_path, f"unit-{index}.md"),
+            "depends_on": [],
+        }
+        for index in range(101)
+    ]
+
+    result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
+
+    assert result.valid is True
+    assert result.plan is not None
+    assert len(result.plan.units) == 101
+
+
+def test_delivery_plan_check_preserves_source_task_and_inherited_constraints(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["source_task"] = _write_source_task(tmp_path)
+    data["constraints"] = [
+        {
+            "id": "protocol-authority",
+            "kind": "authoritative_read_only_dependency",
+            "summary": "Protocol changes remain owned by the external protocol project.",
+            "unit_ids": ["01-domain", "02-api"],
+            "disposition": "preserved",
+        }
+    ]
+
+    result = check_delivery_plan_file(_write_plan(tmp_path, data))
+
+    assert result.valid is True
+    assert result.plan is not None
+    assert result.plan.source_task is not None
+    assert result.plan.source_task.to_dict() == data["source_task"]
+    assert [constraint.to_dict() for constraint in result.plan.constraints] == data["constraints"]
+    assert result.to_dict()["plan"]["constraints"] == data["constraints"]
+
+
+def test_delivery_plan_check_rejects_stale_source_task_fingerprint(tmp_path: Path) -> None:
+    data = _base_plan(tmp_path)
+    data["source_task"] = _write_source_task(tmp_path)
+    data["source_task"]["sha256"] = "sha256:" + "0" * 64
+
+    result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
+
+    assert result.valid is False
+    assert "source_task.hash_mismatch" in _codes(result)
+
+
+def test_delivery_plan_source_task_hash_uses_logical_utf8_text_across_crlf(tmp_path: Path) -> None:
+    source_text = "# Source task\n\nPreserve the boundary.\n"
+    source_path = tmp_path / ".sikula" / "tasks" / "source-task.md"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(source_text.replace("\n", "\r\n").encode("utf-8"))
+    data = _base_plan(tmp_path)
+    data["source_task"] = {
+        "path": source_path.relative_to(tmp_path).as_posix(),
+        "sha256": "sha256:" + sha256(source_text.encode("utf-8")).hexdigest(),
+    }
+
+    result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
+
+    assert result.valid is True
+
+
+def test_delivery_plan_check_rejects_and_omits_verbatim_constraint_summary(tmp_path: Path) -> None:
+    source_rule = "Only the protocol repository may change protocol files."
+    data = _base_plan(tmp_path)
+    data["source_task"] = _write_source_task(tmp_path, f"# Source task\n\n- **{source_rule}**\n")
+    data["constraints"] = [
+        {
+            "id": "protocol-authority",
+            "kind": "repository_ownership",
+            "summary": source_rule,
+            "unit_ids": ["01-domain"],
+            "disposition": "preserved",
+        }
+    ]
+
+    result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
+    serialized = json.dumps(result.to_dict())
+
+    assert result.valid is False
+    assert "constraints.summary_source_excerpt" in _codes(result)
+    assert source_rule not in serialized
+
+
+@pytest.mark.parametrize(
+    ("mutator", "expected_code"),
+    [
+        pytest.param(
+            lambda data: data.update({"source_task": []}),
+            "source_task.invalid_type",
+            id="source_task_type",
+        ),
+        pytest.param(
+            lambda data: data["source_task"].update({"sha256": "sha256:not-a-hash"}),
+            "source_task.sha256_invalid",
+            id="source_task_hash",
+        ),
+        pytest.param(
+            lambda data: data.pop("source_task"),
+            "constraints.source_task_required",
+            id="source_task_required",
+        ),
+        pytest.param(
+            lambda data: data.update({"constraints": {}}),
+            "constraints.invalid_type",
+            id="constraints_type",
+        ),
+        pytest.param(
+            lambda data: data["constraints"][0].update({"kind": "unknown"}),
+            "constraints.kind_invalid",
+            id="kind",
+        ),
+        pytest.param(
+            lambda data: data["constraints"][0].update({"summary": "Read /Users/example/private/task.md"}),
+            "constraints.summary_invalid",
+            id="summary",
+        ),
+        pytest.param(
+            lambda data: data["constraints"][0].update({"unit_ids": ["missing"]}),
+            "constraints.unit_unknown",
+            id="unit",
+        ),
+        pytest.param(
+            lambda data: data["constraints"][0].update({"unit_ids": ["01-domain", "01-domain"]}),
+            "constraints.unit_id_duplicate",
+            id="duplicate_unit",
+        ),
+        pytest.param(
+            lambda data: data["constraints"][0].update({"disposition": "conflict"}),
+            "constraints.disposition_unresolved",
+            id="disposition",
+        ),
+    ],
+)
+def test_delivery_plan_check_rejects_invalid_inherited_constraints(
+    tmp_path: Path,
+    mutator: Callable[[dict], object],
+    expected_code: str,
+) -> None:
+    data = _base_plan(tmp_path)
+    data["source_task"] = _write_source_task(tmp_path)
+    data["constraints"] = [
+        {
+            "id": "protocol-authority",
+            "kind": "authoritative_read_only_dependency",
+            "summary": "Protocol changes remain owned by the external protocol project.",
+            "unit_ids": ["01-domain"],
+            "disposition": "preserved",
+        }
+    ]
+    mutator(data)
+
+    result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
+
+    assert result.valid is False
+    assert expected_code in _codes(result)
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("unknown_field", "source_task.unknown_field"),
+        ("missing_path", "source_task.path.missing"),
+        ("unsafe_metadata", "source_task.path_metadata_invalid"),
+        ("parent_traversal", "source_task.path_parent_traversal"),
+        ("missing_file", "source_task.read_failed"),
+    ],
+)
+def test_delivery_plan_check_rejects_source_task_boundary_cases(
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+) -> None:
+    data = _base_plan(tmp_path)
+    data["source_task"] = _write_source_task(tmp_path)
+    if case == "unknown_field":
+        data["source_task"]["private"] = "unsupported"
+    elif case == "missing_path":
+        data["source_task"].pop("path")
+    elif case == "unsafe_metadata":
+        data["source_task"]["path"] = "task.md\nprivate"
+    elif case == "parent_traversal":
+        data["source_task"]["path"] = ".sikula/tasks/../tasks/source-task.md"
+    elif case == "missing_file":
+        data["source_task"]["path"] = ".sikula/tasks/missing.md"
+
+    result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
+
+    assert result.valid is False
+    assert expected_code in _codes(result)
+
+
+def test_delivery_plan_check_rejects_symlink_and_non_utf8_source_tasks(tmp_path: Path) -> None:
+    data = _base_plan(tmp_path)
+    source = tmp_path / ".sikula" / "tasks" / "source-task.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"\xff")
+    data["source_task"] = {
+        "path": source.relative_to(tmp_path).as_posix(),
+        "sha256": "sha256:" + sha256(b"\xff").hexdigest(),
+    }
+
+    invalid_utf8 = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
+
+    assert "source_task.read_failed" in _codes(invalid_utf8)
+
+    target = source.with_name("source-target.md")
+    target.write_text("# Source task\n", encoding="utf-8")
+    source.unlink()
+    source.symlink_to(target.name)
+    data["source_task"]["sha256"] = "sha256:" + sha256(target.read_bytes()).hexdigest()
+
+    symlink = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
+
+    assert "source_task.symlink" in _codes(symlink)
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("too_many", "constraints.too_many"),
+        ("non_object", "constraints.item_invalid"),
+        ("unknown_field", "constraints.unknown_field"),
+        ("invalid_id", "constraints.id_invalid"),
+        ("duplicate_id", "constraints.duplicate_id"),
+        ("empty_units", "constraints.unit_ids_empty"),
+        ("too_many_units", "constraints.unit_ids_too_many"),
+        ("superseded_unit", "constraints.unit_superseded"),
+    ],
+)
+def test_delivery_plan_check_rejects_constraint_boundary_cases(
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+) -> None:
+    data = _base_plan(tmp_path)
+    data["source_task"] = _write_source_task(tmp_path)
+    constraint = {
+        "id": "protocol-authority",
+        "kind": "authoritative_read_only_dependency",
+        "summary": "Protocol changes remain owned by the external protocol project.",
+        "unit_ids": ["01-domain"],
+        "disposition": "preserved",
+    }
+    data["constraints"] = [constraint]
+    if case == "too_many":
+        data["constraints"] = [
+            {**constraint, "id": f"constraint-{index}"} for index in range(MAX_DELIVERY_CONSTRAINTS + 1)
+        ]
+    elif case == "non_object":
+        data["constraints"] = ["constraint"]
+    elif case == "unknown_field":
+        constraint["private"] = "unsupported"
+    elif case == "invalid_id":
+        constraint["id"] = "x" * (MAX_DELIVERY_UNIT_ID_LENGTH + 1)
+    elif case == "duplicate_id":
+        data["constraints"] = [constraint, {**constraint, "id": "PROTOCOL-AUTHORITY"}]
+    elif case == "empty_units":
+        constraint["unit_ids"] = []
+    elif case == "too_many_units":
+        constraint["unit_ids"] = ["01-domain"] * (MAX_DELIVERY_CONSTRAINT_UNIT_IDS + 1)
+    elif case == "superseded_unit":
+        data["units"][0]["superseded_by"] = ["02-api"]
+
+    result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
+
+    assert result.valid is False
+    assert expected_code in _codes(result)
+
+
 def test_delivery_plan_check_redacts_unsafe_metadata_from_public_projection(tmp_path: Path) -> None:
     _git_init(tmp_path)
     data = _base_plan(tmp_path)
@@ -196,6 +489,23 @@ def test_delivery_plan_check_projects_unsafe_identity_references_consistently(tm
     data["units"][1]["id"] = second_unit_id
     data["units"][1]["repo_id"] = repository_id
     data["units"][1]["depends_on"] = [first_unit_id]
+    source_task = tmp_path / ".sikula" / "tasks" / "source.md"
+    source_task.parent.mkdir(parents=True, exist_ok=True)
+    source_body = "# Source\n\nPreserve the private ownership boundary.\n"
+    source_task.write_text(source_body, encoding="utf-8")
+    data["source_task"] = {
+        "path": source_task.relative_to(tmp_path).as_posix(),
+        "sha256": f"sha256:{sha256(source_body.encode()).hexdigest()}",
+    }
+    data["constraints"] = [
+        {
+            "id": "ownership",
+            "kind": "repository_ownership",
+            "summary": "Preserve repository ownership.",
+            "unit_ids": [first_unit_id],
+            "disposition": "preserved",
+        }
+    ]
 
     result = check_delivery_plan_file(_write_plan(tmp_path, data))
     payload = result.to_dict()
@@ -208,6 +518,9 @@ def test_delivery_plan_check_projects_unsafe_identity_references_consistently(tm
     assert projected_repo == payload["plan"]["units"][1]["repo_id"]
     assert projected_first == payload["plan"]["units"][1]["depends_on"][0]
     assert projected_first != projected_second
+    assert result.plan is not None
+    _, _, private_constraints = delivery_unit_constraint_context(result.plan, first_unit_id)
+    assert private_constraints[0]["unit_ids"] == [first_unit_id]
     serialized = json.dumps(payload)
     assert repository_id not in serialized
     assert first_unit_id not in serialized

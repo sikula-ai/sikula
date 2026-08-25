@@ -353,6 +353,13 @@ class TestCargoToolIsSyncAdoptableFile:
 
 
 class TestCargoToolIsTestOnlyChange:
+    def test_requests_bounded_content_only_for_rust_sources(self):
+        tool = _make_tool(Path("."))
+
+        assert tool.requires_test_only_change_content("src/lib.rs") is True
+        assert tool.requires_test_only_change_content("target/debug/generated.rs") is False
+        assert tool.requires_test_only_change_content("target/debug/lib.rmeta") is False
+
     def test_allows_changes_inside_existing_cfg_test_module(self):
         tool = _make_tool(Path("."))
         before = """\

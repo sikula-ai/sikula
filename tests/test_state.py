@@ -10,6 +10,13 @@ import pytest
 
 import core.state as state_module
 from core.state import JsonStateStore, TaskState
+from core.structured_output import (
+    DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP,
+    DELIVERY_DISPOSITION_FIX_IN_SCOPE,
+    DELIVERY_IMPLEMENTATION_DISPOSITIONS,
+    DELIVERY_REVIEW_DISPOSITIONS,
+    parse_delivery_disposition,
+)
 
 
 _REVIEW_DELIVERY_FIELD_VALUES = (
@@ -184,6 +191,77 @@ class TestJsonStateStore:
         assert loaded is not None
         assert loaded.delivery_unit_budget == {"max_planner_steps": 2, "max_changed_files": 4}
 
+    def test_create_persists_copied_delivery_constraint_context(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        source_task = {"path": ".sikula/tasks/source.md", "sha256": f"sha256:{'a' * 64}"}
+        constraints = [
+            {
+                "id": "repository-ownership",
+                "kind": "repository_ownership",
+                "summary": "Only this repository may be changed.",
+                "unit_ids": ["unit-1"],
+                "disposition": "preserved",
+            }
+        ]
+
+        state = store.create(
+            "delivery child",
+            delivery_constraint_context_schema_version=1,
+            delivery_source_task=source_task,
+            delivery_inherited_constraints=constraints,
+            delivery_constraint_context_fingerprint="b" * 64,
+        )
+        source_task["path"] = "mutated.md"
+        constraints[0]["unit_ids"].append("mutated")
+        loaded = store.load(state.task_id)
+
+        assert loaded is not None
+        assert loaded.delivery_constraint_context_schema_version == 1
+        assert loaded.delivery_constraint_context_fingerprint == "b" * 64
+        assert loaded.delivery_source_task == {
+            "path": ".sikula/tasks/source.md",
+            "sha256": f"sha256:{'a' * 64}",
+        }
+        assert loaded.delivery_inherited_constraints == [
+            {
+                "id": "repository-ownership",
+                "kind": "repository_ownership",
+                "summary": "Only this repository may be changed.",
+                "unit_ids": ["unit-1"],
+                "disposition": "preserved",
+            }
+        ]
+
+    def test_create_persists_copied_delivery_write_scope(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        declared_paths = ["core/state.py"]
+        declared_exact_file_paths = ["core/state.py"]
+        effective_paths = ["core/state.py"]
+        effective_exact_file_paths = ["core/state.py"]
+
+        state = store.create(
+            "delivery child",
+            delivery_write_scope_schema_version=2,
+            delivery_write_scope_mode="unit_explicit",
+            delivery_declared_write_paths=declared_paths,
+            delivery_declared_write_exact_file_paths=declared_exact_file_paths,
+            delivery_effective_write_paths=effective_paths,
+            delivery_effective_write_exact_file_paths=effective_exact_file_paths,
+        )
+        declared_paths.append("mutated.py")
+        declared_exact_file_paths.append("mutated.py")
+        effective_paths.append("mutated.py")
+        effective_exact_file_paths.append("mutated.py")
+        loaded = store.load(state.task_id)
+
+        assert loaded is not None
+        assert loaded.delivery_write_scope_schema_version == 2
+        assert loaded.delivery_write_scope_mode == "unit_explicit"
+        assert loaded.delivery_declared_write_paths == ["core/state.py"]
+        assert loaded.delivery_declared_write_exact_file_paths == ["core/state.py"]
+        assert loaded.delivery_effective_write_paths == ["core/state.py"]
+        assert loaded.delivery_effective_write_exact_file_paths == ["core/state.py"]
+
     def test_create_persists_delivery_handoff_inputs(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
         dependency_handoff = {
@@ -223,6 +301,12 @@ class TestJsonStateStore:
         state.test_writer_audit_agent_completed = True
         state.test_writer_audit_files_written = ["tests/LoginTest.py"]
         state.test_writer_audit_gate_counts = {"tests/LoginTest.py": {"skip:abc123": 1}}
+        state.delivery_runtime_write_scope_binding = {
+            "schema_version": 1,
+            "status": "bound",
+            "roots": [{"path": "src", "resolved_path": "src", "exact_file": False}],
+        }
+        state.delivery_scope_audit_pending = {"schema_version": 1, "agent": "implementer"}
         store.save(state)
 
         loaded = store.load("abc123")
@@ -237,6 +321,8 @@ class TestJsonStateStore:
         assert loaded.test_writer_audit_agent_completed is True
         assert loaded.test_writer_audit_files_written == ["tests/LoginTest.py"]
         assert loaded.test_writer_audit_gate_counts == {"tests/LoginTest.py": {"skip:abc123": 1}}
+        assert loaded.delivery_runtime_write_scope_binding == state.delivery_runtime_write_scope_binding
+        assert loaded.delivery_scope_audit_pending == {"schema_version": 1, "agent": "implementer"}
 
     def test_legacy_state_without_step_file_tracking_loads_with_safe_defaults(self, tmp_path: Path):
         store = JsonStateStore(tmp_path)
@@ -341,6 +427,7 @@ class TestJsonStateStore:
         data = json.loads((tmp_path / "order1.json").read_text())
         keys = list(data)
         record_keys = [
+            "analyst_cycle_records",
             "planner_retry_records",
             "implement_cycle_records",
             "review_cycle_records",
@@ -821,6 +908,21 @@ class TestJsonStateStore:
         state = TaskState(task_id="summary_incomplete", task_description="incomplete")
 
         assert state_module._terminal_result(state) == "incomplete"
+
+    def test_analyst_run_count_uses_dedicated_prompt_and_attempt_metadata(self):
+        state = TaskState(
+            task_id="analyst_count",
+            task_description="count analyst invocations",
+            analyst_prompt="initial prompt",
+        )
+
+        assert state_module._analyst_runs_count(state) == 1
+
+        state.analyst_retry_records.append({"attempt": 1, "will_retry": True})
+        assert state_module._analyst_runs_count(state) == 2
+
+        state.analyst_cycle_records.append({"attempt": 2, "error": "timeout"})
+        assert state_module._analyst_runs_count(state) == 2
 
     @pytest.mark.parametrize(
         ("done", "failed", "delivery_status", "expected_result"),
@@ -1463,6 +1565,317 @@ class TestTaskStateChildDeliveryMetadata:
         assert state.delivery_plan_id is None
         assert state.delivery_unit_id is None
         assert state.delivery_plan_path is None
+        assert state.delivery_constraint_context_schema_version is None
+        assert state.delivery_source_task is None
+        assert state.delivery_inherited_constraints == []
+        assert state.delivery_constraint_context_fingerprint is None
+        assert state.delivery_stop_code is None
+        assert state.delivery_stop_disposition is None
+        assert state.delivery_disposition_parse_error is None
+
+    def test_implementer_disposition_parse_error_roundtrips_as_terminal_evidence(self, tmp_path: Path):
+        state = TaskState(task_id="delivery-invalid-output", task_description="delivery child")
+        state.record_delivery_disposition_parse_error(
+            "implementer",
+            "delivery_disposition.keys_invalid",
+        )
+        store = JsonStateStore(tmp_path)
+
+        store.save(state)
+        loaded = store.load(state.task_id)
+
+        assert loaded is not None
+        assert loaded.delivery_disposition_parse_error is not None
+        assert loaded.delivery_disposition_parse_error["schema_version"] == 1
+        assert loaded.delivery_disposition_parse_error["source"] == "implementer"
+        assert loaded.delivery_disposition_parse_error["error_code"] == "delivery_disposition.keys_invalid"
+        assert "timestamp" in loaded.delivery_disposition_parse_error
+        assert loaded.delivery_stop_code_from_parse_error() == "implementer_disposition_invalid"
+        assert loaded.history[-1]["action"] == "delivery_disposition_parse_error"
+
+    @pytest.mark.parametrize(
+        ("source", "error_code", "expected_message"),
+        [
+            ("reviewer", "delivery_disposition.keys_invalid", "source is invalid"),
+            ("implementer", "invalid", "code is invalid"),
+        ],
+    )
+    def test_implementer_disposition_parse_error_rejects_invalid_input(
+        self,
+        source: str,
+        error_code: str,
+        expected_message: str,
+    ) -> None:
+        state = TaskState(task_id="delivery-invalid-parse-input", task_description="delivery child")
+
+        with pytest.raises(ValueError, match=expected_message):
+            state.record_delivery_disposition_parse_error(source, error_code)
+
+        assert state.delivery_disposition_parse_error is None
+
+    @pytest.mark.parametrize(
+        ("field", "value", "expected_message"),
+        [
+            ("schema_version", 2, "schema is invalid"),
+            ("error_code", "invalid", "code is invalid"),
+            ("source", "reviewer", "source is invalid"),
+            ("timestamp", "not-a-timestamp", "timestamp is invalid"),
+        ],
+    )
+    def test_persisted_implementer_disposition_parse_error_rejects_invalid_fields(
+        self,
+        field: str,
+        value: object,
+        expected_message: str,
+    ) -> None:
+        parse_error = {
+            "schema_version": 1,
+            "error_code": "delivery_disposition.keys_invalid",
+            "source": "implementer",
+            "timestamp": "2026-07-20T10:03:00Z",
+        }
+        parse_error[field] = value
+        state = TaskState(
+            task_id="delivery-invalid-parse-field",
+            task_description="delivery child",
+            delivery_disposition_parse_error=parse_error,
+        )
+
+        with pytest.raises(ValueError, match=expected_message):
+            state.delivery_stop_code_from_parse_error()
+
+    def test_terminal_delivery_disposition_roundtrips(self, tmp_path: Path):
+        parsed = parse_delivery_disposition(
+            json.dumps(
+                {
+                    "sikula_disposition_schema_version": 1,
+                    "disposition": DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP,
+                    "summary": "The required API belongs to another repository.",
+                }
+            ),
+            allowed_dispositions=DELIVERY_IMPLEMENTATION_DISPOSITIONS,
+        )
+        assert parsed is not None
+        state = TaskState(task_id="delivery-stop", task_description="delivery child")
+        state.set_delivery_stop_disposition("implementer", parsed)
+        store = JsonStateStore(tmp_path)
+
+        store.save(state)
+        loaded = store.load(state.task_id)
+
+        assert loaded is not None
+        assert loaded.delivery_stop_disposition is not None
+        assert loaded.delivery_stop_disposition["schema_version"] == 1
+        assert loaded.delivery_stop_disposition["source"] == "implementer"
+        assert loaded.delivery_stop_disposition["disposition"] == "external_dependency_gap"
+        assert loaded.delivery_stop_disposition["recommended_action"] == "external_dependency_follow_up"
+        assert "timestamp" in loaded.delivery_stop_disposition
+        assert loaded.delivery_stop_code_from_disposition() == "external_dependency_gap"
+        assert loaded.history[-1]["action"] == "delivery_stop_disposition"
+
+    def test_scope_amendment_disposition_requires_review_source(self):
+        parsed = parse_delivery_disposition(
+            json.dumps(
+                {
+                    "sikula_disposition_schema_version": 1,
+                    "disposition": "requires_scope_amendment",
+                    "summary": "The bounded unit needs another production surface.",
+                }
+            ),
+            allowed_dispositions=DELIVERY_REVIEW_DISPOSITIONS,
+        )
+        assert parsed is not None
+        state = TaskState(task_id="delivery-amend", task_description="delivery child")
+
+        with pytest.raises(ValueError, match="source is invalid"):
+            state.set_delivery_stop_disposition("implementer", parsed)
+
+        state.set_delivery_stop_disposition("reviewer", parsed)
+        assert state.delivery_stop_code_from_disposition() == "scope_amendment_required"
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            state_module.DELIVERY_STOP_UNIT_SCOPE_VIOLATION,
+            state_module.DELIVERY_STOP_SCOPE_AMENDMENT_REQUIRED,
+            state_module.DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP,
+            state_module.DELIVERY_STOP_IMPLEMENTER_DISPOSITION_INVALID,
+        ],
+    )
+    def test_terminal_stop_code_sets_stable_failed_state(self, code: str):
+        state = TaskState(task_id="delivery-terminal", task_description="delivery child", done=True)
+
+        state.set_delivery_terminal_stop(code, source="orchestrator")
+        state.set_delivery_terminal_stop(code, source="orchestrator")
+
+        assert state.delivery_stop_code == code
+        assert state.failed is True
+        assert state.done is False
+        assert [entry["action"] for entry in state.history].count("delivery_terminal_stop") == 1
+
+    def test_scope_violation_has_priority_over_reported_dependency_stop(self):
+        state = TaskState(task_id="delivery-priority", task_description="delivery child")
+        state.set_delivery_terminal_stop(
+            state_module.DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP,
+            source="implementer",
+        )
+
+        state.set_delivery_terminal_stop(
+            state_module.DELIVERY_STOP_UNIT_SCOPE_VIOLATION,
+            source="orchestrator",
+        )
+        state.set_delivery_terminal_stop(
+            state_module.DELIVERY_STOP_SCOPE_AMENDMENT_REQUIRED,
+            source="reviewer",
+        )
+
+        assert state.delivery_stop_code == "unit_scope_violation"
+        assert [entry["result"] for entry in state.history if entry["action"] == "delivery_terminal_stop"] == [
+            "external_dependency_gap",
+            "unit_scope_violation",
+        ]
+
+    @pytest.mark.parametrize(
+        ("code", "source"),
+        [
+            ("unknown_stop", "orchestrator"),
+            (state_module.DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP, "provider-output"),
+        ],
+    )
+    def test_terminal_stop_rejects_unknown_code_or_source(self, code: str, source: str):
+        state = TaskState(task_id="delivery-invalid-stop", task_description="delivery child")
+
+        with pytest.raises(ValueError, match="invalid"):
+            state.set_delivery_terminal_stop(code, source=source)
+
+        assert state.failed is False
+        assert state.delivery_stop_code is None
+
+    def test_invalid_persisted_terminal_disposition_fails_validation(self):
+        state = TaskState(
+            task_id="delivery-invalid",
+            task_description="delivery child",
+            delivery_stop_disposition={"disposition": "external_dependency_gap"},
+        )
+
+        with pytest.raises(ValueError, match="malformed"):
+            state.delivery_stop_code_from_disposition()
+
+    def test_invalid_persisted_disposition_parse_error_fails_validation(self):
+        state = TaskState(
+            task_id="delivery-invalid-parse-error",
+            task_description="delivery child",
+            delivery_disposition_parse_error={"error_code": "delivery_disposition.keys_invalid"},
+        )
+
+        with pytest.raises(ValueError, match="parse-error state is malformed"):
+            state.delivery_stop_code_from_parse_error()
+
+    @pytest.mark.parametrize(
+        ("field", "value", "expected_message"),
+        [
+            ("schema_version", None, "schema is invalid"),
+            ("disposition", "fix_in_scope", "value is invalid"),
+            ("recommended_action", "bounded_fix", "recovery action is invalid"),
+            ("summary", "", "summary is invalid"),
+            ("summary", "Read /Users/example/private/task.md", "summary is invalid"),
+            ("source", "orchestrator", "source is invalid"),
+            ("timestamp", "not-a-timestamp", "timestamp is invalid"),
+        ],
+    )
+    def test_persisted_terminal_disposition_rejects_invalid_fields(
+        self,
+        field: str,
+        value: object,
+        expected_message: str,
+    ) -> None:
+        disposition = {
+            "schema_version": 1,
+            "disposition": "external_dependency_gap",
+            "summary": "The required API belongs to another repository.",
+            "recommended_action": "external_dependency_follow_up",
+            "source": "implementer",
+            "timestamp": "2026-07-20T10:03:00Z",
+        }
+        disposition[field] = value
+        state = TaskState(
+            task_id="delivery-invalid-field",
+            task_description="delivery child",
+            delivery_stop_disposition=disposition,
+        )
+
+        with pytest.raises(ValueError, match=expected_message):
+            state.delivery_stop_code_from_disposition()
+
+    def test_persisted_scope_amendment_disposition_requires_review_source(self) -> None:
+        state = TaskState(
+            task_id="delivery-invalid-scope-source",
+            task_description="delivery child",
+            delivery_stop_disposition={
+                "schema_version": 1,
+                "disposition": "requires_scope_amendment",
+                "summary": "The bounded unit needs another production surface.",
+                "recommended_action": "delivery_amend_prepare",
+                "source": "implementer",
+                "timestamp": "2026-07-20T10:03:00Z",
+            },
+        )
+
+        with pytest.raises(ValueError, match="scope-amendment disposition source is invalid"):
+            state.delivery_stop_code_from_disposition()
+
+    def test_terminal_disposition_setter_rejects_unknown_source_and_unparsed_value(self) -> None:
+        parsed = parse_delivery_disposition(
+            json.dumps(
+                {
+                    "sikula_disposition_schema_version": 1,
+                    "disposition": DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP,
+                    "summary": "The required API belongs to another repository.",
+                }
+            ),
+            allowed_dispositions=DELIVERY_IMPLEMENTATION_DISPOSITIONS,
+        )
+        assert parsed is not None
+        state = TaskState(task_id="delivery-invalid-setter", task_description="delivery child")
+
+        with pytest.raises(ValueError, match="source is invalid"):
+            state.set_delivery_stop_disposition("orchestrator", parsed)
+        with pytest.raises(TypeError, match="parser-validated"):
+            state.set_delivery_stop_disposition("implementer", object())  # type: ignore[arg-type]
+
+        assert state.delivery_stop_disposition is None
+
+    def test_terminal_stop_rejects_invalid_persisted_code(self) -> None:
+        state = TaskState(
+            task_id="delivery-invalid-persisted-stop",
+            task_description="delivery child",
+            delivery_stop_code="unknown_stop",
+        )
+
+        with pytest.raises(ValueError, match="persisted delivery terminal stop code is invalid"):
+            state.set_delivery_terminal_stop(
+                state_module.DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP,
+                source="orchestrator",
+            )
+
+    def test_non_terminal_disposition_cannot_enter_terminal_state_field(self):
+        parsed = parse_delivery_disposition(
+            json.dumps(
+                {
+                    "sikula_disposition_schema_version": 1,
+                    "disposition": DELIVERY_DISPOSITION_FIX_IN_SCOPE,
+                    "summary": "Fix the bounded null check.",
+                }
+            ),
+            allowed_dispositions=DELIVERY_REVIEW_DISPOSITIONS,
+        )
+        assert parsed is not None
+        state = TaskState(task_id="delivery-fix", task_description="delivery child")
+
+        with pytest.raises(ValueError, match="not terminal"):
+            state.set_delivery_stop_disposition("reviewer", parsed)
+
+        assert state.delivery_stop_disposition is None
 
     @pytest.mark.parametrize(
         ("plan_id", "unit_id", "plan_path"),
@@ -1507,3 +1920,49 @@ class TestTaskStateChildDeliveryMetadata:
         loaded = store.load("oldchild1")
         assert loaded is not None
         assert getattr(loaded, field_name) is None
+
+    def test_load_old_state_without_delivery_constraint_context_uses_legacy_defaults(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="oldconstraints1", task_description="old child task")
+        store.save(state)
+        path = tmp_path / "oldconstraints1.json"
+        data = json.loads(path.read_text())
+        data.pop("delivery_constraint_context_schema_version", None)
+        data.pop("delivery_source_task", None)
+        data.pop("delivery_inherited_constraints", None)
+        data.pop("delivery_constraint_context_fingerprint", None)
+        path.write_text(json.dumps(data))
+
+        loaded = store.load("oldconstraints1")
+
+        assert loaded is not None
+        assert loaded.delivery_constraint_context_schema_version is None
+        assert loaded.delivery_source_task is None
+        assert loaded.delivery_inherited_constraints == []
+        assert loaded.delivery_constraint_context_fingerprint is None
+
+    def test_load_old_state_without_delivery_write_scope_uses_legacy_defaults(self, tmp_path: Path):
+        store = JsonStateStore(tmp_path)
+        state = TaskState(task_id="oldwritescope1", task_description="old child task")
+        store.save(state)
+        path = tmp_path / "oldwritescope1.json"
+        data = json.loads(path.read_text())
+        data.pop("delivery_write_scope_schema_version", None)
+        data.pop("delivery_write_scope_mode", None)
+        data.pop("delivery_declared_write_paths", None)
+        data.pop("delivery_declared_write_exact_file_paths", None)
+        data.pop("delivery_effective_write_paths", None)
+        data.pop("delivery_effective_write_exact_file_paths", None)
+        data.pop("delivery_runtime_write_scope_binding", None)
+        path.write_text(json.dumps(data))
+
+        loaded = store.load("oldwritescope1")
+
+        assert loaded is not None
+        assert loaded.delivery_write_scope_schema_version is None
+        assert loaded.delivery_write_scope_mode is None
+        assert loaded.delivery_declared_write_paths == []
+        assert loaded.delivery_declared_write_exact_file_paths is None
+        assert loaded.delivery_effective_write_paths == []
+        assert loaded.delivery_effective_write_exact_file_paths is None
+        assert loaded.delivery_runtime_write_scope_binding is None

@@ -344,6 +344,7 @@ Every agent that invokes an LLM must append one record per invocation to the app
 
 | Agent | List |
 |-------|------|
+| `AnalystAgent` | `state.analyst_cycle_records` |
 | `ImplementerAgent` | `state.implement_cycle_records` |
 | `FixerAgent` | `state.fix_cycle_records` |
 | `ReviewerAgent` | `state.review_cycle_records` |
@@ -351,10 +352,11 @@ Every agent that invokes an LLM must append one record per invocation to the app
 | `TestWriterAgent` | `state.test_write_records` |
 | Orchestrator validation phases | `state.validation_cycle_records` |
 
-`AnalystAgent` is the exception for successful calls: its primary prompt and output are
-stored in dedicated fields (`state.analyst_prompt` and `state.implementation_prompt`)
-because that output drives the whole task. Rejected analyst outputs that trigger analysis
-retry are append-only records in `state.analyst_retry_records`.
+`AnalystAgent` cycle records are content-free invocation indexes: store bounded outcome,
+reason/error/disposition, and correlation metadata without duplicating its full prompt or output.
+The primary accepted prompt and output remain in `state.analyst_prompt` and
+`state.implementation_prompt`; rejected outputs and retry prompts remain append-only in
+`state.analyst_retry_records`.
 
 Prompts stored in `TaskState` are local audit artifacts. They should remain faithful to
 what the agent received, including provider-added boundary instructions, and should not be
@@ -364,9 +366,10 @@ messages, provider diagnostics, CI output, PR comments, or external reports. `si
 is the explicit full-state audit/debug command and may print prompts; remind users to
 review and redact its output before sharing it outside the local project context.
 
-Each agent record must include at minimum: the agent's prompt, LLM output (`None` on
-exception), files written, timestamp, and the correlation keys needed to locate the record
-within the pipeline: `step`, `build_iteration` (`state.build_iterations`),
+Except for the content-free `AnalystAgent` index described above, each agent record must
+include at minimum: the agent's prompt, LLM output (`None` on exception), files written,
+timestamp, and the correlation keys needed to locate the record within the pipeline:
+`step`, `build_iteration` (`state.build_iterations`),
 `review_iteration` (`state.review_iterations`), `security_review_iteration`
 (`state.security_review_iterations`), and `scope` (`"task"`, `"step"`, or
 `"final_full_task"` when the agent runs after all planned steps).
@@ -425,6 +428,39 @@ and leave control flow to the orchestrator.
 
 Each agent has a fixed scope — crossing it silently breaks the pipeline:
 
+- **Delivery child agents** must validate the persisted inherited-constraint
+  context before every provider call. The Analyst, Implementer, Reviewer, and
+  Security Reviewer receive the same authoritative unit constraints; dependency
+  handoffs and the implementation prompt may not weaken or expand them.
+- **Delivery boundary dispositions** are control data, not advisory prose.
+  Reviewer and Security Reviewer prompts must receive the same current validated
+  production scope enforced for that child invocation, including exact-file versus
+  path-prefix semantics. A resumed run must not present the broader creation-time
+  upper bound after current policy has narrowed it.
+  A delivery-child approval uses the explicit `approved` disposition; ordinary
+  non-delivery review retains the standalone `APPROVED` signal. `approved` is
+  positive audit evidence only and must never enter terminal-stop or amendment
+  failure evidence. A malformed
+  Reviewer or Security Reviewer disposition may receive exactly one read-only
+  protocol retry with the parser error included in its history. That retry must
+  not consume a fix iteration or invoke a write agent, and a repeated malformed
+  result must fail closed.
+  `fix_in_scope` may continue the bounded fix loop;
+  `requires_scope_amendment` and `external_dependency_gap` must stop the child
+  immediately, preserve its audit evidence, and prevent later write agents,
+  validation, commit, handoff, and assembly.
+- **Delivery constraint verification** must be actionable and bounded. An
+  incomplete verifier result must identify concrete omitted constraints or
+  missing unit assignments; a bare negative completeness claim is invalid. At
+  most one constraints-only repair may run, it must preserve the complete unit
+  draft and every existing constraint identity, and its result must pass a
+  second independent verification before deterministic publication.
+- **Delivery unit contracts** must be self-contained because child agents cannot
+  read the parent source task. Source-defined identifiers and values required
+  verbatim must appear in every affected unit task. Independent preparation
+  verification may return only bounded complete source-task lines missing from
+  named units; deterministic repair may append those lines to task Markdown but
+  must not modify any other unit field, and the result must be reverified.
 - **`AnalystAgent`** must not suggest or generate test file changes — test changes are exclusively the domain of `TestWriterAgent`.
 - **`AnalystAgent`, `ReviewerAgent`, and `TestWriterAgent`** must preserve structured input contracts: parser, validator, expression engine, DSL, config, schema, and rule-engine changes need explicit accepted/rejected cases, materially different rejected input classes, expected-result-type handling when typed contexts exist, and a validation-vs-runtime failure-phase distinction when observable.
 - **`TestWriterAgent`** must only write to paths within `sandbox.allowed_test_write_paths`; production source files are off-limits.
@@ -465,7 +501,7 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
   restoring that pass and retrying once before validation is run again; a repeated omission
   should remain auditable without blocking an otherwise valid task solely on prompt format.
 - **`ReviewerAgent` and `SecurityReviewerAgent`** must never write files — use `run_readonly_agent()` only.
-- **`SecurityReviewerAgent`** fail-safe: if the LLM output contains no `APPROVED` signal, no `## Warnings` section, and no `## Security Issues` section, treat it as blocking. Never relax this — ambiguous output from the security reviewer must always fail closed.
+- **`SecurityReviewerAgent`** fail-safe: non-delivery output with no `APPROVED` signal, no `## Warnings` section, and no `## Security Issues` section is blocking. Delivery output always requires a valid disposition, including warning-only output; a missing disposition is a protocol error subject only to the bounded read-only retry. Never relax this — ambiguous output from the security reviewer must always fail closed.
 
 ### Platform neutrality
 
@@ -500,7 +536,9 @@ outputs that `sync()` may intentionally update and that should be reviewed in th
 when they already exist as tracked files. Brand-new generated outputs require explicit
 `build.sync_adopt_paths` opt-in.
 Override `is_test_only_change()` only for syntax-aware mixed source/test file detection; the
-default must remain conservative.
+default must remain conservative. If that detection requires before/after file bytes,
+override `requires_test_only_change_content()` only for plausible mixed source/test files;
+generated, binary, and oversized content must remain digest-only.
 
 For Gradle-based platforms, subclass `GradleBaseTool` (`tools/gradle_tool.py`) instead of
 `BuildTool` directly — it provides `_run()`, `_run_shell()`, `run_check()`, and
@@ -717,12 +755,62 @@ python3 -m ruff format .
 - **Never** clear or modify past entries in `state.history` — it is a permanent audit log.
 - **Never** use `state.implement_cycle_records`, `state.fix_cycle_records`, `state.review_cycle_records`, `state.security_review_cycle_records`, `state.test_write_records`, or `state.validation_artifact_records` to drive pipeline control flow — they are observability records only.
 - **Never** expose raw `TaskState`, prompts, provider output, logs, source snippets, or terminal text through public JSON/status/result output. Add an explicit projection instead.
+- **Never** trust a write-capable provider's reported file list as delivery-scope
+  enforcement. Stabilize provider-owned project setup before the baseline, rejecting
+  collisions with tracked provider configuration instead of overwriting or baselining
+  them. Then audit actual full-worktree changes after every physical Implementer and
+  Fixer provider attempt, including provider-internal retries and multiple calls inside
+  one agent run. Bind each audit to the pre-attempt commit, Git directory, common Git
+  directory, worktree root, and active Git-reference authority. Reject later Git discovery
+  that retargets those locations and fail closed on any provider or deterministic-tool
+  mutation of `HEAD`, its active ref/reflog, packed refs, or reftable metadata; Sikula alone
+  owns commits and ref movement. The binding must detect a commit followed by a reset back
+  to the captured baseline without trusting reflogs or final ancestry. Do not trust replace
+  refs or a provider-mutated index. Bind the effective Git ignore authority before
+  each mutation, neutralize repository `core.excludesFile` overrides, and fail closed if
+  `info/exclude` or an effective `.gitignore` changes before candidate enumeration completes.
+  Use Git-visible tracked, staged, and ordinary
+  untracked paths as sparse candidates, traverse ignored paths unless the active `BuildTool`
+  owns them as disposable dependency/build output, and never let that platform
+  classification hide a Git-visible candidate. A failed attempt must finish its
+  audit before another provider call is allowed. For a nested `project.root_path`, classify paths below it relative to
+  the project and treat every sibling worktree change as terminal. A production path
+  outside the effective unit scope is an evidence-preserving `unit_scope_violation`.
+  Preserve bounded actual project-relative paths from successful audits for later
+  amendment evidence, but retain outside-project paths separately so they cannot be
+  mistaken for authorizable project scope. Persist a dedicated audit-pending control
+  field before the baseline and provider call, retain it across every interruption, and
+  clear it only after the audit result is saved; `active_operation` must remain
+  visibility-only regardless of heartbeat configuration. Stream candidate hashes and retain
+  full content only for bounded, non-binary mixed source/test candidates selected by the
+  active platform. Preserve native filesystem path semantics during classification,
+  including platform `is_ephemeral_build_path()` hooks: a POSIX backslash is a filename
+  character, not a separator. Treat Windows reparse points
+  as link-like entries. Revalidate each captured lexical-to-resolved root binding before
+  every pre-mutation snapshot, including bindings reached through a link ancestor. Validate every
+  symlink or link-like entry at or below an active write root before and after the provider
+  call, and fail closed when its resolved target escapes that
+  invocation's production and explicitly active test-write roots. Construct each Fixer
+  provider-attempt policy from the separate production and test roots passed to that exact
+  `_run_once`, persist that narrower policy for interruption recovery, and restore the
+  whole-agent fallback only after its audit completes. A Fixer path is test-exempt only
+  when the current invocation actually received that test-write root;
+  apply the same effective production boundary to deterministic phases whose output may
+  be retained in the delivery worktree (`presync`, dependency `sync`, and configured
+  check `fix_command`), auditing before adoption, cleanup, revalidation, or another phase;
+  persist those roots in the interruption marker so resume cannot recompute broader
+  authority.
+- **Never** treat a persisted delivery scope or terminal boundary stop as
+  retryable authority. Current config may narrow a saved scope but cannot broaden
+  it; an exact-file root cannot become a directory prefix after dependency
+  assembly. The winning terminal failure code selects recovery, and
+  `--reset-failed` must not bypass scope, amendment, or external-dependency stops.
 - **Never** use real provider-backed nested `sikula run` or `sikula review --fix` delivery flows as tests or validation commands unless a task explicitly targets that behavior and isolates all state and providers.
 - **Always** add `from __future__ import annotations` immediately after the optional
   module docstring and before all other imports.
 - **Always** add type hints to every function signature.
 - **Always** call `state.record(self.name, action, summary)` after every meaningful agent action.
-- **Always** append one record to the appropriate `*_cycle_records` / `*_write_records` list per LLM invocation, including on exception (set `output` to `None`).
+- **Always** append one record to the appropriate `*_cycle_records` / `*_write_records` list per LLM invocation, including on exception. Non-Analyst records set `output` to `None`; Analyst records remain content-free as described above.
 - **Always** store `state.analyst_prompt` before the LLM call in `AnalystAgent` — not after.
 - **Always** set `ToolResult.error` to combined stdout+stderr (`output[-4000:]`), not stderr alone.
 - **Always** return `AgentResult(success=False, message=...)` on failure — never raise from `run()`.

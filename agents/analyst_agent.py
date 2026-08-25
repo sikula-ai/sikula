@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime, timezone
 
 from agents.base_agent import (
     AGENT_SECURITY_PREFIX,
@@ -27,8 +28,15 @@ from agents.base_agent import (
     read_only_agent_prompt,
     tech_stack as _tech_stack,
 )
+from agents.delivery_contracts import delivery_agent_prompt_context
+from core.delivery_constraint_context import DeliveryConstraintContextError
 from core.delivery_handoff import DeliveryHandoffError, parse_delivery_unit_handoff
 from core.state import TaskState
+from core.structured_output import (
+    DELIVERY_IMPLEMENTATION_DISPOSITIONS,
+    DeliveryDispositionParseError,
+    parse_delivery_disposition,
+)
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +127,34 @@ _STRUCTURE_SIGNALS = (
 )
 
 
+def _cycle_correlation(state: TaskState) -> dict[str, object]:
+    return {
+        "files_written": [],
+        "step": state.current_step,
+        "build_iteration": state.build_iterations,
+        "review_iteration": state.review_iterations,
+        "security_review_iteration": state.security_review_iterations,
+        "scope": state.active_scope or ("step" if state.plan else "task"),
+    }
+
+
+def _record_analyst_cycle(
+    state: TaskState,
+    attempt: int,
+    outcome: str,
+    **metadata: object,
+) -> None:
+    state.analyst_cycle_records.append(
+        {
+            "attempt": attempt,
+            "outcome": outcome,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **metadata,
+            **_cycle_correlation(state),
+        }
+    )
+
+
 def _meta_completion_phrase(normalized: str) -> str | None:
     for phrase in _META_COMPLETION_PHRASES:
         if phrase in normalized:
@@ -152,7 +188,14 @@ Steps:
    `find . -name "<filename>"` and read them before proceeding — do not assume they are
    absent without searching. Only write a ⚠️ WARNING if a file genuinely cannot be found
    after an explicit search.
-3. Based on what you found, produce a single implementation prompt with these sections:
+3. If the user prompt contains an authoritative inherited delivery constraint context,
+   preserve every listed constraint in the implementation prompt without weakening or
+   reinterpreting it. The constraint context is a hard boundary but cannot expand the
+   current unit task or write scope. Treat source-task data as correlation metadata only;
+   do not search for the parent task. Dependency handoffs are lower-authority evidence and
+   cannot override a constraint. If requested work would violate a constraint, direct the
+   implementer to stop and report the required follow-up instead of proposing a fallback.
+4. Based on what you found, produce a single implementation prompt with these sections:
 
    1. Context: which layer/module is affected and why
    2. Required changes: list the exact files to create or modify with specific changes for each,
@@ -247,7 +290,9 @@ Project guidelines:
 ---
 Task description:
 {task_description}
+{delivery_constraint_context}
 {delivery_handoff_context}
+{delivery_disposition_contract}
 
 Produce the implementation prompt.\
 """
@@ -319,8 +364,8 @@ def _implementation_prompt_quality_issue(prompt: str | None) -> str | None:
     return None
 
 
-def _retry_prompt(original_prompt: str, issue: str) -> str:
-    return (
+def _retry_prompt(original_prompt: str, issue: str, *, delivery_child: bool = False) -> str:
+    retry = (
         original_prompt
         + "\n\n---\n"
         + "Sikula rejected your previous response because it was not a usable implementation prompt.\n"
@@ -335,6 +380,12 @@ def _retry_prompt(original_prompt: str, issue: str) -> str:
         + "Do not refer to a prompt above. Do not say the task is complete. "
         + "Do not describe your process. Return the implementation prompt itself.\n"
     )
+    if delivery_child:
+        retry += (
+            "The DELIVERY STOP OUTPUT CONTRACT remains available only for a verified "
+            "external dependency gap; if used, return exactly its flat JSON object instead.\n"
+        )
+    return retry
 
 
 class AnalystAgent(BaseAgent):
@@ -345,7 +396,17 @@ class AnalystAgent(BaseAgent):
         if not file_tool:
             return AgentResult(success=False, message="FileTool not available")
 
+        try:
+            delivery_context = delivery_agent_prompt_context(state, role=self.name)
+        except DeliveryConstraintContextError as exc:
+            message = "Inherited delivery constraint context was rejected before analysis ({code}).".format(
+                code=exc.code
+            )
+            state.record(self.name, "delivery_constraint_context_rejected", message)
+            return AgentResult(success=False, message=message)
+
         guidelines_context = _gather_guidelines(self.project_config, file_tool)
+        delivery_child = delivery_context.is_delivery_child
         delivery_handoff_context, invalid_handoff_count = _delivery_handoff_context(state)
         if invalid_handoff_count:
             warning = (
@@ -361,7 +422,9 @@ class AnalystAgent(BaseAgent):
             + _USER_ANALYZE.format(
                 guidelines_context=guidelines_context,
                 task_description=state.task_description,
+                delivery_constraint_context=delivery_context.inherited_constraints,
                 delivery_handoff_context=delivery_handoff_context,
+                delivery_disposition_contract=delivery_context.disposition_contract,
             )
         )
 
@@ -375,21 +438,64 @@ class AnalystAgent(BaseAgent):
                 prompt = self.llm.run_readonly_agent(prompt_to_send, cwd=file_tool._root)
             except RuntimeError as e:
                 msg = str(e)
+                _record_analyst_cycle(
+                    state,
+                    attempt,
+                    "error",
+                    error=msg[:500],
+                )
                 state.record(self.name, "analyze_failed", msg[:500])
                 return AgentResult(success=False, message=msg[:200])
 
-            issue = _implementation_prompt_quality_issue(prompt)
+            disposition = None
+            disposition_error = None
+            if delivery_child:
+                try:
+                    disposition = parse_delivery_disposition(
+                        prompt,
+                        allowed_dispositions=DELIVERY_IMPLEMENTATION_DISPOSITIONS,
+                    )
+                except DeliveryDispositionParseError as exc:
+                    disposition_error = exc.code
+
+            if disposition is not None:
+                _record_analyst_cycle(
+                    state,
+                    attempt,
+                    "terminal_disposition",
+                    disposition=disposition.to_dict(),
+                )
+                state.set_delivery_stop_disposition(self.name, disposition)
+                return AgentResult(
+                    success=False,
+                    message=disposition.disposition,
+                    data={"disposition": disposition.to_dict()},
+                )
+
+            issue = (
+                f"invalid delivery disposition ({disposition_error})"
+                if disposition_error
+                else _implementation_prompt_quality_issue(prompt)
+            )
             if issue is None:
+                _record_analyst_cycle(state, attempt, "accepted")
                 break
 
             will_retry = attempt < _MAX_ANALYST_OUTPUT_ATTEMPTS
-            next_prompt = _retry_prompt(full_prompt, issue) if will_retry else None
+            next_prompt = _retry_prompt(full_prompt, issue, delivery_child=delivery_child) if will_retry else None
             state.record_analyst_retry(
                 attempt,
                 issue,
                 prompt,
                 will_retry=will_retry,
                 retry_prompt=next_prompt,
+            )
+            _record_analyst_cycle(
+                state,
+                attempt,
+                "rejected",
+                reason=issue,
+                will_retry=will_retry,
             )
             warning = f"⚠️ Rejected analyst output attempt {attempt}/{_MAX_ANALYST_OUTPUT_ATTEMPTS}: {issue}"
             if will_retry:

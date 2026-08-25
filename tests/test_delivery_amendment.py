@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from dataclasses import replace
 import hashlib
 import json
@@ -18,23 +19,35 @@ import core.worktree as worktree_module
 import sikula
 from core.delivery_amendment import (
     DeliveryAmendmentApplyResult,
+    DeliveryAmendmentDependencyIdentity,
     DeliveryAmendmentError,
+    DeliveryAmendmentFailureEvidence,
     DeliveryAmendmentProposal,
+    DeliveryAmendmentReviewEvidence,
     apply_delivery_amendment,
+    capture_delivery_amendment_failure_evidence,
     capture_delivery_amendment_source_snapshot,
     create_delivery_amendment_proposal,
     delivery_amendment_proposal_path,
     inspect_delivery_amendment_target,
     preview_delivery_amendment,
 )
+from core.delivery_constraint_context import delivery_constraint_context_fingerprint
 from core.delivery_authoring import (
     DeliveryAmendmentAuthoringDraft,
+    DeliveryAuthoringConstraintDraft,
     DeliveryAuthoringParseError,
     DeliveryAuthoringUnitDraft,
+    DeliveryConstraintVerification,
 )
 from core.delivery_assembly import DeliveryArtifactAssemblyResult
 from core.delivery_finalize import preview_delivery_finalize
-from core.delivery_plan import DeliveryBudgetExceeded, DeliveryPlanIssue, check_delivery_plan_file
+from core.delivery_plan import (
+    DeliveryBudgetExceeded,
+    DeliveryPlanIssue,
+    check_delivery_plan_file,
+    delivery_unit_constraint_context,
+)
 from core.delivery_progress import (
     DeliveryProgressLockError,
     delivery_events_path,
@@ -43,7 +56,8 @@ from core.delivery_progress import (
     render_delivery_status,
 )
 from core.delivery_run_next import preview_delivery_run_next
-from core.state import JsonStateStore
+from core.state import JsonStateStore, StateStore, TaskState
+from core.delivery_write_scope import SUPPORTED_DELIVERY_WRITE_SCOPE_SCHEMA_VERSION
 from core.delivery_unit_metadata import DeliveryUnitBudget
 from sikula_cli.delivery import (
     DeliveryChildRunResult,
@@ -58,6 +72,19 @@ from sikula_cli.delivery import (
     render_delivery_amend_apply,
     render_delivery_amend_prepare,
 )
+
+
+def _amend_context(root: Path, author: Callable[..., DeliveryAmendmentAuthoringDraft]) -> DeliveryAmendPrepareContext:
+    return DeliveryAmendPrepareContext(author, JsonStateStore(root / ".sikula" / "state"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX treats backslashes as filename characters")
+def test_amendment_evidence_preserves_posix_backslash_filename(tmp_path: Path) -> None:
+    physical_name = r"scripts\payload"
+    (tmp_path / physical_name).write_text("outside lexical scripts directory\n", encoding="utf-8")
+
+    assert delivery_amendment_module._safe_delivery_amendment_path(physical_name, root=tmp_path) == physical_name
+    assert delivery_amendment_module._safe_delivery_amendment_worktree_path(physical_name) == physical_name
 
 
 def test_automatic_amendment_metadata_is_bound_deterministically() -> None:
@@ -266,6 +293,35 @@ def _add_plan_component(plan_path: Path, component_id: str) -> None:
     plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
 
 
+def _add_target_constraint(root: Path, plan_path: Path) -> None:
+    source_task = root / ".sikula" / "tasks" / "source.md"
+    source_task.parent.mkdir(parents=True, exist_ok=True)
+    source_text = "# Source task\n\nPreserve the protocol authority boundary.\n"
+    source_task.write_text(source_text, encoding="utf-8")
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan["source_task"] = {
+        "path": source_task.relative_to(root).as_posix(),
+        "sha256": f"sha256:{hashlib.sha256(source_text.encode('utf-8')).hexdigest()}",
+    }
+    plan["constraints"] = [
+        {
+            "id": "protocol-authority",
+            "kind": "authoritative_read_only_dependency",
+            "summary": "Protocol changes remain owned by the external protocol project.",
+            "unit_ids": ["a", "c", "d"],
+            "disposition": "preserved",
+        },
+        {
+            "id": "foundation-boundary",
+            "kind": "security_boundary",
+            "summary": "Foundation behavior remains independently constrained.",
+            "unit_ids": ["b"],
+            "disposition": "preserved",
+        },
+    ]
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+
+
 def _write_progress(root: Path, first_commit: str, second_commit: str, *, target_status: str = "pending") -> Path:
     target: dict[str, str] = {
         "unit_id": "c",
@@ -355,12 +411,773 @@ def _setup(root: Path, *, target_status: str = "pending") -> tuple[Path, Path, P
     return plan_path, progress_path, proposal_root
 
 
+def _write_terminal_child_state(
+    root: Path,
+    plan_path: Path,
+    progress_path: Path,
+    *,
+    failure_code: str,
+) -> TaskState:
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    target_progress = next(unit for unit in progress["units"] if unit["unit_id"] == "c")
+    target_progress["failure_code"] = failure_code
+    progress_path.write_text(json.dumps(progress, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    checked = check_delivery_plan_file(plan_path, project_root=root)
+    assert checked.plan is not None
+    schema_version, source_task, constraints = delivery_unit_constraint_context(checked.plan, "c")
+    plan_relative = plan_path.relative_to(root).as_posix()
+    disposition_by_code = {
+        "scope_amendment_required": "requires_scope_amendment",
+        "external_dependency_gap": "external_dependency_gap",
+    }
+    action_by_code = {
+        "scope_amendment_required": "delivery_amend_prepare",
+        "external_dependency_gap": "external_dependency_follow_up",
+    }
+    state = TaskState(
+        task_id="task-c",
+        task_description="PRIVATE SOURCE TASK BODY",
+        delivery_plan_id="amend-demo",
+        delivery_unit_id="c",
+        delivery_plan_path=plan_relative,
+        delivery_constraint_context_schema_version=schema_version,
+        delivery_source_task=source_task,
+        delivery_inherited_constraints=constraints,
+        delivery_constraint_context_fingerprint=delivery_constraint_context_fingerprint(
+            schema_version=schema_version,
+            plan_id="amend-demo",
+            unit_id="c",
+            plan_path=plan_relative,
+            source_task=source_task,
+            constraints=constraints,
+        ),
+        delivery_write_scope_schema_version=SUPPORTED_DELIVERY_WRITE_SCOPE_SCHEMA_VERSION,
+        delivery_write_scope_mode="repository_default",
+        delivery_declared_write_paths=[],
+        delivery_declared_write_exact_file_paths=[],
+        delivery_effective_write_paths=["."],
+        delivery_effective_write_exact_file_paths=[],
+    )
+    state.failed = True
+    state.done = False
+    state.delivery_stop_code = failure_code
+    state.files_changed = ["src/partial.py", str(root / "private" / "secret.py")]
+    if disposition := disposition_by_code.get(failure_code):
+        disposition_value = {
+            "schema_version": 1,
+            "disposition": disposition,
+            "summary": "A required protocol change is owned outside the current unit boundary.",
+            "recommended_action": action_by_code[failure_code],
+        }
+        state.delivery_stop_disposition = {
+            **disposition_value,
+            "source": "security_reviewer",
+            "timestamp": "2026-07-20T10:03:00Z",
+        }
+        state.security_review_cycle_records = [
+            {
+                "approved": False,
+                "reviewer": "security_reviewer",
+                "disposition": disposition_value,
+                "reviewer_output": "PRIVATE REVIEW OUTPUT",
+            }
+        ]
+    JsonStateStore(root / ".sikula" / "state").save(state)
+    return state
+
+
 def _snapshot(root: Path) -> dict[str, bytes]:
     return {
         path.relative_to(root).as_posix(): path.read_bytes()
         for path in root.rglob("*")
         if path.is_file() and ".git" not in path.parts
     }
+
+
+def test_capture_amendment_failure_evidence_is_correlated_and_sanitized(tmp_path: Path) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="external_dependency_gap",
+    )
+    target = inspect_delivery_amendment_target(
+        plan_path,
+        "c",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    evidence = capture_delivery_amendment_failure_evidence(
+        target,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+    )
+
+    assert evidence is not None
+    assert evidence.failure_code == "external_dependency_gap"
+    assert evidence.recommended_action == "external_dependency_follow_up"
+    assert evidence.requires_external_follow_up is True
+    assert evidence.declared_write_paths == ()
+    assert evidence.effective_write_paths == (".",)
+    assert evidence.changed_count == 2
+    assert evidence.changed_paths == ("src/partial.py",)
+    assert evidence.omitted_changed_paths_count == 1
+    assert evidence.security_reviewer.records_count == 1
+    assert evidence.security_reviewer.dispositions[0]["disposition"] == "external_dependency_gap"
+
+
+def test_capture_amendment_failure_evidence_ignores_prior_delivery_approval(tmp_path: Path) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="external_dependency_gap",
+    )
+    state.security_review_cycle_records.insert(
+        0,
+        {
+            "approved": True,
+            "reviewer": "security_reviewer",
+            "disposition": {
+                "schema_version": 1,
+                "disposition": "approved",
+                "summary": "No blocking security issues were found in the earlier review.",
+                "recommended_action": "continue",
+            },
+            "reviewer_output": "PRIVATE EARLIER REVIEW OUTPUT",
+        },
+    )
+    JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+    target = inspect_delivery_amendment_target(
+        plan_path,
+        "c",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    evidence = capture_delivery_amendment_failure_evidence(
+        target,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+    )
+
+    assert evidence is not None
+    assert evidence.security_reviewer.records_count == 2
+    assert evidence.security_reviewer.issues_count == 1
+    assert [item["disposition"] for item in evidence.security_reviewer.dispositions] == ["external_dependency_gap"]
+
+
+def test_capture_amendment_failure_evidence_uses_injected_state_store(tmp_path: Path) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="external_dependency_gap",
+    )
+    target = inspect_delivery_amendment_target(
+        plan_path,
+        "c",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    class InjectedStateStore(StateStore):
+        def load(self, task_id: str) -> TaskState | None:
+            return state if task_id == state.task_id else None
+
+    evidence = capture_delivery_amendment_failure_evidence(
+        target,
+        state_store=InjectedStateStore(),
+    )
+
+    assert evidence is not None
+    assert evidence.child_task_id == state.task_id
+    assert evidence.stop_disposition == {
+        "schema_version": 1,
+        "disposition": "external_dependency_gap",
+        "summary": "A required protocol change is owned outside the current unit boundary.",
+        "recommended_action": "external_dependency_follow_up",
+        "source": "security_reviewer",
+    }
+    serialized = json.dumps(evidence.to_dict(), sort_keys=True)
+    assert "PRIVATE SOURCE TASK BODY" not in serialized
+    assert "PRIVATE REVIEW OUTPUT" not in serialized
+    assert str(tmp_path) not in serialized
+    assert "secret.py" not in serialized
+
+
+def test_capture_amendment_failure_evidence_uses_runtime_narrowed_scope(tmp_path: Path) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="scope_amendment_required",
+    )
+    state.delivery_runtime_write_scope_binding = {
+        "schema_version": 1,
+        "status": "bound",
+        "roots": [{"path": "src", "resolved_path": "src", "exact_file": False}],
+    }
+    JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+    target = inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    evidence = capture_delivery_amendment_failure_evidence(
+        target,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+    )
+
+    assert evidence is not None
+    assert evidence.declared_write_paths == ()
+    assert evidence.effective_write_paths == ("src",)
+
+
+def test_capture_amendment_failure_evidence_uses_child_worktree_for_all_scope_evidence(tmp_path: Path) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    next(unit for unit in plan["units"] if unit["id"] == "c")["scope_paths"] = ["src/alias"]
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="scope_amendment_required",
+    )
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "operator-target").mkdir()
+    (tmp_path / "src" / "alias").symlink_to("operator-target", target_is_directory=True)
+    child_root = tmp_path / ".sikula" / "worktrees" / state.task_id / "project"
+    (child_root / "src" / "alias").mkdir(parents=True)
+    state.worktree_path = str(child_root)
+    state.worktree_base = str(child_root.parent)
+    state.delivery_write_scope_mode = "unit_explicit"
+    state.delivery_declared_write_paths = ["src/alias"]
+    state.delivery_effective_write_paths = ["src/alias"]
+    state.delivery_runtime_write_scope_binding = {
+        "schema_version": 1,
+        "status": "bound",
+        "roots": [{"path": "src/alias", "resolved_path": "src/alias", "exact_file": False}],
+    }
+    state.files_changed = ["src/alias/partial.py"]
+    JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+    target = inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    evidence = capture_delivery_amendment_failure_evidence(
+        target,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+    )
+
+    assert evidence is not None
+    assert evidence.declared_write_paths == ("src/alias",)
+    assert evidence.effective_write_paths == ("src/alias",)
+    assert evidence.changed_paths == ("src/alias/partial.py",)
+
+
+def test_capture_amendment_failure_evidence_preserves_scope_retarget_stop(tmp_path: Path) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    next(unit for unit in plan["units"] if unit["id"] == "c")["scope_paths"] = ["src/alias"]
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="unit_scope_violation",
+    )
+    (tmp_path / "src" / "alias").mkdir(parents=True)
+    child_root = tmp_path / ".sikula" / "worktrees" / state.task_id / "project"
+    (child_root / "src" / "apps").mkdir(parents=True)
+    (child_root / "src" / "alias").symlink_to("apps", target_is_directory=True)
+    state.worktree_path = str(child_root)
+    state.worktree_base = str(child_root.parent)
+    state.delivery_write_scope_mode = "unit_explicit"
+    state.delivery_declared_write_paths = ["src/alias"]
+    state.delivery_effective_write_paths = ["src/alias"]
+    state.delivery_runtime_write_scope_binding = {
+        "schema_version": 1,
+        "status": "denied",
+        "roots": [],
+    }
+    state.files_changed = []
+    JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+    target = inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    evidence = capture_delivery_amendment_failure_evidence(
+        target,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+    )
+
+    assert evidence is not None
+    assert evidence.declared_write_paths == ("src/alias",)
+    assert evidence.effective_write_paths == ("src/alias",)
+    assert evidence.recommended_action == "delivery_amend_prepare"
+
+
+def test_capture_amendment_failure_evidence_preserves_post_binding_scope_retarget(tmp_path: Path) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    next(unit for unit in plan["units"] if unit["id"] == "c")["scope_paths"] = ["src/alias"]
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="unit_scope_violation",
+    )
+    child_root = tmp_path / ".sikula" / "worktrees" / state.task_id / "project"
+    alias = child_root / "src" / "alias"
+    alias.mkdir(parents=True)
+    outside = tmp_path / "outside-child"
+    outside.mkdir()
+    alias.rmdir()
+    try:
+        alias.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+    state.worktree_path = str(child_root)
+    state.worktree_base = str(child_root.parent)
+    state.delivery_write_scope_mode = "unit_explicit"
+    state.delivery_declared_write_paths = ["src/alias"]
+    state.delivery_effective_write_paths = ["src/alias"]
+    state.delivery_runtime_write_scope_binding = {
+        "schema_version": 1,
+        "status": "bound",
+        "roots": [{"path": "src/alias", "resolved_path": "src/alias", "exact_file": False}],
+    }
+    JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+    target = inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    evidence = capture_delivery_amendment_failure_evidence(
+        target,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+    )
+
+    assert evidence is not None
+    assert evidence.declared_write_paths == ("src/alias",)
+    assert evidence.effective_write_paths == ("src/alias",)
+    assert evidence.recommended_action == "delivery_amend_prepare"
+
+
+def test_capture_amendment_failure_evidence_rejects_child_correlation_mismatch(tmp_path: Path) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="scope_amendment_required",
+    )
+    state.delivery_unit_id = "other-unit"
+    JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+    target = inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        capture_delivery_amendment_failure_evidence(
+            target,
+            state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        )
+
+    assert exc_info.value.issue.code == "delivery_amend.failure_evidence_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("constraint_context_invalid", "delivery_amend.failure_evidence_invalid"),
+        ("constraint_context_absent", "delivery_amend.failure_evidence_invalid"),
+        ("write_scope_invalid", "delivery_amend.failure_evidence_invalid"),
+        ("write_scope_absent", "delivery_amend.failure_evidence_mismatch"),
+        ("runtime_write_scope_invalid", "delivery_amend.failure_evidence_invalid"),
+        ("handoffs_malformed", "delivery_amend.failure_evidence_invalid"),
+        ("review_malformed", "delivery_amend.failure_evidence_invalid"),
+        ("changed_files_malformed", "delivery_amend.failure_evidence_invalid"),
+        ("validation_malformed", "delivery_amend.failure_evidence_invalid"),
+        ("stop_disposition_invalid", "delivery_amend.failure_evidence_invalid"),
+        ("stop_disposition_absent", "delivery_amend.failure_evidence_mismatch"),
+    ],
+)
+def test_capture_amendment_failure_evidence_fails_closed_on_malformed_child_state(
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="external_dependency_gap",
+    )
+    if case == "constraint_context_invalid":
+        state.delivery_constraint_context_schema_version = 999
+    elif case == "constraint_context_absent":
+        state.delivery_constraint_context_schema_version = None
+        state.delivery_source_task = None
+        state.delivery_inherited_constraints = []
+        state.delivery_constraint_context_fingerprint = None
+    elif case == "write_scope_invalid":
+        state.delivery_write_scope_schema_version = 999
+    elif case == "write_scope_absent":
+        state.delivery_write_scope_schema_version = None
+        state.delivery_write_scope_mode = None
+        state.delivery_declared_write_paths = []
+        state.delivery_declared_write_exact_file_paths = None
+        state.delivery_effective_write_paths = []
+        state.delivery_effective_write_exact_file_paths = None
+    elif case == "runtime_write_scope_invalid":
+        state.delivery_runtime_write_scope_binding = {"schema_version": 999, "status": "bound", "roots": []}
+    elif case == "handoffs_malformed":
+        state.delivery_dependency_handoffs = None  # type: ignore[assignment]
+    elif case == "review_malformed":
+        state.review_cycle_records = None  # type: ignore[assignment]
+    elif case == "changed_files_malformed":
+        state.files_changed = None  # type: ignore[assignment]
+    elif case == "validation_malformed":
+        state.validation_cycle_records = None  # type: ignore[assignment]
+    elif case == "stop_disposition_invalid":
+        state.delivery_stop_disposition = {"disposition": "external_dependency_gap"}
+    elif case == "stop_disposition_absent":
+        state.delivery_stop_disposition = None
+    state_path = tmp_path / ".sikula" / "state" / f"{state.task_id}.json"
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    for field_name in (
+        "delivery_constraint_context_schema_version",
+        "delivery_source_task",
+        "delivery_inherited_constraints",
+        "delivery_constraint_context_fingerprint",
+        "delivery_write_scope_schema_version",
+        "delivery_write_scope_mode",
+        "delivery_declared_write_paths",
+        "delivery_declared_write_exact_file_paths",
+        "delivery_effective_write_paths",
+        "delivery_effective_write_exact_file_paths",
+        "delivery_runtime_write_scope_binding",
+        "delivery_dependency_handoffs",
+        "review_cycle_records",
+        "files_changed",
+        "validation_cycle_records",
+        "delivery_stop_disposition",
+    ):
+        persisted[field_name] = getattr(state, field_name)
+    state_path.write_text(json.dumps(persisted, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    target = inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        capture_delivery_amendment_failure_evidence(
+            target,
+            state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        )
+
+    assert exc_info.value.issue.code == expected_code
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("changed_count_bool", "delivery_amend.failure_evidence_invalid"),
+        ("violation_count_negative", "delivery_amend.failure_evidence_invalid"),
+        ("changed_paths_malformed", "delivery_amend.failure_evidence_invalid"),
+        ("counts_inconsistent", "delivery_amend.failure_evidence_invalid"),
+        ("outside_paths_malformed", "delivery_amend.failure_evidence_invalid"),
+        ("outside_counts_inconsistent", "delivery_amend.failure_evidence_invalid"),
+        ("total_violation_count_inconsistent", "delivery_amend.failure_evidence_invalid"),
+    ],
+)
+def test_capture_amendment_scope_audit_rejects_invalid_counts_and_paths(
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="unit_scope_violation",
+    )
+    metadata: dict[str, object] = {
+        "code": "unit_scope_violation",
+        "changed_count": 2,
+        "violation_count": 1,
+        "changed_paths": ["src/partial.py", "docs/escaped.md"],
+        "violation_paths": ["docs/escaped.md"],
+    }
+    if case == "changed_count_bool":
+        metadata["changed_count"] = True
+    elif case == "violation_count_negative":
+        metadata["violation_count"] = -1
+    elif case == "changed_paths_malformed":
+        metadata["changed_paths"] = "src/partial.py"
+    elif case == "counts_inconsistent":
+        metadata["violation_count"] = 0
+    elif case == "outside_paths_malformed":
+        metadata["outside_project_count"] = 1
+        metadata["outside_project_paths"] = "shared/escaped.py"
+    elif case == "outside_counts_inconsistent":
+        metadata["outside_project_count"] = 0
+        metadata["outside_project_paths"] = ["shared/escaped.py"]
+    elif case == "total_violation_count_inconsistent":
+        metadata["outside_project_count"] = 1
+        metadata["outside_project_paths"] = ["shared/escaped.py"]
+    state.validation_cycle_records = [
+        {
+            "phase": "delivery_scope_audit",
+            "status": "failed",
+            "metadata": metadata,
+        }
+    ]
+    JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+    target = inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        capture_delivery_amendment_failure_evidence(
+            target,
+            state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        )
+
+    assert exc_info.value.issue.code == expected_code
+
+
+def test_capture_amendment_scope_violation_uses_bounded_audit_paths(tmp_path: Path) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="unit_scope_violation",
+    )
+    state.validation_cycle_records = [
+        {
+            "phase": "delivery_scope_audit",
+            "status": "failed",
+            "metadata": {
+                "code": "unit_scope_violation",
+                "changed_count": 3,
+                "violation_count": 1,
+                "changed_paths": ["docs/escaped.md", "src/partial.py"],
+                "violation_paths": ["docs/escaped.md"],
+            },
+        }
+    ]
+    JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+    target = inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    evidence = capture_delivery_amendment_failure_evidence(
+        target,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+    )
+
+    assert evidence is not None
+    assert evidence.recommended_action == "delivery_amend_prepare"
+    assert evidence.changed_count == 3
+    assert evidence.changed_paths == ("docs/escaped.md", "src/partial.py")
+    assert evidence.omitted_changed_paths_count == 1
+    assert evidence.violation_count == 1
+    assert evidence.violation_paths == ("docs/escaped.md",)
+
+
+def test_capture_amendment_preserves_separate_outside_project_violation_paths(tmp_path: Path) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="unit_scope_violation",
+    )
+    state.files_changed = ["src/partial.py"]
+    state.validation_cycle_records = [
+        {
+            "phase": "delivery_scope_audit",
+            "status": "failed",
+            "metadata": {
+                "code": "unit_scope_violation",
+                "changed_count": 2,
+                "changed_paths": ["src/partial.py"],
+                "violation_count": 1,
+                "violation_paths": [],
+                "outside_project_count": 1,
+                "outside_project_paths": ["shared/escaped.py"],
+            },
+        }
+    ]
+    JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+    target = inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    evidence = capture_delivery_amendment_failure_evidence(
+        target,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+    )
+
+    assert evidence is not None
+    assert evidence.schema_version == 2
+    assert evidence.changed_count == 2
+    assert evidence.changed_paths == ("src/partial.py",)
+    assert evidence.omitted_changed_paths_count == 1
+    assert evidence.violation_count == 1
+    assert evidence.violation_paths == ()
+    assert evidence.outside_project_count == 1
+    assert evidence.outside_project_paths == ("shared/escaped.py",)
+    assert evidence.omitted_outside_project_paths_count == 0
+    assert evidence.to_dict()["scope_violations"]["outside_project"] == {
+        "count": 1,
+        "paths": ["shared/escaped.py"],
+        "omitted_paths_count": 0,
+    }
+
+
+def test_capture_amendment_bounds_and_sanitizes_outside_project_paths(tmp_path: Path) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="unit_scope_violation",
+    )
+    state.files_changed = ["src/partial.py"]
+    outside_values = [
+        "shared/escaped.py",
+        "shared/escaped.py",
+        "../private.py",
+        *(f"shared/generated-{index}.py" for index in range(101)),
+    ]
+    outside_count = len(outside_values)
+    state.validation_cycle_records = [
+        {
+            "phase": "delivery_scope_audit",
+            "status": "failed",
+            "metadata": {
+                "code": "unit_scope_violation",
+                "changed_count": outside_count + 1,
+                "changed_paths": ["src/partial.py"],
+                "violation_count": outside_count,
+                "violation_paths": [],
+                "outside_project_count": outside_count,
+                "outside_project_paths": outside_values,
+            },
+        }
+    ]
+    JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+    target = inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    evidence = capture_delivery_amendment_failure_evidence(
+        target,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+    )
+
+    assert evidence is not None
+    assert evidence.outside_project_count == outside_count
+    assert len(evidence.outside_project_paths) == delivery_amendment_module._MAX_DELIVERY_AMENDMENT_EVIDENCE_PATHS
+    assert "shared/escaped.py" in evidence.outside_project_paths
+    assert "../private.py" not in evidence.outside_project_paths
+    assert evidence.omitted_outside_project_paths_count == 4
+
+
+def test_capture_amendment_uses_paths_from_successful_scope_audit(tmp_path: Path) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="scope_amendment_required",
+    )
+    state.files_changed = ["src/tracked.py"]
+    state.validation_cycle_records = [
+        {
+            "phase": "delivery_scope_audit",
+            "status": "passed",
+            "metadata": {
+                "code": "delivery_scope_audit_passed",
+                "changed_count": 2,
+                "changed_paths": ["src/tracked.py", "src/ignored.env"],
+                "violation_count": 0,
+            },
+        }
+    ]
+    JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+    target = inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    evidence = capture_delivery_amendment_failure_evidence(
+        target,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+    )
+
+    assert evidence is not None
+    assert evidence.failure_code == "scope_amendment_required"
+    assert evidence.changed_count == 2
+    assert evidence.changed_paths == ("src/ignored.env", "src/tracked.py")
+    assert evidence.omitted_changed_paths_count == 0
+
+
+def test_capture_amendment_ignores_unrelated_and_legacy_successful_audits(tmp_path: Path) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="scope_amendment_required",
+    )
+    state.files_changed = ["src/tracked.py"]
+    state.validation_cycle_records = [
+        {"malformed": True},
+        {"phase": "build", "status": "failed"},
+        {"phase": "delivery_scope_audit", "status": "unknown", "metadata": {}},
+        {
+            "phase": "delivery_scope_audit",
+            "status": "passed",
+            "metadata": {"code": "unrelated", "changed_count": 99},
+        },
+        {
+            "phase": "delivery_scope_audit",
+            "status": "passed",
+            "metadata": {"code": "delivery_scope_audit_passed", "changed_count": 0},
+        },
+    ]
+    JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+    target = inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    evidence = capture_delivery_amendment_failure_evidence(
+        target,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+    )
+
+    assert evidence is not None
+    assert evidence.changed_count == 1
+    assert evidence.changed_paths == ("src/tracked.py",)
+    assert evidence.omitted_changed_paths_count == 0
+
+
+def test_scope_violation_recovery_ignores_lower_priority_external_disposition(tmp_path: Path) -> None:
+    plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="unit_scope_violation",
+    )
+    state.delivery_stop_disposition = {
+        "schema_version": 1,
+        "disposition": "external_dependency_gap",
+        "summary": "The implementer first reported an external dependency.",
+        "recommended_action": "external_dependency_follow_up",
+        "source": "implementer",
+        "timestamp": "2026-07-20T10:03:00Z",
+    }
+    JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+    target = inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
+
+    evidence = capture_delivery_amendment_failure_evidence(
+        target,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+    )
+
+    assert evidence is not None
+    assert evidence.failure_code == "unit_scope_violation"
+    assert evidence.recommended_action == "delivery_amend_prepare"
+    assert state.delivery_stop_disposition["disposition"] == "external_dependency_gap"
+    assert evidence.stop_disposition is None
+    assert evidence.requires_external_follow_up is False
 
 
 def test_pending_middle_split_preserves_progress_and_rewires_to_all_leaves(tmp_path: Path) -> None:
@@ -663,6 +1480,133 @@ def test_amendment_redacts_asset_assignment_check_failure(
     assert exc_info.value.issue.code == "delivery_amend.asset_assignment_check_failed"
     assert private_detail not in str(exc_info.value)
     assert not proposal_root.exists()
+
+
+def test_constrained_middle_split_reassigns_constraint_to_every_replacement(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    _add_target_constraint(tmp_path, plan_path)
+    asset_path = ".sikula/task-assets/protocol-reference.png"
+    asset_file = tmp_path / asset_path
+    asset_file.parent.mkdir(parents=True)
+    asset_file.write_bytes(b"protocol reference")
+    target_task = plan_path.parent / "units" / "c.md"
+    target_task.write_text(
+        target_task.read_text(encoding="utf-8").rstrip()
+        + f"\n\n## Assets\n\n- Reference asset: `{asset_path}`\n  - Usage: reference only.\n",
+        encoding="utf-8",
+    )
+    before = check_delivery_plan_file(plan_path, project_root=tmp_path)
+    assert before.valid is True
+    asset_draft = _draft()
+    asset_draft.replacement_units[0] = replace(
+        asset_draft.replacement_units[0],
+        asset_paths=[asset_path],
+    )
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        create_delivery_amendment_proposal(
+            plan_path,
+            "c",
+            asset_draft,
+            project_root=tmp_path,
+            proposal_root=proposal_root,
+            project_config=_project_config(tmp_path),
+        )
+    assert exc_info.value.issue.code == "delivery_amend.constraint_verification_required"
+
+    draft = replace(
+        asset_draft,
+        constraint_verification=DeliveryConstraintVerification(
+            constraints_complete=True,
+            constraints=[
+                DeliveryAuthoringConstraintDraft(
+                    id="protocol-authority",
+                    kind="authoritative_read_only_dependency",
+                    summary="Protocol changes remain owned by the external protocol project.",
+                    unit_ids=["c-1", "c-2", "c-3"],
+                    disposition="preserved",
+                )
+            ],
+        ),
+    )
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path,
+        "c",
+        draft,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+        project_config=_project_config(tmp_path),
+    )
+    result = apply_delivery_amendment(
+        plan_path,
+        proposal.proposal_id,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.applied is True
+    assert f"- Reference asset: `{asset_path}`" in proposal.replacement_units[0].task_markdown
+    amended = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    constraint = amended["constraints"][0]
+    assert constraint["unit_ids"] == ["a", "c-1", "c-2", "c-3", "d"]
+    assert "c" not in constraint["unit_ids"]
+    assert amended["constraints"][1]["unit_ids"] == ["b"]
+
+    checked = check_delivery_plan_file(plan_path, project_root=tmp_path)
+    assert checked.valid is True
+    assert checked.plan is not None
+    for replacement_id in proposal.replacement_ids:
+        _, source_task, inherited = delivery_unit_constraint_context(checked.plan, replacement_id)
+        assert source_task == amended["source_task"]
+        assert inherited == [constraint]
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("mismatch", "delivery_amend.constraint_verification_invalid"),
+        ("incomplete", "delivery_amend.constraint_verification_incomplete"),
+        ("conflict", "delivery_amend.constraint_conflict"),
+        ("needs_review", "delivery_amend.constraint_review_required"),
+    ],
+)
+def test_constrained_amendment_rejects_untrusted_verification(
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    _add_target_constraint(tmp_path, plan_path)
+    verification_constraints = []
+    if case != "mismatch":
+        verification_constraints = [
+            DeliveryAuthoringConstraintDraft(
+                id="protocol-authority",
+                kind="authoritative_read_only_dependency",
+                summary="Protocol changes remain owned by the external protocol project.",
+                unit_ids=["c-1", "c-2", "c-3"],
+                disposition="preserved" if case == "incomplete" else case,
+            )
+        ]
+    draft = replace(
+        _draft(),
+        constraint_verification=DeliveryConstraintVerification(
+            constraints_complete=case != "incomplete",
+            constraints=verification_constraints,
+        ),
+    )
+
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        create_delivery_amendment_proposal(
+            plan_path,
+            "c",
+            draft,
+            project_root=tmp_path,
+            proposal_root=proposal_root,
+        )
+
+    assert exc_info.value.issue.code == expected_code
 
 
 def test_prepare_stores_componentless_replacements_without_component_metadata(tmp_path: Path) -> None:
@@ -2011,7 +2955,7 @@ def test_amend_prepare_rejects_private_target_before_authoring(
     }
 
     with pytest.raises(SystemExit) as exc_info:
-        cmd_delivery_amend_prepare(args, cfg, DeliveryAmendPrepareContext(author))
+        cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author))
 
     payload = json.loads(capsys.readouterr().out)
     assert exc_info.value.code == 1
@@ -2062,7 +3006,7 @@ def test_amend_prepare_rejects_target_under_configured_private_root_before_autho
     cfg = {**_project_config(tmp_path), "tasks": tasks}
 
     with pytest.raises(SystemExit) as exc_info:
-        cmd_delivery_amend_prepare(args, cfg, DeliveryAmendPrepareContext(author))
+        cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author))
 
     payload = json.loads(capsys.readouterr().out)
     assert exc_info.value.code == 1
@@ -2104,7 +3048,7 @@ def test_amend_prepare_rejects_symlink_contract_before_authoring(
     }
 
     with pytest.raises(SystemExit) as exc_info:
-        cmd_delivery_amend_prepare(args, cfg, DeliveryAmendPrepareContext(author))
+        cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author))
 
     payload = json.loads(capsys.readouterr().out)
     assert exc_info.value.code == 1
@@ -2181,7 +3125,7 @@ def test_amend_prepare_rejects_filtered_contract_before_storing_proposal(
     }
 
     with pytest.raises(SystemExit) as exc_info:
-        cmd_delivery_amend_prepare(args, cfg, DeliveryAmendPrepareContext(author))
+        cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author))
 
     payload = json.loads(capsys.readouterr().out)
     assert exc_info.value.code == 1
@@ -2231,7 +3175,7 @@ def test_amend_prepare_rejects_target_symlink_race_before_model_read(
     }
 
     with pytest.raises(SystemExit) as exc_info:
-        cmd_delivery_amend_prepare(args, cfg, DeliveryAmendPrepareContext(author_with_race))
+        cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author_with_race))
 
     payload = json.loads(capsys.readouterr().out)
     assert exc_info.value.code == 1
@@ -3476,6 +4420,229 @@ def test_main_amend_commands_delegate_to_delivery_cli() -> None:
     apply.assert_called_once_with(args, cfg)
 
 
+def test_amend_prepare_external_failure_returns_follow_up_without_proposal(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path, target_status="failed")
+    _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="external_dependency_gap",
+    )
+    calls = []
+
+    def author(**kwargs):
+        calls.append(kwargs)
+        return _draft()
+
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        split_unit="c",
+        json=True,
+        agent_model=None,
+        agent_provider=None,
+        agent_timeout=None,
+    )
+    cfg = {
+        **_project_config(tmp_path),
+        "tasks": {"contract_report_dir": str(proposal_root)},
+    }
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert payload["prepared"] is False
+    assert payload["proposal_id"] is None
+    assert payload["proposal_path"] is None
+    assert payload["recommended_action"] == "external_dependency_follow_up"
+    assert [issue["code"] for issue in payload["errors"]] == ["delivery_amend.external_dependency_follow_up_required"]
+    assert calls == []
+    assert not list(proposal_root.rglob("*.json"))
+    serialized = json.dumps(payload)
+    assert "PRIVATE SOURCE TASK BODY" not in serialized
+    assert "PRIVATE REVIEW OUTPUT" not in serialized
+    assert str(tmp_path) not in serialized
+
+
+def test_amend_prepare_scope_stop_uses_evidence_and_can_publish_valid_proposal(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path, target_status="failed")
+    _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="scope_amendment_required",
+    )
+    evidence_seen = None
+
+    def author(**kwargs):
+        nonlocal evidence_seen
+        evidence_seen = kwargs["failure_evidence"]
+        return _draft()
+
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        split_unit="c",
+        json=True,
+        agent_model=None,
+        agent_provider=None,
+        agent_timeout=None,
+    )
+    cfg = {
+        **_project_config(tmp_path),
+        "tasks": {"contract_report_dir": str(proposal_root)},
+    }
+
+    cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["prepared"] is True
+    assert payload["proposal_id"] is not None
+    assert payload["recommended_action"] is None
+    assert evidence_seen is not None
+    assert evidence_seen.failure_code == "scope_amendment_required"
+    assert len(list(proposal_root.rglob("*.json"))) == 1
+
+
+def test_amend_prepare_uses_winning_scope_violation_over_stale_external_disposition(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path, target_status="failed")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="unit_scope_violation",
+    )
+    state.delivery_stop_disposition = {
+        "schema_version": 1,
+        "disposition": "external_dependency_gap",
+        "summary": "The implementer first reported an external dependency.",
+        "recommended_action": "external_dependency_follow_up",
+        "source": "implementer",
+        "timestamp": "2026-07-20T10:03:00Z",
+    }
+    JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+    evidence_seen = None
+
+    def author(**kwargs):
+        nonlocal evidence_seen
+        evidence_seen = kwargs["failure_evidence"]
+        return _draft()
+
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        split_unit="c",
+        json=True,
+        agent_model=None,
+        agent_provider=None,
+        agent_timeout=None,
+    )
+    cfg = {
+        **_project_config(tmp_path),
+        "tasks": {"contract_report_dir": str(proposal_root)},
+    }
+
+    cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["prepared"] is True
+    assert payload["recommended_action"] is None
+    assert evidence_seen is not None
+    assert evidence_seen.failure_code == "unit_scope_violation"
+    assert evidence_seen.stop_disposition is None
+    assert evidence_seen.requires_external_follow_up is False
+
+
+def test_amend_prepare_scope_stop_can_return_external_follow_up_without_proposal(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path, target_status="failed")
+    _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="scope_amendment_required",
+    )
+
+    def author(**_kwargs):
+        return replace(
+            _draft(),
+            replacement_units=[],
+            disposition="external_dependency_follow_up_required",
+            summary="The required protocol change remains externally owned.",
+        )
+
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        split_unit="c",
+        json=True,
+        agent_model=None,
+        agent_provider=None,
+        agent_timeout=None,
+    )
+    cfg = {
+        **_project_config(tmp_path),
+        "tasks": {"contract_report_dir": str(proposal_root)},
+    }
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert payload["recommended_action"] == "external_dependency_follow_up"
+    assert payload["proposal_id"] is None
+    assert not list(proposal_root.rglob("*.json"))
+
+
+def test_amend_prepare_rejects_child_evidence_changed_during_authoring(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan_path, progress_path, proposal_root = _setup(tmp_path, target_status="failed")
+    state = _write_terminal_child_state(
+        tmp_path,
+        plan_path,
+        progress_path,
+        failure_code="scope_amendment_required",
+    )
+
+    def author(**_kwargs):
+        state.files_changed.append("src/raced.py")
+        JsonStateStore(tmp_path / ".sikula" / "state").save(state)
+        return _draft()
+
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        split_unit="c",
+        json=True,
+        agent_model=None,
+        agent_provider=None,
+        agent_timeout=None,
+    )
+    cfg = {
+        **_project_config(tmp_path),
+        "tasks": {"contract_report_dir": str(proposal_root)},
+    }
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert [issue["code"] for issue in payload["errors"]] == ["delivery_amend.authoring_inputs_stale"]
+    assert not list(proposal_root.rglob("*.json"))
+
+
 def test_amend_prepare_cli_stores_allowlisted_proposal_projection(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -3502,7 +4669,7 @@ def test_amend_prepare_cli_stores_allowlisted_proposal_projection(
         "tasks": {"contract_report_dir": str(proposal_root)},
     }
 
-    cmd_delivery_amend_prepare(args, cfg, DeliveryAmendPrepareContext(author))
+    cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author))
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["prepared"] is True
@@ -3537,7 +4704,7 @@ def test_amend_prepare_cli_reports_authoring_warning(tmp_path: Path, capsys: pyt
         "tasks": {"contract_report_dir": str(proposal_root)},
     }
 
-    cmd_delivery_amend_prepare(args, cfg, DeliveryAmendPrepareContext(author))
+    cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author))
 
     payload = json.loads(capsys.readouterr().out)
     assert [issue["code"] for issue in payload["warnings"]] == ["delivery_amend.authoring_warnings_present"]
@@ -3613,7 +4780,7 @@ def test_amend_prepare_cli_projects_authoring_failures(
     }
 
     with pytest.raises(SystemExit) as exc_info:
-        cmd_delivery_amend_prepare(args, cfg, DeliveryAmendPrepareContext(author))
+        cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author))
 
     payload = json.loads(capsys.readouterr().out)
     assert exc_info.value.code == 1
@@ -3675,6 +4842,7 @@ def test_main_amend_authoring_adapter_attaches_audit_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan_path, _, proposal_root = _setup(tmp_path)
+    _add_target_constraint(tmp_path, plan_path)
     target = inspect_delivery_amendment_target(
         plan_path,
         "c",
@@ -3689,8 +4857,22 @@ def test_main_amend_authoring_adapter_attaches_audit_path(
             assert kwargs["target_unit_id"] == "c"
             assert kwargs["downstream_units"][0]["id"] == "d"
             assert kwargs["component_ids"] == []
+            assert kwargs["applicable_constraints"] == [
+                {
+                    "id": "protocol-authority",
+                    "kind": "authoritative_read_only_dependency",
+                    "summary": "Protocol changes remain owned by the external protocol project.",
+                    "unit_ids": ["a", "c", "d"],
+                    "disposition": "preserved",
+                }
+            ]
+            assert kwargs["failure_evidence"] == {"failure_code": "unit_scope_violation"}
             kwargs["audit_recorder"]({"phase": "test"})
             return _draft()
+
+    class FailureEvidence:
+        def to_prompt_dict(self):
+            return {"failure_code": "unit_scope_violation"}
 
     audit_records = []
     monkeypatch.setattr(sikula, "_create_delivery_preparation_agent", lambda args, cfg: Agent())
@@ -3705,10 +4887,106 @@ def test_main_amend_authoring_adapter_attaches_audit_path(
         cfg=_project_config(tmp_path),
         target=target,
         source_snapshot=snapshot,
+        failure_evidence=FailureEvidence(),
     )
 
     assert draft.audit_path == ".sikula/contract-reports/amend-audit.jsonl"
     assert audit_records == [{"phase": "test"}]
+
+
+def test_main_amend_authoring_adapter_projects_failure_evidence_identities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    target = inspect_delivery_amendment_target(
+        plan_path,
+        "c",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+    snapshot = capture_delivery_amendment_source_snapshot(target)
+    private_plan_id = str(tmp_path / "private-plan")
+    private_target_id = str(tmp_path / "private-target")
+    private_target_child_id = str(tmp_path / "private-target-child")
+    private_constraint_id = str(tmp_path / "private-constraint")
+    private_unit_id = str(tmp_path / "private-unit")
+    private_child_id = str(tmp_path / "private-child")
+    empty_review = DeliveryAmendmentReviewEvidence(0, 0, (), ())
+    failure_evidence = DeliveryAmendmentFailureEvidence(
+        plan_id=private_plan_id,
+        unit_id=private_target_id,
+        child_task_id=private_target_child_id,
+        failure_code="unit_scope_violation",
+        recommended_action="delivery_amend_prepare",
+        inherited_constraints=(
+            {
+                "id": private_constraint_id,
+                "kind": "authoritative_read_only_dependency",
+                "summary": "Use the established contract without changing its owner.",
+                "unit_ids": ["c", private_unit_id],
+                "disposition": "preserved",
+            },
+        ),
+        declared_write_paths=("src",),
+        effective_write_paths=("src",),
+        changed_paths=(),
+        changed_count=0,
+        omitted_changed_paths_count=0,
+        violation_paths=(),
+        violation_count=0,
+        outside_project_paths=(),
+        outside_project_count=0,
+        omitted_outside_project_paths_count=0,
+        reviewer=empty_review,
+        security_reviewer=empty_review,
+        stop_disposition=None,
+        dependency_handoffs=(
+            DeliveryAmendmentDependencyIdentity(
+                plan_id="amend-demo",
+                unit_id=private_unit_id,
+                child_task_id=private_child_id,
+            ),
+        ),
+        fingerprint=f"sha256:{'a' * 64}",
+    )
+
+    class Agent:
+        def author_delivery_amendment(self, **kwargs):
+            projected = kwargs["failure_evidence"]
+            serialized = json.dumps(projected)
+            assert str(tmp_path) not in serialized
+            assert projected["plan_id"].startswith("<redacted:")
+            assert projected["unit_id"].startswith("<redacted:")
+            assert projected["child_task_id"].startswith("<redacted:")
+            assert projected["inherited_constraints"][0]["unit_ids"][0] == "c"
+            assert projected["inherited_constraints"][0]["unit_ids"][1].startswith("<redacted:")
+            assert projected["inherited_constraints"][0]["id"].startswith("<redacted:")
+            assert projected["dependency_handoffs"][0]["unit_id"].startswith("<redacted:")
+            assert projected["dependency_handoffs"][0]["child_task_id"].startswith("<redacted:")
+            return _draft()
+
+    monkeypatch.setattr(sikula, "_create_delivery_preparation_agent", lambda args, cfg: Agent())
+    monkeypatch.setattr(
+        sikula,
+        "_make_auto_preparation_audit_recorder",
+        lambda **kwargs: (lambda record: None, proposal_root / "amend-audit.jsonl"),
+    )
+
+    raw_evidence = failure_evidence.to_dict()
+    assert raw_evidence["plan_id"] == private_plan_id
+    assert raw_evidence["unit_id"] == private_target_id
+    assert raw_evidence["child_task_id"] == private_target_child_id
+    assert raw_evidence["inherited_constraints"][0]["unit_ids"][1] == private_unit_id
+    assert raw_evidence["dependency_handoffs"][0]["child_task_id"] == private_child_id
+
+    sikula._run_delivery_amend_prepare_authoring(
+        args=argparse.Namespace(),
+        cfg=_project_config(tmp_path),
+        target=target,
+        source_snapshot=snapshot,
+        failure_evidence=failure_evidence,
+    )
 
 
 def test_main_amend_authoring_adapter_preserves_raw_plan_references(
@@ -3830,8 +5108,8 @@ def test_main_amend_authoring_adapter_attaches_audit_path_to_failure(
     assert exc_info.value.audit_path == ".sikula/contract-reports/amend-audit.jsonl"
 
 
-def test_main_run_next_context_uses_shared_amend_authoring_adapter() -> None:
-    context = sikula._delivery_run_next_context()
+def test_main_run_next_context_uses_shared_amend_authoring_adapter(tmp_path: Path) -> None:
+    context = sikula._delivery_run_next_context(_project_config(tmp_path))
 
     assert context.run_amendment_authoring is sikula._run_delivery_amend_prepare_authoring
 
@@ -3867,7 +5145,7 @@ def test_amend_prepare_cli_reports_git_execution_failure(
     }
 
     with pytest.raises(SystemExit) as exc_info:
-        cmd_delivery_amend_prepare(args, cfg, DeliveryAmendPrepareContext(author))
+        cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author))
 
     payload = json.loads(capsys.readouterr().out)
     assert exc_info.value.code == 1
@@ -4006,7 +5284,7 @@ def test_amend_prepare_cli_rejects_inputs_changed_during_authoring(
     }
 
     with pytest.raises(SystemExit) as exc_info:
-        cmd_delivery_amend_prepare(args, cfg, DeliveryAmendPrepareContext(author))
+        cmd_delivery_amend_prepare(args, cfg, _amend_context(tmp_path, author))
 
     payload = json.loads(capsys.readouterr().out)
     assert exc_info.value.code == 1
@@ -5125,7 +6403,11 @@ def test_run_next_after_amendment_without_existing_progress(
         "project": {"root_path": str(tmp_path), "build_tool": "python"},
         "tasks": {"state_dir": str(state_dir)},
     }
-    context = DeliveryRunNextContext(run_task=runner, resolve_state_dir=lambda _: state_dir)
+    context = DeliveryRunNextContext(
+        run_task=runner,
+        resolve_state_dir=lambda _: state_dir,
+        state_store=JsonStateStore(state_dir),
+    )
 
     cmd_delivery_run_next(args, cfg, context)
 

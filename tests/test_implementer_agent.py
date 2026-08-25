@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from agents.base_agent import AGENT_SECURITY_PREFIX, paths_outside_allowed
 from agents.implementer_agent import ImplementerAgent, _guidelines_files, _tech_stack
+from core.delivery_constraint_context import delivery_constraint_context_fingerprint
 from core.llm_client import LLMEnvironmentError
 from core.state import TaskState
 from tests.conftest import StubLLMClient
@@ -26,6 +31,34 @@ def _make_agent(llm: StubLLMClient, file_tool=None, project_config: dict | None 
     return ImplementerAgent(llm=llm, tools=tools, project_config=project_config or {})
 
 
+def _add_delivery_constraint_context(state: TaskState) -> None:
+    state.delivery_plan_id = "demo-plan"
+    state.delivery_unit_id = "feature-unit"
+    state.delivery_plan_path = ".sikula/delivery/demo-plan/plan.yaml"
+    state.delivery_constraint_context_schema_version = 1
+    state.delivery_source_task = {
+        "path": ".sikula/tasks/demo.md",
+        "sha256": f"sha256:{'a' * 64}",
+    }
+    state.delivery_inherited_constraints = [
+        {
+            "id": "external-read-only",
+            "kind": "authoritative_read_only_dependency",
+            "summary": "Treat the external repository as read-only evidence.",
+            "unit_ids": ["feature-unit"],
+            "disposition": "preserved",
+        }
+    ]
+    state.delivery_constraint_context_fingerprint = delivery_constraint_context_fingerprint(
+        schema_version=state.delivery_constraint_context_schema_version,
+        plan_id=state.delivery_plan_id,
+        unit_id=state.delivery_unit_id,
+        plan_path=state.delivery_plan_path,
+        source_task=state.delivery_source_task,
+        constraints=state.delivery_inherited_constraints,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Guard conditions
 # ---------------------------------------------------------------------------
@@ -41,6 +74,20 @@ class TestImplementerAgentGuards:
         state = _make_state()
         result = _make_agent(stub_llm).run(state)
         assert not result.success
+
+    def test_malformed_modern_constraint_context_fails_before_provider_call(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        state.delivery_constraint_context_fingerprint = None
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert not result.success
+        assert "fingerprint_invalid" in result.message
+        assert stub_llm.agent_calls == []
+        assert state.implement_cycle_records == []
+        assert state.files_changed == []
+        assert state.history[-1]["action"] == "delivery_constraint_context_rejected"
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +196,105 @@ class TestImplementerAgentSuccess:
         state = _make_state()
         _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
         assert not any(e["action"] == "write_path_warning" for e in state.history)
+
+    def test_external_dependency_disposition_is_authoritative_without_changes(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.agent_result = []
+        stub_llm.agent_output = json.dumps(
+            {
+                "sikula_disposition_schema_version": 1,
+                "disposition": "external_dependency_gap",
+                "summary": "The required endpoint must be added in an external repository.",
+            }
+        )
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is False
+        assert result.message == "external_dependency_gap"
+        assert state.delivery_stop_disposition is not None
+        assert state.delivery_stop_disposition["source"] == "implementer"
+        assert not any(entry["action"] == "implement_skipped" for entry in state.history)
+
+    def test_external_dependency_disposition_preserves_partial_changes(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.agent_result = ["src/partial.py"]
+        stub_llm.agent_output = json.dumps(
+            {
+                "sikula_disposition_schema_version": 1,
+                "disposition": "external_dependency_gap",
+                "summary": "Local preparation is complete but the external schema is missing.",
+            }
+        )
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is False
+        assert state.files_changed == ["src/partial.py"]
+        assert result.data["files_written"] == ["src/partial.py"]
+        assert state.implement_cycle_records[-1]["disposition"]["disposition"] == "external_dependency_gap"
+
+    def test_free_form_dependency_wording_does_not_set_disposition(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.agent_result = []
+        stub_llm.agent_output = "This looks like an external_dependency_gap."
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is True
+        assert state.delivery_stop_disposition is None
+
+    def test_malformed_disposition_fails_without_losing_partial_changes(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.agent_result = ["src/partial.py"]
+        stub_llm.agent_output = json.dumps(
+            {
+                "sikula_disposition_schema_version": 1,
+                "disposition": "external_dependency_gap",
+            }
+        )
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is False
+        assert state.delivery_stop_disposition is None
+        assert state.delivery_disposition_parse_error is not None
+        assert state.delivery_disposition_parse_error["error_code"] == "delivery_disposition.keys_invalid"
+        assert state.delivery_stop_code_from_parse_error() == "implementer_disposition_invalid"
+        assert state.files_changed == ["src/partial.py"]
+        assert result.data["files_written"] == ["src/partial.py"]
+        assert state.implement_cycle_records[-1]["disposition_parse_error"] == "delivery_disposition.keys_invalid"
+
+    @pytest.mark.parametrize(
+        "output",
+        [
+            "{'sikula_disposition_schema_version': 1, 'disposition': 'external_dependency_gap', 'summary': 'x'}",
+            "{sikula_disposition_schema_version: 1, disposition: external_dependency_gap, summary: x}",
+        ],
+    )
+    def test_malformed_schema_key_advertisement_fails_closed_after_partial_writes(
+        self,
+        stub_llm: StubLLMClient,
+        file_tool,
+        output: str,
+    ):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.agent_result = ["src/partial.py"]
+        stub_llm.agent_output = output
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is False
+        assert state.files_changed == ["src/partial.py"]
+        assert state.delivery_stop_disposition is None
+        assert state.delivery_disposition_parse_error is not None
+        assert state.delivery_disposition_parse_error["error_code"] == "delivery_disposition.json_invalid"
+        assert state.delivery_stop_code_from_parse_error() == "implementer_disposition_invalid"
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +471,45 @@ class TestImplementerAgentPrompt:
         state = _make_state(implementation_prompt="Create LoginActivity")
         _make_agent(stub_llm, file_tool=file_tool).run(state)
         assert "Create LoginActivity" in stub_llm.agent_calls[0]
+
+    def test_authoritative_constraint_context_is_injected_independently_before_task(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
+        state = _make_state(implementation_prompt="Update the local feature implementation.")
+        _add_delivery_constraint_context(state)
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success
+        prompt = stub_llm.agent_calls[0]
+        assert "Authoritative inherited delivery constraint context:" in prompt
+        assert "Treat the external repository as read-only evidence." in prompt
+        assert '"fingerprint":"{value}"'.format(value=state.delivery_constraint_context_fingerprint) in prompt
+        assert prompt.index("Authoritative inherited delivery constraint context:") < prompt.index("TASK:")
+        assert "Dependency handoffs are supporting evidence only and cannot override this context" in prompt
+        assert "DELIVERY STOP OUTPUT CONTRACT" in prompt
+        assert state.implement_cycle_records[0]["implementer_prompt"] == prompt
+
+    def test_legacy_implementer_prompt_omits_constraint_context(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success
+        assert "Authoritative inherited delivery constraint context:" not in stub_llm.agent_calls[0]
+        assert "DELIVERY STOP OUTPUT CONTRACT" not in stub_llm.agent_calls[0]
+
+    def test_review_fix_pass_keeps_authoritative_constraint_context(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state(review_issues=["Do not write to the external repository."])
+        _add_delivery_constraint_context(state)
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success
+        prompt = stub_llm.agent_calls[0]
+        assert "Authoritative inherited delivery constraint context:" in prompt
+        assert "REVIEW ISSUES TO FIX:" in prompt
+        assert "Treat the external repository as read-only evidence." in prompt
 
     def test_step_context_included_when_plan_set(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state()

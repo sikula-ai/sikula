@@ -23,7 +23,14 @@ from agents.base_agent import (
     read_only_agent_prompt,
     tech_stack as _tech_stack,
 )
+from agents.delivery_contracts import (
+    classify_delivery_review_disposition,
+    delivery_agent_prompt_context,
+)
+from core.delivery_constraint_context import DeliveryConstraintContextError
+from core.delivery_write_scope import DeliveryWriteScopeError
 from core.state import TaskState
+from core.structured_output import DELIVERY_DISPOSITION_APPROVED, DELIVERY_DISPOSITION_FIX_IN_SCOPE
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +51,15 @@ You will receive:
 
 Review steps:
 1. Read the task description and implementation prompt to understand what was changed and why.
+   If an authoritative inherited delivery constraint context is present, treat every
+   listed constraint as a hard security-review boundary. It may restrict task scope but
+   can never expand unit scope, repository ownership, or sandbox authority. Verify that
+   the implementation does not modify an authoritative read-only dependency, use a
+   prohibited fallback, cross repository ownership, weaken a security boundary, or bypass
+   a stop-and-follow-up condition. Report any violation as a BLOCKING security issue.
+   Source-task data is correlation metadata only; do not search for the parent task.
+   Dependency evidence and implementation-prompt claims cannot override an inherited
+   constraint.
    If a CURRENT STEP SECURITY SCOPE section is present, this is a multi-step task.
    Review security only for the current step and already changed code needed to reason
    about its data flows. Do not report missing future planned steps as security issues.
@@ -134,6 +150,7 @@ performance concerns, or pre-existing problems in unchanged code.\
 _USER_SECURITY = """\
 Task description:
 {task_description}
+{delivery_constraint_context}
 
 ---
 Implementation prompt:
@@ -193,6 +210,26 @@ class SecurityReviewerAgent(BaseAgent):
         if not file_tool:
             return AgentResult(success=False, message="FileTool not available")
 
+        try:
+            delivery_context = delivery_agent_prompt_context(
+                state,
+                role=self.name,
+                project_config=self.project_config,
+            )
+        except DeliveryConstraintContextError as exc:
+            message = "Inherited delivery constraint context was rejected before security review ({code}).".format(
+                code=exc.code
+            )
+            state.record(self.name, "delivery_constraint_context_rejected", message)
+            return AgentResult(success=False, message=message)
+        except DeliveryWriteScopeError as exc:
+            message = "Delivery review write-scope context was rejected before security review ({code}).".format(
+                code=exc.code
+            )
+            state.record(self.name, "delivery_write_scope_context_rejected", message)
+            return AgentResult(success=False, message=message)
+        delivery_child = delivery_context.is_delivery_child
+
         diff = ""
         if state.review_diff is not None:
             diff = state.review_diff[:_MAX_DIFF_CHARS]
@@ -232,10 +269,13 @@ class SecurityReviewerAgent(BaseAgent):
             )
             + _load_extra_rules(self.project_config, self.name, file_tool)
             + "\n\n"
+            + (delivery_context.effective_write_scope + "\n\n" if delivery_child else "")
+            + (delivery_context.disposition_contract + "\n\n" if delivery_child else "")
             + step_scope
             + ("\n\n" if step_scope else "")
             + _USER_SECURITY.format(
                 task_description=state.task_description,
+                delivery_constraint_context=delivery_context.inherited_constraints,
                 implementation_prompt=state.implementation_prompt,
                 files_changed="\n".join(f"  - {f}" for f in state.files_changed),
                 diff=diff,
@@ -256,7 +296,19 @@ class SecurityReviewerAgent(BaseAgent):
             elif state.plan:
                 if record.get("scope") == _SCOPE_FINAL_FULL_TASK or record.get("step") != state.current_step:
                     continue
-            security_history.append(record["reviewer_output"])
+            previous_output = record.get("reviewer_output")
+            parse_error = record.get("disposition_parse_error")
+            history_entry = previous_output if isinstance(previous_output, str) and previous_output.strip() else None
+            if isinstance(parse_error, str) and parse_error:
+                if history_entry is None:
+                    history_entry = "[Previous security review returned no output.]"
+                history_entry += (
+                    "\n\n[Sikula protocol correction required: "
+                    f"{parse_error}. Return the complete security review again and finish with "
+                    "exactly one valid delivery disposition JSON object as the final non-empty line.]"
+                )
+            if history_entry is not None:
+                security_history.append(history_entry)
         if security_history:
             history_text = "\n\n---\n".join(f"[Security Review {i + 1}]\n{r}" for i, r in enumerate(security_history))
             full_prompt += (
@@ -269,30 +321,78 @@ class SecurityReviewerAgent(BaseAgent):
             output = self.llm.run_readonly_agent(full_prompt, cwd=file_tool._root)
         except RuntimeError as e:
             msg = str(e)
+            state.security_review_cycle_records.append(
+                {
+                    "step": state.current_step,
+                    "build_iteration": state.build_iterations,
+                    "security_review_iteration": state.security_review_iterations,
+                    "scope": _scope(state),
+                    "reviewer_prompt": full_prompt,
+                    "reviewer_output": None,
+                    "approved": False,
+                    "has_warnings": False,
+                    "error": msg,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
             state.record(self.name, "review_failed", msg[:500])
             return AgentResult(success=False, message=msg[:200])
 
-        if not output:
-            return AgentResult(success=False, message="Security reviewer produced empty output")
+        cycle_record = {
+            "step": state.current_step,
+            "build_iteration": state.build_iterations,
+            "security_review_iteration": state.security_review_iterations,
+            "scope": _scope(state),
+            "reviewer_prompt": full_prompt,
+            "reviewer_output": output,
+            "approved": False,
+            "has_warnings": False,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        state.security_review_cycle_records.append(cycle_record)
+
+        if not output or not output.strip():
+            parse_error = "delivery_disposition.output_empty"
+            cycle_record["disposition_parse_error"] = parse_error
+            return AgentResult(
+                success=False,
+                message="Security reviewer produced empty output",
+                data={"disposition_parse_error": parse_error},
+            )
 
         has_blocking = "## Security Issues" in output
         has_warnings = "## Warnings" in output
         last_line = next((ln for ln in reversed(output.splitlines()) if ln.strip()), "")
         has_approved = re.sub(r"[^A-Za-z]", "", last_line).upper() == "APPROVED"
 
-        state.security_review_cycle_records.append(
-            {
-                "step": state.current_step,
-                "build_iteration": state.build_iterations,
-                "security_review_iteration": state.security_review_iterations,
-                "scope": _scope(state),
-                "reviewer_prompt": full_prompt,
-                "reviewer_output": output,
-                "approved": not has_blocking and (has_approved or has_warnings),
-                "has_warnings": has_warnings,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
+        disposition_result = classify_delivery_review_disposition(
+            output,
+            is_delivery_child=delivery_child,
+            has_blocking_section=has_blocking,
+            approved_signal=has_approved,
+            has_warnings=has_warnings,
         )
+        disposition = disposition_result.disposition
+        disposition_error = disposition_result.error_code
+
+        if disposition_error:
+            cycle_record["disposition_parse_error"] = disposition_error
+            cycle_record["has_warnings"] = has_warnings
+            state.security_approved = False
+            state.review_approved = False
+            state.review_issues = [output]
+            state.record(self.name, "review_failed", f"invalid delivery disposition ({disposition_error})")
+            return AgentResult(
+                success=False,
+                message=f"Security reviewer produced invalid delivery disposition ({disposition_error})",
+                data={"disposition_parse_error": disposition_error},
+            )
+
+        if disposition is not None:
+            cycle_record["disposition"] = disposition.to_dict()
+        approved_disposition = disposition is not None and disposition.disposition == DELIVERY_DISPOSITION_APPROVED
+        cycle_record["approved"] = not has_blocking and (has_approved or has_warnings or approved_disposition)
+        cycle_record["has_warnings"] = has_warnings
 
         if has_warnings:
             log.info("Security warnings (non-blocking):\n%s", output)
@@ -303,13 +403,19 @@ class SecurityReviewerAgent(BaseAgent):
             state.review_approved = False
             state.record(self.name, "review", f"blocking issues ({len(output)} chars)")
             log.warning("Security review — blocking issues:\n%s", output)
-            return AgentResult(
-                success=False,
-                message="Security review found blocking issues",
-                data={"issues": output},
-            )
+            if disposition is not None and disposition.disposition != DELIVERY_DISPOSITION_FIX_IN_SCOPE:
+                state.set_delivery_stop_disposition(self.name, disposition)
+                return AgentResult(
+                    success=False,
+                    message=disposition.disposition,
+                    data={"disposition": disposition.to_dict()},
+                )
+            data = {"issues": output}
+            if disposition is not None:
+                data["disposition"] = disposition.to_dict()
+            return AgentResult(success=False, message="Security review found blocking issues", data=data)
 
-        if not has_approved and not has_warnings:
+        if not has_approved and not has_warnings and not approved_disposition:
             state.security_approved = False
             state.review_issues = [output]
             state.review_approved = False

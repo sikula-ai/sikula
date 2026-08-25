@@ -42,6 +42,7 @@ from core.delivery_unit_metadata import (
     delivery_unit_budget_snapshot,
     delivery_unit_planner_step_limit,
 )
+from core.state import StateStore
 from sikula_cli.agent_overrides import (
     DELIVERY_PREPARATION_AGENT_NAMES,
     RUNTIME_AGENT_NAMES,
@@ -76,9 +77,21 @@ _DELIVERY_PREPARE_UNIT_READINESS_FAILED_MESSAGE = (
 _DELIVERY_PREPARE_ASSET_PRESERVATION_FAILED_MESSAGE = (
     "Generated unit task contracts did not preserve source task asset declarations; no source artifacts were finalized."
 )
+_DELIVERY_PREPARE_CONSTRAINT_REVIEW_MESSAGE = (
+    "Delivery prepare requires source-task constraint review; no source artifacts were finalized."
+)
+_DELIVERY_PREPARE_CONSTRAINT_CONFLICT_MESSAGE = (
+    "Generated delivery units conflict with a source-task constraint; no source artifacts were finalized."
+)
+_DELIVERY_PREPARE_UNIT_CONTEXT_INCOMPLETE_MESSAGE = (
+    "Generated delivery units are missing required source-task values; no source artifacts were finalized."
+)
 _DELIVERY_PREPARE_ASSET_PRESERVATION_FAILURE = "asset_preservation_blocked"
 _DELIVERY_PREPARE_UNIT_READINESS_FAILURE = "unit_readiness_blocked"
 _DELIVERY_PREPARE_PLAN_VALIDATION_FAILURE = "plan_validation_failed"
+_DELIVERY_PREPARE_CONSTRAINT_REVIEW_FAILURE = "constraint_review_required"
+_DELIVERY_PREPARE_CONSTRAINT_CONFLICT_FAILURE = "constraint_conflict"
+_DELIVERY_PREPARE_UNIT_CONTEXT_INCOMPLETE_FAILURE = "unit_context_incomplete"
 _DELIVERY_ASSESSMENT_CONTEXT_MISSING_MESSAGE = "Delivery assessment requires the main Sikula command context."
 _DELIVERY_ASSESSMENT_PORTABLE_COMMAND_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
 _DELIVERY_ASSESSMENT_REASON_MESSAGES = {
@@ -393,6 +406,7 @@ class DeliveryAmendPrepareResult:
     replacement_ids: list[str] = field(default_factory=list)
     proposal_path: str | None = None
     audit_path: str | None = None
+    recommended_action: str | None = None
     errors: list[DeliveryPlanIssue] = field(default_factory=list)
     warnings: list[DeliveryPlanIssue] = field(default_factory=list)
     message: str = ""
@@ -421,6 +435,7 @@ class DeliveryAmendPrepareResult:
             "replacement_ids": [project_delivery_public_identity(value) for value in self.replacement_ids],
             "proposal_path": safe_path(self.proposal_path),
             "audit_path": safe_path(self.audit_path),
+            "recommended_action": self.recommended_action,
             "errors": [_safe_amend_issue_dict(issue, root, sensitive_paths=(self.plan_path,)) for issue in self.errors],
             "warnings": [
                 _safe_amend_issue_dict(issue, root, sensitive_paths=(self.plan_path,)) for issue in self.warnings
@@ -432,6 +447,7 @@ class DeliveryAmendPrepareResult:
 @dataclass(frozen=True)
 class DeliveryAmendPrepareContext:
     run_authoring_assistant: Callable[..., DeliveryAmendmentAuthoringDraft]
+    state_store: StateStore
 
 
 def cmd_delivery_amend_prepare(
@@ -455,6 +471,7 @@ def _prepare_delivery_amendment(
 ) -> DeliveryAmendPrepareResult:
     from core.delivery_amendment import (
         DeliveryAmendmentError,
+        capture_delivery_amendment_failure_evidence,
         capture_delivery_amendment_source_snapshot,
         create_delivery_amendment_proposal,
         inspect_delivery_amendment_target,
@@ -465,6 +482,7 @@ def _prepare_delivery_amendment(
     target_id = str(args.split_unit)
     errors = _validate_delivery_prepare_agent_overrides(args)
     target = None
+    failure_evidence = None
     if not errors:
         try:
             target = inspect_delivery_amendment_target(
@@ -472,6 +490,14 @@ def _prepare_delivery_amendment(
                 target_id,
                 project_root=root,
                 project_config=cfg,
+            )
+        except DeliveryAmendmentError as exc:
+            errors.append(DeliveryPrepareIssue(exc.issue.severity, exc.issue.code, exc.issue.message, exc.issue.path))
+    if target is not None and not errors and context is not None:
+        try:
+            failure_evidence = capture_delivery_amendment_failure_evidence(
+                target,
+                state_store=context.state_store,
             )
         except DeliveryAmendmentError as exc:
             errors.append(DeliveryPrepareIssue(exc.issue.severity, exc.issue.code, exc.issue.message, exc.issue.path))
@@ -487,6 +513,8 @@ def _prepare_delivery_amendment(
         message="Delivery amendment proposal preparation is blocked.",
     )
     if target is not None and not result.errors:
+        if failure_evidence is not None and failure_evidence.requires_external_follow_up:
+            return _external_dependency_follow_up_result(result)
         if context is None:
             result = replace(
                 result,
@@ -508,6 +536,8 @@ def _prepare_delivery_amendment(
                     "target": target,
                     "source_snapshot": source_snapshot,
                 }
+                if failure_evidence is not None:
+                    authoring_kwargs["failure_evidence"] = failure_evidence
                 if authoritative_amend_reason is not None or authoritative_budget_exceeded is not None:
                     authoring_kwargs.update(
                         amend_reason=authoritative_amend_reason,
@@ -521,6 +551,25 @@ def _prepare_delivery_amendment(
                     amend_reason=authoritative_amend_reason,
                     budget_exceeded=authoritative_budget_exceeded,
                 )
+                if capture_delivery_amendment_source_snapshot(target) != source_snapshot:
+                    raise DeliveryAmendmentError(
+                        "delivery_amend.authoring_inputs_stale",
+                        "Delivery plan, target task, or progress changed while the amendment was being authored; retry prepare.",
+                    )
+                refreshed_failure_evidence = capture_delivery_amendment_failure_evidence(
+                    target,
+                    state_store=context.state_store,
+                )
+                if refreshed_failure_evidence != failure_evidence:
+                    raise DeliveryAmendmentError(
+                        "delivery_amend.authoring_inputs_stale",
+                        "Delivery plan, target task, progress, or child failure evidence changed while the amendment was being authored; retry prepare.",
+                    )
+                if _requires_external_dependency_follow_up(draft, failure_evidence):
+                    return _external_dependency_follow_up_result(
+                        result,
+                        audit_path=getattr(draft, "audit_path", None),
+                    )
                 proposal, proposal_path = create_delivery_amendment_proposal(
                     plan_path,
                     target_id,
@@ -580,6 +629,51 @@ def _prepare_delivery_amendment(
     return result
 
 
+def _external_dependency_follow_up_result(
+    result: DeliveryAmendPrepareResult,
+    *,
+    audit_path: str | None = None,
+) -> DeliveryAmendPrepareResult:
+    return replace(
+        result,
+        audit_path=audit_path,
+        recommended_action="external_dependency_follow_up",
+        errors=[
+            DeliveryPlanIssue(
+                "error",
+                "delivery_amend.external_dependency_follow_up_required",
+                "The required change is owned outside the current repository; complete the external dependency follow-up before preparing another amendment.",
+            )
+        ],
+        message="External dependency follow-up is required; no amendment proposal was published.",
+    )
+
+
+def _requires_external_dependency_follow_up(
+    draft: DeliveryAmendmentAuthoringDraft,
+    failure_evidence: Any | None,
+) -> bool:
+    disposition = getattr(draft, "disposition", None)
+    summary = getattr(draft, "summary", None)
+    if disposition not in {None, "external_dependency_follow_up_required"}:
+        from core.delivery_amendment import DeliveryAmendmentError
+
+        raise DeliveryAmendmentError(
+            "delivery_amend.authoring_invalid",
+            "Amendment authoring returned an unsupported disposition.",
+        )
+    if disposition is not None:
+        if draft.replacement_units or not isinstance(summary, str) or not is_safe_delivery_public_metadata(summary):
+            from core.delivery_amendment import DeliveryAmendmentError
+
+            raise DeliveryAmendmentError(
+                "delivery_amend.authoring_invalid",
+                "External dependency follow-up authoring output is malformed.",
+            )
+        return True
+    return bool(failure_evidence and failure_evidence.requires_external_follow_up)
+
+
 def _bind_authoritative_amendment_metadata(
     draft: DeliveryAmendmentAuthoringDraft,
     *,
@@ -626,6 +720,8 @@ def render_delivery_amend_prepare(result: DeliveryAmendPrepareResult) -> str:
         lines.append(f"Proposal artifact: {projection['proposal_path']}")
     if projection["audit_path"]:
         lines.append(f"Authoring audit: {projection['audit_path']}")
+    if projection["recommended_action"]:
+        lines.append(f"Recommended action: {projection['recommended_action']}")
     lines.append(projection["message"])
     if result.errors:
         lines.extend(["", "Errors:", *[_format_amend_issue_data(issue) for issue in projection["errors"]]])
@@ -1435,6 +1531,12 @@ def _delivery_prepare_writer_failure(failure_reason: str | None) -> tuple[str, s
         return "delivery_prepare.unit_readiness_blocked", _DELIVERY_PREPARE_UNIT_READINESS_FAILED_MESSAGE
     if failure_reason == _DELIVERY_PREPARE_PLAN_VALIDATION_FAILURE:
         return "delivery_prepare.plan_validation_failed", _DELIVERY_PREPARE_VALIDATION_FAILED_MESSAGE
+    if failure_reason == _DELIVERY_PREPARE_CONSTRAINT_REVIEW_FAILURE:
+        return "delivery_prepare.constraint_review_required", _DELIVERY_PREPARE_CONSTRAINT_REVIEW_MESSAGE
+    if failure_reason == _DELIVERY_PREPARE_CONSTRAINT_CONFLICT_FAILURE:
+        return "delivery_prepare.constraint_conflict", _DELIVERY_PREPARE_CONSTRAINT_CONFLICT_MESSAGE
+    if failure_reason == _DELIVERY_PREPARE_UNIT_CONTEXT_INCOMPLETE_FAILURE:
+        return "delivery_prepare.unit_context_incomplete", _DELIVERY_PREPARE_UNIT_CONTEXT_INCOMPLETE_MESSAGE
     return "delivery_prepare.write_failed", _DELIVERY_PREPARE_WRITE_FAILED_MESSAGE
 
 
@@ -2024,7 +2126,7 @@ def cmd_delivery_run(
     project_root_raw = cfg.get("project", {}).get("root_path") if isinstance(cfg, dict) else None
     project_root = Path(project_root_raw).resolve() if project_root_raw else None
     if getattr(args, "dry_run", False):
-        result = _preview_delivery_run(args, cfg, project_root=project_root)
+        result = _preview_delivery_run(args, cfg, context=context, project_root=project_root)
     else:
         if context is None:
             print("delivery run execution requires the main Sikula command context.")
@@ -2049,6 +2151,7 @@ def _preview_delivery_run(
     args: argparse.Namespace,
     cfg: dict,
     *,
+    context: DeliveryRunNextContext | None = None,
     project_root: Path | None,
 ):
     from core.delivery_finalize import preview_delivery_finalize
@@ -2125,6 +2228,7 @@ def _preview_delivery_run(
         preview,
         args.plan_file,
         cfg=cfg,
+        state_store=context.state_store if context is not None else None,
         project_root=project_root,
         reset_failed=reset_failed,
     )
@@ -2501,6 +2605,7 @@ class DeliveryChildLinkFailed(RuntimeError):
 class DeliveryRunNextContext:
     run_task: Callable[[argparse.Namespace, dict], DeliveryChildRunResult | int]
     resolve_state_dir: Callable[[dict], Path]
+    state_store: StateStore
     run_amendment_authoring: Callable[..., DeliveryAmendmentAuthoringDraft] | None = None
 
 
@@ -2557,6 +2662,7 @@ def cmd_delivery_run_next(
             result,
             args.plan_file,
             cfg=cfg,
+            state_store=context.state_store if context is not None else None,
             project_root=project_root,
             reset_failed=bool(getattr(args, "reset_failed", False)),
         )
@@ -2618,7 +2724,6 @@ def _coordinate_budget_split_preparation(
 ) -> "DeliveryRunNextExecutionResult":
     from core.delivery_progress import get_delivery_status
     from core.delivery_run_next import DeliveryBudgetSplitPreparationResult
-    from core.state import JsonStateStore
 
     status = get_delivery_status(args.plan_file, project_root=project_root)
     candidates = [
@@ -2663,7 +2768,7 @@ def _coordinate_budget_split_preparation(
         )
         return replace(result, budget_split_preparation=preparation)
 
-    store = JsonStateStore(context.resolve_state_dir(cfg))
+    store = context.state_store
     try:
         child_state = store.load(child_task_id)
     except (AttributeError, OSError, TypeError, ValueError):
@@ -2784,7 +2889,7 @@ def _coordinate_budget_split_preparation(
     prepare_result = _prepare_delivery_amendment(
         prepare_args,
         cfg,
-        DeliveryAmendPrepareContext(context.run_amendment_authoring),
+        DeliveryAmendPrepareContext(context.run_amendment_authoring, context.state_store),
         authoritative_amend_reason=DELIVERY_UNIT_BUDGET_EXCEEDED_CODE,
         authoritative_budget_exceeded=budget_exceeded,
     )
@@ -2856,7 +2961,8 @@ def _run_next_delivery_unit(
     project_root: Path | None,
     bounded_run_unit_ids: frozenset[str] | None = None,
 ):
-    from core.delivery_plan import DeliveryPlanIssue
+    from core.delivery_constraint_context import delivery_constraint_context_fingerprint
+    from core.delivery_plan import DeliveryPlanIssue, delivery_unit_constraint_context
     from core.delivery_progress import (
         DeliveryProgressLockError,
         acquire_delivery_progress_lock,
@@ -2876,11 +2982,14 @@ def _run_next_delivery_unit(
         _blocked_run_next_reason,
         preview_delivery_run_next,
     )
-    from core.state import JsonStateStore
+    from core.delivery_write_scope import DeliveryWriteScopeError, resolve_delivery_write_scope
 
     reset_failed = bool(getattr(args, "reset_failed", False))
     preflight = preview_delivery_run_next(args.plan_file, project_root=project_root, reset_failed=reset_failed)
     status = get_delivery_status(args.plan_file, project_root=project_root)
+    terminal_result = _execution_result_from_terminal_stop(status)
+    if terminal_result is not None:
+        return terminal_result
 
     if not preflight.valid:
         budget_split_recovery = bool(getattr(args, "prepare_budget_split", False)) and any(
@@ -2944,6 +3053,9 @@ def _run_next_delivery_unit(
                 errors=errors,
                 message="Delivery plan is not ready to run.",
             )
+        terminal_result = _execution_result_from_terminal_stop(status)
+        if terminal_result is not None:
+            return terminal_result
         running_units = _running_delivery_units(status)
         if len(running_units) == 1:
             snapshot_issue = _bounded_delivery_run_snapshot_issue(bounded_run_unit_ids, running_units[0])
@@ -3083,6 +3195,28 @@ def _run_next_delivery_unit(
                 failed_unit=selected_unit,
             )
 
+        sandbox_config = cfg.get("sandbox", {})
+        configured_write_paths = (
+            sandbox_config.get("allowed_write_paths", []) if isinstance(sandbox_config, dict) else sandbox_config
+        )
+        try:
+            delivery_write_scope = resolve_delivery_write_scope(
+                project_root=root,
+                configured_write_paths=configured_write_paths,
+                unit_scope_paths=selected_unit.scope_paths,
+            )
+        except DeliveryWriteScopeError as exc:
+            scope_issue = DeliveryPlanIssue("error", exc.code, str(exc))
+            return _execution_result_from_status(
+                status,
+                ran=False,
+                selected_unit=selected_unit,
+                progress_path=str(progress_path),
+                events_path=str(events_path),
+                errors=[*errors, scope_issue],
+                message=scope_issue.message,
+            )
+
         progress = _progress_for_update(status, progress_path, read_delivery_progress=read_delivery_progress)
         progress, assembly_commit, assembly_issue = _assemble_completed_delivery_units(
             status=status,
@@ -3150,6 +3284,19 @@ def _run_next_delivery_unit(
                 raise DeliveryChildLinkFailed() from exc
 
         delivery_plan_path = _delivery_plan_metadata_path(status, root)
+        (
+            constraint_context_schema_version,
+            delivery_source_task,
+            delivery_inherited_constraints,
+        ) = delivery_unit_constraint_context(status.plan, selected_unit.id)
+        constraint_context_fingerprint = delivery_constraint_context_fingerprint(
+            schema_version=constraint_context_schema_version,
+            plan_id=plan_id,
+            unit_id=selected_unit.id,
+            plan_path=delivery_plan_path,
+            source_task=delivery_source_task,
+            constraints=delivery_inherited_constraints,
+        )
 
         child_result = _invoke_delivery_child_run(
             args,
@@ -3161,13 +3308,22 @@ def _run_next_delivery_unit(
             delivery_unit_id=selected_unit.id,
             delivery_plan_path=delivery_plan_path,
             delivery_unit_budget=delivery_unit_budget_snapshot(selected_unit.budget),
+            delivery_constraint_context_schema_version=constraint_context_schema_version,
+            delivery_source_task=delivery_source_task,
+            delivery_inherited_constraints=delivery_inherited_constraints,
+            delivery_constraint_context_fingerprint=constraint_context_fingerprint,
+            delivery_write_scope_schema_version=delivery_write_scope.schema_version,
+            delivery_write_scope_mode=delivery_write_scope.mode,
+            delivery_declared_write_paths=list(delivery_write_scope.declared_paths),
+            delivery_declared_write_exact_file_paths=list(delivery_write_scope.declared_exact_file_paths),
+            delivery_effective_write_paths=list(delivery_write_scope.effective_paths),
+            delivery_effective_write_exact_file_paths=list(delivery_write_scope.effective_exact_file_paths),
             delivery_handoff_schema_version=SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION,
             delivery_dependency_handoffs=dependency_handoffs,
             delivery_child_created_callback=link_child_task,
             worktree_start_ref=assembly_commit,
         )
-        state_dir = context.resolve_state_dir(cfg)
-        store = JsonStateStore(state_dir)
+        store = context.state_store
         child_task_id = child_result.child_task_id
         if child_result.child_link_failed:
             _restore_delivery_progress(progress_path, progress_before_start, existed=progress_existed_before_start)
@@ -3272,11 +3428,19 @@ def _run_next_delivery_unit(
         if child_result.exception is not None:
             raise child_result.exception
         updated_unit = _status_unit_by_id(updated_status, selected_unit.id) or selected_unit
+        terminal_stop_issue, result_valid, result_errors = _delivery_terminal_result_projection(
+            updated_status,
+            updated_unit,
+            handoff_issue,
+            assembly_issue,
+        )
 
         if handoff_issue is not None:
             message = handoff_issue.message
         elif assembly_issue is not None:
             message = assembly_issue.message
+        elif terminal_stop_issue is not None:
+            message = terminal_stop_issue.message
         elif unit_status == "done":
             message = f"Delivery unit {selected_unit.id} completed."
         elif updated_unit.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE:
@@ -3289,7 +3453,7 @@ def _run_next_delivery_unit(
         return DeliveryRunNextExecutionResult(
             plan_path=status.plan_path,
             project_root=status.project_root,
-            valid=updated_status.valid and handoff_issue is None and assembly_issue is None,
+            valid=result_valid,
             ran=True,
             succeeded=unit_status == "done" and updated_status.valid and assembly_issue is None,
             status=updated_status.status,
@@ -3300,11 +3464,7 @@ def _run_next_delivery_unit(
             run_exit_code=child_result.exit_code,
             progress_path=str(progress_path),
             events_path=str(events_path),
-            errors=[
-                *updated_status.errors,
-                *([handoff_issue] if handoff_issue else []),
-                *([assembly_issue] if assembly_issue else []),
-            ],
+            errors=result_errors,
             warnings=updated_status.warnings,
             message=message,
         )
@@ -3663,15 +3823,30 @@ def _apply_delivery_preview_execution_guards(
     plan_file: str | Path,
     *,
     cfg: dict,
+    state_store: StateStore | None,
     project_root: Path | None,
     reset_failed: bool,
 ):
+    from core.delivery_plan import DeliveryPlanIssue
+    from core.delivery_progress import get_delivery_status
+    from core.delivery_write_scope import DeliveryWriteScopeError, resolve_delivery_write_scope
+
+    status = get_delivery_status(plan_file, project_root=project_root)
+    terminal_stop = _delivery_terminal_stop(status)
+    if terminal_stop is not None:
+        terminal_stop_unit, terminal_stop_issue = terminal_stop
+        return replace(
+            preview,
+            valid=False,
+            ready=False,
+            selected_unit=terminal_stop_unit,
+            errors=[*status.errors, terminal_stop_issue],
+            warnings=list(status.warnings),
+            message=terminal_stop_issue.message,
+        )
     if not preview.ready or preview.selected_unit is None or preview.project_root is None:
         return preview
 
-    from core.delivery_progress import get_delivery_status
-
-    status = get_delivery_status(plan_file, project_root=project_root)
     selected_unit = _status_unit_by_id(status, preview.selected_unit.id) or preview.selected_unit
     if not status.valid or status.project_root is None:
         return replace(
@@ -3686,6 +3861,7 @@ def _apply_delivery_preview_execution_guards(
     root = Path(status.project_root).resolve()
     child_state_issue = _delivery_preview_child_state_issue(
         cfg=cfg,
+        state_store=state_store,
         status=status,
         root=root,
         selected_unit=selected_unit,
@@ -3730,6 +3906,26 @@ def _apply_delivery_preview_execution_guards(
                 message="Delivery unit dependencies are not present in the assembled delivery branch.",
             )
         return preview
+    sandbox_config = cfg.get("sandbox", {})
+    configured_write_paths = (
+        sandbox_config.get("allowed_write_paths", []) if isinstance(sandbox_config, dict) else sandbox_config
+    )
+    try:
+        resolve_delivery_write_scope(
+            project_root=root,
+            configured_write_paths=configured_write_paths,
+            unit_scope_paths=selected_unit.scope_paths,
+        )
+    except DeliveryWriteScopeError as exc:
+        scope_issue = DeliveryPlanIssue("error", exc.code, str(exc))
+        return replace(
+            preview,
+            valid=False,
+            ready=False,
+            selected_unit=selected_unit,
+            errors=[*preview.errors, scope_issue],
+            message=scope_issue.message,
+        )
     assembly_issue = _delivery_assembly_preview_issue(status, root)
     if assembly_issue is not None:
         return replace(
@@ -3758,13 +3954,13 @@ def _apply_delivery_preview_execution_guards(
 def _delivery_preview_child_state_issue(
     *,
     cfg: dict,
+    state_store: StateStore | None,
     status,
     root: Path,
     selected_unit,
     reset_failed: bool,
 ):
     from core.delivery_plan import DeliveryPlanIssue
-    from core.state import JsonStateStore
 
     if selected_unit.status not in {"running", "failed"}:
         return None
@@ -3793,8 +3989,10 @@ def _delivery_preview_child_state_issue(
         )
         return DeliveryPlanIssue("error", "delivery.child_task_missing", message)
 
-    store = JsonStateStore(_resolve_state_dir(cfg))
-    child_state = store.load(child_task_id)
+    if state_store is None:
+        message = "Delivery child state inspection requires the main Sikula state-store context."
+        return DeliveryPlanIssue("error", "delivery.state_store_context_missing", message)
+    child_state = state_store.load(child_task_id)
     if child_state is None:
         message = (
             f"Delivery unit {unit_id} is linked to child task {child_task_id}, but that task state was not found in "
@@ -3815,21 +4013,45 @@ def _delivery_preview_child_state_issue(
         )
         return DeliveryPlanIssue("error", "delivery.child_task_metadata_mismatch", message)
 
+    terminal_stop_issue = _delivery_terminal_stop_issue(_delivery_child_terminal_stop_code(child_state))
+    if terminal_stop_issue is not None:
+        return terminal_stop_issue
+
     if selected_unit.status == "running":
         if getattr(child_state, "failed", False) and reset_failed:
             if not _delivery_child_has_resume_worktree(child_state):
                 return _delivery_child_worktree_missing_issue(selected_unit, child_task_id)
-            return None
+            return _delivery_preview_child_runtime_scope_issue(cfg, child_state)
         if getattr(child_state, "done", False) or getattr(child_state, "failed", False):
             return None
         if not _delivery_child_has_resume_worktree(child_state):
             return _delivery_child_worktree_missing_issue(selected_unit, child_task_id)
-        return None
+        return _delivery_preview_child_runtime_scope_issue(cfg, child_state)
 
     if getattr(child_state, "done", False):
         return None
     if not _delivery_child_has_resume_worktree(child_state):
         return _delivery_child_worktree_missing_issue(selected_unit, child_task_id)
+    return _delivery_preview_child_runtime_scope_issue(cfg, child_state)
+
+
+def _delivery_preview_child_runtime_scope_issue(cfg: dict, child_state):
+    """Mirror the non-mutating delivery-scope preflight used by child resume."""
+    from core.delivery_plan import DeliveryPlanIssue
+    from core.delivery_write_scope import DeliveryWriteScopeError, apply_delivery_write_scope_to_config
+
+    worktree_path = getattr(child_state, "worktree_path", None)
+    preview_cfg = dict(cfg)
+    project = cfg.get("project")
+    if isinstance(project, dict):
+        preview_cfg["project"] = {**project, "root_path": worktree_path}
+    sandbox = cfg.get("sandbox")
+    if isinstance(sandbox, dict):
+        preview_cfg["sandbox"] = dict(sandbox)
+    try:
+        apply_delivery_write_scope_to_config(preview_cfg, child_state)
+    except DeliveryWriteScopeError as exc:
+        return DeliveryPlanIssue("error", exc.code, str(exc))
     return None
 
 
@@ -3963,6 +4185,89 @@ def _running_delivery_units(status) -> list:
     return [unit for unit in status.units if unit.status == "running"]
 
 
+def _delivery_terminal_stop(status):
+    if any(
+        unit.status == "failed" and unit.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE for unit in status.units
+    ):
+        return None
+    for unit in status.units:
+        if unit.status != "failed":
+            continue
+        issue = _delivery_terminal_stop_issue(unit.failure_code)
+        if issue is not None:
+            return unit, issue
+    return None
+
+
+def _execution_result_from_terminal_stop(status):
+    from core.delivery_progress import delivery_events_path
+
+    terminal_stop = _delivery_terminal_stop(status)
+    if terminal_stop is None:
+        return None
+    terminal_stop_unit, terminal_stop_issue = terminal_stop
+    events_path = None
+    if status.plan is not None and status.project_root is not None:
+        root = Path(status.project_root).resolve()
+        events_path = str(delivery_events_path(root, status.plan.plan_id))
+    return _execution_result_from_status(
+        status,
+        ran=False,
+        selected_unit=terminal_stop_unit,
+        progress_path=status.progress_path,
+        events_path=events_path,
+        errors=[*status.errors, terminal_stop_issue],
+        message=terminal_stop_issue.message,
+    )
+
+
+def _delivery_terminal_stop_issue(failure_code: str | None) -> DeliveryPlanIssue | None:
+    from core.delivery_progress import (
+        delivery_terminal_stop_error_code,
+        delivery_terminal_stop_recovery_action,
+    )
+
+    error_code = delivery_terminal_stop_error_code(failure_code)
+    recovery_action = delivery_terminal_stop_recovery_action(failure_code)
+    if error_code is None or recovery_action is None:
+        return None
+    messages = {
+        "unit_scope_violation": "A delivery unit changed production paths outside its effective scope",
+        "scope_amendment_required": "A delivery unit requires a scope amendment",
+        "external_dependency_gap": "A delivery unit is blocked by an external dependency",
+        "implementer_disposition_invalid": "A delivery unit produced an invalid implementer disposition",
+    }
+    message = messages.get(failure_code)
+    if message is None:
+        return None
+    return DeliveryPlanIssue(
+        "error",
+        error_code,
+        f"{message}; {recovery_action}.",
+    )
+
+
+def _delivery_terminal_result_projection(updated_status, updated_unit, handoff_issue, assembly_issue):
+    terminal_stop_issue = _delivery_terminal_stop_issue(updated_unit.failure_code)
+    errors = [
+        *updated_status.errors,
+        *([handoff_issue] if handoff_issue else []),
+        *([assembly_issue] if assembly_issue else []),
+        *([terminal_stop_issue] if terminal_stop_issue else []),
+    ]
+    valid = updated_status.valid and handoff_issue is None and assembly_issue is None and terminal_stop_issue is None
+    return terminal_stop_issue, valid, errors
+
+
+def _delivery_child_terminal_stop_code(child_state) -> str | None:
+    from core.state import DELIVERY_TERMINAL_STOP_CODES
+
+    code = getattr(child_state, "delivery_stop_code", None)
+    if not isinstance(code, str) or code not in DELIVERY_TERMINAL_STOP_CODES:
+        return None
+    return code
+
+
 def _is_valid_delivery_child_task_id(task_id: str) -> bool:
     return bool(_DELIVERY_CHILD_TASK_ID_RE.fullmatch(task_id))
 
@@ -3981,7 +4286,6 @@ def _handle_failed_delivery_unit_retry(
 ) -> "DeliveryRunNextExecutionResult":
     from core.delivery_plan import DeliveryPlanIssue
     from core.delivery_run_next import DeliveryRunNextExecutionResult
-    from core.state import JsonStateStore
 
     unit_id = failed_unit.id
     child_task_id = failed_unit.child_task_id
@@ -4010,8 +4314,7 @@ def _handle_failed_delivery_unit_retry(
             message=message,
         )
 
-    state_dir = context.resolve_state_dir(cfg)
-    store = JsonStateStore(state_dir)
+    store = context.state_store
     child_state = store.load(child_task_id)
     if child_state is None:
         code = "delivery.child_task_missing"
@@ -4104,12 +4407,10 @@ def _run_delivery_child_retry(
         write_delivery_progress,
     )
     from core.delivery_run_next import DeliveryRunNextExecutionResult
-    from core.state import JsonStateStore
 
     unit_id = selected_unit.id
     child_task_id = selected_unit.child_task_id
-    state_dir = context.resolve_state_dir(cfg)
-    store = JsonStateStore(state_dir)
+    store = context.state_store
     child_state = store.load(child_task_id)
     if child_state is None:
         code = "delivery.child_task_missing"
@@ -4134,6 +4435,26 @@ def _run_delivery_child_retry(
             errors=[*status.errors, DeliveryPlanIssue("error", code, message)],
             warnings=status.warnings,
             message=message,
+        )
+    terminal_stop_issue = _delivery_terminal_stop_issue(_delivery_child_terminal_stop_code(child_state))
+    if terminal_stop_issue is not None:
+        return DeliveryRunNextExecutionResult(
+            plan_path=status.plan_path,
+            project_root=str(root.resolve()),
+            valid=False,
+            ran=False,
+            succeeded=False,
+            status=status.status,
+            progress_exists=status.progress_exists,
+            selected_unit=selected_unit,
+            child_task_id=child_task_id,
+            unit_status=selected_unit.status,
+            run_exit_code=None,
+            progress_path=str(progress_path),
+            events_path=str(events_path),
+            errors=[*status.errors, terminal_stop_issue],
+            warnings=status.warnings,
+            message=terminal_stop_issue.message,
         )
     progress = _progress_for_update(status, progress_path, read_delivery_progress=read_delivery_progress)
     if child_state.done:
@@ -4263,11 +4584,19 @@ def _run_delivery_child_retry(
         raise child_result.exception
 
     updated_unit = _status_unit_by_id(updated_status, unit_id) or selected_unit
+    terminal_stop_issue, result_valid, result_errors = _delivery_terminal_result_projection(
+        updated_status,
+        updated_unit,
+        handoff_issue,
+        assembly_issue,
+    )
     message = (
         handoff_issue.message
         if handoff_issue is not None
         else assembly_issue.message
         if assembly_issue is not None
+        else terminal_stop_issue.message
+        if terminal_stop_issue is not None
         else (
             f"Delivery unit {unit_id} retried and completed."
             if unit_status == "done"
@@ -4278,7 +4607,7 @@ def _run_delivery_child_retry(
     return DeliveryRunNextExecutionResult(
         plan_path=status.plan_path,
         project_root=str(root.resolve()),
-        valid=updated_status.valid and handoff_issue is None and assembly_issue is None,
+        valid=result_valid,
         ran=True,
         succeeded=unit_status == "done" and updated_status.valid and assembly_issue is None,
         status=updated_status.status,
@@ -4289,11 +4618,7 @@ def _run_delivery_child_retry(
         run_exit_code=child_result.exit_code,
         progress_path=str(progress_path),
         events_path=str(events_path),
-        errors=[
-            *updated_status.errors,
-            *([handoff_issue] if handoff_issue else []),
-            *([assembly_issue] if assembly_issue else []),
-        ],
+        errors=result_errors,
         warnings=updated_status.warnings,
         message=message,
     )
@@ -4319,7 +4644,6 @@ def _handle_running_delivery_unit(
     )
     from core.delivery_plan import DeliveryPlanIssue
     from core.delivery_run_next import DeliveryRunNextExecutionResult
-    from core.state import JsonStateStore
 
     unit_id = running_unit.id
     child_task_id = running_unit.child_task_id
@@ -4372,8 +4696,7 @@ def _handle_running_delivery_unit(
             message=message,
         )
 
-    state_dir = context.resolve_state_dir(cfg)
-    store = JsonStateStore(state_dir)
+    store = context.state_store
     child_state = store.load(child_task_id)
     if child_state is None:
         code = "delivery.child_task_missing"
@@ -4475,11 +4798,19 @@ def _handle_running_delivery_unit(
             handoff_issue=handoff_issue,
         )
         updated_unit = _status_unit_by_id(updated_status, unit_id) or running_unit
+        terminal_stop_issue, result_valid, result_errors = _delivery_terminal_result_projection(
+            updated_status,
+            updated_unit,
+            handoff_issue,
+            assembly_issue,
+        )
         message = (
             handoff_issue.message
             if handoff_issue is not None
             else assembly_issue.message
             if assembly_issue is not None
+            else terminal_stop_issue.message
+            if terminal_stop_issue is not None
             else (
                 f"Delivery unit {unit_id} reconciled terminal child task as done."
                 if unit_status == "done"
@@ -4489,7 +4820,7 @@ def _handle_running_delivery_unit(
         return DeliveryRunNextExecutionResult(
             plan_path=status.plan_path,
             project_root=str(root.resolve()),
-            valid=updated_status.valid and handoff_issue is None and assembly_issue is None,
+            valid=result_valid,
             ran=True,
             succeeded=unit_status == "done" and updated_status.valid and assembly_issue is None,
             status=updated_status.status,
@@ -4500,11 +4831,7 @@ def _handle_running_delivery_unit(
             run_exit_code=None,
             progress_path=str(progress_path),
             events_path=str(events_path),
-            errors=[
-                *updated_status.errors,
-                *([handoff_issue] if handoff_issue else []),
-                *([assembly_issue] if assembly_issue else []),
-            ],
+            errors=result_errors,
             warnings=updated_status.warnings,
             message=message,
         )
@@ -4562,11 +4889,19 @@ def _handle_running_delivery_unit(
         raise child_result.exception
 
     updated_unit = _status_unit_by_id(updated_status, unit_id) or running_unit
+    terminal_stop_issue, result_valid, result_errors = _delivery_terminal_result_projection(
+        updated_status,
+        updated_unit,
+        handoff_issue,
+        assembly_issue,
+    )
     message = (
         handoff_issue.message
         if handoff_issue is not None
         else assembly_issue.message
         if assembly_issue is not None
+        else terminal_stop_issue.message
+        if terminal_stop_issue is not None
         else (
             f"Delivery unit {unit_id} resumed and completed."
             if unit_status == "done"
@@ -4576,7 +4911,7 @@ def _handle_running_delivery_unit(
     return DeliveryRunNextExecutionResult(
         plan_path=status.plan_path,
         project_root=str(root.resolve()),
-        valid=updated_status.valid and handoff_issue is None and assembly_issue is None,
+        valid=result_valid,
         ran=True,
         succeeded=unit_status == "done" and updated_status.valid and assembly_issue is None,
         status=updated_status.status,
@@ -4587,11 +4922,7 @@ def _handle_running_delivery_unit(
         run_exit_code=child_result.exit_code,
         progress_path=str(progress_path),
         events_path=str(events_path),
-        errors=[
-            *updated_status.errors,
-            *([handoff_issue] if handoff_issue else []),
-            *([assembly_issue] if assembly_issue else []),
-        ],
+        errors=result_errors,
         warnings=updated_status.warnings,
         message=message,
     )
@@ -4769,19 +5100,23 @@ def _classify_delivery_child_run(
     child_result: DeliveryChildRunResult,
     child_state,
 ) -> DeliveryChildRunClassification:
+    if child_state is not None:
+        budget_exceeded = _delivery_child_budget_exceeded(child_state)
+        if budget_exceeded is not None:
+            return DeliveryChildRunClassification(
+                "failed",
+                DELIVERY_UNIT_BUDGET_EXCEEDED_CODE,
+                budget_exceeded,
+            )
+        terminal_stop_code = _delivery_child_terminal_stop_code(child_state)
+        if terminal_stop_code is not None:
+            return DeliveryChildRunClassification("failed", terminal_stop_code)
     if child_result.interrupted:
         return DeliveryChildRunClassification("failed", "child_run_interrupted")
     if child_result.exception is not None:
         return DeliveryChildRunClassification("failed", "child_run_exception")
     if child_state is None:
         return DeliveryChildRunClassification("failed", "child_task_missing")
-    budget_exceeded = _delivery_child_budget_exceeded(child_state)
-    if budget_exceeded is not None:
-        return DeliveryChildRunClassification(
-            "failed",
-            DELIVERY_UNIT_BUDGET_EXCEEDED_CODE,
-            budget_exceeded,
-        )
     if child_result.exit_code != 0:
         return DeliveryChildRunClassification("failed", "child_run_failed")
     if not getattr(child_state, "done", False):
@@ -4864,6 +5199,16 @@ def _invoke_delivery_child_run(
     delivery_unit_id: str | None = None,
     delivery_plan_path: str | None = None,
     delivery_unit_budget: dict[str, int] | None = None,
+    delivery_constraint_context_schema_version: int | None = None,
+    delivery_source_task: dict[str, str] | None = None,
+    delivery_inherited_constraints: list[dict] | None = None,
+    delivery_constraint_context_fingerprint: str | None = None,
+    delivery_write_scope_schema_version: int | None = None,
+    delivery_write_scope_mode: str | None = None,
+    delivery_declared_write_paths: list[str] | None = None,
+    delivery_declared_write_exact_file_paths: list[str] | None = None,
+    delivery_effective_write_paths: list[str] | None = None,
+    delivery_effective_write_exact_file_paths: list[str] | None = None,
     delivery_handoff_schema_version: int | None = None,
     delivery_dependency_handoffs: list[dict] | None = None,
     delivery_child_created_callback: Callable[[str], None] | None = None,
@@ -4879,6 +5224,16 @@ def _invoke_delivery_child_run(
         delivery_unit_id=delivery_unit_id,
         delivery_plan_path=delivery_plan_path,
         delivery_unit_budget=delivery_unit_budget,
+        delivery_constraint_context_schema_version=delivery_constraint_context_schema_version,
+        delivery_source_task=delivery_source_task,
+        delivery_inherited_constraints=delivery_inherited_constraints,
+        delivery_constraint_context_fingerprint=delivery_constraint_context_fingerprint,
+        delivery_write_scope_schema_version=delivery_write_scope_schema_version,
+        delivery_write_scope_mode=delivery_write_scope_mode,
+        delivery_declared_write_paths=delivery_declared_write_paths,
+        delivery_declared_write_exact_file_paths=delivery_declared_write_exact_file_paths,
+        delivery_effective_write_paths=delivery_effective_write_paths,
+        delivery_effective_write_exact_file_paths=delivery_effective_write_exact_file_paths,
         delivery_handoff_schema_version=delivery_handoff_schema_version,
         delivery_dependency_handoffs=delivery_dependency_handoffs,
         delivery_child_created_callback=delivery_child_created_callback,
@@ -4898,6 +5253,16 @@ def _delivery_child_run_args(
     delivery_unit_id: str | None = None,
     delivery_plan_path: str | None = None,
     delivery_unit_budget: dict[str, int] | None = None,
+    delivery_constraint_context_schema_version: int | None = None,
+    delivery_source_task: dict[str, str] | None = None,
+    delivery_inherited_constraints: list[dict] | None = None,
+    delivery_constraint_context_fingerprint: str | None = None,
+    delivery_write_scope_schema_version: int | None = None,
+    delivery_write_scope_mode: str | None = None,
+    delivery_declared_write_paths: list[str] | None = None,
+    delivery_declared_write_exact_file_paths: list[str] | None = None,
+    delivery_effective_write_paths: list[str] | None = None,
+    delivery_effective_write_exact_file_paths: list[str] | None = None,
     delivery_handoff_schema_version: int | None = None,
     delivery_dependency_handoffs: list[dict] | None = None,
     delivery_child_created_callback: Callable[[str], None] | None = None,
@@ -4929,6 +5294,24 @@ def _delivery_child_run_args(
         delivery_unit_id=delivery_unit_id,
         delivery_plan_path=delivery_plan_path,
         delivery_unit_budget=dict(delivery_unit_budget or {}),
+        delivery_constraint_context_schema_version=delivery_constraint_context_schema_version,
+        delivery_source_task=copy.deepcopy(delivery_source_task),
+        delivery_inherited_constraints=copy.deepcopy(delivery_inherited_constraints or []),
+        delivery_constraint_context_fingerprint=delivery_constraint_context_fingerprint,
+        delivery_write_scope_schema_version=delivery_write_scope_schema_version,
+        delivery_write_scope_mode=delivery_write_scope_mode,
+        delivery_declared_write_paths=list(delivery_declared_write_paths or []),
+        delivery_declared_write_exact_file_paths=(
+            list(delivery_declared_write_exact_file_paths)
+            if delivery_declared_write_exact_file_paths is not None
+            else None
+        ),
+        delivery_effective_write_paths=list(delivery_effective_write_paths or []),
+        delivery_effective_write_exact_file_paths=(
+            list(delivery_effective_write_exact_file_paths)
+            if delivery_effective_write_exact_file_paths is not None
+            else None
+        ),
         delivery_handoff_schema_version=delivery_handoff_schema_version,
         delivery_dependency_handoffs=copy.deepcopy(delivery_dependency_handoffs or []),
         delivery_child_created_callback=delivery_child_created_callback,
@@ -4971,6 +5354,16 @@ def _delivery_child_resume_run_args(
         delivery_unit_id=None,
         delivery_plan_path=None,
         delivery_unit_budget=None,
+        delivery_constraint_context_schema_version=None,
+        delivery_source_task=None,
+        delivery_inherited_constraints=None,
+        delivery_constraint_context_fingerprint=None,
+        delivery_write_scope_schema_version=None,
+        delivery_write_scope_mode=None,
+        delivery_declared_write_paths=None,
+        delivery_declared_write_exact_file_paths=None,
+        delivery_effective_write_paths=None,
+        delivery_effective_write_exact_file_paths=None,
         delivery_handoff_schema_version=None,
         delivery_dependency_handoffs=None,
         delivery_child_created_callback=None,

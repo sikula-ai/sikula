@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
 import yaml
 
-from core.delivery_authoring import DeliveryAuthoringDraft, DeliveryAuthoringUnitDraft
+from core.delivery_authoring import (
+    DeliveryAuthoringConstraintDraft,
+    DeliveryAuthoringDraft,
+    DeliveryAuthoringUnitDraft,
+    DeliveryConstraintGap,
+    DeliveryConstraintVerification,
+    DeliveryUnitContextGap,
+)
+from core.delivery_plan import DeliveryPlanSourceTask
 from core.delivery_prepare_writer import write_delivery_prepare_artifacts
 from core.delivery_unit_metadata import DeliveryUnitBudget
 
@@ -119,7 +129,10 @@ def _draft(
     plan_id: str = "team-invites",
     planning_mode: str | None = "fixed_window",
     units: list[DeliveryAuthoringUnitDraft] | None = None,
+    constraints: list[DeliveryAuthoringConstraintDraft] | None = None,
+    source_task: DeliveryPlanSourceTask | None = None,
 ) -> DeliveryAuthoringDraft:
+    constraint_values = constraints or []
     return DeliveryAuthoringDraft(
         plan_id=plan_id,
         title="Team invites delivery",
@@ -152,6 +165,13 @@ def _draft(
             ),
         ],
         planning_mode=planning_mode,
+        constraints=constraint_values,
+        source_task=source_task,
+        constraint_verification=(
+            DeliveryConstraintVerification(constraints_complete=True, constraints=list(constraint_values))
+            if source_task is not None
+            else None
+        ),
     )
 
 
@@ -171,6 +191,30 @@ def test_writer_rejects_unsafe_public_metadata_before_writing(tmp_path: Path) ->
     assert result.errors[0].code == "delivery_prepare.metadata_invalid"
     assert result.errors[0].path == "units[0].title"
     assert str(tmp_path) not in str(result.to_dict())
+    assert not (tmp_path / ".sikula" / "delivery").exists()
+
+
+def test_writer_rejects_unsafe_typed_constraint_metadata_before_writing(tmp_path: Path) -> None:
+    constraint = DeliveryAuthoringConstraintDraft(
+        id="protocol-authority",
+        kind="authoritative_read_only_dependency",
+        summary="Read /Users/example/private/task.md",
+        unit_ids=["foundation"],
+        disposition="preserved",
+    )
+
+    result = write_delivery_prepare_artifacts(
+        _draft(units=[_unit("foundation")], constraints=[constraint]),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "blocked"
+    assert result.failure_reason == "write_failed"
+    assert result.errors[0].code == "delivery_prepare.metadata_invalid"
+    assert result.errors[0].path == "constraints[0].summary"
+    assert "/Users/example" not in str(result.to_dict())
     assert not (tmp_path / ".sikula" / "delivery").exists()
 
 
@@ -253,6 +297,252 @@ def test_write_delivery_prepare_artifacts_writes_valid_plan_and_units(tmp_path: 
     assert not (tmp_path / ".sikula" / "state" / "delivery" / "team-invites").exists()
     assert str(tmp_path) not in repr(result.to_dict())
     assert "Raw prompts" not in repr(result.to_dict())
+
+
+def test_writer_persists_source_task_fingerprint_and_preserved_constraints(tmp_path: Path) -> None:
+    source_text = "# Team invites\n\nThe protocol project remains authoritative.\n"
+    source_path = tmp_path / ".sikula" / "tasks" / "team-invites.md"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(source_text, encoding="utf-8")
+    source_task = DeliveryPlanSourceTask(
+        path=".sikula/tasks/team-invites.md",
+        sha256="sha256:" + sha256(source_text.encode("utf-8")).hexdigest(),
+    )
+    constraint = DeliveryAuthoringConstraintDraft(
+        id="protocol-authority",
+        kind="authoritative_read_only_dependency",
+        summary="Protocol changes remain owned by the external protocol project.",
+        unit_ids=["foundation", "cli"],
+        disposition="preserved",
+    )
+
+    result = write_delivery_prepare_artifacts(
+        _draft(constraints=[constraint], source_task=source_task),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    plan_data = yaml.safe_load(
+        (tmp_path / ".sikula" / "delivery" / "team-invites" / "plan.yaml").read_text(encoding="utf-8")
+    )
+    assert result.status == "ready"
+    assert plan_data["source_task"] == source_task.to_dict()
+    assert plan_data["constraints"] == [constraint.to_plan_dict()]
+
+
+def test_writer_blocks_when_independent_source_constraint_verification_is_incomplete(tmp_path: Path) -> None:
+    source_text = "# Task\n\nOnly the protocol repository may change protocol files.\n"
+    source_path = tmp_path / ".sikula" / "tasks" / "source.md"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(source_text, encoding="utf-8")
+    source_task = DeliveryPlanSourceTask(
+        path=".sikula/tasks/source.md",
+        sha256="sha256:" + sha256(source_text.encode("utf-8")).hexdigest(),
+    )
+    draft = _draft(source_task=source_task)
+    gap = DeliveryConstraintGap(
+        reason="omitted",
+        kind="repository_ownership",
+        summary="Protocol file updates remain externally owned.",
+        affected_unit_ids=["foundation"],
+    )
+    draft.constraint_verification = DeliveryConstraintVerification(
+        constraints_complete=False,
+        constraints=[],
+        constraint_gaps=[gap],
+    )
+
+    result = write_delivery_prepare_artifacts(
+        draft,
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "blocked"
+    assert result.failure_reason == "constraint_review_required"
+    assert result.errors[0].code == "delivery_prepare.constraint_verification_incomplete"
+    assert result.errors[1].code == "delivery_prepare.constraint_gap"
+    assert result.errors[1].path == "constraint_verification.constraint_gaps[0]"
+    assert "repository_ownership" in result.errors[1].message
+    assert "foundation" in result.errors[1].message
+    assert not (tmp_path / ".sikula" / "delivery" / "team-invites" / "plan.yaml").exists()
+
+
+def test_writer_blocks_source_plan_without_independent_constraint_verification(tmp_path: Path) -> None:
+    source_text = "# Task\n\nPrepare the delivery.\n"
+    source_path = tmp_path / ".sikula" / "tasks" / "source.md"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(source_text, encoding="utf-8")
+    source_task = DeliveryPlanSourceTask(
+        path=".sikula/tasks/source.md",
+        sha256="sha256:" + sha256(source_text.encode("utf-8")).hexdigest(),
+    )
+    draft = _draft(source_task=source_task)
+    draft.constraint_verification = None
+
+    result = write_delivery_prepare_artifacts(
+        draft,
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "blocked"
+    assert result.errors[0].code == "delivery_prepare.constraint_verification_required"
+
+
+def test_writer_blocks_persistent_unit_context_gap_without_exposing_literals(tmp_path: Path) -> None:
+    source_text = '# Task\n\n- <resource.title> — "Resource"\n'
+    source_path = tmp_path / ".sikula" / "tasks" / "source.md"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(source_text, encoding="utf-8")
+    source_task = DeliveryPlanSourceTask(
+        path=".sikula/tasks/source.md",
+        sha256="sha256:" + sha256(source_text.encode("utf-8")).hexdigest(),
+    )
+    draft = _draft(source_task=source_task)
+    draft.constraint_verification = DeliveryConstraintVerification(
+        constraints_complete=True,
+        constraints=[],
+        unit_context_complete=False,
+        unit_context_gaps=[
+            DeliveryUnitContextGap(
+                unit_id="foundation",
+                source_literals=['- <resource.title> — "Resource"'],
+            )
+        ],
+    )
+
+    result = write_delivery_prepare_artifacts(
+        draft,
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "blocked"
+    assert result.failure_reason == "unit_context_incomplete"
+    assert result.errors[0].code == "delivery_prepare.unit_context_verification_incomplete"
+    assert result.errors[1].code == "delivery_prepare.unit_context_gap"
+    assert "foundation" in result.errors[1].message
+    assert "resource.title" not in result.errors[1].message
+
+
+@pytest.mark.parametrize(
+    ("verification_kind", "expected_code"),
+    [
+        ("mismatch", "delivery_prepare.constraint_verification_invalid"),
+        ("conflict", "delivery_prepare.constraint_conflict"),
+        ("needs_review", "delivery_prepare.constraint_review_required"),
+    ],
+)
+def test_writer_blocks_untrusted_independent_constraint_verification(
+    tmp_path: Path,
+    verification_kind: str,
+    expected_code: str,
+) -> None:
+    source_text = "# Task\n\nPreserve protocol ownership.\n"
+    source_path = tmp_path / ".sikula" / "tasks" / "source.md"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(source_text, encoding="utf-8")
+    source_task = DeliveryPlanSourceTask(
+        path=".sikula/tasks/source.md",
+        sha256="sha256:" + sha256(source_text.encode("utf-8")).hexdigest(),
+    )
+    constraint = DeliveryAuthoringConstraintDraft(
+        id="protocol-authority",
+        kind="authoritative_read_only_dependency",
+        summary="Protocol changes remain owned by the protocol repository.",
+        unit_ids=["foundation"],
+        disposition="preserved",
+    )
+    verification_constraints = []
+    if verification_kind != "mismatch":
+        verification_constraints = [replace(constraint, disposition=verification_kind)]
+    draft = _draft(units=[_unit("foundation")], constraints=[constraint], source_task=source_task)
+    draft.constraint_verification = DeliveryConstraintVerification(
+        constraints_complete=True,
+        constraints=verification_constraints,
+    )
+
+    result = write_delivery_prepare_artifacts(
+        draft,
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "blocked"
+    assert result.errors[0].code == expected_code
+
+
+@pytest.mark.parametrize(
+    ("disposition", "expected_reason", "expected_code"),
+    [
+        pytest.param(
+            "needs_review",
+            "constraint_review_required",
+            "delivery_prepare.constraint_review_required",
+            id="needs_review",
+        ),
+        pytest.param(
+            "conflict",
+            "constraint_conflict",
+            "delivery_prepare.constraint_conflict",
+            id="conflict",
+        ),
+    ],
+)
+def test_writer_blocks_unresolved_inherited_constraints_before_writing(
+    tmp_path: Path,
+    disposition: str,
+    expected_reason: str,
+    expected_code: str,
+) -> None:
+    constraint = DeliveryAuthoringConstraintDraft(
+        id="protocol-authority",
+        kind="authoritative_read_only_dependency",
+        summary="Protocol changes remain owned by the external protocol project.",
+        unit_ids=["foundation"],
+        disposition=disposition,
+    )
+
+    result = write_delivery_prepare_artifacts(
+        _draft(units=[_unit("foundation")], constraints=[constraint]),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "blocked"
+    assert result.prepared is False
+    assert result.failure_reason == expected_reason
+    assert result.errors[0].code == expected_code
+    assert not (tmp_path / ".sikula" / "delivery").exists()
+
+
+def test_writer_rejects_unknown_typed_constraint_disposition_before_writing(tmp_path: Path) -> None:
+    constraint = DeliveryAuthoringConstraintDraft(
+        id="protocol-authority",
+        kind="authoritative_read_only_dependency",
+        summary="Protocol changes remain owned by the external protocol project.",
+        unit_ids=["foundation"],
+        disposition="unknown",
+    )
+
+    result = write_delivery_prepare_artifacts(
+        _draft(units=[_unit("foundation")], constraints=[constraint]),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "blocked"
+    assert result.failure_reason == "write_failed"
+    assert result.errors[0].code == "delivery_prepare.constraint_disposition_invalid"
+    assert not (tmp_path / ".sikula" / "delivery").exists()
 
 
 def test_write_delivery_prepare_artifacts_canonicalizes_generated_unit_headings(tmp_path: Path) -> None:

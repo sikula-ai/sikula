@@ -261,3 +261,6 @@ class XcodeTool(BuildTool):
 
     def is_sync_adoptable_file(self, path: str) -> bool:
         return Path(path).name == "Package.resolved"
+
+    def is_ephemeral_build_path(self, path: str) -> bool:
+        return any(part in {".build", "DerivedData", "build"} for part in self._delivery_scope_path_parts(path))

@@ -17,7 +17,14 @@ from agents.base_agent import (
     tech_stack as _tech_stack,
 )
 from agents.build_guidance import write_agent_constraints as _write_agent_constraints
+from agents.delivery_contracts import delivery_agent_prompt_context
+from core.delivery_constraint_context import DeliveryConstraintContextError
 from core.state import TaskState
+from core.structured_output import (
+    DELIVERY_IMPLEMENTATION_DISPOSITIONS,
+    DeliveryDispositionParseError,
+    parse_delivery_disposition,
+)
 
 _AGENT_PROMPT = """\
 You are implementing a change to a {tech_stack} codebase.
@@ -50,6 +57,8 @@ CONSTRAINTS — follow strictly:
 - NEVER create or modify unit tests — no files under any test source directory
   (e.g. `test/`, `__tests__/`, `spec/`), regardless of what the task says;
   a dedicated agent handles tests separately
+{delivery_constraint_context}
+{delivery_disposition_contract}
 
 TASK:
 {implementation_prompt}
@@ -132,12 +141,22 @@ class ImplementerAgent(BaseAgent):
         if not file_tool:
             return AgentResult(success=False, message="FileTool not available")
 
+        try:
+            delivery_context = delivery_agent_prompt_context(state, role=self.name)
+        except DeliveryConstraintContextError as exc:
+            message = "Inherited delivery constraint context was rejected before implementation ({code}).".format(
+                code=exc.code
+            )
+            state.record(self.name, "delivery_constraint_context_rejected", message)
+            return AgentResult(success=False, message=message)
+
         sandbox = self.project_config.get("sandbox", {})
         allowed_write_paths = sandbox.get("allowed_write_paths", [])
         allowed_read_paths = sandbox.get("allowed_read_paths", ["."])
         allowed_str = ", ".join(allowed_write_paths) if allowed_write_paths else "(not configured)"
         allowed_read_str = ", ".join(allowed_read_paths)
         tech_stack = _tech_stack(self.project_config)
+        delivery_child = delivery_context.is_delivery_child
 
         step_section = ""
         if state.plan and state.active_scope != _SCOPE_FINAL_FULL_TASK:
@@ -160,6 +179,8 @@ class ImplementerAgent(BaseAgent):
             allowed_write_paths=allowed_str,
             guidelines_files=_guidelines_files(self.project_config),
             build_tool_constraints=_write_agent_constraints(self.project_config),
+            delivery_constraint_context=delivery_context.inherited_constraints,
+            delivery_disposition_contract=delivery_context.disposition_contract,
             implementation_prompt=state.implementation_prompt,
             step_section=step_section,
             review_fix_section=review_fix_section,
@@ -193,29 +214,58 @@ class ImplementerAgent(BaseAgent):
             )
             return AgentResult(success=False, message=msg[:200])
 
-        state.implement_cycle_records.append(
-            {
-                "step": state.current_step,
-                "build_iteration": state.build_iterations,
-                "review_iteration": state.review_iterations,
-                "security_review_iteration": state.security_review_iterations,
-                "scope": _scope(state),
-                "step_description": step_description,
-                "implementer_prompt": prompt,
-                "implementer_output": agent_output,
-                "files_written": changed,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        cycle_record = {
+            "step": state.current_step,
+            "build_iteration": state.build_iterations,
+            "review_iteration": state.review_iterations,
+            "security_review_iteration": state.security_review_iterations,
+            "scope": _scope(state),
+            "step_description": step_description,
+            "implementer_prompt": prompt,
+            "implementer_output": agent_output,
+            "files_written": changed,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        state.implement_cycle_records.append(cycle_record)
+
+        state.files_changed.extend(p for p in changed if p not in state.files_changed)
+        if changed:
+            _record_write_path_warnings(state, self.name, changed, allowed_write_paths, "allowed_write_paths")
+
+        if delivery_child:
+            try:
+                disposition = parse_delivery_disposition(
+                    agent_output,
+                    allowed_dispositions=DELIVERY_IMPLEMENTATION_DISPOSITIONS,
+                )
+            except DeliveryDispositionParseError as exc:
+                cycle_record["disposition_parse_error"] = exc.code
+                state.record_delivery_disposition_parse_error(self.name, exc.code)
+                msg = f"Implementer produced invalid delivery disposition ({exc.code})"
+                state.record(self.name, "implement_failed", msg)
+                return AgentResult(
+                    success=False,
+                    message=msg,
+                    data={"files_written": changed},
+                )
+            if disposition is not None:
+                cycle_record["disposition"] = disposition.to_dict()
+                state.set_delivery_stop_disposition(self.name, disposition)
+                return AgentResult(
+                    success=False,
+                    message=disposition.disposition,
+                    data={
+                        "files_written": changed,
+                        "disposition": disposition.to_dict(),
+                    },
+                )
 
         if not changed:
             msg = "Agent made no file changes"
             state.record(self.name, "implement_skipped", msg)
             return AgentResult(success=True, message=msg)
 
-        state.files_changed.extend(p for p in changed if p not in state.files_changed)
         state.record(self.name, "implement", f"files changed: {changed}")
-        _record_write_path_warnings(state, self.name, changed, allowed_write_paths, "allowed_write_paths")
         return AgentResult(
             success=True,
             message=f"Written {len(changed)} file(s): {changed}",

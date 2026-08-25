@@ -25,8 +25,9 @@ from agents.fixer_agent import (
     _validation_error_targets,
     _write_paths_for_state,
 )
-from tests.conftest import StubLLMClient
+from core.delivery_constraint_context import delivery_constraint_context_fingerprint
 from core.state import TaskState
+from tests.conftest import StubLLMClient
 
 
 def _make_state(**kwargs) -> TaskState:
@@ -44,6 +45,34 @@ def _make_agent(llm: StubLLMClient, file_tool=None, project_config: dict | None 
     if file_tool is not None:
         tools["file"] = file_tool
     return FixerAgent(llm=llm, tools=tools, project_config=project_config or {})
+
+
+def _add_delivery_constraint_context(state: TaskState) -> None:
+    state.delivery_plan_id = "demo-plan"
+    state.delivery_unit_id = "unit-a"
+    state.delivery_plan_path = ".sikula/delivery/demo/plan.yaml"
+    state.delivery_constraint_context_schema_version = 1
+    state.delivery_source_task = {
+        "path": ".sikula/tasks/demo.md",
+        "sha256": "sha256:" + "1" * 64,
+    }
+    state.delivery_inherited_constraints = [
+        {
+            "id": "external-owner",
+            "kind": "authoritative_read_only_dependency",
+            "summary": "Treat the external repository as read-only evidence.",
+            "unit_ids": ["unit-a"],
+            "disposition": "preserved",
+        }
+    ]
+    state.delivery_constraint_context_fingerprint = delivery_constraint_context_fingerprint(
+        schema_version=state.delivery_constraint_context_schema_version,
+        plan_id=state.delivery_plan_id,
+        unit_id=state.delivery_unit_id,
+        plan_path=state.delivery_plan_path,
+        source_task=state.delivery_source_task,
+        constraints=state.delivery_inherited_constraints,
+    )
 
 
 class _FakeBuildTool:
@@ -113,6 +142,42 @@ class TestFixerAgentGuards:
         state.errors = ["compile error"]
         result = _make_agent(stub_llm).run(state)
         assert not result.success
+
+    def test_rejects_invalid_delivery_constraint_context_before_provider_call(
+        self,
+        stub_llm: StubLLMClient,
+        file_tool,
+    ):
+        state = _make_state(errors=["compile error"])
+        _add_delivery_constraint_context(state)
+        state.delivery_constraint_context_fingerprint = None
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert not result.success
+        assert "rejected before fixing" in result.message
+        assert stub_llm.agent_calls == []
+        assert state.history[-1]["action"] == "delivery_constraint_context_rejected"
+
+    def test_prompt_contains_authoritative_delivery_constraint_context(
+        self,
+        stub_llm: StubLLMClient,
+        file_tool,
+    ):
+        state = _make_state(errors=["compile error"])
+        _add_delivery_constraint_context(state)
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.message == "Agent made no file changes"
+        prompt = stub_llm.agent_calls[0]
+        assert "Authoritative inherited delivery constraint context:" in prompt
+        assert "Treat the external repository as read-only evidence." in prompt
+        assert state.delivery_constraint_context_fingerprint in prompt
+        assert prompt.index("ORIGINAL TASK") < prompt.index("Authoritative inherited delivery constraint context:")
+        assert prompt.index("Authoritative inherited delivery constraint context:") < prompt.index(
+            "IMPLEMENTATION THAT WAS APPLIED"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1411,6 +1476,38 @@ class TestWritePathsForState:
         state.test_errors = ["assertion failed"]
         sandbox = {"allowed_write_paths": ["."], "allowed_test_write_paths": ["."]}
         assert _write_paths_for_state(state, sandbox) == ["."]
+
+    def test_delivery_scope_reports_no_test_authority_for_build_failure(self, tmp_path: Path):
+        state = _make_state()
+        state.errors = ["compile error"]
+        agent = _make_agent(
+            StubLLMClient(),
+            file_tool=type("FileTool", (), {"_root": tmp_path})(),
+            project_config={
+                "sandbox": {
+                    "allowed_write_paths": ["src/"],
+                    "allowed_test_write_paths": ["tests/"],
+                }
+            },
+        )
+
+        assert agent.delivery_scope_active_test_write_paths(state) == []
+
+    def test_delivery_scope_reports_test_authority_for_test_failure(self, tmp_path: Path):
+        state = _make_state()
+        state.test_errors = ["assertion failed"]
+        agent = _make_agent(
+            StubLLMClient(),
+            file_tool=type("FileTool", (), {"_root": tmp_path})(),
+            project_config={
+                "sandbox": {
+                    "allowed_write_paths": ["src/"],
+                    "allowed_test_write_paths": ["tests/"],
+                }
+            },
+        )
+
+        assert agent.delivery_scope_active_test_write_paths(state) == ["tests/"]
 
 
 class TestTestFailureProductionWrites:

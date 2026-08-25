@@ -56,6 +56,7 @@ from core.llm_client import (
     _claude_write_settings,
     _codex_parse_text,
     _codex_reported_tokens,
+    _LLMCallValue,
     _codex_stream_error,
     _codex_subprocess_error,
     _git_exclude_file,
@@ -180,6 +181,37 @@ class TestCallWithRetry:
         assert len(events) == 1
         assert events[0]["outcome"] == "fatal_error"
         assert events[0]["error_type"] == "LLMQuotaExceeded"
+
+    def test_records_successful_provider_usage_when_write_boundary_rejects_attempt(self):
+        class RejectingWriteBoundary:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                raise RuntimeError("scope audit rejected provider writes")
+
+        events = []
+        cfg = LLMConfig(
+            provider="codex",
+            usage_observer=events.append,
+            write_attempt_boundary=lambda _attempt: RejectingWriteBoundary(),
+        )
+        usage = {"input_tokens": 12, "output_tokens": 3}
+
+        with pytest.raises(RuntimeError, match="scope audit rejected provider writes"):
+            _call_with_retry(
+                "test",
+                lambda: _LLMCallValue("result", output_chars=6, reported_tokens=usage),
+                cfg,
+                "run_agent",
+                input_chars=20,
+            )
+
+        assert len(events) == 1
+        assert events[0]["outcome"] == "error"
+        assert events[0]["error_type"] == "RuntimeError"
+        assert events[0]["output_chars"] == 6
+        assert events[0]["reported_tokens"] == usage
 
     def test_records_timeout_and_retry_as_separate_attempts(self):
         events = []
@@ -2964,6 +2996,73 @@ class TestClaudeWriteSettings:
         assert settings_path.exists()
         assert not (tmp_path / ".git").exists()
 
+    @pytest.mark.parametrize("provider_dir", [".claude", ".gemini"])
+    def test_provider_settings_reject_symlinked_directory(self, tmp_path: Path, provider_dir: str):
+        project = tmp_path / "project"
+        project.mkdir()
+        external = tmp_path / "external"
+        external.mkdir()
+        try:
+            (project / provider_dir).symlink_to(external, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+
+        with (
+            patch("core.llm_client._git_exclude_file", return_value=None),
+            pytest.raises(LLMConfigurationError, match="symlinked provider settings path"),
+        ):
+            if provider_dir == ".claude":
+                _claude_write_settings(project)
+            else:
+                _gemini_write_settings(project, {"tools": {}})
+
+        assert not (external / "settings.json").exists()
+
+    @pytest.mark.parametrize("provider_dir", [".claude", ".gemini"])
+    def test_provider_settings_reject_symlinked_destination(self, tmp_path: Path, provider_dir: str):
+        project = tmp_path / "project"
+        settings_dir = project / provider_dir
+        settings_dir.mkdir(parents=True)
+        external = tmp_path / "external-settings.json"
+        external.write_text('{"external": true}\n', encoding="utf-8")
+        try:
+            (settings_dir / "settings.json").symlink_to(external)
+        except OSError as exc:
+            pytest.skip(f"symlinks are not available: {exc}")
+
+        with (
+            patch("core.llm_client._git_exclude_file", return_value=None),
+            pytest.raises(LLMConfigurationError, match="symlinked provider settings path"),
+        ):
+            if provider_dir == ".claude":
+                _claude_write_settings(project)
+            else:
+                _gemini_write_settings(project, {"tools": {}})
+
+        assert external.read_text(encoding="utf-8") == '{"external": true}\n'
+
+    def test_prepare_write_agent_workspace_materializes_settings(self, tmp_path: Path):
+        client = ClaudeClient(LLMConfig(provider="claude", model="claude-sonnet-4-6"))
+
+        with patch("core.llm_client._git_exclude_file", return_value=None):
+            client.prepare_write_agent_workspace(tmp_path)
+
+        assert (tmp_path / ".claude" / "settings.json").exists()
+
+    def test_prepare_write_agent_workspace_rejects_tracked_settings(self, tmp_project: Path):
+        settings = tmp_project / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text('{"project": true}\n', encoding="utf-8")
+        subprocess.run(["git", "add", ".claude/settings.json"], cwd=tmp_project, check=True)
+        subprocess.run(["git", "commit", "-m", "track claude settings"], cwd=tmp_project, check=True)
+
+        client = ClaudeClient(LLMConfig(provider="claude", model="claude-sonnet-4-6"))
+
+        with pytest.raises(LLMConfigurationError, match="tracked provider settings"):
+            client.prepare_write_agent_workspace(tmp_project)
+
+        assert settings.read_text(encoding="utf-8") == '{"project": true}\n'
+
     def test_run_readonly_agent_calls_write_settings(self, tmp_path):
         cfg = LLMConfig(provider="claude", model="claude-sonnet-4-6")
         client = ClaudeClient(cfg)
@@ -4282,6 +4381,29 @@ class TestGeminiClientCommands:
                 "models": {model: {"tokens": tokens} for model, tokens in model_tokens.items()},
             }
         return MagicMock(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    def test_prepare_write_agent_workspace_materializes_implementer_settings(self, tmp_path: Path):
+        client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro"))
+
+        with patch("core.llm_client._git_exclude_file", return_value=None):
+            client.prepare_write_agent_workspace(tmp_path)
+
+        settings = json.loads((tmp_path / ".gemini" / "settings.json").read_text(encoding="utf-8"))
+        assert "write_file" in settings["tools"]["core"]
+
+    def test_prepare_write_agent_workspace_rejects_tracked_settings(self, tmp_project: Path):
+        settings = tmp_project / ".gemini" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text('{"project": true}\n', encoding="utf-8")
+        subprocess.run(["git", "add", ".gemini/settings.json"], cwd=tmp_project, check=True)
+        subprocess.run(["git", "commit", "-m", "track gemini settings"], cwd=tmp_project, check=True)
+
+        client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro"))
+
+        with pytest.raises(LLMConfigurationError, match="tracked provider settings"):
+            client.prepare_write_agent_workspace(tmp_project)
+
+        assert settings.read_text(encoding="utf-8") == '{"project": true}\n'
 
     def test_generate_skips_workspace_trust_check(self):
         client = GeminiClient(LLMConfig(provider="gemini", model="gemini-2.5-pro", agent_timeout=123))

@@ -87,6 +87,41 @@ class TestStatusCliModule:
         state.worktree_path = str(worktree)
         assert status_cli._status_next_action(state, "FAILED") == "sikula run --task-id delivery-child --reset-failed"
 
+    @pytest.mark.parametrize(
+        ("stop_code", "expected_action"),
+        [
+            (
+                "unit_scope_violation",
+                "prepare a delivery amendment with delivery amend prepare before continuing",
+            ),
+            (
+                "scope_amendment_required",
+                "prepare a delivery amendment with delivery amend prepare before continuing",
+            ),
+            (
+                "external_dependency_gap",
+                "complete the external dependency follow-up before continuing",
+            ),
+            (
+                "implementer_disposition_invalid",
+                "inspect the invalid implementer disposition and replace the failed child before continuing",
+            ),
+        ],
+    )
+    def test_terminal_delivery_child_next_action_is_not_reset(self, stop_code: str, expected_action: str):
+        from core.state import TaskState
+
+        state = TaskState(
+            task_id="delivery-child",
+            task_description="terminal child",
+            failed=True,
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_stop_code=stop_code,
+        )
+
+        assert status_cli._status_next_action(state, "FAILED") == expected_action
+
     def test_active_operation_fallback_helpers(self):
         from datetime import datetime, timedelta, timezone
         import sikula_cli.status as status_cli

@@ -35,12 +35,15 @@
 | `LLMUsage` helpers | `core/llm_usage.py` | Provider-neutral validation and aggregation for bounded invocation counts, elapsed time, character counts, outcomes, and optional provider-reported token usage |
 | `ContractCheck` helpers | `core/contract_check.py` | Deterministic implementation-contract readiness checks for Markdown/plain-text task files; `sikula run` stores a warning-only state snapshot and `sikula contract check --write-report` explicitly writes report artifacts |
 | `StructuredOutput` helpers | `core/structured_output.py` | Side-effect-free schema-aware extraction of one unambiguous top-level JSON object from LLM output while rejecting malformed, nested, or multiple response candidates |
-| `DeliveryAuthoring` helpers | `core/delivery_authoring.py` | Side-effect-free parser and derived-path helpers for delivery prepare authoring drafts |
-| `DeliveryPrepareWriter` helpers | `core/delivery_prepare_writer.py` | Deterministic source-artifact writer for parsed delivery authoring drafts; preserves source-task asset declarations across unit tasks and renders `plan.yaml` and unit task files with readiness checks, plan validation, overwrite guards, and rollback |
+| `DeliveryAuthoring` helpers | `core/delivery_authoring.py` | Side-effect-free parser and derived-path helpers for delivery prepare authoring drafts, including bounded inherited source-task constraints and source-asset assignments |
+| `DeliveryPrepareWriter` helpers | `core/delivery_prepare_writer.py` | Deterministic source-artifact writer for parsed delivery authoring drafts; binds generated plans to a source-task fingerprint, blocks unresolved constraints, preserves source-task asset declarations, and renders `plan.yaml` plus unit task files with readiness checks, plan validation, overwrite guards, and rollback |
+| `DeliveryAssetAssignment` helpers | `core/delivery_asset_assignment.py` | Deterministic source-to-unit asset completeness, canonical alias matching, exact declaration rendering, and rendered-contract verification for prepare and amendment flows |
+| `DeliveryConstraintContext` helpers | `core/delivery_constraint_context.py` | Strict validation, integrity fingerprinting, and deterministic agent-prompt projection for a delivery child's bounded inherited constraints and parent-plan correlation |
 | `DeliveryAmendment` helpers | `core/delivery_amendment.py` | Fingerprinted split proposals, assembly-based dependency guards, no-write preview, transactional plan/unit and assembly publication, idempotent recovery, and append-only amendment events |
 | `DeliveryHandoff` helpers | `core/delivery_handoff.py` | Versioned, fingerprinted, privacy-safe unit handoff artifacts consumed by later dependency units |
 | `DeliveryAssembly` helpers | `core/delivery_assembly.py` | Dependency-ordered result integration plus bounded delivery-owned artifact commits, with ancestry-preserving outcomes, temporary-index tree construction, and compare-and-swap direct-ref updates |
 | `TaskAsset` helpers | `core/task_assets.py` | Deterministic local task-asset parsing, path canonicalization, answer mapping, and asset-manifest line rendering used by contract preparation |
+| `MarkdownDocument` helpers | `core/markdown_document.py` | Shared CommonMark structure and source-range projection used where task and contract boundaries must preserve exact Markdown blocks |
 | `Worktree` helpers | `core/worktree.py` | Shared low-level git/worktree operations used by run, review, cleanup/delete, and init CLI surfaces; command-specific state mutation stays in the owning command layer |
 | `TaskState` | `core/state.py` | Single source of truth; persisted as JSON after every agent operation |
 | `JsonStateStore` | `core/state.py` | Stores each task as `<task_id>.json` in the configured state dir; serializes same-process access and writes via temp-file replacement so heartbeat updates and audit saves cannot interleave partial JSON writes |
@@ -75,6 +78,7 @@ cmd_run()
    │       <delivery assembled commit, otherwise HEAD>
    │     copy BuildTool.env_files() from original project root to worktree
    │     (e.g. local.properties for AndroidGradleTool)
+   │     only after rejecting symlinked or escaping destination components
    │     state.worktree_path / worktree_base / worktree_branch set
    │
    ├─ Orchestrator.run(task_id)
@@ -107,6 +111,10 @@ later resume records do not promote legacy partial history to complete
 evidence. Report-only review records its equivalent effective snapshot before
 its first agent starts. Terminal no-op `run --task-id` calls do not append
 records.
+Interrupted delivery-scope recovery records the resume invocation before loading or
+comparing its pending evidence. If recovery passes and the same CLI invocation enters
+the normal pipeline, `Orchestrator.run()` reuses that record instead of appending a
+second one.
 
 **`--reset-failed`** (requires `--task-id`): clears `state.failed`, resets iteration counters, clears error blobs, and auto-populates `state.files_changed` from `git diff` if empty (recovers from false-negative change detection).
 
@@ -263,18 +271,55 @@ incidental prose around one schema-matching top-level JSON object while
 rejecting malformed, nested, or multiple response candidates, then
 `core/delivery_authoring.py` validates the draft without side effects. Public plan and unit
 metadata is bounded, single-line, and rejects absolute local paths while
-preserving explicit HTTP routes such as `GET /users`.
-`core/delivery_prepare_writer.py` then derives artifact paths and reads the source
-task's canonical direct-list `## Assets` declarations. Each unit draft assigns
-relevant source assets through bounded `asset_paths` aliases. Every source asset
-must be assigned to at least one unit; unknown, duplicate, and repeated canonical
-source paths are rejected. The shared task-asset parser owns declaration
-semantics and CommonMark source ranges; the delivery boundary requires a
-one-to-one match with its canonical source blocks. The writer copies each
-selected declaration and its direct child metadata without rewriting their
-content or asking the assistant to reproduce it, then reparses the rendered
-unit and verifies its path, classification, target, provenance, hash, and
-retained source block. Assistant-authored asset declarations
+preserving explicit HTTP routes such as `GET /users`. Slash-prefixed values are
+treated as routes only in HTTP method or `endpoint`/`route` context; otherwise
+they remain private absolute-path candidates.
+The authoring schema requires an explicit `constraints` list. Each inherited
+hard constraint has a stable ID, one supported kind, a bounded paraphrased
+summary, exact generated-unit references, and a disposition. Deterministic
+authoring validation rejects a substantive summary copied from a source-task
+line before the independent verifier runs. Plan checking repeats that comparison
+against the fingerprinted authoritative source and omits a rejected summary from
+public projections, including invalid-plan JSON. `needs_review`
+and `conflict` dispositions block before filesystem mutation; only
+`preserved` constraints can enter a published plan. After the authoring call, a
+second command-free read-only generation call independently compares the full
+source task, declared constraints, and complete candidate unit contracts. Its
+strict result must echo the constraint identities and assignments exactly,
+confirm completeness, and classify every disposition. An incomplete result must
+identify bounded `omitted` or `incompletely_assigned` gaps with affected unit IDs;
+a bare negative completeness claim is invalid. Sikula gives those gaps to one
+constraints-only repair call that cannot alter units, dependencies, task Markdown,
+scope, assets, sizing, risk, or budgets. Deterministic validation permits only one
+new constraint per omitted gap and only the missing assignments named for existing
+constraints, while preserving all original constraint identities and dispositions.
+The repaired list is independently verified once more. A second incomplete result,
+malformed repair, uncertainty, or conflict blocks before filesystem mutation and
+projects the remaining bounded gaps instead of a generic write failure.
+The same verification call checks that each generated unit is self-contained for
+source-defined exact identifiers and values because delivery children cannot read
+the parent source task. It may report only bounded complete source-task lines that
+are missing from a named unit. Deterministic code appends those verified lines to
+that unit's task Markdown without changing any other unit field, then includes the
+result in the same second verification round. Persistent gaps block publication;
+ordinary CLI output exposes only the unit ID and missing-value count.
+The agent adds
+`source_task.path` and a SHA-256 fingerprint deterministically from the task
+input rather than trusting model output. Plan checking rejects stale source
+fingerprints, malformed constraint metadata, unresolved dispositions, unknown
+unit references, and constraints still assigned to superseded units. Existing
+plans without this additive metadata remain valid.
+The same parsed authoring units carry bounded `asset_paths` assignments. Unlike
+semantic constraints, asset continuity is verified deterministically: the writer
+reads the authoritative source snapshot's canonical direct-list `## Assets`
+declarations and requires every source asset to be assigned to at least one unit.
+Unknown, duplicate, and repeated canonical source paths are rejected. The shared
+task-asset parser owns declaration semantics and CommonMark source ranges; the
+delivery boundary requires a one-to-one match with its canonical source blocks.
+The writer copies each selected declaration and its direct child metadata without
+rewriting their content or asking either authoring pass to reproduce it, then
+reparses the rendered unit and verifies its path, classification, target,
+provenance, hash, and retained source block. Assistant-authored asset declarations
 and unterminated blocks that could hide appended declarations are rejected.
 Delivery amendment authoring applies the same assignment and rendering boundary
 to the selected unit before replacement tasks enter the persisted proposal, so
@@ -283,10 +328,11 @@ target contracts retain their `## Asset manifest`, and replacement readiness is
 checked with the same implementation-contract semantics used by `sikula run`.
 When the prepared contract also retains its original `## Assets` declaration,
 compatible source-only child constraints are merged into the manifest-backed
-replacement declaration; conflicting repeated constraints fail closed.
-Other task asset syntax remains governed by the existing readiness checks rather
-than this delivery-specific preservation boundary. The writer then checks the completed
-unit tasks for readiness in memory, writes `plan.yaml` and
+replacement declaration; conflicting repeated constraints fail closed. Other
+task asset syntax remains governed by the existing readiness checks rather than
+this delivery-specific preservation boundary.
+`core/delivery_prepare_writer.py` then checks the completed unit tasks for
+readiness in memory, writes `plan.yaml` and
 `units/<unit-id>.md` transactionally, validates the generated plan, and rolls
 back on asset preservation, readiness, metadata, validation, write, or
 filesystem failure. The writer repeats the public-metadata check before any
@@ -301,6 +347,8 @@ nested Sikula commands, command tools, delivery progress, branches, or progress
 mutations. Raw prompts and provider output are stored only in local preparation
 audit artifacts at
 `.sikula/contract-reports/<task-stem>.delivery-prepare.auto-llm.jsonl`.
+Each audit envelope includes the Sikula runtime version; constraint verification
+records retain their actual round index and bounded parsed gaps.
 Ordinary text and JSON output is an explicit allowlisted projection and must not
 embed source task bodies, unit Markdown bodies, prompts, raw provider output,
 diffs, logs, or task state.
@@ -318,9 +366,27 @@ when incidental model prose surrounds it, and rejects malformed, nested,
 multiple, whole-plan, and writer-path output. `core/delivery_amendment.py`
 normalizes replacement paths and
 root dependencies, snapshots the source plan, target task contract, sanitized
-parent progress, and delivery assembly head before model authoring, rejects
-drafts when those inputs change during authoring, validates the resulting amended plan, and
-rechecks source fingerprints and replacement path availability before and after
+parent progress, eligible correlated child-failure evidence, and delivery assembly
+head before model authoring, rejects drafts when those inputs change during
+authoring, validates the resulting amended plan, and reassigns every constraint
+applicable to the superseded target to all replacement units before that validation.
+The CLI wiring creates the configured `StateStore` once and injects that same instance
+through amendment evidence capture, budget-split preparation, dry-run inspection, and
+child reconciliation; core amendment code never reconstructs a JSON-backed store from a
+state-directory path.
+Failure-evidence schema v2 keeps in-project scope violations project-relative and
+reports sibling changes from nested projects in a separate bounded
+`scope_violations.outside_project` object whose paths remain worktree-relative. Those
+paths inform ownership recovery but can never be reinterpreted as authorizable project
+scope.
+Applicable constraints come from the validated source plan on every amendment
+path, independently of optional failure evidence. A second read-only verification
+call must confirm that every replacement preserves every applicable constraint,
+and deterministic proposal creation rejects absent, incomplete, changed,
+uncertain, or conflicting verification.
+The target reference is removed rather than leaving a constraint attached to a
+superseded unit. Sikula then rechecks source fingerprints and replacement path
+availability before and after
 publication. A proposal made stale during publication is removed before prepare
 reports failure. The immutable local proposal is bound to the project-relative
 source plan path under the configured contract report directory. Replacement
@@ -344,6 +410,22 @@ validates location before and after the read and must match the captured task
 fingerprint. It does not change the
 tracked plan, unit task files, progress, events, child state, worktrees, or Git
 refs.
+
+The provider-facing child-failure projection is a bounded typed structure, not raw `TaskState`.
+It may contain stable failure and recovery codes, inherited-constraint and
+declared/effective-scope metadata, project-relative changed/violation paths and
+counts, bounded review/security summaries and dispositions, and dependency
+handoff identities. It excludes task bodies, prompts, provider output, diffs,
+source contents, validation logs, and absolute paths. Raw local evidence retains
+exact correlation identities; the authoring boundary maps unsafe plan, unit,
+constraint, child-task, and handoff identities to stable public tokens.
+Preparation fingerprints and recaptures the raw local evidence around authoring
+just like the plan, target task,
+and parent progress. A correlated `external_dependency_gap` child returns
+`delivery_amend.external_dependency_follow_up_required` with
+`external_dependency_follow_up` and no proposal without invoking the authoring
+model. A scope-stop author may either return a corrected in-repository proposal
+or the same explicit external-follow-up result.
 
 `sikula delivery amend apply PLAN_FILE --proposal PROPOSAL_ID --dry-run` loads
 that exact proposal, verifies its content-derived ID, checks plan/task/progress
@@ -445,7 +527,9 @@ clearing only stale finalization metadata.
 **Delivery run-next dry run:** `sikula delivery run-next PLAN_FILE --dry-run`
 loads project runtime config, validates delivery status, and reports the first
 eligible unit that a future execution command would run. It also mirrors the
-execution dependency result-commit guard against the recorded assembly commit
+execution effective write-scope resolver, including malformed paths and an empty
+intersection with configured production write paths, without creating child state.
+It mirrors the dependency result-commit guard against the recorded assembly commit
 when available and verifies that dependency result commits are resolvable. It also
 validates any referenced dependency handoff schema, fingerprint, artifact, and
 parent-progress correlation. It is
@@ -485,9 +569,207 @@ is manually reconciled.
 Resume-path blocks return allowlisted metadata only and do not expose
 `TaskState` contents or absolute local paths.
 If no ambiguous/runnable running unit exists, `run-next` selects one eligible pending
-unit, records it as `running`, creates one child `TaskState`, and before any child
+unit. Before mutating parent progress, creating child state, or creating a worktree,
+the new-child path resolves the unit's production write scope against
+`sandbox.allowed_write_paths`. An absent or empty unit `scope_paths` list keeps the
+legacy repository-default mode and configured production scope. A non-empty unit
+scope uses the canonical project-relative intersection; malformed paths or an empty
+intersection block fail closed without progress or child side effects. The resolved
+schema version, mode, declared paths, effective paths, and exact-file subsets are
+forwarded to child creation and persisted as one stable typed audit snapshot.
+Explicit unit scope paths must keep their lexical project identity: preflight rejects
+symlinked roots or paths below symlinked prefixes, and assembled-worktree validation
+rejects a dependency that replaces a declared path with an in-project alias.
+After that preflight, `run-next` records the unit as `running`, creates one child
+`TaskState`, and before any child
 worktree, orchestrator, or agent execution starts updates parent progress with
 the same `running` unit and `child_task_id` and appends a `unit.child_linked` event.
+Before constructing the child Orchestrator on both fresh execution and direct resume,
+Sikula validates every marked snapshot and intersects its persisted effective paths
+with the current `sandbox.allowed_write_paths`. The persisted scope is therefore an
+upper bound: a broader current configuration cannot expand the child, while a narrower
+current configuration may restrict it further. A malformed snapshot or disjoint runtime
+intersection marks the child failed and stops before Orchestrator, tool, or agent
+construction. For isolated children this authoritative check runs after selecting the
+worktree rooted at the assembled delivery commit, not only against the operator
+checkout. Fresh execution and resume therefore reject a dependency-created symlink
+that aliases an explicit unit scope path, even when its target remains inside the child
+project. They also reject an
+original exact-file root that an assembled dependency deleted or replaced with a
+directory, rather than reinterpreting the saved path as a writable prefix. The first
+successfully applied post-assembly intersection is persisted as one versioned runtime
+binding whose typed roots contain both their lexical paths and resolved project-relative
+identities. Resume validates this binding without replacing it, and current configuration
+may only derive a narrower active scope from its roots. A broader current policy remains
+capped by the binding; a changed symlink target, an exact-file root reinterpreted as a
+prefix, or a disjoint current policy fails closed. A
+failed initial post-assembly check persists an explicit denied binding and a terminal
+`unit_scope_violation`, so parent status never recommends an unchanged reset. Amendment
+failure evidence validates this binding in the preserved authoritative child tree and
+falls back to the creation-time upper bound only for legacy children without the additive
+binding. A correlated `unit_scope_violation` validates the creation snapshot lexically.
+A denied binding preserves that original upper bound as amendment evidence; a previously
+bound root validates its persisted lexical and resolved identities structurally against the
+same upper bound without requiring the current retargeted path to become valid again.
+Legacy child state without
+a scope marker keeps the current configured
+production policy. Runtime scope application does not modify
+`sandbox.allowed_test_write_paths`; TestWriter retains the independently configured test
+write policy.
+At child creation, `run-next` also snapshots the plan's project-relative source-task
+path and fingerprint plus only the bounded inherited constraints that explicitly
+reference the selected unit. A context schema marker distinguishes new children
+with an intentionally empty snapshot from legacy child state that predates this
+metadata. A fingerprint over the schema, parent plan/unit/path correlation, source
+binding, and constraints detects removed or modified state fields. `AnalystAgent`,
+`ImplementerAgent`, `FixerAgent`, `ReviewerAgent`, and `SecurityReviewerAgent`
+independently validate
+this context before any LLM call. The Analyst includes the deterministic authoritative
+block before lower-authority dependency handoff evidence; the Implementer includes the
+same block directly before its task for initial, step, and review/security fix passes;
+the Fixer includes it between the original task and implementation prompt for every
+build- or test-error correction pass;
+the Reviewer and Security Reviewer include it between the original task and implementation
+prompt for every review scope. Both reviewers treat violations as blocking, and security
+review keeps its existing fail-closed output contract. A malformed modern context fails
+the agent without invoking the provider. Unit identity validation matches the delivery
+plan's bounded, control-free compatibility rules; raw legacy-valid identities remain in
+private state and its fingerprint, while provider prompt rendering applies the public
+identity projection. Legacy state omits the block. These private state
+and prompt fields are not added to ordinary delivery status or result projections.
+Before a delivery Implementer or Fixer invocation, the Orchestrator asks the provider
+through its generic write-workspace lifecycle hook to materialize stable provider-owned
+workspace files. Tracked `.claude/settings.json` or `.gemini/settings.json` collisions
+are rejected before mutation; ordinary setup exceptions become saved task failures while
+interruptions still propagate. The provider-neutral call wrapper then opens an
+Orchestrator-owned audit boundary around every physical write-capable provider attempt,
+including internal retries and multiple Fixer calls. Each attempt is audited before the
+provider client or agent can continue. The existing whole-agent comparison remains a
+fallback for custom clients and agent-side writes. After every attempt or fallback
+invocation, including recovery of an interrupted write-capable operation, the
+Orchestrator compares a sparse, no-symlink-follow filesystem snapshot with the effective
+production scope independently of provider-reported files. Git supplies tracked,
+staged, and ordinary untracked candidates. Ignored files remain candidates unless the
+active `BuildTool` classifies their path as a disposable dependency cache or build-output
+tree; Git-visible candidates are never removed by that classification. The snapshot
+covers the entire Git worktree, even when
+`project.root_path` selects a nested project: paths under that root are evaluated as
+project-relative paths, while changes elsewhere in the worktree are terminal
+outside-project violations. It traverses non-ephemeral ignored roots and the ancestors
+needed to reach sparse Git candidates instead of hashing every clean tracked file. The
+entire project subtree is additionally traversed metadata-only for symlinks and special
+files, including paths outside active production/test roots, so an existing link cannot
+hide a write to a sibling or external checkout. The bound Git control directory is
+validated separately and excluded from this filesystem traversal. The traversal excludes
+configured Sikula state/runtime roots and prunes
+regular content in platform-owned ephemeral ignored trees. Ephemeral branches related to
+an active root still receive a metadata-only traversal that validates every symlink,
+Windows reparse point, and special file without reading disposable regular files.
+Traversal uses descriptor-relative,
+no-follow recursion with directory identity checks where the host supports directory
+descriptors. On hosts without that support, path-based traversal checks each directory
+and regular-file identity through the same no-follow path API before and after access,
+avoiding cross-API identity comparisons while still failing closed on observed replacement.
+The snapshot is persisted privately before the provider or tool call so
+interruption recovery compares against the real pre-call candidates. Git candidates and
+traversed filesystem entries preserve separator-native names: on POSIX,
+a backslash remains a literal filename character and never becomes a scope separator;
+the amendment evidence projection preserves the same identity.
+Before every pre-mutation snapshot, lexical production/test roots are resolved again and
+must still match the policy's captured resolved identities, including roots reached
+through symlink ancestors. Sparse Git candidates are always computed against the immutable
+pre-call commit rather than the mutable `HEAD`. The audit binds the pre-attempt absolute
+Git directory, common Git directory, and worktree root, rejects later Git discovery that
+resolves any location differently, and supplies those bound locations explicitly to every
+security-sensitive Git command. Sikula exclusively owns Git commits and reference movement.
+Before each mutation, the audit fingerprints the active `HEAD`, symbolic ref and reflogs,
+packed refs, and reftable authority using content plus filesystem identity metadata. Any
+provider or deterministic-tool ref mutation fails closed, including a commit followed by a
+hard reset to the original commit; the audit does not trust a provider-restorable reflog or
+final ancestry to reconstruct discarded commits. Security-sensitive Git queries disable
+replace refs. Worktree candidates are discovered through a temporary trusted index
+rebuilt from that commit, so provider changes to the live index, including
+`assume-unchanged`, `skip-worktree`, and fsmonitor metadata, cannot hide an out-of-scope
+change. The binding also fingerprints the effective `info/exclude` and `.gitignore`
+inputs while audit Git commands override `core.excludesFile` with an empty source. Candidate
+enumeration validates that fingerprint before and after its Git queries, so a provider
+cannot reclassify an untracked path as disposable ignored output during the attempt.
+History, endpoint-tree, live-index, and trusted-index/worktree comparisons retain
+each distinct class of Git-visible change.
+NUL-delimited Git path output remains bytes until each candidate is decoded with the
+reversible filesystem codec, preserving non-UTF-8 POSIX filenames without lossy
+replacement.
+Before capturing that baseline, the Orchestrator persists the versioned
+`delivery_scope_audit_pending` control field with the active write actor, project prefix,
+the full pre-call Git commit ID, absolute Git/common-directory binding, Git-reference and
+Git-ignore fingerprints, typed lexical production
+roots, their resolved project identities, and the lexical and resolved test-write roots
+authorized for that invocation. Each Fixer `_run_once` publishes its production and test
+roots separately. Its physical provider boundary temporarily replaces the whole-agent
+fallback marker after safely writing a separate private snapshot for that exact policy;
+after a completed attempt audit it restores the fallback, while interruption leaves the
+narrower marker and snapshot authoritative.
+The same boundary wraps deterministic
+workspace-mutation phases that may retain project changes: presync source generation,
+dependency sync, and configured check autofix. Their output is audited before sync
+adoption, artifact cleanup, revalidation, or another pipeline phase. It clears the field
+and private baseline only after the post-mutation audit result is saved. Resume recovers
+this immutable policy and baseline before current configuration can revalidate or persist
+a different runtime scope. It consults the marker independently of heartbeat
+configuration; `active_operation` remains visibility-only. Missing,
+malformed, or orphaned pending/baseline state fails closed, including interruption by
+`KeyboardInterrupt` or process termination.
+Complete before/after content is retained only for bounded, non-binary files that the
+active `BuildTool` identifies as plausible mixed source/test files; other files remain
+digest-only. Missing, malformed, or unreadable audit evidence fails closed.
+The same immutable per-invocation policy validates symlinks at and below active write
+roots before and after the mutation call; a resolved target outside the active production
+and Fixer test-write set fails closed. An internal symlink scope root retains its lexical
+identity for assembled-worktree revalidation while its resolved identity authorizes the
+same filesystem objects in full-worktree change classification for repository-default
+configured scope aliases; explicit unit scope aliases are rejected before runtime construction.
+Test artifacts remain governed by
+`sandbox.allowed_test_write_paths`, and are exempted from production scope only when the
+current Fixer invocation actually received the matching test-write root. An
+out-of-scope production change records a sanitized `delivery_scope_audit`, sets
+the terminal `unit_scope_violation`, preserves the worktree and state evidence,
+and skips validation, review, security review, test writing, commit, handoff, and
+assembly. Successful audit records also preserve bounded actual project-relative
+changed paths for later amendment evidence, including non-ephemeral ignored files. Changes outside a
+nested project root are retained separately as bounded worktree-relative audit evidence
+and are never projected as authorizable project-relative scope.
+
+Delivery child agents emit a validated structured disposition when a discovered
+boundary controls execution. Reviewer and Security Reviewer also emit an explicit
+`approved` disposition when no blocking issue exists. Standalone `APPROVED` remains
+valid only for non-delivery review output; persisted delivery approvals do not need
+their original provider output reparsed.
+Approval records remain in review-cycle audit history but are excluded from terminal
+stop and amendment failure evidence.
+`fix_in_scope` keeps the normal bounded fix path.
+Reviewer and Security Reviewer prompts receive the current validated runtime
+production scope before making that decision, including exact-file versus path-prefix
+semantics. The prompt scope is re-derived after current-policy narrowing against the
+immutable runtime binding rather than copied from the broader creation-time upper bound.
+`requires_scope_amendment` is accepted from Reviewer or Security Reviewer and
+maps to `scope_amendment_required`; `external_dependency_gap` is accepted from
+Analyst, Implementer, Reviewer, or Security Reviewer and keeps that code. A
+terminal disposition stops immediately and cannot be bypassed by inconsistent
+done/failed state or a resumed run; malformed persisted disposition state fails
+before provider execution. When Implementer output recognizably advertises the disposition
+schema key but cannot be parsed—including single-quoted or unquoted key syntax—the agent
+stores only bounded parser error metadata rather than treating it as ordinary prose.
+Orchestration maps it to terminal `implementer_disposition_invalid`; partial writes
+remain inspectable but cannot pass into review or validation through either direct
+reset or parent `run-next --reset-failed`.
+Malformed Reviewer or Security Reviewer disposition output receives one bounded
+read-only retry with the stable parser error included in review history. The retry
+does not consume a fix iteration or invoke a write agent. A second malformed output
+fails closed through the existing reviewer failure path, while both invocations and
+outputs remain in their cycle records.
+When more than one stop is observed, the persisted highest-priority terminal
+`failure_code` alone selects recovery. Lower-priority dispositions remain audit
+evidence but cannot reroute a winning scope violation to external follow-up.
 If that link update fails, `delivery run-next` aborts before any child execution and
 reports `delivery.child_link_failed`; parent progress is restored to its pre-start
 state and an audit event records the failed link attempt.
@@ -503,6 +785,17 @@ worktree isolation, provider execution, validation, review, state persistence, a
 task audit reporting. When the child run exits, delivery progress stores only
 compact parent metadata: unit status, child task id, branch, result commit when
 available, handoff schema/fingerprint reference, timestamps, and a failure code.
+Terminal child boundary failures project without interpretation as
+`unit_scope_violation`, `scope_amendment_required`, `external_dependency_gap`, or
+`implementer_disposition_invalid`.
+Status uses that exact value for both `failure_code` and
+`run_next_blocked_reason`, makes `run_next_available` false, and omits a retry
+action. `run-next` text/JSON use the corresponding
+`delivery.unit_scope_violation`, `delivery.scope_amendment_required`, or
+`delivery.external_dependency_gap`, with `delivery.implementer_disposition_invalid`
+for malformed advertised Implementer output. Ordinary, dry-run, and
+`--reset-failed` preflight are side-effect-free for such a persisted stop: they
+do not resume the child, invoke agents, append events, or mutate progress.
 New delivery children opt into the current handoff schema when their state is
 created. A successfully completed opted-in child produces
 `.sikula/state/delivery/<plan-id>/handoffs/<unit-key>.json` before its parent unit
@@ -588,7 +881,8 @@ active units present when the loop starts, and `--max-units` can lower or
 explicitly set that bound. `--max-elapsed-minutes` is a soft wall-clock bound
 checked only between child runs; an active child is never interrupted. A bound
 stop is resumable and successful. A failed, waiting, budget-stopped, ambiguous,
-or assembly-blocked unit stops the loop immediately without automatic reset,
+scope-stopped, external-dependency-stopped, or assembly-blocked unit stops the
+loop immediately without automatic reset,
 amendment, split, or unit skipping. Explicit `--reset-failed` permits one
 failed-child retry per `delivery run` command invocation: the first `run-next`
 attempt may retry the current failed child, the permission is consumed after
@@ -1161,6 +1455,9 @@ Output written to state:
   architecture constraints, hard rules, cleanup candidates with verified class names, and acceptance criteria.
 - `state.analyst_retry_records` — rejected analyst outputs when the response is empty, generic,
   or looks like a meta completion message instead of an implementation prompt.
+- `state.analyst_cycle_records` — one bounded, content-free invocation record for every
+  accepted, rejected, failed, or terminal-disposition Analyst call. Full accepted and
+  rejected artifacts remain in their dedicated fields rather than being duplicated here.
 
 Before `state.implementation_prompt` is stored, Sikula validates that the analyst response is
 usable as implementation input. Meta responses such as "the prompt above is the final output" or
@@ -1189,6 +1486,7 @@ the retry is still invalid, the orchestrator fails the task before planner or im
 
 **Input:**
 - `state.implementation_prompt` — what to change and why (from AnalystAgent)
+- validated `TaskState` inherited-constraint context — the same fingerprinted authoritative block received by the Analyst, injected independently so an incomplete analyst output cannot remove a governing constraint
 - `sandbox.allowed_write_paths` from project config — passed as constraint in the agent prompt
 - project guidelines filenames from `guidelines.context_files` — implementer reads content via its tools
 - In step mode: a `CURRENT STEP N/M: <description>` section is appended instructing the agent to focus only on that step; the orchestrator runs exactly as many passes as `state.plan` has entries
@@ -1219,6 +1517,9 @@ No file content is passed in the prompt.
   For `GeminiClient`, the `write_file` tool enforces a path check (`Path not in workspace`)
   that blocks writes outside the project directory. Sikula passes `--skip-trust` to Gemini;
   task repository and worktree checks are enforced by Sikula before execution.
+  Project-local Gemini write settings are materialized through the generic provider
+  workspace-preparation hook before a delivery scope baseline is captured, so Sikula-owned
+  setup is not attributed to the agent invocation.
   Gemini permits writes to `~/.gemini/tmp/`
   — Sikula agents do not use this path.
   For `OpenCodeClient`, Sikula invokes the CLI with `cwd` and `--dir` set to the task
@@ -1305,6 +1606,7 @@ file that was already dirty before the run is still detected as changed if the a
 
 **Input:**
 - `state.task_description` — sole authority on scope; anything not mentioned here is out of scope regardless of what the implementation prompt claims
+- validated `TaskState` inherited-constraint context — a fingerprinted hard-review boundary that may restrict but never expand task scope; injected independently of the implementation prompt
 - `state.implementation_prompt` — the developer's plan; authoritative for required changes only; scope expansion claims ("this caller is intentionally affected") must be verified against the task description
 - `state.files_changed` — list of all files modified so far
 - diff (capped at 40 000 chars) — `state.review_diff` when set (`cmd_review()` sets the initial `git diff base...branch`; `review --fix` refreshes it before reviewer/security-reviewer calls); otherwise obtained live via `GitTool.diff_head()` (`git diff HEAD`)
@@ -1375,6 +1677,11 @@ invalid fixtures, or material missing tests may be reported as review issues.
 - Approved: `state.review_approved = True`, `state.review_issues` cleared; output includes a structured verification summary — `Completeness:`, `Correctness:`, and `Callers verified:` lines, each omitted when not applicable — followed by `APPROVED` on its own line; record appended to `state.review_cycle_records` with `approved = True`
 - Issues found: `state.review_issues` populated with structured issue list; `state.review_approved` stays `False`; record appended with `approved = False`
 
+For a delivery child, the appended disposition contract replaces the standalone
+approval marker: approval is the explicit `approved` JSON disposition on the final
+non-empty line. One malformed disposition is retried read-only with protocol feedback;
+the retry does not count as a review fix attempt.
+
 **Re-review after fixer:** if `FixerAgent` changes production-impacting files, the
 orchestrator resets `state.review_approved = False` and first reruns deterministic
 build/test/check validation. Test-only fixer changes whose reported files are all under
@@ -1397,6 +1704,10 @@ means after reviewer approval; if `run_review: false`, it still runs unless
 
 **Input:**
 - `state.task_description` and `state.implementation_prompt`
+- validated `TaskState` inherited-constraint context — the same fingerprinted authoritative
+  block received by the other child agents, injected independently between the original
+  task and implementation prompt; it restricts but never expands unit, repository, or
+  sandbox authority, and applies in task, step, repeated, and final full-task security review
 - `state.files_changed` — list of all files modified so far
 - diff (capped at 40 000 chars) — `state.review_diff` when set; otherwise `GitTool.diff_head()` (same priority and refresh behavior as ReviewerAgent)
 - project guidelines content pre-loaded from `guidelines.context_files` (same mechanism as analyst; capped at `guidelines.max_file_chars` per file; truncated files include a Read-tool marker)
@@ -1426,6 +1737,10 @@ means after reviewer approval; if `run_review: false`, it still runs unless
   then review loop re-runs, then security review re-runs; record appended with `approved = False`
 - Unexpected output (no `APPROVED` signal, no `## Warnings`, no `## Security Issues`):
   treated as blocking — same as blocking issues path
+
+For a delivery child, all-clear and warning-only output use the explicit `approved`
+JSON disposition on the final non-empty line. One malformed or missing disposition
+is retried read-only with protocol feedback and without consuming a security fix attempt.
 
 **Iteration limit:** uses `config.max_security_review_iterations` (independent of `config.max_review_iterations`); timeout sets `state.failed = True`.
 
@@ -1814,6 +2129,21 @@ Sikula processes at once is still unsupported.
 | `delivery_plan_path` | `str \| None` | `cmd_run()` in `sikula_cli/run.py` | Project-relative path to the delivery plan file (e.g. `.sikula/delivery/my-plan/plan.yaml`); set only by `delivery run-next` child creation, defaults to `None` for existing/non-delivery state, and must not drive pipeline control flow |
 | `delivery_unit_budget` | `dict[str, int]` | `delivery run-next` / `cmd_run()` | Effective allowlisted unit budget snapshot persisted at child creation; always includes `max_planner_steps` (default `1`) |
 | `delivery_budget_stop` | `dict \| None` | Orchestrator | Structured terminal planner budget stop with stable code, budget name, limit, actual count, phase, and timestamp; preserved for audit and parent progress classification |
+| `delivery_stop_code` | `str \| None` | Orchestrator | Closed-set terminal child boundary outcome. Includes scope violation, scope-amendment, external-dependency, and invalid-advertised-Implementer-disposition stops; forces failed/not-done state and blocks unchanged reset recovery. |
+| `delivery_stop_disposition` | `dict \| None` | Delivery agents / Orchestrator | Parser-validated bounded disposition, sanitized summary, recovery action, source, schema version, and timestamp. Raw provider output remains in the agent cycle record and is not projected to parent progress. |
+| `delivery_disposition_parse_error` | `dict \| None` | ImplementerAgent / Orchestrator | Bounded durable evidence that Implementer output advertised the delivery-disposition marker but was malformed: schema version, stable parser error code, source, and timestamp only. Drives terminal `implementer_disposition_invalid` without storing raw output in the control field. |
+| `delivery_constraint_context_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Version marker for the inherited-constraint snapshot. New delivery children use the current version even when no constraints apply; legacy and non-delivery state keep `None`. |
+| `delivery_source_task` | `dict[str, str] \| None` | `delivery run-next` / `cmd_run()` | Allowlisted project-relative source-task path and SHA-256 binding copied from the validated parent plan. Raw source task text and absolute paths are never persisted here. |
+| `delivery_inherited_constraints` | `list[dict]` | `delivery run-next` / `cmd_run()` | Bounded normalized parent-plan constraints whose unit references include this child. The snapshot is private audit/context data and is not projected through ordinary delivery output. |
+| `delivery_constraint_context_fingerprint` | `str \| None` | `delivery run-next` / `cmd_run()` | SHA-256 integrity fingerprint over the complete versioned constraint snapshot and its parent plan/unit/path correlation. New marked context must match before agent prompt injection; legacy state keeps `None`. |
+| `delivery_write_scope_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Version marker for the effective production write-scope snapshot. New delivery children use the current version; legacy and non-delivery state keep `None`. |
+| `delivery_write_scope_mode` | `str \| None` | `delivery run-next` / `cmd_run()` | Resolution mode captured at child creation: `repository_default` for absent/empty unit scope or `unit_explicit` for a non-empty declared unit scope. Legacy and non-delivery state keep `None`. |
+| `delivery_declared_write_paths` | `list[str]` | `delivery run-next` / `cmd_run()` | Canonical project-relative production paths declared by the selected delivery unit. Empty in repository-default, legacy, and non-delivery state. |
+| `delivery_declared_write_exact_file_paths` | `list[str] \| None` | `delivery run-next` / `cmd_run()` | Schema-v2 subset of declared paths that were exact files at child creation. `None` distinguishes legacy/unmarked state; a marked snapshot requires a list. |
+| `delivery_effective_write_paths` | `list[str]` | `delivery run-next` / `cmd_run()` | Canonical project-relative production paths resolved from configured write scope and unit scope before child creation. They are the persisted upper bound for fresh and resumed child runtime; the current configured production policy may narrow but never expand them. This private audit snapshot is not added to ordinary delivery output. |
+| `delivery_effective_write_exact_file_paths` | `list[str] \| None` | `delivery run-next` / `cmd_run()` | Schema-v2 subset that preserves exact-file semantics in the persisted upper bound. Runtime construction stops if an entry is missing or has become a directory in the authoritative child tree. |
+| `delivery_runtime_write_scope_binding` | `dict \| None` | `cmd_run()` | Versioned immutable post-assembly production-scope binding. A `bound` value stores canonical lexical roots together with their resolved project-relative identities and exact-file kinds; a `denied` value records failed initial construction. Resume validates the original identities and can derive only a narrower active scope without replacing the binding. Legacy children keep `None`, and amendment evidence falls back to their creation-time upper bound. |
+| `delivery_scope_audit_pending` | `dict \| None` | Orchestrator | Dedicated versioned control marker containing the active delivery write actor (Implementer/Fixer or an allowlisted deterministic mutation phase), authoritative project prefix, immutable pre-call Git commit ID, absolute Git/common-directory bindings, Git-reference and Git-ignore fingerprints, typed lexical and resolved production roots, and lexical and resolved Fixer test-write roots authorized for that invocation. It is persisted before the private sparse worktree baseline and cleared only after the post-mutation or resume audit result is saved. Resume accepts only the current complete marker schema, verifies that Git discovery and reference authority still match those bindings, computes Git candidates against the saved commit, audits its immutable policy before applying current runtime-scope changes, and never derives or broadens authority from current `HEAD`, errors, config, filesystem aliases, or `active_operation`; malformed, incomplete, unsupported, unavailable, retargeted, mutated-ref, or orphaned marker/baseline state fails closed. |
 | `delivery_handoff_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Opt-in schema marker set on newly created delivery children. Legacy children keep `None`, so terminal reconciliation does not fabricate or require a handoff for state created by older versions. |
 | `delivery_dependency_handoffs` | `list[dict]` | `delivery run-next` / `cmd_run()` | Validated, fingerprinted, allowlisted snapshots from the child unit's completed dependency closure. `AnalystAgent` consumes them as supporting evidence; malformed resume-state entries are ignored and recorded as warnings rather than injected into prompts. |
 | `config_snapshot` | `dict` | `cmd_run()` / Orchestrator | Effective run configuration captured on first run before agents start (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `planner.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. It is also saved for contract-gate failures that exit before `Orchestrator.run()`. Visible in `show <task_id>`. |
@@ -1847,6 +2177,7 @@ Sikula processes at once is still unsupported.
 | `security_review_iterations` | `int` | Orchestrator | Security fix attempt counter for the current cycle (counts completed security-review→implement pairs); independent of `review_iterations`; resets to 0 on step transitions and fixer passes; guarded by `config.max_security_review_iterations` |
 | `analyst_warnings` | `list[str]` | AnalystAgent | Warnings produced by the analyst (e.g. ambiguous task scope, missing context); logged for visibility, never block the pipeline |
 | `analyst_retry_records` | `list[dict]` | AnalystAgent | Append-only records for analyst outputs rejected before `implementation_prompt` is stored, including attempt number, reason, whether another retry follows, timestamp, the rejected output, and the retry prompt when another attempt follows. These records are audit-only and never drive pipeline control flow. |
+| `analyst_cycle_records` | `list[dict]` | AnalystAgent | One append-only bounded record per Analyst LLM invocation, including attempt, outcome (`accepted`, `rejected`, `error`, or `terminal_disposition`), timestamp, correlation fields, and bounded reason/error/disposition metadata when applicable. Full prompts and outputs remain only in `analyst_prompt`, `implementation_prompt`, or `analyst_retry_records`. These records are audit-only and never drive pipeline control flow. |
 | `planner_retry_records` | `list[dict]` | PlannerAgent | Append-only records for planner outputs rejected because the parsed step count exceeded the active global or delivery-unit planner limit, including attempt number, reason, active step limit, parsed step count, whether another retry follows, timestamp, the rejected output, and the retry prompt when another attempt follows. These records are audit-only and never drive pipeline control flow. |
 | `llm_usage_records` | `list[dict]` | `core/retry_history.py` / built-in LLM clients | Append-only, content-free record for each physical provider invocation attempt made while an agent is attached to task state. Records contain bounded agent/provider/model/operation identifiers, attempt relationship, outcome, elapsed time, input/output character counts when measurable, and optional structured provider-reported token counts. They never contain prompts, provider output, source excerpts, paths, credentials, or estimated tokens/costs, and never drive pipeline behavior. |
 | `review_diff` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / Orchestrator | PR-style diff passed to ReviewerAgent and SecurityReviewerAgent; initially set to `git diff base...branch` (three-dot) in `sikula review` mode; refreshed in `"review_fix"` mode before reviewer/security-reviewer calls so uncommitted fixes are included; `None` in standard `sikula run` flow (agents fall back to `GitTool.diff_head()`) |
@@ -1866,7 +2197,7 @@ Sikula processes at once is still unsupported.
 | `test_execution_gate_records` | `list[dict]` | Orchestrator | Structured audit signal for newly added execution gates in Sikula-modified test files or inline-test source files under configured test write paths, including skip/disable/ignore/expected-failure/assumption/environment gates. Entries include `source` (`test_writer` or `fixer`), `step`, `build_iteration`, optional `scope`, `status` (`detected` or `resolved`), timestamp, and per-finding `path`, `line`, `category`, `reason`, `signature`, `baseline_count`, and `occurrence`. Raw source excerpts are intentionally omitted. Active findings are resolved by recounting the added gate occurrence against the current file so pre-existing identical gates do not keep stale findings active; resolved findings remain for audit. |
 | `synthetic_test_harness_records` | `list[dict]` | Orchestrator | Structured audit signal for generated/modified tests that newly cross the broad synthetic-runtime-harness threshold relative to the task baseline, including harnesses assembled across multiple agent passes. Entries include `source` (`test_writer` or `fixer`), `step`, `build_iteration`, optional `scope`, `status` (`detected` or `resolved`), timestamp, and per-finding `path`, `subsystems`, `baseline_subsystems`, sanitized line metadata, and recommendation. Raw source excerpts are intentionally omitted. Active findings are deduplicated and included in later test-writer/fixer prompts and terminal audit warnings. The orchestrator uses them for soft recovery by restoring affected generated tests and retrying once, but the findings never directly fail a task. |
 | `fix_cycle_records` | `list[dict]` | FixerAgent | Structured observability — one entry per fixer invocation after a failed sync/build/test/check attempt: `build_iteration` (globally unique, never resets), `step`, `scope`, `errors_before` snapshot (sync/build/test/check), `fixer_prompt`, `fixer_output` (`None` on exception), `files_written`, optional `triage_scope` (`test_failure` or `test_origin_validation`), optional `triage_pass` (`test_only`, `test_only_retry`, or `production_confirmed`), optional `confirmed_test_failure_triage`, optional `generated_test_retriage`, optional `generated_test_retriage_violation`, optional `scope_recovery`, optional `test_only_scope_violation` restore audit, `timestamp`; never read for pipeline decisions |
-| `validation_cycle_records` | `list[dict]` | Orchestrator | Structured observability — one entry per presync/sync/build/test/check outcome with `phase`, `status`, `build_iteration`, `step`, `timestamp`, optional `scope`, optional `elapsed_s`, optional `check_name`, and diagnostic `error_excerpt` plus high-signal `diagnostic_summary` lines on failure; excerpts preserve failure-marker blocks from long tool output instead of storing only the final tail, including Gradle's bounded raw `What went wrong` block, while summaries highlight shortened compiler locations, failed tests, sanitized assertion failures, and linter rules for terminal audit output sampled across failed validation attempts without echoing source-code frames, assertion values, quoted literal payloads, secret-looking key/value tokens, or absolute path prefixes; raw excerpts are sensitive local audit data available through explicit state inspection and are never copied into delivery handoffs or used for pipeline decisions |
+| `validation_cycle_records` | `list[dict]` | Orchestrator | Structured observability — one entry per presync/sync/build/test/check outcome with `phase`, `status`, `build_iteration`, `step`, `timestamp`, optional `scope`, optional `elapsed_s`, optional `check_name`, and diagnostic `error_excerpt` plus high-signal `diagnostic_summary` lines on failure; excerpts preserve failure-marker blocks from long tool output instead of storing only the final tail, including Gradle's bounded raw `What went wrong` block, while summaries highlight shortened compiler locations, failed tests, sanitized assertion failures, and linter rules for terminal audit output sampled across failed validation attempts without echoing source-code frames, assertion values, quoted literal payloads, secret-looking key/value tokens, or absolute path prefixes; delivery scope audit records preserve bounded actual project-relative changed paths on pass and failure plus separately labeled worktree-relative paths outside a nested project root; raw excerpts and audit paths are sensitive local audit data available through explicit state inspection, are never copied into delivery handoffs, and never drive pipeline decisions |
 | `validation_artifact_records` | `list[dict]` | Orchestrator | Structured observability for unexpected non-ignored repository changes produced by sync/build/test/check validation commands, plus sync outputs that cannot be adopted safely. Each record stores `phase`, `status` (`cleaned`, `blocked`, or `cleanup_failed`), `build_iteration`, `step`, optional `scope`, optional `check_name`, and changed paths with before/after status. Cleanup success allows validation to continue for unexpected artifacts; cleanup failure, or a blocked sync output such as an adoptable file outside `project.root_path`, is treated as that validation phase failing. |
 | `active_operation` | `dict \| None` | Orchestrator | Current long-running operation heartbeat for status visibility while an agent or validation command is blocked. Contains `phase`, optional `agent`, optional `scope`, `started_at`, `last_heartbeat_at`, `heartbeat_count`, optional `heartbeat_interval_seconds`, and optional `message`. Cleared when the operation completes; never drives pipeline decisions. |
 | `test_files_written` | `list[str]` | TestWriterAgent | Cumulative list of all files written by the test writer agent across all runs; never cleared; passed to ReviewerAgent so it does not flag those files as implementer scope violations. In normal `sikula run`, these files are not reviewer-owned output; in `sikula review`, changed test files are reviewed as branch output. |
@@ -1920,7 +2251,9 @@ command into a decoding failure.
 | `run_check(name, task_config)` | Run a named quality check (lint, detekt, …). `task_config` is the opaque dict from `build.checks[i]` in the project YAML — the orchestrator passes it through unchanged; each BuildTool subclass interprets it. | `task_config["command"]` is the shell command to run (falls back to `name` if absent). `task_config["timeout"]` overrides the compile timeout. Uses `_run_shell()` — identical interface to PythonTool. |
 | `is_build_config_file(path)` | True if the file affects the build graph | `*.gradle`, `*.gradle.kts`, `*.properties`, `*.toml`, `gradle/`, `buildSrc/`, `build-logic/` |
 | `is_sync_adoptable_file(path)` | True if `sync()` may intentionally update this source-controlled project-relative path and the final branch diff should include it when the file already exists as a tracked file. Default returns `False`; platform subclasses only classify paths, while the orchestrator owns adoption, cleanup, audit records, and stale semantic gates. Brand-new generated outputs require explicit `build.sync_adopt_paths` opt-in. | Gradle dependency lock files and verification metadata; other platforms classify their own lockfiles such as `Cargo.lock`, Node package-manager lockfiles, or SwiftPM `Package.resolved`. |
+| `is_ephemeral_build_path(path)` | True only for ignored dependency caches or disposable build-output trees whose regular content delivery-scope snapshots may prune. Classifiers split paths with `BuildTool._delivery_scope_path_parts()` so POSIX backslashes remain literal filename characters while Windows separators are recognized. Git-visible tracked, staged, and ordinary untracked candidates remain audited even under a matching path, and active write roots retain metadata-only symlink/special-file traversal through matching directories. Default returns `False`. | Gradle `.gradle/` and `build/` trees; other platforms classify conventional outputs such as Node `node_modules/` plus Yarn Berry `.yarn/cache/`, `.yarn/unplugged/`, and `.yarn/install-state.gz`, Cargo/Maven `target/`, Python virtualenv/cache directories, and Xcode `.build/`, `build/`, or `DerivedData/`. |
 | `is_test_only_change(path, before, after)` | Optional conservative hook for mixed source/test files during test-failure fixer audit. Default returns `False`; platform subclasses may return `True` only when syntax-aware diff analysis proves the fixer changed test-only code. | Cargo treats edits limited to an already-existing Rust `#[cfg(test)] mod tests` block as test-only. |
+| `requires_test_only_change_content(path)` | Optional conservative selector for files whose before/after bytes must be retained so `is_test_only_change()` can inspect a mixed source/test edit. Default returns `False`; selected content is still dropped when binary or over the audit size limit. | Cargo selects Rust source outside generated `target/` trees. |
 | `env_files()` *(static)* | Filenames of gitignored files that must be present for the build; copied from the original project root to each new worktree. Default returns `[]`. | `["local.properties"]` (SDK path) |
 
 #### `project` config keys
@@ -2212,8 +2545,14 @@ All keys live under `test_writer:` in `.sikula/config.yaml`.
    Override `env_files()` if the platform needs gitignored files copied to new worktrees (e.g. `Secrets.xcconfig`, `.env`).
    Override `is_sync_adoptable_file()` only for source-controlled outputs that `sync()` may
    intentionally update and that should enter the final diff. Override
+   `is_ephemeral_build_path()` only for ignored dependency caches and disposable build
+   output that can be omitted from delivery-scope filesystem traversal; split these
+   filesystem-derived paths with `_delivery_scope_path_parts()` and do not classify
+   persistent generated sources or configuration. Override
    `is_test_only_change()` only when syntax-aware diff analysis can prove mixed
-   source/test file edits are test-only; otherwise leave it fail-closed.
+   source/test file edits are test-only; otherwise leave it fail-closed. When that
+   analysis requires before/after bytes, also override
+   `requires_test_only_change_content()` narrowly enough to exclude generated trees.
    Optionally override `generate_sources()` if `sync()` is too broad for the presync phase —
    the default calls `sync()` which is fine when sync doesn't trigger compilation:
    - **iOS / SPM**: `sync()` resolves SPM dependencies (no compilation) → default is fine.
@@ -2302,6 +2641,11 @@ See [Providers](docs/providers.md) for provider setup and the extension entry po
 | `generate(system, user) -> str` | PlannerAgent, DeliveryPreparationAgent | Single-shot text generation; returns the model's text response |
 | `run_readonly_agent(prompt, cwd) -> str` | AnalystAgent, ReviewerAgent, SecurityReviewerAgent | Runs the model as an autonomous read-only agent in `cwd`; returns text output (stdout) |
 | `run_agent(prompt, cwd) -> tuple[list[str], str]` | ImplementerAgent, TestWriterAgent, FixerAgent | Runs the model as an autonomous agent with file read/write tools in `cwd`; returns `(changed_file_paths, agent_text_output)` — paths via git diff, text best-effort |
+
+Providers that must create or update project-local files before a write-capable call
+override the optional `prepare_write_agent_workspace(cwd)` hook. The operation must be
+idempotent. Delivery orchestration invokes it before capturing the external scope-audit
+baseline; `run_agent()` must still be safe when called directly.
 
 The `system` argument passed to `generate` and the `prompt` argument passed to `run_readonly_agent` and `run_agent` already contain `AGENT_SECURITY_PREFIX` (defined in `agents/base_agent.py`) — the network and filesystem constraint is injected by each agent before calling the provider. Provider implementations do not need to add it.
 For CLI-backed providers, `LLMConfig.agent_timeout` applies to provider subprocess calls for `generate`, `run_readonly_agent`, and `run_agent`; `delivery_preparer` timeout overrides therefore apply to delivery prepare authoring even though it uses `generate()`.

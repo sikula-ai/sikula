@@ -99,6 +99,7 @@ def test_platform_onboarding_docs_include_audit_and_buildtool_registries():
         "tests/test_platform_onboarding.py",
         "is_sync_adoptable_file",
         "is_test_only_change",
+        "requires_test_only_change_content",
         "_TEST_GATE_AUDIT_SOURCE_SUFFIXES",
         "core/test_execution_gate_audit.py",
         "tests/test_test_execution_gate_audit.py",

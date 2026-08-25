@@ -51,12 +51,25 @@ from agents.planner_agent import PlannerAgent
 from agents.reviewer_agent import ReviewerAgent
 from agents.security_reviewer_agent import SecurityReviewerAgent
 from agents.test_writer_agent import TestWriterAgent
+from core.delivery_scope_audit import (
+    DELIVERY_SCOPE_VIOLATION_CODE,
+    DeliveryScopeAudit,
+    DeliveryScopeAuditPolicy,
+    DeliveryScopeProviderAttemptStopped,
+    DeliveryScopeToolMutationStopped,
+    delivery_scope_audit_recovery_required as delivery_scope_audit_recovery_required,
+)
 from core.delivery_unit_metadata import delivery_unit_planner_step_limit
 from core.diagnostics import diagnostic_excerpt
 from core.llm_client import LLMClient
 from core.progress import ActiveOperationHeartbeat
 from core.retry_history import llm_retry_history
-from core.state import StateStore, TaskState
+from core.state import (
+    DELIVERY_STOP_UNIT_SCOPE_VIOLATION,
+    DELIVERY_TERMINAL_STOP_CODES,
+    StateStore,
+    TaskState,
+)
 from core.synthetic_test_harness_audit import (
     active_findings_for_current_files as active_synthetic_harness_findings_for_current_files,
 )
@@ -67,6 +80,7 @@ from core.test_execution_gate_audit import (
     test_execution_gate_signature_counts,
 )
 from core.validation_artifacts import (
+    DeliveryScopeSnapshotError,
     detect_validation_artifacts,
     restore_validation_artifacts,
     snapshot_validation_dirty_files,
@@ -90,6 +104,7 @@ _VALIDATION_ARTIFACT_CLEANUP_MAX_PASSES = 5
 _TEST_EXECUTION_GATE_AUDIT_MARKER = "TEST EXECUTION GATE AUDIT:"
 _SYNTHETIC_HARNESS_RECOVERY_MAX_RETRIES = 1
 _TEST_WRITER_AUDIT_SNAPSHOT = "test_writer_audit_before"
+_DELIVERY_STOP_STATE_INVALID_CODE = "delivery_stop_state_invalid"
 _TEST_PATH_MARKERS = {
     "__tests__",
     "androidtest",
@@ -101,6 +116,8 @@ _TEST_PATH_MARKERS = {
     "unittest",
     "unittests",
 }
+
+
 _TEST_FILE_PREFIXES = ("test_", "test-")
 _TEST_FILE_SUFFIXES = (
     ".spec.js",
@@ -181,12 +198,18 @@ def _build_loop_can_validate(state: TaskState, max_iterations: int) -> bool:
 
 
 def _normalize_artifact_path(path: str) -> str:
-    return path.replace("\\", "/").strip().strip("/")
+    normalized = path.replace("\\", "/") if os.name == "nt" else path
+    return normalized.strip().strip("/")
+
+
+def _native_scope_path(path: object) -> str:
+    raw = str(path)
+    return raw.replace("\\", "/") if os.name == "nt" else raw
 
 
 def _path_matches_pattern(path: str, pattern: str) -> bool:
     normalized_path = _normalize_artifact_path(path)
-    raw_pattern = pattern.replace("\\", "/").strip()
+    raw_pattern = _native_scope_path(pattern).strip()
     directory_pattern = raw_pattern.endswith("/")
     normalized_pattern = raw_pattern.strip("/")
     if not normalized_path or not normalized_pattern:
@@ -197,7 +220,7 @@ def _path_matches_pattern(path: str, pattern: str) -> bool:
 
 
 def _normalize_project_path(path: str) -> str:
-    normalized = posixpath.normpath(str(path).replace("\\", "/").strip())
+    normalized = posixpath.normpath(_native_scope_path(path).strip())
     if normalized in ("", ".") or normalized == ".." or normalized.startswith("../") or posixpath.isabs(normalized):
         return ""
     return normalized.strip("/")
@@ -412,7 +435,6 @@ class Orchestrator:
 
         self._session_code_changed = False
         self._reviewer_ran_this_session = False
-
         # Agent registry — add new agents here
         self._agents = {
             "analyst": AnalystAgent(_llm("analyst"), self._tools, pc),
@@ -423,10 +445,33 @@ class Orchestrator:
             "test_writer": TestWriterAgent(_llm("test_writer"), self._tools, pc),
             "fixer": FixerAgent(_llm("fixer"), self._tools, pc),
         }
+        self._delivery_scope_audit = DeliveryScopeAudit(
+            config=config,
+            store=state_store,
+            tools=self._tools,
+            agents=lambda: self._agents,
+        )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def recover_interrupted_delivery_scope(self, task_id: str) -> TaskState:
+        """Recover a persisted delivery audit without entering the pipeline."""
+        state = self._store.load(task_id)
+        if state is None:
+            raise ValueError(f"Task not found: {task_id}")
+        active_invocation = not state.done and not state.failed
+        if active_invocation:
+            state.record_run_invocation(self._config_snapshot)
+            if not state.config_snapshot and self._config_snapshot:
+                state.config_snapshot = self._config_snapshot
+            self._store.save(state)
+            self._audit_interrupted_delivery_scope(state)
+        state.clear_active_operation()
+        state.pid = os.getpid()
+        self._store.save(state)
+        return state
 
     def run(
         self,
@@ -435,6 +480,7 @@ class Orchestrator:
         label: Optional[str] = None,
         complete_invocation_history: bool = False,
         before_pipeline: Optional[Callable[[TaskState], None]] = None,
+        invocation_already_recorded: bool = False,
     ) -> TaskState:
         created_state = False
         if task_id:
@@ -450,17 +496,22 @@ class Orchestrator:
         display = label or state.task_description.splitlines()[0][:60]
         log.info("Task %s — %s", state.task_id, display)
         active_invocation = not state.done and not state.failed
-        if active_invocation:
+        if active_invocation and not invocation_already_recorded:
             state.record_run_invocation(
                 self._config_snapshot,
                 complete_history_from_creation=(created_state or complete_invocation_history),
             )
+        resume_scope_violation = active_invocation and self._audit_interrupted_delivery_scope(state)
         state.clear_active_operation()
         state.pid = os.getpid()
         # Capture effective config on first run before any pre-pipeline work.
         if active_invocation and not state.config_snapshot and self._config_snapshot:
             state.config_snapshot = self._config_snapshot
         self._store.save(state)
+        if resume_scope_violation:
+            return state
+        if self._abort_on_delivery_terminal_stop(state):
+            return state
         if active_invocation and before_pipeline is not None:
             before_pipeline(state)
         self._loop(state)
@@ -471,6 +522,9 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _loop(self, state: TaskState) -> None:
+        if self._abort_on_delivery_terminal_stop(state):
+            return
+
         if state.done or state.failed:
             if state.failed:
                 if state.contract_gate_blocked and not state.worktree_path and not state.worktree_branch:
@@ -500,6 +554,8 @@ class Orchestrator:
         # analyst proceeds with whatever is in build/ from prior builds.
         if self._config.run_presync and not state.presync_done:
             self._run_presync(state)
+            if self._abort_on_delivery_terminal_stop(state):
+                return
 
         # Phase 1: analyze (idempotent — skipped if prompt already exists)
         if not state.implementation_prompt:
@@ -536,6 +592,43 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _abort_on_delivery_terminal_stop(self, state: TaskState) -> str | None:
+        try:
+            if state.delivery_stop_code is not None:
+                state.set_delivery_terminal_stop(state.delivery_stop_code, source="orchestrator")
+            if state.delivery_stop_code != DELIVERY_STOP_UNIT_SCOPE_VIOLATION:
+                parse_error_code = state.delivery_stop_code_from_parse_error()
+                if parse_error_code is not None:
+                    parse_error = state.delivery_disposition_parse_error or {}
+                    state.set_delivery_terminal_stop(
+                        parse_error_code,
+                        source=str(parse_error.get("source", "orchestrator")),
+                    )
+                disposition_code = state.delivery_stop_code_from_disposition()
+                if disposition_code is not None:
+                    disposition = state.delivery_stop_disposition or {}
+                    state.set_delivery_terminal_stop(
+                        disposition_code,
+                        source=str(disposition.get("source", "orchestrator")),
+                    )
+        except (TypeError, ValueError) as exc:
+            message = f"{_DELIVERY_STOP_STATE_INVALID_CODE}: {exc}"
+            log.error(message)
+            state.record("orchestrator", "abort", message)
+            state.failed = True
+            state.done = False
+            self._store.save(state)
+            return _DELIVERY_STOP_STATE_INVALID_CODE
+
+        code = state.delivery_stop_code
+        if code is None:
+            return None
+        if code not in DELIVERY_TERMINAL_STOP_CODES:  # Defensive; setter validates this above.
+            raise AssertionError("validated delivery terminal stop code escaped its closed set")
+        log.error("Delivery child stopped with terminal outcome: %s", code)
+        self._store.save(state)
+        return code
 
     def _abort_on_delivery_planner_budget(self, state: TaskState) -> bool:
         if not (state.delivery_plan_id and state.delivery_unit_id and state.plan_decided):
@@ -682,7 +775,7 @@ class Orchestrator:
             log.info("--- Phase: final review (test changes) ---")
             if not self._refresh_review_fix_diff(state):
                 return
-            reviewer_result = self._run_agent("reviewer", state)
+            reviewer_result = self._run_delivery_review_agent("reviewer", state)
             self._reviewer_ran_this_session = True
             if state.failed or self._abort_on_failed_agent_result(state, "reviewer", reviewer_result):
                 return
@@ -702,7 +795,7 @@ class Orchestrator:
             log.info("--- Phase: final security review (test changes) ---")
             if not self._refresh_review_fix_diff(state):
                 return
-            security_result = self._run_agent("security_reviewer", state)
+            security_result = self._run_delivery_review_agent("security_reviewer", state)
             if state.failed or self._abort_on_failed_agent_result(state, "security_reviewer", security_result):
                 return
             if not state.security_approved:
@@ -1023,8 +1116,14 @@ class Orchestrator:
         log.info("--- Phase: presync (generating sources before analyze) ---")
         log.info("Running %s.generate_sources()...", build_tool.__class__.__name__)
         t0 = time.perf_counter()
-        with self._active_operation(state, phase="presync", message="Generating sources"):
-            result = build_tool.generate_sources()
+        try:
+            with self._active_operation(state, phase="presync", message="Generating sources"):
+                with self._delivery_scope_tool_mutation_boundary(state, "presync"):
+                    result = build_tool.generate_sources()
+        except DeliveryScopeToolMutationStopped:
+            state.presync_done = True
+            self._store.save(state)
+            return
         elapsed_s = time.perf_counter() - t0
         state.presync_done = True
         if result.success:
@@ -1087,6 +1186,8 @@ class Orchestrator:
             if not state.build_synced:
                 log.info(f"--- Phase: sync ({progress}) ---")
                 if not self._sync(state):
+                    if state.failed:
+                        return False
                     if validation_only:
                         break
                     if not self._run_fix_phase(state, progress):
@@ -1118,6 +1219,8 @@ class Orchestrator:
 
             if self._config.run_checks:
                 if not self._run_checks(state, progress):
+                    if state.failed:
+                        return False
                     if validation_only:
                         break
                     if not self._run_fix_phase(state, progress):
@@ -1168,7 +1271,7 @@ class Orchestrator:
             log.info(f"--- Phase: {_phase_scope_label(state)}review ({label}) ---")
             if not self._refresh_review_fix_diff(state):
                 return
-            reviewer_result = self._run_agent("reviewer", state)
+            reviewer_result = self._run_delivery_review_agent("reviewer", state)
             self._reviewer_ran_this_session = True
             if state.failed or self._abort_on_failed_agent_result(state, "reviewer", reviewer_result):
                 return
@@ -1233,7 +1336,7 @@ class Orchestrator:
             log.info(f"--- Phase: {_phase_scope_label(state)}security review ({sec_label}) ---")
             if not self._refresh_review_fix_diff(state):
                 return
-            security_result = self._run_agent("security_reviewer", state)
+            security_result = self._run_delivery_review_agent("security_reviewer", state)
             if state.failed or self._abort_on_failed_agent_result(state, "security_reviewer", security_result):
                 return
             if state.security_approved:
@@ -1496,12 +1599,13 @@ class Orchestrator:
             return [str(item) for item in raw if str(item).strip()]
         return []
 
-    def _is_configured_test_write_path(self, path: str) -> bool:
+    @staticmethod
+    def _path_in_write_roots(path: str, roots: tuple[str, ...] | list[str]) -> bool:
         normalized_path = _normalize_project_path(path)
         if not normalized_path:
             return False
-        for raw_root in self._configured_test_write_paths():
-            root = raw_root.replace("\\", "/").strip()
+        for raw_root in roots:
+            root = _native_scope_path(raw_root).strip()
             normalized_root = _normalize_project_path(root)
             if not root:
                 continue
@@ -1516,6 +1620,9 @@ class Orchestrator:
             if _path_is_under_root(normalized_path, normalized_root):
                 return True
         return False
+
+    def _is_configured_test_write_path(self, path: str) -> bool:
+        return self._path_in_write_roots(path, self._configured_test_write_paths())
 
     def _fixer_change_is_test_only(self, files_written) -> bool:
         paths = [str(path) for path in files_written if str(path).strip()]
@@ -1667,7 +1774,7 @@ class Orchestrator:
     def _iter_configured_test_files(self):
         project_root = self._config.project_root.resolve()
         for raw_root in self._configured_test_write_paths():
-            raw = raw_root.replace("\\", "/").strip()
+            raw = _native_scope_path(raw_root).strip()
             if not raw:
                 continue
             candidates: list[Path]
@@ -2518,15 +2625,122 @@ class Orchestrator:
             state.errors.append(excerpt)
             state.build_status = "failed"
 
+    def _delivery_scope_audit_enabled(self, state: TaskState, name: str) -> bool:
+        return self._delivery_scope_audit.enabled(state, name)
+
+    def _delivery_scope_audit_policy(
+        self,
+        state: TaskState,
+        name: str,
+        *,
+        active_test_write_paths: tuple[str, ...] | None = None,
+    ) -> DeliveryScopeAuditPolicy:
+        return self._delivery_scope_audit.policy(
+            state,
+            name,
+            active_test_write_paths=active_test_write_paths,
+        )
+
+    def _set_delivery_scope_audit_pending(
+        self,
+        state: TaskState,
+        name: str,
+        *,
+        policy: DeliveryScopeAuditPolicy | None = None,
+    ) -> None:
+        self._delivery_scope_audit.set_pending(state, name, policy=policy)
+
+    def _delivery_scope_audit_snapshot(
+        self,
+        state: TaskState,
+        name: str,
+        *,
+        policy: DeliveryScopeAuditPolicy | None = None,
+    ) -> dict | None:
+        return self._delivery_scope_audit.snapshot(state, name, policy=policy)
+
+    def _record_delivery_scope_snapshot_failure(self, state: TaskState, name: str) -> bool:
+        return self._delivery_scope_audit.record_snapshot_failure(state, name)
+
+    def _clear_delivery_scope_audit_pending(self, state: TaskState) -> None:
+        self._delivery_scope_audit.clear_pending(state)
+
+    def _delivery_scope_provider_attempt_boundary(
+        self,
+        state: TaskState,
+        name: str,
+        policy: DeliveryScopeAuditPolicy,
+        attempt: dict[str, object],
+    ):
+        return self._delivery_scope_audit.provider_attempt_boundary(state, name, policy, attempt)
+
+    def _delivery_scope_tool_mutation_boundary(self, state: TaskState, phase: str):
+        return self._delivery_scope_audit.tool_mutation_boundary(state, phase)
+
+    def _audit_delivery_scope_after_mutation(
+        self,
+        state: TaskState,
+        name: str,
+        before: dict | None,
+        policy: DeliveryScopeAuditPolicy | None,
+        **kwargs,
+    ) -> bool:
+        return self._delivery_scope_audit.audit_after_mutation(state, name, before, policy, **kwargs)
+
+    def _audit_interrupted_delivery_scope(self, state: TaskState) -> bool:
+        return self._delivery_scope_audit.recover_interrupted(state)
+
     def _run_agent(self, name: str, state: TaskState):
         from agents.base_agent import AgentResult
 
         agent = self._agents[name]
+        prepare_workspace = getattr(getattr(agent, "llm", None), "prepare_write_agent_workspace", None)
+        if name in {"implementer", "fixer", "test_writer"} and callable(prepare_workspace):
+            try:
+                prepare_workspace(self._config.project_root)
+            except Exception as exc:
+                message = f"provider workspace setup failed: {exc}"
+                state.record(name, "workspace_setup_failed", message[:500])
+                state.failed = True
+                self._store.save(state)
+                return AgentResult(success=False, message=message[:200])
+        delivery_scope_enabled = self._delivery_scope_audit_enabled(state, name)
+        delivery_scope_policy: DeliveryScopeAuditPolicy | None = None
+        try:
+            if delivery_scope_enabled:
+                delivery_scope_policy = self._delivery_scope_audit_policy(state, name)
+                self._set_delivery_scope_audit_pending(state, name, policy=delivery_scope_policy)
+            delivery_scope_before = self._delivery_scope_audit_snapshot(
+                state,
+                name,
+                policy=delivery_scope_policy,
+            )
+        except DeliveryScopeSnapshotError:
+            self._record_delivery_scope_snapshot_failure(state, name)
+            if delivery_scope_enabled:
+                self._clear_delivery_scope_audit_pending(state)
+            return AgentResult(success=False, message="delivery_scope_audit_unavailable")
         log.info(f"Running {name} agent...")
         t0 = time.perf_counter()
         hist_len = len(state.history)
         set_session_title = getattr(getattr(agent, "llm", None), "set_session_title", None)
+        set_write_attempt_boundary = getattr(
+            getattr(agent, "llm", None),
+            "set_write_attempt_boundary",
+            None,
+        )
         previous_title = set_session_title(_agent_session_title(name, state)) if callable(set_session_title) else None
+        previous_write_attempt_boundary = None
+        provider_attempt_stopped = False
+        if delivery_scope_policy is not None and callable(set_write_attempt_boundary):
+            previous_write_attempt_boundary = set_write_attempt_boundary(
+                lambda attempt: self._delivery_scope_provider_attempt_boundary(
+                    state,
+                    name,
+                    delivery_scope_policy,
+                    attempt,
+                )
+            )
         try:
             with self._active_operation(
                 state,
@@ -2534,16 +2748,45 @@ class Orchestrator:
                 agent=name,
                 message=f"Running {name} agent",
             ):
-                with llm_retry_history(agent, name, state, self._store):
-                    result = agent.run(state)
+                try:
+                    with llm_retry_history(agent, name, state, self._store):
+                        result = agent.run(state)
+                except DeliveryScopeProviderAttemptStopped as exc:
+                    result = AgentResult(success=False, message=str(exc))
+                    provider_attempt_stopped = True
+                except Exception as exc:
+                    elapsed_s = time.perf_counter() - t0
+                    log.error(f"{name} raised an unexpected error ({_fmt_elapsed(elapsed_s)}): {exc}")
+                    state.record(name, "error", str(exc), elapsed_s=elapsed_s)
+                    state.failed = True
+                    self._store.save(state)
+                    result = AgentResult(success=False, message=str(exc))
+                provider_attempt_stopped = provider_attempt_stopped or (
+                    delivery_scope_enabled and state.delivery_stop_code == DELIVERY_STOP_UNIT_SCOPE_VIOLATION
+                )
+                scope_audit_stopped = provider_attempt_stopped or self._audit_delivery_scope_after_mutation(
+                    state,
+                    name,
+                    delivery_scope_before,
+                    delivery_scope_policy,
+                )
+                if delivery_scope_enabled:
+                    self._clear_delivery_scope_audit_pending(state)
+                if scope_audit_stopped:
+                    result = AgentResult(success=False, message=DELIVERY_SCOPE_VIOLATION_CODE)
+                delivery_stop = self._abort_on_delivery_terminal_stop(state)
+                if delivery_stop is not None:
+                    result = AgentResult(success=False, message=delivery_stop)
         except Exception as exc:
             elapsed_s = time.perf_counter() - t0
             log.error(f"{name} raised an unexpected error ({_fmt_elapsed(elapsed_s)}): {exc}")
             state.record(name, "error", str(exc), elapsed_s=elapsed_s)
             state.failed = True
             self._store.save(state)
-            return AgentResult(success=False, message=str(exc))
+            result = AgentResult(success=False, message=str(exc))
         finally:
+            if callable(set_write_attempt_boundary):
+                set_write_attempt_boundary(previous_write_attempt_boundary)
             if callable(set_session_title):
                 set_session_title(previous_title)
         elapsed_s = time.perf_counter() - t0
@@ -2558,6 +2801,27 @@ class Orchestrator:
         self._record_step_files_changed(state, data.get("files_written", []))
         self._store.save(state)
         return result
+
+    def _run_delivery_review_agent(self, name: str, state: TaskState):
+        """Retry one malformed delivery review without consuming a fix attempt."""
+        result = self._run_agent(name, state)
+        data = result.data if isinstance(result.data, dict) else {}
+        parse_error = data.get("disposition_parse_error")
+        if (
+            result.success
+            or state.failed
+            or not state.delivery_plan_id
+            or not state.delivery_unit_id
+            or name not in {"reviewer", "security_reviewer"}
+            or not isinstance(parse_error, str)
+            or not parse_error
+        ):
+            return result
+
+        state.record(name, "review_protocol_retry", parse_error)
+        self._store.save(state)
+        log.warning("Retrying %s after invalid delivery disposition (%s)", name, parse_error)
+        return self._run_agent(name, state)
 
     def _abort_on_failed_agent_result(self, state: TaskState, name: str, result) -> bool:
         if result.success:
@@ -2783,12 +3047,18 @@ class Orchestrator:
                     fix_cfg["timeout"] = check["timeout"]
                 t0 = time.perf_counter()
                 autofix_artifact_before = self._validation_artifact_snapshot(state)
-                with self._active_operation(
-                    state,
-                    phase="check_autofix",
-                    message=f"Running check/{name} autofix",
-                ):
-                    fix_result = build_tool.run_check(f"{name}_autofix", fix_cfg)
+                try:
+                    with self._active_operation(
+                        state,
+                        phase="check_autofix",
+                        message=f"Running check/{name} autofix",
+                    ):
+                        with self._delivery_scope_tool_mutation_boundary(state, "check_autofix"):
+                            fix_result = build_tool.run_check(f"{name}_autofix", fix_cfg)
+                except DeliveryScopeToolMutationStopped:
+                    state.check_status = "failed"
+                    self._store.save(state)
+                    return False
                 fix_elapsed_s = time.perf_counter() - t0
                 autofix_artifacts_ok = self._record_validation_artifacts(
                     state,
@@ -2891,8 +3161,12 @@ class Orchestrator:
         log.info(f"Running build sync ({build_tool.__class__.__name__}.sync()) — this may take a few minutes...")
         artifact_before = self._validation_artifact_snapshot(state)
         t0 = time.perf_counter()
-        with self._active_operation(state, phase="sync", message="Running build sync"):
-            result = build_tool.sync()
+        try:
+            with self._active_operation(state, phase="sync", message="Running build sync"):
+                with self._delivery_scope_tool_mutation_boundary(state, "sync"):
+                    result = build_tool.sync()
+        except DeliveryScopeToolMutationStopped:
+            return False
         elapsed_s = time.perf_counter() - t0
         artifacts_ok, sync_output_metadata, artifact_error = self._record_sync_artifact_changes(
             state,

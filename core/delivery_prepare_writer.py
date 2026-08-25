@@ -22,6 +22,7 @@ from core.delivery_asset_assignment import (
     render_delivery_asset_assignments,
 )
 from core.delivery_plan import (
+    DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION,
     SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION,
     check_delivery_plan_file,
     delivery_final_branch_for_plan_id,
@@ -41,6 +42,9 @@ _FAILURE_ASSET_PRESERVATION_BLOCKED = "asset_preservation_blocked"
 _FAILURE_UNIT_READINESS_BLOCKED = "unit_readiness_blocked"
 _FAILURE_PLAN_VALIDATION_FAILED = "plan_validation_failed"
 _FAILURE_WRITE_FAILED = "write_failed"
+_FAILURE_CONSTRAINT_REVIEW_REQUIRED = "constraint_review_required"
+_FAILURE_CONSTRAINT_CONFLICT = "constraint_conflict"
+_FAILURE_UNIT_CONTEXT_INCOMPLETE = "unit_context_incomplete"
 _ROLLBACK_FAILED_MESSAGE = "Delivery prepare failed while restoring artifacts; inspect the selected output directory."
 _FORBIDDEN_OUTPUT_ROOTS = (
     (".git",),
@@ -280,6 +284,22 @@ def write_delivery_prepare_artifacts(
                     invalid_metadata_path,
                 )
             ],
+        )
+
+    verification_stop_issues = _constraint_verification_stop_issues(draft)
+    constraint_stop_issue = verification_stop_issues[0] if verification_stop_issues else _constraint_stop_issue(draft)
+    if constraint_stop_issue is not None:
+        failure_reason = {
+            "delivery_prepare.constraint_conflict": _FAILURE_CONSTRAINT_CONFLICT,
+            "delivery_prepare.constraint_review_required": _FAILURE_CONSTRAINT_REVIEW_REQUIRED,
+            "delivery_prepare.constraint_verification_incomplete": _FAILURE_CONSTRAINT_REVIEW_REQUIRED,
+            "delivery_prepare.unit_context_verification_incomplete": _FAILURE_UNIT_CONTEXT_INCOMPLETE,
+        }.get(constraint_stop_issue.code, _FAILURE_WRITE_FAILED)
+        return _blocked_result(
+            DeliveryAuthoringDerivedPaths(plan_file="", units_dir="", unit_task_paths={}),
+            unit_task_paths={},
+            failure_reason=failure_reason,
+            errors=verification_stop_issues or [constraint_stop_issue],
         )
 
     if _is_absolute_path(output_dir):
@@ -613,12 +633,145 @@ def _lexical_artifact_paths(
 def _invalid_delivery_public_metadata_path(draft: DeliveryAuthoringDraft) -> str | None:
     if not is_safe_delivery_public_metadata(draft.title):
         return "title"
+    if draft.source_task is not None:
+        if not is_safe_delivery_public_metadata(draft.source_task.path):
+            return "source_task.path"
+        if not is_safe_delivery_public_metadata(draft.source_task.sha256):
+            return "source_task.sha256"
+    for index, constraint in enumerate(draft.constraints):
+        for field_name in ("id", "kind", "summary", "disposition"):
+            if not is_safe_delivery_public_metadata(getattr(constraint, field_name)):
+                return f"constraints[{index}].{field_name}"
+        for unit_index, unit_id in enumerate(constraint.unit_ids):
+            if not is_safe_delivery_public_metadata(unit_id):
+                return f"constraints[{index}].unit_ids[{unit_index}]"
     for index, unit in enumerate(draft.units):
         for field_name in ("title", "stream", "component", "phase", "kind", "platform"):
             value = getattr(unit, field_name)
             if value is not None and not is_safe_delivery_public_metadata(value):
                 return f"units[{index}].{field_name}"
     return None
+
+
+def _constraint_stop_issue(draft: DeliveryAuthoringDraft) -> DeliveryPrepareWriteIssue | None:
+    for index, constraint in enumerate(draft.constraints):
+        if constraint.disposition == "needs_review":
+            return DeliveryPrepareWriteIssue(
+                "error",
+                "delivery_prepare.constraint_review_required",
+                "Inherited source-task constraints require operator review before delivery artifacts can be published.",
+                f"constraints[{index}].disposition",
+            )
+        if constraint.disposition == "conflict":
+            return DeliveryPrepareWriteIssue(
+                "error",
+                "delivery_prepare.constraint_conflict",
+                "A generated unit conflicts with an inherited source-task constraint.",
+                f"constraints[{index}].disposition",
+            )
+        if constraint.disposition != DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION:
+            return DeliveryPrepareWriteIssue(
+                "error",
+                "delivery_prepare.constraint_disposition_invalid",
+                "Inherited source-task constraint disposition is unsupported.",
+                f"constraints[{index}].disposition",
+            )
+    return None
+
+
+def _constraint_verification_stop_issues(draft: DeliveryAuthoringDraft) -> list[DeliveryPrepareWriteIssue]:
+    if draft.source_task is None:
+        return []
+    verification = draft.constraint_verification
+    if verification is None:
+        return [
+            DeliveryPrepareWriteIssue(
+                "error",
+                "delivery_prepare.constraint_verification_required",
+                "Source-task constraints must be independently verified before delivery artifacts can be published.",
+                "constraint_verification",
+            )
+        ]
+    expected = [
+        (constraint.id, constraint.kind, constraint.summary, constraint.unit_ids) for constraint in draft.constraints
+    ]
+    actual = [
+        (constraint.id, constraint.kind, constraint.summary, constraint.unit_ids)
+        for constraint in verification.constraints
+    ]
+    if actual != expected:
+        return [
+            DeliveryPrepareWriteIssue(
+                "error",
+                "delivery_prepare.constraint_verification_invalid",
+                "Independent constraint verification does not match the authored delivery constraints.",
+                "constraint_verification.constraints",
+            )
+        ]
+    if not verification.constraints_complete:
+        issues = [
+            DeliveryPrepareWriteIssue(
+                "error",
+                "delivery_prepare.constraint_verification_incomplete",
+                "Independent verification still found an omitted or incompletely assigned source-task constraint.",
+                "constraint_verification.constraints_complete",
+            )
+        ]
+        for index, gap in enumerate(verification.constraint_gaps):
+            affected = ", ".join(gap.affected_unit_ids[:5])
+            if len(gap.affected_unit_ids) > 5:
+                affected += f", and {len(gap.affected_unit_ids) - 5} more"
+            issues.append(
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.constraint_gap",
+                    f"{gap.reason} {gap.kind} constraint affecting {affected}: {gap.summary}",
+                    f"constraint_verification.constraint_gaps[{index}]",
+                )
+            )
+        return issues
+    for index, constraint in enumerate(verification.constraints):
+        if constraint.disposition == "conflict":
+            return [
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.constraint_conflict",
+                    "Independent verification found a unit that conflicts with a source-task constraint.",
+                    f"constraint_verification.constraints[{index}].disposition",
+                )
+            ]
+        if constraint.disposition != DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION:
+            return [
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.constraint_review_required",
+                    "Independent constraint verification requires operator review.",
+                    f"constraint_verification.constraints[{index}].disposition",
+                )
+            ]
+    if not verification.unit_context_complete:
+        issues = [
+            DeliveryPrepareWriteIssue(
+                "error",
+                "delivery_prepare.unit_context_verification_incomplete",
+                "Independent verification still found source-defined exact values missing from generated units.",
+                "constraint_verification.unit_context_complete",
+            )
+        ]
+        for index, gap in enumerate(verification.unit_context_gaps):
+            issues.append(
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.unit_context_gap",
+                    (
+                        f"Unit {gap.unit_id} is missing {len(gap.source_literals)} "
+                        "source-defined exact value(s); inspect the local preparation audit."
+                    ),
+                    f"constraint_verification.unit_context_gaps[{index}]",
+                )
+            )
+        return issues
+    return []
 
 
 def _lexical_project_relative_path(path: str | Path, root: Path) -> Path:
@@ -839,6 +992,10 @@ def _render_plan_yaml(draft: DeliveryAuthoringDraft, unit_task_paths: dict[str, 
         plan_data["planning_mode"] = draft.planning_mode
     plan_data["final_branch"] = delivery_final_branch_for_plan_id(draft.plan_id)
     plan_data["repositories"] = [{"id": "main", "root": "."}]
+    if draft.source_task:
+        plan_data["source_task"] = draft.source_task.to_dict()
+    if draft.constraints:
+        plan_data["constraints"] = [constraint.to_plan_dict() for constraint in draft.constraints]
     streams = _distinct_streams(draft)
     if streams:
         plan_data["streams"] = streams

@@ -236,6 +236,8 @@ def test_rejects_invalid_assignments(
         "## Assets\n\n- Reference asset: [reference](assets/reference.png)\n",
         "## Assets\n\n- Reference asset: `assets/reference.png`\n    - Notes: nested metadata\n",
         "## Assets\n\n```markdown\n- Reference asset: `assets/reference.png`\n```\n",
+        ("## Assets\n\n### [Reference assets](https://example.test)\n\n- Reference asset: `assets/reference.png`\n"),
+        "## Assets\n\n### Group\n\n- Reference asset: `assets/reference.png`\n",
         "## Assets\n\n#### Group\n\n- Reference asset: `assets/reference.png`\n",
         (
             "## Assets\n\n- Reference asset: `assets/reference.png`\n"

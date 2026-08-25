@@ -3642,6 +3642,56 @@ class TestCmdRunStateStore:
         assert "Build attempts:  10 total (max 10/loop)" in out
         assert "Total time:" not in out
 
+    @pytest.mark.parametrize(
+        ("stop_code", "expected_action"),
+        [
+            (
+                "unit_scope_violation",
+                "prepare a delivery amendment with delivery amend prepare before continuing",
+            ),
+            (
+                "scope_amendment_required",
+                "prepare a delivery amendment with delivery amend prepare before continuing",
+            ),
+            (
+                "external_dependency_gap",
+                "complete the external dependency follow-up before continuing",
+            ),
+            (
+                "implementer_disposition_invalid",
+                "inspect the invalid implementer disposition and replace the failed child before continuing",
+            ),
+        ],
+    )
+    def test_terminal_delivery_child_prints_non_retryable_recovery(
+        self,
+        tmp_path: Path,
+        capsys,
+        stop_code: str,
+        expected_action: str,
+    ):
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        state = TaskState(
+            task_id="abc123",
+            task_description="terminal child",
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            failed=True,
+            delivery_stop_code=stop_code,
+        )
+        store.save(state)
+
+        with patch("sys.exit"):
+            cmd_run(_run_args(task_id="abc123"), _run_cfg(tmp_path))
+
+        out = capsys.readouterr().out
+        assert f"non-retryable terminal stop: {stop_code}" in out
+        assert f"Suggested next step: {expected_action}." in out
+        assert "Inspect state: sikula show abc123" in out
+        assert "--reset-failed" not in out
+
     def test_failed_report_only_review_prints_rerun_review_hint(self, tmp_path: Path, capsys):
         from core.state import JsonStateStore, TaskState
 
@@ -3928,6 +3978,7 @@ class TestCmdRunChildDeliveryMetadata:
             cfg_arg: dict, overrides: dict | None = None, state_store: JsonStateStore | None = None
         ) -> MagicMock:
             captured["overrides"] = overrides
+            captured["sandbox"] = dict(cfg_arg["sandbox"])
             mock = MagicMock()
             assert state_store is not None
             task_id = state_store.list_tasks()[0]
@@ -3949,10 +4000,34 @@ class TestCmdRunChildDeliveryMetadata:
                 delivery_unit_id="unit-456",
                 delivery_plan_path=".sikula/delivery/plan.yaml",
                 delivery_unit_budget={"max_planner_steps": 2, "max_changed_files": 4},
+                delivery_constraint_context_schema_version=1,
+                delivery_source_task={
+                    "path": ".sikula/tasks/source.md",
+                    "sha256": f"sha256:{'b' * 64}",
+                },
+                delivery_inherited_constraints=[
+                    {
+                        "id": "ownership",
+                        "kind": "repository_ownership",
+                        "summary": "Only this repository may be changed.",
+                        "unit_ids": ["unit-456"],
+                        "disposition": "preserved",
+                    }
+                ],
+                delivery_constraint_context_fingerprint="c" * 64,
+                delivery_write_scope_schema_version=2,
+                delivery_write_scope_mode="unit_explicit",
+                delivery_declared_write_paths=["core/state.py"],
+                delivery_declared_write_exact_file_paths=[],
+                delivery_effective_write_paths=["core/state.py"],
+                delivery_effective_write_exact_file_paths=[],
                 delivery_handoff_schema_version=1,
                 delivery_dependency_handoffs=[{"schema_version": 1, "fingerprint": "a" * 64}],
             )
-            cmd_run(args, _run_cfg(tmp_path))
+            cfg = _run_cfg(tmp_path)
+            cfg["sandbox"]["allowed_write_paths"] = ["core/"]
+            cfg["sandbox"]["allowed_test_write_paths"] = ["tests/"]
+            cmd_run(args, cfg)
 
         exit_mock.assert_called_with(0)
         store = JsonStateStore(tmp_path / ".sikula" / "state")
@@ -3964,9 +4039,401 @@ class TestCmdRunChildDeliveryMetadata:
         assert state.delivery_unit_id == "unit-456"
         assert state.delivery_plan_path == ".sikula/delivery/plan.yaml"
         assert state.delivery_unit_budget == {"max_planner_steps": 2, "max_changed_files": 4}
+        assert state.delivery_constraint_context_schema_version == 1
+        assert state.delivery_source_task == {
+            "path": ".sikula/tasks/source.md",
+            "sha256": f"sha256:{'b' * 64}",
+        }
+        assert state.delivery_inherited_constraints == [
+            {
+                "id": "ownership",
+                "kind": "repository_ownership",
+                "summary": "Only this repository may be changed.",
+                "unit_ids": ["unit-456"],
+                "disposition": "preserved",
+            }
+        ]
+        assert state.delivery_constraint_context_fingerprint == "c" * 64
+        assert state.delivery_write_scope_schema_version == 2
+        assert state.delivery_write_scope_mode == "unit_explicit"
+        assert state.delivery_declared_write_paths == ["core/state.py"]
+        assert state.delivery_declared_write_exact_file_paths == []
+        assert state.delivery_effective_write_paths == ["core/state.py"]
+        assert state.delivery_effective_write_exact_file_paths == []
+        assert state.delivery_runtime_write_scope_binding == {
+            "schema_version": 1,
+            "status": "bound",
+            "roots": [{"path": "core/state.py", "resolved_path": "core/state.py", "exact_file": False}],
+        }
         assert state.delivery_handoff_schema_version == 1
         assert state.delivery_dependency_handoffs == [{"schema_version": 1, "fingerprint": "a" * 64}]
         assert captured["overrides"]["run_planner"] is True
+        assert captured["sandbox"]["allowed_write_paths"] == ["core/state.py"]
+        assert captured["sandbox"]["allowed_test_write_paths"] == ["tests/"]
+        assert state.config_snapshot["sandbox"]["allowed_write_paths"] == ["core/state.py"]
+        assert state.config_snapshot["sandbox"]["allowed_test_write_paths"] == ["tests/"]
+
+    def test_cmd_run_revalidates_delivery_scope_in_assembled_worktree(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        project_root = tmp_path / "project"
+        operator_scope = project_root / "src" / "alias"
+        operator_scope.mkdir(parents=True)
+        external_root = tmp_path / "external"
+        external_root.mkdir()
+        task_file = project_root / "task.md"
+        task_file.write_text("change the assembled scoped path")
+
+        def fake_create_worktree(_git_root: Path, worktree_base: Path, _branch: str, *_args) -> tuple[bool, str]:
+            (worktree_base / "src").mkdir(parents=True)
+            (worktree_base / "src" / "alias").symlink_to(external_root, target_is_directory=True)
+            return True, ""
+
+        cfg = _run_cfg(project_root)
+        cfg["sandbox"]["allowed_write_paths"] = ["src/"]
+
+        with (
+            patch("sikula._find_git_root", return_value=project_root),
+            patch("sikula._ensure_gitignore"),
+            patch("sikula._create_worktree", side_effect=fake_create_worktree),
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_run(
+                _run_args(
+                    task_file=str(task_file),
+                    worktree_start_ref="assembled-commit",
+                    delivery_plan_id="plan-1",
+                    delivery_unit_id="unit-2",
+                    delivery_write_scope_schema_version=2,
+                    delivery_write_scope_mode="unit_explicit",
+                    delivery_declared_write_paths=["src/alias"],
+                    delivery_declared_write_exact_file_paths=[],
+                    delivery_effective_write_paths=["src/alias"],
+                    delivery_effective_write_exact_file_paths=[],
+                ),
+                cfg,
+            )
+
+        assert exc_info.value.code == 1
+        build_orchestrator.assert_not_called()
+        assert "delivery_write_scope.snapshot_invalid" in capsys.readouterr().out
+        store = JsonStateStore(project_root / ".sikula" / "state")
+        task_id = store.list_tasks()[0]
+        state = store.load(task_id)
+        assert state is not None
+        assert state.failed is True
+        assert state.delivery_stop_code == "unit_scope_violation"
+        assert state.delivery_runtime_write_scope_binding == {
+            "schema_version": 1,
+            "status": "denied",
+            "roots": [],
+        }
+        assert state.worktree_path is not None
+        assert Path(state.worktree_path).exists()
+        assert state.history[-1]["action"] == "delivery_write_scope_invalid"
+
+    def test_cmd_run_rejects_dangling_assembled_environment_destination(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        project_root = tmp_path / "project"
+        (project_root / "src" / "allowed").mkdir(parents=True)
+        (project_root / "local.properties").write_text("sdk.dir=/opt/android-sdk\n", encoding="utf-8")
+        task_file = project_root / "task.md"
+        task_file.write_text("change the assembled project", encoding="utf-8")
+        external = tmp_path / "external" / "local.properties"
+
+        def fake_create_worktree(_git_root: Path, worktree_base: Path, _branch: str, *_args) -> tuple[bool, str]:
+            (worktree_base / "src" / "allowed").mkdir(parents=True)
+            try:
+                (worktree_base / "local.properties").symlink_to(external)
+            except OSError as exc:
+                pytest.skip(f"symlinks are not available: {exc}")
+            return True, ""
+
+        cfg = _run_cfg(project_root)
+        cfg["project"]["build_tool"] = "gradle-android"
+        cfg["sandbox"]["allowed_write_paths"] = ["src/allowed"]
+
+        with (
+            patch("sikula._find_git_root", return_value=project_root),
+            patch("sikula._ensure_gitignore"),
+            patch("sikula._create_worktree", side_effect=fake_create_worktree),
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_run(
+                _run_args(
+                    task_file=str(task_file),
+                    worktree_start_ref="assembled-commit",
+                    delivery_plan_id="plan-1",
+                    delivery_unit_id="unit-2",
+                    delivery_write_scope_schema_version=2,
+                    delivery_write_scope_mode="unit_explicit",
+                    delivery_declared_write_paths=["src/allowed"],
+                    delivery_declared_write_exact_file_paths=[],
+                    delivery_effective_write_paths=["src/allowed"],
+                    delivery_effective_write_exact_file_paths=[],
+                ),
+                cfg,
+            )
+
+        assert exc_info.value.code == 1
+        assert not external.exists()
+        build_orchestrator.assert_not_called()
+        assert "contains a symlink" in capsys.readouterr().out
+        store = JsonStateStore(project_root / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state is not None
+        assert state.failed is True
+        assert state.worktree_path is not None
+        assert state.history[-1]["action"] == "worktree_environment_copy_rejected"
+
+    def test_cmd_run_preserves_exact_file_scope_across_assembled_worktree(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        project_root = tmp_path / "project"
+        exact_scope = project_root / "src" / "exact.py"
+        exact_scope.parent.mkdir(parents=True)
+        exact_scope.write_text("operator tree file\n", encoding="utf-8")
+        task_file = project_root / "task.md"
+        task_file.write_text("change the exact file", encoding="utf-8")
+
+        def fake_create_worktree(_git_root: Path, worktree_base: Path, _branch: str, *_args) -> tuple[bool, str]:
+            replacement = worktree_base / "src" / "exact.py"
+            replacement.mkdir(parents=True)
+            (replacement / "descendant.py").write_text("must remain out of scope\n", encoding="utf-8")
+            return True, ""
+
+        cfg = _run_cfg(project_root)
+        cfg["sandbox"]["allowed_write_paths"] = ["src/"]
+
+        with (
+            patch("sikula._find_git_root", return_value=project_root),
+            patch("sikula._ensure_gitignore"),
+            patch("sikula._create_worktree", side_effect=fake_create_worktree),
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_run(
+                _run_args(
+                    task_file=str(task_file),
+                    worktree_start_ref="assembled-commit",
+                    delivery_plan_id="plan-1",
+                    delivery_unit_id="unit-2",
+                    delivery_write_scope_schema_version=2,
+                    delivery_write_scope_mode="unit_explicit",
+                    delivery_declared_write_paths=["src/exact.py"],
+                    delivery_declared_write_exact_file_paths=["src/exact.py"],
+                    delivery_effective_write_paths=["src/exact.py"],
+                    delivery_effective_write_exact_file_paths=["src/exact.py"],
+                ),
+                cfg,
+            )
+
+        assert exc_info.value.code == 1
+        build_orchestrator.assert_not_called()
+        assert "delivery_write_scope.snapshot_path_type_changed" in capsys.readouterr().out
+        store = JsonStateStore(project_root / ".sikula" / "state")
+        state = store.load(store.list_tasks()[0])
+        assert state is not None
+        assert state.delivery_stop_code == "unit_scope_violation"
+        assert state.delivery_runtime_write_scope_binding == {
+            "schema_version": 1,
+            "status": "denied",
+            "roots": [],
+        }
+
+    def test_cmd_run_resume_revalidates_delivery_scope_in_existing_worktree(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from core.state import TaskState
+
+        project_root = tmp_path / "project"
+        (project_root / "src" / "alias").mkdir(parents=True)
+        external_root = tmp_path / "external"
+        external_root.mkdir()
+        worktree = tmp_path / "worktree"
+        (worktree / "src").mkdir(parents=True)
+        (worktree / "src" / "alias").symlink_to(external_root, target_is_directory=True)
+        store = JsonStateStore(project_root / ".sikula" / "state")
+        store.save(
+            TaskState(
+                task_id="assembled-scope",
+                task_description="resume assembled delivery child",
+                delivery_plan_id="plan-1",
+                delivery_unit_id="unit-2",
+                delivery_write_scope_schema_version=2,
+                delivery_write_scope_mode="unit_explicit",
+                delivery_declared_write_paths=["src/alias"],
+                delivery_declared_write_exact_file_paths=[],
+                delivery_effective_write_paths=["src/alias"],
+                delivery_effective_write_exact_file_paths=[],
+                worktree_path=str(worktree),
+                worktree_base=str(worktree),
+            )
+        )
+        cfg = _run_cfg(project_root)
+        cfg["sandbox"]["allowed_write_paths"] = ["src/"]
+
+        with (
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_run(_run_args(task_id="assembled-scope"), cfg)
+
+        assert exc_info.value.code == 1
+        build_orchestrator.assert_not_called()
+        assert "delivery_write_scope.snapshot_invalid" in capsys.readouterr().out
+        loaded = store.load("assembled-scope")
+        assert loaded is not None
+        assert loaded.failed is True
+        assert loaded.delivery_stop_code == "unit_scope_violation"
+        assert loaded.delivery_runtime_write_scope_binding == {
+            "schema_version": 1,
+            "status": "denied",
+            "roots": [],
+        }
+        assert loaded.history[-1]["action"] == "delivery_write_scope_invalid"
+
+    def test_cmd_run_resume_rejects_retargeted_internal_runtime_scope_alias(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from core.state import TaskState
+
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        worktree = tmp_path / "worktree"
+        (worktree / "src" / "a").mkdir(parents=True)
+        (worktree / "src" / "b").mkdir()
+        (worktree / "src" / "alias").symlink_to("b", target_is_directory=True)
+        store = JsonStateStore(project_root / ".sikula" / "state")
+        store.save(
+            TaskState(
+                task_id="retargeted-scope",
+                task_description="resume delivery child after idle alias retarget",
+                delivery_plan_id="plan-1",
+                delivery_unit_id="unit-2",
+                delivery_write_scope_schema_version=2,
+                delivery_write_scope_mode="repository_default",
+                delivery_declared_write_paths=[],
+                delivery_declared_write_exact_file_paths=[],
+                delivery_effective_write_paths=["src/alias"],
+                delivery_effective_write_exact_file_paths=[],
+                delivery_runtime_write_scope_binding={
+                    "schema_version": 1,
+                    "status": "bound",
+                    "roots": [{"path": "src/alias", "resolved_path": "src/a", "exact_file": False}],
+                },
+                worktree_path=str(worktree),
+                worktree_base=str(worktree),
+            )
+        )
+        cfg = _run_cfg(project_root)
+        cfg["sandbox"]["allowed_write_paths"] = ["src/"]
+
+        with (
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_run(_run_args(task_id="retargeted-scope"), cfg)
+
+        assert exc_info.value.code == 1
+        build_orchestrator.assert_not_called()
+        assert "delivery_write_scope.runtime_binding_changed" in capsys.readouterr().out
+        loaded = store.load("retargeted-scope")
+        assert loaded is not None
+        assert loaded.delivery_stop_code == "unit_scope_violation"
+        assert loaded.delivery_runtime_write_scope_binding == {
+            "schema_version": 1,
+            "status": "bound",
+            "roots": [{"path": "src/alias", "resolved_path": "src/a", "exact_file": False}],
+        }
+
+    @pytest.mark.parametrize("reset_failed", [False, True])
+    def test_cmd_run_recovers_pending_scope_audit_before_runtime_scope_changes(
+        self,
+        tmp_path: Path,
+        reset_failed: bool,
+    ) -> None:
+        from core.state import TaskState
+
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        worktree = tmp_path / "worktree"
+        (worktree / "src" / "a").mkdir(parents=True)
+        store = JsonStateStore(project_root / ".sikula" / "state")
+        state = TaskState(
+            task_id="pending-scope-audit",
+            task_description="resume interrupted delivery child",
+            failed=reset_failed,
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-2",
+            delivery_write_scope_schema_version=2,
+            delivery_write_scope_mode="unit_explicit",
+            delivery_declared_write_paths=["."],
+            delivery_declared_write_exact_file_paths=[],
+            delivery_effective_write_paths=["."],
+            delivery_effective_write_exact_file_paths=[],
+            delivery_runtime_write_scope_binding={
+                "schema_version": 1,
+                "status": "bound",
+                "roots": [{"path": "src/a", "resolved_path": "src/a", "exact_file": False}],
+            },
+            delivery_scope_audit_pending={
+                "schema_version": 4,
+                "agent": "implementer",
+                "project_prefix": ".",
+                "production_roots": [{"path": "src/a", "resolved_path": "src/a", "exact_file": False}],
+                "active_test_write_paths": [],
+            },
+            worktree_path=str(worktree),
+            worktree_base=str(worktree),
+        )
+        store.save(state)
+        cfg = _run_cfg(project_root)
+        cfg["sandbox"]["allowed_write_paths"] = ["."]
+        build_calls = 0
+
+        def capture_orchestrator(
+            cfg_arg: dict,
+            overrides: dict | None = None,
+            state_store: JsonStateStore | None = None,
+        ) -> MagicMock:
+            nonlocal build_calls
+            build_calls += 1
+            assert state_store is not None
+            loaded = state_store.load("pending-scope-audit")
+            assert loaded is not None
+            assert loaded.delivery_runtime_write_scope_binding == state.delivery_runtime_write_scope_binding
+            assert cfg_arg["sandbox"]["allowed_write_paths"] == ["."]
+            mock = MagicMock()
+
+            def recover(task_id: str) -> TaskState:
+                assert task_id == "pending-scope-audit"
+                recovered = state_store.load(task_id)
+                assert recovered is not None
+                recovered.set_delivery_terminal_stop("unit_scope_violation", source="orchestrator")
+                state_store.save(recovered)
+                return recovered
+
+            mock.recover_interrupted_delivery_scope.side_effect = recover
+            return mock
+
+        with (
+            patch("sikula.build_orchestrator", side_effect=capture_orchestrator),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_run(_run_args(task_id="pending-scope-audit", reset_failed=reset_failed), cfg)
+
+        assert exc_info.value.code == 1
+        assert build_calls == 1
+        loaded = store.load("pending-scope-audit")
+        assert loaded is not None
+        assert loaded.delivery_stop_code == "unit_scope_violation"
+        assert loaded.delivery_runtime_write_scope_binding == state.delivery_runtime_write_scope_binding
 
     def test_cmd_run_reset_failed_blocks_delivery_budget_stop(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -4007,6 +4474,47 @@ class TestCmdRunChildDeliveryMetadata:
         assert loaded is not None
         assert loaded.failed is True
         assert loaded.delivery_budget_stop == state.delivery_budget_stop
+
+    def test_cmd_run_reset_failed_blocks_invalid_implementer_disposition(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from core.state import TaskState
+
+        store = JsonStateStore(tmp_path / ".sikula" / "state")
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        state = TaskState(
+            task_id="invalid-disposition",
+            task_description="delivery child with partial writes",
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            files_changed=["src/partial.py"],
+            worktree_path=str(worktree),
+        )
+        state.record_delivery_disposition_parse_error(
+            "implementer",
+            "delivery_disposition.keys_invalid",
+        )
+        state.failed = True
+        store.save(state)
+
+        with (
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_run(_run_args(task_id=state.task_id, reset_failed=True), _run_cfg(tmp_path))
+
+        assert exc_info.value.code == 1
+        build_orchestrator.assert_not_called()
+        output = capsys.readouterr().out
+        assert "non-retryable delivery stop: implementer_disposition_invalid" in output
+        assert "--reset-failed cannot bypass" in output
+        loaded = store.load(state.task_id)
+        assert loaded is not None
+        assert loaded.failed is True
+        assert loaded.files_changed == ["src/partial.py"]
+        assert loaded.delivery_stop_code is None
+        assert loaded.delivery_disposition_parse_error == state.delivery_disposition_parse_error
 
     def test_cmd_run_reset_failed_blocks_delivery_child_without_worktree(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -4088,12 +4596,20 @@ class TestCmdRunChildDeliveryMetadata:
             delivery_plan_id="preserved-plan",
             delivery_unit_id="preserved-unit",
             delivery_plan_path=".sikula/delivery/preserved.yaml",
+            delivery_write_scope_schema_version=2,
+            delivery_write_scope_mode="unit_explicit",
+            delivery_declared_write_paths=["core/state.py"],
+            delivery_declared_write_exact_file_paths=[],
+            delivery_effective_write_paths=["core/state.py"],
+            delivery_effective_write_exact_file_paths=[],
         )
         store.save(state)
+        captured: dict = {}
 
         def capture_orch(
             cfg_arg: dict, overrides: dict | None = None, state_store: JsonStateStore | None = None
         ) -> MagicMock:
+            captured["sandbox"] = dict(cfg_arg["sandbox"])
             mock = MagicMock()
             mock.run.return_value = MagicMock(
                 done=True,
@@ -4117,13 +4633,70 @@ class TestCmdRunChildDeliveryMetadata:
                 delivery_unit_id="overwriting-unit",
                 delivery_plan_path="overwriting-path",
             )
-            cmd_run(args, _run_cfg(tmp_path))
+            cfg = _run_cfg(tmp_path)
+            cfg["sandbox"]["allowed_write_paths"] = ["."]
+            cmd_run(args, cfg)
 
         loaded = store.load("abc123")
         assert loaded is not None
         assert loaded.delivery_plan_id == "preserved-plan"
         assert loaded.delivery_unit_id == "preserved-unit"
         assert loaded.delivery_plan_path == ".sikula/delivery/preserved.yaml"
+        assert captured["sandbox"]["allowed_write_paths"] == ["core/state.py"]
+
+    @pytest.mark.parametrize(
+        ("declared_paths", "effective_paths", "configured_paths", "expected_code"),
+        [
+            (["core"], ["agents"], ["."], "delivery_write_scope.snapshot_invalid"),
+            (["core"], ["core"], ["agents"], "delivery_write_scope.runtime_intersection_invalid"),
+        ],
+    )
+    def test_cmd_run_resume_rejects_invalid_delivery_write_scope_before_runtime(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        declared_paths: list[str],
+        effective_paths: list[str],
+        configured_paths: list[str],
+        expected_code: str,
+    ) -> None:
+        from core.state import TaskState
+
+        state_dir = tmp_path / ".sikula" / "state"
+        store = JsonStateStore(state_dir)
+        state = TaskState(
+            task_id="badscope1",
+            task_description="resume malformed delivery child",
+            delivery_plan_id="preserved-plan",
+            delivery_unit_id="preserved-unit",
+            delivery_write_scope_schema_version=2,
+            delivery_write_scope_mode="unit_explicit",
+            delivery_declared_write_paths=declared_paths,
+            delivery_declared_write_exact_file_paths=[],
+            delivery_effective_write_paths=effective_paths,
+            delivery_effective_write_exact_file_paths=[],
+        )
+        store.save(state)
+        cfg = _run_cfg(tmp_path)
+        cfg["sandbox"]["allowed_write_paths"] = configured_paths
+
+        with (
+            patch("sikula.build_orchestrator") as build_orchestrator,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_run(_run_args(task_id="badscope1"), cfg)
+
+        assert exc_info.value.code == 1
+        build_orchestrator.assert_not_called()
+        output = capsys.readouterr().out
+        assert expected_code in output
+        assert str(tmp_path) not in output
+        loaded = store.load("badscope1")
+        assert loaded is not None
+        assert loaded.failed is True
+        assert loaded.worktree_path is None
+        assert loaded.history[-1]["action"] == "delivery_write_scope_invalid"
+        assert loaded.history[-1]["error"] == expected_code
 
     def test_cmd_run_task_id_resume_does_not_call_delivery_child_created_callback(self, tmp_path: Path) -> None:
         from core.state import TaskState

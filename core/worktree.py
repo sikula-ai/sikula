@@ -4,7 +4,50 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+import shutil
 import subprocess
+
+
+class WorktreeEnvironmentCopyError(RuntimeError):
+    """Raised when an environment file cannot be copied without escaping its worktree."""
+
+
+def copy_worktree_environment_file(source: Path, destination: Path, worktree_root: Path) -> bool:
+    """Copy one required environment file without following destination symlinks."""
+    if not source.exists():
+        return False
+    try:
+        relative = destination.relative_to(worktree_root)
+    except ValueError as exc:
+        raise WorktreeEnvironmentCopyError("Environment file destination is outside the worktree") from exc
+    if not relative.parts or ".." in relative.parts:
+        raise WorktreeEnvironmentCopyError("Environment file destination is outside the worktree")
+
+    try:
+        resolved_root = worktree_root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise WorktreeEnvironmentCopyError("Environment file worktree cannot be resolved safely") from exc
+
+    current = worktree_root
+    for part in relative.parts:
+        current /= part
+        try:
+            if current.is_symlink():
+                raise WorktreeEnvironmentCopyError(
+                    f"Environment file destination {relative.as_posix()} contains a symlink"
+                )
+            current.resolve(strict=False).relative_to(resolved_root)
+        except WorktreeEnvironmentCopyError:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise WorktreeEnvironmentCopyError(
+                f"Environment file destination {relative.as_posix()} cannot be resolved inside the worktree"
+            ) from exc
+
+    if destination.exists():
+        return False
+    shutil.copy2(source, destination)
+    return True
 
 
 def _short_audit_line(value: str | None, limit: int = 180) -> str:

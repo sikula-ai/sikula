@@ -140,6 +140,7 @@ def test_task_description_asset_manifest_section_detection_allows_fenced_example
 """
 
     assert task_description_has_asset_manifest_section(markdown) is False
+    assert task_description_has_asset_manifest_section(markdown, ignore_fenced_blocks=False) is True
 
 
 def test_task_description_asset_manifest_section_detection_allows_product_manifest_copy():

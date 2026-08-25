@@ -128,3 +128,6 @@ class MavenTool(BuildTool):
     def is_build_config_file(self, path: str) -> bool:
         p = path.replace("\\", "/")
         return Path(p).name in _BUILD_CONFIG_FILES or any(d in p for d in _BUILD_CONFIG_DIRS)
+
+    def is_ephemeral_build_path(self, path: str) -> bool:
+        return "target" in self._delivery_scope_path_parts(path)

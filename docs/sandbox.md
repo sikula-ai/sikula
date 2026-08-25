@@ -47,7 +47,25 @@ git commit -m "Add Sikula project setup"
 - `sandbox.allowed_test_write_paths`
 - `sandbox.allowed_read_paths`
 
-These paths are passed to agents as constraints. Provider-specific hard enforcement varies. Sikula audits changed files after write-capable agent calls and records write-scope warnings when changes fall outside the active scope.
+These paths are passed to agents as constraints. Provider-specific hard
+enforcement varies. For ordinary tasks, an unexpected write remains an audited
+write-scope warning unless a more specific pipeline invariant applies.
+
+Delivery children add a fail-closed production boundary. An absent or empty unit
+`scope_paths` list keeps `sandbox.allowed_write_paths`; a non-empty list is
+canonically intersected with it before parent progress or child state is
+created. An invalid or empty intersection blocks without starting agents. The
+resolved scope is persisted as an upper bound, so resume may narrow it against a
+new config but never broaden it. `sandbox.allowed_test_write_paths` remains a
+separate TestWriter/Fixer policy and is not reduced by production unit scope.
+
+After each Implementer or Fixer call, Sikula inspects actual repository changes
+independently of provider-reported file lists. An out-of-scope production write
+is a terminal `unit_scope_violation`: Sikula preserves the isolated worktree and
+sanitized audit evidence, but does not proceed to validation, review, test
+writing, commit, handoff, or delivery assembly. The audit exposes only bounded
+project-relative path metadata, never file contents, prompts, provider output,
+or raw task state.
 
 ## Read-Only Agents
 

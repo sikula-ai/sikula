@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import stat
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -11,11 +13,28 @@ from typing import Callable
 import pytest
 
 import core.orchestrator as orchestrator_module
+import core.delivery_scope_audit as delivery_scope_audit_module
+from core import llm_client as llm_client_module
 from agents.base_agent import AgentResult
+from agents.fixer_agent import FixerAgent
 from tests.conftest import StubLLMClient
-from core.orchestrator import Orchestrator, OrchestratorConfig, _build_tool, _fmt_elapsed
+from core.delivery_write_scope import DeliveryWriteScopeError, apply_delivery_write_scope_to_config
+from core.llm_client import LLMConfig, LLMTransientError
+from core.orchestrator import (
+    Orchestrator,
+    OrchestratorConfig,
+    _build_tool,
+    _fmt_elapsed,
+)
 from core.state import JsonStateStore, TaskState
+from core.structured_output import (
+    DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP,
+    DELIVERY_DISPOSITION_REQUIRES_SCOPE_AMENDMENT,
+    DELIVERY_DISPOSITION_SCHEMA_VERSION,
+    DeliveryDisposition,
+)
 from core.test_execution_gate_audit import detect_new_test_execution_gates
+from core.validation_artifacts import DeliveryScopeSnapshotError, delivery_scope_git_binding
 from tools.base_tool import Sandbox, ToolResult
 from tools.cargo_tool import CargoTool
 from tools.gradle_android_tool import AndroidGradleTool
@@ -28,6 +47,41 @@ from tools.python_tool import PythonTool
 # ---------------------------------------------------------------------------
 
 
+def _git_head(path: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _git_ignore_fingerprint(path: Path) -> str:
+    return delivery_scope_git_binding(path).ignore_fingerprint
+
+
+def _git_scope_binding_fields(path: Path) -> dict[str, str]:
+    binding = delivery_scope_git_binding(path)
+    return {
+        "git_baseline": binding.baseline,
+        "git_dir": binding.git_dir,
+        "git_common_dir": binding.common_dir,
+        "git_ignore_fingerprint": binding.ignore_fingerprint,
+        "git_ref_fingerprint": binding.ref_fingerprint,
+    }
+
+
+def _git_dir(path: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "--absolute-git-dir"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 @dataclass
 class StubAgent:
     name: str = ""
@@ -37,6 +91,11 @@ class StubAgent:
     result_success: bool = True
     result_message: str | None = None
     raise_exception: Exception | None = None
+    llm: object | None = None
+    active_test_write_paths: list[str] = field(default_factory=list)
+
+    def delivery_scope_active_test_write_paths(self, state: TaskState) -> list[str]:
+        return list(self.active_test_write_paths)
 
     def run(self, state: TaskState) -> AgentResult:
         if self.raise_exception:
@@ -73,10 +132,12 @@ class StubBuildTool:
         self.check_configs: list[tuple[str, dict]] = []
         self.compile_side_effect: Callable[[], None] | None = None
         self.test_side_effect: Callable[[], None] | None = None
+        self.presync_side_effect: Callable[[], None] | None = None
         self.check_side_effects: dict[str, Callable[[], None]] = {}
         self.sync_side_effect: Callable[[], None] | None = None
         self.sync_metadata: dict = {}
         self.sync_adoptable_files: set[str] = set()
+        self.ephemeral_build_components: set[str] = set()
 
     def sync(self) -> ToolResult:
         self.sync_calls += 1
@@ -91,6 +152,8 @@ class StubBuildTool:
 
     def generate_sources(self) -> ToolResult:
         self.presync_calls += 1
+        if self.presync_side_effect:
+            self.presync_side_effect()
         return ToolResult(
             success=self.presync_success, output="", error="" if self.presync_success else "presync failed"
         )
@@ -128,6 +191,9 @@ class StubBuildTool:
 
     def is_sync_adoptable_file(self, path: str) -> bool:
         return path in self.sync_adoptable_files
+
+    def is_ephemeral_build_path(self, path: str) -> bool:
+        return any(part in self.ephemeral_build_components for part in Path(path).parts)
 
 
 class RetryReportingAgent:
@@ -175,6 +241,79 @@ class UsageReportingAgent:
         return AgentResult(success=True, message="ok", data={"files_written": []})
 
 
+class ProviderCallingAgent:
+    def __init__(self, llm, *, calls_per_run: int = 1, swallow_provider_errors: bool = False) -> None:
+        self.llm = llm
+        self.calls_per_run = calls_per_run
+        self.swallow_provider_errors = swallow_provider_errors
+        self.calls: list[TaskState] = []
+
+    def delivery_scope_active_test_write_paths(self, state: TaskState) -> list[str]:
+        return []
+
+    def run(self, state: TaskState) -> AgentResult:
+        self.calls.append(state)
+        for _ in range(self.calls_per_run):
+            try:
+                self.llm.run_agent("write files", Path(state.worktree_path or self.llm.cwd))
+            except RuntimeError:
+                if not self.swallow_provider_errors:
+                    raise
+        return AgentResult(success=True, message="ok", data={"files_written": []})
+
+
+class ObservedWriteClient(StubLLMClient):
+    def __init__(self, cwd: Path, actions: list[Callable[[], tuple[list[str], str]]]) -> None:
+        super().__init__()
+        self.cwd = cwd
+        self.actions = actions
+        self.provider_call_requests = 0
+        self.provider_calls = 0
+        self._config = LLMConfig(provider="test-provider", model="test-model")
+
+    def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
+        action = self.actions[self.provider_call_requests]
+        self.provider_call_requests += 1
+
+        def invoke() -> tuple[list[str], str]:
+            self.provider_calls += 1
+            return action()
+
+        return llm_client_module._call_observed(
+            self._config,
+            operation="run_agent",
+            attempt=1,
+            max_attempts=1,
+            input_chars=len(prompt),
+            fn=invoke,
+        )
+
+
+class RetryingObservedWriteClient(ObservedWriteClient):
+    def run_agent(self, prompt: str, cwd: Path) -> tuple[list[str], str]:
+        last_error: LLMTransientError | None = None
+        for attempt, action in enumerate(self.actions, start=1):
+            self.provider_call_requests += 1
+
+            def invoke() -> tuple[list[str], str]:
+                self.provider_calls += 1
+                return action()
+
+            try:
+                return llm_client_module._call_observed(
+                    self._config,
+                    operation="run_agent",
+                    attempt=attempt,
+                    max_attempts=len(self.actions),
+                    input_chars=len(prompt),
+                    fn=invoke,
+                )
+            except LLMTransientError as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -198,14 +337,240 @@ class TestPathClassification:
         assert not orchestrator_module._path_looks_like_test_audit_candidate("assets/logo.png")
 
 
+class TestDeliveryWriteScopeRuntimeConfig:
+    def test_explicit_scope_replaces_only_production_write_policy(self, tmp_path: Path):
+        project_config = {
+            "project": {"root_path": str(tmp_path), "build_tool": "python"},
+            "sandbox": {
+                "allowed_write_paths": ["core", "agents"],
+                "allowed_test_write_paths": ["tests"],
+                "allowed_read_paths": ["."],
+            },
+        }
+        state = TaskState(
+            task_id="scope1",
+            task_description="delivery child",
+            delivery_plan_id="plan",
+            delivery_unit_id="unit",
+            delivery_write_scope_schema_version=2,
+            delivery_write_scope_mode="unit_explicit",
+            delivery_declared_write_paths=["core/state.py"],
+            delivery_declared_write_exact_file_paths=[],
+            delivery_effective_write_paths=["core/state.py"],
+            delivery_effective_write_exact_file_paths=[],
+        )
+
+        apply_delivery_write_scope_to_config(project_config, state)
+
+        assert project_config["sandbox"] == {
+            "allowed_write_paths": ["core/state.py"],
+            "allowed_test_write_paths": ["tests"],
+            "allowed_read_paths": ["."],
+        }
+
+    def test_repository_default_uses_persisted_effective_scope(self, tmp_path: Path):
+        project_config = {
+            "project": {"root_path": str(tmp_path), "build_tool": "python"},
+            "sandbox": {
+                "allowed_write_paths": ["."],
+                "allowed_test_write_paths": ["tests"],
+            },
+        }
+        state = TaskState(
+            task_id="scope2",
+            task_description="delivery child",
+            delivery_plan_id="plan",
+            delivery_unit_id="unit",
+            delivery_write_scope_schema_version=2,
+            delivery_write_scope_mode="repository_default",
+            delivery_declared_write_exact_file_paths=[],
+            delivery_effective_write_paths=["persisted-production"],
+            delivery_effective_write_exact_file_paths=[],
+        )
+
+        apply_delivery_write_scope_to_config(project_config, state)
+
+        assert project_config["sandbox"]["allowed_write_paths"] == ["persisted-production"]
+        assert project_config["sandbox"]["allowed_test_write_paths"] == ["tests"]
+
+    def test_empty_persisted_scope_disables_runtime_production_writes(self, tmp_path: Path):
+        project_config = {
+            "project": {"root_path": str(tmp_path), "build_tool": "python"},
+            "sandbox": {"allowed_write_paths": ["."]},
+        }
+        state = TaskState(
+            task_id="scope-empty",
+            task_description="delivery child",
+            delivery_plan_id="plan",
+            delivery_unit_id="unit",
+            delivery_write_scope_schema_version=2,
+            delivery_write_scope_mode="repository_default",
+            delivery_declared_write_exact_file_paths=[],
+            delivery_effective_write_paths=[],
+            delivery_effective_write_exact_file_paths=[],
+        )
+
+        runtime_paths = apply_delivery_write_scope_to_config(project_config, state)
+
+        assert runtime_paths is not None
+        assert runtime_paths.effective_paths == ()
+        assert project_config["sandbox"]["allowed_write_paths"] == []
+
+    def test_current_config_can_further_narrow_persisted_scope(self, tmp_path: Path):
+        project_config = {
+            "project": {"root_path": str(tmp_path), "build_tool": "python"},
+            "sandbox": {
+                "allowed_write_paths": ["core/state.py"],
+                "allowed_test_write_paths": ["tests"],
+            },
+        }
+        state = TaskState(
+            task_id="scope5",
+            task_description="delivery child",
+            delivery_plan_id="plan",
+            delivery_unit_id="unit",
+            delivery_write_scope_schema_version=2,
+            delivery_write_scope_mode="unit_explicit",
+            delivery_declared_write_paths=["core"],
+            delivery_declared_write_exact_file_paths=[],
+            delivery_effective_write_paths=["core"],
+            delivery_effective_write_exact_file_paths=[],
+        )
+
+        apply_delivery_write_scope_to_config(project_config, state)
+
+        assert project_config["sandbox"]["allowed_write_paths"] == ["core/state.py"]
+        assert project_config["sandbox"]["allowed_test_write_paths"] == ["tests"]
+
+    def test_existing_runtime_binding_rejects_retargeted_internal_scope_alias(self, tmp_path: Path):
+        (tmp_path / "core").mkdir()
+        (tmp_path / "docs").mkdir()
+        alias = tmp_path / "scope-alias"
+        alias.symlink_to("core", target_is_directory=True)
+        project_config = {
+            "project": {"root_path": str(tmp_path), "build_tool": "python"},
+            "sandbox": {"allowed_write_paths": ["scope-alias"]},
+        }
+        state = TaskState(
+            task_id="scope-retarget",
+            task_description="delivery child",
+            delivery_plan_id="plan",
+            delivery_unit_id="unit",
+            delivery_write_scope_schema_version=2,
+            delivery_write_scope_mode="repository_default",
+            delivery_declared_write_paths=[],
+            delivery_declared_write_exact_file_paths=[],
+            delivery_effective_write_paths=["scope-alias"],
+            delivery_effective_write_exact_file_paths=[],
+            delivery_runtime_write_scope_binding={
+                "schema_version": 1,
+                "status": "bound",
+                "roots": [{"path": "scope-alias", "resolved_path": "core", "exact_file": False}],
+            },
+        )
+        alias.unlink()
+        alias.symlink_to("docs", target_is_directory=True)
+
+        with pytest.raises(DeliveryWriteScopeError) as exc_info:
+            apply_delivery_write_scope_to_config(project_config, state)
+
+        assert exc_info.value.code == "delivery_write_scope.runtime_binding_changed"
+
+    def test_existing_runtime_binding_remains_the_upper_bound_when_config_broadens(self, tmp_path: Path):
+        (tmp_path / "core").mkdir()
+        project_config = {
+            "project": {"root_path": str(tmp_path), "build_tool": "python"},
+            "sandbox": {"allowed_write_paths": ["."]},
+        }
+        binding = {
+            "schema_version": 1,
+            "status": "bound",
+            "roots": [{"path": "core/state.py", "resolved_path": "core/state.py", "exact_file": False}],
+        }
+        state = TaskState(
+            task_id="scope-broaden",
+            task_description="delivery child",
+            delivery_plan_id="plan",
+            delivery_unit_id="unit",
+            delivery_write_scope_schema_version=2,
+            delivery_write_scope_mode="unit_explicit",
+            delivery_declared_write_paths=["core"],
+            delivery_declared_write_exact_file_paths=[],
+            delivery_effective_write_paths=["core"],
+            delivery_effective_write_exact_file_paths=[],
+            delivery_runtime_write_scope_binding=binding,
+        )
+
+        apply_delivery_write_scope_to_config(project_config, state)
+
+        assert project_config["sandbox"]["allowed_write_paths"] == ["core/state.py"]
+        assert state.delivery_runtime_write_scope_binding is binding
+
+    def test_disjoint_current_config_fails_closed(self, tmp_path: Path):
+        project_config = {
+            "project": {"root_path": str(tmp_path), "build_tool": "python"},
+            "sandbox": {"allowed_write_paths": ["agents"]},
+        }
+        state = TaskState(
+            task_id="scope6",
+            task_description="delivery child",
+            delivery_plan_id="plan",
+            delivery_unit_id="unit",
+            delivery_write_scope_schema_version=2,
+            delivery_write_scope_mode="unit_explicit",
+            delivery_declared_write_paths=["core"],
+            delivery_declared_write_exact_file_paths=[],
+            delivery_effective_write_paths=["core"],
+            delivery_effective_write_exact_file_paths=[],
+        )
+
+        with pytest.raises(DeliveryWriteScopeError) as exc_info:
+            apply_delivery_write_scope_to_config(project_config, state)
+
+        assert exc_info.value.code == "delivery_write_scope.runtime_intersection_invalid"
+
+    def test_legacy_state_keeps_current_config(self, tmp_path: Path):
+        project_config = {
+            "project": {"root_path": str(tmp_path), "build_tool": "python"},
+            "sandbox": {"allowed_write_paths": ["legacy-production"]},
+        }
+        state = TaskState(task_id="scope3", task_description="legacy child")
+
+        apply_delivery_write_scope_to_config(project_config, state)
+
+        assert project_config["sandbox"]["allowed_write_paths"] == ["legacy-production"]
+
+    def test_modern_scope_must_be_bound_to_delivery_child(self, tmp_path: Path):
+        project_config = {
+            "project": {"root_path": str(tmp_path), "build_tool": "python"},
+            "sandbox": {"allowed_write_paths": ["core"]},
+        }
+        state = TaskState(
+            task_id="scope4",
+            task_description="unbound state",
+            delivery_write_scope_schema_version=2,
+            delivery_write_scope_mode="unit_explicit",
+            delivery_declared_write_paths=["core"],
+            delivery_declared_write_exact_file_paths=[],
+            delivery_effective_write_paths=["core"],
+            delivery_effective_write_exact_file_paths=[],
+        )
+
+        with pytest.raises(DeliveryWriteScopeError) as exc_info:
+            apply_delivery_write_scope_to_config(project_config, state)
+
+        assert exc_info.value.code == "delivery_write_scope.snapshot_unbound"
+
+
 def _make_orchestrator(
     tmp_path: Path,
     **config_kwargs,
 ) -> tuple[Orchestrator, dict[str, StubAgent], StubBuildTool]:
     project_config = config_kwargs.pop("project_config", {"project": {"build_tool": "python"}})
+    allowed_write_paths = config_kwargs.pop("allowed_write_paths", ["."])
     config = OrchestratorConfig(
         project_root=tmp_path,
-        allowed_write_paths=["."],
+        allowed_write_paths=allowed_write_paths,
         allowed_read_paths=["."],
         project_config=project_config,
         **config_kwargs,
@@ -246,6 +611,2418 @@ def _save_state(orch: Orchestrator, **kwargs) -> TaskState:
     return state
 
 
+def _scoped_delivery_state(orch: Orchestrator, effective_paths: list[str]) -> TaskState:
+    return _save_state(
+        orch,
+        implementation_prompt="implement scoped delivery unit",
+        plan_decided=True,
+        delivery_plan_id="delivery-plan",
+        delivery_unit_id="scoped-unit",
+        delivery_write_scope_schema_version=2,
+        delivery_write_scope_mode="unit_explicit",
+        delivery_declared_write_paths=list(effective_paths),
+        delivery_declared_write_exact_file_paths=[],
+        delivery_effective_write_paths=list(effective_paths),
+        delivery_effective_write_exact_file_paths=[],
+    )
+
+
+def _delivery_disposition(disposition: str) -> DeliveryDisposition:
+    actions = {
+        DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP: "external_dependency_follow_up",
+        DELIVERY_DISPOSITION_REQUIRES_SCOPE_AMENDMENT: "delivery_amend_prepare",
+    }
+    return DeliveryDisposition(
+        schema_version=DELIVERY_DISPOSITION_SCHEMA_VERSION,
+        disposition=disposition,
+        summary="The delivery unit cannot continue within its current boundary.",
+        recommended_action=actions[disposition],
+    )
+
+
+class TestDeliveryProductionScopeAudit:
+    def test_presync_out_of_scope_write_is_terminal_before_analysis(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        escaped = tmp_project / "generated" / "api.py"
+        orch, _, build = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+
+        def generate_outside_scope() -> None:
+            escaped.parent.mkdir()
+            escaped.write_text("generated outside scope\n", encoding="utf-8")
+
+        build.presync_side_effect = generate_outside_scope
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        orch._run_presync(state)
+
+        assert build.presync_calls == 1
+        assert escaped.exists()
+        assert state.failed is True
+        assert state.delivery_stop_code == "unit_scope_violation"
+        assert state.presync_done is True
+        audit = state.validation_cycle_records[-1]
+        assert audit["metadata"]["audit_boundary"] == "tool_mutation"
+        assert audit["metadata"]["tool_phase"] == "presync"
+        assert audit["metadata"]["violation_paths"] == ["generated/api.py"]
+
+    def test_sync_cannot_adopt_tracked_output_outside_unit_scope(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        lockfile = tmp_project / "Cargo.lock"
+        lockfile.write_text("version = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "Cargo.lock"], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "track lockfile"], cwd=tmp_project, check=True, capture_output=True)
+        orch, _, build = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        build.sync_adoptable_files.add("Cargo.lock")
+        build.sync_side_effect = lambda: lockfile.write_text("version = 2\n", encoding="utf-8")
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._sync(state)
+
+        assert result is False
+        assert state.delivery_stop_code == "unit_scope_violation"
+        assert state.files_changed == []
+        assert lockfile.read_text(encoding="utf-8") == "version = 2\n"
+        audit = state.validation_cycle_records[-1]
+        assert audit["metadata"]["tool_phase"] == "sync"
+        assert audit["metadata"]["violation_paths"] == ["Cargo.lock"]
+
+    def test_sync_can_adopt_tracked_output_inside_unit_scope(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        generated = allowed / "generated.py"
+        generated.write_text("version = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "src/allowed/generated.py"], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "track generated source"], cwd=tmp_project, check=True, capture_output=True
+        )
+        orch, _, build = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        build.sync_adoptable_files.add("src/allowed/generated.py")
+        build.sync_side_effect = lambda: generated.write_text("version = 2\n", encoding="utf-8")
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._sync(state)
+
+        assert result is True
+        assert state.delivery_stop_code is None
+        assert state.files_changed == ["src/allowed/generated.py"]
+        audits = [record for record in state.validation_cycle_records if record.get("phase") == "delivery_scope_audit"]
+        assert audits[-1]["status"] == "passed"
+        assert audits[-1]["metadata"]["tool_phase"] == "sync"
+
+    def test_sync_ignores_declared_ephemeral_dependency_tree_outside_unit_scope(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        dependency_file = tmp_project / "node_modules" / "package" / "index.js"
+        (tmp_project / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+        orch, _, build = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        build.ephemeral_build_components.add("node_modules")
+
+        def install_dependencies() -> None:
+            dependency_file.parent.mkdir(parents=True)
+            dependency_file.write_text("module.exports = {}\n", encoding="utf-8")
+
+        build.sync_side_effect = install_dependencies
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._sync(state)
+
+        assert result is True
+        assert dependency_file.exists()
+        assert state.delivery_stop_code is None
+        audit = next(
+            record for record in reversed(state.validation_cycle_records) if record["phase"] == "delivery_scope_audit"
+        )
+        assert audit["status"] == "passed"
+        assert audit["metadata"]["changed_paths"] == []
+
+    def test_node_sync_ignores_yarn_berry_disposable_install_state(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        (tmp_project / ".gitignore").write_text(
+            ".yarn/install-state.gz\n.yarn/cache/\n.yarn/unplugged/\n",
+            encoding="utf-8",
+        )
+        orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        node_tool = NodeTool(
+            sandbox=Sandbox(project_root=tmp_project, allowed_write_paths=["."], allowed_read_paths=["."]),
+            project_root=tmp_project,
+        )
+
+        def install_dependencies() -> ToolResult:
+            for path in (
+                tmp_project / ".yarn" / "install-state.gz",
+                tmp_project / ".yarn" / "cache" / "package.zip",
+                tmp_project / ".yarn" / "unplugged" / "package" / "index.js",
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("disposable\n", encoding="utf-8")
+            return ToolResult(success=True, output="")
+
+        node_tool.sync = install_dependencies  # type: ignore[method-assign]
+        orch._tools["build"] = node_tool
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._sync(state)
+
+        assert result is True
+        assert state.delivery_stop_code is None
+        audit = next(
+            record for record in reversed(state.validation_cycle_records) if record["phase"] == "delivery_scope_audit"
+        )
+        assert audit["status"] == "passed"
+        assert audit["metadata"]["changed_paths"] == []
+
+    def test_node_sync_keeps_tracked_yarn_zero_install_cache_auditable(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        cache_file = tmp_project / ".yarn" / "cache" / "zero-install.zip"
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text("tracked before\n", encoding="utf-8")
+        (tmp_project / ".gitignore").write_text(".yarn/cache/\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", ".gitignore"],
+            cwd=tmp_project,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "add", "-f", ".yarn/cache/zero-install.zip"],
+            cwd=tmp_project,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "track zero-install cache"],
+            cwd=tmp_project,
+            check=True,
+            capture_output=True,
+        )
+        orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        node_tool = NodeTool(
+            sandbox=Sandbox(project_root=tmp_project, allowed_write_paths=["."], allowed_read_paths=["."]),
+            project_root=tmp_project,
+        )
+
+        def update_zero_install_cache() -> ToolResult:
+            cache_file.write_text("tracked after\n", encoding="utf-8")
+            return ToolResult(success=True, output="")
+
+        node_tool.sync = update_zero_install_cache  # type: ignore[method-assign]
+        orch._tools["build"] = node_tool
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._sync(state)
+
+        assert result is False
+        assert state.delivery_stop_code == "unit_scope_violation"
+        assert state.validation_cycle_records[-1]["metadata"]["violation_paths"] == [".yarn/cache/zero-install.zip"]
+
+    def test_check_autofix_out_of_scope_write_stops_before_recheck(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        escaped = tmp_project / "src" / "main.py"
+        orch, _, build = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            run_checks=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "build": {
+                    "checks": [
+                        {
+                            "name": "ruff",
+                            "command": "ruff check .",
+                            "fix_command": "ruff check . --fix",
+                        }
+                    ]
+                },
+            },
+        )
+        build.check_results["ruff"] = [False, True]
+        build.check_side_effects["ruff_autofix"] = lambda: escaped.write_text(
+            "# changed outside scope\n",
+            encoding="utf-8",
+        )
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_checks(state, "1/1")
+
+        assert result is False
+        assert build.check_calls == ["ruff", "ruff_autofix"]
+        assert state.delivery_stop_code == "unit_scope_violation"
+        assert escaped.read_text(encoding="utf-8") == "# changed outside scope\n"
+        audit = state.validation_cycle_records[-1]
+        assert audit["metadata"]["tool_phase"] == "check_autofix"
+        assert audit["metadata"]["violation_paths"] == ["src/main.py"]
+
+    def test_tool_scope_snapshot_failure_blocks_mutation_call(
+        self,
+        tmp_project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, _, build = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        monkeypatch.setattr(
+            delivery_scope_audit_module,
+            "snapshot_delivery_scope_files",
+            lambda *args, **kwargs: (_ for _ in ()).throw(DeliveryScopeSnapshotError("unavailable")),
+        )
+
+        result = orch._sync(state)
+
+        assert result is False
+        assert build.sync_calls == 0
+        assert state.delivery_stop_code == "unit_scope_violation"
+        assert state.validation_cycle_records[-1]["metadata"] == {
+            "code": "delivery_scope_audit_unavailable",
+            "agent": "tool:sync",
+            "audit_boundary": "tool_mutation",
+            "tool_phase": "sync",
+        }
+
+    def test_interrupted_tool_mutation_is_audited_before_pipeline_resume(
+        self,
+        tmp_project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        (tmp_project / "src" / "allowed").mkdir()
+        escaped = tmp_project / "Cargo.lock"
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        policy = orch._delivery_scope_audit_policy(state, "tool:sync", active_test_write_paths=())
+        orch._set_delivery_scope_audit_pending(state, "tool:sync", policy=policy)
+        orch._delivery_scope_audit_snapshot(state, "tool:sync", policy=policy)
+        escaped.write_text("partial interrupted sync output\n", encoding="utf-8")
+        pipeline_calls: list[TaskState] = []
+        monkeypatch.setattr(orch, "_loop", pipeline_calls.append)
+
+        result = orch.run(task_id=state.task_id)
+
+        assert result.delivery_stop_code == "unit_scope_violation"
+        assert result.delivery_scope_audit_pending is None
+        assert pipeline_calls == []
+        assert not any(stub.calls for stub in stubs.values())
+        audit = result.validation_cycle_records[-1]
+        assert audit["metadata"]["resume_recovery"] is True
+        assert audit["metadata"]["audit_boundary"] == "tool_mutation"
+        assert audit["metadata"]["tool_phase"] == "sync"
+        assert audit["metadata"]["violation_paths"] == ["Cargo.lock"]
+
+    def test_provider_workspace_setup_runs_before_scope_baseline(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        settings = tmp_project / ".gemini" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text("readonly\n", encoding="utf-8")
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+
+        class PreparingLLM(StubLLMClient):
+            def prepare_write_agent_workspace(self, cwd: Path) -> None:
+                assert cwd == tmp_project
+                settings.write_text("implementer\n", encoding="utf-8")
+
+        def write_in_scope(_state: TaskState) -> None:
+            assert settings.read_text(encoding="utf-8") == "implementer\n"
+            settings.write_text("implementer\n", encoding="utf-8")
+            (allowed / "kept.py").write_text("in scope\n", encoding="utf-8")
+
+        stubs["implementer"].llm = PreparingLLM()
+        stubs["implementer"].side_effect = write_in_scope
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is True
+        audit = state.validation_cycle_records[-1]
+        assert audit["status"] == "passed"
+        assert audit["metadata"]["changed_paths"] == ["src/allowed/kept.py"]
+        assert audit["metadata"]["violation_count"] == 0
+
+    def test_provider_workspace_setup_failure_blocks_agent(self, tmp_project: Path):
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+
+        class FailingWorkspaceLLM(StubLLMClient):
+            def prepare_write_agent_workspace(self, cwd: Path) -> None:
+                raise OSError("settings directory is read-only")
+
+        stubs["implementer"].llm = FailingWorkspaceLLM()
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "provider workspace setup failed: settings directory is read-only"
+        assert stubs["implementer"].calls == []
+        assert state.failed is True
+        assert state.history[-1]["action"] == "workspace_setup_failed"
+        persisted = orch._store.load(state.task_id)
+        assert persisted is not None
+        assert persisted.history[-1]["action"] == "workspace_setup_failed"
+
+    def test_non_os_workspace_setup_failure_is_recorded_and_saved(self, tmp_project: Path):
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+
+        class FailingWorkspaceLLM(StubLLMClient):
+            def prepare_write_agent_workspace(self, cwd: Path) -> None:
+                raise RuntimeError("provider setup hook failed")
+
+        stubs["implementer"].llm = FailingWorkspaceLLM()
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "provider workspace setup failed: provider setup hook failed"
+        assert stubs["implementer"].calls == []
+        assert state.failed is True
+        persisted = orch._store.load(state.task_id)
+        assert persisted is not None
+        assert persisted.failed is True
+
+    def test_each_provider_call_is_audited_before_fixer_can_make_another(self, tmp_project: Path):
+        (tmp_project / "src" / "allowed").mkdir()
+        outside = tmp_project / "build" / "escaped.txt"
+        second_call_started = False
+
+        def first_call() -> tuple[list[str], str]:
+            outside.parent.mkdir()
+            outside.write_text("out of scope\n", encoding="utf-8")
+            return [], "first"
+
+        def second_call() -> tuple[list[str], str]:
+            nonlocal second_call_started
+            second_call_started = True
+            outside.unlink()
+            return [], "second"
+
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        client = ObservedWriteClient(tmp_project, [first_call, second_call])
+        agent = ProviderCallingAgent(client, calls_per_run=2, swallow_provider_errors=True)
+        stubs["fixer"] = agent  # type: ignore[assignment]
+        orch._agents["fixer"] = agent
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("fixer", state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        assert client.provider_calls == 1
+        assert client.provider_call_requests == 2
+        assert second_call_started is False
+        audit = state.validation_cycle_records[-1]
+        assert audit["metadata"]["audit_boundary"] == "provider_attempt"
+        assert audit["metadata"]["provider_attempt"] == 1
+        assert audit["metadata"]["violation_paths"] == ["build/escaped.txt"]
+
+    def test_scope_violation_stops_provider_internal_retry(self, tmp_project: Path):
+        (tmp_project / "src" / "allowed").mkdir()
+        outside = tmp_project / "ignored-output" / "escaped.txt"
+        exclude = tmp_project / ".git" / "info" / "exclude"
+        exclude.write_text(exclude.read_text(encoding="utf-8") + "\nignored-output/\n", encoding="utf-8")
+        retry_started = False
+
+        def first_attempt() -> tuple[list[str], str]:
+            outside.parent.mkdir()
+            outside.write_text("partial\n", encoding="utf-8")
+            raise LLMTransientError("retry me")
+
+        def retry_attempt() -> tuple[list[str], str]:
+            nonlocal retry_started
+            retry_started = True
+            outside.unlink()
+            return [], "recovered"
+
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        client = RetryingObservedWriteClient(tmp_project, [first_attempt, retry_attempt])
+        agent = ProviderCallingAgent(client)
+        stubs["implementer"] = agent  # type: ignore[assignment]
+        orch._agents["implementer"] = agent
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        assert client.provider_calls == 1
+        assert retry_started is False
+        assert state.validation_cycle_records[-1]["metadata"]["audit_boundary"] == "provider_attempt"
+
+    def test_provider_cannot_hide_ephemeral_write_by_mutating_info_exclude(self, tmp_project: Path):
+        (tmp_project / "src" / "allowed").mkdir()
+        escaped = tmp_project / "target" / "escaped"
+
+        def mutate_ignore_authority() -> tuple[list[str], str]:
+            exclude = tmp_project / ".git" / "info" / "exclude"
+            exclude.write_text(exclude.read_text(encoding="utf-8") + "\ntarget/\n", encoding="utf-8")
+            escaped.parent.mkdir()
+            escaped.write_text("out of scope\n", encoding="utf-8")
+            return [], "hidden"
+
+        orch, stubs, build = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        build.ephemeral_build_components.add("target")
+        client = ObservedWriteClient(tmp_project, [mutate_ignore_authority])
+        agent = ProviderCallingAgent(client)
+        stubs["implementer"] = agent  # type: ignore[assignment]
+        orch._agents["implementer"] = agent
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        assert client.provider_calls == 1
+        assert state.delivery_stop_code == "unit_scope_violation"
+        assert state.validation_cycle_records[-1]["metadata"]["code"] == "delivery_scope_audit_unavailable"
+
+    def test_clean_transient_provider_attempt_is_audited_before_retry(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+
+        def transient_attempt() -> tuple[list[str], str]:
+            raise LLMTransientError("retry me")
+
+        def successful_attempt() -> tuple[list[str], str]:
+            (allowed / "kept.py").write_text("in scope\n", encoding="utf-8")
+            return ["src/allowed/kept.py"], "done"
+
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        client = RetryingObservedWriteClient(tmp_project, [transient_attempt, successful_attempt])
+        agent = ProviderCallingAgent(client)
+        stubs["implementer"] = agent  # type: ignore[assignment]
+        orch._agents["implementer"] = agent
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is True
+        assert client.provider_calls == 2
+        attempt_audits = [
+            record
+            for record in state.validation_cycle_records
+            if record.get("metadata", {}).get("audit_boundary") == "provider_attempt"
+        ]
+        assert [record["status"] for record in attempt_audits] == ["passed", "passed"]
+        assert [record["metadata"]["provider_attempt"] for record in attempt_audits] == [1, 2]
+
+    def test_provider_attempt_snapshot_failure_blocks_provider_execution(
+        self,
+        tmp_project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        client = ObservedWriteClient(tmp_project, [lambda: ([], "must not run")])
+        agent = ProviderCallingAgent(client)
+        stubs["implementer"] = agent  # type: ignore[assignment]
+        orch._agents["implementer"] = agent
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        original_snapshot = delivery_scope_audit_module.snapshot_delivery_scope_files
+        calls = 0
+
+        def fail_attempt_baseline(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise DeliveryScopeSnapshotError("unavailable")
+            return original_snapshot(*args, **kwargs)
+
+        monkeypatch.setattr(delivery_scope_audit_module, "snapshot_delivery_scope_files", fail_attempt_baseline)
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        assert client.provider_call_requests == 1
+        assert client.provider_calls == 0
+        assert state.validation_cycle_records[-1]["metadata"]["code"] == "delivery_scope_audit_unavailable"
+
+    def test_scope_audit_rejects_project_outside_authoritative_worktree(self, tmp_path: Path):
+        project = tmp_path / "project"
+        worktree = tmp_path / "unrelated-worktree"
+        (project / "src" / "allowed").mkdir(parents=True)
+        worktree.mkdir()
+        orch, stubs, _ = _make_orchestrator(project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        state.worktree_base = str(worktree)
+        state.worktree_path = str(project)
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "delivery_scope_audit_unavailable"
+        assert stubs["implementer"].calls == []
+        assert state.delivery_stop_code == "unit_scope_violation"
+
+    def test_scope_audit_covers_siblings_of_nested_project_root(self, tmp_path: Path):
+        repository = tmp_path / "repository"
+        project = repository / "packages" / "app"
+        allowed = project / "src" / "allowed"
+        sibling = repository / "shared" / "escaped.py"
+        allowed.mkdir(parents=True)
+        sibling.parent.mkdir(parents=True)
+        subprocess.run(["git", "init"], cwd=repository, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"], cwd=repository, check=True, capture_output=True
+        )
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repository, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=repository, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-m", "init"], cwd=repository, check=True, capture_output=True
+        )
+        orch, stubs, _ = _make_orchestrator(project, allowed_write_paths=["src/allowed"])
+
+        def write_across_project_boundary(_state: TaskState) -> None:
+            (allowed / "kept.py").write_text("in scope\n", encoding="utf-8")
+            sibling.write_text("outside nested project\n", encoding="utf-8")
+
+        stubs["implementer"].side_effect = write_across_project_boundary
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        state.worktree_base = str(repository)
+        state.worktree_path = str(project)
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert state.delivery_stop_code == "unit_scope_violation"
+        audit = state.validation_cycle_records[-1]
+        assert audit["status"] == "failed"
+        assert audit["metadata"]["changed_paths"] == ["src/allowed/kept.py"]
+        assert audit["metadata"]["outside_project_count"] == 1
+        assert audit["metadata"]["outside_project_paths"] == ["shared/escaped.py"]
+        assert audit["metadata"]["violation_paths"] == []
+        assert audit["metadata"]["violation_count"] == 1
+
+    def test_broad_test_root_does_not_retain_generated_content(self, tmp_project: Path):
+        generated = tmp_project / "app" / "build" / "generated.bin"
+        generated.parent.mkdir(parents=True)
+        generated.write_bytes(b"generated" * 1024)
+        project_config = {
+            "project": {"build_tool": "gradle-android"},
+            "sandbox": {
+                "allowed_write_paths": ["src/allowed"],
+                "allowed_test_write_paths": ["app/"],
+            },
+        }
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            project_config=project_config,
+        )
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        snapshot = orch._delivery_scope_audit_snapshot(state, "fixer")
+
+        assert snapshot is not None
+        assert snapshot["app/build/generated.bin"].content is None
+
+    def test_scope_audit_finishes_before_agent_active_operation_clears(
+        self,
+        tmp_project: Path,
+        monkeypatch,
+    ):
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            heartbeat_interval_seconds=60,
+        )
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        original_audit = orch._audit_delivery_scope_after_mutation
+
+        def assert_active_operation(*args, **kwargs) -> bool:
+            loaded = orch._store.load(state.task_id)
+            assert loaded is not None
+            assert loaded.active_operation is not None
+            assert loaded.active_operation["phase"] == "agent"
+            assert loaded.active_operation["agent"] == "implementer"
+            return original_audit(*args, **kwargs)
+
+        monkeypatch.setattr(orch, "_audit_delivery_scope_after_mutation", assert_active_operation)
+
+        result = orch._run_agent("implementer", state)
+
+        loaded = orch._store.load(state.task_id)
+        assert result.success is True
+        assert loaded is not None
+        assert loaded.active_operation is None
+
+    @pytest.mark.parametrize("recovery_phase", ["load", "compare", "save"])
+    @pytest.mark.parametrize("exception_type", [KeyboardInterrupt, SystemExit, BaseException])
+    def test_interrupted_scope_recovery_preserves_pending_evidence(
+        self,
+        tmp_project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        recovery_phase: str,
+        exception_type: type[BaseException],
+    ) -> None:
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        policy = orch._delivery_scope_audit_policy(state, "implementer")
+        orch._set_delivery_scope_audit_pending(state, "implementer", policy=policy)
+        orch._delivery_scope_audit_snapshot(state, "implementer", policy=policy)
+        pending_before = deepcopy(state.delivery_scope_audit_pending)
+        snapshot_before = orch._store.load_text_snapshot(state.task_id, "delivery_scope_audit_before")
+        original_load = orch._store.load_text_snapshot
+        original_detect = delivery_scope_audit_module.detect_validation_artifacts
+        original_save = orch._store.save
+        interrupted = False
+
+        def interrupt_load(*args, **kwargs):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise exception_type()
+            return original_load(*args, **kwargs)
+
+        def interrupt_compare(*args, **kwargs):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise exception_type()
+            return original_detect(*args, **kwargs)
+
+        def interrupt_save(*args, **kwargs):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise exception_type()
+            return original_save(*args, **kwargs)
+
+        if recovery_phase == "load":
+            monkeypatch.setattr(orch._store, "load_text_snapshot", interrupt_load)
+        elif recovery_phase == "compare":
+            monkeypatch.setattr(delivery_scope_audit_module, "detect_validation_artifacts", interrupt_compare)
+        else:
+            monkeypatch.setattr(orch._store, "save", interrupt_save)
+
+        with pytest.raises(exception_type):
+            orch.recover_interrupted_delivery_scope(state.task_id)
+
+        preserved = orch._store.load(state.task_id)
+        assert preserved is not None
+        assert preserved.delivery_scope_audit_pending == pending_before
+        assert orch._store.load_text_snapshot(state.task_id, "delivery_scope_audit_before") == snapshot_before
+        assert not any(record.get("phase") == "delivery_scope_audit" for record in preserved.validation_cycle_records)
+
+        recovered = orch.recover_interrupted_delivery_scope(state.task_id)
+
+        assert recovered.failed is False
+        assert recovered.delivery_scope_audit_pending is None
+        assert orch._store.load_text_snapshot(state.task_id, "delivery_scope_audit_before") is None
+        audit = recovered.validation_cycle_records[-1]
+        assert audit["status"] == "passed"
+        assert audit["metadata"]["resume_recovery"] is True
+
+    @pytest.mark.parametrize("agent_name", ["implementer", "fixer"])
+    def test_provider_report_cannot_hide_partial_out_of_scope_writes(
+        self,
+        tmp_project: Path,
+        agent_name: str,
+    ):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        project_config = {
+            "project": {"build_tool": "python"},
+            "sandbox": {
+                "allowed_write_paths": ["src/allowed"],
+                "allowed_test_write_paths": ["tests"],
+            },
+        }
+        orch, stubs, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            project_config=project_config,
+        )
+
+        def write_outside_scope(_state: TaskState) -> None:
+            (allowed / "kept.py").write_text("in scope\n", encoding="utf-8")
+            outside = tmp_project / "docs" / "escaped.md"
+            outside.parent.mkdir()
+            outside.write_text("outside scope\n", encoding="utf-8")
+
+        stubs[agent_name].side_effect = write_outside_scope
+        stubs[agent_name].result_data = {"files_written": []}
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent(agent_name, state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        assert state.failed is True
+        assert state.delivery_stop_code == "unit_scope_violation"
+        assert (allowed / "kept.py").exists()
+        assert (tmp_project / "docs" / "escaped.md").exists()
+        audit = state.validation_cycle_records[-1]
+        assert audit["phase"] == "delivery_scope_audit"
+        assert audit["status"] == "failed"
+        assert audit["metadata"] == {
+            "code": "unit_scope_violation",
+            "agent": agent_name,
+            "changed_count": 2,
+            "production_changed_count": 2,
+            "violation_count": 1,
+            "declared_count": 1,
+            "effective_count": 1,
+            "changed_paths": ["docs/escaped.md", "src/allowed/kept.py"],
+            "violation_paths": ["docs/escaped.md"],
+            "declared_paths": ["src/allowed"],
+            "effective_paths": ["src/allowed"],
+            "recommended_action": "delivery_amend_prepare",
+        }
+
+    def test_provider_commit_changes_git_authority_and_fails_closed(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        escaped = tmp_project / "docs" / "escaped.md"
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+
+        def commit_outside_scope(_state: TaskState) -> None:
+            escaped.parent.mkdir()
+            escaped.write_text("committed outside scope\n", encoding="utf-8")
+            subprocess.run(["git", "add", "docs/escaped.md"], cwd=tmp_project, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-m", "provider commit"],
+                cwd=tmp_project,
+                check=True,
+                capture_output=True,
+            )
+            (allowed / "dirty.py").write_text("dirty in scope\n", encoding="utf-8")
+
+        stubs["implementer"].side_effect = commit_outside_scope
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        assert state.delivery_stop_code == "unit_scope_violation"
+        audit = state.validation_cycle_records[-1]
+        assert audit["metadata"] == {
+            "code": "delivery_scope_audit_unavailable",
+            "agent": "implementer",
+        }
+
+    def test_provider_commit_and_revert_changes_git_authority_and_fails_closed(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        escaped = tmp_project / "docs" / "escaped.md"
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+
+        def commit_and_revert_outside_scope(_state: TaskState) -> None:
+            escaped.parent.mkdir()
+            escaped.write_text("committed outside scope\n", encoding="utf-8")
+            subprocess.run(["git", "add", "docs/escaped.md"], cwd=tmp_project, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-m", "provider commit"],
+                cwd=tmp_project,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(["git", "rm", "docs/escaped.md"], cwd=tmp_project, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-m", "provider revert"],
+                cwd=tmp_project,
+                check=True,
+                capture_output=True,
+            )
+            (allowed / "dirty.py").write_text("dirty in scope\n", encoding="utf-8")
+
+        stubs["implementer"].side_effect = commit_and_revert_outside_scope
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        audit = state.validation_cycle_records[-1]
+        assert audit["metadata"] == {
+            "code": "delivery_scope_audit_unavailable",
+            "agent": "implementer",
+        }
+
+    def test_provider_commit_and_hard_reset_to_baseline_fails_closed(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        escaped = tmp_project / "docs" / "discarded.md"
+        baseline = _git_head(tmp_project)
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+
+        def commit_and_discard_outside_scope(_state: TaskState) -> None:
+            escaped.parent.mkdir()
+            escaped.write_text("discarded outside scope\n", encoding="utf-8")
+            subprocess.run(["git", "add", "docs/discarded.md"], cwd=tmp_project, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-m", "discarded provider commit"],
+                cwd=tmp_project,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(["git", "reset", "--hard", baseline], cwd=tmp_project, check=True, capture_output=True)
+
+        stubs["implementer"].side_effect = commit_and_discard_outside_scope
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        assert len(stubs["implementer"].calls) == 1
+        assert not escaped.exists()
+        assert state.delivery_stop_code == "unit_scope_violation"
+        assert state.validation_cycle_records[-1]["metadata"] == {
+            "code": "delivery_scope_audit_unavailable",
+            "agent": "implementer",
+        }
+
+    def test_provider_index_flag_cannot_hide_out_of_scope_write(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        escaped = tmp_project / "docs" / "escaped.md"
+        escaped.parent.mkdir()
+        escaped.write_text("before\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/escaped.md"], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "track escaped path"], cwd=tmp_project, check=True, capture_output=True)
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+
+        def hide_outside_scope(_state: TaskState) -> None:
+            subprocess.run(
+                ["git", "update-index", "--assume-unchanged", "docs/escaped.md"],
+                cwd=tmp_project,
+                check=True,
+                capture_output=True,
+            )
+            escaped.write_text("hidden outside scope\n", encoding="utf-8")
+            (allowed / "dirty.py").write_text("dirty in scope\n", encoding="utf-8")
+
+        stubs["implementer"].side_effect = hide_outside_scope
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        assert state.delivery_stop_code == "unit_scope_violation"
+        audit = state.validation_cycle_records[-1]
+        assert audit["metadata"]["changed_paths"] == ["docs/escaped.md", "src/allowed/dirty.py"]
+        assert audit["metadata"]["violation_paths"] == ["docs/escaped.md"]
+
+    @pytest.mark.parametrize("agent_name", ["implementer", "fixer"])
+    def test_gitignored_out_of_scope_write_is_a_terminal_violation(
+        self,
+        tmp_project: Path,
+        agent_name: str,
+    ):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        (tmp_project / ".gitignore").write_text(".env\n", encoding="utf-8")
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+
+        def write_ignored_file(_state: TaskState) -> None:
+            (tmp_project / ".env").write_text("PRIVATE_CONFIGURATION=changed\n", encoding="utf-8")
+
+        stubs[agent_name].side_effect = write_ignored_file
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent(agent_name, state)
+
+        assert result.success is False
+        assert state.delivery_stop_code == "unit_scope_violation"
+        assert state.validation_cycle_records[-1]["metadata"]["violation_paths"] == [".env"]
+
+    def test_existing_nested_symlink_cannot_escape_active_write_scope(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        outside = tmp_project.parent / f"{tmp_project.name}-outside-symlink"
+        outside.mkdir()
+        try:
+            (allowed / "link").symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation is unavailable: {exc}")
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "delivery_scope_audit_unavailable"
+        assert stubs["implementer"].calls == []
+        assert state.delivery_stop_code == "unit_scope_violation"
+
+    def test_existing_out_of_scope_symlink_cannot_escape_project(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        out_of_scope = tmp_project / "docs"
+        out_of_scope.mkdir()
+        outside = tmp_project.parent / f"{tmp_project.name}-outside-project"
+        outside.mkdir()
+        try:
+            (out_of_scope / "link").symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation is unavailable: {exc}")
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+
+        def write_through_out_of_scope_symlink(_state: TaskState) -> None:
+            (out_of_scope / "link" / "escaped.txt").write_text("outside project\n", encoding="utf-8")
+
+        stubs["implementer"].side_effect = write_through_out_of_scope_symlink
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "delivery_scope_audit_unavailable"
+        assert stubs["implementer"].calls == []
+        assert not (outside / "escaped.txt").exists()
+        assert state.delivery_stop_code == "unit_scope_violation"
+
+    def test_new_nested_symlink_escape_stops_after_provider(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        outside = tmp_project.parent / f"{tmp_project.name}-new-outside-symlink"
+        outside.mkdir()
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+
+        def create_escaping_symlink(_state: TaskState) -> None:
+            try:
+                (allowed / "link").symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+
+        stubs["implementer"].side_effect = create_escaping_symlink
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert len(stubs["implementer"].calls) == 1
+        assert state.delivery_stop_code == "unit_scope_violation"
+
+    def test_ephemeral_tree_symlink_escape_stops_after_provider(self, tmp_project: Path):
+        (tmp_project / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+        outside = tmp_project.parent / f"{tmp_project.name}-ephemeral-symlink"
+        outside.mkdir()
+        orch, stubs, build = _make_orchestrator(tmp_project, allowed_write_paths=["."])
+        build.ephemeral_build_components.add("node_modules")
+
+        def write_through_ephemeral_symlink(_state: TaskState) -> None:
+            dependency_root = tmp_project / "node_modules"
+            dependency_root.mkdir()
+            link = dependency_root / "escape"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+            (link / "escaped.txt").write_text("outside project\n", encoding="utf-8")
+
+        stubs["implementer"].side_effect = write_through_ephemeral_symlink
+        state = _scoped_delivery_state(orch, ["."])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert len(stubs["implementer"].calls) == 1
+        assert state.delivery_stop_code == "unit_scope_violation"
+
+    def test_nested_symlink_cannot_escape_to_another_project_path(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        forbidden = tmp_project / "src" / "forbidden"
+        allowed.mkdir()
+        forbidden.mkdir()
+        try:
+            (allowed / "link").symlink_to("../forbidden", target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation is unavailable: {exc}")
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert stubs["implementer"].calls == []
+        assert state.delivery_stop_code == "unit_scope_violation"
+
+    def test_nested_symlink_within_active_write_scope_is_allowed(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        target = allowed / "real"
+        target.mkdir(parents=True)
+        try:
+            (allowed / "link").symlink_to("real", target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation is unavailable: {exc}")
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+
+        def write_through_safe_symlink(_state: TaskState) -> None:
+            (allowed / "link" / "kept.py").write_text("in scope\n", encoding="utf-8")
+
+        stubs["implementer"].side_effect = write_through_safe_symlink
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is True
+        assert state.validation_cycle_records[-1]["metadata"]["violation_count"] == 0
+
+    def test_internal_symlink_scope_root_allows_writes_to_resolved_target(self, tmp_project: Path):
+        target = tmp_project / "core"
+        target.mkdir()
+        alias = tmp_project / "core-alias"
+        try:
+            alias.symlink_to("core", target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation is unavailable: {exc}")
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["core-alias"])
+
+        def write_through_scope_alias(_state: TaskState) -> None:
+            (alias / "kept.py").write_text("in scope\n", encoding="utf-8")
+
+        stubs["implementer"].side_effect = write_through_scope_alias
+        state = _scoped_delivery_state(orch, ["core-alias"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is True
+        audit = state.validation_cycle_records[-1]
+        assert audit["metadata"]["changed_paths"] == ["core/kept.py"]
+        assert audit["metadata"]["violation_count"] == 0
+
+    def test_internal_symlink_scope_root_retarget_is_rejected(self, tmp_project: Path):
+        (tmp_project / "core").mkdir()
+        (tmp_project / "other").mkdir()
+        alias = tmp_project / "core-alias"
+        try:
+            alias.symlink_to("core", target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation is unavailable: {exc}")
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["core-alias"])
+
+        def retarget_scope_alias(_state: TaskState) -> None:
+            alias.unlink()
+            alias.symlink_to("other", target_is_directory=True)
+
+        stubs["implementer"].side_effect = retarget_scope_alias
+        state = _scoped_delivery_state(orch, ["core-alias"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        assert state.delivery_stop_code == "unit_scope_violation"
+
+    def test_internal_symlink_scope_root_retarget_before_baseline_is_rejected(
+        self,
+        tmp_project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (tmp_project / "core").mkdir()
+        (tmp_project / "other").mkdir()
+        alias = tmp_project / "core-alias"
+        try:
+            alias.symlink_to("core", target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation is unavailable: {exc}")
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["core-alias"])
+        original_set_pending = orch._set_delivery_scope_audit_pending
+
+        def set_pending_then_retarget(state: TaskState, name: str, *, policy=None) -> None:
+            original_set_pending(state, name, policy=policy)
+            alias.unlink()
+            alias.symlink_to("other", target_is_directory=True)
+
+        monkeypatch.setattr(orch, "_set_delivery_scope_audit_pending", set_pending_then_retarget)
+        state = _scoped_delivery_state(orch, ["core-alias"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "delivery_scope_audit_unavailable"
+        assert stubs["implementer"].calls == []
+        assert state.delivery_stop_code == "unit_scope_violation"
+
+    def test_internal_symlink_scope_root_replaced_by_directory_is_rejected(self, tmp_project: Path):
+        (tmp_project / "core").mkdir()
+        alias = tmp_project / "core-alias"
+        try:
+            alias.symlink_to("core", target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation is unavailable: {exc}")
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["core-alias"])
+
+        def replace_scope_alias(_state: TaskState) -> None:
+            alias.unlink()
+            alias.mkdir()
+            (alias / "new.py").write_text("outside resolved scope\n", encoding="utf-8")
+
+        stubs["implementer"].side_effect = replace_scope_alias
+        state = _scoped_delivery_state(orch, ["core-alias"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        assert state.delivery_stop_code == "unit_scope_violation"
+        assert state.validation_cycle_records[-1]["metadata"]["violation_paths"] == [
+            "core-alias",
+            "core-alias/new.py",
+        ]
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX treats backslashes as filename characters")
+    def test_posix_backslash_filename_does_not_inherit_directory_scope(self, tmp_project: Path) -> None:
+        (tmp_project / "scripts").mkdir()
+        escaped = tmp_project / r"scripts\payload"
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["scripts"])
+
+        def write_backslash_name(_state: TaskState) -> None:
+            escaped.write_text("outside scripts directory\n", encoding="utf-8")
+
+        stubs["implementer"].side_effect = write_backslash_name
+        state = _scoped_delivery_state(orch, ["scripts"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        assert state.validation_cycle_records[-1]["metadata"]["violation_paths"] == [r"scripts\payload"]
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX treats backslashes as filename characters")
+    def test_posix_backslash_scope_file_remains_exact_in_audit_policy(self, tmp_project: Path) -> None:
+        scoped_file = tmp_project / r"scope\name"
+        scoped_file.write_text("allowed exact file\n", encoding="utf-8")
+        escaped = tmp_project / "scope" / "name" / "escaped.py"
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=[r"scope\name"])
+
+        def write_descendant_of_rewritten_path(_state: TaskState) -> None:
+            escaped.parent.mkdir(parents=True)
+            escaped.write_text("must remain outside exact scope\n", encoding="utf-8")
+
+        stubs["implementer"].side_effect = write_descendant_of_rewritten_path
+        state = _scoped_delivery_state(orch, [r"scope\name"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        assert state.validation_cycle_records[-1]["metadata"]["effective_paths"] == [r"scope\name"]
+        assert state.validation_cycle_records[-1]["metadata"]["violation_paths"] == ["scope/name/escaped.py"]
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX treats backslashes as filename characters")
+    def test_ignored_posix_backslash_filename_is_not_pruned_as_node_output(self, tmp_project: Path) -> None:
+        (tmp_project / "src" / "allowed").mkdir(parents=True)
+        (tmp_project / ".gitignore").write_text("outside*\n", encoding="utf-8")
+        escaped = tmp_project / r"outside\node_modules\payload"
+        orch, stubs, build = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        node_tool = object.__new__(NodeTool)
+        build.is_ephemeral_build_path = node_tool.is_ephemeral_build_path  # type: ignore[method-assign]
+
+        def write_backslash_name(_state: TaskState) -> None:
+            escaped.write_text("ignored outside scope\n", encoding="utf-8")
+
+        stubs["implementer"].side_effect = write_backslash_name
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        assert state.validation_cycle_records[-1]["metadata"]["violation_paths"] == [r"outside\node_modules\payload"]
+
+    def test_project_root_symlink_is_allowed_by_repository_wide_scope(self, tmp_project: Path):
+        try:
+            (tmp_project / "root-link").symlink_to(".", target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation is unavailable: {exc}")
+        orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["."])
+        state = _scoped_delivery_state(orch, ["."])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is True
+        assert state.validation_cycle_records[-1]["metadata"]["violation_count"] == 0
+
+    def test_scope_audit_snapshot_failure_blocks_provider_execution(
+        self,
+        tmp_project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        monkeypatch.setattr(
+            delivery_scope_audit_module,
+            "snapshot_delivery_scope_files",
+            lambda *args, **kwargs: (_ for _ in ()).throw(DeliveryScopeSnapshotError("unavailable")),
+        )
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert result.message == "delivery_scope_audit_unavailable"
+        assert stubs["implementer"].calls == []
+        assert state.delivery_stop_code == "unit_scope_violation"
+
+    def test_scope_audit_post_snapshot_failure_stops_after_provider(
+        self,
+        tmp_project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        original_snapshot = delivery_scope_audit_module.snapshot_delivery_scope_files
+        calls = 0
+
+        def fail_second_snapshot(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise DeliveryScopeSnapshotError("unavailable")
+            return original_snapshot(*args, **kwargs)
+
+        monkeypatch.setattr(delivery_scope_audit_module, "snapshot_delivery_scope_files", fail_second_snapshot)
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert len(stubs["implementer"].calls) == 1
+        assert state.delivery_stop_code == "unit_scope_violation"
+
+    @pytest.mark.parametrize("persisted", [None, {"broken": "not-json"}])
+    def test_interrupted_scope_audit_fails_closed_without_valid_baseline(
+        self,
+        tmp_project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        persisted: dict[str, str] | None,
+    ):
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        state.delivery_scope_audit_pending = {"schema_version": 1, "agent": "implementer"}
+        if persisted is not None:
+            orch._store.save_text_snapshot(state.task_id, "delivery_scope_audit_before", persisted)
+        state.start_active_operation("agent", agent="implementer", message="interrupted")
+        orch._store.save(state)
+        pipeline_calls: list[TaskState] = []
+        monkeypatch.setattr(orch, "_loop", pipeline_calls.append)
+
+        result = orch.run(task_id=state.task_id)
+
+        assert result.failed is True
+        assert result.delivery_stop_code == "unit_scope_violation"
+        assert pipeline_calls == []
+        assert not any(stub.calls for stub in stubs.values())
+        assert result.validation_cycle_records[-1]["metadata"]["code"] == "delivery_scope_audit_unavailable"
+        assert result.delivery_scope_audit_pending is None
+
+    def test_resume_fails_closed_on_orphaned_scope_baseline(self, tmp_project: Path, monkeypatch):
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        orch._delivery_scope_audit_snapshot(state, "implementer")
+        pipeline_calls: list[TaskState] = []
+        monkeypatch.setattr(orch, "_loop", pipeline_calls.append)
+
+        result = orch.run(task_id=state.task_id)
+
+        assert result.failed is True
+        assert result.delivery_stop_code == "unit_scope_violation"
+        assert pipeline_calls == []
+        assert not any(stub.calls for stub in stubs.values())
+        assert result.validation_cycle_records[-1]["metadata"] == {
+            "code": "delivery_scope_audit_unavailable",
+            "agent": "unknown",
+        }
+
+    @pytest.mark.parametrize(
+        "pending",
+        [
+            {"schema_version": True, "agent": "implementer"},
+            {
+                "schema_version": 4,
+                "agent": "implementer",
+                "project_prefix": ".",
+                "production_roots": [{"path": "src/allowed", "resolved_path": "src/allowed", "exact_file": False}],
+                "active_test_write_paths": [],
+            },
+        ],
+    )
+    def test_resume_fails_closed_on_malformed_scope_pending(
+        self,
+        tmp_project: Path,
+        monkeypatch,
+        pending: dict,
+    ):
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        orch._delivery_scope_audit_snapshot(state, "implementer")
+        state.delivery_scope_audit_pending = pending
+        orch._store.save(state)
+        pipeline_calls: list[TaskState] = []
+        monkeypatch.setattr(orch, "_loop", pipeline_calls.append)
+
+        result = orch.run(task_id=state.task_id)
+
+        assert result.failed is True
+        assert result.delivery_stop_code == "unit_scope_violation"
+        assert pipeline_calls == []
+        assert not any(stub.calls for stub in stubs.values())
+        assert result.delivery_scope_audit_pending is None
+
+    @pytest.mark.parametrize(
+        "pending",
+        [
+            {
+                "schema_version": 8,
+                "agent": "implementer",
+                "project_prefix": ".",
+                "production_roots": [{"path": "src/allowed", "exact_file": False}],
+                "active_test_write_paths": [],
+            },
+            {
+                "schema_version": 8,
+                "agent": "implementer",
+                "project_prefix": ".",
+                "production_roots": [{"path": "src/allowed", "resolved_path": "../outside", "exact_file": False}],
+                "active_test_write_paths": [],
+            },
+            {
+                "schema_version": 8,
+                "agent": "implementer",
+                "project_prefix": ".",
+                "production_roots": [{"path": ".", "resolved_path": ".", "exact_file": True}],
+                "active_test_write_paths": [],
+            },
+            {
+                "schema_version": 8,
+                "agent": "implementer",
+                "project_prefix": ".",
+                "production_roots": [{"path": "src/allowed", "resolved_path": "src/allowed", "exact_file": False}],
+                "active_test_write_paths": ["tests"],
+            },
+        ],
+    )
+    def test_resume_fails_closed_on_malformed_resolved_scope_policy(
+        self,
+        tmp_project: Path,
+        pending: dict,
+    ) -> None:
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        orch._delivery_scope_audit_snapshot(state, "implementer")
+        pending.update(_git_scope_binding_fields(tmp_project))
+        pending["snapshot_name"] = "delivery_scope_audit_before"
+        state.delivery_scope_audit_pending = pending
+        orch._store.save(state)
+
+        result = orch.recover_interrupted_delivery_scope(state.task_id)
+
+        assert result.failed is True
+        assert result.delivery_stop_code == "unit_scope_violation"
+        assert result.validation_cycle_records[-1]["metadata"]["code"] == "delivery_scope_audit_unavailable"
+
+    @pytest.mark.parametrize("git_baseline", [None, True, "a" * 39, "g" * 40, "a" * 40])
+    def test_resume_fails_closed_on_invalid_git_baseline(
+        self,
+        tmp_project: Path,
+        git_baseline: object,
+    ) -> None:
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        orch._delivery_scope_audit_snapshot(state, "implementer")
+        state.delivery_scope_audit_pending = {
+            "schema_version": 8,
+            "agent": "implementer",
+            "project_prefix": ".",
+            **_git_scope_binding_fields(tmp_project),
+            "git_baseline": git_baseline,
+            "snapshot_name": "delivery_scope_audit_before",
+            "production_roots": [{"path": "src/allowed", "resolved_path": "src/allowed", "exact_file": False}],
+            "active_test_write_paths": [],
+        }
+        orch._store.save(state)
+
+        result = orch.recover_interrupted_delivery_scope(state.task_id)
+
+        assert result.failed is True
+        assert result.delivery_stop_code == "unit_scope_violation"
+        assert result.validation_cycle_records[-1]["metadata"]["code"] == "delivery_scope_audit_unavailable"
+
+    @pytest.mark.parametrize("git_dir", [None, True, "", "relative/path", "/missing/sikula-git-dir"])
+    def test_resume_fails_closed_on_invalid_git_directory_binding(
+        self,
+        tmp_project: Path,
+        git_dir: object,
+    ) -> None:
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        orch._delivery_scope_audit_snapshot(state, "implementer")
+        state.delivery_scope_audit_pending = {
+            "schema_version": 8,
+            "agent": "implementer",
+            "project_prefix": ".",
+            **_git_scope_binding_fields(tmp_project),
+            "git_baseline": _git_head(tmp_project),
+            "git_dir": git_dir,
+            "snapshot_name": "delivery_scope_audit_before",
+            "production_roots": [{"path": "src/allowed", "resolved_path": "src/allowed", "exact_file": False}],
+            "active_test_write_paths": [],
+        }
+        orch._store.save(state)
+
+        result = orch.recover_interrupted_delivery_scope(state.task_id)
+
+        assert result.failed is True
+        assert result.delivery_stop_code == "unit_scope_violation"
+        assert result.validation_cycle_records[-1]["metadata"]["code"] == "delivery_scope_audit_unavailable"
+
+    @pytest.mark.parametrize("git_common_dir", [None, True, "", "relative/path", "/missing/sikula-common-dir"])
+    def test_resume_fails_closed_on_invalid_common_git_directory_binding(
+        self,
+        tmp_project: Path,
+        git_common_dir: object,
+    ) -> None:
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        orch._delivery_scope_audit_snapshot(state, "implementer")
+        state.delivery_scope_audit_pending = {
+            "schema_version": 8,
+            "agent": "implementer",
+            "project_prefix": ".",
+            **_git_scope_binding_fields(tmp_project),
+            "git_common_dir": git_common_dir,
+            "snapshot_name": "delivery_scope_audit_before",
+            "production_roots": [{"path": "src/allowed", "resolved_path": "src/allowed", "exact_file": False}],
+            "active_test_write_paths": [],
+        }
+        orch._store.save(state)
+
+        result = orch.recover_interrupted_delivery_scope(state.task_id)
+
+        assert result.failed is True
+        assert result.delivery_stop_code == "unit_scope_violation"
+        assert result.validation_cycle_records[-1]["metadata"]["code"] == "delivery_scope_audit_unavailable"
+
+    @pytest.mark.parametrize("fingerprint", [None, True, "a" * 63, "g" * 64])
+    def test_resume_fails_closed_on_invalid_git_ignore_binding(
+        self,
+        tmp_project: Path,
+        fingerprint: object,
+    ) -> None:
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        orch._delivery_scope_audit_snapshot(state, "implementer")
+        state.delivery_scope_audit_pending = {
+            "schema_version": 8,
+            "agent": "implementer",
+            "project_prefix": ".",
+            **_git_scope_binding_fields(tmp_project),
+            "git_ignore_fingerprint": fingerprint,
+            "snapshot_name": "delivery_scope_audit_before",
+            "production_roots": [{"path": "src/allowed", "resolved_path": "src/allowed", "exact_file": False}],
+            "active_test_write_paths": [],
+        }
+        orch._store.save(state)
+
+        result = orch.recover_interrupted_delivery_scope(state.task_id)
+
+        assert result.failed is True
+        assert result.delivery_stop_code == "unit_scope_violation"
+        assert result.validation_cycle_records[-1]["metadata"]["code"] == "delivery_scope_audit_unavailable"
+
+    @pytest.mark.parametrize("fingerprint", [None, True, "a" * 63, "g" * 64])
+    def test_resume_fails_closed_on_invalid_git_ref_binding(
+        self,
+        tmp_project: Path,
+        fingerprint: object,
+    ) -> None:
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        orch._delivery_scope_audit_snapshot(state, "implementer")
+        state.delivery_scope_audit_pending = {
+            "schema_version": 8,
+            "agent": "implementer",
+            "project_prefix": ".",
+            **_git_scope_binding_fields(tmp_project),
+            "git_ref_fingerprint": fingerprint,
+            "snapshot_name": "delivery_scope_audit_before",
+            "production_roots": [{"path": "src/allowed", "resolved_path": "src/allowed", "exact_file": False}],
+            "active_test_write_paths": [],
+        }
+        orch._store.save(state)
+
+        result = orch.recover_interrupted_delivery_scope(state.task_id)
+
+        assert result.failed is True
+        assert result.delivery_stop_code == "unit_scope_violation"
+        assert result.validation_cycle_records[-1]["metadata"]["code"] == "delivery_scope_audit_unavailable"
+
+    def test_active_operation_does_not_trigger_scope_recovery_without_control_state(
+        self,
+        tmp_project: Path,
+        monkeypatch,
+    ):
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            heartbeat_interval_seconds=60,
+        )
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        state.start_active_operation("agent", agent="implementer", message="visibility only")
+        orch._store.save(state)
+        pipeline_calls: list[TaskState] = []
+        monkeypatch.setattr(orch, "_loop", pipeline_calls.append)
+
+        result = orch.run(task_id=state.task_id)
+
+        assert pipeline_calls == [result]
+        assert result.active_operation is None
+        assert result.delivery_scope_audit_pending is None
+        assert not any(record.get("phase") == "delivery_scope_audit" for record in result.validation_cycle_records)
+
+    @pytest.mark.parametrize("agent_name", ["implementer", "fixer"])
+    @pytest.mark.parametrize("heartbeat_interval_seconds", [0, 60])
+    def test_keyboard_interrupt_preserves_scope_audit_for_resume(
+        self,
+        tmp_project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        agent_name: str,
+        heartbeat_interval_seconds: int,
+    ):
+        (tmp_project / "src" / "allowed").mkdir()
+        orch, stubs, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+        )
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        outside = tmp_project / "docs" / "interrupted.md"
+
+        def write_then_interrupt(_state: TaskState) -> None:
+            outside.parent.mkdir()
+            outside.write_text("partial out-of-scope write\n", encoding="utf-8")
+            raise KeyboardInterrupt
+
+        stubs[agent_name].side_effect = write_then_interrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            orch._run_agent(agent_name, state)
+
+        interrupted = orch._store.load(state.task_id)
+        assert interrupted is not None
+        assert interrupted.active_operation is None
+        assert interrupted.delivery_scope_audit_pending == {
+            "schema_version": 8,
+            "agent": agent_name,
+            "project_prefix": ".",
+            **_git_scope_binding_fields(tmp_project),
+            "snapshot_name": "delivery_scope_audit_before",
+            "production_roots": [{"path": "src/allowed", "resolved_path": "src/allowed", "exact_file": False}],
+            "active_test_write_paths": [],
+        }
+        assert orch._store.load_text_snapshot(state.task_id, "delivery_scope_audit_before") is not None
+        pipeline_calls: list[TaskState] = []
+        monkeypatch.setattr(orch, "_loop", pipeline_calls.append)
+
+        result = orch.run(task_id=state.task_id)
+
+        assert result.failed is True
+        assert result.delivery_stop_code == "unit_scope_violation"
+        assert result.delivery_scope_audit_pending is None
+        assert orch._store.load_text_snapshot(state.task_id, "delivery_scope_audit_before") is None
+        assert pipeline_calls == []
+        assert len(stubs[agent_name].calls) == 1
+        audit = result.validation_cycle_records[-1]
+        assert audit["metadata"]["resume_recovery"] is True
+        assert audit["metadata"]["violation_paths"] == ["docs/interrupted.md"]
+
+    def test_interrupted_scope_audit_uses_immutable_production_roots_after_config_broadens(
+        self,
+        tmp_project: Path,
+    ):
+        allowed = tmp_project / "src" / "a"
+        allowed.mkdir(parents=True)
+        original_orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/a"])
+        state = _scoped_delivery_state(original_orch, ["src/a"])
+        state.delivery_runtime_write_scope_binding = {
+            "schema_version": 1,
+            "status": "bound",
+            "roots": [{"path": "src/a", "resolved_path": "src/a", "exact_file": False}],
+        }
+        policy = original_orch._delivery_scope_audit_policy(state, "implementer")
+        original_orch._set_delivery_scope_audit_pending(state, "implementer", policy=policy)
+        original_orch._delivery_scope_audit_snapshot(state, "implementer", policy=policy)
+        escaped = tmp_project / "src" / "b" / "partial.py"
+        escaped.parent.mkdir()
+        escaped.write_text("partial write\n", encoding="utf-8")
+
+        resumed_orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["."])
+        result = resumed_orch.recover_interrupted_delivery_scope(state.task_id)
+
+        assert result.failed is True
+        assert result.delivery_stop_code == "unit_scope_violation"
+        audit = result.validation_cycle_records[-1]
+        assert audit["metadata"]["resume_recovery"] is True
+        assert audit["metadata"]["violation_paths"] == ["src/b/partial.py"]
+        assert audit["metadata"]["effective_paths"] == ["src/a"]
+
+    def test_interrupted_scope_audit_rejects_provider_git_ref_change(self, tmp_project: Path):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        escaped = tmp_project / "docs" / "committed.md"
+        orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        policy = orch._delivery_scope_audit_policy(state, "implementer")
+        orch._set_delivery_scope_audit_pending(state, "implementer", policy=policy)
+        orch._delivery_scope_audit_snapshot(state, "implementer", policy=policy)
+        escaped.parent.mkdir()
+        escaped.write_text("committed outside scope\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/committed.md"], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "interrupted provider commit"],
+            cwd=tmp_project,
+            check=True,
+            capture_output=True,
+        )
+        (allowed / "dirty.py").write_text("dirty in scope\n", encoding="utf-8")
+
+        result = orch.recover_interrupted_delivery_scope(state.task_id)
+
+        assert result.failed is True
+        assert result.delivery_stop_code == "unit_scope_violation"
+        audit = result.validation_cycle_records[-1]
+        assert audit["metadata"] == {
+            "code": "delivery_scope_audit_unavailable",
+            "agent": "implementer",
+        }
+
+    def test_interrupted_scope_audit_preserves_resolved_symlink_root_authority(self, tmp_project: Path):
+        target = tmp_project / "core"
+        target.mkdir()
+        alias = tmp_project / "core-alias"
+        try:
+            alias.symlink_to("core", target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation is unavailable: {exc}")
+        orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["core-alias"])
+        state = _scoped_delivery_state(orch, ["core-alias"])
+        policy = orch._delivery_scope_audit_policy(state, "implementer")
+        orch._set_delivery_scope_audit_pending(state, "implementer", policy=policy)
+        assert state.delivery_scope_audit_pending == {
+            "schema_version": 8,
+            "agent": "implementer",
+            "project_prefix": ".",
+            **_git_scope_binding_fields(tmp_project),
+            "snapshot_name": "delivery_scope_audit_before",
+            "production_roots": [{"path": "core-alias", "resolved_path": "core", "exact_file": False}],
+            "active_test_write_paths": [],
+        }
+        orch._delivery_scope_audit_snapshot(state, "implementer", policy=policy)
+        (alias / "partial.py").write_text("in scope\n", encoding="utf-8")
+
+        result = orch.recover_interrupted_delivery_scope(state.task_id)
+
+        assert result.failed is False
+        audit = result.validation_cycle_records[-1]
+        assert audit["metadata"]["resume_recovery"] is True
+        assert audit["metadata"]["changed_paths"] == ["core/partial.py"]
+        assert audit["metadata"]["violation_count"] == 0
+
+    def test_exact_file_scope_does_not_authorize_replacement_directory_descendants(
+        self,
+        tmp_project: Path,
+    ):
+        project_config = {
+            "project": {"build_tool": "python"},
+            "sandbox": {"allowed_write_paths": ["src/main.py"]},
+        }
+        orch, stubs, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/main.py"],
+            project_config=project_config,
+        )
+
+        def replace_file_with_directory(_state: TaskState) -> None:
+            main = tmp_project / "src" / "main.py"
+            main.unlink()
+            main.mkdir()
+            (main / "escaped.py").write_text("outside exact file scope\n", encoding="utf-8")
+
+        stubs["implementer"].side_effect = replace_file_with_directory
+        stubs["implementer"].result_data = {"files_written": ["src/main.py"]}
+        state = _scoped_delivery_state(orch, ["src/main.py"])
+
+        result = orch._run_agent("implementer", state)
+
+        assert result.success is False
+        assert state.failed is True
+        audit = state.validation_cycle_records[-1]["metadata"]
+        assert audit["violation_paths"] == ["src/main.py/escaped.py"]
+        assert (tmp_project / "src" / "main.py" / "escaped.py").exists()
+
+    def test_fixer_test_path_remains_governed_by_test_policy(self, tmp_project: Path):
+        (tmp_project / "src" / "allowed").mkdir()
+        project_config = {
+            "project": {"build_tool": "python"},
+            "sandbox": {
+                "allowed_write_paths": ["src/allowed"],
+                "allowed_test_write_paths": ["tests"],
+            },
+        }
+        orch, stubs, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            project_config=project_config,
+        )
+
+        def write_test(_state: TaskState) -> None:
+            test_file = tmp_project / "tests" / "test_allowed.py"
+            test_file.parent.mkdir()
+            test_file.write_text("def test_allowed(): pass\n", encoding="utf-8")
+
+        stubs["fixer"].side_effect = write_test
+        stubs["fixer"].result_data = {"files_written": ["tests/test_allowed.py"]}
+        stubs["fixer"].active_test_write_paths = ["tests"]
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("fixer", state)
+
+        assert result.success is True
+        assert state.failed is False
+        audit = state.validation_cycle_records[-1]
+        assert audit["status"] == "passed"
+        assert audit["metadata"]["changed_count"] == 1
+        assert audit["metadata"]["production_changed_count"] == 0
+
+    def test_fixer_test_only_edit_to_clean_mixed_cargo_source_uses_retained_baseline(
+        self,
+        tmp_project: Path,
+    ) -> None:
+        lib = tmp_project / "src" / "lib.rs"
+        before = """pub fn value() -> i32 { 1 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn value_is_one() {
+        assert_eq!(super::value(), 1);
+    }
+}
+"""
+        after = before.replace("assert_eq!(super::value(), 1);", 'assert_eq!(super::value(), 1, "value");')
+        lib.write_text(before, encoding="utf-8")
+        subprocess.run(["git", "add", "src/lib.rs"], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "track mixed source"], cwd=tmp_project, check=True, capture_output=True)
+        project_config = {
+            "project": {"build_tool": "cargo"},
+            "sandbox": {
+                "allowed_write_paths": ["src/allowed"],
+                "allowed_test_write_paths": ["src"],
+            },
+        }
+        orch, stubs, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            project_config=project_config,
+        )
+        orch._tools["build"] = CargoTool(
+            Sandbox(tmp_project, allowed_write_paths=["src"], allowed_read_paths=["."]),
+            tmp_project,
+        )
+        stubs["fixer"].active_test_write_paths = ["src"]
+        stubs["fixer"].side_effect = lambda _state: lib.write_text(after, encoding="utf-8")
+        stubs["fixer"].result_data = {"files_written": ["src/lib.rs"]}
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch._run_agent("fixer", state)
+
+        assert result.success is True
+        assert state.failed is False
+        audit = state.validation_cycle_records[-1]
+        assert audit["status"] == "passed"
+        assert audit["metadata"]["changed_paths"] == ["src/lib.rs"]
+        assert audit["metadata"]["production_changed_count"] == 0
+
+    def test_fixer_without_active_test_authority_cannot_write_test_paths(self, tmp_project: Path):
+        (tmp_project / "src" / "allowed").mkdir()
+        project_config = {
+            "project": {"build_tool": "python"},
+            "sandbox": {
+                "allowed_write_paths": ["src/allowed"],
+                "allowed_test_write_paths": ["tests"],
+            },
+        }
+        orch, stubs, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            project_config=project_config,
+        )
+
+        def write_test(_state: TaskState) -> None:
+            test_file = tmp_project / "tests" / "test_escaped.py"
+            test_file.parent.mkdir()
+            test_file.write_text("def test_escaped(): pass\n", encoding="utf-8")
+
+        stubs["fixer"].side_effect = write_test
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        state.errors = ["compile failed"]
+
+        result = orch._run_agent("fixer", state)
+
+        assert result.success is False
+        assert state.delivery_stop_code == "unit_scope_violation"
+        assert state.validation_cycle_records[-1]["metadata"]["violation_paths"] == ["tests/test_escaped.py"]
+
+    def test_test_only_fixer_provider_call_cannot_write_unit_production_scope(self, tmp_project: Path):
+        (tmp_project / "src" / "allowed").mkdir()
+        project_config = {
+            "project": {"build_tool": "python"},
+            "sandbox": {
+                "allowed_write_paths": ["src/allowed"],
+                "allowed_test_write_paths": ["tests"],
+            },
+        }
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            project_config=project_config,
+        )
+
+        def hidden_production_write() -> tuple[list[str], str]:
+            (tmp_project / "src" / "allowed" / "hidden.py").write_text("unauthorized\n", encoding="utf-8")
+            test_file = tmp_project / "tests" / "test_allowed.py"
+            test_file.parent.mkdir()
+            test_file.write_text("def test_allowed(): pass\n", encoding="utf-8")
+            return ["tests/test_allowed.py"], (
+                "TEST FAILURE TRIAGE:\nclassification: stale_test\ncontract_affected: none\nchosen_fix: test_code\n"
+            )
+
+        client = ObservedWriteClient(tmp_project, [hidden_production_write])
+        fixer = FixerAgent(client, orch._tools, project_config)
+        orch._agents["fixer"] = fixer
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        state.test_errors = ["tests/test_allowed.py: assertion failed"]
+
+        result = orch._run_agent("fixer", state)
+
+        assert result.success is False
+        assert result.message == "unit_scope_violation"
+        assert state.delivery_stop_code == "unit_scope_violation"
+        audit = state.validation_cycle_records[-1]
+        assert audit["metadata"]["audit_boundary"] == "provider_attempt"
+        assert audit["metadata"]["violation_paths"] == ["src/allowed/hidden.py"]
+        assert audit["metadata"]["effective_paths"] == []
+
+    def test_interrupted_test_only_fixer_audit_persists_exact_provider_authority(
+        self,
+        tmp_project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (tmp_project / "src" / "allowed").mkdir()
+        project_config = {
+            "project": {"build_tool": "python"},
+            "sandbox": {
+                "allowed_write_paths": ["src/allowed"],
+                "allowed_test_write_paths": ["tests"],
+            },
+        }
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            project_config=project_config,
+        )
+        orch._config_snapshot = {"run_build": True}
+
+        def write_test() -> tuple[list[str], str]:
+            (tmp_project / "src" / "allowed" / "hidden.py").write_text("unauthorized\n", encoding="utf-8")
+            test_file = tmp_project / "tests" / "test_partial.py"
+            test_file.parent.mkdir()
+            test_file.write_text("def test_partial(): pass\n", encoding="utf-8")
+            return ["tests/test_partial.py"], "partial"
+
+        client = ObservedWriteClient(tmp_project, [write_test])
+        fixer = FixerAgent(client, orch._tools, project_config)
+        orch._agents["fixer"] = fixer
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        state.test_errors = ["tests/test_partial.py: assertion failed"]
+        original_capture = orch._delivery_scope_audit._capture_delivery_scope_snapshot
+        captures = 0
+
+        def interrupt_provider_post_snapshot(*args, **kwargs):
+            nonlocal captures
+            captures += 1
+            if captures == 3:
+                raise KeyboardInterrupt
+            return original_capture(*args, **kwargs)
+
+        monkeypatch.setattr(
+            orch._delivery_scope_audit,
+            "_capture_delivery_scope_snapshot",
+            interrupt_provider_post_snapshot,
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            orch._run_agent("fixer", state)
+
+        interrupted = orch._store.load(state.task_id)
+        assert interrupted is not None
+        pending = interrupted.delivery_scope_audit_pending
+        assert isinstance(pending, dict)
+        assert pending["schema_version"] == 8
+        assert pending["snapshot_name"] == "delivery_scope_attempt_before"
+        assert pending["production_roots"] == []
+        assert pending["active_test_write_paths"] == [{"path": "tests", "resolved_path": "tests"}]
+        assert orch._store.load_text_snapshot(state.task_id, "delivery_scope_attempt_before") is not None
+
+        recovered = orch.recover_interrupted_delivery_scope(state.task_id)
+
+        assert recovered.failed is True
+        assert recovered.delivery_stop_code == "unit_scope_violation"
+        assert [record["config_snapshot"] for record in recovered.run_invocation_records] == [{"run_build": True}]
+        assert recovered.validation_cycle_records[-1]["metadata"]["violation_paths"] == ["src/allowed/hidden.py"]
+        assert orch._store.load_text_snapshot(state.task_id, "delivery_scope_attempt_before") is None
+
+    def test_scope_violation_preempts_no_change_adoption_and_later_phases(self, tmp_project: Path):
+        (tmp_project / "src" / "allowed").mkdir()
+        project_config = {
+            "project": {"build_tool": "python"},
+            "sandbox": {"allowed_write_paths": ["src/allowed"]},
+        }
+        orch, stubs, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            project_config=project_config,
+            run_build=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+
+        def hidden_write(_state: TaskState) -> None:
+            (tmp_project / "outside.py").write_text("provider omitted this path\n", encoding="utf-8")
+
+        stubs["implementer"].side_effect = hidden_write
+        stubs["implementer"].result_data = {"files_written": []}
+        _scoped_delivery_state(orch, ["src/allowed"])
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed is True
+        assert len(stubs["implementer"].calls) == 1
+        assert not stubs["reviewer"].calls
+        assert not stubs["security_reviewer"].calls
+        assert (tmp_project / "outside.py").exists()
+        assert not any(entry["action"] == "adopt_worktree_changes" for entry in result.history)
+        assert not any("produced no file changes" in entry["result"] for entry in result.history)
+
+    def test_resume_audits_interrupted_implementer_before_pipeline_continues(
+        self,
+        tmp_project: Path,
+        monkeypatch,
+    ):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        orch, stubs, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            heartbeat_interval_seconds=60,
+        )
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        orch._set_delivery_scope_audit_pending(state, "implementer")
+        orch._delivery_scope_audit_snapshot(state, "implementer")
+        state.start_active_operation("agent", agent="implementer", message="interrupted")
+        orch._store.save(state)
+        (allowed / "kept.py").write_text("in scope\n", encoding="utf-8")
+        outside = tmp_project / "docs" / "escaped.md"
+        outside.parent.mkdir()
+        outside.write_text("outside scope\n", encoding="utf-8")
+        pipeline_calls: list[TaskState] = []
+        monkeypatch.setattr(orch, "_loop", pipeline_calls.append)
+
+        result = orch.run(task_id=state.task_id)
+
+        assert result.failed is True
+        assert result.delivery_stop_code == "unit_scope_violation"
+        assert result.active_operation is None
+        assert pipeline_calls == []
+        assert not any(stub.calls for stub in stubs.values())
+        assert (allowed / "kept.py").exists()
+        assert outside.exists()
+        audit = result.validation_cycle_records[-1]
+        assert audit["status"] == "failed"
+        assert audit["metadata"]["code"] == "unit_scope_violation"
+        assert audit["metadata"]["resume_recovery"] is True
+        assert audit["metadata"]["violation_paths"] == ["docs/escaped.md"]
+
+    def test_resume_allows_interrupted_implementer_with_only_in_scope_changes(
+        self,
+        tmp_project: Path,
+        monkeypatch,
+    ):
+        allowed = tmp_project / "src" / "allowed"
+        allowed.mkdir()
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            heartbeat_interval_seconds=60,
+        )
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        orch._set_delivery_scope_audit_pending(state, "implementer")
+        orch._delivery_scope_audit_snapshot(state, "implementer")
+        state.start_active_operation("agent", agent="implementer", message="interrupted")
+        orch._store.save(state)
+        (allowed / "kept.py").write_text("in scope\n", encoding="utf-8")
+        pipeline_calls: list[TaskState] = []
+        monkeypatch.setattr(orch, "_loop", pipeline_calls.append)
+
+        result = orch.run(task_id=state.task_id)
+
+        assert result.failed is False
+        assert result.active_operation is None
+        assert pipeline_calls == [result]
+        audit = result.validation_cycle_records[-1]
+        assert audit["status"] == "passed"
+        assert audit["metadata"]["resume_recovery"] is True
+        assert audit["metadata"]["production_changed_count"] == 1
+
+    def test_resume_keeps_interrupted_fixer_test_path_under_test_policy(
+        self,
+        tmp_project: Path,
+        monkeypatch,
+    ):
+        (tmp_project / "src" / "allowed").mkdir()
+        project_config = {
+            "project": {"build_tool": "python"},
+            "sandbox": {
+                "allowed_write_paths": ["src/allowed"],
+                "allowed_test_write_paths": ["tests"],
+            },
+        }
+        orch, stubs, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            heartbeat_interval_seconds=60,
+            project_config=project_config,
+        )
+        stubs["fixer"].active_test_write_paths = ["tests"]
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        orch._set_delivery_scope_audit_pending(state, "fixer")
+        assert state.delivery_scope_audit_pending == {
+            "schema_version": 8,
+            "agent": "fixer",
+            "project_prefix": ".",
+            **_git_scope_binding_fields(tmp_project),
+            "snapshot_name": "delivery_scope_audit_before",
+            "production_roots": [{"path": "src/allowed", "resolved_path": "src/allowed", "exact_file": False}],
+            "active_test_write_paths": [{"path": "tests", "resolved_path": "tests"}],
+        }
+        orch._delivery_scope_audit_snapshot(state, "fixer")
+        state.start_active_operation("agent", agent="fixer", message="interrupted")
+        orch._store.save(state)
+        test_file = tmp_project / "tests" / "test_allowed.py"
+        test_file.parent.mkdir()
+        test_file.write_text("def test_allowed(): pass\n", encoding="utf-8")
+        pipeline_calls: list[TaskState] = []
+        monkeypatch.setattr(orch, "_loop", pipeline_calls.append)
+
+        result = orch.run(task_id=state.task_id)
+
+        assert result.failed is False
+        assert pipeline_calls == [result]
+        audit = result.validation_cycle_records[-1]
+        assert audit["status"] == "passed"
+        assert audit["metadata"]["resume_recovery"] is True
+        assert audit["metadata"]["changed_count"] == 1
+        assert audit["metadata"]["production_changed_count"] == 0
+
+    def test_resume_rejects_interrupted_production_fixer_test_write(
+        self,
+        tmp_project: Path,
+        monkeypatch,
+    ):
+        (tmp_project / "src" / "allowed").mkdir()
+        project_config = {
+            "project": {"build_tool": "python"},
+            "sandbox": {
+                "allowed_write_paths": ["src/allowed"],
+                "allowed_test_write_paths": ["tests"],
+            },
+        }
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src/allowed"],
+            heartbeat_interval_seconds=60,
+            project_config=project_config,
+        )
+        state = _scoped_delivery_state(orch, ["src/allowed"])
+        state.errors = ["compile failed"]
+        orch._set_delivery_scope_audit_pending(state, "fixer")
+        assert state.delivery_scope_audit_pending == {
+            "schema_version": 8,
+            "agent": "fixer",
+            "project_prefix": ".",
+            **_git_scope_binding_fields(tmp_project),
+            "snapshot_name": "delivery_scope_audit_before",
+            "production_roots": [{"path": "src/allowed", "resolved_path": "src/allowed", "exact_file": False}],
+            "active_test_write_paths": [],
+        }
+        orch._delivery_scope_audit_snapshot(state, "fixer")
+        test_file = tmp_project / "tests" / "test_escaped.py"
+        test_file.parent.mkdir()
+        test_file.write_text("def test_escaped(): pass\n", encoding="utf-8")
+        pipeline_calls: list[TaskState] = []
+        monkeypatch.setattr(orch, "_loop", pipeline_calls.append)
+
+        result = orch.run(task_id=state.task_id)
+
+        assert result.failed is True
+        assert pipeline_calls == []
+        assert result.delivery_stop_code == "unit_scope_violation"
+        audit = result.validation_cycle_records[-1]
+        assert audit["metadata"]["resume_recovery"] is True
+        assert audit["metadata"]["violation_paths"] == ["tests/test_escaped.py"]
+
+
+class TestDeliveryTerminalStops:
+    @staticmethod
+    def _ready_child(orch: Orchestrator, **kwargs) -> TaskState:
+        return _save_state(
+            orch,
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            **kwargs,
+        )
+
+    def test_analyst_dependency_stop_prevents_all_later_phases(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            run_build=True,
+        )
+        stubs["analyst"].side_effect = lambda state: state.set_delivery_stop_disposition(
+            "analyst",
+            _delivery_disposition(DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP),
+        )
+        self._ready_child(orch)
+
+        result = orch.run(task_id="t1")
+
+        assert result.delivery_stop_code == "external_dependency_gap"
+        assert result.failed is True
+        assert result.done is False
+        assert len(stubs["analyst"].calls) == 1
+        assert not any(stub.calls for name, stub in stubs.items() if name != "analyst")
+        assert build.sync_calls == build.compile_calls == build.test_calls == 0
+        assert result.result_commit is None
+        assert result.delivery_dependency_handoffs == []
+
+    def test_implementer_dependency_stop_prevents_review_and_validation(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            run_build=True,
+        )
+        stubs["implementer"].side_effect = lambda state: state.set_delivery_stop_disposition(
+            "implementer",
+            _delivery_disposition(DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP),
+        )
+        self._ready_child(orch, implementation_prompt="p", plan_decided=True)
+
+        result = orch.run(task_id="t1")
+
+        assert result.delivery_stop_code == "external_dependency_gap"
+        assert result.failed is True
+        assert len(stubs["implementer"].calls) == 1
+        assert not stubs["reviewer"].calls
+        assert not stubs["security_reviewer"].calls
+        assert not stubs["test_writer"].calls
+        assert build.sync_calls == build.compile_calls == build.test_calls == 0
+        assert result.result_commit is None
+
+    def test_invalid_implementer_disposition_with_partial_writes_is_terminal(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            run_build=True,
+        )
+
+        def malformed_disposition(state: TaskState) -> None:
+            state.files_changed.append("src/partial.py")
+            state.record_delivery_disposition_parse_error(
+                "implementer",
+                "delivery_disposition.keys_invalid",
+            )
+
+        stubs["implementer"].side_effect = malformed_disposition
+        stubs["implementer"].result_success = False
+        self._ready_child(orch, implementation_prompt="p", plan_decided=True)
+
+        result = orch.run(task_id="t1")
+
+        assert result.delivery_stop_code == "implementer_disposition_invalid"
+        assert result.failed is True
+        assert result.done is False
+        assert result.files_changed == ["src/partial.py"]
+        assert len(stubs["implementer"].calls) == 1
+        assert not stubs["reviewer"].calls
+        assert not stubs["security_reviewer"].calls
+        assert not stubs["test_writer"].calls
+        assert build.sync_calls == build.compile_calls == build.test_calls == 0
+        assert result.result_commit is None
+
+        result.failed = False
+        orch._store.save(result)
+        resumed = orch.run(task_id="t1")
+
+        assert resumed.delivery_stop_code == "implementer_disposition_invalid"
+        assert resumed.failed is True
+        assert len(stubs["implementer"].calls) == 1
+        assert not stubs["reviewer"].calls
+
+    def test_reviewer_scope_amendment_stop_does_not_enter_fix_loop(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            run_build=True,
+        )
+        stubs["reviewer"].side_effect = lambda state: state.set_delivery_stop_disposition(
+            "reviewer",
+            _delivery_disposition(DELIVERY_DISPOSITION_REQUIRES_SCOPE_AMENDMENT),
+        )
+        self._ready_child(
+            orch,
+            implementation_prompt="p",
+            plan_decided=True,
+            files_changed=["src/main.py"],
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.delivery_stop_code == "scope_amendment_required"
+        assert result.failed is True
+        assert len(stubs["reviewer"].calls) == 1
+        assert not stubs["implementer"].calls
+        assert not stubs["security_reviewer"].calls
+        assert not stubs["test_writer"].calls
+        assert build.sync_calls == build.compile_calls == build.test_calls == 0
+        assert result.result_commit is None
+
+    def test_security_dependency_stop_prevents_test_and_validation(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            run_build=True,
+        )
+        stubs["security_reviewer"].side_effect = lambda state: state.set_delivery_stop_disposition(
+            "security_reviewer",
+            _delivery_disposition(DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP),
+        )
+        self._ready_child(
+            orch,
+            implementation_prompt="p",
+            plan_decided=True,
+            files_changed=["src/main.py"],
+            review_approved=True,
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.delivery_stop_code == "external_dependency_gap"
+        assert result.failed is True
+        assert len(stubs["security_reviewer"].calls) == 1
+        assert not stubs["implementer"].calls
+        assert not stubs["reviewer"].calls
+        assert not stubs["test_writer"].calls
+        assert build.sync_calls == build.compile_calls == build.test_calls == 0
+        assert result.result_commit is None
+
+    def test_persisted_stop_cannot_be_bypassed_by_reset_or_done_state(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_build=False)
+        before_pipeline_calls: list[TaskState] = []
+        self._ready_child(
+            orch,
+            implementation_prompt="p",
+            plan_decided=True,
+            delivery_stop_code="external_dependency_gap",
+        )
+
+        result = orch.run(task_id="t1", before_pipeline=before_pipeline_calls.append)
+
+        assert result.failed is True
+        assert result.done is False
+        assert result.delivery_stop_code == "external_dependency_gap"
+        assert result.final_summary["result"] == "failed"
+        assert result.final_summary["delivery_stop_code"] == "external_dependency_gap"
+        assert before_pipeline_calls == []
+        assert not any(stub.calls for stub in stubs.values())
+
+    def test_persisted_stop_overrides_inconsistent_done_state(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_build=False)
+        self._ready_child(
+            orch,
+            done=True,
+            delivery_stop_code="scope_amendment_required",
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed is True
+        assert result.done is False
+        assert result.delivery_stop_code == "scope_amendment_required"
+        assert not any(stub.calls for stub in stubs.values())
+
+    def test_malformed_persisted_disposition_fails_before_provider(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_build=False)
+        self._ready_child(
+            orch,
+            delivery_stop_disposition={"disposition": "external_dependency_gap"},
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed is True
+        assert result.done is False
+        assert result.delivery_stop_code is None
+        assert not any(stub.calls for stub in stubs.values())
+        assert any("delivery_stop_state_invalid" in entry["result"] for entry in result.history)
+
+    def test_malformed_persisted_disposition_parse_error_fails_before_provider(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_build=False)
+        self._ready_child(
+            orch,
+            delivery_disposition_parse_error={"error_code": "delivery_disposition.keys_invalid"},
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.failed is True
+        assert result.done is False
+        assert result.delivery_stop_code is None
+        assert not any(stub.calls for stub in stubs.values())
+        assert any("delivery_stop_state_invalid" in entry["result"] for entry in result.history)
+
+
 # ---------------------------------------------------------------------------
 # Tests — loop gates and idempotency
 # ---------------------------------------------------------------------------
@@ -278,6 +3055,19 @@ class TestOrchestratorLoop:
 
         assert state.run_invocation_schema_version == 1
         assert len(state.run_invocation_records) == 1
+
+    def test_run_reuses_invocation_recorded_by_scope_recovery(self, tmp_path: Path, monkeypatch):
+        orch, _, _ = _make_orchestrator(tmp_path)
+        state = orch._store.create("test task")
+        state.record_run_invocation({"run_build": True})
+        orch._store.save(state)
+        monkeypatch.setattr(orch, "_loop", lambda _state: None)
+
+        orch.run(task_id=state.task_id, invocation_already_recorded=True)
+
+        loaded = orch._store.load(state.task_id)
+        assert loaded is not None
+        assert [record["config_snapshot"] for record in loaded.run_invocation_records] == [{"run_build": True}]
 
     def test_before_pipeline_interruption_preserves_invocation_evidence(self, tmp_path: Path, monkeypatch):
         orch, _, _ = _make_orchestrator(tmp_path)
@@ -1137,6 +3927,7 @@ class TestOrchestratorReviewLoop:
         orch.run(task_id="t1")
         assert len(stubs["reviewer"].calls) == 2
         assert len(stubs["implementer"].calls) == 1
+        assert orch._store.load("t1").delivery_stop_code is None
 
     def test_noop_review_fix_does_not_mark_code_or_tests_stale(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(
@@ -1216,6 +4007,72 @@ class TestOrchestratorReviewLoop:
             and entry["result"] == "reviewer failed: usage limit reached"
             for entry in result.history
         )
+
+    @pytest.mark.parametrize(
+        ("agent_name", "approval_field"),
+        [("reviewer", "review_approved"), ("security_reviewer", "security_approved")],
+    )
+    def test_delivery_review_protocol_error_retries_once_without_fix(
+        self,
+        tmp_path: Path,
+        agent_name: str,
+        approval_field: str,
+    ):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_review=True, run_build=False)
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            delivery_plan_id="plan",
+            delivery_unit_id="unit",
+        )
+        review_agent = stubs[agent_name]
+
+        def malformed_then_approved(current: TaskState) -> None:
+            if len(review_agent.calls) == 1:
+                setattr(current, approval_field, False)
+                current.review_issues = ["malformed output"]
+                review_agent.result_success = False
+                review_agent.result_message = "invalid delivery disposition"
+                review_agent.result_data = {"disposition_parse_error": "delivery_disposition.position_invalid"}
+            else:
+                setattr(current, approval_field, True)
+                current.review_issues.clear()
+                review_agent.result_success = True
+                review_agent.result_message = "approved"
+                review_agent.result_data = {}
+
+        review_agent.side_effect = malformed_then_approved
+
+        result = orch._run_delivery_review_agent(agent_name, state)
+
+        assert result.success is True
+        assert len(review_agent.calls) == 2
+        assert len(stubs["implementer"].calls) == 0
+        assert state.review_iterations == 0
+        assert any(entry["action"] == "review_protocol_retry" for entry in state.history)
+
+    @pytest.mark.parametrize("agent_name", ["reviewer", "security_reviewer"])
+    def test_delivery_review_protocol_error_aborts_after_one_retry(self, tmp_path: Path, agent_name: str):
+        orch, stubs, _ = _make_orchestrator(tmp_path, run_review=True, run_build=False)
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            files_changed=["src/main.py"],
+            delivery_plan_id="plan",
+            delivery_unit_id="unit",
+        )
+        review_agent = stubs[agent_name]
+        review_agent.result_success = False
+        review_agent.result_message = "invalid delivery disposition"
+        review_agent.result_data = {"disposition_parse_error": "delivery_disposition.position_invalid"}
+
+        result = orch._run_delivery_review_agent(agent_name, state)
+
+        assert result.success is False
+        assert len(review_agent.calls) == 2
+        assert len(stubs["implementer"].calls) == 0
+        assert sum(entry["action"] == "review_protocol_retry" for entry in state.history) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -5169,6 +8026,7 @@ class TestOrchestratorPlannerAbort:
         assert result.delivery_budget_stop["limit"] == 1
         assert result.delivery_budget_stop["actual"] == 3
         assert result.delivery_budget_stop["phase"] == "planner"
+        assert result.delivery_stop_code is None
         assert len(stubs["planner"].calls) == 1
         assert len(stubs["implementer"].calls) == 0
         assert saved is not None

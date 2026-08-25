@@ -498,6 +498,7 @@ def test_run_delivery_prepare_authoring_records_audit_and_forwards_context(tmp_p
     assert audit_record["task"]["path"] == ".sikula/tasks/team-invites.md"
     assert audit_record["task"]["sha256"].startswith("sha256:")
     assert audit_record["output"]["path"] == ".sikula/delivery/team-invites"
+    assert audit_record["runtime_metadata"]["sikula_version"]
     assert audit_record["record"] == {
         "phase": "delivery_prepare_authoring",
         "parsed": {"status": "parsed", "unit_ids": ["foundation"]},

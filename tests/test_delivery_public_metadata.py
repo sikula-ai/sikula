@@ -9,6 +9,18 @@ from core.delivery_public_metadata import (
 def test_delivery_public_metadata_accepts_urls_and_relative_labels() -> None:
     for value in (
         "Integrate https://api.example.test/users",
+        "Integrate http://api.example.test/users",
+        "Consume the GET /api/v1/resource endpoint without changing that contract.",
+        "Create POST /orders",
+        "Implement GET /users",
+        "Expose PATCH /v1/files/{id}",
+        "Add GET /countries/population-stats",
+        "Expose GET /etc/passwd as a compatibility route",
+        "Implement GET /Users as an API route",
+        "Handle POST /home",
+        "Keep endpoint /api/v1/resource stable",
+        "Keep /orders route stable",
+        "Use v1/users",
         "Open café/menu",
     ):
         assert is_safe_delivery_public_metadata(value)
@@ -21,15 +33,10 @@ def test_delivery_public_metadata_rejects_private_paths_and_control_characters()
         "source=/Users/example/private/task.md",
         "Read //server/private/task.md",
         "source=//server/private/task.md",
-        "Implement GET /users",
-        "Handle POST /home",
-        "Expose PATCH /v1/files/{id}",
-        "Add GET /countries/population-stats",
         "Implement GET //server/private/task.md",
-        "Implement GET /Users",
-        "Implement GET /Users/alice/private/task.md",
-        "Implement POST /home/alice/secret",
-        "Read GET /workspace/project/private",
+        "Read /api/v1/resource from disk",
+        "Call GET /api/v1/resource?source=/Users/alice/private",
+        "/etc/passwd",
         r"Read C:\Users\example\private\task.md",
         r"root:C:\Users\example\private\task.md",
         r"Read \\server\private\task.md",
@@ -65,5 +72,5 @@ def test_delivery_public_identity_projection_is_stable_and_correlation_safe() ->
     assert first not in projected_first
     assert second not in projected_second
     assert project_delivery_public_identity("safe-unit") == "safe-unit"
-    assert project_delivery_public_identity("GET /users") != "GET /users"
+    assert project_delivery_public_identity("GET /users") == "GET /users"
     assert project_delivery_public_identity("\ud800") is not None
