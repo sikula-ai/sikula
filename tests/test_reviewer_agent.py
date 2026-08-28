@@ -1604,6 +1604,33 @@ class TestReviewerAgentPlanContext:
 
 
 class TestReviewerAgentCycleRecord:
+    @pytest.mark.parametrize("provider_error", [False, True])
+    def test_record_has_complete_correlation_fields(
+        self,
+        stub_llm: StubLLMClient,
+        file_tool,
+        provider_error: bool,
+    ):
+        state = _make_state()
+        state.current_step = 2
+        state.build_iterations = 3
+        state.review_iterations = 4
+        state.security_review_iterations = 5
+        if provider_error:
+            stub_llm.readonly_error = RuntimeError("review unavailable")
+        else:
+            stub_llm.readonly_result = "APPROVED"
+
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        record = state.review_cycle_records[0]
+        assert record["step"] == 2
+        assert record["build_iteration"] == 3
+        assert record["review_iteration"] == 4
+        assert record["security_review_iteration"] == 5
+        assert record["scope"] == "task"
+        assert record["files_written"] == []
+
     def test_record_has_no_reviewer_field(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()

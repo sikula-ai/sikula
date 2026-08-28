@@ -99,7 +99,10 @@ def _git_paths_z(
         return None
     if not isinstance(result.stdout, bytes):
         return None
-    return [os.fsdecode(value) for value in result.stdout.split(b"\0") if value]
+    try:
+        return [os.fsdecode(value) for value in result.stdout.split(b"\0") if value]
+    except UnicodeDecodeError as exc:
+        raise DeliveryScopeSnapshotError("Delivery scope audit could not decode a Git path safely.") from exc
 
 
 def _delivery_scope_git_env(
@@ -139,16 +142,6 @@ def _delivery_scope_link_like(entry_stat) -> bool:
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     file_attributes = getattr(entry_stat, "st_file_attributes", 0)
     return stat.S_ISLNK(entry_stat.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
-
-
-def _delivery_scope_entry_identity(entry_stat) -> tuple[int, ...]:
-    return (
-        entry_stat.st_dev,
-        entry_stat.st_ino,
-        stat.S_IFMT(entry_stat.st_mode),
-        getattr(entry_stat, "st_file_attributes", 0),
-        getattr(entry_stat, "st_reparse_tag", 0),
-    )
 
 
 def _dirty_paths(cwd: Path) -> tuple[set[str], set[str]] | None:
@@ -403,7 +396,9 @@ def snapshot_delivery_scope_files(
         validate_entry_link: bool,
     ) -> None:
         if link_like:
-            symlink_target = (
+            # Windows may report different inode identities for the same reparse
+            # point. Bind the observable link target on both sides of the stat.
+            symlink_target_before = (
                 os.readlink(entry.name, dir_fd=directory_fd) if directory_fd is not None else os.readlink(entry.path)
             )
             after = (
@@ -411,14 +406,15 @@ def snapshot_delivery_scope_files(
                 if directory_fd is not None
                 else Path(entry.path).stat(follow_symlinks=False)
             )
-            if not _delivery_scope_link_like(after) or _delivery_scope_entry_identity(
-                after
-            ) != _delivery_scope_entry_identity(entry_stat):
+            symlink_target_after = (
+                os.readlink(entry.name, dir_fd=directory_fd) if directory_fd is not None else os.readlink(entry.path)
+            )
+            if not _delivery_scope_link_like(after) or symlink_target_after != symlink_target_before:
                 raise DeliveryScopeSnapshotError("A project path changed during delivery scope audit.")
             if (
                 validate_entry_link
                 and validate_symlink is not None
-                and not validate_symlink(normalized, symlink_target)
+                and not validate_symlink(normalized, symlink_target_after)
             ):
                 raise DeliveryScopeSnapshotError(
                     "Delivery scope audit found a symlink that escapes the active write scope."
@@ -428,7 +424,7 @@ def snapshot_delivery_scope_files(
                 exists=True,
                 content=None,
                 mode=stat.S_IMODE(entry_stat.st_mode),
-                symlink_target=symlink_target,
+                symlink_target=symlink_target_after,
             )
         elif stat.S_ISREG(entry_stat.st_mode):
             path = entry.name if directory_fd is not None else Path(entry.path)

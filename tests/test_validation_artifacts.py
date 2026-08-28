@@ -121,6 +121,32 @@ def test_delivery_scope_snapshot_rejects_symlink_when_policy_callback_denies_it(
         )
 
 
+def test_delivery_scope_snapshot_rejects_symlink_target_change_during_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "first").mkdir()
+    (tmp_path / "second").mkdir()
+    link = tmp_path / "changing"
+    _make_symlink(link, "first")
+    original_readlink = os.readlink
+    link_reads = 0
+
+    def changing_readlink(path, *args, **kwargs):
+        nonlocal link_reads
+        if Path(path).name == link.name:
+            link_reads += 1
+            return "first" if link_reads == 1 else "second"
+        return original_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(validation_artifacts_module.os, "readlink", changing_readlink)
+
+    with pytest.raises(DeliveryScopeSnapshotError, match="project path changed"):
+        snapshot_delivery_scope_files(tmp_path)
+
+    assert link_reads == 2
+
+
 def test_delivery_scope_snapshot_round_trip_preserves_change_detection(tmp_path: Path) -> None:
     source = tmp_path / "ignored.env"
     source.write_text("before\n", encoding="utf-8")
@@ -270,7 +296,9 @@ def test_delivery_scope_snapshot_rejects_retargeted_worktree_git_pointer(tmp_pat
         git_baseline=binding.baseline,
         git_dir=binding.git_dir,
     )
-    (linked / ".git").write_text(f"gitdir: {tmp_path / '.git'}\n", encoding="utf-8")
+    git_pointer = linked / ".git"
+    git_pointer.chmod(git_pointer.stat().st_mode | stat.S_IWUSR)
+    git_pointer.write_text(f"gitdir: {tmp_path / '.git'}\n", encoding="utf-8")
 
     with pytest.raises(DeliveryScopeSnapshotError, match="binding"):
         snapshot_delivery_scope_files(
@@ -408,8 +436,8 @@ def test_delivery_scope_snapshot_bounds_large_and_binary_retained_content(tmp_pa
 def test_delivery_scope_snapshot_retains_selected_clean_file_under_active_root(tmp_path: Path) -> None:
     source = tmp_path / "src"
     source.mkdir()
-    (source / "lib.rs").write_text("#[cfg(test)]\nmod tests {}\n", encoding="utf-8")
-    (source / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+    (source / "lib.rs").write_bytes(b"#[cfg(test)]\nmod tests {}\n")
+    (source / "main.rs").write_bytes(b"fn main() {}\n")
     subprocess.run(["git", "add", "src"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-m", "track rust sources"], cwd=tmp_path, check=True, capture_output=True)
 
@@ -454,8 +482,12 @@ def test_delivery_scope_git_paths_use_reversible_filesystem_decoding(
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=raw_path + b"\0", stderr=b""),
     )
 
-    paths = validation_artifacts_module._git_paths_z(tmp_path, ["ls-files", "-z"])
+    if os.name == "nt":
+        with pytest.raises(DeliveryScopeSnapshotError, match="decode a Git path safely"):
+            validation_artifacts_module._git_paths_z(tmp_path, ["ls-files", "-z"])
+        return
 
+    paths = validation_artifacts_module._git_paths_z(tmp_path, ["ls-files", "-z"])
     assert paths == [os.fsdecode(raw_path)]
     assert os.fsencode(paths[0]) == raw_path
 
@@ -530,7 +562,7 @@ def test_delivery_scope_snapshot_hashes_only_git_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tracked = tmp_path / "tracked.py"
-    tracked.write_text("clean\n", encoding="utf-8")
+    tracked.write_bytes(b"clean\n")
     subprocess.run(["git", "add", "tracked.py"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-m", "track candidate"], cwd=tmp_path, check=True, capture_output=True)
     original_snapshot = validation_artifacts_module._snapshot_delivery_scope_regular_file
@@ -543,7 +575,7 @@ def test_delivery_scope_snapshot_hashes_only_git_candidates(
     monkeypatch.setattr(validation_artifacts_module, "_snapshot_delivery_scope_regular_file", record_hash)
 
     clean = snapshot_delivery_scope_files(tmp_path)
-    tracked.write_text("changed\n", encoding="utf-8")
+    tracked.write_bytes(b"changed\n")
     dirty = snapshot_delivery_scope_files(tmp_path)
 
     assert "tracked.py" not in clean
@@ -870,8 +902,9 @@ def test_delivery_scope_path_fallback_rejects_file_replacement(
 
     def replace_after_read(path, **kwargs):
         result = original_snapshot(path, **kwargs)
-        source.rename(tmp_path / "file-original.txt")
-        source.write_text("after\n", encoding="utf-8")
+        if Path(path) == source:
+            source.rename(tmp_path / "file-original.txt")
+            source.write_text("after\n", encoding="utf-8")
         return result
 
     monkeypatch.setattr(validation_artifacts_module.os, "supports_fd", set())
