@@ -144,6 +144,24 @@ def _delivery_scope_link_like(entry_stat) -> bool:
     return stat.S_ISLNK(entry_stat.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
 
 
+def _normalize_windows_delivery_scope_link_target(target: str) -> str:
+    for prefix in ("\\\\?\\UNC\\", "\\??\\UNC\\"):
+        if target[: len(prefix)].casefold() == prefix.casefold():
+            return "\\\\" + target[len(prefix) :]
+    for prefix in ("\\\\?\\", "\\??\\"):
+        if target.startswith(prefix):
+            remainder = target[len(prefix) :]
+            if len(remainder) >= 3 and remainder[0].isalpha() and remainder[1] == ":" and remainder[2] in "\\/":
+                return remainder
+    return target
+
+
+def _normalize_delivery_scope_link_target(target: str) -> str:
+    if os.name != "nt":
+        return target
+    return _normalize_windows_delivery_scope_link_target(target)
+
+
 def _dirty_paths(cwd: Path) -> tuple[set[str], set[str]] | None:
     modified = _git_lines(cwd, ["diff", "--name-only", "--relative", "HEAD", "--", "."])
     staged = _git_lines(cwd, ["diff", "--cached", "--name-only", "--relative", "HEAD", "--", "."])
@@ -398,7 +416,7 @@ def snapshot_delivery_scope_files(
         if link_like:
             # Windows may report different inode identities for the same reparse
             # point. Bind the observable link target on both sides of the stat.
-            symlink_target_before = (
+            symlink_target_before = _normalize_delivery_scope_link_target(
                 os.readlink(entry.name, dir_fd=directory_fd) if directory_fd is not None else os.readlink(entry.path)
             )
             after = (
@@ -406,7 +424,7 @@ def snapshot_delivery_scope_files(
                 if directory_fd is not None
                 else Path(entry.path).stat(follow_symlinks=False)
             )
-            symlink_target_after = (
+            symlink_target_after = _normalize_delivery_scope_link_target(
                 os.readlink(entry.name, dir_fd=directory_fd) if directory_fd is not None else os.readlink(entry.path)
             )
             if not _delivery_scope_link_like(after) or symlink_target_after != symlink_target_before:

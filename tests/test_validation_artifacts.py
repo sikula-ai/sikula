@@ -298,7 +298,11 @@ def test_delivery_scope_snapshot_rejects_retargeted_worktree_git_pointer(tmp_pat
     )
     git_pointer = linked / ".git"
     git_pointer.chmod(git_pointer.stat().st_mode | stat.S_IWUSR)
-    git_pointer.write_text(f"gitdir: {tmp_path / '.git'}\n", encoding="utf-8")
+    replacement = f"gitdir: {tmp_path / '.git'}\n".encode()
+    with git_pointer.open("r+b") as pointer_file:
+        pointer_file.seek(0)
+        pointer_file.write(replacement)
+        pointer_file.truncate()
 
     with pytest.raises(DeliveryScopeSnapshotError, match="binding"):
         snapshot_delivery_scope_files(
@@ -664,6 +668,20 @@ def test_delivery_scope_link_like_recognizes_windows_reparse_directory() -> None
     )
 
     assert validation_artifacts_module._delivery_scope_link_like(entry_stat) is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "normalized"),
+    [
+        (r"\\?\C:\workspace\src", r"C:\workspace\src"),
+        (r"\??\C:\workspace\src", r"C:\workspace\src"),
+        (r"\\?\UNC\server\share\src", r"\\server\share\src"),
+        (r"\\?\Volume{1234}\src", r"\\?\Volume{1234}\src"),
+        (r"relative\src", r"relative\src"),
+    ],
+)
+def test_normalize_windows_delivery_scope_link_target(raw: str, normalized: str) -> None:
+    assert validation_artifacts_module._normalize_windows_delivery_scope_link_target(raw) == normalized
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")
