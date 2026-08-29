@@ -21,11 +21,74 @@ from pathlib import Path
 from typing import Optional
 
 from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
+from core.delivery_public_metadata import is_safe_delivery_public_metadata
 from core.diagnostics import diagnostic_excerpt, diagnostic_summary_lines, validation_error_excerpt
 from core.llm_usage import aggregate_llm_usage, aggregate_llm_usage_by_agent, sanitize_llm_usage_record
+from core.structured_output import (
+    DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP,
+    DELIVERY_DISPOSITION_REQUIRES_SCOPE_AMENDMENT,
+    DELIVERY_DISPOSITION_SCHEMA_VERSION,
+    MAX_DELIVERY_DISPOSITION_SUMMARY_CHARS,
+    DeliveryDisposition,
+    delivery_disposition_recommended_action,
+)
 from core.version import sikula_version
 
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+DELIVERY_STOP_UNIT_SCOPE_VIOLATION = "unit_scope_violation"
+DELIVERY_STOP_SCOPE_AMENDMENT_REQUIRED = "scope_amendment_required"
+DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP = "external_dependency_gap"
+DELIVERY_STOP_IMPLEMENTER_DISPOSITION_INVALID = "implementer_disposition_invalid"
+DELIVERY_TERMINAL_STOP_CODES = frozenset(
+    {
+        DELIVERY_STOP_UNIT_SCOPE_VIOLATION,
+        DELIVERY_STOP_SCOPE_AMENDMENT_REQUIRED,
+        DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP,
+        DELIVERY_STOP_IMPLEMENTER_DISPOSITION_INVALID,
+    }
+)
+
+DELIVERY_DISPOSITION_PARSE_ERROR_SCHEMA_VERSION = 1
+_DELIVERY_DISPOSITION_PARSE_ERROR_KEYS = frozenset(
+    {
+        "schema_version",
+        "error_code",
+        "source",
+        "timestamp",
+    }
+)
+_DELIVERY_DISPOSITION_PARSE_ERROR_CODE_RE = re.compile(r"^delivery_disposition\.[a-z][a-z0-9_]*$")
+
+_DELIVERY_STOP_DISPOSITION_KEYS = frozenset(
+    {
+        "schema_version",
+        "disposition",
+        "summary",
+        "recommended_action",
+        "source",
+        "timestamp",
+    }
+)
+_DELIVERY_STOP_DISPOSITION_CODES = {
+    DELIVERY_DISPOSITION_REQUIRES_SCOPE_AMENDMENT: DELIVERY_STOP_SCOPE_AMENDMENT_REQUIRED,
+    DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP: DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP,
+}
+_DELIVERY_STOP_PRIORITIES = {
+    DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP: 1,
+    DELIVERY_STOP_IMPLEMENTER_DISPOSITION_INVALID: 2,
+    DELIVERY_STOP_SCOPE_AMENDMENT_REQUIRED: 3,
+    DELIVERY_STOP_UNIT_SCOPE_VIOLATION: 4,
+}
+_DELIVERY_STOP_SOURCES = frozenset(
+    {
+        "analyst",
+        "implementer",
+        "reviewer",
+        "security_reviewer",
+        "orchestrator",
+    }
+)
 
 
 def _is_valid_state_task_id(task_id: str) -> bool:
@@ -253,6 +316,19 @@ def _is_terminal_for_audit(state: "TaskState") -> bool:
     return _terminal_result(state) != "incomplete"
 
 
+def _analyst_runs_count(state: "TaskState") -> int:
+    count = 1 if state.analyst_prompt is not None else 0
+    for record in state.analyst_retry_records:
+        attempt = record.get("attempt")
+        if type(attempt) is int and attempt > 0:
+            count = max(count, attempt + (1 if record.get("will_retry") is True else 0))
+    for record in state.analyst_cycle_records:
+        attempt = record.get("attempt")
+        if type(attempt) is int and attempt > 0:
+            count = max(count, attempt)
+    return count
+
+
 def _final_summary(state: "TaskState") -> dict:
     created_at = _parse_iso(state.created_at)
     finished_at = _parse_iso(state.finished_at)
@@ -297,10 +373,15 @@ def _final_summary(state: "TaskState") -> dict:
         "implementation_asset_target_warnings_count": _implementation_asset_target_warning_count(
             state.implementation_asset_target_records
         ),
+        "analyst_runs_count": _analyst_runs_count(state),
         "analyst_retries_count": len(state.analyst_retry_records),
         "planner_retries_count": len(state.planner_retry_records),
         "delivery_unit_budget": dict(state.delivery_unit_budget),
         "delivery_budget_stop": dict(state.delivery_budget_stop) if state.delivery_budget_stop else None,
+        "delivery_stop_code": state.delivery_stop_code,
+        "delivery_disposition_parse_error": (
+            dict(state.delivery_disposition_parse_error) if state.delivery_disposition_parse_error else None
+        ),
         "delivery_handoff_schema_version": state.delivery_handoff_schema_version,
         "delivery_dependency_handoffs_count": len(state.delivery_dependency_handoffs),
         "llm_retries": sum(1 for entry in state.history if entry.get("action") == "llm_retry"),
@@ -419,6 +500,7 @@ class TaskState:
     )
     # Structured observability records; never read for pipeline decisions.
     llm_usage_records: list[dict] = field(default_factory=list)
+    analyst_cycle_records: list[dict] = field(default_factory=list)
     planner_retry_records: list[dict] = field(default_factory=list)
     implement_cycle_records: list[dict] = field(default_factory=list)
     review_cycle_records: list[dict] = field(default_factory=list)
@@ -436,6 +518,21 @@ class TaskState:
     delivery_plan_path: Optional[str] = None
     delivery_unit_budget: dict[str, int] = field(default_factory=dict)
     delivery_budget_stop: Optional[dict] = None
+    delivery_stop_code: Optional[str] = None
+    delivery_stop_disposition: Optional[dict] = None
+    delivery_disposition_parse_error: Optional[dict] = None
+    delivery_constraint_context_schema_version: Optional[int] = None
+    delivery_source_task: Optional[dict[str, str]] = None
+    delivery_inherited_constraints: list[dict] = field(default_factory=list)
+    delivery_constraint_context_fingerprint: Optional[str] = None
+    delivery_write_scope_schema_version: Optional[int] = None
+    delivery_write_scope_mode: Optional[str] = None
+    delivery_declared_write_paths: list[str] = field(default_factory=list)
+    delivery_declared_write_exact_file_paths: Optional[list[str]] = None
+    delivery_effective_write_paths: list[str] = field(default_factory=list)
+    delivery_effective_write_exact_file_paths: Optional[list[str]] = None
+    delivery_runtime_write_scope_binding: Optional[dict] = None
+    delivery_scope_audit_pending: Optional[dict] = None
     delivery_handoff_schema_version: Optional[int] = None
     delivery_dependency_handoffs: list[dict] = field(default_factory=list)
     worktree_path: Optional[str] = None
@@ -624,6 +721,117 @@ class TaskState:
             f"{name} exceeded: limit={limit}, actual={actual}; split the delivery unit before implementation",
         )
 
+    def set_delivery_stop_disposition(self, source: str, disposition: DeliveryDisposition) -> None:
+        if source not in {"analyst", "implementer", "reviewer", "security_reviewer"}:
+            raise ValueError("delivery stop disposition source is invalid")
+        if not isinstance(disposition, DeliveryDisposition):
+            raise TypeError("delivery stop disposition must be parser-validated")
+        if disposition.disposition not in {
+            DELIVERY_DISPOSITION_REQUIRES_SCOPE_AMENDMENT,
+            DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP,
+        }:
+            raise ValueError("delivery stop disposition is not terminal")
+        if disposition.disposition == DELIVERY_DISPOSITION_REQUIRES_SCOPE_AMENDMENT and source not in {
+            "reviewer",
+            "security_reviewer",
+        }:
+            raise ValueError("scope-amendment disposition source is invalid")
+        self.delivery_stop_disposition = {
+            **disposition.to_dict(),
+            "source": source,
+            "timestamp": _now(),
+        }
+        self.record(
+            source,
+            "delivery_stop_disposition",
+            f"{disposition.disposition}; recommended action: {disposition.recommended_action}",
+        )
+
+    def record_delivery_disposition_parse_error(self, source: str, error_code: str) -> None:
+        if source != "implementer":
+            raise ValueError("delivery disposition parse-error source is invalid")
+        if not isinstance(error_code, str) or not _DELIVERY_DISPOSITION_PARSE_ERROR_CODE_RE.fullmatch(error_code):
+            raise ValueError("delivery disposition parse-error code is invalid")
+        self.delivery_disposition_parse_error = {
+            "schema_version": DELIVERY_DISPOSITION_PARSE_ERROR_SCHEMA_VERSION,
+            "error_code": error_code,
+            "source": source,
+            "timestamp": _now(),
+        }
+        self.record(source, "delivery_disposition_parse_error", error_code)
+
+    def delivery_stop_code_from_parse_error(self) -> str | None:
+        value = self.delivery_disposition_parse_error
+        if value is None:
+            return None
+        if not isinstance(value, dict) or frozenset(value) != _DELIVERY_DISPOSITION_PARSE_ERROR_KEYS:
+            raise ValueError("delivery disposition parse-error state is malformed")
+        schema_version = value.get("schema_version")
+        error_code = value.get("error_code")
+        source = value.get("source")
+        timestamp = value.get("timestamp")
+        if type(schema_version) is not int or schema_version != DELIVERY_DISPOSITION_PARSE_ERROR_SCHEMA_VERSION:
+            raise ValueError("delivery disposition parse-error schema is invalid")
+        if not isinstance(error_code, str) or not _DELIVERY_DISPOSITION_PARSE_ERROR_CODE_RE.fullmatch(error_code):
+            raise ValueError("delivery disposition parse-error code is invalid")
+        if source != "implementer":
+            raise ValueError("delivery disposition parse-error source is invalid")
+        if not isinstance(timestamp, str) or _parse_iso(timestamp) is None:
+            raise ValueError("delivery disposition parse-error timestamp is invalid")
+        return DELIVERY_STOP_IMPLEMENTER_DISPOSITION_INVALID
+
+    def delivery_stop_code_from_disposition(self) -> str | None:
+        value = self.delivery_stop_disposition
+        if value is None:
+            return None
+        if not isinstance(value, dict) or frozenset(value) != _DELIVERY_STOP_DISPOSITION_KEYS:
+            raise ValueError("delivery stop disposition state is malformed")
+        schema_version = value.get("schema_version")
+        disposition = value.get("disposition")
+        summary = value.get("summary")
+        action = value.get("recommended_action")
+        source = value.get("source")
+        timestamp = value.get("timestamp")
+        if type(schema_version) is not int or schema_version != DELIVERY_DISPOSITION_SCHEMA_VERSION:
+            raise ValueError("delivery stop disposition schema is invalid")
+        if not isinstance(disposition, str) or disposition not in _DELIVERY_STOP_DISPOSITION_CODES:
+            raise ValueError("delivery stop disposition value is invalid")
+        if action != delivery_disposition_recommended_action(disposition):
+            raise ValueError("delivery stop disposition recovery action is invalid")
+        if (
+            not isinstance(summary, str)
+            or not summary
+            or summary != summary.strip()
+            or len(summary) > MAX_DELIVERY_DISPOSITION_SUMMARY_CHARS
+            or not is_safe_delivery_public_metadata(summary)
+        ):
+            raise ValueError("delivery stop disposition summary is invalid")
+        if not isinstance(source, str) or source not in _DELIVERY_STOP_SOURCES - {"orchestrator"}:
+            raise ValueError("delivery stop disposition source is invalid")
+        if disposition == DELIVERY_DISPOSITION_REQUIRES_SCOPE_AMENDMENT and source not in {
+            "reviewer",
+            "security_reviewer",
+        }:
+            raise ValueError("scope-amendment disposition source is invalid")
+        if not isinstance(timestamp, str) or _parse_iso(timestamp) is None:
+            raise ValueError("delivery stop disposition timestamp is invalid")
+        return _DELIVERY_STOP_DISPOSITION_CODES[disposition]
+
+    def set_delivery_terminal_stop(self, code: str, *, source: str) -> None:
+        if not isinstance(code, str) or code not in DELIVERY_TERMINAL_STOP_CODES:
+            raise ValueError("delivery terminal stop code is invalid")
+        if not isinstance(source, str) or source not in _DELIVERY_STOP_SOURCES:
+            raise ValueError("delivery terminal stop source is invalid")
+        current = self.delivery_stop_code
+        if current is not None and current not in DELIVERY_TERMINAL_STOP_CODES:
+            raise ValueError("persisted delivery terminal stop code is invalid")
+        self.failed = True
+        self.done = False
+        if current is not None and _DELIVERY_STOP_PRIORITIES[current] >= _DELIVERY_STOP_PRIORITIES[code]:
+            return
+        self.delivery_stop_code = code
+        self.record(source, "delivery_terminal_stop", code)
+
     def record_testability_gap(
         self,
         source: str,
@@ -807,6 +1015,16 @@ class StateStore:
         delivery_unit_id: str | None = None,
         delivery_plan_path: str | None = None,
         delivery_unit_budget: dict[str, int] | None = None,
+        delivery_constraint_context_schema_version: int | None = None,
+        delivery_source_task: dict[str, str] | None = None,
+        delivery_inherited_constraints: list[dict] | None = None,
+        delivery_constraint_context_fingerprint: str | None = None,
+        delivery_write_scope_schema_version: int | None = None,
+        delivery_write_scope_mode: str | None = None,
+        delivery_declared_write_paths: list[str] | None = None,
+        delivery_declared_write_exact_file_paths: list[str] | None = None,
+        delivery_effective_write_paths: list[str] | None = None,
+        delivery_effective_write_exact_file_paths: list[str] | None = None,
         delivery_handoff_schema_version: int | None = None,
         delivery_dependency_handoffs: list[dict] | None = None,
     ) -> TaskState:
@@ -818,6 +1036,24 @@ class StateStore:
             delivery_unit_id=delivery_unit_id,
             delivery_plan_path=delivery_plan_path,
             delivery_unit_budget=dict(delivery_unit_budget or {}),
+            delivery_constraint_context_schema_version=delivery_constraint_context_schema_version,
+            delivery_source_task=copy.deepcopy(delivery_source_task),
+            delivery_inherited_constraints=copy.deepcopy(delivery_inherited_constraints or []),
+            delivery_constraint_context_fingerprint=delivery_constraint_context_fingerprint,
+            delivery_write_scope_schema_version=delivery_write_scope_schema_version,
+            delivery_write_scope_mode=delivery_write_scope_mode,
+            delivery_declared_write_paths=list(delivery_declared_write_paths or []),
+            delivery_declared_write_exact_file_paths=(
+                list(delivery_declared_write_exact_file_paths)
+                if delivery_declared_write_exact_file_paths is not None
+                else None
+            ),
+            delivery_effective_write_paths=list(delivery_effective_write_paths or []),
+            delivery_effective_write_exact_file_paths=(
+                list(delivery_effective_write_exact_file_paths)
+                if delivery_effective_write_exact_file_paths is not None
+                else None
+            ),
             delivery_handoff_schema_version=delivery_handoff_schema_version,
             delivery_dependency_handoffs=copy.deepcopy(delivery_dependency_handoffs or []),
         )

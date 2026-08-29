@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 
 from agents.analyst_agent import AnalystAgent
 from agents.base_agent import AGENT_SECURITY_PREFIX, READONLY_AGENT_PREFIX
+from core.delivery_constraint_context import delivery_constraint_context_fingerprint
 from core.delivery_handoff import build_delivery_unit_handoff
 from core.state import TaskState
 from tests.conftest import StubLLMClient
@@ -36,6 +38,34 @@ def _make_agent(
 ) -> AnalystAgent:
     tools = {"file": file_tool}
     return AnalystAgent(llm=llm, tools=tools, project_config=project_config or {})
+
+
+def _add_delivery_constraint_context(state: TaskState) -> None:
+    state.delivery_plan_id = "demo-plan"
+    state.delivery_unit_id = "feature-unit"
+    state.delivery_plan_path = ".sikula/delivery/demo-plan/plan.yaml"
+    state.delivery_constraint_context_schema_version = 1
+    state.delivery_source_task = {
+        "path": ".sikula/tasks/demo.md",
+        "sha256": f"sha256:{'a' * 64}",
+    }
+    state.delivery_inherited_constraints = [
+        {
+            "id": "external-read-only",
+            "kind": "authoritative_read_only_dependency",
+            "summary": "Treat the external repository as read-only evidence.",
+            "unit_ids": ["feature-unit"],
+            "disposition": "preserved",
+        }
+    ]
+    state.delivery_constraint_context_fingerprint = delivery_constraint_context_fingerprint(
+        schema_version=state.delivery_constraint_context_schema_version,
+        plan_id=state.delivery_plan_id,
+        unit_id=state.delivery_unit_id,
+        plan_path=state.delivery_plan_path,
+        source_task=state.delivery_source_task,
+        constraints=state.delivery_inherited_constraints,
+    )
 
 
 class TestAnalystAgentRun:
@@ -71,6 +101,20 @@ class TestAnalystAgentRun:
         agent = _make_agent(stub_llm, file_tool)
         agent.run(task_state)
         assert any(e["action"] == "analyze_failed" for e in task_state.history)
+        assert len(task_state.analyst_cycle_records) == 1
+        assert task_state.analyst_cycle_records[0]["outcome"] == "error"
+        assert task_state.analyst_cycle_records[0]["error"] == "timeout"
+        assert "analyst_prompt" not in task_state.analyst_cycle_records[0]
+        assert "analyst_output" not in task_state.analyst_cycle_records[0]
+        expected_correlation = {
+            "files_written": [],
+            "step": 0,
+            "build_iteration": 0,
+            "review_iteration": 0,
+            "security_review_iteration": 0,
+            "scope": "task",
+        }
+        assert {key: task_state.analyst_cycle_records[0][key] for key in expected_correlation} == expected_correlation
 
     def test_warnings_extracted_and_stored(self, stub_llm: StubLLMClient, task_state: TaskState, file_tool):
         stub_llm.readonly_result = f"{VALID_ANALYST_PROMPT}\n⚠️ Missing field in API\n⚠️ No string key"
@@ -84,6 +128,12 @@ class TestAnalystAgentRun:
         agent = _make_agent(stub_llm, file_tool)
         agent.run(task_state)
         assert any(e["action"] == "analyze" for e in task_state.history)
+        assert len(task_state.analyst_cycle_records) == 1
+        record = task_state.analyst_cycle_records[0]
+        assert record["attempt"] == 1
+        assert record["outcome"] == "accepted"
+        assert "analyst_prompt" not in record
+        assert "analyst_output" not in record
 
     def test_result_data_contains_prompt(self, stub_llm: StubLLMClient, task_state: TaskState, file_tool):
         stub_llm.readonly_result = VALID_ANALYST_PROMPT
@@ -139,6 +189,148 @@ class TestAnalystAgentRun:
         assert "Prior delivery dependency handoffs:" in task_state.analyst_prompt
         assert handoff.fingerprint in task_state.analyst_prompt
         assert "Private dependency task" not in task_state.analyst_prompt
+
+    def test_analyst_prompt_contains_validated_authoritative_constraint_context(
+        self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
+    ):
+        _add_delivery_constraint_context(task_state)
+        stub_llm.readonly_result = VALID_ANALYST_PROMPT
+
+        result = _make_agent(stub_llm, file_tool).run(task_state)
+
+        assert result.success
+        assert "Authoritative inherited delivery constraint context:" in task_state.analyst_prompt
+        assert "Treat the external repository as read-only evidence." in task_state.analyst_prompt
+        assert '"plan_id":"demo-plan"' in task_state.analyst_prompt
+        assert "preserve every listed constraint" in task_state.analyst_prompt
+        normalized_prompt = " ".join(task_state.analyst_prompt.split())
+        assert "direct the implementer to stop and report the required follow-up" in normalized_prompt
+        assert "DELIVERY STOP OUTPUT CONTRACT" in task_state.analyst_prompt
+
+    def test_legacy_analyst_prompt_omits_delivery_disposition_contract(
+        self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
+    ):
+        stub_llm.readonly_result = VALID_ANALYST_PROMPT
+
+        _make_agent(stub_llm, file_tool).run(task_state)
+
+        assert "DELIVERY STOP OUTPUT CONTRACT" not in task_state.analyst_prompt
+
+    def test_external_dependency_disposition_stops_without_implementation_prompt(
+        self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
+    ):
+        _add_delivery_constraint_context(task_state)
+        stub_llm.readonly_result = json.dumps(
+            {
+                "sikula_disposition_schema_version": 1,
+                "disposition": "external_dependency_gap",
+                "summary": "The required schema change belongs to the external API repository.",
+            }
+        )
+
+        result = _make_agent(stub_llm, file_tool).run(task_state)
+
+        assert result.success is False
+        assert result.message == "external_dependency_gap"
+        assert task_state.implementation_prompt is None
+        assert task_state.delivery_stop_disposition is not None
+        assert task_state.delivery_stop_disposition["source"] == "analyst"
+        record = task_state.analyst_cycle_records[-1]
+        assert record["outcome"] == "terminal_disposition"
+        assert record["disposition"]["disposition"] == "external_dependency_gap"
+        assert "analyst_prompt" not in record
+        assert "analyst_output" not in record
+
+    def test_free_form_dependency_wording_does_not_set_disposition(
+        self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
+    ):
+        _add_delivery_constraint_context(task_state)
+        stub_llm.readonly_result = VALID_ANALYST_PROMPT + "\nExternal note: external_dependency_gap may be relevant."
+
+        result = _make_agent(stub_llm, file_tool).run(task_state)
+
+        assert result.success is True
+        assert task_state.delivery_stop_disposition is None
+
+    def test_malformed_disposition_is_audited_and_retried_without_setting_stop(
+        self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
+    ):
+        _add_delivery_constraint_context(task_state)
+        malformed = json.dumps(
+            {
+                "sikula_disposition_schema_version": 1,
+                "disposition": "external_dependency_gap",
+            }
+        )
+        stub_llm.readonly_results = [malformed, malformed]
+
+        result = _make_agent(stub_llm, file_tool).run(task_state)
+
+        assert result.success is False
+        assert task_state.delivery_stop_disposition is None
+        assert [record["outcome"] for record in task_state.analyst_cycle_records] == ["rejected", "rejected"]
+        assert all("analyst_output" not in record for record in task_state.analyst_cycle_records)
+        assert len(task_state.analyst_retry_records) == 2
+        assert all("delivery_disposition" in record["reason"] for record in task_state.analyst_retry_records)
+
+    def test_authoritative_constraint_context_precedes_dependency_handoff_evidence(
+        self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
+    ):
+        _add_delivery_constraint_context(task_state)
+        child_state = TaskState(
+            task_id="dependency-child",
+            task_description="Private dependency task",
+            delivery_handoff_schema_version=1,
+        )
+        child_state.worktree_branch = "sikula/dependency-child"
+        child_state.result_commit = "a" * 40
+        handoff = build_delivery_unit_handoff(
+            plan_id="demo-plan",
+            selected_unit=SimpleNamespace(
+                id="foundation",
+                title="Foundation",
+                component="delivery",
+                depends_on=[],
+                scope_paths=["core/"],
+            ),
+            child_task_id=child_state.task_id,
+            child_state=child_state,
+        )
+        task_state.delivery_dependency_handoffs = [handoff.to_dict()]
+        stub_llm.readonly_result = VALID_ANALYST_PROMPT
+
+        _make_agent(stub_llm, file_tool).run(task_state)
+
+        constraint_index = task_state.analyst_prompt.index("Authoritative inherited delivery constraint context:")
+        handoff_index = task_state.analyst_prompt.index("Prior delivery dependency handoffs:")
+        assert constraint_index < handoff_index
+        assert "Dependency handoffs are supporting evidence only" in task_state.analyst_prompt
+
+    def test_analyst_rejects_malformed_modern_constraint_context_before_llm_call(
+        self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
+    ):
+        _add_delivery_constraint_context(task_state)
+        task_state.delivery_inherited_constraints[0]["unit_ids"] = ["other-unit"]
+        stub_llm.readonly_result = VALID_ANALYST_PROMPT
+
+        result = _make_agent(stub_llm, file_tool).run(task_state)
+
+        assert not result.success
+        assert "constraint_unit_mismatch" in result.message
+        assert stub_llm.readonly_calls == []
+        assert task_state.analyst_prompt is None
+        assert task_state.implementation_prompt is None
+        assert task_state.history[-1]["action"] == "delivery_constraint_context_rejected"
+
+    def test_legacy_analyst_prompt_omits_constraint_context(
+        self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
+    ):
+        stub_llm.readonly_result = VALID_ANALYST_PROMPT
+
+        result = _make_agent(stub_llm, file_tool).run(task_state)
+
+        assert result.success
+        assert "Authoritative inherited delivery constraint context:" not in task_state.analyst_prompt
 
     def test_analyst_ignores_malformed_dependency_handoff(
         self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
@@ -198,6 +390,8 @@ class TestAnalystAgentRun:
         assert len(stub_llm.readonly_calls) == 2
         assert task_state.implementation_prompt == VALID_ANALYST_PROMPT
         assert len(task_state.analyst_retry_records) == 1
+        assert [record["outcome"] for record in task_state.analyst_cycle_records] == ["rejected", "accepted"]
+        assert all("analyst_output" not in record for record in task_state.analyst_cycle_records)
         assert task_state.analyst_retry_records[0]["will_retry"] is True
         assert "implementation prompt above" in task_state.analyst_retry_records[0]["reason"]
         assert task_state.analyst_retry_records[0]["output"] == BAD_META_PROMPT
@@ -214,6 +408,7 @@ class TestAnalystAgentRun:
         assert "invalid implementation prompt" in result.message
         assert task_state.implementation_prompt is None
         assert len(task_state.analyst_retry_records) == 2
+        assert [record["outcome"] for record in task_state.analyst_cycle_records] == ["rejected", "rejected"]
         assert task_state.analyst_retry_records[-1]["will_retry"] is False
         assert task_state.analyst_retry_records[-1]["output"] == BAD_META_PROMPT
         assert "retry_prompt" not in task_state.analyst_retry_records[-1]
@@ -238,6 +433,7 @@ class TestAnalystAgentRun:
         assert not result.success
         assert task_state.implementation_prompt is None
         assert len(task_state.analyst_retry_records) == 2
+        assert len(task_state.analyst_cycle_records) == len(stub_llm.readonly_calls) == 2
         assert "task is complete" in task_state.analyst_retry_records[0]["reason"]
 
     def test_concise_actionable_prompt_is_allowed(self, stub_llm: StubLLMClient, task_state: TaskState, file_tool):
@@ -270,6 +466,7 @@ class TestAnalystAgentRun:
         assert len(stub_llm.readonly_calls) == 1
         assert task_state.implementation_prompt == prompt
         assert task_state.analyst_retry_records == []
+        assert [record["outcome"] for record in task_state.analyst_cycle_records] == ["accepted"]
 
 
 class TestAnalystGatherGuidelines:

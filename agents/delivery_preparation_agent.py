@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from hashlib import sha256
 import json
 from collections.abc import Sequence
 from pathlib import Path, PureWindowsPath
@@ -11,12 +13,20 @@ from agents.base_agent import AGENT_SECURITY_PREFIX, guidelines_files, read_only
 from core.delivery_authoring import (
     DeliveryAmendmentAuthoringDraft,
     DeliveryAssessmentDraft,
+    DeliveryAuthoringConstraintDraft,
     DeliveryAuthoringDraft,
     DeliveryAuthoringParseError,
+    DeliveryAuthoringUnitDraft,
+    DeliveryConstraintGap,
+    DeliveryConstraintVerification,
+    apply_delivery_unit_context_gaps,
     parse_delivery_assessment_output,
     parse_delivery_amendment_authoring_output,
     parse_delivery_authoring_output,
+    parse_delivery_constraint_repair_output,
+    parse_delivery_constraint_verification_output,
 )
+from core.delivery_plan import DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION, DeliveryPlanSourceTask
 from core.llm_client import LLMClient
 
 DeliveryPreparationAuditRecorder = Callable[[dict[str, Any]], None]
@@ -37,8 +47,9 @@ Hard rules:
 - Do not inspect external services, make network requests, or use network commands.
 - Do not include writer-facing path fields in unit objects, including task_path, path, unit_path,
   output_path, plan_path, units_dir, or output_dir.
-- Do not include raw prompts, raw provider output, source excerpts, task state, diffs, logs,
-  secrets, personal data, or absolute local paths in the JSON draft.
+- Do not include raw prompts, raw provider output, unrelated source excerpts, task state, diffs,
+  logs, secrets, personal data, or absolute local paths in the JSON draft. Source-defined exact
+  identifiers and values required by a unit may appear verbatim only in that unit's task_markdown.
 - Do not infer unsupported product, security, privacy, validation, platform, or release requirements
   beyond the source task and checked-in project context.
 - Return exactly one JSON object and no Markdown outside the JSON.
@@ -70,6 +81,23 @@ Configured validation commands:
 Delivery-plan constraints:
 - plan_id must equal the selected delivery plan id.
 - units must be non-empty.
+- constraints must explicitly list every hard source-task constraint that affects delivery, or be
+  an empty list when the source task contains none. Do not omit the field.
+- Supported constraint kinds are repository_ownership, authoritative_read_only_dependency,
+  stop_and_follow_up, security_boundary, and prohibited_fallback.
+- Before returning, check the full source task once for each supported constraint kind. This is an
+  internal completeness checklist; do not emit the checklist.
+- Treat requirements to reuse an existing mechanism, consume an authoritative contract or schema,
+  or leave dependency-owned behavior unchanged as authoritative_read_only_dependency constraints,
+  not merely implementation guidance.
+- Treat explicit trust, permission, secret, privacy, or execution boundaries as security_boundary
+  constraints even when they appear inside broader acceptance or implementation prose.
+- Constraint summaries must be bounded single-line paraphrases. Do not quote source-task text or
+  include source excerpts, absolute paths, prompts, provider output, or private data.
+- Each constraint must list every generated unit to which it applies in unit_ids.
+- Use disposition preserved only when every listed unit keeps the constraint. Use needs_review
+  when consistency cannot be established, and conflict when a unit contradicts the constraint.
+  The deterministic writer blocks needs_review and conflict instead of publishing the plan.
 - Unit IDs must be stable path-safe IDs using only letters, numbers, dots, underscores, and hyphens.
 - Unit IDs must not contain path separators, absolute paths, ".", or "..".
 - depends_on must reference known unit IDs only and must not contain duplicates, self-dependencies,
@@ -91,6 +119,11 @@ Delivery-plan constraints:
   max_changed_modules, max_generated_test_files.
 - Unit task Markdown must be product/behavior descriptions with acceptance criteria and verification
   expectations, not file-by-file implementation scripts.
+- Every unit task must be self-contained because implementation agents cannot read the parent source
+  task. Copy every source-defined identifier, enum value, field name, localization key and value,
+  fixed user-visible string, or other literal that the unit must use exactly into its task Markdown.
+  Never write dangling references such as "use the provided keys", "use the given values", or
+  "as listed above" when the referenced values exist only in the source task.
 - Unit task Markdown must include all of these exact contract-ready section headings:
   Goal, Current behavior, Desired behavior, Acceptance criteria, Security and privacy, Reviewer focus,
   Out of scope, and Validation.
@@ -139,6 +172,15 @@ Return this JSON shape:
   "title": "Short delivery plan title",
   "planning_mode": "fixed_window",
   "warnings": [],
+  "constraints": [
+    {{
+      "id": "stable-constraint-id",
+      "kind": "repository_ownership",
+      "summary": "Bounded paraphrase of the hard delivery rule",
+      "unit_ids": ["stable-unit-id"],
+      "disposition": "preserved"
+    }}
+  ],
   "units": [
     {{
       "id": "stable-unit-id",
@@ -247,6 +289,140 @@ Return this JSON shape:
 }}
 """
 
+_DELIVERY_CONSTRAINT_VERIFICATION_PROMPT = """\
+You are Sikula's independent read-only delivery-constraint verifier. You did not author the
+candidate units. Compare the authoritative task text, the complete constraint input, and every
+candidate unit before returning a strict verification result.
+
+Hard rules:
+- Do not write, edit, delete, move, rename, format, or create files.
+- Do not run commands, start nested Sikula commands, inspect external services, or use the network.
+- Outside unit_context_gaps.source_literals, do not include source excerpts, task bodies, prompts,
+  provider output, diffs, logs, secrets, personal data, or absolute local paths in the JSON result.
+- Do not invent, rename, omit, summarize, or change a supplied constraint or unit id.
+- Return exactly one JSON object and no Markdown outside the JSON.
+
+Verification scope: {verification_scope}
+
+Completeness rule:
+{completeness_rule}
+
+Unit self-containment rule:
+{unit_context_rule}
+
+Authoritative task text:
+```markdown
+{authority_description}
+```
+
+Constraint input:
+```json
+{constraints_json}
+```
+
+Candidate units:
+```json
+{units_json}
+```
+
+For each supplied constraint, echo id, kind, summary, and unit_ids exactly. Set disposition to:
+- preserved only when every listed candidate unit preserves the constraint;
+- needs_review when semantic consistency cannot be established;
+- conflict when any listed candidate unit contradicts the constraint.
+
+Set constraints_complete to false when the completeness rule is not satisfied. An empty constraint
+input is valid only when the completeness rule establishes that no governing hard constraint was
+omitted. When constraints_complete is false, constraint_gaps must identify every detected omission
+or incomplete assignment. Use reason omitted when the constraint input lacks the rule and omit
+constraint_id. Use reason incompletely_assigned when an existing constraint is missing affected
+units; constraint_id, kind, and summary must then echo that supplied constraint exactly. Summaries
+must be bounded paraphrases, never source excerpts. affected_unit_ids must list every candidate unit
+that needs the omitted constraint or every missing assignment for an existing constraint.
+
+When constraints_complete is true, return an empty constraint_gaps list.
+
+When unit self-containment is enabled, set unit_context_complete to false if a candidate unit refers
+to source-defined exact identifiers, keys, enum values, field names, fixed copy, or other required
+literals that are absent from its task_markdown. For each affected unit, return one unit_context_gaps
+entry. source_literals must contain only the minimal complete, non-empty, single-line source-task
+lines that the unit needs verbatim. Copy those lines exactly; do not paraphrase, combine, truncate,
+or include unrelated source context. If every candidate unit is self-contained, set
+unit_context_complete to true and return an empty unit_context_gaps list.
+
+Return this JSON shape:
+{{
+  "constraints_complete": true,
+  "constraint_gaps": [],
+  "unit_context_complete": true,
+  "unit_context_gaps": [],
+  "constraints": [
+    {{
+      "id": "exact-supplied-id",
+      "kind": "repository_ownership",
+      "summary": "Exact supplied bounded summary",
+      "unit_ids": ["exact-supplied-unit-id"],
+      "disposition": "preserved"
+    }}
+  ]
+}}
+"""
+
+_DELIVERY_CONSTRAINT_REPAIR_PROMPT = """\
+You are Sikula's read-only delivery-constraint repair assistant.
+
+Repair only the structured constraint list after an independent verifier identified actionable
+gaps. Do not redesign, rewrite, or return the delivery units. The supplied candidate units,
+dependencies, task Markdown, scope paths, asset paths, sizing, risk tags, and budgets are immutable.
+
+Hard rules:
+- Do not write files, run commands, use tools, inspect external services, or access the network.
+- Return exactly one JSON object and no Markdown outside the JSON.
+- Preserve every existing constraint in the same order with exactly the same id, kind, summary,
+  disposition, and existing unit_ids.
+- For incompletely_assigned gaps, append exactly the listed affected_unit_ids to that existing
+  constraint and make no other assignment changes.
+- For omitted gaps, append exactly one new constraint per gap in gap order. Create a stable path-safe
+  id, preserve the gap kind and summary exactly, and assign exactly the listed affected_unit_ids.
+- Do not add constraints that are not represented by a supplied gap.
+- Use preserved only when every assigned candidate unit keeps the rule. Use needs_review when
+  consistency cannot be established and conflict when a candidate unit contradicts the rule.
+- Do not include source excerpts, task bodies, prompts, provider output, diffs, logs, secrets,
+  personal data, or absolute local paths in the JSON result.
+
+Authoritative task text:
+```markdown
+{authority_description}
+```
+
+Existing constraints:
+```json
+{constraints_json}
+```
+
+Actionable verifier gaps:
+```json
+{gaps_json}
+```
+
+Immutable candidate units:
+```json
+{units_json}
+```
+
+Return this JSON shape:
+{{
+  "constraints": [
+    {{
+      "id": "stable-constraint-id",
+      "kind": "authoritative_read_only_dependency",
+      "summary": "Bounded paraphrase of the governing rule",
+      "unit_ids": ["affected-unit-id"],
+      "disposition": "preserved"
+    }}
+  ]
+}}
+"""
+
 _DELIVERY_AMENDMENT_PROMPT = """\
 You are Sikula's read-only delivery-plan amendment authoring assistant.
 
@@ -273,6 +449,16 @@ Source-plan component guidance:
 Verified recovery metadata supplied by deterministic Sikula code:
 ```json
 {recovery_metadata_json}
+```
+
+Correlated failed-child boundary evidence supplied by deterministic Sikula code:
+```json
+{failure_evidence_json}
+```
+
+Applicable inherited constraints supplied by deterministic plan validation:
+```json
+{applicable_constraints_json}
 ```
 
 Target unit metadata:
@@ -316,6 +502,15 @@ Replacement constraints:
   underscores, and hyphens.
 - When verified recovery metadata is non-null, copy its amend_reason and budget_exceeded values
   exactly. Deterministic Sikula code rejects conflicting recovery metadata.
+- When failed-child boundary evidence is non-null, use its inherited constraints, write scope,
+  changed and violation paths, review dispositions, and dependency identities to correct the
+  ownership or scope boundary. Do not merely restate the original invalid split.
+- Every applicable inherited constraint must be preserved by every replacement unit. Do not
+  weaken, omit, rename, reinterpret, or transfer it to only a subset of the replacements.
+- If that evidence proves a required change is owned outside this repository and no valid
+  single-repository replacement graph can satisfy it, return disposition
+  external_dependency_follow_up_required, a bounded summary, and an empty replacement_units
+  list. Never use this disposition for uncertainty or an in-repository scope correction.
 - Every task_markdown must contain these exact headings: Goal, Current behavior, Desired behavior,
   Acceptance criteria, Security and privacy, Reviewer focus, Out of scope, and Validation.
 - For a selected unit containing structured `## Assets` or a prepared `## Asset manifest`,
@@ -358,6 +553,18 @@ Return this JSON shape:
       "task_markdown": "# Replacement title\\n\\n## Goal\\n\\n...\\n\\n## Validation\\n\\n- `command`"
     }}
   ]
+}}
+
+For an externally owned requirement, return this shape instead:
+{{
+  "plan_id": "{plan_id}",
+  "target_unit_id": {target_unit_id_json},
+  "disposition": "external_dependency_follow_up_required",
+  "summary": "One bounded single-line explanation without absolute paths or private content",
+  "amend_reason": {amend_reason_json},
+  "budget_exceeded": {budget_exceeded_json},
+  "warnings": [],
+  "replacement_units": []
 }}
 """
 
@@ -415,6 +622,7 @@ class DeliveryPreparationAgent:
                 expected_plan_id=plan_id,
                 project_root=root,
                 output_dir=output_dir,
+                source_task_description=task_description,
             )
         except DeliveryAuthoringParseError as exc:
             self._record_failure(
@@ -426,8 +634,72 @@ class DeliveryPreparationAgent:
             )
             raise
 
+        source_task_path = self._project_relative_path(task_path, root)
+        if source_task_path != "<outside-project>":
+            draft = replace(
+                draft,
+                source_task=DeliveryPlanSourceTask(
+                    path=source_task_path,
+                    sha256="sha256:" + sha256(task_description.encode("utf-8")).hexdigest(),
+                ),
+            )
+
         self._record_success(audit_recorder, prompt=prompt, output=output, draft=draft)
-        return draft
+        verification = self._verify_constraint_continuity(
+            authority_description=task_description,
+            constraints=draft.constraints,
+            units=draft.units,
+            verification_scope="source_task_to_units",
+            completeness_rule=(
+                "Set constraints_complete to false if any hard ownership, authoritative dependency, "
+                "stop-and-follow-up, security-boundary, or prohibited-fallback rule in the authoritative "
+                "source task is missing from the constraint input or is not assigned to every affected unit."
+            ),
+            audit_recorder=audit_recorder,
+            audit_phase="delivery_prepare_constraint_verification",
+            round_index=1,
+            verify_unit_context=True,
+        )
+        if verification.constraints_complete and verification.unit_context_complete:
+            return replace(draft, constraint_verification=verification)
+        if any(
+            constraint.disposition != DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION
+            for constraint in (*draft.constraints, *verification.constraints)
+        ):
+            return replace(draft, constraint_verification=verification)
+
+        repaired_units = apply_delivery_unit_context_gaps(draft.units, verification.unit_context_gaps)
+        repaired_constraints = list(draft.constraints)
+        if not verification.constraints_complete:
+            repaired_constraints = self._repair_constraint_gaps(
+                authority_description=task_description,
+                constraints=draft.constraints,
+                units=repaired_units,
+                gaps=verification.constraint_gaps,
+                audit_recorder=audit_recorder,
+            )
+        repaired_verification = self._verify_constraint_continuity(
+            authority_description=task_description,
+            constraints=repaired_constraints,
+            units=repaired_units,
+            verification_scope="source_task_to_units_after_bounded_repair",
+            completeness_rule=(
+                "Set constraints_complete to false if any hard ownership, authoritative dependency, "
+                "stop-and-follow-up, security-boundary, or prohibited-fallback rule in the authoritative "
+                "source task remains missing from the repaired constraint input or is not assigned to every "
+                "affected unit."
+            ),
+            audit_recorder=audit_recorder,
+            audit_phase="delivery_prepare_constraint_verification",
+            round_index=2,
+            verify_unit_context=True,
+        )
+        return replace(
+            draft,
+            units=repaired_units,
+            constraints=repaired_constraints,
+            constraint_verification=repaired_verification,
+        )
 
     def assess_delivery_mode(
         self,
@@ -484,6 +756,8 @@ class DeliveryPreparationAgent:
         project_root: str | Path,
         project_context: dict[str, Any] | None = None,
         component_ids: Sequence[str] = (),
+        applicable_constraints: Sequence[dict[str, Any]] = (),
+        failure_evidence: dict[str, Any] | None = None,
         amend_reason: str | None = None,
         budget_exceeded: dict[str, Any] | None = None,
         audit_recorder: DeliveryPreparationAuditRecorder | None = None,
@@ -519,6 +793,8 @@ class DeliveryPreparationAgent:
                     indent=2,
                     sort_keys=True,
                 ),
+                failure_evidence_json=json.dumps(failure_evidence, indent=2, sort_keys=True),
+                applicable_constraints_json=json.dumps(list(applicable_constraints), indent=2, sort_keys=True),
                 amend_reason_json=json.dumps(amend_reason),
                 budget_exceeded_json=json.dumps(budget_exceeded, sort_keys=True),
                 component_guidance=component_guidance,
@@ -558,7 +834,259 @@ class DeliveryPreparationAgent:
             )
             raise
         self._record_amendment_success(audit_recorder, prompt=prompt, output=output, draft=draft)
-        return draft
+        if not applicable_constraints or not draft.replacement_units:
+            return draft
+
+        replacement_ids = [unit.id for unit in draft.replacement_units]
+        constraints = [
+            DeliveryAuthoringConstraintDraft(
+                id=str(value.get("id", "")),
+                kind=str(value.get("kind", "")),
+                summary=str(value.get("summary", "")),
+                unit_ids=list(replacement_ids),
+                disposition="preserved",
+            )
+            for value in applicable_constraints
+        ]
+        verification = self._verify_constraint_continuity(
+            authority_description=target_task_description,
+            constraints=constraints,
+            units=draft.replacement_units,
+            verification_scope="amendment_target_to_replacements",
+            completeness_rule=(
+                "Set constraints_complete to false unless every applicable inherited constraint supplied "
+                "by deterministic plan validation is represented exactly and preserved by every replacement unit."
+            ),
+            audit_recorder=audit_recorder,
+            audit_phase="delivery_amend_constraint_verification",
+            round_index=1,
+            verify_unit_context=False,
+        )
+        return replace(draft, constraint_verification=verification)
+
+    def _verify_constraint_continuity(
+        self,
+        *,
+        authority_description: str,
+        constraints: Sequence[DeliveryAuthoringConstraintDraft],
+        units: Sequence[DeliveryAuthoringUnitDraft],
+        verification_scope: str,
+        completeness_rule: str,
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+        audit_phase: str,
+        round_index: int,
+        verify_unit_context: bool,
+    ) -> DeliveryConstraintVerification:
+        constraints_payload = [constraint.to_plan_dict() for constraint in constraints]
+        units_payload = [self._verification_unit_payload(unit) for unit in units]
+        prompt = read_only_agent_prompt(
+            AGENT_SECURITY_PREFIX
+            + _DELIVERY_CONSTRAINT_VERIFICATION_PROMPT.format(
+                verification_scope=verification_scope,
+                completeness_rule=completeness_rule,
+                unit_context_rule=(
+                    "Check every candidate unit against the authoritative source task and report exact missing "
+                    "source literals as described below."
+                    if verify_unit_context
+                    else "This is a constraint-only amendment check. Return unit_context_complete=true and "
+                    "unit_context_gaps=[]."
+                ),
+                authority_description=authority_description,
+                constraints_json=json.dumps(constraints_payload, indent=2, sort_keys=True),
+                units_json=json.dumps(units_payload, indent=2, sort_keys=True),
+            )
+        )
+        try:
+            output = self.llm.generate("", prompt)
+        except Exception as exc:
+            self._record_constraint_verification_failure(
+                audit_recorder,
+                phase=audit_phase,
+                prompt=prompt,
+                output=None,
+                error=exc,
+                error_code="delivery_constraint_verification.authoring_failed",
+                round_index=round_index,
+            )
+            raise DeliveryPreparationAgentError("Delivery constraint verification assistant failed.") from None
+
+        try:
+            verification = parse_delivery_constraint_verification_output(
+                output,
+                unit_ids={unit.id for unit in units},
+                source_task_description=authority_description,
+                unit_task_markdown_by_id={unit.id: unit.task_markdown for unit in units},
+                require_unit_context=verify_unit_context,
+            )
+            self._assert_constraint_verification_echo(constraints, verification)
+        except DeliveryAuthoringParseError as exc:
+            self._record_constraint_verification_failure(
+                audit_recorder,
+                phase=audit_phase,
+                prompt=prompt,
+                output=output,
+                error=exc,
+                error_code=exc.code,
+                round_index=round_index,
+            )
+            raise
+
+        self._record_constraint_verification_success(
+            audit_recorder,
+            phase=audit_phase,
+            prompt=prompt,
+            output=output,
+            verification=verification,
+            round_index=round_index,
+        )
+        return verification
+
+    def _repair_constraint_gaps(
+        self,
+        *,
+        authority_description: str,
+        constraints: Sequence[DeliveryAuthoringConstraintDraft],
+        units: Sequence[DeliveryAuthoringUnitDraft],
+        gaps: Sequence[DeliveryConstraintGap],
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+    ) -> list[DeliveryAuthoringConstraintDraft]:
+        constraints_payload = [constraint.to_plan_dict() for constraint in constraints]
+        gaps_payload = [gap.to_dict() for gap in gaps]
+        units_payload = [self._verification_unit_payload(unit) for unit in units]
+        prompt = read_only_agent_prompt(
+            AGENT_SECURITY_PREFIX
+            + _DELIVERY_CONSTRAINT_REPAIR_PROMPT.format(
+                authority_description=authority_description,
+                constraints_json=json.dumps(constraints_payload, indent=2, sort_keys=True),
+                gaps_json=json.dumps(gaps_payload, indent=2, sort_keys=True),
+                units_json=json.dumps(units_payload, indent=2, sort_keys=True),
+            )
+        )
+        try:
+            output = self.llm.generate("", prompt)
+        except Exception as exc:
+            self._record_constraint_repair_failure(
+                audit_recorder,
+                prompt=prompt,
+                output=None,
+                error=exc,
+                error_code="delivery_constraint_repair.authoring_failed",
+            )
+            raise DeliveryPreparationAgentError("Delivery constraint repair assistant failed.") from None
+
+        try:
+            repaired = parse_delivery_constraint_repair_output(
+                output,
+                unit_ids={unit.id for unit in units},
+                source_task_description=authority_description,
+            )
+            self._assert_constraint_repair(constraints, repaired, gaps)
+        except DeliveryAuthoringParseError as exc:
+            self._record_constraint_repair_failure(
+                audit_recorder,
+                prompt=prompt,
+                output=output,
+                error=exc,
+                error_code=exc.code,
+            )
+            raise
+
+        self._record_constraint_repair_success(
+            audit_recorder,
+            prompt=prompt,
+            output=output,
+            constraints=repaired,
+        )
+        return repaired
+
+    @staticmethod
+    def _verification_unit_payload(unit: DeliveryAuthoringUnitDraft) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "id": unit.id,
+            "title": unit.title,
+            "depends_on": list(unit.depends_on),
+            "scope_paths": list(unit.scope_paths),
+            "asset_paths": list(unit.asset_paths),
+            "risk_tags": list(unit.risk_tags),
+            "task_markdown": unit.task_markdown,
+        }
+        for field_name in ("stream", "component", "phase", "kind", "platform", "estimated_size"):
+            value = getattr(unit, field_name)
+            if value is not None:
+                payload[field_name] = value
+        if unit.budget is not None:
+            payload["budget"] = unit.budget.to_dict()
+        return payload
+
+    @staticmethod
+    def _assert_constraint_verification_echo(
+        constraints: Sequence[DeliveryAuthoringConstraintDraft],
+        verification: DeliveryConstraintVerification,
+    ) -> None:
+        expected = [
+            (constraint.id, constraint.kind, constraint.summary, constraint.unit_ids) for constraint in constraints
+        ]
+        actual = [
+            (constraint.id, constraint.kind, constraint.summary, constraint.unit_ids)
+            for constraint in verification.constraints
+        ]
+        if actual != expected:
+            raise DeliveryAuthoringParseError(
+                "delivery_constraint_verification.constraints_mismatch",
+                "Constraint verification must echo every supplied constraint exactly and in order.",
+            )
+
+    @staticmethod
+    def _assert_constraint_repair(
+        original: Sequence[DeliveryAuthoringConstraintDraft],
+        repaired: Sequence[DeliveryAuthoringConstraintDraft],
+        gaps: Sequence[DeliveryConstraintGap],
+    ) -> None:
+        omitted = [gap for gap in gaps if gap.reason == "omitted"]
+        if len(repaired) != len(original) + len(omitted):
+            raise DeliveryAuthoringParseError(
+                "delivery_constraint_repair.constraint_count_invalid",
+                "Constraint repair must add exactly one constraint for every omitted gap.",
+            )
+
+        assignments_by_id: dict[str, list[str]] = {}
+        for gap in gaps:
+            if gap.reason == "incompletely_assigned" and gap.constraint_id is not None:
+                assignments_by_id.setdefault(gap.constraint_id, []).extend(gap.affected_unit_ids)
+
+        for index, existing in enumerate(original):
+            candidate = repaired[index]
+            if (
+                candidate.id != existing.id
+                or candidate.kind != existing.kind
+                or candidate.summary != existing.summary
+                or candidate.disposition != existing.disposition
+            ):
+                raise DeliveryAuthoringParseError(
+                    "delivery_constraint_repair.existing_constraint_changed",
+                    "Constraint repair must preserve every existing constraint identity and disposition.",
+                )
+            expected_unit_ids = list(existing.unit_ids)
+            for unit_id in assignments_by_id.get(existing.id, []):
+                if unit_id not in expected_unit_ids:
+                    expected_unit_ids.append(unit_id)
+            if candidate.unit_ids != expected_unit_ids:
+                raise DeliveryAuthoringParseError(
+                    "delivery_constraint_repair.assignment_invalid",
+                    "Constraint repair may add only verifier-identified missing unit assignments.",
+                )
+
+        additions = repaired[len(original) :]
+        for candidate, gap in zip(additions, omitted):
+            if (
+                candidate.kind != gap.kind
+                or candidate.summary != gap.summary
+                or candidate.unit_ids != gap.affected_unit_ids
+            ):
+                raise DeliveryAuthoringParseError(
+                    "delivery_constraint_repair.omitted_constraint_mismatch",
+                    "New constraints must match omitted verifier gaps in order, kind, summary, and affected units.",
+                )
 
     def _build_authoring_prompt(
         self,
@@ -781,6 +1309,7 @@ class DeliveryPreparationAgent:
                     "target_unit_id": draft.target_unit_id,
                     "replacement_ids": [unit.id for unit in draft.replacement_units],
                     "replacement_count": len(draft.replacement_units),
+                    "disposition": draft.disposition,
                     "warnings": list(draft.warnings),
                 },
             }
@@ -800,6 +1329,117 @@ class DeliveryPreparationAgent:
         audit_recorder(
             {
                 "phase": "delivery_amend_prepare_authoring",
+                "round_index": 1,
+                "prompt": prompt,
+                "raw_output": output,
+                "parsed": {
+                    "status": "failed",
+                    "error_type": type(error).__name__,
+                    "error_code": error_code,
+                    "error": str(error),
+                },
+            }
+        )
+
+    def _record_constraint_verification_success(
+        self,
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+        *,
+        phase: str,
+        prompt: str,
+        output: str,
+        verification: DeliveryConstraintVerification,
+        round_index: int,
+    ) -> None:
+        if audit_recorder is None:
+            return
+        audit_recorder(
+            {
+                "phase": phase,
+                "round_index": round_index,
+                "prompt": prompt,
+                "raw_output": output,
+                "parsed": {
+                    "status": "parsed",
+                    "constraints_complete": verification.constraints_complete,
+                    "constraint_ids": [constraint.id for constraint in verification.constraints],
+                    "dispositions": [constraint.disposition for constraint in verification.constraints],
+                    "constraint_gaps": [gap.to_dict() for gap in verification.constraint_gaps],
+                    "unit_context_complete": verification.unit_context_complete,
+                    "unit_context_gaps": [
+                        {"unit_id": gap.unit_id, "source_literal_count": len(gap.source_literals)}
+                        for gap in verification.unit_context_gaps
+                    ],
+                },
+            }
+        )
+
+    def _record_constraint_verification_failure(
+        self,
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+        *,
+        phase: str,
+        prompt: str,
+        output: str | None,
+        error: Exception,
+        error_code: str,
+        round_index: int,
+    ) -> None:
+        if audit_recorder is None:
+            return
+        audit_recorder(
+            {
+                "phase": phase,
+                "round_index": round_index,
+                "prompt": prompt,
+                "raw_output": output,
+                "parsed": {
+                    "status": "failed",
+                    "error_type": type(error).__name__,
+                    "error_code": error_code,
+                    "error": str(error),
+                },
+            }
+        )
+
+    def _record_constraint_repair_success(
+        self,
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+        *,
+        prompt: str,
+        output: str,
+        constraints: Sequence[DeliveryAuthoringConstraintDraft],
+    ) -> None:
+        if audit_recorder is None:
+            return
+        audit_recorder(
+            {
+                "phase": "delivery_prepare_constraint_repair",
+                "round_index": 1,
+                "prompt": prompt,
+                "raw_output": output,
+                "parsed": {
+                    "status": "parsed",
+                    "constraint_ids": [constraint.id for constraint in constraints],
+                    "dispositions": [constraint.disposition for constraint in constraints],
+                },
+            }
+        )
+
+    def _record_constraint_repair_failure(
+        self,
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+        *,
+        prompt: str,
+        output: str | None,
+        error: Exception,
+        error_code: str,
+    ) -> None:
+        if audit_recorder is None:
+            return
+        audit_recorder(
+            {
+                "phase": "delivery_prepare_constraint_repair",
                 "round_index": 1,
                 "prompt": prompt,
                 "raw_output": output,

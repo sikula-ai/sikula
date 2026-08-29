@@ -845,6 +845,10 @@ class TestCmdReviewWorktreeSetup:
         def capture(cmd, **kwargs):
             if cmd[0:2] == ["git", "symbolic-ref"]:
                 return _sub(stdout="feature/current\n")
+            if cmd[0:3] == ["git", "worktree", "add"]:
+                path_index = 4 if cmd[3] == "--detach" else 3
+                Path(cmd[path_index]).mkdir(parents=True)
+                return _sub()
             if cmd == ["git", "diff", "--cached", "--name-only"]:
                 return _sub()
             if cmd == ["git", "diff", "--name-only"]:
@@ -1274,6 +1278,10 @@ class TestCmdReviewWorktreeSetup:
 
         def capture(cmd, **kwargs):
             calls.append(cmd)
+            if cmd[0:3] == ["git", "worktree", "add"]:
+                path_index = 4 if cmd[3] == "--detach" else 3
+                Path(cmd[path_index]).mkdir(parents=True)
+                return _sub()
             if cmd[0:3] == ["git", "diff", "--name-only"]:
                 return _sub(stdout="src/main.py\n")
             if "diff" in cmd:
@@ -1308,6 +1316,40 @@ class TestCmdReviewWorktreeSetup:
             cmd_review(_args(fix=True), cfg)
 
         assert any("local.properties" in src for src, _ in copied)
+
+    def test_fix_mode_rejects_dangling_environment_destination(self, tmp_path: Path) -> None:
+        (tmp_path / "local.properties").write_text("sdk.dir=/opt/android-sdk\n", encoding="utf-8")
+        external = tmp_path / "external" / "local.properties"
+        calls: list[list[str]] = []
+
+        def capture(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0:3] == ["git", "worktree", "add"]:
+                path_index = 4 if cmd[3] == "--detach" else 3
+                worktree = Path(cmd[path_index])
+                worktree.mkdir(parents=True)
+                try:
+                    (worktree / "local.properties").symlink_to(external)
+                except OSError as exc:
+                    pytest.skip(f"symlinks are not available: {exc}")
+            return _sub()
+
+        cfg = _cfg(tmp_path)
+        cfg["project"]["build_tool"] = "gradle-android"
+
+        with (
+            patch("sikula._find_git_root", return_value=tmp_path),
+            patch("sikula._ensure_gitignore"),
+            patch("subprocess.run", side_effect=capture),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_review(_args(fix=True), cfg)
+
+        assert exc_info.value.code == 1
+        assert not external.exists()
+        remove_calls = [cmd for cmd in calls if cmd[0:3] == ["git", "worktree", "remove"]]
+        assert len(remove_calls) == 1
+        assert Path(remove_calls[0][3]).parent == tmp_path / ".sikula" / "worktrees"
 
     def test_report_only_does_not_copy_env_files(self, tmp_path: Path):
         """Report-only mode must not copy any files — it is strictly read-only."""

@@ -8,11 +8,12 @@ from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import time
 import uuid
+
+from core.worktree import WorktreeEnvironmentCopyError, copy_worktree_environment_file
 
 
 def register_parser(subparsers) -> argparse.ArgumentParser:
@@ -250,12 +251,16 @@ def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | Non
 
     if args.fix:
         # Copy gitignored environment files the build needs (e.g. local.properties on Android).
-        for name in context.build_tool_class(cfg).env_files():
-            src = original_project_root / name
-            dst = worktree_project_root / name
-            if src.exists() and not dst.exists():
-                shutil.copy2(src, dst)
-                context.logger.info("Copied %s to worktree", name)
+        try:
+            for name in context.build_tool_class(cfg).env_files():
+                src = original_project_root / name
+                dst = worktree_project_root / name
+                if copy_worktree_environment_file(src, dst, worktree_project_root):
+                    context.logger.info("Copied %s to worktree", name)
+        except WorktreeEnvironmentCopyError as exc:
+            print(f"Worktree environment setup failed: {exc}")
+            subprocess.run(["git", "worktree", "remove", str(worktree_base)], cwd=git_root, check=False)
+            sys.exit(1)
 
     # Compute three-dot diff: all commits introduced by the selected target vs base.
     diff_target = "HEAD" if current_branch_mode else branch

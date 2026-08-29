@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from hashlib import sha256
 import json
 from pathlib import Path
 import subprocess
@@ -10,6 +11,10 @@ import pytest
 import yaml
 
 from core.delivery_authoring import DeliveryAmendmentAuthoringDraft, DeliveryAuthoringUnitDraft
+from core.delivery_constraint_context import (
+    delivery_constraint_context_fingerprint,
+    parse_delivery_constraint_context,
+)
 from core.delivery_handoff import (
     build_delivery_unit_handoff,
     delivery_unit_handoff_path,
@@ -53,6 +58,7 @@ from sikula_cli.delivery import (
     _progress_from_status,
     _run_next_delivery_unit,
     _system_exit_code,
+    cmd_delivery_run,
     cmd_delivery_run_next,
 )
 
@@ -371,6 +377,7 @@ def _run_next_context(root: Path, runner) -> DeliveryRunNextContext:
     return DeliveryRunNextContext(
         run_task=runner,
         resolve_state_dir=lambda cfg: Path(cfg["tasks"]["state_dir"]),
+        state_store=JsonStateStore(root / ".sikula" / "state"),
     )
 
 
@@ -524,6 +531,64 @@ def test_cmd_delivery_run_next_dry_run_rejects_invalid_agent_override_before_pre
     assert "Unknown agent 'bogus'" in capsys.readouterr().out
     assert not delivery_progress_path(tmp_path, "delivery-run-next-demo").exists()
     assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_dry_run_blocks_disjoint_write_scope(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan["units"][0]["scope_paths"] = ["core/"]
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+    cfg = _run_next_cfg(tmp_path)
+    cfg["sandbox"] = {"allowed_write_paths": ["agents/"]}
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, dry_run=True, json_output=True),
+            cfg,
+        )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert payload["ready"] is False
+    assert payload["errors"][-1]["code"] == "delivery_write_scope.empty_intersection"
+    assert not delivery_progress_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_bounded_delivery_dry_run_blocks_disjoint_write_scope(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan["units"][0]["scope_paths"] = ["core/"]
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+    cfg = _run_next_cfg(tmp_path)
+    cfg["sandbox"] = {"allowed_write_paths": ["agents/"]}
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        dry_run=True,
+        reset_failed=False,
+        json=True,
+        max_units=None,
+        max_elapsed_minutes=None,
+        agent_model=None,
+        agent_provider=None,
+        agent_timeout=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_run(args, cfg)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert payload["ready"] is False
+    assert payload["errors"][-1]["code"] == "delivery_write_scope.empty_intersection"
+    assert not delivery_progress_path(tmp_path, "delivery-run-next-demo").exists()
 
 
 def test_cmd_delivery_run_next_rejects_budget_split_with_dry_run_before_side_effects(
@@ -1355,6 +1420,116 @@ def test_cmd_delivery_run_next_records_failed_child_run(tmp_path: Path, capsys: 
     assert progress["units"][0]["failure_code"] == "child_run_failed"
 
 
+@pytest.mark.parametrize(
+    ("failure_code", "source", "public_error"),
+    [
+        ("unit_scope_violation", "orchestrator", "delivery.unit_scope_violation"),
+        ("scope_amendment_required", "reviewer", "delivery.scope_amendment_required"),
+        ("external_dependency_gap", "implementer", "delivery.external_dependency_gap"),
+        (
+            "implementer_disposition_invalid",
+            "implementer",
+            "delivery.implementer_disposition_invalid",
+        ),
+    ],
+)
+def test_cmd_delivery_run_next_projects_terminal_child_stop(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    failure_code: str,
+    source: str,
+    public_error: str,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        state = store.create("child task")
+        state.set_delivery_terminal_stop(failure_code, source=source)
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=1, child_task_id=state.task_id)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    projected = payload["selected_unit"]
+    assert payload["ran"] is True
+    assert payload["succeeded"] is False
+    assert payload["unit_status"] == "failed"
+    assert payload["errors"][0]["code"] == public_error
+    assert projected["failure_code"] == failure_code
+    assert projected["run_next_blocked_reason"] == failure_code
+    assert projected["run_next_available"] is False
+    assert "run_next_action" not in projected
+
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["failure_code"] == failure_code
+    events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    assert json.loads(events[-1])["failure_code"] == failure_code
+
+
+@pytest.mark.parametrize(
+    ("failure_code", "public_error"),
+    [
+        ("unit_scope_violation", "delivery.unit_scope_violation"),
+        ("scope_amendment_required", "delivery.scope_amendment_required"),
+        ("external_dependency_gap", "delivery.external_dependency_gap"),
+    ],
+)
+def test_cmd_delivery_run_next_rechecks_terminal_stop_after_lock_acquisition(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    failure_code: str,
+    public_error: str,
+) -> None:
+    import core.delivery_progress as delivery_progress_module
+
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    child_called = False
+
+    def acquire_and_transition(*args, **kwargs):
+        lock = acquire_delivery_progress_lock(*args, **kwargs)
+        _write_progress(
+            tmp_path,
+            [{"unit_id": "01-foundation", "status": "failed", "failure_code": failure_code}],
+        )
+        return lock
+
+    def runner(*_args) -> DeliveryChildRunResult:
+        nonlocal child_called
+        child_called = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    monkeypatch.setattr(delivery_progress_module, "acquire_delivery_progress_lock", acquire_and_transition)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert child_called is False
+    assert payload["ran"] is False
+    assert payload["errors"][-1]["code"] == public_error
+    assert payload["selected_unit"]["failure_code"] == failure_code
+    assert payload["selected_unit"]["run_next_blocked_reason"] == failure_code
+    assert payload["selected_unit"]["run_next_available"] is False
+
+
 def test_cmd_delivery_run_next_does_not_mark_unfinalized_child_run_done(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1508,6 +1683,7 @@ def test_cmd_delivery_run_next_dry_run_reports_running_recovery_even_when_depend
     cmd_delivery_run_next(
         _run_next_args(plan_path, dry_run=True, json_output=True),
         cfg,
+        _run_next_context(tmp_path, lambda *_args: 0),
     )
 
     payload = json.loads(capsys.readouterr().out)
@@ -1517,6 +1693,105 @@ def test_cmd_delivery_run_next_dry_run_reports_running_recovery_even_when_depend
     assert payload["selected_unit"]["child_task_id"] == "resume-child"
     assert payload["errors"] == []
     assert "resume or reconciliation" in payload["message"]
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+@pytest.mark.parametrize(
+    ("unit_status", "child_failed", "reset_failed"),
+    [
+        ("running", False, False),
+        ("failed", True, True),
+    ],
+)
+def test_cmd_delivery_run_next_dry_run_revalidates_persisted_scope_for_resume(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    unit_status: str,
+    child_failed: bool,
+    reset_failed: bool,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-foundation", "status": unit_status, "child_task_id": "resume-child"}],
+    )
+    cfg = _run_next_cfg(tmp_path)
+    cfg["sandbox"] = {"allowed_write_paths": ["docs/"]}
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    state = _resume_child_state()
+    state.failed = child_failed
+    state.delivery_write_scope_schema_version = 2
+    state.delivery_write_scope_mode = "unit_explicit"
+    state.delivery_declared_write_paths = ["src"]
+    state.delivery_declared_write_exact_file_paths = []
+    state.delivery_effective_write_paths = ["src"]
+    state.delivery_effective_write_exact_file_paths = []
+    _record_resume_worktree(state, tmp_path)
+    store.save(state)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(
+                plan_path,
+                dry_run=True,
+                reset_failed=reset_failed,
+                json_output=True,
+            ),
+            cfg,
+            _run_next_context(tmp_path, lambda *_args: 0),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is False
+    assert payload["selected_unit"]["status"] == unit_status
+    assert payload["errors"][-1]["code"] == "delivery_write_scope.runtime_intersection_invalid"
+    assert cfg["project"]["root_path"] == str(tmp_path)
+    assert cfg["sandbox"]["allowed_write_paths"] == ["docs/"]
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_cmd_delivery_run_next_dry_run_rejects_retargeted_persisted_symlink_scope(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}],
+    )
+    cfg = _run_next_cfg(tmp_path)
+    cfg["sandbox"] = {"allowed_write_paths": ["."]}
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    state = _resume_child_state()
+    state.delivery_write_scope_schema_version = 2
+    state.delivery_write_scope_mode = "unit_explicit"
+    state.delivery_declared_write_paths = ["src/alias"]
+    state.delivery_declared_write_exact_file_paths = []
+    state.delivery_effective_write_paths = ["src/alias"]
+    state.delivery_effective_write_exact_file_paths = []
+    _record_resume_worktree(state, tmp_path)
+    worktree = Path(state.worktree_path or "")
+    (worktree / "src").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (worktree / "src" / "alias").symlink_to(outside, target_is_directory=True)
+    store.save(state)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, dry_run=True, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, lambda *_args: 0),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is False
+    assert payload["errors"][-1]["code"] == "delivery_write_scope.snapshot_invalid"
+    assert str(outside) not in json.dumps(payload)
     assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
 
 
@@ -1534,6 +1809,7 @@ def test_cmd_delivery_run_next_dry_run_blocks_running_recovery_missing_child_sta
         cmd_delivery_run_next(
             _run_next_args(plan_path, dry_run=True, json_output=True),
             _run_next_cfg(tmp_path),
+            _run_next_context(tmp_path, lambda *_args: 0),
         )
 
     assert exc.value.code == 1
@@ -1566,6 +1842,7 @@ def test_cmd_delivery_run_next_dry_run_blocks_running_recovery_child_metadata_mi
         cmd_delivery_run_next(
             _run_next_args(plan_path, dry_run=True, json_output=True),
             cfg,
+            _run_next_context(tmp_path, lambda *_args: 0),
         )
 
     assert exc.value.code == 1
@@ -2550,7 +2827,7 @@ def test_cmd_delivery_run_next_resumes_running_child_and_records_failed_parent_u
     assert [json.loads(event)["event_type"] for event in events] == ["unit.resume_intent", "unit.failed"]
 
 
-def test_cmd_delivery_run_next_resumes_running_child_and_marks_interrupted_parent_unit(
+def test_cmd_delivery_run_next_resumes_running_child_and_preserves_terminal_stop_during_interrupt(
     tmp_path: Path,
 ) -> None:
     _git_init(tmp_path)
@@ -2570,6 +2847,10 @@ def test_cmd_delivery_run_next_resumes_running_child_and_marks_interrupted_paren
         assert run_args.delivery_unit_id is None
         assert run_args.delivery_plan_path is None
         assert run_args.delivery_child_created_callback is None
+        interrupted = store.load("resume-child")
+        assert interrupted is not None
+        interrupted.set_delivery_terminal_stop("unit_scope_violation", source="orchestrator")
+        store.save(interrupted)
         raise KeyboardInterrupt
 
     with pytest.raises(KeyboardInterrupt):
@@ -2581,7 +2862,7 @@ def test_cmd_delivery_run_next_resumes_running_child_and_marks_interrupted_paren
 
     progress = _load_delivery_progress(tmp_path)
     assert progress["units"][0]["status"] == "failed"
-    assert progress["units"][0]["failure_code"] == "child_run_interrupted"
+    assert progress["units"][0]["failure_code"] == "unit_scope_violation"
     events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
     assert [json.loads(event)["event_type"] for event in events] == ["unit.resume_intent", "unit.failed"]
 
@@ -3020,6 +3301,58 @@ def test_cmd_delivery_run_next_reconciles_running_unit_with_terminal_child_state
     assert parsed_events[1]["child_task_id"] == "resume-child"
 
 
+def test_cmd_delivery_run_next_reconciles_running_terminal_stop_despite_stale_done_flags(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [{"unit_id": "01-foundation", "status": "running", "child_task_id": "resume-child"}],
+    )
+    cfg = _run_next_cfg(tmp_path)
+    store = JsonStateStore(Path(cfg["tasks"]["state_dir"]))
+    state = _resume_child_state()
+    state.set_delivery_terminal_stop("scope_amendment_required", source="reviewer")
+    state.failed = False
+    state.done = True
+    state.result_commit = "stale-result-commit"
+    state.worktree_branch = "sikula/01-foundation-child"
+    store.save(state)
+    child_called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal child_called
+        child_called = True
+        return DeliveryChildRunResult(exit_code=0)
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert child_called is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is True
+    assert payload["valid"] is False
+    assert payload["unit_status"] == "failed"
+    assert payload["errors"][0]["code"] == "delivery.scope_amendment_required"
+    assert payload["selected_unit"]["failure_code"] == "scope_amendment_required"
+    assert payload["selected_unit"]["run_next_available"] is False
+
+    progress = _load_delivery_progress(tmp_path)
+    assert progress["units"][0]["failure_code"] == "scope_amendment_required"
+    assert not delivery_unit_handoff_path(tmp_path, "delivery-run-next-demo", "01-foundation").exists()
+    events = delivery_events_path(tmp_path, "delivery-run-next-demo").read_text(encoding="utf-8").splitlines()
+    parsed_events = [json.loads(event) for event in events]
+    assert [event["event_type"] for event in parsed_events] == ["unit.reconcile_intent", "unit.failed"]
+    assert parsed_events[-1]["failure_code"] == "scope_amendment_required"
+
+
 def test_cmd_delivery_run_next_reset_failed_retries_failed_running_child(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3217,6 +3550,12 @@ def test_delivery_child_resume_run_args_uses_task_id_resume_shape(reset_failed: 
     assert args.delivery_plan_id is None
     assert args.delivery_unit_id is None
     assert args.delivery_plan_path is None
+    assert args.delivery_write_scope_schema_version is None
+    assert args.delivery_write_scope_mode is None
+    assert args.delivery_declared_write_paths is None
+    assert args.delivery_declared_write_exact_file_paths is None
+    assert args.delivery_effective_write_paths is None
+    assert args.delivery_effective_write_exact_file_paths is None
     assert args.delivery_child_created_callback is None
     assert args.created_task_id == "resume-child"
     assert args.agent_model == ["analyst=gpt-5.5"]
@@ -3522,6 +3861,7 @@ def test_classify_delivery_child_run_preserves_planner_budget_stop() -> None:
         result_commit=None,
         worktree_path="wt",
         worktree_base=None,
+        delivery_stop_code="external_dependency_gap",
         delivery_budget_stop={
             "code": "unit_budget_exceeded",
             "name": "max_planner_steps",
@@ -3542,6 +3882,93 @@ def test_classify_delivery_child_run_preserves_planner_budget_stop() -> None:
         "limit": 1,
         "actual": 3,
     }
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    [
+        "unit_scope_violation",
+        "scope_amendment_required",
+        "external_dependency_gap",
+        "implementer_disposition_invalid",
+    ],
+)
+def test_classify_delivery_child_run_preserves_terminal_stop(failure_code: str) -> None:
+    child_state = argparse.Namespace(
+        done=False,
+        failed=True,
+        result_commit=None,
+        worktree_path="wt",
+        worktree_base=None,
+        delivery_budget_stop=None,
+        delivery_stop_code=failure_code,
+    )
+
+    classification = _classify_delivery_child_run(DeliveryChildRunResult(exit_code=1), child_state)
+
+    assert classification.unit_status == "failed"
+    assert classification.failure_code == failure_code
+    assert classification.budget_exceeded is None
+
+
+def test_classify_delivery_child_run_preserves_terminal_stop_despite_stale_done_flags() -> None:
+    child_state = argparse.Namespace(
+        done=True,
+        failed=False,
+        result_commit="stale-result-commit",
+        worktree_path="wt",
+        worktree_base=None,
+        delivery_budget_stop=None,
+        delivery_stop_code="unit_scope_violation",
+    )
+
+    classification = _classify_delivery_child_run(DeliveryChildRunResult(exit_code=0), child_state)
+
+    assert classification.unit_status == "failed"
+    assert classification.failure_code == "unit_scope_violation"
+
+
+@pytest.mark.parametrize(
+    "child_result",
+    [
+        DeliveryChildRunResult(exit_code=1, interrupted=True),
+        DeliveryChildRunResult(exit_code=1, exception=RuntimeError("wrapper failed")),
+    ],
+)
+def test_classify_delivery_child_run_prefers_persisted_terminal_stop_over_wrapper_failure(
+    child_result: DeliveryChildRunResult,
+) -> None:
+    child_state = argparse.Namespace(
+        done=False,
+        failed=True,
+        result_commit=None,
+        worktree_path="wt",
+        worktree_base=None,
+        delivery_budget_stop=None,
+        delivery_stop_code="unit_scope_violation",
+    )
+
+    classification = _classify_delivery_child_run(child_result, child_state)
+
+    assert classification.unit_status == "failed"
+    assert classification.failure_code == "unit_scope_violation"
+
+
+@pytest.mark.parametrize("failure_code", ["unknown", 1, None])
+def test_classify_delivery_child_run_rejects_invalid_terminal_stop(failure_code) -> None:
+    child_state = argparse.Namespace(
+        done=False,
+        failed=True,
+        result_commit=None,
+        worktree_path="wt",
+        worktree_base=None,
+        delivery_budget_stop=None,
+        delivery_stop_code=failure_code,
+    )
+
+    classification = _classify_delivery_child_run(DeliveryChildRunResult(exit_code=1), child_state)
+
+    assert classification.failure_code == "child_run_failed"
 
 
 def test_classify_delivery_child_run_rejects_malformed_budget_stop() -> None:
@@ -3678,6 +4105,67 @@ def test_delivery_child_run_args_copies_unit_budget() -> None:
     assert args.delivery_unit_budget == {"max_planner_steps": 2, "max_changed_files": 4}
 
 
+def test_delivery_child_run_args_copies_constraint_context() -> None:
+    source_task = {"path": ".sikula/tasks/source.md", "sha256": f"sha256:{'a' * 64}"}
+    constraints = [
+        {
+            "id": "ownership",
+            "kind": "repository_ownership",
+            "summary": "Only this repository may be changed.",
+            "unit_ids": ["01-foundation"],
+            "disposition": "preserved",
+        }
+    ]
+
+    args = _delivery_child_run_args(
+        root=Path("/fake/root"),
+        task_path="tasks/unit.md",
+        delivery_constraint_context_schema_version=1,
+        delivery_source_task=source_task,
+        delivery_inherited_constraints=constraints,
+        delivery_constraint_context_fingerprint="b" * 64,
+    )
+    source_task["path"] = "mutated.md"
+    constraints[0]["unit_ids"].append("mutated")
+
+    assert args.delivery_constraint_context_schema_version == 1
+    assert args.delivery_source_task == {
+        "path": ".sikula/tasks/source.md",
+        "sha256": f"sha256:{'a' * 64}",
+    }
+    assert args.delivery_inherited_constraints[0]["unit_ids"] == ["01-foundation"]
+    assert args.delivery_constraint_context_fingerprint == "b" * 64
+
+
+def test_delivery_child_run_args_copies_write_scope() -> None:
+    declared_paths = ["core/state.py"]
+    declared_exact_file_paths = ["core/state.py"]
+    effective_paths = ["core/state.py"]
+    effective_exact_file_paths = ["core/state.py"]
+
+    args = _delivery_child_run_args(
+        root=Path("/fake/root"),
+        task_path="tasks/unit.md",
+        delivery_write_scope_schema_version=2,
+        delivery_write_scope_mode="unit_explicit",
+        delivery_declared_write_paths=declared_paths,
+        delivery_declared_write_exact_file_paths=declared_exact_file_paths,
+        delivery_effective_write_paths=effective_paths,
+        delivery_effective_write_exact_file_paths=effective_exact_file_paths,
+    )
+    declared_paths.append("mutated.py")
+    declared_exact_file_paths.append("mutated.py")
+    effective_paths.append("mutated.py")
+    effective_exact_file_paths.append("mutated.py")
+
+    assert args.delivery_write_scope_schema_version == 2
+    assert args.delivery_write_scope_mode == "unit_explicit"
+    assert args.delivery_declared_write_paths == ["core/state.py"]
+    assert args.delivery_declared_write_exact_file_paths == ["core/state.py"]
+    assert args.delivery_effective_write_paths == ["core/state.py"]
+    assert args.delivery_effective_write_exact_file_paths == ["core/state.py"]
+
+
 def test_delivery_child_run_args_filters_delivery_preparer_overrides() -> None:
     args = _delivery_child_run_args(
         root=Path("/fake/root"),
@@ -3718,6 +4206,12 @@ def test_invoke_delivery_child_run_forwards_metadata(tmp_path: Path) -> None:
         delivery_plan_id="my-plan-id",
         delivery_unit_id="my-unit-id",
         delivery_plan_path="my-plan-path",
+        delivery_write_scope_schema_version=2,
+        delivery_write_scope_mode="unit_explicit",
+        delivery_declared_write_paths=["core/state.py"],
+        delivery_declared_write_exact_file_paths=[],
+        delivery_effective_write_paths=["core/state.py"],
+        delivery_effective_write_exact_file_paths=[],
         delivery_child_created_callback=callback,
     )
 
@@ -3725,6 +4219,12 @@ def test_invoke_delivery_child_run_forwards_metadata(tmp_path: Path) -> None:
     assert captured_args.delivery_plan_id == "my-plan-id"
     assert captured_args.delivery_unit_id == "my-unit-id"
     assert captured_args.delivery_plan_path == "my-plan-path"
+    assert captured_args.delivery_write_scope_schema_version == 2
+    assert captured_args.delivery_write_scope_mode == "unit_explicit"
+    assert captured_args.delivery_declared_write_paths == ["core/state.py"]
+    assert captured_args.delivery_declared_write_exact_file_paths == []
+    assert captured_args.delivery_effective_write_paths == ["core/state.py"]
+    assert captured_args.delivery_effective_write_exact_file_paths == []
     assert captured_args.delivery_child_created_callback is callback
 
 
@@ -3733,7 +4233,38 @@ def test_cmd_delivery_run_next_computes_and_forwards_metadata(
 ) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
+    source_task = tmp_path / ".sikula" / "tasks" / "delivery-source.md"
+    source_task.parent.mkdir(parents=True, exist_ok=True)
+    source_body = "# Delivery source\n\nKeep ownership boundaries.\n"
+    source_task.write_text(source_body, encoding="utf-8")
+    plan_data = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan_data["source_task"] = {
+        "path": source_task.relative_to(tmp_path).as_posix(),
+        "sha256": f"sha256:{sha256(source_body.encode()).hexdigest()}",
+    }
+    plan_data["constraints"] = [
+        {
+            "id": "foundation-ownership",
+            "kind": "repository_ownership",
+            "summary": "Only this repository may be changed.",
+            "unit_ids": ["01-foundation"],
+            "disposition": "preserved",
+        },
+        {
+            "id": "feature-stop",
+            "kind": "stop_and_follow_up",
+            "summary": "Stop the feature unit if external work is required.",
+            "unit_ids": ["02-feature"],
+            "disposition": "preserved",
+        },
+    ]
+    plan_data["units"][0]["scope_paths"] = ["core/state.py"]
+    plan_path.write_text(yaml.safe_dump(plan_data, sort_keys=False), encoding="utf-8")
     cfg = _run_next_cfg(tmp_path)
+    cfg["sandbox"] = {
+        "allowed_write_paths": ["core/"],
+        "allowed_test_write_paths": ["tests/"],
+    }
 
     captured_args = None
 
@@ -3760,6 +4291,135 @@ def test_cmd_delivery_run_next_computes_and_forwards_metadata(
     expected_path = plan_path.resolve().relative_to(tmp_path.resolve()).as_posix()
     assert captured_args.delivery_plan_path == expected_path
     assert captured_args.delivery_unit_budget == {"max_planner_steps": 1}
+    assert captured_args.delivery_constraint_context_schema_version == 1
+    assert captured_args.delivery_source_task == plan_data["source_task"]
+    assert captured_args.delivery_inherited_constraints == [plan_data["constraints"][0]]
+    assert captured_args.delivery_constraint_context_fingerprint == delivery_constraint_context_fingerprint(
+        schema_version=1,
+        plan_id="delivery-run-next-demo",
+        unit_id="01-foundation",
+        plan_path=expected_path,
+        source_task=plan_data["source_task"],
+        constraints=[plan_data["constraints"][0]],
+    )
+    assert captured_args.delivery_write_scope_schema_version == 2
+    assert captured_args.delivery_write_scope_mode == "unit_explicit"
+    assert captured_args.delivery_declared_write_paths == ["core/state.py"]
+    assert captured_args.delivery_declared_write_exact_file_paths == []
+    assert captured_args.delivery_effective_write_paths == ["core/state.py"]
+    assert captured_args.delivery_effective_write_exact_file_paths == []
+
+
+@pytest.mark.parametrize("legacy_unit_id", ["unit one", "feature/api", r"feature\api"])
+def test_cmd_delivery_run_next_preserves_legacy_valid_unit_ids_in_child_context(
+    tmp_path: Path,
+    legacy_unit_id: str,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    plan_data = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    original_id = plan_data["units"][0]["id"]
+    plan_data["units"][0]["id"] = legacy_unit_id
+    plan_data["units"][1]["depends_on"] = [legacy_unit_id]
+    source_task = tmp_path / ".sikula" / "tasks" / "source.md"
+    source_task.parent.mkdir(parents=True, exist_ok=True)
+    source_body = "# Source\n\nPreserve repository ownership.\n"
+    source_task.write_text(source_body, encoding="utf-8")
+    plan_data["source_task"] = {
+        "path": source_task.relative_to(tmp_path).as_posix(),
+        "sha256": f"sha256:{sha256(source_body.encode()).hexdigest()}",
+    }
+    plan_data["constraints"] = [
+        {
+            "id": "ownership",
+            "kind": "repository_ownership",
+            "summary": "Repository changes stay with their designated owner.",
+            "unit_ids": [legacy_unit_id],
+            "disposition": "preserved",
+        }
+    ]
+    plan_path.write_text(yaml.safe_dump(plan_data, sort_keys=False), encoding="utf-8")
+    cfg = _run_next_cfg(tmp_path)
+    parsed_unit_ids: list[str] = []
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        context_state = TaskState(
+            task_id="context-child",
+            task_description="child task",
+            delivery_plan_id=run_args.delivery_plan_id,
+            delivery_unit_id=run_args.delivery_unit_id,
+            delivery_plan_path=run_args.delivery_plan_path,
+            delivery_constraint_context_schema_version=run_args.delivery_constraint_context_schema_version,
+            delivery_source_task=run_args.delivery_source_task,
+            delivery_inherited_constraints=run_args.delivery_inherited_constraints,
+            delivery_constraint_context_fingerprint=run_args.delivery_constraint_context_fingerprint,
+        )
+        context = parse_delivery_constraint_context(context_state)
+        assert context is not None
+        parsed_unit_ids.append(context.unit_id)
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        state = store.create("child task")
+        state.done = True
+        state.worktree_branch = "branch"
+        state.result_commit = "commit"
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
+
+    cmd_delivery_run_next(
+        _run_next_args(plan_path),
+        cfg,
+        _run_next_context(tmp_path, runner),
+    )
+
+    assert original_id != legacy_unit_id
+    assert parsed_unit_ids == [legacy_unit_id]
+
+
+def test_cmd_delivery_run_next_blocks_disjoint_write_scope_before_child_creation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    plan_data = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan_data["units"][0]["scope_paths"] = ["core/"]
+    plan_path.write_text(yaml.safe_dump(plan_data, sort_keys=False), encoding="utf-8")
+    cfg = _run_next_cfg(tmp_path)
+    cfg["sandbox"] = {
+        "allowed_write_paths": ["agents/"],
+        "allowed_test_write_paths": ["tests/"],
+    }
+    child_called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal child_called
+        child_called = True
+        return DeliveryChildRunResult(exit_code=0, child_task_id="unexpected-child")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc_info.value.code == 1
+    assert child_called is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is False
+    assert payload["succeeded"] is False
+    assert payload["status"] == "pending"
+    assert payload["progress_exists"] is False
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["selected_unit"]["status"] == "pending"
+    assert payload["child_task_id"] is None
+    assert payload["errors"][-1]["code"] == "delivery_write_scope.empty_intersection"
+    assert str(tmp_path) not in json.dumps(payload)
+    assert not delivery_progress_path(tmp_path, "delivery-run-next-demo").exists()
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+    state_dir = Path(cfg["tasks"]["state_dir"])
+    assert not list(state_dir.glob("*.json"))
+    assert not (tmp_path / ".sikula" / "worktrees").exists()
 
 
 def test_cmd_delivery_run_next_does_not_prepare_split_when_unit_completes(
@@ -3771,6 +4431,16 @@ def test_cmd_delivery_run_next_does_not_prepare_split_when_unit_completes(
     cfg = _run_next_cfg(tmp_path)
 
     def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        assert run_args.delivery_constraint_context_schema_version == 1
+        assert run_args.delivery_source_task is None
+        assert run_args.delivery_inherited_constraints == []
+        assert len(run_args.delivery_constraint_context_fingerprint) == 64
+        assert run_args.delivery_write_scope_schema_version == 2
+        assert run_args.delivery_write_scope_mode == "repository_default"
+        assert run_args.delivery_declared_write_paths == []
+        assert run_args.delivery_declared_write_exact_file_paths == []
+        assert run_args.delivery_effective_write_paths == []
+        assert run_args.delivery_effective_write_exact_file_paths == []
         store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
         state = store.create("child task")
         state.done = True
@@ -3785,6 +4455,7 @@ def test_cmd_delivery_run_next_does_not_prepare_split_when_unit_completes(
     context = DeliveryRunNextContext(
         run_task=runner,
         resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
         run_amendment_authoring=author,
     )
 
@@ -3822,6 +4493,7 @@ def test_cmd_delivery_run_next_does_not_prepare_split_for_non_budget_failure(
     context = DeliveryRunNextContext(
         run_task=runner,
         resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
         run_amendment_authoring=author,
     )
 
@@ -3968,6 +4640,7 @@ def test_cmd_delivery_run_next_prepares_existing_budget_split_after_lock_release
     context = DeliveryRunNextContext(
         run_task=runner,
         resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
         run_amendment_authoring=author,
     )
 
@@ -4050,6 +4723,7 @@ def test_cmd_delivery_run_next_does_not_prepare_existing_budget_split_while_lock
     context = DeliveryRunNextContext(
         run_task=runner,
         resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
         run_amendment_authoring=author,
     )
     lock = acquire_delivery_progress_lock(tmp_path, "delivery-run-next-demo")
@@ -4112,6 +4786,7 @@ def test_cmd_delivery_run_next_prepares_fresh_budget_split_after_child_failure(
     context = DeliveryRunNextContext(
         run_task=runner,
         resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
         run_amendment_authoring=author,
     )
 
@@ -4181,6 +4856,7 @@ def test_cmd_delivery_run_next_budget_split_rejects_mismatched_child_stop_before
     context = DeliveryRunNextContext(
         run_task=lambda *_args: None,
         resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
         run_amendment_authoring=author,
     )
 
@@ -4241,6 +4917,7 @@ def test_cmd_delivery_run_next_budget_split_rejects_mismatched_child_budget_snap
     context = DeliveryRunNextContext(
         run_task=lambda *_args: None,
         resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
         run_amendment_authoring=author,
     )
 
@@ -4285,6 +4962,7 @@ def test_cmd_delivery_run_next_budget_split_blocks_ambiguous_candidates_before_a
     context = DeliveryRunNextContext(
         run_task=lambda *_args: None,
         resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
         run_amendment_authoring=author,
     )
 
@@ -4339,6 +5017,7 @@ def test_cmd_delivery_run_next_budget_split_blocks_invalid_child_state_before_au
     context = DeliveryRunNextContext(
         run_task=lambda *_args: None,
         resolve_state_dir=lambda config: Path(config["tasks"]["state_dir"]),
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
         run_amendment_authoring=author,
     )
 
@@ -4393,6 +5072,7 @@ def test_cmd_delivery_run_next_omits_unsafe_metadata_plan_path(tmp_path: Path, m
     assert captured_args.delivery_plan_id == "delivery-run-next-demo"
     assert captured_args.delivery_unit_id == "01-foundation"
     assert captured_args.delivery_plan_path is None
+    assert len(captured_args.delivery_constraint_context_fingerprint) == 64
 
 
 def test_cmd_delivery_run_next_blocks_missing_child_task_state_for_retry(
@@ -4598,6 +5278,7 @@ def test_cmd_delivery_run_next_dry_run_blocks_failed_child_retry_with_stale_work
         cmd_delivery_run_next(
             _run_next_args(plan_path, dry_run=True, reset_failed=True, json_output=True),
             cfg,
+            _run_next_context(tmp_path, lambda *_args: 0),
         )
 
     assert exc.value.code == 1
@@ -4638,6 +5319,7 @@ def test_cmd_delivery_run_next_dry_run_allows_completed_failed_child_retry_witho
     cmd_delivery_run_next(
         _run_next_args(plan_path, dry_run=True, reset_failed=True, json_output=True),
         cfg,
+        _run_next_context(tmp_path, lambda *_args: 0),
     )
 
     payload = json.loads(capsys.readouterr().out)
@@ -4675,6 +5357,7 @@ def test_cmd_delivery_run_next_dry_run_blocks_failed_retry_with_unapplied_depend
         cmd_delivery_run_next(
             _run_next_args(plan_path, dry_run=True, reset_failed=True, json_output=True),
             cfg,
+            _run_next_context(tmp_path, lambda *_args: 0),
         )
 
     assert exc.value.code == 1
@@ -5070,6 +5753,101 @@ def test_cmd_delivery_run_next_blocks_budget_stop_until_split(
     assert payload["ran"] is False
     assert payload["errors"][0]["code"] == "delivery.unit_budget_exceeded"
     assert "split it with delivery amend prepare" in payload["message"]
+
+
+@pytest.mark.parametrize("reset_failed", [False, True])
+@pytest.mark.parametrize(
+    ("failure_code", "public_error"),
+    [
+        ("unit_scope_violation", "delivery.unit_scope_violation"),
+        ("scope_amendment_required", "delivery.scope_amendment_required"),
+        ("external_dependency_gap", "delivery.external_dependency_gap"),
+        ("implementer_disposition_invalid", "delivery.implementer_disposition_invalid"),
+    ],
+)
+def test_cmd_delivery_run_next_blocks_terminal_stop_without_progress_mutation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    reset_failed: bool,
+    failure_code: str,
+    public_error: str,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "failed",
+                "child_task_id": "task-xyz",
+                "failure_code": failure_code,
+            },
+        ],
+    )
+    progress_path = delivery_progress_path(tmp_path, "delivery-run-next-demo")
+    original_progress = progress_path.read_bytes()
+    events_path = delivery_events_path(tmp_path, "delivery-run-next-demo")
+    child_called = False
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        nonlocal child_called
+        child_called = True
+        return DeliveryChildRunResult(exit_code=0, child_task_id="task-xyz")
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, reset_failed=reset_failed, json_output=True),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+
+    assert exc.value.code == 1
+    assert child_called is False
+    payload = json.loads(capsys.readouterr().out)
+    projected = payload["selected_unit"]
+    assert payload["ran"] is False
+    assert payload["valid"] is False
+    assert payload["errors"][0]["code"] == public_error
+    assert projected["failure_code"] == failure_code
+    assert projected["run_next_blocked_reason"] == failure_code
+    assert projected["run_next_available"] is False
+    assert "run_next_action" not in projected
+    assert progress_path.read_bytes() == original_progress
+    assert events_path.exists() is False
+
+
+def test_cmd_delivery_run_next_dry_run_projects_terminal_stop(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        [
+            {
+                "unit_id": "01-foundation",
+                "status": "failed",
+                "child_task_id": "task-xyz",
+                "failure_code": "external_dependency_gap",
+            },
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path, dry_run=True, reset_failed=True, json_output=True),
+            _run_next_cfg(tmp_path),
+        )
+
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is False
+    assert payload["errors"][0]["code"] == "delivery.external_dependency_gap"
+    assert payload["selected_unit"]["failure_code"] == "external_dependency_gap"
+    assert payload["selected_unit"]["run_next_blocked_reason"] == "external_dependency_gap"
 
 
 def test_cmd_delivery_run_next_blocks_with_reset_failed_when_reset_unavailable(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import subprocess
@@ -9,6 +10,8 @@ from typing import Any
 import yaml
 
 from core.delivery_public_metadata import (
+    contains_delivery_source_excerpt,
+    is_safe_delivery_public_metadata,
     project_delivery_public_identity,
     sanitize_delivery_public_metadata,
 )
@@ -22,7 +25,21 @@ from core.delivery_unit_metadata import (
 )
 
 SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION = 1
+SUPPORTED_DELIVERY_CONSTRAINT_CONTEXT_SCHEMA_VERSION = 1
+DELIVERY_CONSTRAINT_KIND_VALUES = frozenset(
+    {
+        "authoritative_read_only_dependency",
+        "prohibited_fallback",
+        "repository_ownership",
+        "security_boundary",
+        "stop_and_follow_up",
+    }
+)
+DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION = "preserved"
+MAX_DELIVERY_CONSTRAINTS = 100
+MAX_DELIVERY_CONSTRAINT_UNIT_IDS = 1000
 _DELIVERY_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_DELIVERY_SOURCE_TASK_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 MAX_DELIVERY_UNIT_ID_LENGTH = 1000
 _GIT_REF_FORBIDDEN_CHARS_RE = re.compile(r"[\000-\037\177 ~^:?*\[\\]")
 _SPLIT_RECOMMENDED_TAG_SET = frozenset({"external_execution_boundary", "structured_output_contract", "cli_surface"})
@@ -89,6 +106,43 @@ class DeliveryRepository:
         if self.implicit:
             data["implicit"] = True
         return data
+
+
+@dataclass(frozen=True)
+class DeliveryPlanSourceTask:
+    path: str
+    sha256: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"path": self.path, "sha256": self.sha256}
+
+
+@dataclass(frozen=True)
+class DeliveryConstraint:
+    id: str
+    kind: str
+    summary: str
+    unit_ids: list[str]
+    disposition: str = DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": project_delivery_public_identity(self.id),
+            "kind": self.kind,
+            "summary": sanitize_delivery_public_metadata(self.summary),
+            "unit_ids": [project_delivery_public_identity(unit_id) for unit_id in self.unit_ids],
+            "disposition": self.disposition,
+        }
+
+    def to_context_dict(self) -> dict[str, Any]:
+        """Serialize private child context without applying public identity projection."""
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "summary": self.summary,
+            "unit_ids": list(self.unit_ids),
+            "disposition": self.disposition,
+        }
 
 
 @dataclass(frozen=True)
@@ -208,6 +262,8 @@ class DeliveryPlan:
     repositories: list[DeliveryRepository]
     stream_ids: list[str] = field(default_factory=list)
     components: list[DeliveryComponent] = field(default_factory=list)
+    constraints: list[DeliveryConstraint] = field(default_factory=list)
+    source_task: DeliveryPlanSourceTask | None = None
     planning_mode: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -223,9 +279,23 @@ class DeliveryPlan:
             data["streams"] = [project_delivery_public_identity(stream) for stream in self.stream_ids]
         if self.components:
             data["components"] = [component.to_dict() for component in self.components]
+        if self.source_task:
+            data["source_task"] = self.source_task.to_dict()
+        if self.constraints:
+            data["constraints"] = [constraint.to_dict() for constraint in self.constraints]
         if self.planning_mode:
             data["planning_mode"] = self.planning_mode
         return data
+
+
+def delivery_unit_constraint_context(
+    plan: DeliveryPlan,
+    unit_id: str,
+) -> tuple[int, dict[str, str] | None, list[dict[str, Any]]]:
+    """Return the bounded source binding and constraints applicable to one unit."""
+    source_task = plan.source_task.to_dict() if plan.source_task else None
+    constraints = [constraint.to_context_dict() for constraint in plan.constraints if unit_id in constraint.unit_ids]
+    return SUPPORTED_DELIVERY_CONSTRAINT_CONTEXT_SCHEMA_VERSION, source_task, constraints
 
 
 @dataclass(frozen=True)
@@ -444,6 +514,11 @@ def _parse_delivery_plan(
     planning_mode = _optional_string(data, "planning_mode", "planning_mode", errors)
     repositories = _parse_repositories(data.get("repositories"), errors)
     repo_ids = {repo.id for repo in repositories}
+    source_task, source_task_description = _parse_source_task(
+        data.get("source_task"),
+        project_root=project_root,
+        errors=errors,
+    )
     stream_ids = _parse_streams(data.get("streams"), errors)
     components = _parse_components(
         data.get("components"),
@@ -461,6 +536,22 @@ def _parse_delivery_plan(
         warnings=warnings,
         virtual_task_paths=virtual_task_paths,
     )
+    raw_constraints = data.get("constraints")
+    constraints = _parse_constraints(
+        raw_constraints,
+        units=units,
+        source_task_description=source_task_description,
+        errors=errors,
+    )
+    if isinstance(raw_constraints, list) and raw_constraints and source_task is None:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "constraints.source_task_required",
+                "Plans with inherited constraints must include a valid source_task fingerprint.",
+                "source_task",
+            )
+        )
 
     if units:
         _validate_dependencies(units, errors)
@@ -477,6 +568,8 @@ def _parse_delivery_plan(
         repositories=repositories,
         stream_ids=stream_ids,
         components=components,
+        constraints=constraints,
+        source_task=source_task,
         planning_mode=planning_mode,
     )
 
@@ -532,6 +625,108 @@ def _parse_repositories(value: Any, errors: list[DeliveryPlanIssue]) -> list[Del
             )
         )
     return [DeliveryRepository(id=repo_id, root=root)]
+
+
+def _parse_source_task(
+    value: Any,
+    *,
+    project_root: Path,
+    errors: list[DeliveryPlanIssue],
+) -> tuple[DeliveryPlanSourceTask | None, str | None]:
+    if value is None:
+        return None, None
+    if not isinstance(value, dict):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "source_task.invalid_type",
+                "source_task must be a mapping with path and sha256 fields.",
+                "source_task",
+            )
+        )
+        return None, None
+    unknown_fields = set(value) - {"path", "sha256"}
+    if unknown_fields:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "source_task.unknown_field",
+                "source_task contains an unsupported field.",
+                f"source_task.{sorted(str(field) for field in unknown_fields)[0]}",
+            )
+        )
+
+    source_path = _require_string(value, "path", "source_task.path", errors)
+    source_sha256 = _require_string(value, "sha256", "source_task.sha256", errors)
+    if source_path is None or source_sha256 is None:
+        return None, None
+    if not is_safe_delivery_public_metadata(source_path):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "source_task.path_metadata_invalid",
+                "source_task.path must be bounded single-line public metadata without absolute paths.",
+                "source_task.path",
+            )
+        )
+        return None, None
+    path_error_count = len(errors)
+    _validate_project_relative_metadata_path(
+        source_path,
+        project_root=project_root,
+        errors=errors,
+        path="source_task.path",
+        code_prefix="source_task.path",
+        subject="Source task path",
+    )
+    if len(errors) != path_error_count:
+        return None, None
+    if not _DELIVERY_SOURCE_TASK_SHA256_RE.fullmatch(source_sha256):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "source_task.sha256_invalid",
+                "source_task.sha256 must use the sha256:<lowercase-hex> format.",
+                "source_task.sha256",
+            )
+        )
+        return None, None
+
+    source_file = project_root / source_path
+    try:
+        if source_file.is_symlink():
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "source_task.symlink",
+                    "source_task.path must not be a symlink.",
+                    "source_task.path",
+                )
+            )
+            return None, None
+        source_text = source_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "source_task.read_failed",
+                "source_task.path must reference a readable UTF-8 file.",
+                "source_task.path",
+            )
+        )
+        return None, None
+    actual_sha256 = "sha256:" + sha256(source_text.encode("utf-8")).hexdigest()
+    if actual_sha256 != source_sha256:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "source_task.hash_mismatch",
+                "The source task changed after inherited constraints were prepared.",
+                "source_task.sha256",
+            )
+        )
+        source_text = None
+    return DeliveryPlanSourceTask(path=source_path, sha256=source_sha256), source_text
 
 
 def _parse_streams(value: Any, errors: list[DeliveryPlanIssue]) -> list[str]:
@@ -646,7 +841,6 @@ def _parse_units(
             DeliveryPlanIssue("error", "units.empty", "units must include at least one delivery unit.", "units")
         )
         return []
-
     seen: set[str] = set()
     units: list[DeliveryPlanUnit] = []
     for idx, item in enumerate(value):
@@ -784,6 +978,197 @@ def _parse_units(
             if not unit.superseded:
                 _append_unit_sizing_warnings(unit, warnings)
     return units
+
+
+def _parse_constraints(
+    value: Any,
+    *,
+    units: list[DeliveryPlanUnit],
+    source_task_description: str | None,
+    errors: list[DeliveryPlanIssue],
+) -> list[DeliveryConstraint]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "constraints.invalid_type",
+                "constraints must be a list of inherited hard-constraint mappings.",
+                "constraints",
+            )
+        )
+        return []
+    if len(value) > MAX_DELIVERY_CONSTRAINTS:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "constraints.too_many",
+                f"constraints must contain at most {MAX_DELIVERY_CONSTRAINTS} entries.",
+                "constraints",
+            )
+        )
+        value = value[:MAX_DELIVERY_CONSTRAINTS]
+
+    unit_by_id = {unit.id: unit for unit in units}
+    constraints: list[DeliveryConstraint] = []
+    seen_ids: set[str] = set()
+    for index, item in enumerate(value):
+        constraint_path = f"constraints[{index}]"
+        if not isinstance(item, dict):
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "constraints.item_invalid",
+                    "Constraint entries must be mappings.",
+                    constraint_path,
+                )
+            )
+            continue
+        unknown_fields = set(item) - {"id", "kind", "summary", "unit_ids", "disposition"}
+        if unknown_fields:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "constraints.unknown_field",
+                    "Constraint entry contains an unsupported field.",
+                    f"{constraint_path}.{sorted(str(field) for field in unknown_fields)[0]}",
+                )
+            )
+
+        constraint_id = _require_string(item, "id", f"{constraint_path}.id", errors)
+        kind = _require_string(item, "kind", f"{constraint_path}.kind", errors)
+        summary = _require_string(item, "summary", f"{constraint_path}.summary", errors)
+        unit_ids = _optional_string_list(item, "unit_ids", f"{constraint_path}.unit_ids", errors)
+        disposition = _require_string(item, "disposition", f"{constraint_path}.disposition", errors)
+
+        if constraint_id:
+            normalized_id = constraint_id.casefold()
+            if len(constraint_id) > MAX_DELIVERY_UNIT_ID_LENGTH or not _DELIVERY_PLAN_ID_RE.fullmatch(constraint_id):
+                errors.append(
+                    DeliveryPlanIssue(
+                        "error",
+                        "constraints.id_invalid",
+                        "Constraint id must be a stable identifier using letters, numbers, dots, underscores, or hyphens.",
+                        f"{constraint_path}.id",
+                    )
+                )
+            if normalized_id in seen_ids:
+                errors.append(
+                    DeliveryPlanIssue(
+                        "error",
+                        "constraints.duplicate_id",
+                        "Constraint ids must be case-insensitively unique.",
+                        f"{constraint_path}.id",
+                    )
+                )
+            seen_ids.add(normalized_id)
+        if kind and kind not in DELIVERY_CONSTRAINT_KIND_VALUES:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "constraints.kind_invalid",
+                    "Constraint kind must be one of the supported inherited hard-constraint kinds.",
+                    f"{constraint_path}.kind",
+                )
+            )
+        if summary and not is_safe_delivery_public_metadata(summary):
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "constraints.summary_invalid",
+                    "Constraint summary must be bounded single-line public metadata without absolute paths.",
+                    f"{constraint_path}.summary",
+                )
+            )
+        elif (
+            summary
+            and source_task_description is not None
+            and contains_delivery_source_excerpt(summary, source_task_description)
+        ):
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "constraints.summary_source_excerpt",
+                    "Constraint summaries must paraphrase source-task rules without copying source text.",
+                    f"{constraint_path}.summary",
+                )
+            )
+            summary = None
+        elif summary and source_task_description is None:
+            summary = None
+        if not unit_ids:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "constraints.unit_ids_empty",
+                    "Each inherited constraint must apply to at least one delivery unit.",
+                    f"{constraint_path}.unit_ids",
+                )
+            )
+        if len(unit_ids) > MAX_DELIVERY_CONSTRAINT_UNIT_IDS:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "constraints.unit_ids_too_many",
+                    f"Constraint unit_ids must contain at most {MAX_DELIVERY_CONSTRAINT_UNIT_IDS} entries.",
+                    f"{constraint_path}.unit_ids",
+                )
+            )
+            unit_ids = unit_ids[:MAX_DELIVERY_CONSTRAINT_UNIT_IDS]
+        seen_unit_ids: set[str] = set()
+        for unit_index, unit_id in enumerate(unit_ids):
+            unit_path = f"{constraint_path}.unit_ids[{unit_index}]"
+            if unit_id in seen_unit_ids:
+                errors.append(
+                    DeliveryPlanIssue(
+                        "error",
+                        "constraints.unit_id_duplicate",
+                        "Constraint unit_ids must not contain duplicates.",
+                        unit_path,
+                    )
+                )
+                continue
+            seen_unit_ids.add(unit_id)
+            unit = unit_by_id.get(unit_id)
+            if unit is None:
+                errors.append(
+                    DeliveryPlanIssue(
+                        "error",
+                        "constraints.unit_unknown",
+                        "Constraint unit_ids must reference known delivery units.",
+                        unit_path,
+                    )
+                )
+            elif unit.superseded:
+                errors.append(
+                    DeliveryPlanIssue(
+                        "error",
+                        "constraints.unit_superseded",
+                        "Inherited constraints must be reassigned before a constrained unit is superseded.",
+                        unit_path,
+                    )
+                )
+        if disposition and disposition != DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "constraints.disposition_unresolved",
+                    "Published delivery plans may contain only preserved inherited constraints.",
+                    f"{constraint_path}.disposition",
+                )
+            )
+        if constraint_id and kind and summary and disposition:
+            constraints.append(
+                DeliveryConstraint(
+                    id=constraint_id,
+                    kind=kind,
+                    summary=summary,
+                    unit_ids=unit_ids,
+                    disposition=disposition,
+                )
+            )
+    return constraints
 
 
 def _validate_task_path(

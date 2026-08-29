@@ -27,6 +27,8 @@ from agents.base_agent import (
     tech_stack as _tech_stack,
 )
 from agents.build_guidance import write_agent_constraints as _write_agent_constraints
+from agents.delivery_contracts import delivery_agent_prompt_context
+from core.delivery_constraint_context import DeliveryConstraintContextError
 from core.state import TaskState
 from core.synthetic_test_harness_audit import prompt_context_for_records as _synthetic_harness_prompt_context
 from core.validation_artifacts import (
@@ -67,6 +69,8 @@ CONSTRAINTS — follow strictly:
 
 ORIGINAL TASK (for context):
 {task_description}
+
+{delivery_constraint_context}
 
 IMPLEMENTATION THAT WAS APPLIED:
 {implementation_prompt}
@@ -408,15 +412,6 @@ def _test_constraint(
     return _CHECK_TEST_CONSTRAINT
 
 
-def _combined_write_paths(sandbox: dict) -> list[str]:
-    paths: list[str] = []
-    for key in ("allowed_write_paths", "allowed_test_write_paths"):
-        for path in sandbox.get(key, []):
-            if path not in paths:
-                paths.append(path)
-    return paths
-
-
 def _test_write_paths(sandbox: dict) -> list[str]:
     paths: list[str] = []
     for path in sandbox.get("allowed_test_write_paths", []):
@@ -432,13 +427,31 @@ def _write_paths_for_state(
     test_origin_validation: bool = False,
     production_fix_confirmed: bool = False,
 ) -> list[str]:
+    production_paths, test_paths = _write_authority_for_state(
+        state,
+        sandbox,
+        test_origin_validation=test_origin_validation,
+        production_fix_confirmed=production_fix_confirmed,
+    )
+    return list(dict.fromkeys([*production_paths, *test_paths]))
+
+
+def _write_authority_for_state(
+    state: TaskState,
+    sandbox: dict,
+    *,
+    test_origin_validation: bool = False,
+    production_fix_confirmed: bool = False,
+) -> tuple[list[str], list[str]]:
+    production_paths = list(sandbox.get("allowed_write_paths", []))
+    test_paths = _test_write_paths(sandbox)
     if production_fix_confirmed:
-        return _combined_write_paths(sandbox)
+        return production_paths, test_paths
     if test_origin_validation or (state.test_errors and not state.errors and not state.check_errors):
-        return _test_write_paths(sandbox)
+        return [], test_paths
     if state.errors:
-        return sandbox.get("allowed_write_paths", [])
-    return _combined_write_paths(sandbox)
+        return production_paths, []
+    return production_paths, test_paths
 
 
 def _normalize_project_path(path: str) -> str:
@@ -917,6 +930,29 @@ def _record_generated_test_fix_attempt(state: TaskState, paths: list[str]) -> No
 class FixerAgent(BaseAgent):
     name = "fixer"
 
+    def delivery_scope_active_test_write_paths(self, state: TaskState) -> list[str]:
+        """Return test roots that may be writable during this complete fixer invocation."""
+        file_tool = self.tools.get("file")
+        if not file_tool:
+            return []
+        sandbox = self.project_config.get("sandbox", {})
+        project_root = Path(file_tool._root)
+        test_origin_validation = _is_test_origin_validation_failure(state, sandbox, project_root)
+        if state.errors and not test_origin_validation:
+            return []
+        return _test_write_paths(sandbox)
+
+    def delivery_scope_attempt_write_authority(self, state: TaskState) -> dict[str, list[str]] | None:
+        """Return the exact authority of the physical provider call in progress."""
+        authority = getattr(self, "_delivery_scope_attempt_authority", None)
+        if authority is None:
+            return None
+        production_paths, test_paths = authority
+        return {
+            "production_write_paths": list(production_paths),
+            "test_write_paths": list(test_paths),
+        }
+
     def run(self, state: TaskState) -> AgentResult:
         if not state.errors and not state.test_errors and not state.check_errors:
             return AgentResult(success=False, message="No errors in state to fix")
@@ -924,6 +960,13 @@ class FixerAgent(BaseAgent):
         file_tool = self.tools.get("file")
         if not file_tool:
             return AgentResult(success=False, message="FileTool not available")
+
+        try:
+            delivery_context = delivery_agent_prompt_context(state, role=self.name)
+        except DeliveryConstraintContextError as exc:
+            message = "Inherited delivery constraint context was rejected before fixing ({code}).".format(code=exc.code)
+            state.record(self.name, "delivery_constraint_context_rejected", message)
+            return AgentResult(success=False, message=message)
 
         sandbox = self.project_config.get("sandbox", {})
         agent_cwd = Path(file_tool._root)
@@ -979,6 +1022,7 @@ class FixerAgent(BaseAgent):
                 build_tool_constraints=_write_agent_constraints(self.project_config),
                 test_constraint=test_constraint,
                 task_description=state.task_description,
+                delivery_constraint_context=delivery_context.inherited_constraints,
                 implementation_prompt=state.implementation_prompt or "(not available)",
                 errors_section=errors_section,
             )
@@ -986,6 +1030,8 @@ class FixerAgent(BaseAgent):
         def _run_once(
             *,
             allowed_write_paths: list[str],
+            production_write_paths: list[str],
+            test_write_paths: list[str],
             test_constraint: str,
             triage_pass: str | None = None,
             previous_triage: str | None = None,
@@ -1001,7 +1047,14 @@ class FixerAgent(BaseAgent):
             dirty_before = _git_dirty_text_snapshot(agent_cwd) if uses_test_failure_triage else {}
             artifact_before = snapshot_validation_dirty_files(agent_cwd) if uses_test_failure_triage else {}
             try:
-                changed, fixer_output = self.llm.run_agent(prompt, cwd=agent_cwd)
+                self._delivery_scope_attempt_authority = (
+                    tuple(production_write_paths),
+                    tuple(test_write_paths),
+                )
+                try:
+                    changed, fixer_output = self.llm.run_agent(prompt, cwd=agent_cwd)
+                finally:
+                    self._delivery_scope_attempt_authority = None
             except RuntimeError as e:
                 msg = str(e)
                 state.record(self.name, "fix_failed", msg[:500])
@@ -1162,7 +1215,12 @@ class FixerAgent(BaseAgent):
 
         violation_continue_restored = False
         if uses_test_failure_triage:
-            allowed_write_paths = _write_paths_for_state(state, sandbox, test_origin_validation=test_origin_validation)
+            production_write_paths, test_write_paths = _write_authority_for_state(
+                state,
+                sandbox,
+                test_origin_validation=test_origin_validation,
+            )
+            allowed_write_paths = list(dict.fromkeys([*production_write_paths, *test_write_paths]))
             test_constraint = _test_constraint(state, test_origin_validation=test_origin_validation)
             scope_recovery: str | None = None
             changed: list[str] = []
@@ -1177,6 +1235,8 @@ class FixerAgent(BaseAgent):
                     log.info("Retrying fixer agent with %s recovery prompt", triage_pass)
                 result, changed, fixer_output, dirty_before, artifact_before, final_allowed_write_paths = _run_once(
                     allowed_write_paths=allowed_write_paths,
+                    production_write_paths=production_write_paths,
+                    test_write_paths=test_write_paths,
                     test_constraint=test_constraint,
                     triage_pass=triage_pass,
                     scope_recovery=scope_recovery,
@@ -1322,15 +1382,18 @@ class FixerAgent(BaseAgent):
                 scope_recovery = _TEST_ONLY_SCOPE_RECOVERY_INSTRUCTION.format(reason=reason)
             if _has_valid_production_test_failure_triage(fixer_output):
                 failure_kind = "test-origin validation" if test_origin_validation else "test-failure"
-                allowed_write_paths = _write_paths_for_state(
+                production_write_paths, test_write_paths = _write_authority_for_state(
                     state,
                     sandbox,
                     test_origin_validation=test_origin_validation,
                     production_fix_confirmed=True,
                 )
+                allowed_write_paths = list(dict.fromkeys([*production_write_paths, *test_write_paths]))
                 log.info("Running fixer agent production-confirmed pass after %s triage", failure_kind)
                 result, changed, fixer_output, dirty_before, _, final_allowed_write_paths = _run_once(
                     allowed_write_paths=allowed_write_paths,
+                    production_write_paths=production_write_paths,
+                    test_write_paths=test_write_paths,
                     test_constraint=_test_constraint(
                         state,
                         test_origin_validation=test_origin_validation,
@@ -1356,9 +1419,16 @@ class FixerAgent(BaseAgent):
                 if test_only_writes:
                     changed = list(dict.fromkeys([*test_only_writes, *changed]))
         else:
-            allowed_write_paths = _write_paths_for_state(state, sandbox, test_origin_validation=test_origin_validation)
+            production_write_paths, test_write_paths = _write_authority_for_state(
+                state,
+                sandbox,
+                test_origin_validation=test_origin_validation,
+            )
+            allowed_write_paths = list(dict.fromkeys([*production_write_paths, *test_write_paths]))
             result, changed, fixer_output, _, _, final_allowed_write_paths = _run_once(
                 allowed_write_paths=allowed_write_paths,
+                production_write_paths=production_write_paths,
+                test_write_paths=test_write_paths,
                 test_constraint=_test_constraint(state, test_origin_validation=test_origin_validation),
             )
             if result is not None:

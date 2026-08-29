@@ -295,6 +295,18 @@ class NodeTool(BuildTool):
         name = path_parts[-1] if path_parts else ""
         return name in {lockfile for lockfile, _package_manager in _PACKAGE_MANAGER_LOCKFILES}
 
+    def is_ephemeral_build_path(self, path: str) -> bool:
+        parts = self._delivery_scope_path_parts(path)
+        if "node_modules" in parts:
+            return True
+        for index, part in enumerate(parts[:-1]):
+            if part != ".yarn":
+                continue
+            yarn_path = parts[index + 1 :]
+            if yarn_path[0] in {"cache", "unplugged"} or yarn_path == ("install-state.gz",):
+                return True
+        return False
+
     def _is_build_config_dir_path(self, path_parts: tuple[str, ...]) -> bool:
         for index, part in enumerate(path_parts[:-1]):
             if part == ".yarn":

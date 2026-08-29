@@ -316,6 +316,39 @@ class TestNodeToolIsBuildConfigFile:
         assert tool.is_build_config_file("src/yarn.locked.ts") is False
 
 
+class TestNodeToolEphemeralBuildPaths:
+    @pytest.mark.parametrize(
+        "path",
+        [
+            ".yarn/install-state.gz",
+            ".yarn/cache/package-npm-1.0.0.zip",
+            ".yarn/unplugged/package/node_modules/package/index.js",
+            "packages/web/node_modules/package/index.js",
+        ],
+    )
+    def test_recognizes_disposable_dependency_state(self, tmp_path: Path, path: str):
+        tool = _make_tool(tmp_path)
+
+        assert tool.is_ephemeral_build_path(path) is True
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            ".pnp.cjs",
+            ".yarn/patches/package.patch",
+            ".yarn/plugins/plugin.cjs",
+            ".yarn/releases/yarn.cjs",
+            ".yarn/sdks/typescript/lib/tsserver.js",
+            ".yarn/versions/version.yml",
+            "yarn.lock",
+        ],
+    )
+    def test_keeps_zero_install_and_configuration_paths_auditable(self, tmp_path: Path, path: str):
+        tool = _make_tool(tmp_path)
+
+        assert tool.is_ephemeral_build_path(path) is False
+
+
 class TestNodeToolIsSyncAdoptableFile:
     @pytest.mark.parametrize("lockfile,package_manager", _PACKAGE_MANAGER_LOCKFILES)
     def test_recognizes_package_manager_lockfiles(self, lockfile: str, package_manager: str, tmp_path: Path):

@@ -90,3 +90,7 @@ class PythonTool(BuildTool):
 
     def is_build_config_file(self, path: str) -> bool:
         return Path(path).name in _BUILD_CONFIG_FILES
+
+    def is_ephemeral_build_path(self, path: str) -> bool:
+        ephemeral = {".mypy_cache", ".nox", ".pytest_cache", ".ruff_cache", ".tox", ".venv", "__pycache__", "venv"}
+        return any(part in ephemeral for part in self._delivery_scope_path_parts(path))

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 from json import JSONDecodeError
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 from typing import Any
+import unicodedata
 
 from core.delivery_unit_metadata import (
     DEFAULT_DELIVERY_UNIT_MAX_PLANNER_STEPS,
@@ -15,8 +16,14 @@ from core.delivery_unit_metadata import (
     MAX_DELIVERY_UNIT_MAX_PLANNER_STEPS,
     DeliveryUnitBudget,
 )
-from core.delivery_plan import MAX_DELIVERY_UNIT_ID_LENGTH
-from core.delivery_public_metadata import is_safe_delivery_public_metadata
+from core.delivery_plan import (
+    DELIVERY_CONSTRAINT_KIND_VALUES,
+    MAX_DELIVERY_CONSTRAINTS,
+    MAX_DELIVERY_CONSTRAINT_UNIT_IDS,
+    MAX_DELIVERY_UNIT_ID_LENGTH,
+    DeliveryPlanSourceTask,
+)
+from core.delivery_public_metadata import contains_delivery_source_excerpt, is_safe_delivery_public_metadata
 from core.markdown_headings import MarkdownHeading, MarkdownHeadingScanner, normalize_heading
 from core.structured_output import load_schema_json_object
 from core.validation_coverage import extract_validation_commands
@@ -68,14 +75,29 @@ _FENCED_JSON_RE = re.compile(
     r"^\s*(?P<fence>`{3,}|~{3,})[ \t]*json[ \t]*\r?\n(?P<content>.*)\r?\n(?P=fence)[ \t]*\s*$",
     re.DOTALL | re.IGNORECASE,
 )
-_TOP_LEVEL_FIELDS = {"plan_id", "title", "units", "planning_mode", "warnings"}
+DELIVERY_CONSTRAINT_DRAFT_DISPOSITIONS = frozenset({"conflict", "needs_review", "preserved"})
+DELIVERY_CONSTRAINT_GAP_REASONS = frozenset({"incompletely_assigned", "omitted"})
+MAX_DELIVERY_UNIT_CONTEXT_GAPS = 100
+MAX_DELIVERY_UNIT_CONTEXT_LITERALS = 100
+MAX_DELIVERY_UNIT_CONTEXT_LITERAL_LENGTH = 1000
+MAX_DELIVERY_UNIT_CONTEXT_TOTAL_LENGTH = 20_000
+_TOP_LEVEL_FIELDS = {"plan_id", "title", "units", "planning_mode", "warnings", "constraints"}
 _AMENDMENT_TOP_LEVEL_FIELDS = {
     "plan_id",
     "target_unit_id",
     "replacement_units",
+    "disposition",
+    "summary",
     "amend_reason",
     "budget_exceeded",
     "warnings",
+}
+_CONSTRAINT_VERIFICATION_TOP_LEVEL_FIELDS = {
+    "constraints_complete",
+    "constraints",
+    "constraint_gaps",
+    "unit_context_complete",
+    "unit_context_gaps",
 }
 _ASSESSMENT_TOP_LEVEL_FIELDS = {"recommended_mode", "reason_codes", "units"}
 _ASSESSMENT_SCHEMA_KEYS = frozenset({"recommended_mode", "reason_codes"})
@@ -96,8 +118,13 @@ _UNIT_FIELDS = {
     "risk_tags",
     "budget",
 }
+_CONSTRAINT_FIELDS = {"id", "kind", "summary", "unit_ids", "disposition"}
+_CONSTRAINT_GAP_FIELDS = {"reason", "constraint_id", "kind", "summary", "affected_unit_ids"}
+_UNIT_CONTEXT_GAP_FIELDS = {"unit_id", "source_literals"}
+_CONSTRAINT_REPAIR_TOP_LEVEL_FIELDS = {"constraints"}
 _AUTHORING_SCHEMA_KEYS = frozenset({"plan_id", "title", "units"})
 _AMENDMENT_SCHEMA_KEYS = frozenset({"plan_id", "target_unit_id", "replacement_units"})
+_CONSTRAINT_VERIFICATION_SCHEMA_KEYS = frozenset({"constraints_complete", "constraints"})
 _UNIT_PATH_FIELDS = {
     "task_path",
     "path",
@@ -162,6 +189,65 @@ class DeliveryAuthoringUnitDraft:
     budget: DeliveryUnitBudget | None = None
 
 
+@dataclass(frozen=True)
+class DeliveryAuthoringConstraintDraft:
+    id: str
+    kind: str
+    summary: str
+    unit_ids: list[str]
+    disposition: str
+
+    def to_plan_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "summary": self.summary,
+            "unit_ids": list(self.unit_ids),
+            "disposition": self.disposition,
+        }
+
+
+@dataclass(frozen=True)
+class DeliveryConstraintGap:
+    reason: str
+    kind: str
+    summary: str
+    affected_unit_ids: list[str]
+    constraint_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "reason": self.reason,
+            "kind": self.kind,
+            "summary": self.summary,
+            "affected_unit_ids": list(self.affected_unit_ids),
+        }
+        if self.constraint_id is not None:
+            data["constraint_id"] = self.constraint_id
+        return data
+
+
+@dataclass(frozen=True)
+class DeliveryUnitContextGap:
+    unit_id: str
+    source_literals: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "unit_id": self.unit_id,
+            "source_literals": list(self.source_literals),
+        }
+
+
+@dataclass(frozen=True)
+class DeliveryConstraintVerification:
+    constraints_complete: bool
+    constraints: list[DeliveryAuthoringConstraintDraft]
+    constraint_gaps: list[DeliveryConstraintGap] = field(default_factory=list)
+    unit_context_complete: bool = True
+    unit_context_gaps: list[DeliveryUnitContextGap] = field(default_factory=list)
+
+
 @dataclass
 class DeliveryAuthoringDraft:
     plan_id: str
@@ -170,6 +256,9 @@ class DeliveryAuthoringDraft:
     planning_mode: str | None = None
     warnings: list[str] = field(default_factory=list)
     audit_records: list[dict[str, Any]] = field(default_factory=list)
+    constraints: list[DeliveryAuthoringConstraintDraft] = field(default_factory=list)
+    source_task: DeliveryPlanSourceTask | None = None
+    constraint_verification: DeliveryConstraintVerification | None = None
 
 
 @dataclass
@@ -181,6 +270,9 @@ class DeliveryAmendmentAuthoringDraft:
     budget_exceeded: dict[str, Any] | None = None
     warnings: list[str] = field(default_factory=list)
     audit_records: list[dict[str, Any]] = field(default_factory=list)
+    disposition: str | None = None
+    summary: str | None = None
+    constraint_verification: DeliveryConstraintVerification | None = None
 
 
 @dataclass
@@ -268,6 +360,7 @@ def parse_delivery_authoring_output(
     expected_plan_id: str,
     project_root: str | Path,
     output_dir: str | Path,
+    source_task_description: str | None = None,
 ) -> DeliveryAuthoringDraft:
     root = _resolve_project_root(project_root)
     selected_plan_id = _expected_plan_id(expected_plan_id, output_dir=output_dir, project_root=root)
@@ -290,6 +383,11 @@ def parse_delivery_authoring_output(
     planning_mode = _optional_planning_mode(data, "planning_mode", "planning_mode")
     warnings = _optional_string_list(data, "warnings", "warnings")
     units = _parse_units(data.get("units"), project_root=root, allow_asset_paths=True)
+    constraints = _parse_constraints(
+        data,
+        unit_ids={unit.id for unit in units},
+        source_task_description=source_task_description,
+    )
 
     return DeliveryAuthoringDraft(
         plan_id=plan_id,
@@ -297,6 +395,112 @@ def parse_delivery_authoring_output(
         units=units,
         planning_mode=planning_mode,
         warnings=warnings,
+        constraints=constraints,
+    )
+
+
+def parse_delivery_constraint_verification_output(
+    output: str,
+    *,
+    unit_ids: set[str],
+    source_task_description: str | None = None,
+    unit_task_markdown_by_id: dict[str, str] | None = None,
+    require_unit_context: bool = False,
+) -> DeliveryConstraintVerification:
+    data = _parse_output_object(output, schema_keys=_CONSTRAINT_VERIFICATION_SCHEMA_KEYS)
+    _reject_unknown_fields(data, _CONSTRAINT_VERIFICATION_TOP_LEVEL_FIELDS, "constraint verification")
+    constraints_complete = data.get("constraints_complete")
+    if type(constraints_complete) is not bool:
+        raise DeliveryAuthoringParseError(
+            "delivery_constraint_verification.complete_invalid",
+            "constraints_complete must be a boolean.",
+        )
+    constraints = _parse_constraints(data, unit_ids=unit_ids)
+    constraint_gaps = _parse_constraint_gaps(
+        data.get("constraint_gaps", []),
+        constraints=constraints,
+        unit_ids=unit_ids,
+        source_task_description=source_task_description,
+    )
+    if constraints_complete and constraint_gaps:
+        raise DeliveryAuthoringParseError(
+            "delivery_constraint_verification.gaps_unexpected",
+            "Complete constraint verification must not report constraint gaps.",
+        )
+    if not constraints_complete and not constraint_gaps:
+        raise DeliveryAuthoringParseError(
+            "delivery_constraint_verification.gaps_required",
+            "Incomplete constraint verification must identify at least one actionable constraint gap.",
+        )
+    unit_context_complete = data.get("unit_context_complete")
+    if require_unit_context and type(unit_context_complete) is not bool:
+        raise DeliveryAuthoringParseError(
+            "delivery_unit_context_verification.complete_invalid",
+            "unit_context_complete must be a boolean.",
+        )
+    if type(unit_context_complete) is not bool:
+        unit_context_complete = True
+    unit_context_gaps = _parse_unit_context_gaps(
+        data.get("unit_context_gaps", []),
+        unit_ids=unit_ids,
+        source_task_description=source_task_description,
+        unit_task_markdown_by_id=unit_task_markdown_by_id,
+    )
+    if unit_context_complete and unit_context_gaps:
+        raise DeliveryAuthoringParseError(
+            "delivery_unit_context_verification.gaps_unexpected",
+            "Complete unit-context verification must not report missing source literals.",
+        )
+    if not unit_context_complete and not unit_context_gaps:
+        raise DeliveryAuthoringParseError(
+            "delivery_unit_context_verification.gaps_required",
+            "Incomplete unit-context verification must identify missing source literals.",
+        )
+    return DeliveryConstraintVerification(
+        constraints_complete=constraints_complete,
+        constraints=constraints,
+        constraint_gaps=constraint_gaps,
+        unit_context_complete=unit_context_complete,
+        unit_context_gaps=unit_context_gaps,
+    )
+
+
+def apply_delivery_unit_context_gaps(
+    units: list[DeliveryAuthoringUnitDraft],
+    gaps: list[DeliveryUnitContextGap],
+) -> list[DeliveryAuthoringUnitDraft]:
+    literals_by_unit = {gap.unit_id: gap.source_literals for gap in gaps}
+    repaired: list[DeliveryAuthoringUnitDraft] = []
+    for unit in units:
+        literals = literals_by_unit.get(unit.id)
+        if not literals:
+            repaired.append(unit)
+            continue
+        addition = "\n".join(f"> {literal}" for literal in literals)
+        task_markdown = (
+            unit.task_markdown.rstrip()
+            + "\n\n## Authoritative source values\n\n"
+            + "Use these source-defined identifiers and values verbatim:\n\n"
+            + addition
+            + "\n"
+        )
+        _validate_unit_task_markdown(task_markdown)
+        repaired.append(replace(unit, task_markdown=task_markdown))
+    return repaired
+
+
+def parse_delivery_constraint_repair_output(
+    output: str,
+    *,
+    unit_ids: set[str],
+    source_task_description: str | None = None,
+) -> list[DeliveryAuthoringConstraintDraft]:
+    data = _parse_output_object(output, schema_keys=frozenset({"constraints"}))
+    _reject_unknown_fields(data, _CONSTRAINT_REPAIR_TOP_LEVEL_FIELDS, "constraint repair")
+    return _parse_constraints(
+        data,
+        unit_ids=unit_ids,
+        source_task_description=source_task_description,
     )
 
 
@@ -324,12 +528,37 @@ def parse_delivery_amendment_authoring_output(
             "delivery_amend_authoring.target_unit_mismatch",
             "target_unit_id must match the selected split unit.",
         )
-    replacement_units = _parse_units(
-        data.get("replacement_units"),
-        project_root=root,
-        allow_asset_paths=True,
-        allow_asset_manifest=allow_asset_manifest,
-    )
+    disposition = _optional_string(data, "disposition", "disposition")
+    if disposition not in {None, "external_dependency_follow_up_required"}:
+        raise DeliveryAuthoringParseError(
+            "delivery_amend_authoring.disposition_invalid",
+            "disposition must be external_dependency_follow_up_required when present.",
+        )
+    summary = None if data.get("summary") is None else _optional_bounded_authoring_string(data, "summary", "summary")
+    if disposition is None and summary is not None:
+        raise DeliveryAuthoringParseError(
+            "delivery_amend_authoring.summary_unexpected",
+            "summary is allowed only with an external dependency follow-up disposition.",
+        )
+    if disposition is not None and summary is None:
+        raise DeliveryAuthoringParseError(
+            "delivery_amend_authoring.summary_required",
+            "An external dependency follow-up disposition requires a bounded summary.",
+        )
+    if disposition is not None:
+        if data.get("replacement_units") != []:
+            raise DeliveryAuthoringParseError(
+                "delivery_amend_authoring.replacements_unexpected",
+                "An external dependency follow-up disposition requires an empty replacement_units list.",
+            )
+        replacement_units = []
+    else:
+        replacement_units = _parse_units(
+            data.get("replacement_units"),
+            project_root=root,
+            allow_asset_paths=True,
+            allow_asset_manifest=allow_asset_manifest,
+        )
     if target_unit_id in {unit.id for unit in replacement_units}:
         raise DeliveryAuthoringParseError(
             "delivery_amend_authoring.target_id_reused",
@@ -347,6 +576,8 @@ def parse_delivery_amendment_authoring_output(
         plan_id=plan_id,
         target_unit_id=target_unit_id,
         replacement_units=replacement_units,
+        disposition=disposition,
+        summary=summary,
         amend_reason=amend_reason,
         budget_exceeded=budget_exceeded,
         warnings=warnings,
@@ -567,6 +798,331 @@ def _parse_units(
 
     _validate_dependencies(units)
     return units
+
+
+def _parse_constraints(
+    data: dict[str, Any],
+    *,
+    unit_ids: set[str],
+    source_task_description: str | None = None,
+) -> list[DeliveryAuthoringConstraintDraft]:
+    if "constraints" not in data:
+        raise DeliveryAuthoringParseError(
+            "delivery_authoring.constraints_required",
+            "constraints must explicitly list inherited hard constraints or be an empty list.",
+        )
+    value = data.get("constraints")
+    if not isinstance(value, list):
+        raise DeliveryAuthoringParseError(
+            "delivery_authoring.constraints_invalid_type",
+            "constraints must be a list of inherited hard-constraint objects.",
+        )
+    if len(value) > MAX_DELIVERY_CONSTRAINTS:
+        raise DeliveryAuthoringParseError(
+            "delivery_authoring.constraints_too_many",
+            "constraints contains too many inherited hard constraints.",
+        )
+
+    constraints: list[DeliveryAuthoringConstraintDraft] = []
+    seen_ids: set[str] = set()
+    for index, item in enumerate(value):
+        constraint_path = f"constraints[{index}]"
+        if not isinstance(item, dict):
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.constraint_not_object",
+                "Constraint entries must be JSON objects.",
+            )
+        _reject_unknown_fields(item, _CONSTRAINT_FIELDS, constraint_path)
+        constraint_id = _require_string(item, "id", f"{constraint_path}.id")
+        if len(constraint_id) > MAX_DELIVERY_UNIT_ID_LENGTH or not _DELIVERY_AUTHORING_ID_RE.fullmatch(constraint_id):
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.constraint_id_invalid",
+                "Constraint ids must use only letters, numbers, dots, underscores, and hyphens.",
+            )
+        normalized_id = constraint_id.casefold()
+        if normalized_id in seen_ids:
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.constraint_id_duplicate",
+                "Constraint ids must be case-insensitively unique.",
+            )
+        seen_ids.add(normalized_id)
+
+        kind = _require_string(item, "kind", f"{constraint_path}.kind")
+        if kind not in DELIVERY_CONSTRAINT_KIND_VALUES:
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.constraint_kind_invalid",
+                "Constraint kind must be a supported inherited hard-constraint kind.",
+            )
+        summary = _bounded_authoring_string(item, "summary", f"{constraint_path}.summary")
+        if source_task_description is not None and contains_delivery_source_excerpt(summary, source_task_description):
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.constraint_summary_source_excerpt",
+                "Constraint summaries must paraphrase source-task rules without copying source text.",
+            )
+        applies_to = _require_string_list(item, "unit_ids", f"{constraint_path}.unit_ids")
+        if not applies_to:
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.constraint_units_empty",
+                "Each inherited hard constraint must apply to at least one unit.",
+            )
+        if len(applies_to) > MAX_DELIVERY_CONSTRAINT_UNIT_IDS:
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.constraint_units_too_many",
+                "Constraint unit_ids contains too many delivery unit references.",
+            )
+        if len(applies_to) != len(set(applies_to)):
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.constraint_unit_duplicate",
+                "Constraint unit_ids must not contain duplicates.",
+            )
+        if any(unit_id not in unit_ids for unit_id in applies_to):
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.constraint_unit_unknown",
+                "Constraint unit_ids must reference generated delivery units only.",
+            )
+        disposition = _require_string(item, "disposition", f"{constraint_path}.disposition")
+        if disposition not in DELIVERY_CONSTRAINT_DRAFT_DISPOSITIONS:
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.constraint_disposition_invalid",
+                "Constraint disposition must be preserved, needs_review, or conflict.",
+            )
+        constraints.append(
+            DeliveryAuthoringConstraintDraft(
+                id=constraint_id,
+                kind=kind,
+                summary=summary,
+                unit_ids=applies_to,
+                disposition=disposition,
+            )
+        )
+    return constraints
+
+
+def _parse_constraint_gaps(
+    value: Any,
+    *,
+    constraints: list[DeliveryAuthoringConstraintDraft],
+    unit_ids: set[str],
+    source_task_description: str | None,
+) -> list[DeliveryConstraintGap]:
+    if not isinstance(value, list):
+        raise DeliveryAuthoringParseError(
+            "delivery_constraint_verification.gaps_invalid_type",
+            "constraint_gaps must be a list of actionable constraint gaps.",
+        )
+    if len(value) > MAX_DELIVERY_CONSTRAINTS:
+        raise DeliveryAuthoringParseError(
+            "delivery_constraint_verification.gaps_too_many",
+            "constraint_gaps contains too many entries.",
+        )
+
+    constraints_by_id = {constraint.id.casefold(): constraint for constraint in constraints}
+    gaps: list[DeliveryConstraintGap] = []
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    for index, item in enumerate(value):
+        gap_path = f"constraint_gaps[{index}]"
+        if not isinstance(item, dict):
+            raise DeliveryAuthoringParseError(
+                "delivery_constraint_verification.gap_not_object",
+                "Constraint gap entries must be JSON objects.",
+            )
+        _reject_unknown_fields(item, _CONSTRAINT_GAP_FIELDS, gap_path)
+        reason = _require_string(item, "reason", f"{gap_path}.reason")
+        if reason not in DELIVERY_CONSTRAINT_GAP_REASONS:
+            raise DeliveryAuthoringParseError(
+                "delivery_constraint_verification.gap_reason_invalid",
+                "Constraint gap reason must be omitted or incompletely_assigned.",
+            )
+        kind = _require_string(item, "kind", f"{gap_path}.kind")
+        if kind not in DELIVERY_CONSTRAINT_KIND_VALUES:
+            raise DeliveryAuthoringParseError(
+                "delivery_constraint_verification.gap_kind_invalid",
+                "Constraint gap kind must be a supported inherited hard-constraint kind.",
+            )
+        summary = _bounded_authoring_string(item, "summary", f"{gap_path}.summary")
+        if source_task_description is not None and contains_delivery_source_excerpt(summary, source_task_description):
+            raise DeliveryAuthoringParseError(
+                "delivery_constraint_verification.gap_summary_source_excerpt",
+                "Constraint gap summaries must paraphrase source-task rules without copying source text.",
+            )
+        affected_unit_ids = _require_string_list(
+            item,
+            "affected_unit_ids",
+            f"{gap_path}.affected_unit_ids",
+        )
+        if not affected_unit_ids:
+            raise DeliveryAuthoringParseError(
+                "delivery_constraint_verification.gap_units_empty",
+                "Each constraint gap must identify at least one affected unit.",
+            )
+        if len(affected_unit_ids) > MAX_DELIVERY_CONSTRAINT_UNIT_IDS:
+            raise DeliveryAuthoringParseError(
+                "delivery_constraint_verification.gap_units_too_many",
+                "Constraint gap affected_unit_ids contains too many unit references.",
+            )
+        if len(affected_unit_ids) != len(set(affected_unit_ids)):
+            raise DeliveryAuthoringParseError(
+                "delivery_constraint_verification.gap_unit_duplicate",
+                "Constraint gap affected_unit_ids must not contain duplicates.",
+            )
+        if any(unit_id not in unit_ids for unit_id in affected_unit_ids):
+            raise DeliveryAuthoringParseError(
+                "delivery_constraint_verification.gap_unit_unknown",
+                "Constraint gap affected_unit_ids must reference generated delivery units only.",
+            )
+
+        constraint_id_value = item.get("constraint_id")
+        constraint_id: str | None = None
+        if reason == "omitted":
+            if constraint_id_value is not None:
+                raise DeliveryAuthoringParseError(
+                    "delivery_constraint_verification.gap_constraint_unexpected",
+                    "Omitted constraint gaps must not identify an existing constraint.",
+                )
+        else:
+            if not isinstance(constraint_id_value, str) or not constraint_id_value.strip():
+                raise DeliveryAuthoringParseError(
+                    "delivery_constraint_verification.gap_constraint_required",
+                    "Incompletely assigned gaps must identify an existing constraint.",
+                )
+            constraint_id = constraint_id_value.strip()
+            existing = constraints_by_id.get(constraint_id.casefold())
+            if existing is None:
+                raise DeliveryAuthoringParseError(
+                    "delivery_constraint_verification.gap_constraint_unknown",
+                    "Constraint gap constraint_id must reference a supplied constraint.",
+                )
+            if existing.id != constraint_id or existing.kind != kind or existing.summary != summary:
+                raise DeliveryAuthoringParseError(
+                    "delivery_constraint_verification.gap_constraint_mismatch",
+                    "An incompletely assigned gap must preserve the supplied constraint identity.",
+                )
+            if any(unit_id in existing.unit_ids for unit_id in affected_unit_ids):
+                raise DeliveryAuthoringParseError(
+                    "delivery_constraint_verification.gap_assignment_not_missing",
+                    "An incompletely assigned gap may identify only missing unit assignments.",
+                )
+
+        identity = (reason, constraint_id or f"{kind}:{summary}", tuple(affected_unit_ids))
+        if identity in seen:
+            raise DeliveryAuthoringParseError(
+                "delivery_constraint_verification.gap_duplicate",
+                "Constraint gaps must not contain duplicate entries.",
+            )
+        seen.add(identity)
+        gaps.append(
+            DeliveryConstraintGap(
+                reason=reason,
+                constraint_id=constraint_id,
+                kind=kind,
+                summary=summary,
+                affected_unit_ids=affected_unit_ids,
+            )
+        )
+    return gaps
+
+
+def _parse_unit_context_gaps(
+    value: Any,
+    *,
+    unit_ids: set[str],
+    source_task_description: str | None,
+    unit_task_markdown_by_id: dict[str, str] | None,
+) -> list[DeliveryUnitContextGap]:
+    if not isinstance(value, list):
+        raise DeliveryAuthoringParseError(
+            "delivery_unit_context_verification.gaps_invalid_type",
+            "unit_context_gaps must be a list.",
+        )
+    if len(value) > MAX_DELIVERY_UNIT_CONTEXT_GAPS:
+        raise DeliveryAuthoringParseError(
+            "delivery_unit_context_verification.gaps_too_many",
+            "unit_context_gaps contains too many entries.",
+        )
+    if value and (source_task_description is None or unit_task_markdown_by_id is None):
+        raise DeliveryAuthoringParseError(
+            "delivery_unit_context_verification.authority_required",
+            "Unit-context gaps require the authoritative source task and candidate unit Markdown.",
+        )
+
+    source_lines = {line.strip() for line in (source_task_description or "").splitlines() if line.strip()}
+    gaps: list[DeliveryUnitContextGap] = []
+    seen_units: set[str] = set()
+    total_length = 0
+    for index, item in enumerate(value):
+        gap_path = f"unit_context_gaps[{index}]"
+        if not isinstance(item, dict):
+            raise DeliveryAuthoringParseError(
+                "delivery_unit_context_verification.gap_not_object",
+                "Unit-context gap entries must be JSON objects.",
+            )
+        _reject_unknown_fields(item, _UNIT_CONTEXT_GAP_FIELDS, gap_path)
+        unit_id = _require_string(item, "unit_id", f"{gap_path}.unit_id")
+        if unit_id not in unit_ids:
+            raise DeliveryAuthoringParseError(
+                "delivery_unit_context_verification.unit_unknown",
+                "Unit-context gaps must reference generated delivery units only.",
+            )
+        if unit_id in seen_units:
+            raise DeliveryAuthoringParseError(
+                "delivery_unit_context_verification.unit_duplicate",
+                "Unit-context gaps must contain at most one entry per unit.",
+            )
+        seen_units.add(unit_id)
+
+        raw_literals = item.get("source_literals")
+        if not isinstance(raw_literals, list) or not raw_literals:
+            raise DeliveryAuthoringParseError(
+                "delivery_unit_context_verification.literals_required",
+                "Each unit-context gap must identify at least one missing source literal.",
+            )
+        if len(raw_literals) > MAX_DELIVERY_UNIT_CONTEXT_LITERALS:
+            raise DeliveryAuthoringParseError(
+                "delivery_unit_context_verification.literals_too_many",
+                "A unit-context gap contains too many source literals.",
+            )
+
+        literals: list[str] = []
+        seen_literals: set[str] = set()
+        task_markdown = (unit_task_markdown_by_id or {}).get(unit_id, "")
+        for literal in raw_literals:
+            if (
+                not isinstance(literal, str)
+                or not literal
+                or literal != literal.strip()
+                or len(literal) > MAX_DELIVERY_UNIT_CONTEXT_LITERAL_LENGTH
+                or len(literal.splitlines()) != 1
+                or any(unicodedata.category(char) in {"Cc", "Cf", "Cs"} for char in literal)
+            ):
+                raise DeliveryAuthoringParseError(
+                    "delivery_unit_context_verification.literal_invalid",
+                    "Source literals must be bounded, single-line source-task values.",
+                )
+            if literal not in source_lines:
+                raise DeliveryAuthoringParseError(
+                    "delivery_unit_context_verification.literal_not_source_line",
+                    "Source literals must exactly match complete non-empty source-task lines.",
+                )
+            if literal in task_markdown:
+                raise DeliveryAuthoringParseError(
+                    "delivery_unit_context_verification.literal_already_present",
+                    "Unit-context gaps may identify only source literals missing from the unit task.",
+                )
+            if literal in seen_literals:
+                raise DeliveryAuthoringParseError(
+                    "delivery_unit_context_verification.literal_duplicate",
+                    "Source literals must not be duplicated within one unit-context gap.",
+                )
+            seen_literals.add(literal)
+            total_length += len(literal)
+            if total_length > MAX_DELIVERY_UNIT_CONTEXT_TOTAL_LENGTH:
+                raise DeliveryAuthoringParseError(
+                    "delivery_unit_context_verification.literals_too_large",
+                    "Unit-context gaps contain too much source literal content.",
+                )
+            literals.append(literal)
+        gaps.append(DeliveryUnitContextGap(unit_id=unit_id, source_literals=literals))
+    return gaps
 
 
 def _assessment_reason_codes(value: Any, recommended_mode: str) -> list[str]:

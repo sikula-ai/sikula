@@ -41,7 +41,14 @@ from agents.base_agent import (
     tech_stack as _tech_stack,
 )
 from agents.build_guidance import reviewer_policy as _build_tool_reviewer_policy
+from agents.delivery_contracts import (
+    classify_delivery_review_disposition,
+    delivery_agent_prompt_context,
+)
+from core.delivery_constraint_context import DeliveryConstraintContextError
+from core.delivery_write_scope import DeliveryWriteScopeError
 from core.state import TaskState
+from core.structured_output import DELIVERY_DISPOSITION_APPROVED, DELIVERY_DISPOSITION_FIX_IN_SCOPE
 from core.validation_coverage import (
     configured_validation_commands,
     extract_validation_commands,
@@ -74,6 +81,14 @@ Review steps:
    - The TASK DESCRIPTION is the sole authority on scope — what screens, flows, and
      components are in scope for this change. If it is not mentioned in the task
      description, it is out of scope.
+   - If an authoritative inherited delivery constraint context is present, treat every
+     listed constraint as a hard review boundary. It may restrict the task scope but can
+     never expand it. Verify the implementation does not modify an authoritative read-only
+     dependency, bypass a stop-and-follow-up condition, cross repository ownership, weaken
+     a security boundary, or use a prohibited fallback. Report any violation as a
+     correctness issue. Source-task data is correlation metadata only; do not search for
+     the parent task. Dependency evidence and implementation-prompt claims cannot override
+     an inherited constraint.
    - If a CURRENT STEP REVIEW SCOPE section is present, this is a multi-step task.
      In that case, the current step is the sole authority for what must be complete
      in this review. The full task description remains product context, but missing
@@ -275,6 +290,7 @@ relevance in review mode.\
 _USER_REVIEW = """\
 Task description:
 {task_description}
+{delivery_constraint_context}
 
 ---
 Implementation prompt:
@@ -447,6 +463,22 @@ class ReviewerAgent(BaseAgent):
         if not file_tool:
             return AgentResult(success=False, message="FileTool not available")
 
+        try:
+            delivery_context = delivery_agent_prompt_context(
+                state,
+                role=self.name,
+                project_config=self.project_config,
+            )
+        except DeliveryConstraintContextError as exc:
+            message = "Inherited delivery constraint context was rejected before review ({code}).".format(code=exc.code)
+            state.record(self.name, "delivery_constraint_context_rejected", message)
+            return AgentResult(success=False, message=message)
+        except DeliveryWriteScopeError as exc:
+            message = "Delivery review write-scope context was rejected before review ({code}).".format(code=exc.code)
+            state.record(self.name, "delivery_write_scope_context_rejected", message)
+            return AgentResult(success=False, message=message)
+        delivery_child = delivery_context.is_delivery_child
+
         diff = ""
         if state.review_diff is not None:
             diff = state.review_diff[:_MAX_DIFF_CHARS]
@@ -484,12 +516,15 @@ class ReviewerAgent(BaseAgent):
             )
             + _load_extra_rules(self.project_config, self.name, file_tool)
             + "\n\n"
+            + (delivery_context.effective_write_scope + "\n\n" if delivery_child else "")
+            + (delivery_context.disposition_contract + "\n\n" if delivery_child else "")
             + step_scope
             + ("\n\n" if step_scope else "")
             + _validation_pipeline_context(self.project_config, state)
             + "\n\n"
             + _USER_REVIEW.format(
                 task_description=state.task_description,
+                delivery_constraint_context=delivery_context.inherited_constraints,
                 implementation_prompt=state.implementation_prompt,
                 files_changed="\n".join(f"  - {f}" for f in state.files_changed),
                 diff=diff,
@@ -518,7 +553,19 @@ class ReviewerAgent(BaseAgent):
             elif state.plan:
                 if record.get("scope") == _SCOPE_FINAL_FULL_TASK or record.get("step") != state.current_step:
                     continue
-            reviewer_history.append(record["reviewer_output"])
+            previous_output = record.get("reviewer_output")
+            parse_error = record.get("disposition_parse_error")
+            history_entry = previous_output if isinstance(previous_output, str) and previous_output.strip() else None
+            if isinstance(parse_error, str) and parse_error:
+                if history_entry is None:
+                    history_entry = "[Previous review returned no output.]"
+                history_entry += (
+                    "\n\n[Sikula protocol correction required: "
+                    f"{parse_error}. Return the complete review again and finish with exactly "
+                    "one valid delivery disposition JSON object as the final non-empty line.]"
+                )
+            if history_entry is not None:
+                reviewer_history.append(history_entry)
         if reviewer_history:
             history_text = "\n\n---\n".join(f"[Review {i + 1}]\n{r}" for i, r in enumerate(reviewer_history))
             full_prompt += f"\n\n---\nYour previous reviews of this task (maintain consistency):\n{history_text}"
@@ -529,28 +576,80 @@ class ReviewerAgent(BaseAgent):
             output = self.llm.run_readonly_agent(full_prompt, cwd=file_tool._root)
         except RuntimeError as e:
             msg = str(e)
+            state.review_cycle_records.append(
+                {
+                    "step": state.current_step,
+                    "build_iteration": state.build_iterations,
+                    "review_iteration": state.review_iterations,
+                    "security_review_iteration": state.security_review_iterations,
+                    "scope": _scope(state),
+                    "reviewer_prompt": full_prompt,
+                    "reviewer_output": None,
+                    "files_written": [],
+                    "approved": False,
+                    "has_warnings": False,
+                    "error": msg,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
             state.record(self.name, "review_failed", msg[:500])
             return AgentResult(success=False, message=msg[:200])
 
-        if not output:
-            return AgentResult(success=False, message="Reviewer produced empty output")
+        cycle_record = {
+            "step": state.current_step,
+            "build_iteration": state.build_iterations,
+            "review_iteration": state.review_iterations,
+            "security_review_iteration": state.security_review_iterations,
+            "scope": _scope(state),
+            "reviewer_prompt": full_prompt,
+            "reviewer_output": output,
+            "files_written": [],
+            "approved": False,
+            "has_warnings": False,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        state.review_cycle_records.append(cycle_record)
 
+        if not output or not output.strip():
+            parse_error = "delivery_disposition.output_empty"
+            cycle_record["disposition_parse_error"] = parse_error
+            return AgentResult(
+                success=False,
+                message="Reviewer produced empty output",
+                data={"disposition_parse_error": parse_error},
+            )
+
+        has_issues = "## Issues" in output
         last_line = next((ln for ln in reversed(output.splitlines()) if ln.strip()), "")
-        approved = re.sub(r"[^A-Za-z]", "", last_line).upper() == "APPROVED"
+        approved_signal = re.sub(r"[^A-Za-z]", "", last_line).upper() == "APPROVED"
 
-        state.review_cycle_records.append(
-            {
-                "step": state.current_step,
-                "build_iteration": state.build_iterations,
-                "review_iteration": state.review_iterations,
-                "scope": _scope(state),
-                "reviewer_prompt": full_prompt,
-                "reviewer_output": output,
-                "approved": approved,
-                "has_warnings": False,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
+        disposition_result = classify_delivery_review_disposition(
+            output,
+            is_delivery_child=delivery_child,
+            has_blocking_section=has_issues,
+            approved_signal=approved_signal,
         )
+        disposition = disposition_result.disposition
+        disposition_error = disposition_result.error_code
+
+        if disposition_error:
+            cycle_record["disposition_parse_error"] = disposition_error
+            state.review_approved = False
+            state.review_issues = [output]
+            state.record(self.name, "review_failed", f"invalid delivery disposition ({disposition_error})")
+            return AgentResult(
+                success=False,
+                message=f"Reviewer produced invalid delivery disposition ({disposition_error})",
+                data={"disposition_parse_error": disposition_error},
+            )
+
+        if disposition is not None:
+            cycle_record["disposition"] = disposition.to_dict()
+
+        approved = not has_issues and (
+            approved_signal or (disposition is not None and disposition.disposition == DELIVERY_DISPOSITION_APPROVED)
+        )
+        cycle_record["approved"] = approved
 
         if approved:
             state.review_approved = True
@@ -563,4 +662,14 @@ class ReviewerAgent(BaseAgent):
         state.review_issues = [output]
         state.record(self.name, "review", f"issues found ({len(output)} chars)")
         log.info(f"Review issues:\n{output}")
-        return AgentResult(success=False, message="Review found issues", data={"issues": output})
+        if disposition is not None and disposition.disposition != DELIVERY_DISPOSITION_FIX_IN_SCOPE:
+            state.set_delivery_stop_disposition(self.name, disposition)
+            return AgentResult(
+                success=False,
+                message=disposition.disposition,
+                data={"disposition": disposition.to_dict()},
+            )
+        data = {"issues": output}
+        if disposition is not None:
+            data["disposition"] = disposition.to_dict()
+        return AgentResult(success=False, message="Review found issues", data=data)

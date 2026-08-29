@@ -16,7 +16,14 @@ from core.delivery_public_metadata import (
 )
 from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE, DeliveryUnitBudget
 from core.llm_usage import aggregate_llm_usage, empty_llm_usage_summary, merge_llm_usage_summaries
-from core.state import JsonStateStore
+from core.state import (
+    DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP,
+    DELIVERY_STOP_IMPLEMENTER_DISPOSITION_INVALID,
+    DELIVERY_STOP_SCOPE_AMENDMENT_REQUIRED,
+    DELIVERY_STOP_UNIT_SCOPE_VIOLATION,
+    DELIVERY_TERMINAL_STOP_CODES,
+    JsonStateStore,
+)
 
 SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION = 1
 DELIVERY_UNIT_STATUSES = {"pending", "running", "done", "failed", "canceled", "waiting"}
@@ -25,6 +32,34 @@ _DELIVERY_METADATA_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _DELIVERY_PROGRESS_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _DELIVERY_HANDOFF_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 _TERMINAL_DELIVERY_UNIT_STATUSES = {"done", "failed", "canceled"}
+_DELIVERY_TERMINAL_STOP_RECOMMENDED_ACTIONS = {
+    DELIVERY_STOP_UNIT_SCOPE_VIOLATION: "delivery_amend_prepare",
+    DELIVERY_STOP_SCOPE_AMENDMENT_REQUIRED: "delivery_amend_prepare",
+    DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP: "external_dependency_follow_up",
+    DELIVERY_STOP_IMPLEMENTER_DISPOSITION_INVALID: "inspect_invalid_implementer_disposition",
+}
+
+
+def delivery_terminal_stop_recommended_action(failure_code: str | None) -> str | None:
+    """Return the stable machine action for a terminal delivery stop."""
+    return _DELIVERY_TERMINAL_STOP_RECOMMENDED_ACTIONS.get(failure_code)
+
+
+def delivery_terminal_stop_error_code(failure_code: str | None) -> str | None:
+    if not isinstance(failure_code, str) or failure_code not in DELIVERY_TERMINAL_STOP_CODES:
+        return None
+    return f"delivery.{failure_code}"
+
+
+def delivery_terminal_stop_recovery_action(failure_code: str | None) -> str | None:
+    action = delivery_terminal_stop_recommended_action(failure_code)
+    if action == "delivery_amend_prepare":
+        return "prepare a delivery amendment with delivery amend prepare before continuing"
+    if action == "external_dependency_follow_up":
+        return "complete the external dependency follow-up before continuing"
+    if action == "inspect_invalid_implementer_disposition":
+        return "inspect the invalid implementer disposition and replace the failed child before continuing"
+    return None
 
 
 @dataclass(frozen=True)
@@ -249,7 +284,7 @@ class DeliveryStatusUnit:
 
     @property
     def run_next_available(self) -> bool:
-        if self.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE:
+        if self.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE or self.failure_code in DELIVERY_TERMINAL_STOP_CODES:
             return False
         if self.status in ("running", "failed"):
             return bool(self.child_task_id)
@@ -259,12 +294,19 @@ class DeliveryStatusUnit:
     def run_next_action(self) -> str | None:
         if self.status == "running" and self.child_task_id:
             return "resume_or_reconcile"
-        if self.status == "failed" and self.child_task_id and self.failure_code != DELIVERY_UNIT_BUDGET_EXCEEDED_CODE:
+        if (
+            self.status == "failed"
+            and self.child_task_id
+            and self.failure_code != DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
+            and self.failure_code not in DELIVERY_TERMINAL_STOP_CODES
+        ):
             return "retry_failed"
         return None
 
     @property
     def run_next_blocked_reason(self) -> str | None:
+        if self.status == "failed" and self.failure_code in DELIVERY_TERMINAL_STOP_CODES:
+            return self.failure_code
         if self.status == "failed" and self.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE:
             return DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
         if self.status in ("running", "failed") and not self.child_task_id:
@@ -700,6 +742,7 @@ def select_next_delivery_unit(status: DeliveryStatusResult, reset_failed: bool =
                 if unit.status == "failed"
                 and unit.child_task_id
                 and unit.failure_code != DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
+                and unit.failure_code not in DELIVERY_TERMINAL_STOP_CODES
             ),
             None,
         )
@@ -1102,6 +1145,8 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
             elif unit.status == "failed":
                 if unit.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE:
                     detail += " (split required before implementation)"
+                elif recovery_action := delivery_terminal_stop_recovery_action(unit.failure_code):
+                    detail += f" ({recovery_action})"
                 elif unit.child_task_id:
                     detail += " (run-next: retry with --reset-failed)"
                 else:
@@ -1536,6 +1581,16 @@ def _next_action(
     if failed_units:
         if any(u.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE for u in failed_units):
             return "split the budget-exceeded unit with delivery amend prepare before continuing"
+        for stop_code in (
+            DELIVERY_STOP_UNIT_SCOPE_VIOLATION,
+            DELIVERY_STOP_SCOPE_AMENDMENT_REQUIRED,
+            DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP,
+            DELIVERY_STOP_IMPLEMENTER_DISPOSITION_INVALID,
+        ):
+            if any(unit.failure_code == stop_code for unit in failed_units):
+                recovery_action = delivery_terminal_stop_recovery_action(stop_code)
+                if recovery_action is not None:
+                    return recovery_action
         if any(u.child_task_id for u in failed_units):
             return "retry a failed delivery unit with delivery run-next --reset-failed"
         return "inspect the failed delivery unit; no linked child task is available for retry"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -12,7 +13,7 @@ from agents.reviewer_agent import (
     ReviewerAgent,
     _MAX_DIFF_CHARS,
 )
-from tests.conftest import StubLLMClient
+from core.delivery_constraint_context import delivery_constraint_context_fingerprint
 from core.state import TaskState
 from core.validation_coverage import (
     configured_validation_commands,
@@ -22,6 +23,7 @@ from core.validation_coverage import (
     validation_commands_equivalent,
 )
 from tools.base_tool import ToolResult
+from tests.conftest import StubLLMClient
 
 
 def _make_state(**kwargs) -> TaskState:
@@ -44,9 +46,66 @@ def _make_agent(
     tools: dict = {}
     if file_tool is not None:
         tools["file"] = file_tool
+        if project_config is None:
+            project_config = {
+                "project": {"root_path": str(file_tool._root)},
+                "sandbox": {"allowed_write_paths": ["."]},
+            }
     if git_tool is not None:
         tools["git"] = git_tool
     return ReviewerAgent(llm=llm, tools=tools, project_config=project_config or {})
+
+
+def _add_delivery_constraint_context(state: TaskState) -> None:
+    state.delivery_plan_id = "demo-plan"
+    state.delivery_unit_id = "feature-unit"
+    state.delivery_plan_path = ".sikula/delivery/demo-plan/plan.yaml"
+    state.delivery_constraint_context_schema_version = 1
+    state.delivery_source_task = {
+        "path": ".sikula/tasks/demo.md",
+        "sha256": f"sha256:{'a' * 64}",
+    }
+    state.delivery_inherited_constraints = [
+        {
+            "id": "external-read-only",
+            "kind": "authoritative_read_only_dependency",
+            "summary": "Treat the external repository as read-only evidence.",
+            "unit_ids": ["feature-unit"],
+            "disposition": "preserved",
+        }
+    ]
+    state.delivery_constraint_context_fingerprint = delivery_constraint_context_fingerprint(
+        schema_version=state.delivery_constraint_context_schema_version,
+        plan_id=state.delivery_plan_id,
+        unit_id=state.delivery_unit_id,
+        plan_path=state.delivery_plan_path,
+        source_task=state.delivery_source_task,
+        constraints=state.delivery_inherited_constraints,
+    )
+
+
+def _add_delivery_write_scope(state: TaskState) -> None:
+    state.delivery_write_scope_schema_version = 2
+    state.delivery_write_scope_mode = "unit_explicit"
+    state.delivery_declared_write_paths = ["src"]
+    state.delivery_declared_write_exact_file_paths = []
+    state.delivery_effective_write_paths = ["src"]
+    state.delivery_effective_write_exact_file_paths = []
+    state.delivery_runtime_write_scope_binding = {
+        "schema_version": 1,
+        "status": "bound",
+        "roots": [{"path": "src", "resolved_path": "src", "exact_file": False}],
+    }
+
+
+def _delivery_approval_output() -> str:
+    return json.dumps(
+        {
+            "sikula_disposition_schema_version": 1,
+            "disposition": "approved",
+            "summary": "No blocking correctness issues found.",
+        }
+    )
 
 
 class TestReviewerAgentGuards:
@@ -70,6 +129,41 @@ class TestReviewerAgentGuards:
         result = agent.run(state)
         assert not result.success
         assert "FileTool" in result.message
+
+    def test_malformed_modern_constraint_context_fails_before_provider_call(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        state.delivery_constraint_context_fingerprint = None
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert not result.success
+        assert "fingerprint_invalid" in result.message
+        assert stub_llm.readonly_calls == []
+        assert state.review_cycle_records == []
+        assert state.review_issues == []
+        assert state.history[-1]["action"] == "delivery_constraint_context_rejected"
+
+    def test_invalid_active_write_scope_fails_before_provider_call(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        _add_delivery_write_scope(state)
+        project_config = {
+            "project": {"root_path": str(file_tool._root)},
+            "sandbox": {"allowed_write_paths": ["../outside"]},
+        }
+
+        result = _make_agent(
+            stub_llm,
+            file_tool=file_tool,
+            project_config=project_config,
+        ).run(state)
+
+        assert not result.success
+        assert "runtime_intersection_invalid" in result.message
+        assert stub_llm.readonly_calls == []
+        assert state.review_cycle_records == []
+        assert state.history[-1]["action"] == "delivery_write_scope_context_rejected"
 
 
 class TestReviewerAgentApproval:
@@ -181,14 +275,210 @@ class TestReviewerAgentErrors:
         agent = _make_agent(stub_llm, file_tool=file_tool)
         agent.run(state)
         assert any(e["action"] == "review_failed" for e in state.history)
+        assert state.review_cycle_records[-1]["reviewer_output"] is None
+        assert state.review_cycle_records[-1]["error"] == "LLM timeout"
 
     def test_empty_output_returns_failure(self, stub_llm: StubLLMClient, file_tool):
-        stub_llm.readonly_result = ""
+        stub_llm.readonly_result = " \n "
         state = _make_state()
         agent = _make_agent(stub_llm, file_tool=file_tool)
         result = agent.run(state)
         assert not result.success
         assert "empty" in result.message
+        assert result.data["disposition_parse_error"] == "delivery_disposition.output_empty"
+        assert state.review_cycle_records[-1]["disposition_parse_error"] == "delivery_disposition.output_empty"
+
+    def test_empty_delivery_output_is_included_in_protocol_retry_prompt(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.readonly_results = ["", TestReviewerDeliveryDispositions._issue_output("fix_in_scope")]
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+
+        first = agent.run(state)
+        agent.run(state)
+
+        assert first.data["disposition_parse_error"] == "delivery_disposition.output_empty"
+        assert "delivery_disposition.output_empty" in stub_llm.readonly_calls[1]
+
+
+class TestReviewerDeliveryDispositions:
+    @staticmethod
+    def _issue_output(disposition: str) -> str:
+        return (
+            "## Issues\n\n### Boundary finding\nFile: app/src/LoginActivity.kt\n"
+            "Problem: The required correction crosses a delivery boundary.\n"
+            "Fix: Apply the disposition-specific recovery.\n\n"
+            + json.dumps(
+                {
+                    "sikula_disposition_schema_version": 1,
+                    "disposition": disposition,
+                    "summary": "The review found one bounded delivery issue.",
+                }
+            )
+        )
+
+    def test_fix_in_scope_authorizes_existing_bounded_fix_signal(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.readonly_result = self._issue_output("fix_in_scope")
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is False
+        assert result.data["issues"] == stub_llm.readonly_result
+        assert result.data["disposition"]["disposition"] == "fix_in_scope"
+        assert state.delivery_stop_disposition is None
+        assert state.review_cycle_records[-1]["disposition"]["recommended_action"] == "bounded_fix"
+
+    def test_explicit_approval_disposition_approves_delivery_child(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.readonly_result = json.dumps(
+            {
+                "sikula_disposition_schema_version": 1,
+                "disposition": "approved",
+                "summary": "No blocking correctness issues found.",
+            }
+        )
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is True
+        assert state.review_approved is True
+        assert state.review_issues == []
+        assert state.review_cycle_records[-1]["disposition"]["recommended_action"] == "continue"
+
+    def test_legacy_approval_signal_does_not_approve_delivery_child(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.readonly_result = "APPROVED"
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is False
+        assert result.data["disposition_parse_error"] == "delivery_disposition.decision_missing"
+        assert state.review_approved is False
+
+    @pytest.mark.parametrize(
+        ("disposition", "action"),
+        [
+            ("requires_scope_amendment", "delivery_amend_prepare"),
+            ("external_dependency_gap", "external_dependency_follow_up"),
+        ],
+    )
+    def test_terminal_disposition_does_not_authorize_fix_signal(
+        self,
+        disposition: str,
+        action: str,
+        stub_llm: StubLLMClient,
+        file_tool,
+    ):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.readonly_result = self._issue_output(disposition)
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is False
+        assert "issues" not in result.data
+        assert state.delivery_stop_disposition is not None
+        assert state.delivery_stop_disposition["disposition"] == disposition
+        assert state.delivery_stop_disposition["recommended_action"] == action
+
+    def test_free_form_delivery_issue_cannot_authorize_fix(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.readonly_result = (
+            "## Issues\n\n### Scope\nFile: app/src/LoginActivity.kt\nProblem: outside scope\n"
+            "Fix: requires_scope_amendment"
+        )
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is False
+        assert "issues" not in result.data
+        assert result.data["disposition_parse_error"] == "delivery_disposition.missing"
+        assert state.delivery_stop_disposition is None
+
+    def test_mixed_approval_and_issue_disposition_fails_closed(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.readonly_result = self._issue_output("fix_in_scope") + "\nAPPROVED"
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is False
+        assert "issues" not in result.data
+        assert result.data["disposition_parse_error"] == "delivery_disposition.conflicting_decision"
+        assert state.review_approved is False
+
+    def test_disposition_without_issue_section_fails_closed(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        state.review_cycle_records.append({"reviewer_output": None})
+        stub_llm.readonly_result = self._issue_output("fix_in_scope").replace("## Issues", "Review note")
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is False
+        assert result.data["disposition_parse_error"] == "delivery_disposition.issue_section_missing"
+        assert state.delivery_stop_disposition is None
+
+    def test_output_without_issue_or_decision_fails_closed(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.readonly_result = "The review output contains neither a decision nor an issue section."
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is False
+        assert result.data["disposition_parse_error"] == "delivery_disposition.decision_missing"
+        assert state.review_approved is False
+
+    def test_disposition_error_is_included_in_next_review_prompt(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        malformed = (
+            json.dumps(
+                {
+                    "sikula_disposition_schema_version": 1,
+                    "disposition": "fix_in_scope",
+                    "summary": "No blocking correctness issues found.",
+                }
+            )
+            + "\nAPPROVED"
+        )
+        approved = json.dumps(
+            {
+                "sikula_disposition_schema_version": 1,
+                "disposition": "approved",
+                "summary": "No blocking correctness issues found.",
+            }
+        )
+        stub_llm.readonly_results = [malformed, approved]
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+
+        first = agent.run(state)
+        second = agent.run(state)
+
+        assert first.data["disposition_parse_error"] == "delivery_disposition.position_invalid"
+        assert second.success is True
+        assert "Sikula protocol correction required" in stub_llm.readonly_calls[1]
+        assert "delivery_disposition.position_invalid" in stub_llm.readonly_calls[1]
+
+    def test_delivery_prompt_declares_closed_disposition_contract(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.readonly_result = "APPROVED"
+
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        prompt = stub_llm.readonly_calls[0]
+        assert "AUTHORITATIVE ACTIVE DELIVERY WRITE SCOPE" in prompt
+        assert '{"kind":"path_prefix","path":"."}' in prompt
+        assert "DELIVERY REVIEW DISPOSITION CONTRACT" in prompt
+        assert '"disposition":"approved"' in prompt
+        assert "replaces the generic APPROVED output instructions" in prompt
 
 
 class TestReviewerAgentDiff:
@@ -252,6 +542,78 @@ class TestReviewerAgentDiff:
 
 
 class TestReviewerAgentPrompt:
+    def test_delivery_prompt_uses_current_narrowed_exact_file_scope(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = _delivery_approval_output()
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        _add_delivery_write_scope(state)
+        project_config = {
+            "project": {"root_path": str(file_tool._root)},
+            "sandbox": {"allowed_write_paths": ["src/main.py"]},
+        }
+
+        result = _make_agent(
+            stub_llm,
+            file_tool=file_tool,
+            project_config=project_config,
+        ).run(state)
+
+        assert result.success
+        prompt = stub_llm.readonly_calls[0]
+        assert '{"kind":"exact_file","path":"src/main.py"}' in prompt
+        assert '{"kind":"path_prefix","path":"src"}' not in prompt
+
+    def test_authoritative_constraint_context_is_between_task_and_implementation_prompt(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
+        stub_llm.readonly_result = _delivery_approval_output()
+        state = _make_state(implementation_prompt="Update the local feature implementation.")
+        _add_delivery_constraint_context(state)
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success
+        prompt = stub_llm.readonly_calls[0]
+        context_index = prompt.index("Authoritative inherited delivery constraint context:")
+        assert prompt.index("Task description:") < context_index < prompt.index("Implementation prompt:")
+        assert "Treat the external repository as read-only evidence." in prompt
+        assert '"fingerprint":"{value}"'.format(value=state.delivery_constraint_context_fingerprint) in prompt
+        assert "may restrict the task scope but can" in prompt
+        assert "never expand it" in prompt
+        assert "Report any violation as a" in prompt
+        assert "DELIVERY REVIEW DISPOSITION CONTRACT" in prompt
+        assert state.review_cycle_records[0]["reviewer_prompt"] == prompt
+
+    def test_legacy_reviewer_prompt_omits_constraint_context(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = "APPROVED"
+        state = _make_state()
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success
+        assert "Authoritative inherited delivery constraint context:" not in stub_llm.readonly_calls[0]
+        assert "AUTHORITATIVE ACTIVE DELIVERY WRITE SCOPE" not in stub_llm.readonly_calls[0]
+        assert "DELIVERY REVIEW DISPOSITION CONTRACT" not in stub_llm.readonly_calls[0]
+
+    def test_re_review_keeps_authoritative_constraint_context(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_results = [
+            "## Issues\n\n### Boundary violation\nFile: src/local.py\nProblem: p\nFix: f",
+            _delivery_approval_output(),
+        ]
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        agent = _make_agent(stub_llm, file_tool=file_tool)
+
+        first = agent.run(state)
+        second = agent.run(state)
+
+        assert not first.success
+        assert second.success
+        assert len(stub_llm.readonly_calls) == 2
+        assert all(
+            "Authoritative inherited delivery constraint context:" in prompt for prompt in stub_llm.readonly_calls
+        )
+
     def test_tech_stack_in_prompt(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         config = {"project": {"platform": "Android", "language": "Kotlin"}}
@@ -1242,6 +1604,33 @@ class TestReviewerAgentPlanContext:
 
 
 class TestReviewerAgentCycleRecord:
+    @pytest.mark.parametrize("provider_error", [False, True])
+    def test_record_has_complete_correlation_fields(
+        self,
+        stub_llm: StubLLMClient,
+        file_tool,
+        provider_error: bool,
+    ):
+        state = _make_state()
+        state.current_step = 2
+        state.build_iterations = 3
+        state.review_iterations = 4
+        state.security_review_iterations = 5
+        if provider_error:
+            stub_llm.readonly_error = RuntimeError("review unavailable")
+        else:
+            stub_llm.readonly_result = "APPROVED"
+
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        record = state.review_cycle_records[0]
+        assert record["step"] == 2
+        assert record["build_iteration"] == 3
+        assert record["review_iteration"] == 4
+        assert record["security_review_iteration"] == 5
+        assert record["scope"] == "task"
+        assert record["files_written"] == []
+
     def test_record_has_no_reviewer_field(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state()

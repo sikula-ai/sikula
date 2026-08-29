@@ -24,6 +24,7 @@ from core.delivery_run import (
     _public_path,
     render_delivery_run,
 )
+from core.state import JsonStateStore
 from sikula_cli.delivery import (
     DeliveryRunNextContext,
     _bounded_delivery_run_snapshot_issue,
@@ -98,6 +99,7 @@ def _context() -> DeliveryRunNextContext:
     return DeliveryRunNextContext(
         run_task=lambda args, cfg: 0,
         resolve_state_dir=lambda cfg: Path("/project/.sikula/state"),
+        state_store=JsonStateStore(Path("/project/.sikula/state")),
     )
 
 

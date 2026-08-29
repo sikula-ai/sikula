@@ -346,26 +346,25 @@ def test_parse_delivery_assessment_rejects_absolute_paths_in_labels(field: str, 
 
 
 @pytest.mark.parametrize("route", ["/users/{id}", "/home", "/v1/files"])
-def test_parse_delivery_assessment_rejects_http_route_in_title(route: str) -> None:
-    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
-        parse_delivery_assessment_output(
-            json.dumps(
-                {
-                    "recommended_mode": "delivery_plan",
-                    "reason_codes": ["multiple_components"],
-                    "units": [
-                        {
-                            "id": "api",
-                            "title": f"Implement GET {route}",
-                            "depends_on": [],
-                        },
-                        {"id": "web", "title": "Web client", "depends_on": ["api"]},
-                    ],
-                }
-            )
+def test_parse_delivery_assessment_accepts_http_route_in_title(route: str) -> None:
+    result = parse_delivery_assessment_output(
+        json.dumps(
+            {
+                "recommended_mode": "delivery_plan",
+                "reason_codes": ["multiple_components"],
+                "units": [
+                    {
+                        "id": "api",
+                        "title": f"Implement GET {route}",
+                        "depends_on": [],
+                    },
+                    {"id": "web", "title": "Web client", "depends_on": ["api"]},
+                ],
+            }
         )
+    )
 
-    assert exc_info.value.code == "delivery_assessment.label_invalid"
+    assert result.units[0].title == f"Implement GET {route}"
 
 
 def test_delivery_assessment_parser_registers_platform_neutral_command() -> None:

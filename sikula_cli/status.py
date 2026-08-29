@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sys
 
+from core.delivery_progress import delivery_terminal_stop_recovery_action
 from core.state import JsonStateStore
 from core.subprocess_utils import windows_pid_running
 from sikula_cli.config import _resolve_state_dir
@@ -267,6 +268,8 @@ def _status_next_action(state, status: str, context: StatusContext | None = None
             return "re-run sikula review"
         if context.contract_gate_blocked_without_worktree(state):
             return context.contract_gate_next_action(state)
+        if recovery_action := delivery_terminal_stop_recovery_action(state.delivery_stop_code):
+            return recovery_action
         if context.delivery_child_without_worktree(state):
             return f"sikula show {state.task_id}"
         return f"sikula run --task-id {state.task_id} --reset-failed"

@@ -8,11 +8,12 @@ from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
-import shutil
 import sys
 import time
 
+from core.delivery_progress import delivery_terminal_stop_recovery_action
 from core.llm_usage import aggregate_llm_usage
+from core.worktree import WorktreeEnvironmentCopyError, copy_worktree_environment_file
 
 
 def register_parser(
@@ -157,6 +158,59 @@ def _run_context(context: RunContext | None = None) -> RunContext:
     return context
 
 
+def _apply_delivery_write_scope_or_stop(cfg: dict, state, store, *, persist_runtime: bool = False) -> bool:
+    from core.delivery_write_scope import (
+        DeliveryWriteScopeError,
+        apply_delivery_write_scope_to_config,
+        create_delivery_runtime_write_scope_binding,
+        denied_delivery_runtime_write_scope_binding,
+    )
+    from core.state import DELIVERY_STOP_UNIT_SCOPE_VIOLATION
+
+    try:
+        runtime_scope = apply_delivery_write_scope_to_config(cfg, state)
+        if persist_runtime and runtime_scope is not None and state.delivery_runtime_write_scope_binding is None:
+            state.delivery_runtime_write_scope_binding = create_delivery_runtime_write_scope_binding(
+                project_root=Path(cfg["project"]["root_path"]),
+                runtime_scope=runtime_scope,
+            ).to_dict()
+    except DeliveryWriteScopeError as exc:
+        if persist_runtime and state.delivery_runtime_write_scope_binding is None:
+            state.delivery_runtime_write_scope_binding = denied_delivery_runtime_write_scope_binding().to_dict()
+        if state.delivery_plan_id and state.delivery_unit_id:
+            state.set_delivery_terminal_stop(DELIVERY_STOP_UNIT_SCOPE_VIOLATION, source="orchestrator")
+        else:
+            state.failed = True
+        state.record(
+            "orchestrator",
+            "delivery_write_scope_invalid",
+            "delivery child write-scope validation failed before runtime construction",
+            error=exc.code,
+        )
+        store.save(state)
+        print(f"Delivery write scope error ({exc.code}): {exc}")
+        sys.exit(1)
+        return False
+    if persist_runtime and runtime_scope is not None:
+        store.save(state)
+    return True
+
+
+def _recover_interrupted_delivery_scope_before_revalidation(
+    cfg: dict,
+    overrides: dict,
+    state,
+    store,
+    context: RunContext,
+):
+    from core.orchestrator import delivery_scope_audit_recovery_required
+
+    if not delivery_scope_audit_recovery_required(state, store):
+        return state, False
+    recovery_orchestrator = context.build_orchestrator(cfg, overrides, state_store=store)
+    return recovery_orchestrator.recover_interrupted_delivery_scope(state.task_id), True
+
+
 def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = None) -> None:
     from core.state import JsonStateStore
 
@@ -256,10 +310,24 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             delivery_unit_id=getattr(args, "delivery_unit_id", None),
             delivery_plan_path=getattr(args, "delivery_plan_path", None),
             delivery_unit_budget=getattr(args, "delivery_unit_budget", None),
+            delivery_constraint_context_schema_version=getattr(
+                args, "delivery_constraint_context_schema_version", None
+            ),
+            delivery_source_task=getattr(args, "delivery_source_task", None),
+            delivery_inherited_constraints=getattr(args, "delivery_inherited_constraints", None),
+            delivery_constraint_context_fingerprint=getattr(args, "delivery_constraint_context_fingerprint", None),
+            delivery_write_scope_schema_version=getattr(args, "delivery_write_scope_schema_version", None),
+            delivery_write_scope_mode=getattr(args, "delivery_write_scope_mode", None),
+            delivery_declared_write_paths=getattr(args, "delivery_declared_write_paths", None),
+            delivery_declared_write_exact_file_paths=getattr(args, "delivery_declared_write_exact_file_paths", None),
+            delivery_effective_write_paths=getattr(args, "delivery_effective_write_paths", None),
+            delivery_effective_write_exact_file_paths=getattr(args, "delivery_effective_write_exact_file_paths", None),
             delivery_handoff_schema_version=getattr(args, "delivery_handoff_schema_version", None),
             delivery_dependency_handoffs=getattr(args, "delivery_dependency_handoffs", None),
         )
         args.created_task_id = state.task_id
+        if not _apply_delivery_write_scope_or_stop(cfg, state, store):
+            return
         state.task_file = Path(args.task_file).name
         state.config_snapshot = context.run_config_snapshot(cfg, overrides)
         preflight_cfg = context.contract_preflight_config(cfg, overrides)
@@ -318,12 +386,25 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
                 print(f"Failed to create git worktree: {err}")
                 sys.exit(1)
             # Copy gitignored environment files that the build needs but are not tracked.
-            for name in context.build_tool_class(cfg).env_files():
-                src = original_project_root / name
-                dst = worktree_project_root / name
-                if src.exists() and not dst.exists():
-                    shutil.copy2(src, dst)
-                    context.logger.info("Copied %s to worktree", name)
+            try:
+                for name in context.build_tool_class(cfg).env_files():
+                    src = original_project_root / name
+                    dst = worktree_project_root / name
+                    if copy_worktree_environment_file(src, dst, worktree_project_root):
+                        context.logger.info("Copied %s to worktree", name)
+            except WorktreeEnvironmentCopyError as exc:
+                state.failed = True
+                state.worktree_path = str(worktree_project_root)
+                state.worktree_base = str(worktree_base)
+                state.worktree_branch = branch
+                state.record(
+                    "orchestrator",
+                    "worktree_environment_copy_rejected",
+                    str(exc),
+                )
+                store.save(state)
+                print(f"Worktree environment setup failed: {exc}")
+                sys.exit(1)
             state.worktree_path = str(worktree_project_root)
             state.worktree_base = str(worktree_base)
             state.worktree_branch = branch
@@ -332,6 +413,13 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             context.logger.info("Worktree created: %s (branch: %s)", worktree_base, branch)
             cfg["project"]["root_path"] = str(worktree_project_root)
 
+        # The delivery snapshot is initially checked before creating a worktree so
+        # malformed child metadata fails without side effects.  An isolated child
+        # can, however, start from an assembled dependency commit whose paths differ
+        # from the operator checkout.  Revalidate against that authoritative tree
+        # immediately before constructing the runtime sandbox.
+        if not _apply_delivery_write_scope_or_stop(cfg, state, store, persist_runtime=True):
+            return
         orch = context.build_orchestrator(cfg, overrides, state_store=store)
         state = orch.run(
             task_id=state.task_id,
@@ -402,8 +490,27 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             context.record_snapshot_asset_drift(state, project_root, store, phase="resume")
 
         if not current_branch_delivery_retry:
-            orch = context.build_orchestrator(cfg, overrides, state_store=store)
-            state = orch.run(task_id=args.task_id)
+            scope_recovery_performed = False
+            if not state.done and not state.failed:
+                state, scope_recovery_performed = _recover_interrupted_delivery_scope_before_revalidation(
+                    cfg,
+                    overrides,
+                    state,
+                    store,
+                    context,
+                )
+            if (
+                not state.done
+                and not state.failed
+                and not _apply_delivery_write_scope_or_stop(cfg, state, store, persist_runtime=True)
+            ):
+                return
+            if not (scope_recovery_performed and (state.done or state.failed)):
+                orch = context.build_orchestrator(cfg, overrides, state_store=store)
+                state = orch.run(
+                    task_id=args.task_id,
+                    invocation_already_recorded=scope_recovery_performed,
+                )
 
     else:
         raise AssertionError("unreachable — task_file/task_id check is in main()")
@@ -475,6 +582,10 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
             if context.contract_gate_blocked_without_worktree(state):
                 print("The contract readiness gate blocked delivery before a worktree was created.")
                 print(f"Suggested next step: {context.contract_gate_next_action(state)}")
+            elif recovery_action := delivery_terminal_stop_recovery_action(state.delivery_stop_code):
+                print(f"This delivery child has a non-retryable terminal stop: {state.delivery_stop_code}.")
+                print(f"Suggested next step: {recovery_action}.")
+                print(f"Inspect state: sikula show {state.task_id}")
             elif context.delivery_child_without_worktree(state):
                 print("Delivery parent-child linking failed before a worktree was created.")
                 print(f"Inspect state: sikula show {state.task_id}")

@@ -1,0 +1,189 @@
+schema_version: 1
+plan_id: delivery-unit-scope-and-external-dependency-stops
+title: Fail-closed delivery scope and dependency stops
+planning_mode: fixed_window
+final_branch: sikula/delivery/delivery-unit-scope-and-external-dependency-stops
+repositories:
+- id: main
+  root: .
+units:
+- id: inherited-constraint-contract
+  title: Preserve source-task delivery constraints
+  task_path: .sikula/delivery/delivery-unit-scope-and-external-dependency-stops/units/inherited-constraint-contract.md
+  depends_on: []
+  scope_paths:
+  - agents/delivery_preparation_agent.py
+  - core/delivery_authoring.py
+  - core/delivery_prepare_writer.py
+  - core/delivery_plan.py
+  estimated_size: medium
+  risk_tags:
+  - structured_output_contract
+  - automation_behavior
+  - security_boundary
+  budget:
+    max_planner_steps: 1
+    max_changed_files: 6
+- id: child-constraint-context
+  title: Carry constraints into delivery children
+  task_path: .sikula/delivery/delivery-unit-scope-and-external-dependency-stops/units/child-constraint-context.md
+  depends_on:
+  - inherited-constraint-contract
+  scope_paths:
+  - core/delivery_constraint_context.py
+  - core/delivery_plan.py
+  - core/state.py
+  - sikula_cli/delivery.py
+  - sikula_cli/run.py
+  - agents/analyst_agent.py
+  - agents/implementer_agent.py
+  - agents/reviewer_agent.py
+  - agents/security_reviewer_agent.py
+  estimated_size: medium
+  risk_tags:
+  - data_persistence
+  - audit_artifacts
+  - privacy
+  budget:
+    max_planner_steps: 1
+    max_changed_files: 9
+- id: effective-unit-write-scope
+  title: Calculate effective unit write scope
+  task_path: .sikula/delivery/delivery-unit-scope-and-external-dependency-stops/units/effective-unit-write-scope.md
+  depends_on:
+  - child-constraint-context
+  scope_paths:
+  - core/delivery_write_scope.py
+  - core/state.py
+  - core/orchestrator.py
+  - sikula_cli/delivery.py
+  - sikula_cli/run.py
+  estimated_size: medium
+  risk_tags:
+  - execution_boundary
+  - security_boundary
+  - configuration
+  budget:
+    max_planner_steps: 1
+    max_changed_files: 5
+- id: provider-independent-scope-audit
+  title: Audit production writes after provider calls
+  task_path: .sikula/delivery/delivery-unit-scope-and-external-dependency-stops/units/provider-independent-scope-audit.md
+  depends_on:
+  - effective-unit-write-scope
+  scope_paths:
+  - core/orchestrator.py
+  - core/validation_artifacts.py
+  - core/llm_client.py
+  - agents/implementer_agent.py
+  - agents/fixer_agent.py
+  - tools/base_tool.py
+  - tools/cargo_tool.py
+  estimated_size: medium
+  risk_tags:
+  - execution_boundary
+  - security_boundary
+  - audit_artifacts
+  budget:
+    max_planner_steps: 1
+    max_changed_files: 7
+- id: structured-stop-dispositions
+  title: Parse structured delivery stop dispositions
+  task_path: .sikula/delivery/delivery-unit-scope-and-external-dependency-stops/units/structured-stop-dispositions.md
+  depends_on:
+  - child-constraint-context
+  scope_paths:
+  - core/structured_output.py
+  - core/state.py
+  - agents/analyst_agent.py
+  - agents/implementer_agent.py
+  - agents/reviewer_agent.py
+  - agents/security_reviewer_agent.py
+  estimated_size: medium
+  risk_tags:
+  - structured_output_contract
+  - automation_behavior
+  - security_boundary
+  budget:
+    max_planner_steps: 2
+    max_changed_files: 8
+- id: terminal-child-stop-control
+  title: Stop child pipelines on boundary findings
+  task_path: .sikula/delivery/delivery-unit-scope-and-external-dependency-stops/units/terminal-child-stop-control.md
+  depends_on:
+  - provider-independent-scope-audit
+  - structured-stop-dispositions
+  scope_paths:
+  - core/orchestrator.py
+  - core/state.py
+  estimated_size: medium
+  risk_tags:
+  - automation_behavior
+  - security_boundary
+  - audit_artifacts
+  budget:
+    max_planner_steps: 1
+    max_changed_files: 5
+- id: delivery-stop-projections
+  title: Project stable delivery stop recovery
+  task_path: .sikula/delivery/delivery-unit-scope-and-external-dependency-stops/units/delivery-stop-projections.md
+  depends_on:
+  - terminal-child-stop-control
+  scope_paths:
+  - core/delivery_progress.py
+  - core/delivery_run.py
+  - sikula_cli/delivery.py
+  - sikula_cli/run.py
+  - sikula_cli/status.py
+  - sikula.py
+  estimated_size: medium
+  risk_tags:
+  - cli_surface
+  - public_output_contract
+  - data_persistence
+  budget:
+    max_planner_steps: 1
+    max_changed_files: 6
+- id: amendment-failure-evidence
+  title: Use failed-child evidence in amendments
+  task_path: .sikula/delivery/delivery-unit-scope-and-external-dependency-stops/units/amendment-failure-evidence.md
+  depends_on:
+  - inherited-constraint-contract
+  - terminal-child-stop-control
+  - delivery-stop-projections
+  scope_paths:
+  - core/delivery_amendment.py
+  - core/delivery_authoring.py
+  - agents/delivery_preparation_agent.py
+  - sikula_cli/delivery.py
+  - sikula.py
+  estimated_size: medium
+  risk_tags:
+  - audit_artifacts
+  - privacy
+  - structured_output_contract
+  budget:
+    max_planner_steps: 2
+    max_changed_files: 7
+- id: delivery-stop-hardening
+  title: Document and harden delivery stops
+  task_path: .sikula/delivery/delivery-unit-scope-and-external-dependency-stops/units/delivery-stop-hardening.md
+  depends_on:
+  - amendment-failure-evidence
+  scope_paths:
+  - ARCHITECTURE.md
+  - CHANGELOG.md
+  - guidelines.md
+  - docs/delivery-plans.md
+  - docs/pipeline.md
+  - docs/sandbox.md
+  - README.md
+  estimated_size: medium
+  risk_tags:
+  - docs_coverage
+  - test_hardening
+  - validation
+  budget:
+    max_planner_steps: 1
+    max_changed_files: 8
+    max_generated_test_files: 8

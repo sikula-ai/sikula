@@ -93,9 +93,9 @@ path traversal, absolute output paths, path collisions, outside-project writes,
 targets remain rejected.
 Generated plan titles and unit title, stream, component, phase, kind, and
 platform metadata must also be bounded, single-line, and free of absolute local
-paths. Slash-prefixed API routes belong in unit task Markdown rather than these
-public metadata fields; full `https://` URLs remain valid metadata. The parser
-and deterministic writer both enforce this boundary before writing.
+paths. Explicit HTTP routes such as `GET /api/v1/resource` and full `http://` or
+`https://` URLs remain valid metadata. The parser and deterministic writer both
+enforce this boundary before writing.
 
 Generated unit task files should remain product and behavior descriptions with
 acceptance criteria, reviewer focus, security/privacy notes, out-of-scope notes,
@@ -140,11 +140,13 @@ The assistant output accepted by `delivery prepare` contains exactly one
 schema-matching top-level JSON object. The object may be raw, fenced, or
 surrounded by incidental model prose; malformed, nested, and multiple response
 objects are rejected. Top-level fields are `plan_id`,
-`title`, `planning_mode`, `warnings`, and `units`; unknown fields are rejected.
+`title`, `planning_mode`, `warnings`, `constraints`, and `units`; unknown fields are rejected.
 `planning_mode`, when present, must be `fixed_window`. `units` must be a
 non-empty list of objects with `id`, `title`, `depends_on`, `task_markdown`,
 and optional `stream`, `component`, `phase`, `kind`, `platform`, and
-`scope_paths`. Units may also include optional sizing metadata:
+`scope_paths`. The authoring-only `asset_paths` list assigns canonical source
+assets for deterministic rendering into the unit task; it is not copied into
+`plan.yaml`. Units may also include optional sizing metadata:
 
 - `estimated_size`: `small`, `medium`, or `large`
 - `risk_tags`: supported tags are `api_surface`, `audit_artifacts`,
@@ -163,6 +165,50 @@ explicitly. `2` is allowed only for a tightly coupled unit that cannot remain
 compile-safe as separate units. Values of `3` or greater are invalid and signal
 that the unit must be split. The other budget fields remain advisory until an
 execution gate is defined for them.
+
+`constraints` is required in fresh authoring output and may be empty only when
+the source task contains no hard delivery constraints. Each constraint contains
+`id`, `kind`, a bounded single-line paraphrased `summary`, exact generated
+`unit_ids`, and `disposition`. Supported kinds are
+`repository_ownership`, `authoritative_read_only_dependency`,
+`stop_and_follow_up`, `security_boundary`, and `prohibited_fallback`.
+Sikula deterministically rejects substantive summary text copied from a source-task
+line both during authoring and whenever the published plan is checked. Rejected
+summaries are omitted from public invalid-plan projections. Dispositions are
+`preserved`, `needs_review`, and `conflict`; the writer blocks
+the latter two before creating delivery artifacts. It never publishes raw task
+excerpts, prompts, provider output, absolute paths, or unresolved constraints.
+After the first authoring response is parsed, Sikula makes a separate command-free
+read-only verification call with the authoritative source task and every candidate
+unit. The verifier must independently confirm that the constraint list is complete,
+echo every constraint identity and unit assignment exactly, and mark every disposition
+preserved. An empty authored list is accepted only when that verification confirms the
+source has no omitted hard rule. An incomplete result must identify every detected
+omitted constraint or missing unit assignment with bounded metadata. Sikula gives those
+gaps to one constraints-only repair call and independently verifies the repaired list.
+The constraint repair call cannot change units, dependencies, task Markdown, scope, asset
+assignments, sizing, risk tags, or budgets, cannot remove or rewrite existing constraints,
+and cannot add anything outside the verifier gaps. A malformed repair, a second incomplete result,
+uncertainty, or conflict blocks before the writer creates files and reports the remaining
+bounded gaps. Every authoring, verification, and repair invocation remains in the local
+preparation audit with its actual round index and Sikula runtime version.
+
+Constraint repair does not rewrite unit tasks. Separately, the same independent
+verification pass checks that each unit task is self-contained for source-defined
+identifiers and values that must be used verbatim. If localization keys, enum values,
+API field names, fixed copy, or similar exact source lines are missing, deterministic
+code appends only the verifier-identified complete source lines to the affected unit's
+Markdown and verifies the result again. No other unit field changes. A persistent gap
+blocks publication and identifies the unit and missing-value count without projecting
+the source values through ordinary CLI output.
+
+For successful authoring, deterministic code adds `source_task.path` and
+`source_task.sha256` to `plan.yaml` from the actual task input. `delivery check`
+recomputes the UTF-8 task hash and rejects stale fingerprints. Published
+constraint entries must use `preserved`, reference known non-superseded units,
+and remain bounded. The fields are additive: existing plans without
+`source_task` or `constraints` stay valid, while any plan that declares
+constraints must also carry a valid source-task fingerprint.
 
 Writer-facing path fields such as `task_path`, `path`, `unit_path`,
 `output_path`, `plan_path`, `units_dir`, and `output_dir` are rejected because
@@ -232,16 +278,33 @@ Prepare stores a normalized, content-addressed proposal under
 `.sikula/contract-reports/delivery-amendments/<plan-id>/`. The proposal includes
 the project-relative source plan path, exact replacement definitions and task
 Markdown, plus fingerprints of the source plan, selected target task contract,
-sanitized parent progress, and the exact delivery assembly base and head. Raw
-prompts and provider output stay in the separate local authoring audit. Sikula
+sanitized parent progress, the exact delivery assembly base and head, and, for
+an eligible failed child, bounded evidence correlated to that child and unit.
+The child evidence may include the stable failure code and recovery action,
+inherited-constraint and declared/effective-scope metadata, changed and violating
+project-relative paths with counts, bounded review/security dispositions and
+summaries, and dependency-handoff identities. It never includes raw child state,
+task bodies, prompts, provider output, diffs, source contents, validation logs, or
+absolute paths. Raw prompts and provider output stay in the separate local
+authoring audit. Sikula
 captures those fingerprints before invoking the assistant and discards the
-draft if any input changes before proposal storage. Prepare rechecks the source
-fingerprints and deterministic replacement paths before and after publication;
-if either changes during publication, Sikula removes the new proposal and
-reports preparation as blocked. Pre-existing files or symlinks block
+draft if the plan, target task, parent progress, child evidence, or assembly
+input changes before proposal storage. Prepare rechecks the source fingerprints
+and deterministic replacement paths before and after publication; if either
+changes during publication, Sikula removes the new proposal and reports
+preparation as blocked. Pre-existing files or symlinks block
 publication. Replacement task Markdown must also pass the normal
 contract-readiness and configured validation-coverage gate, and the resulting
 amended plan must pass deterministic plan validation.
+When the target is constrained, amendment preparation replaces its reference in
+each applicable constraint with every replacement unit ID before validation.
+The original ordering is preserved, duplicates are removed, and the superseded
+target is not left as a constraint owner; each replacement child therefore
+receives the inherited constraint context. Applicable constraints are passed from
+the validated plan on pending, budget-split, and failed-child amendment paths rather
+than being inferred only from optional failure evidence. A separate read-only verifier
+must confirm that all replacements preserve every applicable constraint before
+deterministic proposal publication.
 Proposal publication uses a same-directory temporary file and atomic
 no-overwrite publish, so the content-addressed proposal is complete or absent.
 Directory fsync is best effort, matching Sikula's other state writers.
@@ -255,6 +318,17 @@ the tracked plan, unit files, progress, events, child task state, worktrees,
 branches, or Git refs. Completed prerequisite commits are checked against the
 plan's assembled `final_branch`, not the operator's current `HEAD`, so prepare
 does not require a helper branch containing earlier unit commits.
+
+A scope-stopped child can produce an ordinary corrected in-repository split
+proposal. If the bounded evidence instead establishes an externally owned
+dependency, preparation returns non-zero with
+`delivery_amend.external_dependency_follow_up_required`, recommends
+`external_dependency_follow_up`, and writes no proposal. An authoritative
+`external_dependency_gap` child stop takes this path deterministically without
+calling the authoring model; an amendment author can reach the same no-proposal
+outcome while evaluating a scope stop. This recovery never broadens the current
+repository's delivery plan to pretend that externally owned work can be
+implemented locally.
 
 `amend apply --dry-run` loads the exact stored proposal and performs the complete
 deterministic preflight in memory. It invokes no LLM and writes no proposal,
@@ -421,7 +495,7 @@ sikula delivery status .sikula/delivery/<slug>/plan.yaml
 sikula delivery status .sikula/delivery/<slug>/plan.yaml --json
 ```
 
-`delivery status` evaluates the execution state and marks running and failed units with their actionable next steps. In JSON output, each unit includes `run_next_available` (boolean), `run_next_action` (`"resume_or_reconcile"`, `"retry_failed"`, or omitted), and `run_next_blocked_reason` (`"missing_child_task_id"`, `"unit_budget_exceeded"`, or omitted).
+`delivery status` evaluates the execution state and marks running and failed units with their actionable next steps. In JSON output, each unit includes `run_next_available` (boolean), `run_next_action` (`"resume_or_reconcile"`, `"retry_failed"`, or omitted), and `run_next_blocked_reason` (a stable blocker code or omitted).
 It also reports a numeric `llm_usage` aggregate for the plan and for each unit.
 These aggregates are loaded best-effort from linked child task state and include
 invocation attempts, outcomes, measured provider time, character counts, and
@@ -437,6 +511,28 @@ Budget-stopped units are the exception: they are marked with
 when their child task remains linked and inspectable. Both dry-run and mutating
 `run-next` report `delivery.unit_budget_exceeded`; passing `--reset-failed` does
 not change that recovery action.
+Four other terminal delivery stops also remain inspectable but are never
+retryable through `run-next`:
+
+- `unit_scope_violation` / `delivery.unit_scope_violation`: inspect the preserved
+  child worktree and prepare a scoped amendment.
+- `scope_amendment_required` / `delivery.scope_amendment_required`: prepare and
+  inspect an amended unit proposal.
+- `external_dependency_gap` / `delivery.external_dependency_gap`: create an
+  explicit external follow-up; no local retry or amendment proposal is implied.
+- `implementer_disposition_invalid` /
+  `delivery.implementer_disposition_invalid`: inspect the preserved partial
+  work and invalid structured-output audit, then replace the failed child; an
+  unchanged retry cannot adopt the partial writes.
+
+For these stops, `failure_code` and `run_next_blocked_reason` use the exact
+unprefixed value, `run_next_available` is false, and `run_next_action` is omitted.
+Text and JSON commands return non-zero with the matching public `delivery.*`
+error. Ordinary, dry-run, and `--reset-failed` preflight do not resume the child,
+start agents, append events, or mutate parent progress.
+Direct `sikula run --task-id <child-task-id>` summaries and `sikula status`
+next-action projections use the same recovery mapping, so they do not advertise
+an impossible `--reset-failed` command for these terminal children.
 
 Preview the next eligible unit without changing delivery progress:
 
@@ -445,8 +541,9 @@ sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --dry-run
 sikula delivery run-next .sikula/delivery/<slug>/plan.yaml --dry-run --json
 ```
 
-The dry run mirrors execution preflight, including dependency result-commit and
-referenced handoff integrity checks, but does not acquire the progress lock,
+The dry run mirrors execution preflight, including effective unit write-scope
+resolution, dependency result-commit checks, and referenced handoff integrity checks,
+but does not acquire the progress lock,
 write parent progress, create child task state, or start agents.
 
 Run the next eligible unit:
@@ -531,7 +628,67 @@ After child execution starts, it records the terminal unit status as `done` or
 `failed`.
 It accepts the same per-agent `--agent-model`, `--agent-provider`, and
 `--agent-timeout` overrides as `sikula run` and passes them to the child run.
-When starting the child run, Sikula automatically configures and persists the parent delivery metadata in the child's `TaskState` (specifically the parent `delivery_plan_id`, `delivery_unit_id`, a project-relative `delivery_plan_path`, the effective `delivery_unit_budget`, the current `delivery_handoff_schema_version`, and validated `delivery_dependency_handoffs`). Delivery children always run the planner, even when ordinary task planning is disabled. The planner receives the effective `max_planner_steps` limit in its first prompt. If its plan is oversized, Sikula performs one bounded re-evaluation that may consolidate steps only while preserving the complete compile-safe unit. If the second result is still oversized, Sikula preserves it; if the re-evaluation is invalid, Sikula retains the original valid oversized plan instead. It then records `delivery_budget_stop` and fails before the implementer starts. Parent progress and the terminal `unit.failed` event receive `failure_code: unit_budget_exceeded` and allowlisted `budget_exceeded` metadata. This allows the parent plan relationship and stop reason to be recovered from the configured state directory without copying prompts or raw child state into parent progress.
+When starting the child run, Sikula automatically configures and persists the parent delivery metadata in the child's `TaskState` (specifically the parent `delivery_plan_id`, `delivery_unit_id`, a project-relative `delivery_plan_path`, the effective `delivery_unit_budget`, the current `delivery_handoff_schema_version`, and validated `delivery_dependency_handoffs`). It also snapshots the inherited constraints assigned to the unit and validates that fingerprinted context independently before the Analyst, Implementer, Reviewer, or Security Reviewer invokes a provider. A malformed modern snapshot fails closed; legacy child state remains compatible. After assembled-worktree or resume validation, Sikula separately persists the actual runtime-effective production scope. Amendment evidence validates that narrower value against the preserved authoritative child worktree when present instead of resolving it against the operator checkout or presenting the creation-time upper bound as writable.
+
+Explicit unit `scope_paths` must retain their lexical project identity. Sikula rejects a
+symlinked declared root, a declared path below a symlinked prefix, or an assembled
+dependency that turns the declared path into an in-project alias. Repository-default
+configured write paths may still use internal aliases and remain protected by their
+immutable runtime binding.
+
+Implementer and Fixer calls also receive a private pre-call filesystem snapshot.
+The post-call audit uses Git-visible tracked, staged, and ordinary untracked paths as
+sparse candidates, traverses persistent gitignored paths such as local configuration,
+and separately scans active write roots for symlinks and special files. The active
+platform `BuildTool` prunes regular content in ignored disposable dependency caches and
+build-output trees, but cannot hide a Git-visible candidate. Ephemeral directories below
+an active root still receive a metadata-only traversal so symlinks and special files
+cannot bypass scope validation. For Yarn Berry this includes
+ignored `.yarn/install-state.gz`, `.yarn/cache/`, and `.yarn/unplugged/` install state;
+tracked zero-install content under the same paths remains audited. Known Sikula
+runtime/state roots are also excluded. The baseline survives an interrupted provider call;
+missing, malformed, or unreadable evidence fails closed. Symlinks at or below an
+active write root are accepted only when their resolved targets stay inside the
+production and Fixer test-write roots active for that invocation. The interrupted
+audit marker preserves the pre-call Git commit, project prefix, and both the lexical and
+resolved identities of typed production roots and active test roots. Repository-default internal symlink
+roots therefore keep their lexical identity while authorizing changes to the same resolved
+filesystem objects; retargeting the alias outside that immutable identity stops.
+Tracked and staged candidates are diffed against that saved commit rather than the
+provider-controlled current `HEAD`, including after interruption. Worktree discovery uses
+a temporary index rebuilt from the saved commit, so live-index flags such as
+`assume-unchanged`, `skip-worktree`, and fsmonitor metadata cannot suppress a candidate.
+Committing a change or modifying Git index metadata therefore cannot remove it from scope
+enforcement.
+NUL-delimited Git paths use reversible filesystem decoding, so non-UTF-8 filenames remain
+tied to their actual filesystem entries instead of being dropped or decoded lossily.
+Resume audits that immutable policy before applying current scope configuration, so it
+cannot authorize an interrupted write by broadening either production or test paths.
+Directory recursion uses no-follow handles and identity checks where supported so a
+directory replaced by a symlink cannot redirect the snapshot outside the worktree.
+Hosts without directory-handle support use same-API no-follow path identity checks before
+and after directory traversal and regular-file reads. An out-of-scope change or an
+invalid assembled-tree scope records terminal `unit_scope_violation`, so status does
+not advertise `run-next --reset-failed` for a tree that would fail unchanged.
+
+Delivery children always run the planner, even when ordinary task planning is disabled. The planner receives the effective `max_planner_steps` limit in its first prompt. If its plan is oversized, Sikula performs one bounded re-evaluation that may consolidate steps only while preserving the complete compile-safe unit. If the second result is still oversized, Sikula preserves it; if the re-evaluation is invalid, Sikula retains the original valid oversized plan instead. It then records `delivery_budget_stop` and fails before the implementer starts. Parent progress and the terminal `unit.failed` event receive `failure_code: unit_budget_exceeded` and allowlisted `budget_exceeded` metadata. This allows the parent plan relationship and stop reason to be recovered from the configured state directory without copying prompts or raw child state into parent progress.
+
+Delivery agents use structured dispositions rather than free-form issue text for
+delivery review decisions. Reviewer and Security Reviewer use `approved` when no
+blocking issue exists. Approval remains audit history and is not amendment failure
+evidence; `fix_in_scope` continues the normal bounded fix loop.
+Reviewer or Security Reviewer `requires_scope_amendment` stops with
+`scope_amendment_required`; Analyst, Implementer, Reviewer, or Security Reviewer
+`external_dependency_gap` stops with that same stable code. Once a terminal stop is
+recorded, the child does not start another write agent or continue into later
+review, test-writing, validation, commit, handoff, or assembly phases.
+One malformed Reviewer or Security Reviewer disposition receives a read-only retry
+with protocol feedback and does not consume a fix iteration. A repeated malformed
+result fails the child without starting a write agent.
+If Implementer output advertises the disposition schema marker but is malformed,
+Sikula stores bounded parser metadata, stops with
+`implementer_disposition_invalid`, and applies the same no-later-phase and
+no-reset guarantees even when the provider already made partial writes.
 Child task prompts, provider output, diffs, logs, and full task state remain in
 the normal child task state and are not embedded in delivery progress JSON.
 `delivery run-next --json` reports deterministic failure codes and the child task id
@@ -763,10 +920,46 @@ units:
 
 The MVP validates that component paths and unit scope paths are portable
 project-relative paths inside the current Git repository, and that unit
-`component` references point to declared components. These fields are metadata
-for planning, status, JSON consumers, and future delivery-console grouping. They
-do not change `sikula run` behavior, restrict provider filesystem access, filter
-validation commands, infer dependencies, or create separate worktrees.
+`component` references point to declared components. Component fields remain
+planning and grouping metadata. Unit `scope_paths`, however, constrain delivery
+child production writes: an absent or empty list keeps the configured
+`sandbox.allowed_write_paths`, while a non-empty list uses its canonical
+intersection with those configured paths. A malformed or empty intersection
+blocks before parent progress, child state, worktree, or agent creation. The
+persisted effective scope is an upper bound on resume: current config may narrow
+it but cannot broaden it. Fresh and resumed isolated children revalidate that
+scope after selecting the active worktree created from the assembled delivery
+commit. This rejects a dependency that replaced an allowed path with a symlink
+escaping the child project before Orchestrator, tools, or providers start. Scope
+snapshots also retain whether a root was an exact file; deleting that file or
+replacing it with a directory cannot turn it into a descendant-authorizing prefix.
+Test
+writes remain independently governed by
+`sandbox.allowed_test_write_paths`; unit scope does not filter validation
+commands, infer dependencies, or create additional worktrees.
+
+After each Implementer or Fixer invocation, Sikula computes actual changed paths
+independently of the provider's file report. Git-visible changes and persistent ignored
+paths remain candidates, while the active platform prunes only ignored disposable
+dependency-cache and build-output content; active roots retain symlink and special-file
+traversal through those directories. Provider-owned project setup is stabilized before
+the baseline. The audit covers the complete Git
+worktree even when `project.root_path` is nested: paths within the project are evaluated
+relative to that root, and sibling worktree changes are terminal rather than eligible for
+unit scope. A dedicated persisted pending marker, independent of progress heartbeats,
+keeps that baseline authoritative across `KeyboardInterrupt` and process termination;
+resume fails closed on missing, malformed, or orphaned recovery state. A production
+change outside the effective unit scope records a sanitized
+`unit_scope_violation`, preserves the child worktree and audit evidence for inspection,
+and skips all later child phases, commit, handoff, and delivery assembly. Successful
+audits retain bounded actual project-relative changed paths, including non-ephemeral
+ignored files, so
+a later reviewer-requested amendment receives complete evidence. Nested-project sibling
+paths remain separately labeled, bounded, worktree-relative amendment evidence and never
+become project scope. Test-only changes
+continue to use the separate test-write policy; snapshot content is retained only for
+bounded, non-binary files whose platform-specific mixed source/test classification needs
+it.
 
 ## Repository Scope
 

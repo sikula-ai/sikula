@@ -52,6 +52,15 @@ stops on the first blocker or failure, and finalizes automatically when every
 unit is done. Explicit `--reset-failed` authorizes one retry of the current
 failed child before normal bounded execution continues. It does not add another
 agent pipeline or replace unit-level Sikula runs.
+Before a new unit starts, Sikula intersects its declared production
+`scope_paths` with the configured production write paths and snapshots the
+unit's inherited constraints. Each delivery agent validates that constraint
+context before provider execution. Sikula also audits actual changes after every
+Implementer or Fixer call, independently of the provider's file report. A scope
+violation, required scope amendment, or external dependency gap is a terminal,
+non-retryable child stop: later unit phases and delivery assembly do not run,
+while the isolated worktree and sanitized audit evidence remain available for
+inspection and amendment or external follow-up.
 `delivery status` also reads ignored parent progress from
 `.sikula/state/delivery/<plan-id>/progress.json` when present; if progress does
 not exist yet, units are reported as pending from the plan. Assessment and
@@ -101,7 +110,11 @@ Most phases can be enabled or disabled in `.sikula/config.yaml` or with per-run 
 - `TestWriterAgent` writes or updates tests.
 - `FixerAgent` fixes build, test, and quality-check failures.
 
-Review and security issues feed back to the implementer. Build, test, and check failures feed the fixer until validation passes or the configured iteration limit is reached.
+Review and security issues classified as `fix_in_scope` feed back to the
+implementer. A structured `requires_scope_amendment` or
+`external_dependency_gap` disposition stops the child instead of entering a fix
+loop. Build, test, and check failures feed the fixer until validation passes or
+the configured iteration limit is reached.
 
 ## State File
 

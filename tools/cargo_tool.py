@@ -352,6 +352,13 @@ class CargoTool(BuildTool):
     def is_sync_adoptable_file(self, path: str) -> bool:
         return Path(path).name == "Cargo.lock"
 
+    def is_ephemeral_build_path(self, path: str) -> bool:
+        return "target" in self._delivery_scope_path_parts(path)
+
+    def requires_test_only_change_content(self, path: str) -> bool:
+        normalized = Path(path.replace("\\", "/"))
+        return normalized.suffix == ".rs" and "target" not in normalized.parts
+
     def is_test_only_change(self, path: str, before: str | None, after: str | None) -> bool:
         if Path(path).suffix != ".rs" or before is None or after is None or before == after:
             return False

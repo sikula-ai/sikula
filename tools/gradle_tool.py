@@ -119,3 +119,6 @@ class GradleBaseTool(BuildTool):
         return name in _SYNC_ADOPTABLE_FILES or any(
             p == adoptable_path or p.startswith(adoptable_path) for adoptable_path in _SYNC_ADOPTABLE_PATHS
         )
+
+    def is_ephemeral_build_path(self, path: str) -> bool:
+        return any(part in {".gradle", "build"} for part in self._delivery_scope_path_parts(path))

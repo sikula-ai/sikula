@@ -32,10 +32,10 @@ import subprocess
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, ContextManager, Iterator
 from urllib.parse import quote, unquote
 
 from core.subprocess_utils import (
@@ -69,6 +69,7 @@ _LOCAL_ENVIRONMENT_ERRNOS = frozenset(
 
 RetryObserver = Callable[[dict[str, object]], None]
 UsageObserver = Callable[[dict[str, object]], None]
+WriteAttemptBoundary = Callable[[dict[str, object]], ContextManager[None]]
 
 
 class LLMProviderError(RuntimeError):
@@ -129,6 +130,7 @@ class LLMConfig:
     agent_timeout: int = 1800  # seconds; applies to CLI-backed provider subprocess calls
     retry_observer: RetryObserver | None = None
     usage_observer: UsageObserver | None = None
+    write_attempt_boundary: WriteAttemptBoundary | None = None
     session_title: str | None = None
 
 
@@ -254,13 +256,30 @@ def _call_observed(
         max_attempts=max_attempts,
         input_chars=input_chars,
     ) as observation:
-        value = fn()
-        if isinstance(value, _LLMCallValue):
-            observation.output_chars = value.output_chars
-            observation.reported_tokens = value.reported_tokens
-            return value.value
-        observation.complete(value)
-        return value
+        boundary = config.write_attempt_boundary if operation == "run_agent" else None
+        boundary_context = (
+            nullcontext()
+            if boundary is None
+            else boundary(
+                {
+                    "provider": config.provider,
+                    "model": config.model,
+                    "operation": operation,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                }
+            )
+        )
+        with boundary_context:
+            value = fn()
+            if isinstance(value, _LLMCallValue):
+                observation.output_chars = value.output_chars
+                observation.reported_tokens = value.reported_tokens
+                result = value.value
+            else:
+                observation.complete(value)
+                result = value
+        return result
 
 
 def _git_snapshot(cwd: Path) -> dict[str, str]:
@@ -507,6 +526,19 @@ class LLMClient:
         self._retry_observer = observer
         return previous
 
+    def set_write_attempt_boundary(
+        self,
+        boundary: WriteAttemptBoundary | None,
+    ) -> WriteAttemptBoundary | None:
+        config = getattr(self, "_config", None)
+        if config is not None and hasattr(config, "write_attempt_boundary"):
+            previous = config.write_attempt_boundary
+            config.write_attempt_boundary = boundary
+            return previous
+        previous = getattr(self, "_write_attempt_boundary", None)
+        self._write_attempt_boundary = boundary
+        return previous
+
     def set_session_title(self, title: str | None) -> str | None:
         config = getattr(self, "_config", None)
         if config is not None and hasattr(config, "session_title"):
@@ -527,6 +559,15 @@ class LLMClient:
         agents record the same prompt that the provider subprocess receives.
         """
         return prompt
+
+    def prepare_write_agent_workspace(self, cwd: Path) -> None:
+        """Create stable provider-owned workspace files before an external write audit.
+
+        Providers that need project-local configuration for write-capable calls may
+        override this hook. The orchestrator calls it before taking a delivery scope
+        baseline; run_agent implementations should keep their own setup idempotent so
+        direct client use remains supported.
+        """
 
     def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
         """Run as an autonomous agent with read-only tools in `cwd`. Returns text output."""
@@ -558,6 +599,49 @@ def _add_git_exclude_entry(cwd: Path, entry: str, comment: str) -> None:
             f.write(f"\n# {comment}\n{entry}\n")
 
 
+def _reject_tracked_provider_settings(cwd: Path, relative_path: str) -> None:
+    result = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--", relative_path],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode == 0:
+        raise LLMConfigurationError(
+            f"Sikula cannot overwrite tracked provider settings at {relative_path}; "
+            "untrack or relocate that file before running a write-capable agent"
+        )
+
+
+def _validated_provider_settings_path(cwd: Path, relative_path: str) -> Path:
+    relative = Path(relative_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise LLMConfigurationError("Sikula received an invalid provider settings path")
+    try:
+        resolved_root = cwd.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise LLMConfigurationError("Sikula cannot resolve the provider workspace safely") from exc
+
+    current = cwd
+    for part in relative.parts:
+        current /= part
+        try:
+            if current.is_symlink():
+                raise LLMConfigurationError(
+                    f"Sikula cannot write through symlinked provider settings path {relative_path}"
+                )
+            current.resolve(strict=False).relative_to(resolved_root)
+        except LLMConfigurationError:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise LLMConfigurationError(
+                f"Sikula cannot resolve provider settings path {relative_path} inside the workspace"
+            ) from exc
+    return cwd / relative
+
+
 def _claude_write_settings(cwd: Path) -> Path:
     """Write .claude/settings.json into the worktree and return its path.
 
@@ -582,9 +666,9 @@ def _claude_write_settings(cwd: Path) -> Path:
             },
         }
     }
-    claude_dir = cwd / ".claude"
+    settings_path = _validated_provider_settings_path(cwd, ".claude/settings.json")
+    claude_dir = settings_path.parent
     claude_dir.mkdir(exist_ok=True)
-    settings_path = claude_dir / "settings.json"
     settings_path.write_text(json.dumps(settings, indent=2))
 
     _add_git_exclude_entry(cwd, ".claude/", "Sikula Claude settings")
@@ -873,6 +957,10 @@ class ClaudeClient(LLMClient):
             )
 
         return _call_with_retry("generate", _call, self._config, "generate", input_chars=len(prompt))
+
+    def prepare_write_agent_workspace(self, cwd: Path) -> None:
+        _reject_tracked_provider_settings(cwd, ".claude/settings.json")
+        _claude_write_settings(cwd)
 
     def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
         """Run Claude with read-only tools as an autonomous agent. Returns text output."""
@@ -1958,9 +2046,10 @@ def _gemini_write_settings(cwd: Path, settings: dict) -> None:
     of git diff without touching any tracked file (e.g. the project's own
     .gitignore). Works in both regular repos and worktrees via _git_exclude_file.
     """
-    gemini_dir = cwd / ".gemini"
+    settings_path = _validated_provider_settings_path(cwd, ".gemini/settings.json")
+    gemini_dir = settings_path.parent
     gemini_dir.mkdir(exist_ok=True)
-    (gemini_dir / "settings.json").write_text(json.dumps(settings, indent=2))
+    settings_path.write_text(json.dumps(settings, indent=2))
 
     _add_git_exclude_entry(cwd, ".gemini/", "Sikula Gemini settings")
 
@@ -2057,6 +2146,10 @@ class GeminiClient(LLMClient):
         if windows_batch_command_path(command) is None:
             return command, None
         return self._cmd("", extra), prompt
+
+    def prepare_write_agent_workspace(self, cwd: Path) -> None:
+        _reject_tracked_provider_settings(cwd, ".gemini/settings.json")
+        _gemini_write_settings(cwd, _GEMINI_SETTINGS_IMPLEMENTER)
 
     def generate(self, system: str, user: str) -> str:
         prompt = f"{system}\n\n{user}"

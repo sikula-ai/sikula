@@ -11,10 +11,18 @@ from core.delivery_authoring import (
     DeliveryAuthoringDraft,
     DeliveryAuthoringParseError,
     DeliveryAuthoringUnitDraft,
+    apply_delivery_unit_context_gaps,
     derive_delivery_authoring_paths,
     parse_delivery_assessment_output,
     parse_delivery_amendment_authoring_output,
     parse_delivery_authoring_output,
+    parse_delivery_constraint_repair_output,
+    parse_delivery_constraint_verification_output,
+)
+from core.delivery_plan import (
+    MAX_DELIVERY_CONSTRAINT_UNIT_IDS,
+    MAX_DELIVERY_CONSTRAINTS,
+    MAX_DELIVERY_UNIT_ID_LENGTH,
 )
 from core.delivery_unit_metadata import DeliveryUnitBudget
 
@@ -102,6 +110,7 @@ def _draft_data() -> dict[str, Any]:
         "title": "Team invites delivery",
         "planning_mode": "fixed_window",
         "warnings": ["Review the split before writing artifacts."],
+        "constraints": [],
         "units": [
             {
                 "id": "foundation",
@@ -332,8 +341,8 @@ def test_parse_delivery_assessment_output_rejects_schema_object_in_unclosed_arra
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("plan_title", "Deliver GET /users"),
-        ("title", "Implement POST /home"),
+        ("plan_title", "Read /custom/private/task.md"),
+        ("title", "Read /home/example/private/task.md"),
         ("plan_title", "Read /Users/example/private/task.md"),
         ("title", "Read /Users/example/private/task.md"),
         ("stream", r"client at C:\Users\example\private"),
@@ -365,6 +374,7 @@ def test_parse_delivery_authoring_output_defaults_absent_optional_fields(tmp_pat
     data = {
         "plan_id": "team-invites",
         "title": "Team invites delivery",
+        "constraints": [],
         "units": [
             {
                 "id": "foundation",
@@ -388,6 +398,395 @@ def test_parse_delivery_authoring_output_defaults_absent_optional_fields(tmp_pat
     assert draft.units[0].estimated_size is None
     assert draft.units[0].risk_tags == []
     assert draft.units[0].budget == DeliveryUnitBudget(max_planner_steps=1)
+
+
+def test_parse_delivery_authoring_output_preserves_inherited_constraints(tmp_path: Path) -> None:
+    data = _draft_data()
+    data["constraints"] = [
+        {
+            "id": "protocol-authority",
+            "kind": "authoritative_read_only_dependency",
+            "summary": "Consume GET /api/v1/resource without changing its authoritative contract.",
+            "unit_ids": ["foundation", "cli"],
+            "disposition": "preserved",
+        }
+    ]
+
+    draft = _parse(json.dumps(data), tmp_path)
+
+    assert [constraint.to_plan_dict() for constraint in draft.constraints] == data["constraints"]
+
+
+def test_constraint_verification_requires_actionable_gaps_when_incomplete() -> None:
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        parse_delivery_constraint_verification_output(
+            json.dumps({"constraints_complete": False, "constraints": []}),
+            unit_ids={"foundation"},
+        )
+
+    assert exc_info.value.code == "delivery_constraint_verification.gaps_required"
+
+
+def test_constraint_verification_parses_bounded_omitted_gap() -> None:
+    gap = {
+        "reason": "omitted",
+        "kind": "authoritative_read_only_dependency",
+        "summary": "The existing protocol contract remains authoritative.",
+        "affected_unit_ids": ["foundation"],
+    }
+
+    verification = parse_delivery_constraint_verification_output(
+        json.dumps(
+            {
+                "constraints_complete": False,
+                "constraints": [],
+                "constraint_gaps": [gap],
+            }
+        ),
+        unit_ids={"foundation"},
+    )
+
+    assert [value.to_dict() for value in verification.constraint_gaps] == [gap]
+
+
+def test_constraint_verification_rejects_incomplete_gap_without_missing_assignment() -> None:
+    constraint = {
+        "id": "protocol-authority",
+        "kind": "repository_ownership",
+        "summary": "Protocol changes remain externally owned.",
+        "unit_ids": ["foundation"],
+        "disposition": "preserved",
+    }
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        parse_delivery_constraint_verification_output(
+            json.dumps(
+                {
+                    "constraints_complete": False,
+                    "constraints": [constraint],
+                    "constraint_gaps": [
+                        {
+                            "reason": "incompletely_assigned",
+                            "constraint_id": "protocol-authority",
+                            "kind": "repository_ownership",
+                            "summary": "Protocol changes remain externally owned.",
+                            "affected_unit_ids": ["foundation"],
+                        }
+                    ],
+                }
+            ),
+            unit_ids={"foundation"},
+        )
+
+    assert exc_info.value.code == "delivery_constraint_verification.gap_assignment_not_missing"
+
+
+def test_constraint_verification_rejects_mixed_existing_and_missing_assignment_gap() -> None:
+    constraint = {
+        "id": "protocol-authority",
+        "kind": "authoritative_read_only_dependency",
+        "summary": "Protocol behavior remains defined by its authoritative contract.",
+        "unit_ids": ["foundation"],
+        "disposition": "preserved",
+    }
+    output = json.dumps(
+        {
+            "constraints_complete": False,
+            "constraints": [constraint],
+            "constraint_gaps": [
+                {
+                    "reason": "incompletely_assigned",
+                    "constraint_id": constraint["id"],
+                    "kind": constraint["kind"],
+                    "summary": constraint["summary"],
+                    "affected_unit_ids": ["foundation", "consumer"],
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        parse_delivery_constraint_verification_output(
+            output,
+            unit_ids={"foundation", "consumer"},
+        )
+
+    assert exc_info.value.code == "delivery_constraint_verification.gap_assignment_not_missing"
+
+
+def test_constraint_repair_rejects_source_excerpt() -> None:
+    source_rule = "Only the protocol repository may change protocol files."
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        parse_delivery_constraint_repair_output(
+            json.dumps(
+                {
+                    "constraints": [
+                        {
+                            "id": "protocol-authority",
+                            "kind": "repository_ownership",
+                            "summary": source_rule,
+                            "unit_ids": ["foundation"],
+                            "disposition": "preserved",
+                        }
+                    ]
+                }
+            ),
+            unit_ids={"foundation"},
+            source_task_description=f"# Task\n\n- {source_rule}\n",
+        )
+
+    assert exc_info.value.code == "delivery_authoring.constraint_summary_source_excerpt"
+
+
+def test_unit_context_verification_parses_exact_missing_source_lines() -> None:
+    source_line = '- <screen.title> — "Resource"'
+    verification = parse_delivery_constraint_verification_output(
+        json.dumps(
+            {
+                "constraints_complete": True,
+                "constraints": [],
+                "constraint_gaps": [],
+                "unit_context_complete": False,
+                "unit_context_gaps": [
+                    {
+                        "unit_id": "foundation",
+                        "source_literals": [source_line],
+                    }
+                ],
+            }
+        ),
+        unit_ids={"foundation"},
+        source_task_description=f"# Task\n\n{source_line}\n",
+        unit_task_markdown_by_id={"foundation": _unit_markdown()},
+        require_unit_context=True,
+    )
+
+    assert verification.unit_context_complete is False
+    assert [gap.to_dict() for gap in verification.unit_context_gaps] == [
+        {"unit_id": "foundation", "source_literals": [source_line]}
+    ]
+
+
+def test_unit_context_verification_is_required_for_delivery_authoring() -> None:
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        parse_delivery_constraint_verification_output(
+            json.dumps({"constraints_complete": True, "constraints": []}),
+            unit_ids={"foundation"},
+            source_task_description="# Task",
+            unit_task_markdown_by_id={"foundation": _unit_markdown()},
+            require_unit_context=True,
+        )
+
+    assert exc_info.value.code == "delivery_unit_context_verification.complete_invalid"
+
+
+def test_unit_context_verification_rejects_literal_that_is_not_a_complete_source_line() -> None:
+    source_line = '- <screen.title> — "Resource"'
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        parse_delivery_constraint_verification_output(
+            json.dumps(
+                {
+                    "constraints_complete": True,
+                    "constraints": [],
+                    "constraint_gaps": [],
+                    "unit_context_complete": False,
+                    "unit_context_gaps": [
+                        {
+                            "unit_id": "foundation",
+                            "source_literals": ["<screen.title>"],
+                        }
+                    ],
+                }
+            ),
+            unit_ids={"foundation"},
+            source_task_description=f"# Task\n\n{source_line}\n",
+            unit_task_markdown_by_id={"foundation": _unit_markdown()},
+            require_unit_context=True,
+        )
+
+    assert exc_info.value.code == "delivery_unit_context_verification.literal_not_source_line"
+
+
+def test_apply_unit_context_gaps_changes_only_affected_task_markdown() -> None:
+    unit = DeliveryAuthoringUnitDraft(
+        id="foundation",
+        title="Foundation",
+        depends_on=[],
+        task_markdown=_unit_markdown(),
+        asset_paths=[".sikula/task-assets/reference.png"],
+        scope_paths=["core"],
+        budget=DeliveryUnitBudget(max_planner_steps=1),
+    )
+    source_line = '- <screen.title> — "Resource"'
+    verification = parse_delivery_constraint_verification_output(
+        json.dumps(
+            {
+                "constraints_complete": True,
+                "constraints": [],
+                "constraint_gaps": [],
+                "unit_context_complete": False,
+                "unit_context_gaps": [{"unit_id": "foundation", "source_literals": [source_line]}],
+            }
+        ),
+        unit_ids={unit.id},
+        source_task_description=source_line,
+        unit_task_markdown_by_id={unit.id: unit.task_markdown},
+        require_unit_context=True,
+    )
+
+    repaired = apply_delivery_unit_context_gaps([unit], verification.unit_context_gaps)
+
+    assert repaired[0].task_markdown.startswith(unit.task_markdown.rstrip())
+    assert source_line in repaired[0].task_markdown
+    assert repaired[0].asset_paths == unit.asset_paths
+    assert repaired[0].scope_paths == unit.scope_paths
+    assert repaired[0].budget == unit.budget
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("too_many_constraints", "delivery_authoring.constraints_too_many"),
+        ("non_object", "delivery_authoring.constraint_not_object"),
+        ("invalid_id", "delivery_authoring.constraint_id_invalid"),
+        ("duplicate_id", "delivery_authoring.constraint_id_duplicate"),
+        ("empty_units", "delivery_authoring.constraint_units_empty"),
+        ("too_many_units", "delivery_authoring.constraint_units_too_many"),
+        ("duplicate_unit", "delivery_authoring.constraint_unit_duplicate"),
+    ],
+)
+def test_parse_delivery_authoring_output_rejects_constraint_boundary_cases(
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+) -> None:
+    data = _draft_data()
+    constraint = {
+        "id": "ownership",
+        "kind": "repository_ownership",
+        "summary": "Keep repository ownership explicit.",
+        "unit_ids": ["foundation"],
+        "disposition": "preserved",
+    }
+    data["constraints"] = [constraint]
+    if case == "too_many_constraints":
+        data["constraints"] = [
+            {**constraint, "id": f"ownership-{index}"} for index in range(MAX_DELIVERY_CONSTRAINTS + 1)
+        ]
+    elif case == "non_object":
+        data["constraints"] = ["ownership"]
+    elif case == "invalid_id":
+        constraint["id"] = "x" * (MAX_DELIVERY_UNIT_ID_LENGTH + 1)
+    elif case == "duplicate_id":
+        data["constraints"] = [constraint, {**constraint, "id": "OWNERSHIP"}]
+    elif case == "empty_units":
+        constraint["unit_ids"] = []
+    elif case == "too_many_units":
+        constraint["unit_ids"] = ["foundation"] * (MAX_DELIVERY_CONSTRAINT_UNIT_IDS + 1)
+    elif case == "duplicate_unit":
+        constraint["unit_ids"] = ["foundation", "foundation"]
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        _parse(json.dumps(data), tmp_path)
+
+    assert exc_info.value.code == expected_code
+
+
+@pytest.mark.parametrize(
+    ("mutator", "expected_code"),
+    [
+        pytest.param(
+            lambda data: data.pop("constraints"),
+            "delivery_authoring.constraints_required",
+            id="missing",
+        ),
+        pytest.param(
+            lambda data: data.update({"constraints": {}}),
+            "delivery_authoring.constraints_invalid_type",
+            id="invalid_type",
+        ),
+        pytest.param(
+            lambda data: data.update(
+                {
+                    "constraints": [
+                        {
+                            "id": "ownership",
+                            "kind": "unknown_kind",
+                            "summary": "Keep ownership explicit.",
+                            "unit_ids": ["foundation"],
+                            "disposition": "preserved",
+                        }
+                    ]
+                }
+            ),
+            "delivery_authoring.constraint_kind_invalid",
+            id="kind",
+        ),
+        pytest.param(
+            lambda data: data.update(
+                {
+                    "constraints": [
+                        {
+                            "id": "ownership",
+                            "kind": "repository_ownership",
+                            "summary": "Read /Users/example/private/task.md",
+                            "unit_ids": ["foundation"],
+                            "disposition": "preserved",
+                        }
+                    ]
+                }
+            ),
+            "delivery_authoring.label_invalid",
+            id="unsafe_summary",
+        ),
+        pytest.param(
+            lambda data: data.update(
+                {
+                    "constraints": [
+                        {
+                            "id": "ownership",
+                            "kind": "repository_ownership",
+                            "summary": "Keep ownership explicit.",
+                            "unit_ids": ["missing"],
+                            "disposition": "preserved",
+                        }
+                    ]
+                }
+            ),
+            "delivery_authoring.constraint_unit_unknown",
+            id="unknown_unit",
+        ),
+        pytest.param(
+            lambda data: data.update(
+                {
+                    "constraints": [
+                        {
+                            "id": "ownership",
+                            "kind": "repository_ownership",
+                            "summary": "Keep ownership explicit.",
+                            "unit_ids": ["foundation"],
+                            "disposition": "maybe",
+                        }
+                    ]
+                }
+            ),
+            "delivery_authoring.constraint_disposition_invalid",
+            id="disposition",
+        ),
+    ],
+)
+def test_parse_delivery_authoring_output_rejects_invalid_constraints(
+    tmp_path: Path,
+    mutator: Callable[[dict[str, Any]], object],
+    expected_code: str,
+) -> None:
+    data = _draft_data()
+    mutator(data)
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        _parse(json.dumps(data), tmp_path)
+
+    assert exc_info.value.code == expected_code
 
 
 def test_parse_delivery_authoring_output_accepts_text_heading_equivalents(tmp_path: Path) -> None:
@@ -439,6 +838,78 @@ def test_parse_delivery_amendment_authoring_output_preserves_declared_asset_alia
         )
 
         assert draft.replacement_units[0].asset_paths == [alias]
+
+
+def test_parse_delivery_amendment_authoring_output_accepts_external_follow_up(tmp_path: Path) -> None:
+    data = {
+        "plan_id": "team-invites",
+        "target_unit_id": "oversized",
+        "disposition": "external_dependency_follow_up_required",
+        "summary": "The required protocol change remains owned by the protocol repository.",
+        "amend_reason": None,
+        "budget_exceeded": None,
+        "warnings": [],
+        "replacement_units": [],
+    }
+
+    draft = parse_delivery_amendment_authoring_output(
+        json.dumps(data),
+        expected_plan_id="team-invites",
+        expected_target_unit_id="oversized",
+        project_root=tmp_path,
+    )
+
+    assert draft.disposition == "external_dependency_follow_up_required"
+    assert draft.summary == data["summary"]
+    assert draft.replacement_units == []
+
+
+@pytest.mark.parametrize(
+    ("updates", "expected_code"),
+    [
+        ({"disposition": "unknown", "summary": "External work."}, "delivery_amend_authoring.disposition_invalid"),
+        (
+            {"disposition": "external_dependency_follow_up_required", "summary": None},
+            "delivery_amend_authoring.summary_required",
+        ),
+        ({"summary": "Unexpected summary."}, "delivery_amend_authoring.summary_unexpected"),
+        (
+            {
+                "disposition": "external_dependency_follow_up_required",
+                "summary": "Read /Users/example/private/task.md",
+            },
+            "delivery_authoring.label_invalid",
+        ),
+        (
+            {
+                "disposition": "external_dependency_follow_up_required",
+                "summary": "External work.",
+            },
+            "delivery_amend_authoring.replacements_unexpected",
+        ),
+    ],
+)
+def test_parse_delivery_amendment_authoring_output_rejects_malformed_external_follow_up(
+    tmp_path: Path,
+    updates: dict[str, Any],
+    expected_code: str,
+) -> None:
+    data = _amendment_data()
+    data.update(updates)
+    if updates.get("disposition") == "external_dependency_follow_up_required" and expected_code != (
+        "delivery_amend_authoring.replacements_unexpected"
+    ):
+        data["replacement_units"] = []
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        parse_delivery_amendment_authoring_output(
+            json.dumps(data),
+            expected_plan_id="team-invites",
+            expected_target_unit_id="oversized",
+            project_root=tmp_path,
+        )
+
+    assert exc_info.value.code == expected_code
 
 
 def test_parse_delivery_amendment_authoring_output_accepts_fenced_schema_object_after_prose(tmp_path: Path) -> None:
@@ -1041,6 +1512,55 @@ def test_parse_delivery_authoring_output_rejects_expected_plan_id_mismatch(tmp_p
         )
 
     assert exc_info.value.code == "delivery_authoring.expected_plan_id_mismatch"
+
+
+def test_parse_delivery_authoring_output_rejects_verbatim_constraint_summary(tmp_path: Path) -> None:
+    source_rule = "Only the protocol repository may change protocol files."
+    data = _draft_data()
+    data["constraints"] = [
+        {
+            "id": "protocol-ownership",
+            "kind": "repository_ownership",
+            "summary": source_rule,
+            "unit_ids": ["foundation"],
+            "disposition": "preserved",
+        }
+    ]
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        parse_delivery_authoring_output(
+            json.dumps(data),
+            expected_plan_id="team-invites",
+            project_root=tmp_path,
+            output_dir=".sikula/delivery/team-invites",
+            source_task_description=f"# Task\n\n- **{source_rule}**\n",
+        )
+
+    assert exc_info.value.code == "delivery_authoring.constraint_summary_source_excerpt"
+    assert source_rule not in exc_info.value.message
+
+
+def test_parse_delivery_authoring_output_accepts_paraphrased_constraint_summary(tmp_path: Path) -> None:
+    data = _draft_data()
+    data["constraints"] = [
+        {
+            "id": "protocol-ownership",
+            "kind": "repository_ownership",
+            "summary": "Protocol edits stay under external repository ownership.",
+            "unit_ids": ["foundation"],
+            "disposition": "preserved",
+        }
+    ]
+
+    draft = parse_delivery_authoring_output(
+        json.dumps(data),
+        expected_plan_id="team-invites",
+        project_root=tmp_path,
+        output_dir=".sikula/delivery/team-invites",
+        source_task_description="# Task\n\nOnly the protocol repository may change protocol files.\n",
+    )
+
+    assert draft.constraints[0].summary == "Protocol edits stay under external repository ownership."
 
 
 def test_parse_delivery_authoring_output_rejects_invalid_expected_plan_id(tmp_path: Path) -> None:

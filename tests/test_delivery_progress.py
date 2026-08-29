@@ -589,6 +589,68 @@ def test_delivery_status_unit_projects_budget_stop_as_split_only() -> None:
     assert "split required before implementation" in render_delivery_status(result)
 
 
+@pytest.mark.parametrize(
+    ("failure_code", "recovery_action"),
+    [
+        (
+            "unit_scope_violation",
+            "prepare a delivery amendment with delivery amend prepare before continuing",
+        ),
+        (
+            "scope_amendment_required",
+            "prepare a delivery amendment with delivery amend prepare before continuing",
+        ),
+        (
+            "external_dependency_gap",
+            "complete the external dependency follow-up before continuing",
+        ),
+        (
+            "implementer_disposition_invalid",
+            "inspect the invalid implementer disposition and replace the failed child before continuing",
+        ),
+    ],
+)
+def test_delivery_status_projects_terminal_child_stop_recovery(
+    tmp_path: Path,
+    failure_code: str,
+    recovery_action: str,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {
+                    "unit_id": "01-foundation",
+                    "status": "failed",
+                    "child_task_id": "task-1",
+                    "failure_code": failure_code,
+                },
+            ],
+        },
+    )
+
+    result = get_delivery_status(plan_path)
+    unit = result.units[0]
+    payload = result.to_dict()
+
+    assert result.status == "failed"
+    assert result.next_action == recovery_action
+    assert unit.run_next_available is False
+    assert unit.run_next_action is None
+    assert unit.run_next_blocked_reason == failure_code
+    assert select_next_delivery_unit(result, reset_failed=True) is None
+    assert payload["units"][0]["failure_code"] == failure_code
+    assert payload["units"][0]["run_next_blocked_reason"] == failure_code
+    assert payload["units"][0]["run_next_available"] is False
+    assert "run_next_action" not in payload["units"][0]
+    assert recovery_action in render_delivery_status(result)
+
+
 def test_append_delivery_progress_events_ignores_empty_batch(tmp_path: Path) -> None:
     path = tmp_path / "events.jsonl"
 

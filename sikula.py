@@ -1165,6 +1165,21 @@ def _reset_failed_state(task_id: str, cfg: dict, store) -> None:
         print(f"Task {task_id} is not in failed state — nothing to reset")
         return
 
+    from core.state import DELIVERY_TERMINAL_STOP_CODES
+
+    terminal_stop_code = getattr(state, "delivery_stop_code", None)
+    parse_error = getattr(state, "delivery_disposition_parse_error", None)
+    if parse_error is not None and terminal_stop_code not in DELIVERY_TERMINAL_STOP_CODES:
+        try:
+            terminal_stop_code = state.delivery_stop_code_from_parse_error()
+        except (TypeError, ValueError):
+            terminal_stop_code = "delivery_stop_state_invalid"
+    if terminal_stop_code in DELIVERY_TERMINAL_STOP_CODES or parse_error is not None:
+        print(f"Task {task_id} has non-retryable delivery stop: {terminal_stop_code}.")
+        print("--reset-failed cannot bypass a terminal delivery stop; follow the parent delivery recovery action.")
+        print(f"Inspect state: sikula show {task_id}")
+        sys.exit(1)
+
     if _contract_gate_blocked_without_worktree(state):
         print(f"Task {task_id} failed before worktree creation because the contract readiness gate blocked delivery.")
         print("--reset-failed cannot safely resume it; prepare the task contract and start a fresh run.")
@@ -1725,6 +1740,7 @@ def _make_auto_preparation_audit_recorder(
     output_metadata = {
         "path": _contract_preflight_path(output_path, artifact_base),
     }
+    runtime_metadata = {"sikula_version": _sikula_version()}
 
     def record_auto_preparation_audit(record: dict) -> None:
         audit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1734,6 +1750,7 @@ def _make_auto_preparation_audit_recorder(
             "recorded_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             "task": task_metadata,
             "output": output_metadata,
+            "runtime_metadata": runtime_metadata,
             "record": record,
         }
         with audit_path.open("a", encoding="utf-8") as handle:
@@ -3441,6 +3458,7 @@ def _run_delivery_amend_prepare_authoring(
     cfg: dict,
     target,
     source_snapshot,
+    failure_evidence=None,
     amend_reason: str | None = None,
     budget_exceeded: DeliveryBudgetExceeded | None = None,
 ) -> DeliveryAmendmentAuthoringDraft:
@@ -3462,6 +3480,9 @@ def _run_delivery_amend_prepare_authoring(
     agent = _create_delivery_preparation_agent(args, cfg)
     safe_audit_path = _contract_preflight_path(audit_path, project_root)
     component_ids = [component.id for component in target.plan.components]
+    applicable_constraints = [
+        constraint.to_dict() for constraint in target.plan.constraints if target.target.id in constraint.unit_ids
+    ]
     downstream_by_id = {unit.id: unit for unit in target.plan.units}
     try:
         draft = agent.author_delivery_amendment(
@@ -3473,6 +3494,8 @@ def _run_delivery_amend_prepare_authoring(
             project_root=project_root,
             project_context=_prepare_project_context_from_config(cfg),
             component_ids=component_ids,
+            applicable_constraints=applicable_constraints,
+            failure_evidence=failure_evidence.to_prompt_dict() if failure_evidence else None,
             amend_reason=amend_reason,
             budget_exceeded=budget_exceeded.to_dict() if budget_exceeded else None,
             audit_recorder=audit_recorder,
@@ -3485,7 +3508,12 @@ def _run_delivery_amend_prepare_authoring(
 
 
 def cmd_delivery_amend_prepare(args: argparse.Namespace, cfg: dict) -> None:
-    context = cli_delivery.DeliveryAmendPrepareContext(run_authoring_assistant=_run_delivery_amend_prepare_authoring)
+    from core.state import JsonStateStore
+
+    context = cli_delivery.DeliveryAmendPrepareContext(
+        run_authoring_assistant=_run_delivery_amend_prepare_authoring,
+        state_store=JsonStateStore(_resolve_state_dir(cfg)),
+    )
     return cli_delivery.cmd_delivery_amend_prepare(args, cfg, context)
 
 
@@ -3510,20 +3538,23 @@ def _run_delivery_child_task(args: argparse.Namespace, cfg: dict) -> cli_deliver
     return cli_delivery.DeliveryChildRunResult(exit_code=0, child_task_id=getattr(args, "created_task_id", None))
 
 
-def _delivery_run_next_context() -> cli_delivery.DeliveryRunNextContext:
+def _delivery_run_next_context(cfg: dict) -> cli_delivery.DeliveryRunNextContext:
+    from core.state import JsonStateStore
+
     return cli_delivery.DeliveryRunNextContext(
         run_task=_run_delivery_child_task,
         resolve_state_dir=_resolve_state_dir,
+        state_store=JsonStateStore(_resolve_state_dir(cfg)),
         run_amendment_authoring=_run_delivery_amend_prepare_authoring,
     )
 
 
 def cmd_delivery_run_next(args: argparse.Namespace, cfg: dict) -> None:
-    return cli_delivery.cmd_delivery_run_next(args, cfg, _delivery_run_next_context())
+    return cli_delivery.cmd_delivery_run_next(args, cfg, _delivery_run_next_context(cfg))
 
 
 def cmd_delivery_run(args: argparse.Namespace, cfg: dict) -> None:
-    return cli_delivery.cmd_delivery_run(args, cfg, _delivery_run_next_context())
+    return cli_delivery.cmd_delivery_run(args, cfg, _delivery_run_next_context(cfg))
 
 
 # ---------------------------------------------------------------------------

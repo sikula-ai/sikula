@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import tempfile
 from typing import Any
@@ -48,6 +48,7 @@ from core.delivery_plan import (
     check_delivery_plan_file,
 )
 from core.delivery_public_metadata import (
+    is_safe_delivery_public_metadata,
     project_delivery_public_identity,
     sanitize_delivery_public_metadata,
 )
@@ -59,6 +60,7 @@ from core.delivery_progress import (
     acquire_delivery_progress_lock,
     append_delivery_progress_event,
     append_delivery_progress_events,
+    delivery_terminal_stop_recommended_action,
     delivery_events_path,
     delivery_progress_path,
     get_delivery_status,
@@ -67,9 +69,16 @@ from core.delivery_progress import (
     write_delivery_progress,
 )
 from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_FIELDS
+from core.state import (
+    DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP,
+    DELIVERY_STOP_SCOPE_AMENDMENT_REQUIRED,
+    DELIVERY_STOP_UNIT_SCOPE_VIOLATION,
+    StateStore,
+)
 from core.worktree import resolve_git_commit
 
 SUPPORTED_DELIVERY_AMENDMENT_PROPOSAL_SCHEMA_VERSION = 1
+SUPPORTED_DELIVERY_AMENDMENT_FAILURE_EVIDENCE_SCHEMA_VERSION = 2
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_OBJECT_ID_RE = re.compile(r"^[0-9a-f]{40,64}$")
@@ -79,12 +88,143 @@ _FORBIDDEN_PLAN_ROOTS = (
     (".sikula", "worktrees"),
     (".sikula", "contract-reports"),
 )
+_DELIVERY_AMENDMENT_EVIDENCE_STOP_CODES = frozenset(
+    {
+        DELIVERY_STOP_UNIT_SCOPE_VIOLATION,
+        DELIVERY_STOP_SCOPE_AMENDMENT_REQUIRED,
+        DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP,
+    }
+)
+_MAX_DELIVERY_AMENDMENT_EVIDENCE_PATHS = 100
+_MAX_DELIVERY_AMENDMENT_EVIDENCE_DISPOSITIONS = 16
 
 
 class DeliveryAmendmentError(RuntimeError):
     def __init__(self, code: str, message: str, path: str | None = None) -> None:
         super().__init__(message)
         self.issue = DeliveryPlanIssue("error", code, message, path)
+
+
+@dataclass(frozen=True)
+class DeliveryAmendmentReviewEvidence:
+    records_count: int
+    issues_count: int
+    issue_summaries: tuple[str, ...]
+    dispositions: tuple[dict[str, Any], ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "records_count": self.records_count,
+            "issues_count": self.issues_count,
+            "issue_summaries": list(self.issue_summaries),
+            "dispositions": [dict(value) for value in self.dispositions],
+        }
+
+
+@dataclass(frozen=True)
+class DeliveryAmendmentDependencyIdentity:
+    plan_id: str
+    unit_id: str
+    child_task_id: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "plan_id": self.plan_id,
+            "unit_id": self.unit_id,
+            "child_task_id": self.child_task_id,
+        }
+
+    def to_prompt_dict(self) -> dict[str, str | None]:
+        return {
+            "plan_id": project_delivery_public_identity(self.plan_id),
+            "unit_id": project_delivery_public_identity(self.unit_id),
+            "child_task_id": project_delivery_public_identity(self.child_task_id),
+        }
+
+
+@dataclass(frozen=True)
+class DeliveryAmendmentFailureEvidence:
+    plan_id: str
+    unit_id: str
+    child_task_id: str
+    failure_code: str
+    recommended_action: str
+    inherited_constraints: tuple[dict[str, Any], ...]
+    declared_write_paths: tuple[str, ...]
+    effective_write_paths: tuple[str, ...]
+    changed_paths: tuple[str, ...]
+    changed_count: int
+    omitted_changed_paths_count: int
+    violation_paths: tuple[str, ...]
+    violation_count: int
+    outside_project_paths: tuple[str, ...]
+    outside_project_count: int
+    omitted_outside_project_paths_count: int
+    reviewer: DeliveryAmendmentReviewEvidence
+    security_reviewer: DeliveryAmendmentReviewEvidence
+    stop_disposition: dict[str, Any] | None
+    dependency_handoffs: tuple[DeliveryAmendmentDependencyIdentity, ...]
+    fingerprint: str
+    schema_version: int = SUPPORTED_DELIVERY_AMENDMENT_FAILURE_EVIDENCE_SCHEMA_VERSION
+
+    @property
+    def requires_external_follow_up(self) -> bool:
+        return self.failure_code == DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP
+
+    def payload_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "plan_id": self.plan_id,
+            "unit_id": self.unit_id,
+            "child_task_id": self.child_task_id,
+            "failure_code": self.failure_code,
+            "recommended_action": self.recommended_action,
+            "inherited_constraints": [dict(value) for value in self.inherited_constraints],
+            "write_scope": {
+                "declared_paths": list(self.declared_write_paths),
+                "effective_paths": list(self.effective_write_paths),
+            },
+            "changed_files": {
+                "count": self.changed_count,
+                "paths": list(self.changed_paths),
+                "omitted_paths_count": self.omitted_changed_paths_count,
+            },
+            "scope_violations": {
+                "count": self.violation_count,
+                "paths": list(self.violation_paths),
+                "outside_project": {
+                    "count": self.outside_project_count,
+                    "paths": list(self.outside_project_paths),
+                    "omitted_paths_count": self.omitted_outside_project_paths_count,
+                },
+            },
+            "reviews": {
+                "reviewer": self.reviewer.to_dict(),
+                "security_reviewer": self.security_reviewer.to_dict(),
+            },
+            "stop_disposition": dict(self.stop_disposition) if self.stop_disposition else None,
+            "dependency_handoffs": [value.to_dict() for value in self.dependency_handoffs],
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.payload_dict(), "fingerprint": self.fingerprint}
+
+    def to_prompt_dict(self) -> dict[str, Any]:
+        """Project private identities only at the external-provider boundary."""
+        payload = self.payload_dict()
+        payload["plan_id"] = project_delivery_public_identity(self.plan_id)
+        payload["unit_id"] = project_delivery_public_identity(self.unit_id)
+        payload["child_task_id"] = project_delivery_public_identity(self.child_task_id)
+        payload["inherited_constraints"] = [
+            {
+                **constraint,
+                "id": project_delivery_public_identity(constraint["id"]),
+                "unit_ids": [project_delivery_public_identity(value) for value in constraint["unit_ids"]],
+            }
+            for constraint in self.inherited_constraints
+        ]
+        payload["dependency_handoffs"] = [value.to_prompt_dict() for value in self.dependency_handoffs]
+        return {**payload, "fingerprint": self.fingerprint}
 
 
 @dataclass(frozen=True)
@@ -388,6 +528,542 @@ def inspect_delivery_amendment_target(
     return context
 
 
+def capture_delivery_amendment_failure_evidence(
+    context: DeliveryAmendmentTarget,
+    *,
+    state_store: StateStore,
+) -> DeliveryAmendmentFailureEvidence | None:
+    """Build a bounded, correlated projection of an eligible failed delivery child."""
+    from core.delivery_constraint_context import (
+        DeliveryConstraintContextError,
+        parse_delivery_constraint_context,
+    )
+    from core.delivery_handoff import (
+        DeliveryHandoffError,
+        delivery_unit_handoff_matches_unit,
+        parse_delivery_unit_handoff,
+    )
+    from core.delivery_plan import delivery_unit_constraint_context
+    from core.delivery_write_scope import (
+        DELIVERY_RUNTIME_WRITE_SCOPE_STATUS_DENIED,
+        DeliveryWriteScopeError,
+        delivery_write_scope_matches_unit_declaration,
+        resolve_delivery_write_scope,
+        validate_delivery_runtime_write_scope_binding,
+        validate_delivery_write_scope_snapshot,
+    )
+
+    status_unit = next((unit for unit in context.status.units if unit.id == context.target.id), None)
+    if (
+        status_unit is None
+        or status_unit.status != "failed"
+        or status_unit.failure_code not in _DELIVERY_AMENDMENT_EVIDENCE_STOP_CODES
+    ):
+        return None
+    child_task_id = status_unit.child_task_id
+    if not isinstance(child_task_id, str) or not _ID_RE.fullmatch(child_task_id):
+        _invalid_failure_evidence("The failed delivery unit has no valid linked child task.")
+
+    try:
+        child_state = state_store.load(child_task_id)
+    except (OSError, TypeError, ValueError):
+        _invalid_failure_evidence("The linked delivery child state is unavailable or malformed.")
+    if child_state is None:
+        _invalid_failure_evidence("The linked delivery child state was not found.")
+
+    root = Path(context.project_root).resolve()
+    expected_plan_path = _project_relative_plan_path(Path(context.plan_path), root)
+    if (
+        getattr(child_state, "task_id", None) != child_task_id
+        or getattr(child_state, "delivery_plan_id", None) != context.plan.plan_id
+        or getattr(child_state, "delivery_unit_id", None) != context.target.id
+        or getattr(child_state, "delivery_plan_path", None) != expected_plan_path
+        or getattr(child_state, "failed", None) is not True
+        or getattr(child_state, "done", None) is not False
+        or getattr(child_state, "delivery_stop_code", None) != status_unit.failure_code
+    ):
+        _mismatched_failure_evidence()
+
+    try:
+        constraint_context = parse_delivery_constraint_context(child_state)
+    except DeliveryConstraintContextError:
+        _invalid_failure_evidence("The linked child inherited-constraint context is invalid.")
+    if constraint_context is None:
+        _invalid_failure_evidence("The linked child has no inherited-constraint context.")
+    expected_schema, expected_source_task, expected_constraints = delivery_unit_constraint_context(
+        context.plan,
+        context.target.id,
+    )
+    if (
+        constraint_context.schema_version != expected_schema
+        or constraint_context.plan_id != context.plan.plan_id
+        or constraint_context.unit_id != context.target.id
+        or constraint_context.plan_path != expected_plan_path
+        or (constraint_context.source_task.to_dict() if constraint_context.source_task else None)
+        != expected_source_task
+        or [value.to_context_dict() for value in constraint_context.constraints] != expected_constraints
+    ):
+        _mismatched_failure_evidence()
+
+    runtime_scope_root = _delivery_amendment_child_scope_root(child_state, fallback=root)
+    runtime_binding_value = getattr(child_state, "delivery_runtime_write_scope_binding", None)
+    scope_violation_evidence = status_unit.failure_code == DELIVERY_STOP_UNIT_SCOPE_VIOLATION
+    try:
+        write_scope = validate_delivery_write_scope_snapshot(
+            project_root=runtime_scope_root,
+            schema_version=getattr(child_state, "delivery_write_scope_schema_version", None),
+            mode=getattr(child_state, "delivery_write_scope_mode", None),
+            declared_paths=getattr(child_state, "delivery_declared_write_paths", None),
+            declared_exact_file_paths=getattr(child_state, "delivery_declared_write_exact_file_paths", None),
+            effective_paths=getattr(child_state, "delivery_effective_write_paths", None),
+            effective_exact_file_paths=getattr(child_state, "delivery_effective_write_exact_file_paths", None),
+            validate_current_paths=not scope_violation_evidence,
+        )
+    except DeliveryWriteScopeError:
+        _invalid_failure_evidence("The linked child write-scope snapshot is invalid.")
+    if write_scope is None:
+        _mismatched_failure_evidence()
+    if scope_violation_evidence:
+        if not delivery_write_scope_matches_unit_declaration(write_scope, context.target.scope_paths):
+            _mismatched_failure_evidence()
+    else:
+        try:
+            expected_write_scope = resolve_delivery_write_scope(
+                project_root=runtime_scope_root,
+                configured_write_paths=write_scope.effective_paths,
+                unit_scope_paths=context.target.scope_paths,
+            )
+        except DeliveryWriteScopeError:
+            _mismatched_failure_evidence()
+        if expected_write_scope != write_scope:
+            _mismatched_failure_evidence()
+    try:
+        runtime_binding = validate_delivery_runtime_write_scope_binding(
+            project_root=runtime_scope_root,
+            binding=runtime_binding_value,
+            upper_bound_paths=write_scope.effective_paths,
+            upper_bound_exact_file_paths=write_scope.effective_exact_file_paths,
+            validate_current_paths=not scope_violation_evidence,
+        )
+    except DeliveryWriteScopeError:
+        _invalid_failure_evidence("The linked child runtime write-scope snapshot is invalid.")
+    evidence_effective_paths = (
+        runtime_binding.effective_paths
+        if runtime_binding is not None and runtime_binding.status != DELIVERY_RUNTIME_WRITE_SCOPE_STATUS_DENIED
+        else write_scope.effective_paths
+    )
+
+    stop_disposition = _delivery_amendment_stop_disposition(child_state, status_unit.failure_code)
+    reviewer = _delivery_amendment_review_evidence(
+        getattr(child_state, "review_cycle_records", None),
+        reviewer="reviewer",
+        authoritative=stop_disposition,
+    )
+    security_reviewer = _delivery_amendment_review_evidence(
+        getattr(child_state, "security_review_cycle_records", None),
+        reviewer="security_reviewer",
+        authoritative=stop_disposition,
+    )
+
+    (
+        changed_paths,
+        changed_count,
+        omitted_count,
+        violation_paths,
+        violation_count,
+        outside_project_paths,
+        outside_project_count,
+        omitted_outside_project_count,
+    ) = _delivery_amendment_changed_file_evidence(child_state, root=runtime_scope_root)
+
+    status_by_id = {unit.id: unit for unit in context.status.units}
+    dependency_ids = _delivery_amendment_dependency_ids(context)
+    identities: list[DeliveryAmendmentDependencyIdentity] = []
+    seen_handoffs: set[str] = set()
+    handoff_values = getattr(child_state, "delivery_dependency_handoffs", None)
+    if not isinstance(handoff_values, list):
+        _invalid_failure_evidence("The linked child dependency-handoff evidence is malformed.")
+    for value in handoff_values:
+        try:
+            handoff = parse_delivery_unit_handoff(value)
+        except DeliveryHandoffError:
+            _invalid_failure_evidence("The linked child dependency-handoff evidence is invalid.")
+        dependency = status_by_id.get(handoff.unit_id)
+        if (
+            handoff.plan_id != context.plan.plan_id
+            or handoff.unit_id not in dependency_ids
+            or dependency is None
+            or dependency.status != "done"
+            or handoff.child_task_id != dependency.child_task_id
+            or handoff.schema_version != dependency.handoff_schema_version
+            or handoff.fingerprint != dependency.handoff_fingerprint
+            or not delivery_unit_handoff_matches_unit(handoff, dependency)
+            or handoff.unit_id in seen_handoffs
+        ):
+            _mismatched_failure_evidence()
+        seen_handoffs.add(handoff.unit_id)
+        identities.append(
+            DeliveryAmendmentDependencyIdentity(
+                plan_id=handoff.plan_id,
+                unit_id=handoff.unit_id,
+                child_task_id=handoff.child_task_id,
+            )
+        )
+
+    recommended_action = delivery_terminal_stop_recommended_action(status_unit.failure_code)
+    if recommended_action is None:
+        _invalid_failure_evidence("The linked child terminal stop has no recovery action.")
+    preliminary = DeliveryAmendmentFailureEvidence(
+        plan_id=context.plan.plan_id,
+        unit_id=context.target.id,
+        child_task_id=child_task_id,
+        failure_code=status_unit.failure_code,
+        recommended_action=recommended_action,
+        inherited_constraints=tuple(expected_constraints),
+        declared_write_paths=write_scope.declared_paths,
+        effective_write_paths=evidence_effective_paths,
+        changed_paths=changed_paths,
+        changed_count=changed_count,
+        omitted_changed_paths_count=omitted_count,
+        violation_paths=violation_paths,
+        violation_count=violation_count,
+        outside_project_paths=outside_project_paths,
+        outside_project_count=outside_project_count,
+        omitted_outside_project_paths_count=omitted_outside_project_count,
+        reviewer=reviewer,
+        security_reviewer=security_reviewer,
+        stop_disposition=stop_disposition,
+        dependency_handoffs=tuple(sorted(identities, key=lambda value: value.unit_id)),
+        fingerprint="",
+    )
+    fingerprint = hashlib.sha256(
+        json.dumps(preliminary.payload_dict(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return replace(preliminary, fingerprint=fingerprint)
+
+
+def _invalid_failure_evidence(message: str) -> None:
+    raise DeliveryAmendmentError("delivery_amend.failure_evidence_invalid", message)
+
+
+def _delivery_amendment_child_scope_root(child_state: Any, *, fallback: Path) -> Path:
+    value = getattr(child_state, "worktree_path", None)
+    if value is None:
+        return fallback
+    if not isinstance(value, str) or not value:
+        _invalid_failure_evidence("The linked child authoritative worktree is invalid.")
+    try:
+        root = Path(value).resolve(strict=True)
+        if not root.is_dir():
+            raise ValueError("child project root is not a directory")
+        base_value = getattr(child_state, "worktree_base", None)
+        if base_value is not None:
+            if not isinstance(base_value, str) or not base_value:
+                raise ValueError("child worktree base is invalid")
+            base = Path(base_value).resolve(strict=True)
+            root.relative_to(base)
+    except (OSError, RuntimeError, ValueError):
+        _invalid_failure_evidence("The linked child authoritative worktree is invalid.")
+    return root
+
+
+def _mismatched_failure_evidence() -> None:
+    raise DeliveryAmendmentError(
+        "delivery_amend.failure_evidence_mismatch",
+        "The linked child failure evidence does not match the selected delivery plan and unit.",
+    )
+
+
+def _delivery_amendment_stop_disposition(child_state: Any, failure_code: str) -> dict[str, Any] | None:
+    try:
+        disposition_code = child_state.delivery_stop_code_from_disposition()
+    except (AttributeError, TypeError, ValueError):
+        _invalid_failure_evidence("The linked child stop disposition is invalid.")
+    value = getattr(child_state, "delivery_stop_disposition", None)
+    if (
+        failure_code
+        in {
+            DELIVERY_STOP_SCOPE_AMENDMENT_REQUIRED,
+            DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP,
+        }
+        and disposition_code != failure_code
+    ):
+        _mismatched_failure_evidence()
+    if value is None or failure_code == DELIVERY_STOP_UNIT_SCOPE_VIOLATION:
+        return None
+    return {
+        "schema_version": value["schema_version"],
+        "disposition": value["disposition"],
+        "summary": value["summary"],
+        "recommended_action": value["recommended_action"],
+        "source": value["source"],
+    }
+
+
+def _delivery_amendment_review_evidence(
+    records: Any,
+    *,
+    reviewer: str,
+    authoritative: dict[str, Any] | None,
+) -> DeliveryAmendmentReviewEvidence:
+    from core.structured_output import (
+        DELIVERY_DISPOSITION_APPROVED,
+        DELIVERY_DISPOSITION_SCHEMA_VERSION,
+        DELIVERY_REVIEW_DISPOSITIONS,
+        delivery_disposition_recommended_action,
+    )
+
+    if not isinstance(records, list):
+        _invalid_failure_evidence("The linked child review evidence is malformed.")
+    dispositions: list[dict[str, Any]] = []
+    summaries: list[str] = []
+    issues_count = 0
+    records_count = 0
+    for record in records:
+        if not isinstance(record, dict):
+            _invalid_failure_evidence("The linked child review evidence is malformed.")
+        record_reviewer = record.get("reviewer")
+        if record_reviewer not in {None, reviewer}:
+            continue
+        records_count += 1
+        if record.get("approved") is False:
+            issues_count += 1
+        value = record.get("disposition")
+        if value is None:
+            continue
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"schema_version", "disposition", "summary", "recommended_action"}
+            or value.get("schema_version") != DELIVERY_DISPOSITION_SCHEMA_VERSION
+            or value.get("disposition") not in DELIVERY_REVIEW_DISPOSITIONS
+            or value.get("recommended_action") != delivery_disposition_recommended_action(value.get("disposition"))
+            or not isinstance(value.get("summary"), str)
+            or not is_safe_delivery_public_metadata(value["summary"])
+        ):
+            _invalid_failure_evidence("The linked child review disposition is invalid.")
+        if value["disposition"] == DELIVERY_DISPOSITION_APPROVED:
+            if record.get("approved") is not True:
+                _invalid_failure_evidence("The linked child review approval is inconsistent.")
+            continue
+        projected = {
+            "schema_version": value["schema_version"],
+            "disposition": value["disposition"],
+            "summary": value["summary"],
+            "recommended_action": value["recommended_action"],
+        }
+        if projected not in dispositions and len(dispositions) < _MAX_DELIVERY_AMENDMENT_EVIDENCE_DISPOSITIONS:
+            dispositions.append(projected)
+            summaries.append(value["summary"])
+    if authoritative and authoritative.get("source") == reviewer:
+        projected = {
+            "schema_version": DELIVERY_DISPOSITION_SCHEMA_VERSION,
+            "disposition": authoritative["disposition"],
+            "summary": authoritative["summary"],
+            "recommended_action": authoritative["recommended_action"],
+        }
+        if projected not in dispositions and len(dispositions) < _MAX_DELIVERY_AMENDMENT_EVIDENCE_DISPOSITIONS:
+            dispositions.append(projected)
+            summaries.append(authoritative["summary"])
+    return DeliveryAmendmentReviewEvidence(
+        records_count=records_count,
+        issues_count=issues_count,
+        issue_summaries=tuple(summaries),
+        dispositions=tuple(dispositions),
+    )
+
+
+def _delivery_amendment_changed_file_evidence(
+    child_state: Any,
+    *,
+    root: Path,
+) -> tuple[tuple[str, ...], int, int, tuple[str, ...], int, tuple[str, ...], int, int]:
+    raw_changed = getattr(child_state, "files_changed", None)
+    if not isinstance(raw_changed, list):
+        _invalid_failure_evidence("The linked child changed-file evidence is malformed.")
+    changed_values: list[Any] = list(raw_changed)
+    changed_count = len(raw_changed)
+    violation_values: Any = []
+    violation_count = 0
+    outside_project_values: Any = []
+    outside_project_count = 0
+    records = getattr(child_state, "validation_cycle_records", None)
+    if not isinstance(records, list):
+        _invalid_failure_evidence("The linked child validation evidence is malformed.")
+    for record in records:
+        if not isinstance(record, dict) or record.get("phase") != "delivery_scope_audit":
+            continue
+        status = record.get("status")
+        metadata = record.get("metadata")
+        if status not in {"passed", "failed"} or not isinstance(metadata, dict):
+            continue
+        code = metadata.get("code")
+        if code not in {"delivery_scope_audit_passed", "unit_scope_violation"}:
+            continue
+        audit_changed_values = metadata.get("changed_paths")
+        if audit_changed_values is None and code == "delivery_scope_audit_passed":
+            # Compatibility with successful audit records created before paths were retained.
+            continue
+        if audit_changed_values is None:
+            audit_changed_values = raw_changed
+        audit_changed_count = _nonnegative_evidence_count(metadata.get("changed_count"), "changed-file")
+        if not isinstance(audit_changed_values, list) or audit_changed_count < len(audit_changed_values):
+            _invalid_failure_evidence("The linked child scope-audit counts are inconsistent.")
+        changed_values.extend(audit_changed_values)
+        changed_count = max(changed_count, audit_changed_count)
+        if status == "failed" and code == "unit_scope_violation":
+            audit_violation_values = metadata.get("violation_paths", [])
+            audit_violation_count = _nonnegative_evidence_count(
+                metadata.get("violation_count"),
+                "scope-violation",
+            )
+            audit_outside_project_values = metadata.get("outside_project_paths", [])
+            audit_outside_project_count = _nonnegative_evidence_count(
+                metadata.get("outside_project_count", 0),
+                "outside-project",
+            )
+            if (
+                not isinstance(audit_violation_values, list)
+                or not isinstance(audit_outside_project_values, list)
+                or audit_outside_project_count < len(audit_outside_project_values)
+                or audit_violation_count < len(audit_violation_values) + audit_outside_project_count
+            ):
+                _invalid_failure_evidence("The linked child scope-audit counts are inconsistent.")
+            violation_values = audit_violation_values
+            violation_count = audit_violation_count
+            outside_project_values = audit_outside_project_values
+            outside_project_count = audit_outside_project_count
+    unique_changed_values: list[Any] = []
+    seen_changed_values: set[str] = set()
+    for value in changed_values:
+        if isinstance(value, str):
+            if value in seen_changed_values:
+                continue
+            seen_changed_values.add(value)
+        unique_changed_values.append(value)
+    changed_count = max(changed_count, len(unique_changed_values))
+    changed_paths, unsafe_changed_count = _sanitize_delivery_amendment_paths(unique_changed_values, root=root)
+    violation_paths, _ = _sanitize_delivery_amendment_paths(violation_values, root=root)
+    outside_project_paths, unsafe_outside_project_count = _sanitize_delivery_amendment_worktree_paths(
+        outside_project_values
+    )
+    omitted_count = max(changed_count - len(changed_paths), unsafe_changed_count)
+    omitted_outside_project_count = max(
+        outside_project_count - len(outside_project_paths),
+        unsafe_outside_project_count,
+    )
+    return (
+        changed_paths,
+        changed_count,
+        omitted_count,
+        violation_paths,
+        violation_count,
+        outside_project_paths,
+        outside_project_count,
+        omitted_outside_project_count,
+    )
+
+
+def _nonnegative_evidence_count(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        _invalid_failure_evidence(f"The linked child {label} count is invalid.")
+    return value
+
+
+def _sanitize_delivery_amendment_paths(values: Any, *, root: Path) -> tuple[tuple[str, ...], int]:
+    if not isinstance(values, list):
+        _invalid_failure_evidence("The linked child changed paths are malformed.")
+    result: list[str] = []
+    omitted = 0
+    seen: set[str] = set()
+    for value in values:
+        safe = _safe_delivery_amendment_path(value, root=root)
+        if safe is None or safe in seen:
+            omitted += 1
+            continue
+        seen.add(safe)
+        if len(result) >= _MAX_DELIVERY_AMENDMENT_EVIDENCE_PATHS:
+            omitted += 1
+            continue
+        result.append(safe)
+    return tuple(sorted(result)), omitted
+
+
+def _sanitize_delivery_amendment_worktree_paths(values: Any) -> tuple[tuple[str, ...], int]:
+    if not isinstance(values, list):
+        _invalid_failure_evidence("The linked child outside-project paths are malformed.")
+    result: list[str] = []
+    omitted = 0
+    seen: set[str] = set()
+    for value in values:
+        safe = _safe_delivery_amendment_worktree_path(value)
+        if safe is None or safe in seen:
+            omitted += 1
+            continue
+        seen.add(safe)
+        if len(result) >= _MAX_DELIVERY_AMENDMENT_EVIDENCE_PATHS:
+            omitted += 1
+            continue
+        result.append(safe)
+    return tuple(sorted(result)), omitted
+
+
+def _safe_delivery_amendment_worktree_path(value: Any) -> str | None:
+    if not isinstance(value, str) or not value or value != value.strip():
+        return None
+    posix = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    if (
+        posix.is_absolute()
+        or windows.is_absolute()
+        or windows.drive
+        or windows.root
+        or ".." in posix.parts
+        or ".." in windows.parts
+        or not is_safe_delivery_public_metadata(value)
+    ):
+        return None
+    normalized = windows.as_posix() if os.name == "nt" else posix.as_posix()
+    return normalized if normalized not in {"", "."} else None
+
+
+def _safe_delivery_amendment_path(value: Any, *, root: Path) -> str | None:
+    if not isinstance(value, str) or not value or value != value.strip():
+        return None
+    posix = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    if (
+        posix.is_absolute()
+        or windows.is_absolute()
+        or windows.drive
+        or windows.root
+        or ".." in posix.parts
+        or ".." in windows.parts
+        or not is_safe_delivery_public_metadata(value)
+    ):
+        return None
+    normalized = windows.as_posix() if os.name == "nt" else posix.as_posix()
+    try:
+        relative = (root / normalized).resolve(strict=False).relative_to(root).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return relative or "."
+
+
+def _delivery_amendment_dependency_ids(context: DeliveryAmendmentTarget) -> set[str]:
+    units = {unit.id: unit for unit in context.plan.units}
+    result: set[str] = set()
+    pending = list(context.target.depends_on)
+    while pending:
+        unit_id = pending.pop(0)
+        if unit_id in result:
+            continue
+        result.add(unit_id)
+        unit = units.get(unit_id)
+        if unit is not None:
+            pending.extend(unit.depends_on)
+    return result
+
+
 def create_delivery_amendment_proposal(
     path: str | Path,
     target_unit_id: str,
@@ -421,6 +1097,8 @@ def create_delivery_amendment_proposal(
             "delivery_amend.replacements_too_few",
             "A split proposal must contain at least two replacement units.",
         )
+
+    _validate_amendment_constraint_verification(context, draft)
 
     root = Path(context.project_root)
     plan_path = Path(context.plan_path)
@@ -562,6 +1240,48 @@ def create_delivery_amendment_proposal(
         _remove_published_proposal(proposal_path)
         raise
     return proposal, proposal_path
+
+
+def _validate_amendment_constraint_verification(
+    context: DeliveryAmendmentTarget,
+    draft: DeliveryAmendmentAuthoringDraft,
+) -> None:
+    replacement_ids = [unit.id for unit in draft.replacement_units]
+    applicable = [constraint for constraint in context.plan.constraints if context.target.id in constraint.unit_ids]
+    if not applicable:
+        return
+    verification = draft.constraint_verification
+    if verification is None:
+        raise DeliveryAmendmentError(
+            "delivery_amend.constraint_verification_required",
+            "Applicable constraints must be independently verified before an amendment can be published.",
+        )
+    expected = [(constraint.id, constraint.kind, constraint.summary, replacement_ids) for constraint in applicable]
+    actual = [
+        (constraint.id, constraint.kind, constraint.summary, constraint.unit_ids)
+        for constraint in verification.constraints
+    ]
+    if actual != expected:
+        raise DeliveryAmendmentError(
+            "delivery_amend.constraint_verification_invalid",
+            "Amendment constraint verification does not match the target's applicable constraints.",
+        )
+    if not verification.constraints_complete:
+        raise DeliveryAmendmentError(
+            "delivery_amend.constraint_verification_incomplete",
+            "Independent verification found an omitted or incompletely assigned amendment constraint.",
+        )
+    for constraint in verification.constraints:
+        if constraint.disposition == "conflict":
+            raise DeliveryAmendmentError(
+                "delivery_amend.constraint_conflict",
+                "A replacement unit conflicts with an inherited delivery constraint.",
+            )
+        if constraint.disposition != "preserved":
+            raise DeliveryAmendmentError(
+                "delivery_amend.constraint_review_required",
+                "Amendment constraint verification requires operator review.",
+            )
 
 
 def delivery_amendment_proposal_path(proposal_root: Path, plan_id: str, proposal_id: str) -> Path:
@@ -1525,6 +2245,25 @@ def _amended_plan_data(
     units[target_index + 1 : target_index + 1] = [
         unit.plan_entry(target_unit_id=proposal.target_unit_id) for unit in proposal.replacement_units
     ]
+    constraints = amended.get("constraints")
+    if constraints is not None:
+        if not isinstance(constraints, list):
+            raise DeliveryAmendmentError("delivery_amend.plan_invalid", "Delivery plan constraints are malformed.")
+        for constraint in constraints:
+            if not isinstance(constraint, dict) or not isinstance(constraint.get("unit_ids"), list):
+                raise DeliveryAmendmentError(
+                    "delivery_amend.plan_invalid",
+                    "Delivery plan constraints are malformed.",
+                )
+            if proposal.target_unit_id not in constraint["unit_ids"]:
+                continue
+            reassigned_unit_ids: list[str] = []
+            for unit_id in constraint["unit_ids"]:
+                inherited_ids = replacement_ids if unit_id == proposal.target_unit_id else [unit_id]
+                for inherited_id in inherited_ids:
+                    if inherited_id not in reassigned_unit_ids:
+                        reassigned_unit_ids.append(inherited_id)
+            constraint["unit_ids"] = reassigned_unit_ids
     rewired: list[str] = []
     for item in units:
         if (

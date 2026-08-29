@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -15,12 +16,25 @@ from core.delivery_authoring import (
     DeliveryAssessmentDraft,
     DeliveryAuthoringDraft,
     DeliveryAuthoringParseError,
+    DeliveryAuthoringUnitDraft,
 )
 
 
 class CapturingLLM:
-    def __init__(self, output: str) -> None:
+    def __init__(self, output: str, *, verification_output: str | Exception | None = None) -> None:
         self.output = output
+        self.outputs = [
+            output,
+            verification_output
+            or json.dumps(
+                {
+                    "constraints_complete": True,
+                    "constraints": [],
+                    "unit_context_complete": True,
+                    "unit_context_gaps": [],
+                }
+            ),
+        ]
         self.system_prompts: list[str] = []
         self.prompts: list[str] = []
         self.readonly_agent_calls: list[str] = []
@@ -29,7 +43,10 @@ class CapturingLLM:
     def generate(self, system: str, user: str) -> str:
         self.system_prompts.append(system)
         self.prompts.append(user)
-        return self.output
+        output = self.outputs[min(len(self.prompts) - 1, len(self.outputs) - 1)]
+        if isinstance(output, Exception):
+            raise output
+        return output
 
     def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
         self.readonly_agent_calls.append(prompt)
@@ -102,6 +119,7 @@ def _authoring_output(*, planning_mode: str | None = "fixed_window", warnings: l
     data = {
         "plan_id": "team-invites",
         "title": "Team invites delivery",
+        "constraints": [],
         "units": [
             {
                 "id": "foundation",
@@ -265,6 +283,11 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert draft.plan_id == "team-invites"
     assert draft.planning_mode == "fixed_window"
     assert draft.warnings == ["Review before writing artifacts."]
+    assert draft.source_task is not None
+    assert draft.source_task.path == ".sikula/tasks/team-invites.md"
+    assert draft.source_task.sha256 == (
+        "sha256:" + sha256(b"Add team invite authoring without exposing raw task text.").hexdigest()
+    )
     assert [unit.id for unit in draft.units] == ["foundation"]
     assert draft.units[0].scope_paths == ["agents"]
     assert draft.units[0].asset_paths == [".sikula/task-assets/invite-reference.png"]
@@ -272,7 +295,7 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert draft.units[0].risk_tags == ["automation_behavior"]
     assert draft.units[0].budget is not None
     assert draft.units[0].budget.to_dict() == {"max_planner_steps": 1}
-    assert llm.system_prompts == [""]
+    assert llm.system_prompts == ["", ""]
     assert llm.readonly_agent_calls == []
     assert llm.agent_calls == []
     prompt = llm.prompts[0]
@@ -286,6 +309,9 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert "# Project Guidelines" in prompt
     assert '"python3 -m pytest tests/"' in prompt
     assert "Do not include writer-facing path fields" in prompt
+    assert "constraints must explicitly list every hard source-task constraint" in prompt
+    assert "authoritative_read_only_dependency" in prompt
+    assert '"disposition": "preserved"' in prompt
     assert "Do not write, edit, delete, move, rename, format, or create files." in prompt
     assert "Prefer small units with one primary production surface" in prompt
     assert "Security and privacy" in prompt
@@ -310,7 +336,7 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert "Design every unit for a single implementation pass" in prompt
     assert "Never set max_planner_steps to 3 or more" in prompt
     assert "Add team invite authoring without exposing raw task text." in prompt
-    assert len(audit_records) == 1
+    assert len(audit_records) == 2
     record = audit_records[0]
     assert record["phase"] == "delivery_prepare_authoring"
     assert record["round_index"] == 1
@@ -324,7 +350,443 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
         "planning_mode": "fixed_window",
         "warnings": ["Review before writing artifacts."],
     }
+    verification_record = audit_records[1]
+    assert verification_record["phase"] == "delivery_prepare_constraint_verification"
+    assert verification_record["parsed"] == {
+        "status": "parsed",
+        "constraints_complete": True,
+        "constraint_ids": [],
+        "dispositions": [],
+        "constraint_gaps": [],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+    }
+    assert "independent read-only delivery-constraint verifier" in llm.prompts[1]
+    assert '"asset_paths": [' in llm.prompts[1]
+    assert ".sikula/task-assets/invite-reference.png" in llm.prompts[1]
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+def test_author_delivery_plan_repairs_one_omitted_constraint_and_reverifies(tmp_path: Path) -> None:
+    gap = {
+        "reason": "omitted",
+        "kind": "repository_ownership",
+        "summary": "Protocol file changes remain owned by the protocol repository.",
+        "affected_unit_ids": ["foundation"],
+    }
+    repaired_constraint = {
+        "id": "protocol-repository-ownership",
+        "kind": "repository_ownership",
+        "summary": gap["summary"],
+        "unit_ids": ["foundation"],
+        "disposition": "preserved",
+    }
+    llm = CapturingLLM(_authoring_output())
+    llm.outputs = [
+        _authoring_output(),
+        json.dumps(
+            {
+                "constraints_complete": False,
+                "constraints": [],
+                "constraint_gaps": [gap],
+                "unit_context_complete": True,
+                "unit_context_gaps": [],
+            }
+        ),
+        json.dumps({"constraints": [repaired_constraint]}),
+        json.dumps(
+            {
+                "constraints_complete": True,
+                "constraints": [repaired_constraint],
+                "constraint_gaps": [],
+                "unit_context_complete": True,
+                "unit_context_gaps": [],
+            }
+        ),
+    ]
+    agent = DeliveryPreparationAgent(llm=llm)
+    audit_records: list[dict] = []
+
+    draft = agent.author_delivery_plan(
+        task_description="Only the protocol repository may change protocol files.",
+        task_path=".sikula/tasks/team-invites.md",
+        plan_id="team-invites",
+        project_root=tmp_path,
+        output_dir=".sikula/delivery/team-invites",
+        audit_recorder=audit_records.append,
+    )
+
+    assert draft.constraint_verification is not None
+    assert draft.constraint_verification.constraints_complete is True
+    assert [constraint.to_plan_dict() for constraint in draft.constraints] == [repaired_constraint]
+    assert draft.units[0].asset_paths == [".sikula/task-assets/invite-reference.png"]
+    assert len(llm.prompts) == 4
+    assert "Only the protocol repository may change protocol files." in llm.prompts[1]
+    assert "Repair only the structured constraint list" in llm.prompts[2]
+    assert json.dumps([gap], indent=2, sort_keys=True) in llm.prompts[2]
+    assert "source_task_to_units_after_bounded_repair" in llm.prompts[3]
+    assert [record["phase"] for record in audit_records] == [
+        "delivery_prepare_authoring",
+        "delivery_prepare_constraint_verification",
+        "delivery_prepare_constraint_repair",
+        "delivery_prepare_constraint_verification",
+    ]
+    assert [record["round_index"] for record in audit_records] == [1, 1, 1, 2]
+    assert audit_records[1]["parsed"]["constraint_gaps"] == [gap]
+
+
+def test_author_delivery_plan_adds_missing_exact_source_values_and_reverifies(tmp_path: Path) -> None:
+    first_literal = '- <resource.title> — "Resource"'
+    second_literal = '- <resource.submit> — "Save"'
+    authored = json.loads(_authoring_output())
+    authored["units"][0]["task_markdown"] = _unit_markdown("Foundation").replace(
+        "Prepare the delivery unit.",
+        "Prepare the delivery unit using the provided localization keys.",
+    )
+    gap = {
+        "unit_id": "foundation",
+        "source_literals": [first_literal, second_literal],
+    }
+    llm = CapturingLLM(json.dumps(authored))
+    llm.outputs = [
+        json.dumps(authored),
+        json.dumps(
+            {
+                "constraints_complete": True,
+                "constraints": [],
+                "constraint_gaps": [],
+                "unit_context_complete": False,
+                "unit_context_gaps": [gap],
+            }
+        ),
+        json.dumps(
+            {
+                "constraints_complete": True,
+                "constraints": [],
+                "constraint_gaps": [],
+                "unit_context_complete": True,
+                "unit_context_gaps": [],
+            }
+        ),
+    ]
+    audit_records: list[dict] = []
+
+    agent = DeliveryPreparationAgent(llm=llm)
+    draft = agent.author_delivery_plan(
+        task_description=(f"# Resource\n\n## Context\n\nLocalization keys:\n\n{first_literal}\n{second_literal}\n"),
+        task_path=".sikula/tasks/resource.md",
+        plan_id="team-invites",
+        project_root=tmp_path,
+        output_dir=".sikula/delivery/team-invites",
+        audit_recorder=audit_records.append,
+    )
+
+    assert len(llm.prompts) == 3
+    assert first_literal in draft.units[0].task_markdown
+    assert second_literal in draft.units[0].task_markdown
+    assert "## Authoritative source values" in draft.units[0].task_markdown
+    assert draft.units[0].asset_paths == [".sikula/task-assets/invite-reference.png"]
+    assert draft.units[0].scope_paths == ["agents"]
+    assert draft.constraint_verification is not None
+    assert draft.constraint_verification.unit_context_complete is True
+    assert [record["phase"] for record in audit_records] == [
+        "delivery_prepare_authoring",
+        "delivery_prepare_constraint_verification",
+        "delivery_prepare_constraint_verification",
+    ]
+    assert audit_records[1]["parsed"]["unit_context_gaps"] == [{"unit_id": "foundation", "source_literal_count": 2}]
+
+
+def test_author_delivery_plan_repairs_only_identified_missing_assignment(tmp_path: Path) -> None:
+    authored = json.loads(_authoring_output())
+    authored["units"].append(
+        {
+            "id": "consumer",
+            "title": "Prepare consumer",
+            "depends_on": ["foundation"],
+            "task_markdown": _unit_markdown("Consumer"),
+            "scope_paths": ["core"],
+            "asset_paths": [],
+            "estimated_size": "small",
+            "risk_tags": ["api_surface"],
+            "budget": {"max_planner_steps": 1},
+        }
+    )
+    existing = {
+        "id": "protocol-authority",
+        "kind": "authoritative_read_only_dependency",
+        "summary": "Protocol behavior remains defined by its authoritative contract.",
+        "unit_ids": ["foundation"],
+        "disposition": "preserved",
+    }
+    authored["constraints"] = [existing]
+    gap = {
+        "reason": "incompletely_assigned",
+        "constraint_id": "protocol-authority",
+        "kind": existing["kind"],
+        "summary": existing["summary"],
+        "affected_unit_ids": ["consumer"],
+    }
+    repaired = {**existing, "unit_ids": ["foundation", "consumer"]}
+    llm = CapturingLLM(json.dumps(authored))
+    llm.outputs = [
+        json.dumps(authored),
+        json.dumps(
+            {
+                "constraints_complete": False,
+                "constraints": [existing],
+                "constraint_gaps": [gap],
+                "unit_context_complete": True,
+                "unit_context_gaps": [],
+            }
+        ),
+        json.dumps({"constraints": [repaired]}),
+        json.dumps(
+            {
+                "constraints_complete": True,
+                "constraints": [repaired],
+                "constraint_gaps": [],
+                "unit_context_complete": True,
+                "unit_context_gaps": [],
+            }
+        ),
+    ]
+
+    draft = _author_delivery_plan(DeliveryPreparationAgent(llm=llm), tmp_path=tmp_path)
+
+    assert [constraint.to_plan_dict() for constraint in draft.constraints] == [repaired]
+    assert [unit.id for unit in draft.units] == ["foundation", "consumer"]
+    assert draft.units[0].asset_paths == [".sikula/task-assets/invite-reference.png"]
+    assert draft.units[1].asset_paths == []
+
+
+def test_author_delivery_plan_does_not_repair_incomplete_conflicting_verification(tmp_path: Path) -> None:
+    authored = json.loads(_authoring_output())
+    existing = {
+        "id": "protocol-authority",
+        "kind": "repository_ownership",
+        "summary": "Protocol changes remain externally owned.",
+        "unit_ids": ["foundation"],
+        "disposition": "preserved",
+    }
+    authored["constraints"] = [existing]
+    conflicting = {**existing, "disposition": "conflict"}
+    gap = {
+        "reason": "omitted",
+        "kind": "security_boundary",
+        "summary": "Credential handling remains inside the existing trust boundary.",
+        "affected_unit_ids": ["foundation"],
+    }
+    llm = CapturingLLM(json.dumps(authored))
+    llm.outputs = [
+        json.dumps(authored),
+        json.dumps(
+            {
+                "constraints_complete": False,
+                "constraints": [conflicting],
+                "constraint_gaps": [gap],
+                "unit_context_complete": True,
+                "unit_context_gaps": [],
+            }
+        ),
+    ]
+
+    draft = _author_delivery_plan(DeliveryPreparationAgent(llm=llm), tmp_path=tmp_path)
+
+    assert len(llm.prompts) == 2
+    assert [constraint.to_plan_dict() for constraint in draft.constraints] == [existing]
+    assert draft.constraint_verification is not None
+    assert draft.constraint_verification.constraints[0].disposition == "conflict"
+
+
+def test_author_delivery_plan_rejects_repair_that_rewrites_existing_constraint(tmp_path: Path) -> None:
+    authored = json.loads(_authoring_output())
+    existing = {
+        "id": "protocol-authority",
+        "kind": "authoritative_read_only_dependency",
+        "summary": "Protocol behavior remains defined by its authoritative contract.",
+        "unit_ids": ["foundation"],
+        "disposition": "preserved",
+    }
+    authored["constraints"] = [existing]
+    gap = {
+        "reason": "omitted",
+        "kind": "security_boundary",
+        "summary": "Credential handling remains inside the existing trust boundary.",
+        "affected_unit_ids": ["foundation"],
+    }
+    rewritten = {**existing, "summary": "A different protocol ownership rule."}
+    addition = {
+        "id": "credential-trust-boundary",
+        "kind": "security_boundary",
+        "summary": gap["summary"],
+        "unit_ids": ["foundation"],
+        "disposition": "preserved",
+    }
+    llm = CapturingLLM(json.dumps(authored))
+    llm.outputs = [
+        json.dumps(authored),
+        json.dumps(
+            {
+                "constraints_complete": False,
+                "constraints": [existing],
+                "constraint_gaps": [gap],
+                "unit_context_complete": True,
+                "unit_context_gaps": [],
+            }
+        ),
+        json.dumps({"constraints": [rewritten, addition]}),
+    ]
+    audit_records: list[dict] = []
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        _author_delivery_plan(
+            DeliveryPreparationAgent(llm=llm),
+            tmp_path=tmp_path,
+            audit_records=audit_records,
+        )
+
+    assert exc_info.value.code == "delivery_constraint_repair.existing_constraint_changed"
+    assert len(llm.prompts) == 3
+    assert audit_records[-1]["phase"] == "delivery_prepare_constraint_repair"
+    assert audit_records[-1]["parsed"]["status"] == "failed"
+
+
+def test_author_delivery_plan_rejects_repair_that_rephrases_omitted_gap(tmp_path: Path) -> None:
+    gap = {
+        "reason": "omitted",
+        "kind": "repository_ownership",
+        "summary": "Protocol file changes remain owned by the protocol repository.",
+        "affected_unit_ids": ["foundation"],
+    }
+    llm = CapturingLLM(_authoring_output())
+    llm.outputs = [
+        _authoring_output(),
+        json.dumps(
+            {
+                "constraints_complete": False,
+                "constraints": [],
+                "constraint_gaps": [gap],
+                "unit_context_complete": True,
+                "unit_context_gaps": [],
+            }
+        ),
+        json.dumps(
+            {
+                "constraints": [
+                    {
+                        "id": "protocol-repository-ownership",
+                        "kind": gap["kind"],
+                        "summary": "A different ownership rule.",
+                        "unit_ids": gap["affected_unit_ids"],
+                        "disposition": "preserved",
+                    }
+                ]
+            }
+        ),
+    ]
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        _author_delivery_plan(DeliveryPreparationAgent(llm=llm), tmp_path=tmp_path)
+
+    assert exc_info.value.code == "delivery_constraint_repair.omitted_constraint_mismatch"
+
+
+def test_author_delivery_plan_rejects_source_excerpt_before_constraint_verification(tmp_path: Path) -> None:
+    source_rule = "Only the protocol repository may change protocol files."
+    authored = json.loads(_authoring_output())
+    authored["constraints"] = [
+        {
+            "id": "protocol-authority",
+            "kind": "repository_ownership",
+            "summary": source_rule,
+            "unit_ids": ["foundation"],
+            "disposition": "preserved",
+        }
+    ]
+    llm = CapturingLLM(json.dumps(authored))
+    agent = DeliveryPreparationAgent(llm=llm)
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        agent.author_delivery_plan(
+            task_description=f"# Task\n\n- {source_rule}\n",
+            task_path=".sikula/tasks/team-invites.md",
+            plan_id="team-invites",
+            project_root=tmp_path,
+            output_dir=".sikula/delivery/team-invites",
+        )
+
+    assert exc_info.value.code == "delivery_authoring.constraint_summary_source_excerpt"
+    assert len(llm.prompts) == 1
+
+
+def test_author_delivery_plan_fails_safely_when_constraint_verifier_provider_fails(tmp_path: Path) -> None:
+    llm = CapturingLLM(_authoring_output(), verification_output=RuntimeError("PRIVATE provider failure"))
+    agent = DeliveryPreparationAgent(llm=llm)
+
+    with pytest.raises(DeliveryPreparationAgentError) as exc_info:
+        _author_delivery_plan(agent, tmp_path=tmp_path)
+
+    assert str(exc_info.value) == "Delivery constraint verification assistant failed."
+    assert exc_info.value.__cause__ is None
+    assert len(llm.prompts) == 2
+
+
+def test_author_delivery_plan_audits_malformed_constraint_verification(tmp_path: Path) -> None:
+    llm = CapturingLLM(
+        _authoring_output(),
+        verification_output=json.dumps({"constraints_complete": "yes", "constraints": []}),
+    )
+    agent = DeliveryPreparationAgent(llm=llm)
+    audit_records: list[dict] = []
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        _author_delivery_plan(agent, tmp_path=tmp_path, audit_records=audit_records)
+
+    assert exc_info.value.code == "delivery_constraint_verification.complete_invalid"
+    assert audit_records[-1]["phase"] == "delivery_prepare_constraint_verification"
+    assert audit_records[-1]["parsed"]["status"] == "failed"
+    assert audit_records[-1]["parsed"]["error_code"] == exc_info.value.code
+
+
+def test_author_delivery_plan_rejects_constraint_verifier_identity_mismatch(tmp_path: Path) -> None:
+    authored = json.loads(_authoring_output())
+    authored["constraints"] = [
+        {
+            "id": "protocol-authority",
+            "kind": "authoritative_read_only_dependency",
+            "summary": "Protocol changes remain owned by the protocol repository.",
+            "unit_ids": ["foundation"],
+            "disposition": "preserved",
+        }
+    ]
+    llm = CapturingLLM(
+        json.dumps(authored),
+        verification_output=json.dumps(
+            {
+                "constraints_complete": True,
+                "constraints": [],
+                "unit_context_complete": True,
+                "unit_context_gaps": [],
+            }
+        ),
+    )
+    agent = DeliveryPreparationAgent(llm=llm)
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        _author_delivery_plan(agent, tmp_path=tmp_path)
+
+    assert exc_info.value.code == "delivery_constraint_verification.constraints_mismatch"
+
+
+def test_constraint_verification_unit_payload_omits_absent_optional_fields() -> None:
+    payload = DeliveryPreparationAgent._verification_unit_payload(
+        DeliveryAuthoringUnitDraft("unit", "Unit", [], _unit_markdown("Unit"))
+    )
+
+    assert "budget" not in payload
+    assert "component" not in payload
+    assert payload["asset_paths"] == []
 
 
 def test_author_delivery_amendment_uses_plain_generation_and_records_audit(tmp_path: Path) -> None:
@@ -364,6 +826,55 @@ def test_author_delivery_amendment_uses_plain_generation_and_records_audit(tmp_p
     assert audit_records[0]["parsed"]["replacement_ids"] == ["invite-storage", "invite-cli"]
 
 
+def test_author_delivery_amendment_verifies_applicable_constraints_without_failure_evidence(
+    tmp_path: Path,
+) -> None:
+    verification_output = json.dumps(
+        {
+            "constraints_complete": True,
+            "constraints": [
+                {
+                    "id": "protocol-authority",
+                    "kind": "authoritative_read_only_dependency",
+                    "summary": "Protocol changes remain owned by the protocol repository.",
+                    "unit_ids": ["invite-storage", "invite-cli"],
+                    "disposition": "preserved",
+                }
+            ],
+        }
+    )
+    llm = CapturingLLM(_amendment_output(), verification_output=verification_output)
+    agent = DeliveryPreparationAgent(llm=llm)
+    constraints = [
+        {
+            "id": "protocol-authority",
+            "kind": "authoritative_read_only_dependency",
+            "summary": "Protocol changes remain owned by the protocol repository.",
+            "unit_ids": ["oversized"],
+            "disposition": "preserved",
+        }
+    ]
+
+    draft = agent.author_delivery_amendment(
+        plan_id="team-invites",
+        target_unit_id="oversized",
+        target_task_description="Split the selected constrained unit.",
+        target_unit={"id": "oversized", "depends_on": []},
+        downstream_units=[],
+        project_root=tmp_path,
+        applicable_constraints=constraints,
+    )
+
+    assert draft.constraint_verification is not None
+    assert draft.constraint_verification.constraints_complete is True
+    assert [constraint.unit_ids for constraint in draft.constraint_verification.constraints] == [
+        ["invite-storage", "invite-cli"]
+    ]
+    assert len(llm.prompts) == 2
+    assert json.dumps(constraints, indent=2, sort_keys=True) in llm.prompts[0]
+    assert "amendment_target_to_replacements" in llm.prompts[1]
+
+
 def test_author_delivery_amendment_accepts_fenced_output_after_prose(tmp_path: Path) -> None:
     raw_json = _amendment_output()
     llm = CapturingLLM(f"I split the target into two focused units.\n\n```json\n{raw_json}\n```")
@@ -375,6 +886,30 @@ def test_author_delivery_amendment_accepts_fenced_output_after_prose(tmp_path: P
     assert [unit.id for unit in draft.replacement_units] == ["invite-storage", "invite-cli"]
     assert audit_records[0]["raw_output"] == llm.output
     assert audit_records[0]["parsed"]["status"] == "parsed"
+
+
+def test_author_delivery_amendment_parses_external_follow_up_disposition(tmp_path: Path) -> None:
+    output = json.dumps(
+        {
+            "plan_id": "team-invites",
+            "target_unit_id": "oversized",
+            "disposition": "external_dependency_follow_up_required",
+            "summary": "The protocol repository owns the required change.",
+            "amend_reason": None,
+            "budget_exceeded": None,
+            "warnings": [],
+            "replacement_units": [],
+        }
+    )
+    agent = DeliveryPreparationAgent(llm=CapturingLLM(output))
+    audit_records: list[dict] = []
+
+    draft = _author_delivery_amendment(agent, tmp_path=tmp_path, audit_records=audit_records)
+
+    assert draft.disposition == "external_dependency_follow_up_required"
+    assert draft.replacement_units == []
+    assert audit_records[0]["parsed"]["disposition"] == "external_dependency_follow_up_required"
+    assert audit_records[0]["parsed"]["replacement_count"] == 0
 
 
 def test_author_delivery_amendment_includes_verified_recovery_metadata(tmp_path: Path) -> None:
@@ -397,6 +932,40 @@ def test_author_delivery_amendment_includes_verified_recovery_metadata(tmp_path:
     assert '"amend_reason": "unit_budget_exceeded"' in prompt
     assert '"actual": 5' in prompt
     assert '"limit": 2' in prompt
+
+
+def test_author_delivery_amendment_includes_only_structured_failure_evidence(tmp_path: Path) -> None:
+    llm = CapturingLLM(_amendment_output())
+    agent = DeliveryPreparationAgent(llm=llm)
+    evidence = {
+        "schema_version": 1,
+        "plan_id": "team-invites",
+        "unit_id": "oversized",
+        "child_task_id": "child-1",
+        "failure_code": "unit_scope_violation",
+        "recommended_action": "delivery_amend_prepare",
+        "write_scope": {"declared_paths": ["agents"], "effective_paths": ["agents"]},
+        "changed_files": {"count": 1, "paths": ["agents/example.py"], "omitted_paths_count": 0},
+    }
+
+    agent.author_delivery_amendment(
+        plan_id="team-invites",
+        target_unit_id="oversized",
+        target_task_description="Split the selected unit.",
+        target_unit={"id": "oversized", "depends_on": []},
+        downstream_units=[],
+        project_root=tmp_path,
+        failure_evidence=evidence,
+    )
+
+    prompt = llm.prompts[0]
+    rendered = json.dumps(evidence, indent=2, sort_keys=True)
+    assert (
+        f"Correlated failed-child boundary evidence supplied by deterministic Sikula code:\n```json\n{rendered}"
+        in prompt
+    )
+    assert "use its inherited constraints, write scope" in prompt
+    assert "external_dependency_follow_up_required" in prompt
 
 
 def test_author_delivery_amendment_renders_component_allowlist_with_exact_ids(tmp_path: Path) -> None:
@@ -557,11 +1126,12 @@ def test_author_delivery_plan_redacts_outside_project_task_path_in_prompt(tmp_pa
     llm = CapturingLLM(_authoring_output())
     agent = DeliveryPreparationAgent(llm=llm)
 
-    _author_delivery_plan(agent, tmp_path=tmp_path, task_path=outside_task)
+    draft = _author_delivery_plan(agent, tmp_path=tmp_path, task_path=outside_task)
 
     prompt = llm.prompts[0]
     assert "Source task file: <outside-project>" in prompt
     assert str(outside_task) not in prompt
+    assert draft.source_task is None
 
 
 def test_author_delivery_plan_records_parse_failure_and_raises_safe_error(tmp_path: Path) -> None:

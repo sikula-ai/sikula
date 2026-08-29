@@ -7,8 +7,73 @@ import json
 import re
 from typing import Any, Callable
 
+from core.delivery_public_metadata import sanitize_delivery_public_metadata
+
 
 _JSON_OBJECT_KEY_RE = re.compile(r'(?P<key>"(?:\\.|[^"\\])*")[ \t\r\n]*:')
+_DELIVERY_DISPOSITION_ADVERTISEMENT_RE = re.compile(
+    r'(?<![A-Za-z0-9_])(?:"sikula_disposition_schema_version"|'
+    r"'sikula_disposition_schema_version'|sikula_disposition_schema_version)[ \t\r\n]*:"
+)
+
+DELIVERY_DISPOSITION_SCHEMA_VERSION = 1
+DELIVERY_DISPOSITION_APPROVED = "approved"
+DELIVERY_DISPOSITION_FIX_IN_SCOPE = "fix_in_scope"
+DELIVERY_DISPOSITION_REQUIRES_SCOPE_AMENDMENT = "requires_scope_amendment"
+DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP = "external_dependency_gap"
+DELIVERY_REVIEW_ACTION_DISPOSITIONS = frozenset(
+    {
+        DELIVERY_DISPOSITION_FIX_IN_SCOPE,
+        DELIVERY_DISPOSITION_REQUIRES_SCOPE_AMENDMENT,
+        DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP,
+    }
+)
+DELIVERY_REVIEW_DISPOSITIONS = DELIVERY_REVIEW_ACTION_DISPOSITIONS | {DELIVERY_DISPOSITION_APPROVED}
+DELIVERY_IMPLEMENTATION_DISPOSITIONS = frozenset({DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP})
+MAX_DELIVERY_DISPOSITION_SUMMARY_CHARS = 500
+
+_DELIVERY_DISPOSITION_KEYS = frozenset(
+    {
+        "sikula_disposition_schema_version",
+        "disposition",
+        "summary",
+    }
+)
+_DELIVERY_DISPOSITION_ACTIONS = {
+    DELIVERY_DISPOSITION_APPROVED: "continue",
+    DELIVERY_DISPOSITION_FIX_IN_SCOPE: "bounded_fix",
+    DELIVERY_DISPOSITION_REQUIRES_SCOPE_AMENDMENT: "delivery_amend_prepare",
+    DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP: "external_dependency_follow_up",
+}
+
+
+def delivery_disposition_recommended_action(disposition: object) -> str | None:
+    """Return the stable recovery action for a recognized disposition."""
+    return _DELIVERY_DISPOSITION_ACTIONS.get(disposition) if isinstance(disposition, str) else None
+
+
+class DeliveryDispositionParseError(ValueError):
+    """Raised when an advertised delivery disposition is not safe to consume."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class DeliveryDisposition:
+    schema_version: int
+    disposition: str
+    summary: str
+    recommended_action: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "disposition": self.disposition,
+            "summary": self.summary,
+            "recommended_action": self.recommended_action,
+        }
 
 
 @dataclass
@@ -96,6 +161,112 @@ def load_schema_json_object(
     if len(matches) > 1:
         raise ValueError(f"{output_name} contains multiple JSON objects")
     return matches[0]
+
+
+def parse_delivery_disposition(
+    output: str,
+    *,
+    allowed_dispositions: frozenset[str],
+) -> DeliveryDisposition | None:
+    """Parse one flat, explicitly advertised delivery disposition.
+
+    Free-form output without the schema marker is not a disposition. Once the marker
+    appears, malformed, nested, duplicated, conflicting, or unsupported data is an
+    error rather than an invitation to infer intent from prose.
+    """
+
+    if not isinstance(output, str):
+        return None
+    marker_count = len(_DELIVERY_DISPOSITION_ADVERTISEMENT_RE.findall(output))
+    if marker_count == 0:
+        return None
+    if marker_count != 1:
+        raise DeliveryDispositionParseError(
+            "delivery_disposition.marker_ambiguous",
+            "Delivery disposition must advertise exactly one schema marker.",
+        )
+    if not allowed_dispositions or not allowed_dispositions.issubset(DELIVERY_REVIEW_DISPOSITIONS):
+        raise ValueError("allowed delivery dispositions must be a non-empty supported set")
+
+    json_text = next((line.strip() for line in reversed(output.splitlines()) if line.strip()), "")
+    if not _DELIVERY_DISPOSITION_ADVERTISEMENT_RE.search(json_text):
+        raise DeliveryDispositionParseError(
+            "delivery_disposition.position_invalid",
+            "Delivery disposition JSON must be the final non-empty output line.",
+        )
+
+    try:
+        payload = json.loads(
+            json_text,
+            object_pairs_hook=_object_pairs_without_duplicates,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError) as exc:
+        raise DeliveryDispositionParseError(
+            "delivery_disposition.json_invalid",
+            "Delivery disposition must be one unambiguous flat JSON object with no surrounding text.",
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise DeliveryDispositionParseError(
+            "delivery_disposition.json_invalid",
+            "Delivery disposition must be one unambiguous flat JSON object with no surrounding text.",
+        )
+
+    if frozenset(payload) != _DELIVERY_DISPOSITION_KEYS:
+        raise DeliveryDispositionParseError(
+            "delivery_disposition.keys_invalid",
+            "Delivery disposition contains missing or unsupported fields.",
+        )
+
+    schema_version = payload.get("sikula_disposition_schema_version")
+    if type(schema_version) is not int or schema_version != DELIVERY_DISPOSITION_SCHEMA_VERSION:
+        raise DeliveryDispositionParseError(
+            "delivery_disposition.schema_unsupported",
+            "Delivery disposition uses an unsupported schema version.",
+        )
+
+    disposition = payload.get("disposition")
+    if not isinstance(disposition, str) or disposition not in allowed_dispositions:
+        raise DeliveryDispositionParseError(
+            "delivery_disposition.value_invalid",
+            "Delivery disposition is not supported for this agent output.",
+        )
+    recommended_action = delivery_disposition_recommended_action(disposition)
+    if recommended_action is None:  # Guarded by the supported allowlist check above.
+        raise AssertionError("supported delivery disposition has no recovery action")
+
+    summary = payload.get("summary")
+    if (
+        not isinstance(summary, str)
+        or not summary.strip()
+        or len(summary.strip()) > MAX_DELIVERY_DISPOSITION_SUMMARY_CHARS
+    ):
+        raise DeliveryDispositionParseError(
+            "delivery_disposition.summary_invalid",
+            "Delivery disposition summary must be a non-empty bounded string.",
+        )
+    sanitized_summary = sanitize_delivery_public_metadata(summary.strip()) or "<redacted>"
+
+    return DeliveryDisposition(
+        schema_version=DELIVERY_DISPOSITION_SCHEMA_VERSION,
+        disposition=disposition,
+        summary=sanitized_summary,
+        recommended_action=recommended_action,
+    )
+
+
+def _object_pairs_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant: {value}")
 
 
 def _json_object_key_markers(candidate: str) -> frozenset[str]:

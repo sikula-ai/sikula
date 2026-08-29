@@ -176,15 +176,38 @@ writes:
 `delivery prepare` is an authoring step only. It writes tracked plan and unit
 artifacts but does not start implementation, create task state, mutate delivery
 progress, or update branches. Generated plan and unit metadata must be bounded,
-single-line, and free of absolute local paths. Slash-prefixed API routes belong
-in task or contract Markdown rather than these public metadata fields; full
-`https://` URLs remain valid metadata.
+single-line, and free of absolute local paths. Explicit HTTP routes such as
+`GET /api/v1/resource` and full `http://` or `https://` URLs remain valid
+metadata.
 Delivery preparation preserves canonical source-task asset declarations in the
 relevant unit tasks and blocks before writing when their assignment is
 incomplete or invalid. Delivery amendments preserve the same boundary when
 splitting an existing unit. See [Writing Sikula Tasks](docs/writing-tasks.md#task-assets)
 and [Delivery Plans](docs/delivery-plans.md) for the asset syntax and assignment
 rules.
+
+Freshly authored plans are bound to the source task path and content hash. The
+authoring draft must explicitly classify inherited hard constraints such as
+repository ownership, authoritative read-only dependencies, stop-and-follow-up
+rules, security boundaries, and prohibited fallbacks. Ambiguous or conflicting
+constraints stop preparation for operator review. A separate read-only
+verification pass compares the source task, declared constraints, and generated
+units before anything is published, so an authored empty list cannot silently
+drop a governing rule. When that pass identifies a concrete omitted or incompletely
+assigned constraint, Sikula makes one bounded constraints-only repair and verifies
+the result again without changing generated units or their asset assignments.
+Persistent gaps stop preparation with their bounded kind, summary, and affected
+unit IDs rather than being reported as an artifact-write failure. Published plans
+contain only bounded `preserved`
+constraint metadata. Existing plans without these additive fields remain
+compatible.
+
+Generated unit tasks are also checked for source-defined values that must be used
+exactly, such as localization keys, enum values, API field names, and fixed copy.
+When authoring leaves only a dangling reference to values in the parent task,
+Sikula copies the verifier-identified source lines into the affected unit contract
+and verifies the result again. Scope, dependencies, assets, and budgets are not
+changed by this repair.
 
 Prepared units use `budget.max_planner_steps: 1` by default. A limit of `2` is
 allowed only for tightly coupled work; limits of `3` or more are rejected.
@@ -195,6 +218,18 @@ still requires more steps, the oversized result is preserved and the unit must
 be split through a delivery amendment; `--reset-failed` cannot bypass this stop.
 With `--prepare-budget-split`, `run-next` can prepare, but not apply, a verified
 split proposal.
+
+Delivery units are bounded by their declared production scope. If a unit
+requires changes outside that scope or in an externally owned dependency,
+Sikula stops the unit and preserves its work for inspection instead of
+continuing or retrying unchanged. This post-agent check covers actual filesystem
+changes, including persistent gitignored configuration while pruning platform-owned
+disposable dependency and build output, rather than trusting provider-reported paths.
+Use `delivery amend prepare` for a scope correction;
+resolve external dependency gaps through the owning repository or workflow.
+`--reset-failed` remains available only for ordinary retryable failures. See
+[Delivery Plans](docs/delivery-plans.md) for detailed scope rules, terminal
+failure codes, recovery actions, and amendment behavior.
 
 Successful new units produce fingerprinted handoffs for dependent units.
 `run-next` assembles completed result commits into `final_branch` in dependency
@@ -208,8 +243,8 @@ finalizes a completed plan. By default it is bounded to the active units that
 exist when the command starts; `--max-units` and the between-unit soft
 `--max-elapsed-minutes` limit can stop earlier without failing the plan.
 Each explicit `delivery run --reset-failed` invocation retries the current
-failed child once and continues only after that retry succeeds; a later failure
-stops again and requires another explicit invocation.
+ordinary retryable failed child once and continues only after that retry
+succeeds; a later failure stops again and requires another explicit invocation.
 `run-next` remains available for explicit one-unit execution and recovery.
 Task completion output and `delivery status` report provider invocation counts,
 failed attempts, measured provider time, content-free input/output sizes, and
@@ -264,7 +299,7 @@ delivery safety checks pass.
 - **Config, guidelines, or rules missing in the worktree** - commit `.sikula/config.yaml`, any generated `.sikula/guidelines.md`, and any `extra_rules` files used by enabled phases before the first isolated run. These prompt-context paths must be files in the worktree start ref. A delivery child assembled from another commit also requires that commit to contain the same config loaded for the run. For `sikula review`, make sure the reviewed branch contains its configured guidelines/rules files.
 - **Provider is not authenticated** - run `codex login` or see [Providers](docs/providers.md) for Claude, Gemini, OpenCode, and Antigravity.
 - **Task is too vague** - run `sikula contract check .sikula/tasks/my-task.md` and see [Writing Sikula Tasks](docs/writing-tasks.md).
-- **Run failed after creating a worktree** - inspect `sikula show <task-id>` and `.sikula/worktrees/<task-id>/`; retry with `sikula run --task-id <task-id> --reset-failed`.
+- **Run failed after creating a worktree** - inspect `sikula show <task-id>` and `.sikula/worktrees/<task-id>/`; use `sikula run --task-id <task-id> --reset-failed` only when the summary identifies an ordinary retryable failure. Terminal delivery boundary stops print their required amendment, external-follow-up, or child-replacement action instead.
 
 ## What You Get
 
