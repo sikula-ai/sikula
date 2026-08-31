@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -1180,6 +1181,7 @@ def test_scope_violation_recovery_ignores_lower_priority_external_disposition(tm
     assert evidence.requires_external_follow_up is False
 
 
+@pytest.mark.delivery_amendment_git
 def test_pending_middle_split_preserves_progress_and_rewires_to_all_leaves(tmp_path: Path) -> None:
     plan_path, progress_path, proposal_root = _setup(tmp_path)
     subprocess.run(["git", "config", "core.autocrlf", "true"], cwd=tmp_path, check=True)
@@ -1621,7 +1623,20 @@ def test_prepare_stores_componentless_replacements_without_component_metadata(tm
     assert all("component" not in unit for unit in payload["replacement_units"])
 
 
-def test_proposal_without_downstream_rewiring_round_trips_and_applies(tmp_path: Path) -> None:
+@pytest.mark.delivery_amendment_git
+def test_proposal_without_downstream_rewiring_round_trips_and_applies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_run = subprocess.run
+    git_commands: list[tuple[str, ...]] = []
+
+    def observe_git(command: Any, *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+        if isinstance(command, (list, tuple)) and command and command[0] == "git":
+            git_commands.append(tuple(str(part) for part in command))
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", observe_git)
     plan_path, _, proposal_root = _setup(tmp_path)
     draft = DeliveryAmendmentAuthoringDraft(
         plan_id="amend-demo",
@@ -1642,6 +1657,8 @@ def test_proposal_without_downstream_rewiring_round_trips_and_applies(tmp_path: 
     assert proposal.rewired_unit_ids == []
     assert result.applied is True
     assert result.rewired_unit_ids == []
+    assert len(git_commands) <= 180
+    assert sum(command[1] == "ls-tree" for command in git_commands) <= 12
 
 
 def test_proposal_with_multiple_budget_fields_round_trips_and_applies(tmp_path: Path) -> None:
@@ -1824,6 +1841,7 @@ def test_prepare_and_apply_use_assembly_without_changing_operator_checkout(
         assert task_in_branch == unit.task_markdown.encode("utf-8")
 
 
+@pytest.mark.delivery_amendment_git
 def test_repeated_apply_repairs_missing_progress_and_terminal_event(tmp_path: Path) -> None:
     plan_path, progress_path, proposal_root = _setup(tmp_path)
     proposal, _ = create_delivery_amendment_proposal(
@@ -2068,6 +2086,7 @@ def test_repeated_apply_rejects_replacement_progress_before_recovery_assembly(
     assert "plan.amended" not in [event["event_type"] for event in events]
 
 
+@pytest.mark.delivery_amendment_git
 def test_repeated_apply_compares_canonical_source_plan_blob(tmp_path: Path) -> None:
     plan_path, progress_path, proposal_root = _setup(tmp_path)
     (tmp_path / ".gitattributes").write_text("*.yaml text eol=crlf\n", encoding="utf-8")
@@ -2139,6 +2158,7 @@ def test_repeated_apply_compares_canonical_source_plan_blob(tmp_path: Path) -> N
     assert result.applied is True
 
 
+@pytest.mark.delivery_amendment_git
 @pytest.mark.parametrize(
     ("mode", "error_code"),
     [
@@ -3057,6 +3077,7 @@ def test_amend_prepare_rejects_symlink_contract_before_authoring(
     assert not list(proposal_root.rglob("*.json"))
 
 
+@pytest.mark.delivery_amendment_git
 @pytest.mark.parametrize(
     "attribute_pattern",
     [
@@ -5813,6 +5834,7 @@ def test_apply_does_not_clobber_replacement_task_created_at_publish_boundary(
     assert not (tmp_path / proposal.replacement_units[2].task_path).exists()
 
 
+@pytest.mark.delivery_amendment_git
 def test_apply_rejects_replacement_parent_swapped_to_outside_symlink(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6170,6 +6192,7 @@ def test_recovery_restores_branch_progress_and_events_when_event_reconciliation_
     )
 
 
+@pytest.mark.delivery_amendment_git
 def test_apply_rolls_back_when_final_branch_changes_after_artifact_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

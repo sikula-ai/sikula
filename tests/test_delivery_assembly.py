@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ from core.delivery_assembly import (
     DeliveryAssemblyUnit,
     assemble_delivery_artifacts,
     assemble_delivery_commits,
+    delivery_artifact_compatibility_issue,
     delivery_artifact_content_id,
     find_delivery_artifact_commit,
     ordered_delivery_assembly_units,
@@ -140,6 +142,25 @@ def test_preview_delivery_assembly_validates_without_creating_branch(tmp_path: P
     assert _status(tmp_path) == ""
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows paths cannot contain newlines")
+@pytest.mark.delivery_amendment_git
+def test_preview_delivery_artifacts_supports_newline_in_repository_path(tmp_path: Path) -> None:
+    root = tmp_path / "repository\nname"
+    root.mkdir()
+    _git_init(root)
+    parent = _commit(root, "base.txt", "base\n")
+
+    result = preview_delivery_artifacts(
+        root,
+        branch="sikula/delivery/demo",
+        parent_commit=parent,
+        artifacts=[DeliveryAssemblyArtifact("plan.yaml", b"plan: amended\n")],
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.delivery_amendment_git
 @pytest.mark.parametrize("object_format", [None, "sha256"])
 def test_assemble_delivery_artifacts_uses_exact_tree_and_rolls_back_new_branch(
     tmp_path: Path,
@@ -201,6 +222,7 @@ def test_assemble_delivery_artifacts_uses_exact_tree_and_rolls_back_new_branch(
     )
 
 
+@pytest.mark.delivery_amendment_git
 def test_assemble_delivery_artifacts_applies_git_content_filters(tmp_path: Path) -> None:
     _git_init(tmp_path)
     (tmp_path / ".gitattributes").write_text("*.md text eol=crlf\n", encoding="utf-8")
@@ -259,6 +281,7 @@ def test_assemble_delivery_artifacts_applies_git_content_filters(tmp_path: Path)
     )
 
 
+@pytest.mark.delivery_amendment_git
 def test_preview_delivery_artifacts_honors_safe_core_autocrlf(tmp_path: Path) -> None:
     _git_init(tmp_path)
     subprocess.run(["git", "config", "core.autocrlf", "true"], cwd=tmp_path, check=True)
@@ -300,6 +323,7 @@ def test_preview_delivery_artifacts_honors_safe_core_autocrlf(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires a POSIX filter driver")
+@pytest.mark.delivery_amendment_git
 def test_preview_delivery_artifacts_rejects_external_filter_without_execution(tmp_path: Path) -> None:
     _git_init(tmp_path)
     marker = tmp_path / "filter-ran"
@@ -353,6 +377,7 @@ def test_preview_delivery_artifacts_rejects_external_filter_without_execution(tm
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires a POSIX Git hook")
+@pytest.mark.delivery_amendment_git
 def test_preview_delivery_artifacts_does_not_execute_repository_hooks(tmp_path: Path) -> None:
     _git_init(tmp_path)
     parent = _commit(tmp_path, "plan.yaml", "plan: original\n")
@@ -378,6 +403,7 @@ def test_preview_delivery_artifacts_does_not_execute_repository_hooks(tmp_path: 
     assert not marker.exists()
 
 
+@pytest.mark.delivery_amendment_git
 def test_assemble_delivery_artifacts_uses_parent_attributes_when_checkout_differs(tmp_path: Path) -> None:
     _git_init(tmp_path)
     operator_commit = _commit(tmp_path, "base.txt", "base\n")
@@ -676,6 +702,7 @@ def test_find_delivery_artifact_commit_rejects_changed_current_tree(tmp_path: Pa
     assert branch_commit == current
 
 
+@pytest.mark.delivery_amendment_git
 def test_assemble_delivery_artifacts_uses_git_root_relative_paths_for_nested_project(tmp_path: Path) -> None:
     _git_init(tmp_path)
     project_root = tmp_path / "apps" / "service"
@@ -974,6 +1001,110 @@ def test_assemble_delivery_artifacts_reports_compare_and_swap_failure(
     assert result.error.code == "delivery.assembly_branch_diverged"
 
 
+@pytest.mark.parametrize("operation", ["assemble", "preview"])
+@pytest.mark.parametrize("failure_phase", ["entry", "exit"])
+def test_delivery_artifact_operations_map_temporary_context_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    failure_phase: str,
+) -> None:
+    _git_init(tmp_path)
+    parent = _commit(tmp_path, "base.txt", "base\n")
+    real_temporary_directory = delivery_assembly_module.tempfile.TemporaryDirectory
+
+    if failure_phase == "entry":
+
+        def failing_temporary_directory(*_args, **_kwargs):
+            raise OSError("temporary context unavailable")
+
+    else:
+
+        @contextmanager
+        def failing_temporary_directory(*args, **kwargs):
+            with real_temporary_directory(*args, **kwargs) as path:
+                yield path
+            raise OSError("temporary context cleanup failed")
+
+    monkeypatch.setattr(delivery_assembly_module.tempfile, "TemporaryDirectory", failing_temporary_directory)
+    artifacts = [DeliveryAssemblyArtifact("plan.yaml", b"plan: amended\n")]
+
+    if operation == "assemble":
+        result = assemble_delivery_artifacts(
+            tmp_path,
+            plan_id="demo",
+            proposal_id="4" * 64,
+            branch="sikula/delivery/demo",
+            parent_commit=parent,
+            artifacts=artifacts,
+            created_at="2026-08-05T10:00:00Z",
+        )
+    else:
+        result = preview_delivery_artifacts(
+            tmp_path,
+            branch="sikula/delivery/demo",
+            parent_commit=parent,
+            artifacts=artifacts,
+        )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "delivery.assembly_artifact_git_failed"
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "refs/heads/sikula/delivery/demo"],
+            cwd=tmp_path,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+
+
+def test_delivery_artifact_read_helpers_map_temporary_context_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _git_init(tmp_path)
+    parent = _commit(tmp_path, "base.txt", "base\n")
+    branch = "sikula/delivery/demo"
+    subprocess.run(["git", "update-ref", f"refs/heads/{branch}", parent], cwd=tmp_path, check=True)
+
+    class FailingContext:
+        def __enter__(self) -> None:
+            raise OSError("temporary context unavailable")
+
+        def __exit__(self, _exc_type: object, _exc_value: object, _traceback: object) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        delivery_assembly_module,
+        "_delivery_artifact_git_context",
+        lambda *_args, **_kwargs: FailingContext(),
+    )
+    artifacts = [DeliveryAssemblyArtifact("plan.yaml", b"plan: amended\n")]
+
+    issue = delivery_artifact_compatibility_issue(tmp_path, parent_commit=parent, artifacts=artifacts)
+    content_id = delivery_artifact_content_id(
+        tmp_path,
+        parent_commit=parent,
+        path="plan.yaml",
+        content=b"plan: amended\n",
+    )
+    found, current = find_delivery_artifact_commit(
+        tmp_path,
+        branch=branch,
+        parent_commit=parent,
+        proposal_id="5" * 64,
+        artifacts=artifacts,
+    )
+
+    assert issue is not None
+    assert issue.code == "delivery.assembly_artifact_git_failed"
+    assert content_id is None
+    assert found is None
+    assert current == parent
+
+
 @pytest.mark.parametrize("failure_point", ["resolve", "preflight", "create", "update"])
 def test_assemble_delivery_artifacts_maps_git_failures(
     tmp_path: Path,
@@ -1024,6 +1155,7 @@ def test_assemble_delivery_artifacts_maps_git_failures(
     assert result.error.code == expected_code
 
 
+@pytest.mark.delivery_amendment_git
 def test_assemble_delivery_artifacts_detects_branch_race_during_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
