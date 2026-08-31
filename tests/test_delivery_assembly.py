@@ -140,6 +140,7 @@ def test_preview_delivery_assembly_validates_without_creating_branch(tmp_path: P
     assert _status(tmp_path) == ""
 
 
+@pytest.mark.delivery_amendment_git
 @pytest.mark.parametrize("object_format", [None, "sha256"])
 def test_assemble_delivery_artifacts_uses_exact_tree_and_rolls_back_new_branch(
     tmp_path: Path,
@@ -201,6 +202,7 @@ def test_assemble_delivery_artifacts_uses_exact_tree_and_rolls_back_new_branch(
     )
 
 
+@pytest.mark.delivery_amendment_git
 def test_assemble_delivery_artifacts_applies_git_content_filters(tmp_path: Path) -> None:
     _git_init(tmp_path)
     (tmp_path / ".gitattributes").write_text("*.md text eol=crlf\n", encoding="utf-8")
@@ -259,6 +261,7 @@ def test_assemble_delivery_artifacts_applies_git_content_filters(tmp_path: Path)
     )
 
 
+@pytest.mark.delivery_amendment_git
 def test_preview_delivery_artifacts_honors_safe_core_autocrlf(tmp_path: Path) -> None:
     _git_init(tmp_path)
     subprocess.run(["git", "config", "core.autocrlf", "true"], cwd=tmp_path, check=True)
@@ -300,6 +303,7 @@ def test_preview_delivery_artifacts_honors_safe_core_autocrlf(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires a POSIX filter driver")
+@pytest.mark.delivery_amendment_git
 def test_preview_delivery_artifacts_rejects_external_filter_without_execution(tmp_path: Path) -> None:
     _git_init(tmp_path)
     marker = tmp_path / "filter-ran"
@@ -353,6 +357,7 @@ def test_preview_delivery_artifacts_rejects_external_filter_without_execution(tm
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires a POSIX Git hook")
+@pytest.mark.delivery_amendment_git
 def test_preview_delivery_artifacts_does_not_execute_repository_hooks(tmp_path: Path) -> None:
     _git_init(tmp_path)
     parent = _commit(tmp_path, "plan.yaml", "plan: original\n")
@@ -378,6 +383,7 @@ def test_preview_delivery_artifacts_does_not_execute_repository_hooks(tmp_path: 
     assert not marker.exists()
 
 
+@pytest.mark.delivery_amendment_git
 def test_assemble_delivery_artifacts_uses_parent_attributes_when_checkout_differs(tmp_path: Path) -> None:
     _git_init(tmp_path)
     operator_commit = _commit(tmp_path, "base.txt", "base\n")
@@ -676,6 +682,7 @@ def test_find_delivery_artifact_commit_rejects_changed_current_tree(tmp_path: Pa
     assert branch_commit == current
 
 
+@pytest.mark.delivery_amendment_git
 def test_assemble_delivery_artifacts_uses_git_root_relative_paths_for_nested_project(tmp_path: Path) -> None:
     _git_init(tmp_path)
     project_root = tmp_path / "apps" / "service"
@@ -1024,6 +1031,7 @@ def test_assemble_delivery_artifacts_maps_git_failures(
     assert result.error.code == expected_code
 
 
+@pytest.mark.delivery_amendment_git
 def test_assemble_delivery_artifacts_detects_branch_race_during_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -63,6 +63,9 @@ python3 -m pytest tests/ --ignore=tests/e2e
 # E2E tests only
 python3 -m pytest tests/e2e/ -v
 
+# Focused real-Git delivery amendment and artifact assembly checks
+python3 -m pytest tests/ -m delivery_amendment_git -q
+
 # Coverage, for larger PRs or pipeline/state changes
 python3 -m pytest tests/ --cov=agents --cov=core --cov=tools --cov=sikula --cov-report=term-missing
 ```

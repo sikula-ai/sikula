@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 import hashlib
 import os
@@ -7,6 +8,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import subprocess
 import tempfile
+from typing import Iterator
 
 from core.delivery_plan import DeliveryPlan, DeliveryPlanIssue
 from core.worktree import branch_checked_out, resolve_git_commit
@@ -58,6 +60,52 @@ class DeliveryArtifactAssemblyResult:
     assembled_commit: str | None
     previous_commit: str | None = None
     error: DeliveryPlanIssue | None = None
+
+
+@dataclass
+class _DeliveryArtifactGitContext:
+    project_root: Path
+    git_root: Path
+    git_dir: Path
+    common_dir: Path
+    object_format: str
+    parent_commit: str
+    filter_root: Path
+    env: dict[str, str]
+    tree_entries_by_commit: dict[str, dict[bytes, tuple[str, str]]]
+    index_loaded: bool = False
+
+    @property
+    def project_prefix(self) -> str:
+        return self.project_root.relative_to(self.git_root).as_posix()
+
+    def tree_entries(self, commit: str) -> dict[bytes, tuple[str, str]]:
+        entries = self.tree_entries_by_commit.get(commit)
+        if entries is not None:
+            return entries
+        entries = _load_tree_entries(self.git_root, commit, env=self.env)
+        if entries is None:
+            raise OSError("Git tree entries are unavailable")
+        self.tree_entries_by_commit[commit] = entries
+        return entries
+
+    def ensure_index_loaded(self) -> bool:
+        if self.index_loaded:
+            return True
+        try:
+            result = subprocess.run(
+                ["git", "read-tree", self.parent_commit],
+                cwd=self.git_root,
+                env=self.env,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            return False
+        if result.returncode != 0:
+            return False
+        self.index_loaded = True
+        return True
 
 
 def recorded_delivery_assembly_conflict_issue(
@@ -261,7 +309,36 @@ def assemble_delivery_artifacts(
             "delivery.assembly_expected_commit_missing",
             "Recorded delivery assembly commit is missing.",
         )
-    git_artifacts, artifact_issue = _artifacts_relative_to_git_root(root, artifacts, parent_commit=parent)
+    with _delivery_artifact_git_context(root, parent) as context:
+        if context is None:
+            return _artifact_failure(
+                branch,
+                parent,
+                "delivery.assembly_artifact_git_failed",
+                "Git could not validate delivery amendment artifacts.",
+            )
+        return _assemble_delivery_artifacts_with_context(
+            context,
+            plan_id=plan_id,
+            proposal_id=proposal_id,
+            branch=branch,
+            artifacts=artifacts,
+            created_at=created_at,
+        )
+
+
+def _assemble_delivery_artifacts_with_context(
+    context: _DeliveryArtifactGitContext,
+    *,
+    plan_id: str,
+    proposal_id: str,
+    branch: str,
+    artifacts: list[DeliveryAssemblyArtifact],
+    created_at: str,
+) -> DeliveryArtifactAssemblyResult:
+    root = context.project_root
+    parent = context.parent_commit
+    git_artifacts, artifact_issue = _artifacts_relative_to_git_root(context, artifacts)
     if artifact_issue is not None:
         return DeliveryArtifactAssemblyResult(
             success=False,
@@ -272,7 +349,7 @@ def assemble_delivery_artifacts(
         )
     try:
         current = _branch_commit(root, branch)
-        issue = _artifact_preflight_issue(root, branch, parent, git_artifacts)
+        issue = _artifact_preflight_issue(context, branch, git_artifacts)
     except OSError:
         return _artifact_failure(
             branch,
@@ -309,10 +386,9 @@ def assemble_delivery_artifacts(
             )
 
     commit, issue = _create_artifact_commit(
-        root,
+        context,
         plan_id=plan_id,
         proposal_id=proposal_id,
-        parent_commit=parent,
         artifacts=git_artifacts,
         created_at=created_at,
     )
@@ -364,12 +440,31 @@ def preview_delivery_artifacts(
             "delivery.assembly_expected_commit_missing",
             "Recorded delivery assembly commit is missing.",
         )
-    git_artifacts, artifact_issue = _artifacts_relative_to_git_root(root, artifacts, parent_commit=parent)
+    with _delivery_artifact_git_context(root, parent) as context:
+        if context is None:
+            return _artifact_failure(
+                branch,
+                parent,
+                "delivery.assembly_artifact_git_failed",
+                "Git could not validate delivery amendment artifacts.",
+            )
+        return _preview_delivery_artifacts_with_context(context, branch=branch, artifacts=artifacts)
+
+
+def _preview_delivery_artifacts_with_context(
+    context: _DeliveryArtifactGitContext,
+    *,
+    branch: str,
+    artifacts: list[DeliveryAssemblyArtifact],
+) -> DeliveryArtifactAssemblyResult:
+    root = context.project_root
+    parent = context.parent_commit
+    git_artifacts, artifact_issue = _artifacts_relative_to_git_root(context, artifacts)
     if artifact_issue is not None:
         return DeliveryArtifactAssemblyResult(False, branch, parent, None, error=artifact_issue)
     try:
         current = _branch_commit(root, branch)
-        issue = _artifact_preflight_issue(root, branch, parent, git_artifacts)
+        issue = _artifact_preflight_issue(context, branch, git_artifacts)
     except OSError:
         return _artifact_failure(
             branch,
@@ -400,10 +495,13 @@ def delivery_artifact_compatibility_issue(
             "delivery.assembly_expected_commit_missing",
             "Recorded delivery assembly commit is missing.",
         )
-    git_artifacts, artifact_issue = _artifacts_relative_to_git_root(root, artifacts, parent_commit=parent)
-    if artifact_issue is not None:
-        return artifact_issue
-    return _artifact_parent_compatibility_issue(root, parent, git_artifacts)
+    with _delivery_artifact_git_context(root, parent) as context:
+        if context is None:
+            return _artifact_git_issue()
+        git_artifacts, artifact_issue = _artifacts_relative_to_git_root(context, artifacts)
+        if artifact_issue is not None:
+            return artifact_issue
+        return _artifact_parent_compatibility_issue(context, git_artifacts)
 
 
 def rollback_delivery_artifacts(
@@ -440,21 +538,18 @@ def delivery_artifact_content_id(
 ) -> str | None:
     """Return the blob id produced by the parent tree's clean-filter rules."""
     root = project_root.resolve()
-    artifacts, issue = _artifacts_relative_to_git_root(
-        root,
-        [DeliveryAssemblyArtifact(path, content)],
-        parent_commit=parent_commit,
-    )
-    if issue is not None:
-        return None
-    with tempfile.TemporaryDirectory(prefix="sikula-delivery-filter-") as temp_dir:
-        context = _parent_filter_context(root, parent_commit, Path(temp_dir))
+    with _delivery_artifact_git_context(root, parent_commit) as context:
         if context is None:
             return None
-        filter_root, env = context
-        if _artifact_external_filter_issue(filter_root, artifacts, env=env) is not None:
+        artifacts, issue = _artifacts_relative_to_git_root(
+            context,
+            [DeliveryAssemblyArtifact(path, content)],
+        )
+        if issue is not None:
             return None
-        return _hash_artifact_content(filter_root, artifacts[0].path, content, env=env)
+        if _artifact_external_filter_issue(context.filter_root, artifacts, env=context.env) is not None:
+            return None
+        return _hash_artifact_content(context.filter_root, artifacts[0].path, content, env=context.env)
 
 
 def find_delivery_artifact_commit(
@@ -474,46 +569,45 @@ def find_delivery_artifact_commit(
         return None, None
     if current is None or not ancestor:
         return None, current
-    git_artifacts, artifact_issue = _artifacts_relative_to_git_root(root, artifacts, parent_commit=parent_commit)
-    if artifact_issue is not None:
-        return None, current
-    try:
-        revisions = subprocess.run(
-            [
-                "git",
-                "log",
-                "--format=%H",
-                "--fixed-strings",
-                f"--grep=sikula: apply delivery amendment {proposal_id}",
-                current,
-                f"^{parent_commit}",
-            ],
-            cwd=root,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return None, current
-    if revisions.returncode != 0:
-        return None, current
-    expected_subject = f"sikula: apply delivery amendment {proposal_id}"
-    for commit in revisions.stdout.splitlines():
-        if not _OBJECT_ID_RE.fullmatch(commit):
-            continue
+    with _delivery_artifact_git_context(root, parent_commit) as context:
+        if context is None:
+            return None, current
+        git_artifacts, artifact_issue = _artifacts_relative_to_git_root(context, artifacts)
+        if artifact_issue is not None:
+            return None, current
         try:
-            message = subprocess.run(
-                ["git", "show", "-s", "--format=%s", commit], cwd=root, capture_output=True, text=True
+            revisions = subprocess.run(
+                [
+                    "git",
+                    "log",
+                    "--format=%H",
+                    "--fixed-strings",
+                    f"--grep=sikula: apply delivery amendment {proposal_id}",
+                    current,
+                    f"^{parent_commit}",
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
             )
         except OSError:
             return None, current
-        if message.returncode != 0 or message.stdout.strip() != expected_subject:
-            continue
-        if _commit_has_artifacts(root, commit, parent_commit, git_artifacts):
-            return (
-                (commit, current)
-                if _tree_has_artifacts(root, current, parent_commit, git_artifacts)
-                else (None, current)
-            )
+        if revisions.returncode != 0:
+            return None, current
+        expected_subject = f"sikula: apply delivery amendment {proposal_id}"
+        for commit in revisions.stdout.splitlines():
+            if not _OBJECT_ID_RE.fullmatch(commit):
+                continue
+            try:
+                message = subprocess.run(
+                    ["git", "show", "-s", "--format=%s", commit], cwd=root, capture_output=True, text=True
+                )
+            except OSError:
+                return None, current
+            if message.returncode != 0 or message.stdout.strip() != expected_subject:
+                continue
+            if _commit_has_artifacts(context, commit, parent_commit, git_artifacts):
+                return (commit, current) if _tree_has_artifacts(context, current, git_artifacts) else (None, current)
     return None, current
 
 
@@ -725,11 +819,12 @@ def _merge_commits(
 
 
 def _artifact_preflight_issue(
-    root: Path,
+    context: _DeliveryArtifactGitContext,
     branch: str,
-    parent_commit: str,
     artifacts: list[DeliveryAssemblyArtifact],
 ) -> DeliveryPlanIssue | None:
+    root = context.project_root
+    parent_commit = context.parent_commit
     if not _valid_branch_name(root, branch):
         return DeliveryPlanIssue(
             "error",
@@ -755,69 +850,68 @@ def _artifact_preflight_issue(
             "delivery.assembly_branch_diverged",
             "Delivery assembly branch changed before amendment artifacts were integrated.",
         )
-    return _artifact_parent_compatibility_issue(root, parent_commit, artifacts)
+    return _artifact_parent_compatibility_issue(context, artifacts)
 
 
 def _artifact_parent_compatibility_issue(
-    root: Path,
-    parent_commit: str,
+    context: _DeliveryArtifactGitContext,
     artifacts: list[DeliveryAssemblyArtifact],
 ) -> DeliveryPlanIssue | None:
     issue = _artifact_paths_issue(artifacts)
     if issue is not None:
         return issue
-    with tempfile.TemporaryDirectory(prefix="sikula-delivery-filter-") as temp_dir:
-        context = _parent_filter_context(root, parent_commit, Path(temp_dir))
-        if context is None:
+    filter_issue = _artifact_external_filter_issue(context.filter_root, artifacts, env=context.env)
+    if filter_issue is not None:
+        return filter_issue
+    for artifact in artifacts:
+        try:
+            existing = _tree_artifact_entry(context, context.parent_commit, artifact.path)
+            ancestor_conflict = _artifact_ancestor_conflict(context, context.parent_commit, artifact.path)
+        except (OSError, UnicodeError, ValueError):
             return _artifact_git_issue()
-        filter_root, env = context
-        filter_issue = _artifact_external_filter_issue(filter_root, artifacts, env=env)
-        if filter_issue is not None:
-            return filter_issue
-        for artifact in artifacts:
-            try:
-                existing = _tree_artifact_entry(root, parent_commit, artifact.path)
-                ancestor_conflict = _artifact_ancestor_conflict(root, parent_commit, artifact.path)
-            except (OSError, UnicodeError, ValueError):
-                return _artifact_git_issue()
-            if ancestor_conflict:
-                return DeliveryPlanIssue(
-                    "error",
-                    "delivery.assembly_artifact_conflict",
-                    "A delivery amendment artifact path conflicts with a non-directory assembly entry.",
-                )
-            if artifact.must_not_exist and existing is not None:
-                return DeliveryPlanIssue(
-                    "error",
-                    "delivery.assembly_artifact_conflict",
-                    "A replacement unit artifact already exists in the delivery assembly.",
-                )
-            expected_blob = artifact.expected_object_id
-            if artifact.expected_content is not None:
-                expected_blob = _hash_artifact_content(
-                    filter_root,
-                    artifact.path,
-                    artifact.expected_content,
-                    env=env,
-                )
-                if expected_blob is None:
-                    return _artifact_git_issue()
-            expected_fingerprint = None
-            if artifact.expected_fingerprint is not None and existing is not None:
-                filtered = _filtered_tree_content(filter_root, parent_commit, artifact.path, env=env)
-                if filtered is None:
-                    return _artifact_git_issue()
-                expected_fingerprint = hashlib.sha256(filtered).hexdigest()
-            existing_stale = existing is not None and (
-                (expected_blob is not None and existing[1] != expected_blob)
-                or (artifact.expected_fingerprint is not None and expected_fingerprint != artifact.expected_fingerprint)
+        if ancestor_conflict:
+            return DeliveryPlanIssue(
+                "error",
+                "delivery.assembly_artifact_conflict",
+                "A delivery amendment artifact path conflicts with a non-directory assembly entry.",
             )
-            if existing_stale:
-                return DeliveryPlanIssue(
-                    "error",
-                    "delivery.assembly_artifact_stale",
-                    "A tracked delivery artifact changed in the delivery assembly.",
-                )
+        if artifact.must_not_exist and existing is not None:
+            return DeliveryPlanIssue(
+                "error",
+                "delivery.assembly_artifact_conflict",
+                "A replacement unit artifact already exists in the delivery assembly.",
+            )
+        expected_blob = artifact.expected_object_id
+        if artifact.expected_content is not None:
+            expected_blob = _hash_artifact_content(
+                context.filter_root,
+                artifact.path,
+                artifact.expected_content,
+                env=context.env,
+            )
+            if expected_blob is None:
+                return _artifact_git_issue()
+        expected_fingerprint = None
+        if artifact.expected_fingerprint is not None and existing is not None:
+            filtered = _filtered_tree_content(
+                context.filter_root,
+                context.parent_commit,
+                artifact.path,
+                env=context.env,
+            )
+            if filtered is None:
+                return _artifact_git_issue()
+            expected_fingerprint = hashlib.sha256(filtered).hexdigest()
+        existing_stale = existing is not None and (
+            (expected_blob is not None and existing[1] != expected_blob)
+            or (artifact.expected_fingerprint is not None and expected_fingerprint != artifact.expected_fingerprint)
+        )
+        if existing_stale:
+            return DeliveryPlanIssue(
+                "error",
+                "delivery.assembly_artifact_stale",
+                "A tracked delivery artifact changed in the delivery assembly.",
+            )
     return None
 
 
@@ -865,27 +959,13 @@ def _artifact_paths_issue(artifacts: list[DeliveryAssemblyArtifact]) -> Delivery
 
 
 def _artifacts_relative_to_git_root(
-    project_root: Path,
+    context: _DeliveryArtifactGitContext,
     artifacts: list[DeliveryAssemblyArtifact],
-    *,
-    parent_commit: str,
 ) -> tuple[list[DeliveryAssemblyArtifact], DeliveryPlanIssue | None]:
     issue = _artifact_paths_issue(artifacts)
     if issue is not None:
         return [], issue
-    try:
-        git_root_result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-        )
-        if git_root_result.returncode != 0 or not git_root_result.stdout.strip():
-            return [], _artifact_git_issue()
-        git_root = Path(git_root_result.stdout.strip()).resolve()
-        project_prefix = project_root.resolve().relative_to(git_root).as_posix()
-    except (OSError, RuntimeError, ValueError):
-        return [], _artifact_git_issue()
+    project_prefix = context.project_prefix
     git_artifacts = (
         list(artifacts)
         if project_prefix == "."
@@ -894,7 +974,7 @@ def _artifacts_relative_to_git_root(
     result: list[DeliveryAssemblyArtifact] = []
     try:
         for artifact in git_artifacts:
-            entry = _tree_artifact_entry(project_root, parent_commit, artifact.path)
+            entry = _tree_artifact_entry(context, context.parent_commit, artifact.path)
             if entry is not None and entry[0] not in {"100644", "100755"}:
                 return [], DeliveryPlanIssue(
                     "error",
@@ -908,55 +988,55 @@ def _artifacts_relative_to_git_root(
 
 
 def _create_artifact_commit(
-    root: Path,
+    context: _DeliveryArtifactGitContext,
     *,
     plan_id: str,
     proposal_id: str,
-    parent_commit: str,
     artifacts: list[DeliveryAssemblyArtifact],
     created_at: str,
 ) -> tuple[str | None, DeliveryPlanIssue | None]:
     issue = _artifact_paths_issue(artifacts)
     if issue is not None:
         return None, issue
+    root = context.project_root
+    parent_commit = context.parent_commit
     try:
-        with tempfile.TemporaryDirectory(prefix="sikula-delivery-index-") as temp_dir:
-            context = _parent_filter_context(root, parent_commit, Path(temp_dir))
-            if context is None:
-                return None, _artifact_git_issue()
-            filter_root, env = context
-            filter_issue = _artifact_external_filter_issue(filter_root, artifacts, env=env)
-            if filter_issue is not None:
-                return None, filter_issue
-            for artifact in artifacts:
-                object_id = _hash_artifact_content(
-                    filter_root,
-                    artifact.path,
-                    artifact.content,
-                    write=True,
-                    env=env,
-                )
-                if object_id is None:
-                    return None, _artifact_git_issue()
-                updated = subprocess.run(
-                    ["git", "update-index", "--add", "--cacheinfo", artifact.mode, object_id, artifact.path],
-                    cwd=filter_root,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                )
-                if updated.returncode != 0:
-                    return None, _artifact_git_issue()
-            written = subprocess.run(
-                ["git", "write-tree"],
-                cwd=filter_root,
-                env=env,
-                capture_output=True,
-                text=True,
+        filter_issue = _artifact_external_filter_issue(context.filter_root, artifacts, env=context.env)
+        if filter_issue is not None:
+            return None, filter_issue
+        if not context.ensure_index_loaded():
+            return None, _artifact_git_issue()
+        index_entries: list[bytes] = []
+        for artifact in artifacts:
+            object_id = _hash_artifact_content(
+                context.filter_root,
+                artifact.path,
+                artifact.content,
+                write=True,
+                env=context.env,
             )
-            tree = written.stdout.strip() if written.returncode == 0 else ""
-            if not _OBJECT_ID_RE.fullmatch(tree):
+            if object_id is None:
                 return None, _artifact_git_issue()
+            index_entries.append(f"{artifact.mode} {object_id}\t{artifact.path}".encode("utf-8") + b"\0")
+        updated = subprocess.run(
+            ["git", "update-index", "-z", "--index-info"],
+            cwd=context.filter_root,
+            env=context.env,
+            input=b"".join(index_entries),
+            capture_output=True,
+        )
+        if updated.returncode != 0:
+            return None, _artifact_git_issue()
+        written = subprocess.run(
+            ["git", "write-tree"],
+            cwd=context.filter_root,
+            env=context.env,
+            capture_output=True,
+            text=True,
+        )
+        tree = written.stdout.strip() if written.returncode == 0 else ""
+        if not _OBJECT_ID_RE.fullmatch(tree):
+            return None, _artifact_git_issue()
 
         commit_env = os.environ.copy()
         commit_env.update(
@@ -1049,54 +1129,47 @@ def _artifact_external_filter_issue(
     return None
 
 
+@contextmanager
+def _delivery_artifact_git_context(
+    root: Path,
+    parent_commit: str,
+) -> Iterator[_DeliveryArtifactGitContext | None]:
+    with tempfile.TemporaryDirectory(prefix="sikula-delivery-filter-") as temp_dir:
+        yield _parent_filter_context(root, parent_commit, Path(temp_dir))
+
+
 def _parent_filter_context(
     root: Path,
     parent_commit: str,
     temp_dir: Path,
-) -> tuple[Path, dict[str, str]] | None:
+) -> _DeliveryArtifactGitContext | None:
     autocrlf_valid, autocrlf = _safe_core_autocrlf(root)
     if not autocrlf_valid:
         return None
     try:
-        git_root_result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-        )
-        git_dir_result = subprocess.run(
-            ["git", "rev-parse", "--absolute-git-dir"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-        )
-        common_dir_result = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-        )
-        object_format_result = subprocess.run(
-            ["git", "rev-parse", "--show-object-format"],
+        repository_result = subprocess.run(
+            [
+                "git",
+                "rev-parse",
+                "--show-toplevel",
+                "--absolute-git-dir",
+                "--git-common-dir",
+                "--show-object-format",
+            ],
             cwd=root,
             capture_output=True,
             text=True,
         )
     except OSError:
         return None
-    if (
-        git_root_result.returncode != 0
-        or git_dir_result.returncode != 0
-        or common_dir_result.returncode != 0
-        or object_format_result.returncode != 0
-        or not git_root_result.stdout.strip()
-        or not git_dir_result.stdout.strip()
-        or not common_dir_result.stdout.strip()
-        or object_format_result.stdout.strip() not in {"sha1", "sha256"}
-    ):
+    repository_metadata = repository_result.stdout.splitlines()
+    if repository_result.returncode != 0 or len(repository_metadata) != 4:
         return None
-    git_root = Path(git_root_result.stdout.strip()).resolve()
-    common_dir = Path(common_dir_result.stdout.strip())
+    git_root_text, git_dir_text, common_dir_text, object_format = repository_metadata
+    if not git_root_text or not git_dir_text or not common_dir_text or object_format not in {"sha1", "sha256"}:
+        return None
+    git_root = Path(git_root_text).resolve()
+    common_dir = Path(common_dir_text)
     if not common_dir.is_absolute():
         common_dir = (root / common_dir).resolve()
     object_dir = common_dir / "objects"
@@ -1107,31 +1180,24 @@ def _parent_filter_context(
     (isolated_git_dir / "objects" / "pack").mkdir()
     (isolated_git_dir / "refs" / "heads").mkdir(parents=True)
     (isolated_git_dir / "HEAD").write_text("ref: refs/heads/sikula-filter-context\n", encoding="ascii")
+    if object_format == "sha256":
+        (isolated_git_dir / "config").write_text(
+            "[core]\n\trepositoryFormatVersion = 1\n[extensions]\n\tobjectFormat = sha256\n",
+            encoding="ascii",
+        )
     empty_attributes = temp_dir / "attributes"
     empty_attributes.touch()
     empty_global_config = temp_dir / "global-config"
     empty_global_config.touch()
-    isolated_config = isolated_git_dir / "config"
     config_values = [
-        ("core.repositoryFormatVersion", "1" if object_format_result.stdout.strip() == "sha256" else "0"),
+        ("core.repositoryFormatVersion", "1" if object_format == "sha256" else "0"),
         ("core.bare", "false"),
         ("core.attributesFile", str(empty_attributes)),
     ]
     if autocrlf is not None:
         config_values.append(("core.autocrlf", autocrlf))
-    if object_format_result.stdout.strip() == "sha256":
+    if object_format == "sha256":
         config_values.append(("extensions.objectFormat", "sha256"))
-    try:
-        for key, value in config_values:
-            configured = subprocess.run(
-                ["git", "config", "--file", str(isolated_config), key, value],
-                cwd=git_root,
-                capture_output=True,
-            )
-            if configured.returncode != 0:
-                return None
-    except OSError:
-        return None
     env = os.environ.copy()
     for key in list(env):
         if key in {"GIT_COMMON_DIR", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"} or key.startswith(
@@ -1146,50 +1212,23 @@ def _parent_filter_context(
         GIT_CONFIG_GLOBAL=str(empty_global_config),
         GIT_CONFIG_NOSYSTEM="1",
         GIT_ATTR_NOSYSTEM="1",
+        GIT_CONFIG_COUNT=str(len(config_values)),
     )
+    for index, (key, value) in enumerate(config_values):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
     env.pop("GIT_ATTR_SOURCE", None)
-    try:
-        read_tree = subprocess.run(
-            ["git", "read-tree", parent_commit],
-            cwd=git_root,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return None
-    if read_tree.returncode != 0:
-        return None
-    try:
-        tree_entries = subprocess.run(
-            ["git", "ls-tree", "-r", "-z", parent_commit],
-            cwd=git_root,
-            env=env,
-            capture_output=True,
-        )
-    except OSError:
-        return None
-    if tree_entries.returncode != 0:
+    entries = _load_tree_entries(git_root, parent_commit, env=env)
+    if entries is None:
         return None
     attribute_entries: list[tuple[str, str]] = []
-    for raw_entry in tree_entries.stdout.rstrip(b"\0").split(b"\0"):
-        if not raw_entry:
-            continue
-        if b"\t" not in raw_entry:
-            return None
-        metadata, path = raw_entry.split(b"\t", 1)
-        fields = metadata.split(b" ")
-        if len(fields) != 3:
-            return None
-        if path.rsplit(b"/", 1)[-1] != b".gitattributes" or fields[0] not in {b"100644", b"100755"}:
+    for path, (mode, object_id) in entries.items():
+        if path.rsplit(b"/", 1)[-1] != b".gitattributes" or mode not in {"100644", "100755"}:
             continue
         try:
             decoded_path = path.decode("utf-8", errors="strict")
-            object_id = fields[2].decode("ascii", errors="strict")
         except UnicodeError:
             continue
-        if not _OBJECT_ID_RE.fullmatch(object_id):
-            return None
         attribute_entries.append((decoded_path, object_id))
     for path, object_id in attribute_entries:
         try:
@@ -1209,7 +1248,55 @@ def _parent_filter_context(
             target.write_bytes(blob.stdout)
         except OSError:
             return None
-    return worktree, env
+    return _DeliveryArtifactGitContext(
+        project_root=root,
+        git_root=git_root,
+        git_dir=Path(git_dir_text).resolve(),
+        common_dir=common_dir,
+        object_format=object_format,
+        parent_commit=parent_commit,
+        filter_root=worktree,
+        env=env,
+        tree_entries_by_commit={parent_commit: entries},
+    )
+
+
+def _load_tree_entries(
+    root: Path,
+    commit: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> dict[bytes, tuple[str, str]] | None:
+    try:
+        result = subprocess.run(
+            ["git", "ls-tree", "-r", "-t", "--full-tree", "-z", commit],
+            cwd=root,
+            env=env,
+            capture_output=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    entries: dict[bytes, tuple[str, str]] = {}
+    for raw_entry in result.stdout.rstrip(b"\0").split(b"\0"):
+        if not raw_entry:
+            continue
+        if b"\t" not in raw_entry:
+            return None
+        metadata, path = raw_entry.split(b"\t", 1)
+        fields = metadata.split(b" ")
+        if len(fields) != 3 or not path or path in entries:
+            return None
+        try:
+            mode = fields[0].decode("ascii", errors="strict")
+            object_id = fields[2].decode("ascii", errors="strict")
+        except UnicodeError:
+            return None
+        if not _OBJECT_ID_RE.fullmatch(object_id):
+            return None
+        entries[path] = (mode, object_id)
+    return entries
 
 
 def _safe_core_autocrlf(root: Path) -> tuple[bool, str | None]:
@@ -1241,35 +1328,19 @@ def _safe_core_autocrlf(root: Path) -> tuple[bool, str | None]:
     return (True, normalized) if normalized is not None else (False, None)
 
 
-def _tree_artifact_entry(root: Path, commit: str, path: str) -> tuple[str, str] | None:
-    result = subprocess.run(
-        ["git", "ls-tree", "--full-name", "-z", commit, "--", f":(top,literal){path}"],
-        cwd=root,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        raise OSError("Git tree entry is unavailable")
-    entries = result.stdout.rstrip(b"\0").split(b"\0") if result.stdout else []
-    if not entries:
-        return None
-    if len(entries) != 1 or b"\t" not in entries[0]:
-        raise ValueError("Git tree entry is malformed")
-    metadata, entry_path = entries[0].split(b"\t", 1)
-    fields = metadata.split(b" ")
-    if len(fields) != 3 or entry_path != path.encode("utf-8"):
-        raise ValueError("Git tree entry is malformed")
-    mode = fields[0].decode("ascii", errors="strict")
-    object_id = fields[2].decode("ascii", errors="strict")
-    if not _OBJECT_ID_RE.fullmatch(object_id):
-        raise ValueError("Git tree object is invalid")
-    return mode, object_id
+def _tree_artifact_entry(
+    context: _DeliveryArtifactGitContext,
+    commit: str,
+    path: str,
+) -> tuple[str, str] | None:
+    return context.tree_entries(commit).get(path.encode("utf-8"))
 
 
-def _artifact_ancestor_conflict(root: Path, commit: str, path: str) -> bool:
+def _artifact_ancestor_conflict(context: _DeliveryArtifactGitContext, commit: str, path: str) -> bool:
     for ancestor in reversed(PurePosixPath(path).parents):
         if ancestor == PurePosixPath("."):
             continue
-        entry = _tree_artifact_entry(root, commit, ancestor.as_posix())
+        entry = _tree_artifact_entry(context, commit, ancestor.as_posix())
         if entry is not None and entry[0] != "040000":
             return True
     return False
@@ -1295,11 +1366,12 @@ def _filtered_tree_content(
 
 
 def _commit_has_artifacts(
-    root: Path,
+    context: _DeliveryArtifactGitContext,
     commit: str,
     parent_commit: str,
     artifacts: list[DeliveryAssemblyArtifact],
 ) -> bool:
+    root = context.project_root
     try:
         parent = subprocess.run(
             ["git", "rev-parse", "--verify", f"{commit}^"],
@@ -1320,30 +1392,29 @@ def _commit_has_artifacts(
     changed_paths = {path for path in changed.stdout.rstrip(b"\0").split(b"\0") if path}
     if changed.returncode != 0 or not changed_paths.issubset(artifact_paths):
         return False
-    return _tree_has_artifacts(root, commit, parent_commit, artifacts)
+    return _tree_has_artifacts(context, commit, artifacts)
 
 
 def _tree_has_artifacts(
-    root: Path,
+    context: _DeliveryArtifactGitContext,
     commit: str,
-    attribute_commit: str,
     artifacts: list[DeliveryAssemblyArtifact],
 ) -> bool:
-    with tempfile.TemporaryDirectory(prefix="sikula-delivery-filter-") as temp_dir:
-        context = _parent_filter_context(root, attribute_commit, Path(temp_dir))
-        if context is None:
+    if _artifact_external_filter_issue(context.filter_root, artifacts, env=context.env) is not None:
+        return False
+    for artifact in artifacts:
+        try:
+            entry = _tree_artifact_entry(context, commit, artifact.path)
+            expected_blob = _hash_artifact_content(
+                context.filter_root,
+                artifact.path,
+                artifact.content,
+                env=context.env,
+            )
+        except (OSError, UnicodeError, ValueError):
             return False
-        filter_root, env = context
-        if _artifact_external_filter_issue(filter_root, artifacts, env=env) is not None:
+        if entry is None or expected_blob is None or entry[0] != artifact.mode or entry[1] != expected_blob:
             return False
-        for artifact in artifacts:
-            try:
-                entry = _tree_artifact_entry(root, commit, artifact.path)
-                expected_blob = _hash_artifact_content(filter_root, artifact.path, artifact.content, env=env)
-            except (OSError, UnicodeError, ValueError):
-                return False
-            if entry is None or expected_blob is None or entry[0] != artifact.mode or entry[1] != expected_blob:
-                return False
     return True
 
 

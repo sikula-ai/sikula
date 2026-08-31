@@ -444,7 +444,10 @@ changes required to make the branch contain the updated plan and every contract
 referenced by it. Artifact content uses clean conversion from the assembly
 parent's `.gitattributes`, independent of the operator checkout. The proposal
 retains the resulting canonical source-plan blob ID for interruption recovery,
-and existing parent entries retain their Git file modes. Named Git `filter`
+and existing parent entries retain their Git file modes. Artifact validation loads
+repository metadata, the immutable parent tree, and its isolated clean-filter context
+once per artifact operation; it never caches branch refs, worktree state, or data across
+the initial and locked amendment preflights. Named Git `filter`
 attributes are rejected before any external filter command can run; built-in
 `text` and `eol` conversion remains supported. Apply then advances
 the parent assembly checkpoint and records the branch and commit in the
