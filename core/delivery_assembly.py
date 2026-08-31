@@ -66,9 +66,6 @@ class DeliveryArtifactAssemblyResult:
 class _DeliveryArtifactGitContext:
     project_root: Path
     git_root: Path
-    git_dir: Path
-    common_dir: Path
-    object_format: str
     parent_commit: str
     filter_root: Path
     env: dict[str, str]
@@ -309,25 +306,47 @@ def assemble_delivery_artifacts(
             "delivery.assembly_expected_commit_missing",
             "Recorded delivery assembly commit is missing.",
         )
-    with _delivery_artifact_git_context(root, parent) as context:
-        if context is None:
-            return _artifact_failure(
-                branch,
-                parent,
-                "delivery.assembly_artifact_git_failed",
-                "Git could not validate delivery amendment artifacts.",
+    try:
+        with _delivery_artifact_git_context(root, parent) as context:
+            if context is None:
+                return _artifact_failure(
+                    branch,
+                    parent,
+                    "delivery.assembly_artifact_git_failed",
+                    "Git could not validate delivery amendment artifacts.",
+                )
+            prepared = _prepare_delivery_artifacts_with_context(
+                context,
+                plan_id=plan_id,
+                proposal_id=proposal_id,
+                branch=branch,
+                artifacts=artifacts,
+                created_at=created_at,
             )
-        return _assemble_delivery_artifacts_with_context(
-            context,
-            plan_id=plan_id,
-            proposal_id=proposal_id,
-            branch=branch,
-            artifacts=artifacts,
-            created_at=created_at,
+    except OSError:
+        return _artifact_failure(
+            branch,
+            parent,
+            "delivery.assembly_artifact_git_failed",
+            "Git could not validate delivery amendment artifacts.",
         )
+    if not prepared.success or prepared.assembled_commit is None:
+        return prepared
+    try:
+        updated = _update_ref(root, branch, prepared.assembled_commit, prepared.previous_commit)
+    except OSError:
+        updated = False
+    if not updated:
+        return _artifact_failure(
+            branch,
+            parent,
+            "delivery.assembly_branch_diverged",
+            "Delivery assembly branch changed while amendment artifacts were integrated.",
+        )
+    return prepared
 
 
-def _assemble_delivery_artifacts_with_context(
+def _prepare_delivery_artifacts_with_context(
     context: _DeliveryArtifactGitContext,
     *,
     plan_id: str,
@@ -401,17 +420,6 @@ def _assemble_delivery_artifacts_with_context(
             previous_commit=current,
             error=issue,
         )
-    try:
-        updated = _update_ref(root, branch, commit, current)
-    except OSError:
-        updated = False
-    if not updated:
-        return _artifact_failure(
-            branch,
-            parent,
-            "delivery.assembly_branch_diverged",
-            "Delivery assembly branch changed while amendment artifacts were integrated.",
-        )
     return DeliveryArtifactAssemblyResult(True, branch, parent, commit, current)
 
 
@@ -440,15 +448,23 @@ def preview_delivery_artifacts(
             "delivery.assembly_expected_commit_missing",
             "Recorded delivery assembly commit is missing.",
         )
-    with _delivery_artifact_git_context(root, parent) as context:
-        if context is None:
-            return _artifact_failure(
-                branch,
-                parent,
-                "delivery.assembly_artifact_git_failed",
-                "Git could not validate delivery amendment artifacts.",
-            )
-        return _preview_delivery_artifacts_with_context(context, branch=branch, artifacts=artifacts)
+    try:
+        with _delivery_artifact_git_context(root, parent) as context:
+            if context is None:
+                return _artifact_failure(
+                    branch,
+                    parent,
+                    "delivery.assembly_artifact_git_failed",
+                    "Git could not validate delivery amendment artifacts.",
+                )
+            return _preview_delivery_artifacts_with_context(context, branch=branch, artifacts=artifacts)
+    except OSError:
+        return _artifact_failure(
+            branch,
+            parent,
+            "delivery.assembly_artifact_git_failed",
+            "Git could not validate delivery amendment artifacts.",
+        )
 
 
 def _preview_delivery_artifacts_with_context(
@@ -495,13 +511,16 @@ def delivery_artifact_compatibility_issue(
             "delivery.assembly_expected_commit_missing",
             "Recorded delivery assembly commit is missing.",
         )
-    with _delivery_artifact_git_context(root, parent) as context:
-        if context is None:
-            return _artifact_git_issue()
-        git_artifacts, artifact_issue = _artifacts_relative_to_git_root(context, artifacts)
-        if artifact_issue is not None:
-            return artifact_issue
-        return _artifact_parent_compatibility_issue(context, git_artifacts)
+    try:
+        with _delivery_artifact_git_context(root, parent) as context:
+            if context is None:
+                return _artifact_git_issue()
+            git_artifacts, artifact_issue = _artifacts_relative_to_git_root(context, artifacts)
+            if artifact_issue is not None:
+                return artifact_issue
+            return _artifact_parent_compatibility_issue(context, git_artifacts)
+    except OSError:
+        return _artifact_git_issue()
 
 
 def rollback_delivery_artifacts(
@@ -538,18 +557,21 @@ def delivery_artifact_content_id(
 ) -> str | None:
     """Return the blob id produced by the parent tree's clean-filter rules."""
     root = project_root.resolve()
-    with _delivery_artifact_git_context(root, parent_commit) as context:
-        if context is None:
-            return None
-        artifacts, issue = _artifacts_relative_to_git_root(
-            context,
-            [DeliveryAssemblyArtifact(path, content)],
-        )
-        if issue is not None:
-            return None
-        if _artifact_external_filter_issue(context.filter_root, artifacts, env=context.env) is not None:
-            return None
-        return _hash_artifact_content(context.filter_root, artifacts[0].path, content, env=context.env)
+    try:
+        with _delivery_artifact_git_context(root, parent_commit) as context:
+            if context is None:
+                return None
+            artifacts, issue = _artifacts_relative_to_git_root(
+                context,
+                [DeliveryAssemblyArtifact(path, content)],
+            )
+            if issue is not None:
+                return None
+            if _artifact_external_filter_issue(context.filter_root, artifacts, env=context.env) is not None:
+                return None
+            return _hash_artifact_content(context.filter_root, artifacts[0].path, content, env=context.env)
+    except OSError:
+        return None
 
 
 def find_delivery_artifact_commit(
@@ -569,45 +591,50 @@ def find_delivery_artifact_commit(
         return None, None
     if current is None or not ancestor:
         return None, current
-    with _delivery_artifact_git_context(root, parent_commit) as context:
-        if context is None:
-            return None, current
-        git_artifacts, artifact_issue = _artifacts_relative_to_git_root(context, artifacts)
-        if artifact_issue is not None:
-            return None, current
-        try:
-            revisions = subprocess.run(
-                [
-                    "git",
-                    "log",
-                    "--format=%H",
-                    "--fixed-strings",
-                    f"--grep=sikula: apply delivery amendment {proposal_id}",
-                    current,
-                    f"^{parent_commit}",
-                ],
-                cwd=root,
-                capture_output=True,
-                text=True,
-            )
-        except OSError:
-            return None, current
-        if revisions.returncode != 0:
-            return None, current
-        expected_subject = f"sikula: apply delivery amendment {proposal_id}"
-        for commit in revisions.stdout.splitlines():
-            if not _OBJECT_ID_RE.fullmatch(commit):
-                continue
+    try:
+        with _delivery_artifact_git_context(root, parent_commit) as context:
+            if context is None:
+                return None, current
+            git_artifacts, artifact_issue = _artifacts_relative_to_git_root(context, artifacts)
+            if artifact_issue is not None:
+                return None, current
             try:
-                message = subprocess.run(
-                    ["git", "show", "-s", "--format=%s", commit], cwd=root, capture_output=True, text=True
+                revisions = subprocess.run(
+                    [
+                        "git",
+                        "log",
+                        "--format=%H",
+                        "--fixed-strings",
+                        f"--grep=sikula: apply delivery amendment {proposal_id}",
+                        current,
+                        f"^{parent_commit}",
+                    ],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
                 )
             except OSError:
                 return None, current
-            if message.returncode != 0 or message.stdout.strip() != expected_subject:
-                continue
-            if _commit_has_artifacts(context, commit, parent_commit, git_artifacts):
-                return (commit, current) if _tree_has_artifacts(context, current, git_artifacts) else (None, current)
+            if revisions.returncode != 0:
+                return None, current
+            expected_subject = f"sikula: apply delivery amendment {proposal_id}"
+            for commit in revisions.stdout.splitlines():
+                if not _OBJECT_ID_RE.fullmatch(commit):
+                    continue
+                try:
+                    message = subprocess.run(
+                        ["git", "show", "-s", "--format=%s", commit], cwd=root, capture_output=True, text=True
+                    )
+                except OSError:
+                    return None, current
+                if message.returncode != 0 or message.stdout.strip() != expected_subject:
+                    continue
+                if _commit_has_artifacts(context, commit, parent_commit, git_artifacts):
+                    return (
+                        (commit, current) if _tree_has_artifacts(context, current, git_artifacts) else (None, current)
+                    )
+    except OSError:
+        return None, current
     return None, current
 
 
@@ -1147,26 +1174,27 @@ def _parent_filter_context(
     if not autocrlf_valid:
         return None
     try:
-        repository_result = subprocess.run(
-            [
-                "git",
-                "rev-parse",
-                "--show-toplevel",
-                "--absolute-git-dir",
-                "--git-common-dir",
-                "--show-object-format",
-            ],
+        git_root_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
             cwd=root,
             capture_output=True,
-            text=True,
+        )
+        common_dir_result = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=root,
+            capture_output=True,
         )
     except OSError:
         return None
-    repository_metadata = repository_result.stdout.splitlines()
-    if repository_result.returncode != 0 or len(repository_metadata) != 4:
+    git_root_text = _decode_git_path_output(git_root_result)
+    common_dir_text = _decode_git_path_output(common_dir_result)
+    if git_root_text is None or common_dir_text is None:
         return None
-    git_root_text, git_dir_text, common_dir_text, object_format = repository_metadata
-    if not git_root_text or not git_dir_text or not common_dir_text or object_format not in {"sha1", "sha256"}:
+    if len(parent_commit) == 40:
+        object_format = "sha1"
+    elif len(parent_commit) == 64:
+        object_format = "sha256"
+    else:
         return None
     git_root = Path(git_root_text).resolve()
     common_dir = Path(common_dir_text)
@@ -1251,14 +1279,18 @@ def _parent_filter_context(
     return _DeliveryArtifactGitContext(
         project_root=root,
         git_root=git_root,
-        git_dir=Path(git_dir_text).resolve(),
-        common_dir=common_dir,
-        object_format=object_format,
         parent_commit=parent_commit,
         filter_root=worktree,
         env=env,
         tree_entries_by_commit={parent_commit: entries},
     )
+
+
+def _decode_git_path_output(result: subprocess.CompletedProcess[bytes]) -> str | None:
+    if result.returncode != 0 or not result.stdout.endswith(b"\n"):
+        return None
+    value = result.stdout[:-1]
+    return os.fsdecode(value) if value else None
 
 
 def _load_tree_entries(
