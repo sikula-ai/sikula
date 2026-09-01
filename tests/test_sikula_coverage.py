@@ -6,7 +6,7 @@ import argparse
 import importlib
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -1781,6 +1781,14 @@ class TestMain:
                 with patch("sikula.cmd_show") as mock_show:
                     main()
         mock_show.assert_called_once()
+
+    def test_summary_command_dispatches_to_cmd_summary(self, tmp_path: Path):
+        p1, p2, p3 = self._patch_config(tmp_path)
+        with patch("sys.argv", ["sikula", "summary", "abc123"]):
+            with p1, p2, p3:
+                with patch("sikula.cmd_summary") as mock_summary:
+                    main()
+        mock_summary.assert_called_once_with("abc123", ANY)
 
     def test_cleanup_command_dispatches_to_cmd_cleanup(self, tmp_path: Path):
         p1, p2, p3 = self._patch_config(tmp_path)

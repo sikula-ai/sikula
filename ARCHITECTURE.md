@@ -33,6 +33,7 @@
 | `InitAgent` | `agents/init_agent.py` | Generates `.sikula/guidelines.md` from codebase analysis; called by `cmd_init()` only — not part of the orchestrator loop |
 | `LLMClient` | `core/llm_client.py` | Abstract interface: `generate()` for single-shot text; `run_readonly_agent()` for read-only autonomous agents; `run_agent()` for autonomous file-editing agents; built-in clients emit content-free invocation-attempt observations without changing provider execution |
 | `LLMUsage` helpers | `core/llm_usage.py` | Provider-neutral validation and aggregation for bounded invocation counts, elapsed time, character counts, outcomes, and optional provider-reported token usage |
+| `PRSummary` helpers | `core/pr_summary.py` | Side-effect-free, allowlist-only PR-ready Markdown projection for completed isolated task and review-fix state with a publishable commit; rejects non-publishable states and omits raw audit text, unsafe paths, and provider content |
 | `ContractCheck` helpers | `core/contract_check.py` | Deterministic implementation-contract readiness checks for Markdown/plain-text task files; `sikula run` stores a warning-only state snapshot and `sikula contract check --write-report` explicitly writes report artifacts |
 | `StructuredOutput` helpers | `core/structured_output.py` | Side-effect-free schema-aware extraction of one unambiguous top-level JSON object from LLM output while rejecting malformed, nested, or multiple response candidates |
 | `DeliveryAuthoring` helpers | `core/delivery_authoring.py` | Side-effect-free parser and derived-path helpers for delivery prepare authoring drafts, including bounded inherited source-task constraints and source-asset assignments |
@@ -141,7 +142,8 @@ as root detection, dirty checks, path containment, worktree removal, current-bra
 inspection, and commit resolution live in `core/worktree.py`; `sikula.py` keeps
 compatibility wrappers for existing tests and command contexts.
 
-**Status/show commands:** `sikula status` and `sikula show` parser registration
+**Status/show/summary commands:** `sikula status`, `sikula show`, and
+`sikula summary` parser registration
 and handlers are implemented by `sikula_cli/status.py` with compatibility
 wrappers in `sikula.py`. `sikula status`
 derives a compact task overview from state JSON. It reports terminal states
@@ -157,6 +159,41 @@ the original checkout while reading the task file from the preserved worktree. R
 via `sikula run --task-id <task_id>` is supported from inside the worktree; before
 finalization Sikula switches the process directory back to the original project so the
 worktree can be removed safely.
+
+`sikula show <task_id>` emits the complete local state audit and may contain
+sensitive prompt, source, provider, and diagnostic content. `sikula summary
+<task_id>` is a separate public projection built by `core/pr_summary.py`; it
+reads state without mutating it and emits deterministic Markdown only for a
+completed isolated task or review-fix delivery with a publishable commit. The projection
+uses bounded allowlisted metadata and safe project-relative paths from the
+cumulative `files_changed` audit. The output labels these as files touched
+during the run and warns that reverted paths can remain; it does not claim that
+they are the authoritative terminal diff.
+
+Build, test, check, and review outcomes are interpreted against the last valid
+run-invocation configuration so a resumed phase that was explicitly disabled
+is reported as skipped even when older status or review records remain. The
+residual-risk section uses the same implementation-asset warning classifier as
+the terminal state summary and projects worktree cleanup failures as a bounded
+count without exposing their local diagnostics. A PR-ready result must have a
+safe recorded branch, a full result or isolated-fix commit, and no preserved worktree. Explicit
+cleanup records are rejected because they cannot prove that automatic
+finalization produced the published commit. No-change and `--no-isolate` runs
+therefore do not produce PR-ready summaries. Legacy non-current-branch
+review-fix state may retain stale absolute worktree fields after successful
+cleanup; the projection accepts that shape only when every recorded filesystem
+entry is verifiably absent. Existing, relative, symlink, or uninspectable
+entries fail closed.
+Non-current-branch review-fix summaries require a valid base branch and forbid
+current-branch delivery identity. Current-branch summaries require
+`review_delivery_status = "delivered"`, valid base and target branches, a full
+target-start commit, and matching full isolated-fix/result commits. A recovered
+`cleanup_failed` history record remains a residual-risk count after the
+worktree paths are cleared; unresolved paths continue to block publication.
+Failed or incomplete tasks, delivery-unit child states, report-only reviews,
+unknown or inconsistent review discriminators, unsafe task identities,
+absolute paths, and malformed legacy metadata fail closed or are omitted as
+appropriate.
 
 **Contract check and preparation commands:** `sikula contract check TASK_FILE` is a
 read-only preflight whose CLI parser registration and handler logic live in

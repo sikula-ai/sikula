@@ -262,10 +262,24 @@ sikula run .sikula/tasks/my-task.md
 # Optional: abort before agents if the task is not ready enough for delivery
 sikula run .sikula/tasks/my-task.md --require-contract-ready
 sikula status
+sikula summary <task-id> > pr-body.md
 git diff <base-branch>...sikula/<task-stem>-<task-id>
 ```
 
 Use this when the task file is ready to act as the implementation contract and you want Sikula to run the gated delivery pipeline. See [Writing Sikula Tasks](docs/writing-tasks.md) for contract readiness gates and task-writing guidance.
+
+After a completed isolated task or delivered review-fix with a publishable
+commit, `sikula summary <task-id>` prints deterministic PR-ready Markdown to stdout. The projection
+contains bounded contract identity, validation and review outcomes,
+project-relative files touched during the run, recovered-activity counts, and
+residual-risk counts. The touched-file list is cumulative and can include paths
+whose changes were later reverted. It does not copy task text, prompts,
+provider output, review prose, diagnostics, or absolute paths from local task
+state. Delivery-unit and report-only review states are rejected because they
+are not publishable implementation results.
+PR-ready output requires a safe recorded branch, a full result commit, and no preserved worktree.
+No-change and `--no-isolate` runs are intentionally rejected because they do
+not provide a standalone commit to publish.
 
 **Review an existing branch**
 
@@ -310,6 +324,8 @@ delivery safety checks pass.
 - Build/test/check validation records and recovered diagnostics.
 - Content-free LLM invocation and available usage aggregates by task and agent.
 - A task state file inspectable with `sikula show <task-id>`.
+- Privacy-safe PR-ready Markdown from `sikula summary <task-id>` after a
+  completed isolated task or review-fix with a publishable commit.
 
 ## Example Projects
 
@@ -359,6 +375,9 @@ The main README is the documentation entry point. Deeper guides live under `docs
 Sikula runs locally in your repository and uses git worktrees by default. The LLM provider you configure determines what task, prompt, source, and diff context may be sent outside your machine.
 
 Task state is useful for debugging and audit, but it can contain prompts, source excerpts, build logs, provider output, and sensitive project context. Review and redact `sikula show <task-id>` output before sharing it publicly.
+
+`sikula summary <task-id>` is the bounded public handoff projection. It reads
+state without modifying it and omits raw audit text and unsafe path metadata.
 
 See [Sandbox](docs/sandbox.md), [SECURITY.md](SECURITY.md), and [PRIVACY.md](PRIVACY.md).
 

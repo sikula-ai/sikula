@@ -12,6 +12,7 @@ from pathlib import Path
 import sys
 
 from core.delivery_progress import delivery_terminal_stop_recovery_action
+from core.pr_summary import PrReadySummaryError, build_pr_ready_summary
 from core.state import JsonStateStore
 from core.subprocess_utils import windows_pid_running
 from sikula_cli.config import _resolve_state_dir
@@ -53,6 +54,8 @@ def register_parser(subparsers) -> tuple[argparse.ArgumentParser, argparse.Argum
 
     show_p = subparsers.add_parser("show", help="Show full task state as JSON")
     show_p.add_argument("task_id")
+    summary_p = subparsers.add_parser("summary", help="Print a PR-ready summary for a completed task")
+    summary_p.add_argument("task_id")
     return status_p, show_p
 
 
@@ -378,3 +381,32 @@ def cmd_show(task_id: str, cfg: dict, context: StatusContext | None = None) -> N
         print(f"Task {task_id} not found")
         sys.exit(1)
     print(json.dumps(state.__dict__, indent=2))
+
+
+def cmd_summary(task_id: str, cfg: dict, context: StatusContext | None = None) -> None:
+    context = _status_context(context)
+    state_dir = context.resolve_state_dir(cfg)
+    store = JsonStateStore(state_dir)
+    try:
+        state = store.load(task_id)
+    except Exception:
+        print(
+            "Cannot generate PR-ready summary (pr_summary.state_invalid): Task state could not be loaded safely.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not state:
+        print(f"Task {task_id} not found", file=sys.stderr)
+        sys.exit(1)
+    try:
+        summary = build_pr_ready_summary(state)
+    except PrReadySummaryError as exc:
+        print(f"Cannot generate PR-ready summary ({exc.code}): {exc.message}", file=sys.stderr)
+        sys.exit(1)
+    except Exception:
+        print(
+            "Cannot generate PR-ready summary (pr_summary.state_invalid): Task state could not be projected safely.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(summary, end="")

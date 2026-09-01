@@ -14,6 +14,7 @@ import sikula_cli.status as status_cli
 from core.subprocess_utils import windows_pid_running
 
 cmd_status = status_cli.cmd_status
+cmd_summary = status_cli.cmd_summary
 _pid_running = status_cli._pid_running
 
 _SIKULA_PY = str(Path(__file__).parent.parent / "sikula.py")
@@ -25,6 +26,7 @@ def test_status_cli_module_imports() -> None:
     assert callable(status_cli.register_parser)
     assert callable(status_cli.cmd_status)
     assert callable(status_cli.cmd_show)
+    assert callable(status_cli.cmd_summary)
 
 
 class TestStatusCliModule:
@@ -150,6 +152,106 @@ class TestStatusCliModule:
         store.save(TaskState(task_id="done", task_description="done task", done=True))
         status_cli.cmd_status(cfg, argparse.Namespace(json=False, verbose=False, status_filter=["failed"]))
         assert capsys.readouterr().out.strip() == "No matching tasks."
+
+
+class TestCmdSummary:
+    def test_completed_task_prints_markdown_without_writing_state(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        store = JsonStateStore(tmp_path)
+        state = TaskState(
+            task_id="summary-task",
+            task_description="private task body",
+            done=True,
+            worktree_branch="sikula/summary-task",
+            result_commit="a" * 40,
+            files_changed=["core/example.py"],
+        )
+        store.save(state)
+        state_path = tmp_path / "summary-task.json"
+        before = state_path.read_bytes()
+
+        cmd_summary("summary-task", {"tasks": {"state_dir": str(tmp_path)}})
+
+        output = capsys.readouterr().out
+        assert output.startswith("## Summary\n")
+        assert "core/example.py" in output
+        assert "private task body" not in output
+        assert state_path.read_bytes() == before
+
+    def test_incomplete_task_exits_with_bounded_error(self, tmp_path: Path, capsys):
+        from core.state import JsonStateStore, TaskState
+
+        JsonStateStore(tmp_path).save(TaskState(task_id="incomplete", task_description="private"))
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_summary("incomplete", {"tasks": {"state_dir": str(tmp_path)}})
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "pr_summary.task_not_successful" in captured.err
+        assert "private" not in captured.err
+
+    def test_missing_task_exits_without_stdout(self, tmp_path: Path, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_summary("missing", {"tasks": {"state_dir": str(tmp_path)}})
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.strip() == "Task missing not found"
+
+    def test_malformed_state_exits_with_bounded_error(self, tmp_path: Path, capsys):
+        canary = "/Users/private/project/state.json"
+        (tmp_path / "malformed.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "malformed",
+                    "task_description": "private task",
+                    "schema_version": canary,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_summary("malformed", {"tasks": {"state_dir": str(tmp_path)}})
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.strip() == (
+            "Cannot generate PR-ready summary (pr_summary.state_invalid): Task state could not be loaded safely."
+        )
+        assert canary not in captured.err
+
+    def test_unexpected_projection_failure_exits_with_bounded_error(self, tmp_path: Path, capsys, monkeypatch):
+        from core.state import JsonStateStore, TaskState
+
+        canary = "/Users/private/project/state.json"
+        state = TaskState(
+            task_id="projection-failure",
+            task_description="private task",
+            done=True,
+        )
+        JsonStateStore(tmp_path).save(state)
+
+        def fail_projection(_state):
+            raise TypeError(canary)
+
+        monkeypatch.setattr(status_cli, "build_pr_ready_summary", fail_projection)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_summary("projection-failure", {"tasks": {"state_dir": str(tmp_path)}})
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.strip() == (
+            "Cannot generate PR-ready summary (pr_summary.state_invalid): Task state could not be projected safely."
+        )
+        assert canary not in captured.err
 
 
 class TestVersionFlag:
