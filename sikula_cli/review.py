@@ -370,6 +370,9 @@ def cmd_review(args: argparse.Namespace, cfg: dict, context: ReviewContext | Non
                         context.logger.info("No fixes needed — worktree removed")
             else:
                 success, committed, _ = context.finalize_worktree(worktree_base, git_root, state, commit_msg=fix_msg)
+                if success:
+                    state.worktree_path = None
+                    state.worktree_base = None
                 store.save(state)
                 if success:
                     if committed:

@@ -1528,6 +1528,8 @@ class TestCmdReviewFixStateStore:
         assert state.review_target_branch is None
         assert state.review_target_start_commit is None
         assert state.review_delivery_status is None
+        assert state.worktree_path is None
+        assert state.worktree_base is None
 
 
 # ---------------------------------------------------------------------------

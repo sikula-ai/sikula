@@ -111,6 +111,17 @@ delivery can no longer be retried from that state.
 Use `--reset-failed` only after a terminal failed state, as with other
 `review --fix` tasks.
 
+After a review-fix produces and delivers a publishable commit, its PR-ready
+handoff can be rendered without exposing the full audit state:
+
+```bash
+sikula summary <task-id>
+```
+
+Report-only review tasks are intentionally rejected because they do not
+represent an implementation result. No-change review-fix tasks do not have a
+commit to publish and are also rejected.
+
 ## Review Context
 
 `--description` or `--description-file` is required. Treat it like a PR description: explain what changed, why it changed, and what reviewers should care about.

@@ -264,8 +264,10 @@ def _implementation_asset_has_warning(record: dict) -> bool:
     return kind == "delivery" and not str(record.get("source_license") or "").strip()
 
 
-def _implementation_asset_warning_count(records: list[dict]) -> int:
-    return sum(1 for record in records if _implementation_asset_has_warning(record))
+def implementation_asset_warning_count(records: object) -> int:
+    if not isinstance(records, list):
+        return 0
+    return sum(1 for record in records if isinstance(record, dict) and _implementation_asset_has_warning(record))
 
 
 def _implementation_asset_target_warning_count(records: list[dict]) -> int:
@@ -367,7 +369,7 @@ def _final_summary(state: "TaskState") -> dict:
         "synthetic_test_harness_audits_count": len(state.synthetic_test_harness_records),
         "implementation_asset_records_count": len(state.implementation_asset_records),
         "implementation_asset_records_by_kind": _implementation_asset_kind_counts(state.implementation_asset_records),
-        "implementation_asset_warnings_count": _implementation_asset_warning_count(state.implementation_asset_records),
+        "implementation_asset_warnings_count": implementation_asset_warning_count(state.implementation_asset_records),
         "implementation_asset_drift_records_count": len(state.implementation_asset_drift_records),
         "implementation_asset_target_records_count": len(state.implementation_asset_target_records),
         "implementation_asset_target_warnings_count": _implementation_asset_target_warning_count(

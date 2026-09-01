@@ -31,6 +31,7 @@ Task operations:
   sikula run --task-id <task-id>     # resume existing task
   sikula status
   sikula show <task-id>
+  sikula summary <task-id>           # print privacy-safe PR-ready Markdown
   sikula cleanup <task-id> --force   # remove task worktree; keep state JSON
   sikula delete <task-id> --force    # remove task worktree and state JSON
   sikula review --branch feature/xyz --base-branch main --description-file pr.md
@@ -2994,6 +2995,10 @@ def cmd_show(task_id: str, cfg: dict) -> None:
     return cli_status.cmd_show(task_id, cfg, _status_context())
 
 
+def cmd_summary(task_id: str, cfg: dict) -> None:
+    return cli_status.cmd_summary(task_id, cfg, _status_context())
+
+
 def _cleanup_context() -> cli_cleanup.CleanupContext:
     return cli_cleanup.CleanupContext(
         resolve_state_dir=_resolve_state_dir,
@@ -3671,6 +3676,8 @@ def main() -> None:
         cmd_status(cfg, args)
     elif args.command == "show":
         cmd_show(args.task_id, cfg)
+    elif args.command == "summary":
+        cmd_summary(args.task_id, cfg)
     elif args.command == "cleanup":
         args.delete_state = False
         cmd_cleanup(args, cfg)

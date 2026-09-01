@@ -122,6 +122,7 @@ Each task has persistent state under `.sikula/state/`. Inspect it with:
 
 ```bash
 sikula show <task-id>
+sikula summary <task-id>
 ```
 
 State records:
@@ -138,6 +139,24 @@ State records:
 - final result metadata
 
 State is useful for audit and debugging. It may contain sensitive source or prompt context, so redact it before sharing.
+
+`sikula show` is the explicit full local audit view. For a completed isolated
+task or review-fix with a publishable commit, `sikula summary` instead
+emits a deterministic PR-ready Markdown projection. It includes only
+allowlisted state-derived metadata: bounded contract identity, final
+validation/review status, safe project-relative paths touched during the run,
+and aggregate recovered or residual signals. Touched paths are cumulative audit
+records and can include changes reverted before completion; they are not
+presented as an authoritative terminal diff. It never emits task or contract
+bodies, prompts, provider output, review prose, validation diagnostics, or
+absolute paths. Failed/incomplete tasks, delivery-unit child states, and
+report-only reviews fail closed because they do not represent a publishable
+implementation result.
+
+PR-ready summary generation requires a safe recorded branch, a full result or
+isolated-fix commit, and no preserved worktree. It rejects explicit cleanup records because they do
+not prove automatic finalization. No-change and `--no-isolate` runs do not have
+a standalone commit to publish and are intentionally unsupported.
 
 ## Learn & Adapt
 
