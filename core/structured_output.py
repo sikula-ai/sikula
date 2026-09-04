@@ -7,6 +7,8 @@ import json
 import re
 from typing import Any, Callable
 
+from markdown_it import MarkdownIt
+
 from core.delivery_public_metadata import sanitize_delivery_public_metadata
 
 
@@ -15,11 +17,8 @@ _DELIVERY_DISPOSITION_ADVERTISEMENT_RE = re.compile(
     r'(?<![A-Za-z0-9_])(?:"sikula_disposition_schema_version"|'
     r"'sikula_disposition_schema_version'|sikula_disposition_schema_version)[ \t\r\n]*:"
 )
-_DELIVERY_DISPOSITION_FENCE_OPEN_RE = re.compile(
-    r"(?P<fence>`{3,}|~{3,})[ \t]*json[ \t]*",
-    re.IGNORECASE,
-)
 _DELIVERY_DISPOSITION_FENCE_CLOSE_RE = re.compile(r"`{3,}|~{3,}")
+_DELIVERY_DISPOSITION_MARKDOWN = MarkdownIt("commonmark")
 
 DELIVERY_DISPOSITION_SCHEMA_VERSION = 1
 DELIVERY_DISPOSITION_APPROVED = "approved"
@@ -267,14 +266,18 @@ def _terminal_delivery_disposition_json(output: str) -> str:
         return ""
 
     final_line = lines[-1].strip()
-    if _DELIVERY_DISPOSITION_FENCE_CLOSE_RE.fullmatch(final_line):
-        for index in range(len(lines) - 2, -1, -1):
-            opening = _DELIVERY_DISPOSITION_FENCE_OPEN_RE.fullmatch(lines[index].strip())
-            if opening is None:
-                continue
-            opening_fence = opening.group("fence")
-            if opening_fence[0] == final_line[0] and len(final_line) >= len(opening_fence):
-                return "\n".join(lines[index + 1 : -1]).strip()
+    tokens = _DELIVERY_DISPOSITION_MARKDOWN.parse(output)
+    if tokens and tokens[-1].type == "fence":
+        fence = tokens[-1]
+        opening_fence = fence.markup
+        if (
+            fence.level == 0
+            and fence.info.strip().casefold() == "json"
+            and _DELIVERY_DISPOSITION_FENCE_CLOSE_RE.fullmatch(final_line)
+            and opening_fence[0] == final_line[0]
+            and len(final_line) >= len(opening_fence)
+        ):
+            return fence.content.strip()
     return final_line
 
 

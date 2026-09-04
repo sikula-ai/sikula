@@ -122,6 +122,15 @@ def test_parse_delivery_disposition_rejects_invalid_closing_fence(
     assert exc_info.value.code == "delivery_disposition.position_invalid"
 
 
+def test_parse_delivery_disposition_rejects_nested_opening_fence() -> None:
+    output = f"````json\nExplanation inside the outer block.\n```json\n{_payload(DELIVERY_DISPOSITION_APPROVED)}\n````"
+
+    with pytest.raises(DeliveryDispositionParseError) as exc_info:
+        parse_delivery_disposition(output, allowed_dispositions=DELIVERY_REVIEW_DISPOSITIONS)
+
+    assert exc_info.value.code == "delivery_disposition.json_invalid"
+
+
 def test_parse_delivery_disposition_accepts_pretty_terminal_fenced_json() -> None:
     payload = json.dumps(
         {
