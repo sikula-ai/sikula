@@ -270,7 +270,10 @@ def _terminal_delivery_disposition_json(output: str) -> str:
     if _DELIVERY_DISPOSITION_FENCE_CLOSE_RE.fullmatch(final_line):
         for index in range(len(lines) - 2, -1, -1):
             opening = _DELIVERY_DISPOSITION_FENCE_OPEN_RE.fullmatch(lines[index].strip())
-            if opening is not None and opening.group("fence") == final_line:
+            if opening is None:
+                continue
+            opening_fence = opening.group("fence")
+            if opening_fence[0] == final_line[0] and len(final_line) >= len(opening_fence):
                 return "\n".join(lines[index + 1 : -1]).strip()
     return final_line
 

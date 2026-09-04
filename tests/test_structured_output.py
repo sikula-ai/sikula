@@ -84,13 +84,19 @@ def test_parse_delivery_disposition_requires_json_as_final_non_empty_line() -> N
     assert exc_info.value.code == "delivery_disposition.position_invalid"
 
 
-@pytest.mark.parametrize("fence", ["```", "~~~~"])
-def test_parse_delivery_disposition_accepts_terminal_fenced_json(fence: str) -> None:
+@pytest.mark.parametrize(
+    ("opening_fence", "closing_fence"),
+    [("```", "```"), ("```", "````"), ("~~~~", "~~~~"), ("~~~", "~~~~")],
+)
+def test_parse_delivery_disposition_accepts_terminal_fenced_json(
+    opening_fence: str,
+    closing_fence: str,
+) -> None:
     output = (
         "Security checks: no blocking issue found.\n\n"
-        f"{fence}json\n"
+        f"{opening_fence}json\n"
         f"{_payload(DELIVERY_DISPOSITION_APPROVED, 'No blocking security issues found.')}\n"
-        f"{fence}\n"
+        f"{closing_fence}\n"
     )
 
     parsed = parse_delivery_disposition(output, allowed_dispositions=DELIVERY_REVIEW_DISPOSITIONS)
@@ -98,6 +104,22 @@ def test_parse_delivery_disposition_accepts_terminal_fenced_json(fence: str) -> 
     assert parsed is not None
     assert parsed.disposition == DELIVERY_DISPOSITION_APPROVED
     assert parsed.summary == "No blocking security issues found."
+
+
+@pytest.mark.parametrize(
+    ("opening_fence", "closing_fence"),
+    [("````", "```"), ("```", "~~~")],
+)
+def test_parse_delivery_disposition_rejects_invalid_closing_fence(
+    opening_fence: str,
+    closing_fence: str,
+) -> None:
+    output = f"{opening_fence}json\n{_payload(DELIVERY_DISPOSITION_APPROVED)}\n{closing_fence}"
+
+    with pytest.raises(DeliveryDispositionParseError) as exc_info:
+        parse_delivery_disposition(output, allowed_dispositions=DELIVERY_REVIEW_DISPOSITIONS)
+
+    assert exc_info.value.code == "delivery_disposition.position_invalid"
 
 
 def test_parse_delivery_disposition_accepts_pretty_terminal_fenced_json() -> None:
