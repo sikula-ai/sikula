@@ -172,7 +172,15 @@ def requires_delivery_no_change_verification_context(state: TaskState) -> bool:
     """Return whether the active gate must verify an already-satisfied claim."""
     if not is_delivery_implementation_already_satisfied(state):
         return False
-    return state.active_scope != "final_full_task" or not state.files_changed
+    if state.active_scope != "final_full_task":
+        return True
+
+    if not isinstance(state.files_changed, list) or not isinstance(state.test_files_written, list):
+        return False
+    test_writer_paths = {path for path in state.test_files_written if isinstance(path, str) and path.strip()}
+    return all(
+        isinstance(path, str) and bool(path.strip()) and path in test_writer_paths for path in state.files_changed
+    )
 
 
 def delivery_agent_prompt_context(
