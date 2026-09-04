@@ -444,7 +444,9 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
   Reviewer or Security Reviewer disposition may receive exactly one read-only
   protocol retry with the parser error included in its history. That retry must
   not consume a fix iteration or invoke a write agent, and a repeated malformed
-  result must fail closed.
+  result must fail closed. Parsers may normalize one terminal Markdown JSON fence
+  around the exact disposition object, but must reject trailing prose, multiple
+  schema markers, embedded objects, and ambiguous envelopes.
   `fix_in_scope` may continue the bounded fix loop;
   `requires_scope_amendment` and `external_dependency_gap` must stop the child
   immediately, preserve its audit evidence, and prevent later write agents,

@@ -7,6 +7,8 @@ import json
 import re
 from typing import Any, Callable
 
+from markdown_it import MarkdownIt
+
 from core.delivery_public_metadata import sanitize_delivery_public_metadata
 
 
@@ -15,6 +17,8 @@ _DELIVERY_DISPOSITION_ADVERTISEMENT_RE = re.compile(
     r'(?<![A-Za-z0-9_])(?:"sikula_disposition_schema_version"|'
     r"'sikula_disposition_schema_version'|sikula_disposition_schema_version)[ \t\r\n]*:"
 )
+_DELIVERY_DISPOSITION_FENCE_CLOSE_RE = re.compile(r"`{3,}|~{3,}")
+_DELIVERY_DISPOSITION_MARKDOWN = MarkdownIt("commonmark")
 
 DELIVERY_DISPOSITION_SCHEMA_VERSION = 1
 DELIVERY_DISPOSITION_APPROVED = "approved"
@@ -188,11 +192,11 @@ def parse_delivery_disposition(
     if not allowed_dispositions or not allowed_dispositions.issubset(DELIVERY_REVIEW_DISPOSITIONS):
         raise ValueError("allowed delivery dispositions must be a non-empty supported set")
 
-    json_text = next((line.strip() for line in reversed(output.splitlines()) if line.strip()), "")
+    json_text = _terminal_delivery_disposition_json(output)
     if not _DELIVERY_DISPOSITION_ADVERTISEMENT_RE.search(json_text):
         raise DeliveryDispositionParseError(
             "delivery_disposition.position_invalid",
-            "Delivery disposition JSON must be the final non-empty output line.",
+            "Delivery disposition JSON must be the final bare line or terminal JSON code block.",
         )
 
     try:
@@ -254,6 +258,27 @@ def parse_delivery_disposition(
         summary=sanitized_summary,
         recommended_action=recommended_action,
     )
+
+
+def _terminal_delivery_disposition_json(output: str) -> str:
+    lines = output.rstrip().splitlines()
+    if not lines:
+        return ""
+
+    final_line = lines[-1].strip()
+    tokens = _DELIVERY_DISPOSITION_MARKDOWN.parse(output)
+    if tokens and tokens[-1].type == "fence":
+        fence = tokens[-1]
+        opening_fence = fence.markup
+        if (
+            fence.level == 0
+            and fence.info.strip().casefold() == "json"
+            and _DELIVERY_DISPOSITION_FENCE_CLOSE_RE.fullmatch(final_line)
+            and opening_fence[0] == final_line[0]
+            and len(final_line) >= len(opening_fence)
+        ):
+            return fence.content.strip()
+    return final_line
 
 
 def _object_pairs_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

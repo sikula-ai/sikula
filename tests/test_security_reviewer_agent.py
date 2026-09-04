@@ -462,6 +462,21 @@ class TestSecurityReviewerDeliveryDispositions:
         assert state.review_issues == []
         assert state.security_review_cycle_records[-1]["disposition"]["recommended_action"] == "continue"
 
+    def test_fenced_approval_disposition_approves_delivery_child(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.readonly_result = (
+            "Security checks found no blocking issues.\n\n```json\n"
+            '{"sikula_disposition_schema_version":1,"disposition":"approved",'
+            '"summary":"No blocking security issues found."}\n```'
+        )
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is True
+        assert state.security_approved is True
+        assert "disposition_parse_error" not in state.security_review_cycle_records[-1]
+
     def test_legacy_approval_signal_does_not_approve_delivery_child(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state()
         _add_delivery_constraint_context(state)
