@@ -744,6 +744,49 @@ def test_cmd_delivery_prepare_blocks_unit_readiness_failures_without_artifacts(
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
 
 
+def test_cmd_delivery_prepare_reports_unresolved_scope_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_task(tmp_path)
+    (tmp_path / "app").mkdir()
+    draft = _authoring_draft(
+        unit_ids=["navigation"],
+        scope_paths=["app/main/model/Route.kt"],
+    )
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args("tasks/team-invites.md", json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(draft=draft),
+    )
+
+    payload_text = json.dumps(payload)
+    assert payload["errors"] == [
+        {
+            "code": "delivery_prepare.scope_declaration_invalid",
+            "message": "Generated delivery unit write scope could not be resolved; no source artifacts were finalized.",
+            "path": None,
+            "severity": "error",
+        },
+        {
+            "code": "delivery_prepare.scope_path_unresolved",
+            "message": (
+                "Generated write scope path 'app/main/model/Route.kt' has no existing parent directory; "
+                "declare an existing repository path or its nearest existing parent directory."
+            ),
+            "path": "units[0].scope_paths[0]",
+            "severity": "error",
+        },
+    ]
+    assert payload["unit_readiness"]["status"] == "not_run"
+    assert str(tmp_path) not in payload_text
+    assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
 def test_cmd_delivery_prepare_blocks_dropped_source_assets_without_exposing_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

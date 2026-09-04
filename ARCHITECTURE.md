@@ -368,6 +368,19 @@ compatible source-only child constraints are merged into the manifest-backed
 replacement declaration; conflicting repeated constraints fail closed. Other
 task asset syntax remains governed by the existing readiness checks rather than
 this delivery-specific preservation boundary.
+Automatically authored unit `scope_paths` are execution-boundary metadata and
+normally represent coarse repository ownership bounds rather than predictions of
+the concrete files an implementation will change. They may preserve repository
+paths explicitly required by the technical source task or established by trusted
+project context, but package, namespace, module, and import names are not filesystem
+path authority. Before readiness checks or artifact writes, the writer requires each
+generated non-empty path to name an existing entry or a new direct child of an
+existing directory. An unresolved declaration blocks with its unit field and
+project-relative value; Sikula neither guesses a replacement path nor broadens the
+explicit boundary to the repository default. Concrete file selection remains the
+responsibility of later repository-aware analysis within the pre-authorized upper
+bound. This prepare-only validity check does not change the compatible plan parser
+or runtime scope semantics for manually authored and existing plans.
 `core/delivery_prepare_writer.py` then checks the completed unit tasks for
 readiness in memory, writes `plan.yaml` and
 `units/<unit-id>.md` transactionally, validates the generated plan, and rolls

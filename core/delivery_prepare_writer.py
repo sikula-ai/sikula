@@ -28,7 +28,7 @@ from core.delivery_plan import (
     delivery_final_branch_for_plan_id,
     is_valid_delivery_branch_name,
 )
-from core.delivery_public_metadata import is_safe_delivery_public_metadata
+from core.delivery_public_metadata import is_safe_delivery_public_metadata, sanitize_delivery_public_metadata
 from core.markdown_headings import MarkdownHeadingScanner, normalize_heading
 
 
@@ -45,6 +45,7 @@ _FAILURE_WRITE_FAILED = "write_failed"
 _FAILURE_CONSTRAINT_REVIEW_REQUIRED = "constraint_review_required"
 _FAILURE_CONSTRAINT_CONFLICT = "constraint_conflict"
 _FAILURE_UNIT_CONTEXT_INCOMPLETE = "unit_context_incomplete"
+_FAILURE_SCOPE_DECLARATION_BLOCKED = "scope_declaration_blocked"
 _ROLLBACK_FAILED_MESSAGE = "Delivery prepare failed while restoring artifacts; inspect the selected output directory."
 _FORBIDDEN_OUTPUT_ROOTS = (
     (".git",),
@@ -433,6 +434,15 @@ def write_delivery_prepare_artifacts(
             errors=asset_issues,
         )
 
+    scope_issues = _unresolved_scope_path_issues(draft, root)
+    if scope_issues:
+        return _blocked_result(
+            paths,
+            unit_task_paths=unit_task_paths,
+            failure_reason=_FAILURE_SCOPE_DECLARATION_BLOCKED,
+            errors=scope_issues,
+        )
+
     try:
         unit_readiness = _check_unit_readiness(draft, unit_task_paths, project_config=project_config)
     except (OSError, RuntimeError, ValueError, KeyError):
@@ -677,6 +687,37 @@ def _constraint_stop_issue(draft: DeliveryAuthoringDraft) -> DeliveryPrepareWrit
                 f"constraints[{index}].disposition",
             )
     return None
+
+
+def _unresolved_scope_path_issues(
+    draft: DeliveryAuthoringDraft,
+    project_root: Path,
+) -> list[DeliveryPrepareWriteIssue]:
+    issues: list[DeliveryPrepareWriteIssue] = []
+    for unit_index, unit in enumerate(draft.units):
+        for scope_index, scope_path in enumerate(unit.scope_paths):
+            candidate = project_root.joinpath(*PurePosixPath(scope_path).parts)
+            try:
+                entry_exists = candidate.exists() or candidate.is_symlink()
+                parent_exists = candidate.parent.is_dir()
+            except OSError:
+                entry_exists = False
+                parent_exists = False
+            if entry_exists or parent_exists:
+                continue
+            display_path = sanitize_delivery_public_metadata(scope_path) or "<redacted>"
+            issues.append(
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.scope_path_unresolved",
+                    (
+                        f"Generated write scope path '{display_path}' has no existing parent directory; "
+                        "declare an existing repository path or its nearest existing parent directory."
+                    ),
+                    f"units[{unit_index}].scope_paths[{scope_index}]",
+                )
+            )
+    return issues
 
 
 def _constraint_verification_stop_issues(draft: DeliveryAuthoringDraft) -> list[DeliveryPrepareWriteIssue]:

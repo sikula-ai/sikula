@@ -115,7 +115,11 @@ The delivery slice is described as product behavior with observable outcomes.
 """
 
 
-def _authoring_output(*, planning_mode: str | None = "fixed_window", warnings: list[str] | None = None) -> str:
+def _authoring_output(
+    *,
+    planning_mode: str | None = "fixed_window",
+    warnings: list[str] | None = None,
+) -> str:
     data = {
         "plan_id": "team-invites",
         "title": "Team invites delivery",
@@ -322,6 +326,11 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert "must include all of these exact contract-ready section headings" in prompt
     assert "Validation sections must include explicit commands" in prompt
     assert "asset_paths must contain only paths declared" in prompt
+    assert "scope_paths are execution-boundary metadata" in prompt
+    assert "explicit repository path required by the source task" in prompt
+    assert "never derive a filesystem path from a package" in prompt
+    assert "Prefer stable existing module or directory ownership" in prompt
+    assert "For a new path, its direct parent directory must" in prompt
     assert "least one relevant unit" in prompt
     assert "must not include an asset-root section" in prompt
     assert "Deterministic writer code renders assigned source declarations" in prompt
