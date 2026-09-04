@@ -196,6 +196,37 @@ class TestTestWriterAgentSuccess:
         assert "src/current.py" in prompt
         assert "src/previous.py" not in prompt
 
+    def test_already_satisfied_current_step_does_not_reuse_prior_step_files(
+        self,
+        stub_llm: StubLLMClient,
+        file_tool,
+        git_tool,
+    ):
+        git_tool.diff_head = MagicMock(return_value=ToolResult(success=True, output=""))
+        state = _make_state(
+            plan=["Change previous module", "Verify current module"],
+            current_step=1,
+            files_changed=["src/previous.py"],
+            step_file_tracking_enabled=True,
+            step_files_changed=[],
+            delivery_plan_id="demo-plan",
+            delivery_unit_id="feature-unit",
+            delivery_no_change_outcome="already_satisfied",
+        )
+
+        result = _make_agent(
+            stub_llm,
+            file_tool=file_tool,
+            git_tool=git_tool,
+            project_config=_config_with_test_paths(),
+        ).run(state)
+
+        assert result.success
+        git_tool.diff_head.assert_not_called()
+        prompt = stub_llm.agent_calls[0]
+        assert "NO-CHANGE DELIVERY TEST SCOPE" in prompt
+        assert "src/previous.py" not in prompt
+
     def test_final_scope_uses_complete_change_context(self, stub_llm: StubLLMClient, file_tool, git_tool):
         git_tool.diff_head = MagicMock(return_value=ToolResult(success=True, output="full diff"))
         state = _make_state(

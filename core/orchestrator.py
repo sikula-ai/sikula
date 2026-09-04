@@ -1062,8 +1062,9 @@ class Orchestrator:
                 state.failed = True
                 self._store.save(state)
                 return False
-            if not state.files_changed:
-                dirty = self._worktree_dirty_files(state)
+            implementation_files = (result.data or {}).get("files_written", [])
+            if not implementation_files:
+                dirty = self._worktree_dirty_files(state) if not state.files_changed else []
                 if dirty:
                     log.warning(
                         "Implementer made no new writes but worktree has %d uncommitted file(s) — adopting them",
@@ -1104,7 +1105,6 @@ class Orchestrator:
                     )
                     state.step_implemented = True
                     self._store.save(state)
-                    return True
             state.step_implemented = True
             self._store.save(state)
 

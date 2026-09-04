@@ -19,7 +19,10 @@ from agents.base_agent import (
     record_write_path_warnings as _record_write_path_warnings,
     tech_stack as _tech_stack,
 )
-from agents.delivery_contracts import is_delivery_implementation_already_satisfied
+from agents.delivery_contracts import (
+    is_delivery_implementation_already_satisfied,
+    requires_delivery_no_change_verification_context,
+)
 from core.state import TaskState
 from core.synthetic_test_harness_audit import prompt_context_for_records as _synthetic_harness_prompt_context
 
@@ -274,10 +277,11 @@ _SCOPE_FINAL_FULL_TASK = "final_full_task"
 
 _DELIVERY_ALREADY_SATISFIED_TEST_CONTEXT = """\
 NO-CHANGE DELIVERY TEST SCOPE:
-The Implementer reported `already_satisfied`, so there may be no changed production
-file or diff. Treat that report as a claim to verify. Inspect the existing implementation
-and tests for the active task or step. Add tests only when its required behavior lacks
-meaningful coverage in the configured test surface; otherwise make no changes.\
+The Implementer reported `already_satisfied` for the active task or step, so that
+implementation scope produced no new files. Treat that report as a claim to verify.
+Inspect the existing implementation and tests for the active requirements. Add tests only
+when the required behavior lacks meaningful coverage in the configured test surface;
+otherwise make no changes.\
 """
 
 
@@ -309,7 +313,6 @@ def _change_context_files(state: TaskState) -> tuple[list[str], bool]:
         and state.active_scope != _SCOPE_FINAL_FULL_TASK
         and state.step_file_tracking_enabled is True
         and isinstance(step_files, list)
-        and step_files
         and all(isinstance(path, str) and path.strip() for path in step_files)
     ):
         return list(step_files), True
@@ -397,10 +400,12 @@ class TestWriterAgent(BaseAgent):
         coverage_target = self.project_config.get("test_writer", {}).get("coverage_target", _DEFAULT_COVERAGE_TARGET)
         test_surface_policy = _test_surface_policy(self.project_config)
         change_context_files, active_step_context = _change_context_files(state)
-        no_change_delivery_context = already_satisfied and not change_context_files
+        no_change_delivery_context = (
+            requires_delivery_no_change_verification_context(state) and not change_context_files
+        )
 
         diff = ""
-        if git_tool:
+        if git_tool and (change_context_files or not active_step_context):
             result = git_tool.diff_head(change_context_files if active_step_context else None)
             if result.success and result.output.strip():
                 diff = result.output[:_MAX_DIFF_CHARS]

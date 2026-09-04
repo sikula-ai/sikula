@@ -168,6 +168,13 @@ def is_delivery_implementation_already_satisfied(state: TaskState) -> bool:
     )
 
 
+def requires_delivery_no_change_verification_context(state: TaskState) -> bool:
+    """Return whether the active gate must verify an already-satisfied claim."""
+    if not is_delivery_implementation_already_satisfied(state):
+        return False
+    return state.active_scope != "final_full_task" or not state.files_changed
+
+
 def delivery_agent_prompt_context(
     state: TaskState,
     *,

@@ -135,6 +135,26 @@ class TestReviewerAgentGuards:
         assert "NO-CHANGE DELIVERY REVIEW" in stub_llm.readonly_calls[0]
         assert "no implementation diff" in stub_llm.readonly_calls[0]
 
+    def test_delivery_already_satisfied_step_after_prior_edits_keeps_no_change_review_context(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
+        stub_llm.readonly_result = _delivery_approval_output()
+        state = _make_state(
+            files_changed=["src/earlier.py"],
+            plan=["Change earlier behavior", "Verify existing wiring"],
+            current_step=1,
+            step_file_tracking_enabled=True,
+            step_files_changed=[],
+            delivery_no_change_outcome="already_satisfied",
+        )
+        _add_delivery_constraint_context(state)
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success
+        assert "NO-CHANGE DELIVERY REVIEW" in stub_llm.readonly_calls[0]
+        assert "displayed diff may contain earlier planner" in stub_llm.readonly_calls[0]
+
     def test_no_file_tool_returns_failure(self, stub_llm: StubLLMClient):
         state = _make_state()
         agent = _make_agent(stub_llm)

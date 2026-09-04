@@ -27,6 +27,7 @@ from agents.delivery_contracts import (
     classify_delivery_review_disposition,
     delivery_agent_prompt_context,
     is_delivery_implementation_already_satisfied,
+    requires_delivery_no_change_verification_context,
 )
 from core.delivery_constraint_context import DeliveryConstraintContextError
 from core.delivery_write_scope import DeliveryWriteScopeError
@@ -191,11 +192,13 @@ that affect security-sensitive behavior.\
 _DELIVERY_ALREADY_SATISFIED_SECURITY_CONTEXT = """\
 ---
 NO-CHANGE DELIVERY SECURITY REVIEW:
-The Implementer reported `already_satisfied`, so there is no implementation diff.
-Treat that report as a claim to verify, not as approval. Inspect the current repository
-state and approve only if the task-required behavior already satisfies the applicable
-security boundaries. Report blocking security defects in that required behavior even
-though they were not introduced by a changed file; ignore unrelated pre-existing issues.\
+The Implementer reported `already_satisfied` for the active task or step, so that
+implementation scope produced no new files. A displayed diff may contain earlier planner
+steps or downstream test changes. Treat the report as a claim to verify, not as approval.
+Inspect the current repository state and approve only if the active task-required behavior
+already satisfies the applicable security boundaries. Report blocking security defects in
+that required behavior even though they were not introduced by a changed file; ignore
+unrelated pre-existing issues.\
 """
 
 _SCOPE_FINAL_FULL_TASK = "final_full_task"
@@ -214,6 +217,7 @@ class SecurityReviewerAgent(BaseAgent):
         if not state.implementation_prompt:
             return AgentResult(success=False, message="No implementation prompt in state")
         already_satisfied = is_delivery_implementation_already_satisfied(state)
+        verify_no_change = requires_delivery_no_change_verification_context(state)
         if not state.files_changed and not already_satisfied:
             return AgentResult(success=False, message="No changed files to review")
 
@@ -254,7 +258,7 @@ class SecurityReviewerAgent(BaseAgent):
                 if len(result.output) > _MAX_DIFF_CHARS:
                     diff += "\n... (diff truncated)"
         if not diff:
-            if already_satisfied and not state.files_changed:
+            if verify_no_change:
                 diff = "(no implementation diff; inspect the current repository state)"
             else:
                 diff = "(diff not available — use Read tool to inspect changed files)"
@@ -286,11 +290,7 @@ class SecurityReviewerAgent(BaseAgent):
             + "\n\n"
             + (delivery_context.effective_write_scope + "\n\n" if delivery_child else "")
             + (delivery_context.disposition_contract + "\n\n" if delivery_child else "")
-            + (
-                _DELIVERY_ALREADY_SATISFIED_SECURITY_CONTEXT + "\n\n"
-                if already_satisfied and not state.files_changed
-                else ""
-            )
+            + (_DELIVERY_ALREADY_SATISFIED_SECURITY_CONTEXT + "\n\n" if verify_no_change else "")
             + step_scope
             + ("\n\n" if step_scope else "")
             + _USER_SECURITY.format(
