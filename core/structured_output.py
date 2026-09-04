@@ -15,6 +15,11 @@ _DELIVERY_DISPOSITION_ADVERTISEMENT_RE = re.compile(
     r'(?<![A-Za-z0-9_])(?:"sikula_disposition_schema_version"|'
     r"'sikula_disposition_schema_version'|sikula_disposition_schema_version)[ \t\r\n]*:"
 )
+_DELIVERY_DISPOSITION_FENCE_OPEN_RE = re.compile(
+    r"(?P<fence>`{3,}|~{3,})[ \t]*json[ \t]*",
+    re.IGNORECASE,
+)
+_DELIVERY_DISPOSITION_FENCE_CLOSE_RE = re.compile(r"`{3,}|~{3,}")
 
 DELIVERY_DISPOSITION_SCHEMA_VERSION = 1
 DELIVERY_DISPOSITION_APPROVED = "approved"
@@ -188,11 +193,11 @@ def parse_delivery_disposition(
     if not allowed_dispositions or not allowed_dispositions.issubset(DELIVERY_REVIEW_DISPOSITIONS):
         raise ValueError("allowed delivery dispositions must be a non-empty supported set")
 
-    json_text = next((line.strip() for line in reversed(output.splitlines()) if line.strip()), "")
+    json_text = _terminal_delivery_disposition_json(output)
     if not _DELIVERY_DISPOSITION_ADVERTISEMENT_RE.search(json_text):
         raise DeliveryDispositionParseError(
             "delivery_disposition.position_invalid",
-            "Delivery disposition JSON must be the final non-empty output line.",
+            "Delivery disposition JSON must be the final bare line or terminal JSON code block.",
         )
 
     try:
@@ -254,6 +259,20 @@ def parse_delivery_disposition(
         summary=sanitized_summary,
         recommended_action=recommended_action,
     )
+
+
+def _terminal_delivery_disposition_json(output: str) -> str:
+    lines = output.rstrip().splitlines()
+    if not lines:
+        return ""
+
+    final_line = lines[-1].strip()
+    if _DELIVERY_DISPOSITION_FENCE_CLOSE_RE.fullmatch(final_line):
+        for index in range(len(lines) - 2, -1, -1):
+            opening = _DELIVERY_DISPOSITION_FENCE_OPEN_RE.fullmatch(lines[index].strip())
+            if opening is not None and opening.group("fence") == final_line:
+                return "\n".join(lines[index + 1 : -1]).strip()
+    return final_line
 
 
 def _object_pairs_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

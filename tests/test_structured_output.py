@@ -84,6 +84,59 @@ def test_parse_delivery_disposition_requires_json_as_final_non_empty_line() -> N
     assert exc_info.value.code == "delivery_disposition.position_invalid"
 
 
+@pytest.mark.parametrize("fence", ["```", "~~~~"])
+def test_parse_delivery_disposition_accepts_terminal_fenced_json(fence: str) -> None:
+    output = (
+        "Security checks: no blocking issue found.\n\n"
+        f"{fence}json\n"
+        f"{_payload(DELIVERY_DISPOSITION_APPROVED, 'No blocking security issues found.')}\n"
+        f"{fence}\n"
+    )
+
+    parsed = parse_delivery_disposition(output, allowed_dispositions=DELIVERY_REVIEW_DISPOSITIONS)
+
+    assert parsed is not None
+    assert parsed.disposition == DELIVERY_DISPOSITION_APPROVED
+    assert parsed.summary == "No blocking security issues found."
+
+
+def test_parse_delivery_disposition_accepts_pretty_terminal_fenced_json() -> None:
+    payload = json.dumps(
+        {
+            "sikula_disposition_schema_version": 1,
+            "disposition": DELIVERY_DISPOSITION_FIX_IN_SCOPE,
+            "summary": "One bounded correction is required.",
+        },
+        indent=2,
+    )
+
+    parsed = parse_delivery_disposition(
+        f"Review findings follow.\n\n```JSON\n{payload}\n```",
+        allowed_dispositions=DELIVERY_REVIEW_DISPOSITIONS,
+    )
+
+    assert parsed is not None
+    assert parsed.disposition == DELIVERY_DISPOSITION_FIX_IN_SCOPE
+
+
+def test_parse_delivery_disposition_rejects_prose_after_fenced_json() -> None:
+    output = f"```json\n{_payload(DELIVERY_DISPOSITION_APPROVED)}\n```\nAPPROVED"
+
+    with pytest.raises(DeliveryDispositionParseError) as exc_info:
+        parse_delivery_disposition(output, allowed_dispositions=DELIVERY_REVIEW_DISPOSITIONS)
+
+    assert exc_info.value.code == "delivery_disposition.position_invalid"
+
+
+def test_parse_delivery_disposition_rejects_prose_inside_fenced_json() -> None:
+    output = f"```json\nDecision: {_payload(DELIVERY_DISPOSITION_APPROVED)}\n```"
+
+    with pytest.raises(DeliveryDispositionParseError) as exc_info:
+        parse_delivery_disposition(output, allowed_dispositions=DELIVERY_REVIEW_DISPOSITIONS)
+
+    assert exc_info.value.code == "delivery_disposition.json_invalid"
+
+
 @pytest.mark.parametrize(
     "output",
     [

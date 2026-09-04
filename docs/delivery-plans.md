@@ -684,7 +684,9 @@ recorded, the child does not start another write agent or continue into later
 review, test-writing, validation, commit, handoff, or assembly phases.
 One malformed Reviewer or Security Reviewer disposition receives a read-only retry
 with protocol feedback and does not consume a fix iteration. A repeated malformed
-result fails the child without starting a write agent.
+result fails the child without starting a write agent. Review prompts request the
+disposition as a bare final JSON line; the parser also tolerates one terminal Markdown
+JSON fence, but not trailing verdict text, embedded JSON, or multiple schema markers.
 If Implementer output advertises the disposition schema marker but is malformed,
 Sikula stores bounded parser metadata, stops with
 `implementer_disposition_invalid`, and applies the same no-later-phase and

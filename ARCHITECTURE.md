@@ -1779,8 +1779,11 @@ means after reviewer approval; if `run_review: false`, it still runs unless
   treated as blocking — same as blocking issues path
 
 For a delivery child, all-clear and warning-only output use the explicit `approved`
-JSON disposition on the final non-empty line. One malformed or missing disposition
-is retried read-only with protocol feedback and without consuming a security fix attempt.
+JSON disposition as the terminal output object. The canonical form is a bare final
+line; parser normalization also accepts one terminal Markdown JSON fence while still
+rejecting trailing prose and ambiguous or embedded objects. One malformed or missing
+disposition is retried read-only with protocol feedback and without consuming a security
+fix attempt.
 
 **Iteration limit:** uses `config.max_security_review_iterations` (independent of `config.max_review_iterations`); timeout sets `state.failed = True`.
 
