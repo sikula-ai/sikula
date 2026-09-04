@@ -1105,6 +1105,8 @@ class Orchestrator:
                     )
                     state.step_implemented = True
                     self._store.save(state)
+                    if action == "step_skipped":
+                        return True
             state.step_implemented = True
             self._store.save(state)
 
