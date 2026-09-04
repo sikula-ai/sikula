@@ -1673,6 +1673,22 @@ class TestTaskStateChildDeliveryMetadata:
         assert loaded.delivery_stop_code_from_disposition() == "external_dependency_gap"
         assert loaded.history[-1]["action"] == "delivery_stop_disposition"
 
+    def test_delivery_no_change_outcome_roundtrips(self, tmp_path: Path):
+        state = TaskState(
+            task_id="delivery-noop",
+            task_description="delivery child",
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_no_change_outcome="already_satisfied",
+        )
+        store = JsonStateStore(tmp_path)
+
+        store.save(state)
+        loaded = store.load(state.task_id)
+
+        assert loaded is not None
+        assert loaded.delivery_no_change_outcome == "already_satisfied"
+
     def test_scope_amendment_disposition_requires_review_source(self):
         parsed = parse_delivery_disposition(
             json.dumps(

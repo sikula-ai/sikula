@@ -799,6 +799,13 @@ valid only for non-delivery review output; persisted delivery approvals do not n
 their original provider output reparsed.
 Approval records remain in review-cycle audit history but are excluded from terminal
 stop and amendment failure evidence.
+The Implementer may emit `already_satisfied` only when repository inspection shows
+that the active delivery task or planner step is complete and its provider call has
+a clean no-change result. The agent records this bounded positive outcome, and the
+orchestrator continues through all configured review, security, test-writing, and
+validation gates. A changed-file result carrying `already_satisfied`, or a delivery
+no-op without this explicit outcome, fails closed. Standalone task no-change behavior
+is unchanged.
 `fix_in_scope` keeps the normal bounded fix path.
 Reviewer and Security Reviewer prompts receive the current validated runtime
 production scope before making that decision, including exact-file versus path-prefix
@@ -1650,6 +1657,10 @@ file that was already dirty before the run is still detected as changed if the a
 
 **Output written to state:**
 - `state.files_changed` — paths detected via git diff.
+- `state.delivery_no_change_outcome` — `already_satisfied` only for a parser-validated
+  delivery Implementer outcome paired with an empty changed-file set; cleared by a
+  later changed or unclassified Implementer result. It allows configured downstream
+  gates and no-op finalization to complete without treating free-form prose as control data.
 
 ---
 
@@ -2188,6 +2199,7 @@ Sikula processes at once is still unsupported.
 | `delivery_stop_code` | `str \| None` | Orchestrator | Closed-set terminal child boundary outcome. Includes scope violation, scope-amendment, external-dependency, and invalid-advertised-Implementer-disposition stops; forces failed/not-done state and blocks unchanged reset recovery. |
 | `delivery_stop_disposition` | `dict \| None` | Delivery agents / Orchestrator | Parser-validated bounded disposition, sanitized summary, recovery action, source, schema version, and timestamp. Raw provider output remains in the agent cycle record and is not projected to parent progress. |
 | `delivery_disposition_parse_error` | `dict \| None` | ImplementerAgent / Orchestrator | Bounded durable evidence that Implementer output advertised the delivery-disposition marker but was malformed: schema version, stable parser error code, source, and timestamp only. Drives terminal `implementer_disposition_invalid` without storing raw output in the control field. |
+| `delivery_no_change_outcome` | `str \| None` | ImplementerAgent | Closed positive delivery no-change outcome. The only supported value is `already_satisfied`, accepted only from a parser-validated Implementer result with no changed files. It permits downstream gates and no-op completion but is not a terminal stop or amendment evidence. |
 | `delivery_constraint_context_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Version marker for the inherited-constraint snapshot. New delivery children use the current version even when no constraints apply; legacy and non-delivery state keep `None`. |
 | `delivery_source_task` | `dict[str, str] \| None` | `delivery run-next` / `cmd_run()` | Allowlisted project-relative source-task path and SHA-256 binding copied from the validated parent plan. Raw source task text and absolute paths are never persisted here. |
 | `delivery_inherited_constraints` | `list[dict]` | `delivery run-next` / `cmd_run()` | Bounded normalized parent-plan constraints whose unit references include this child. The snapshot is private audit/context data and is not projected through ordinary delivery output. |

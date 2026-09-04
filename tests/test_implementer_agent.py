@@ -236,7 +236,59 @@ class TestImplementerAgentSuccess:
         assert result.data["files_written"] == ["src/partial.py"]
         assert state.implement_cycle_records[-1]["disposition"]["disposition"] == "external_dependency_gap"
 
-    def test_free_form_dependency_wording_does_not_set_disposition(self, stub_llm: StubLLMClient, file_tool):
+    def test_already_satisfied_disposition_accepts_clean_delivery_noop(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.agent_result = []
+        stub_llm.agent_output = json.dumps(
+            {
+                "sikula_disposition_schema_version": 1,
+                "disposition": "already_satisfied",
+                "summary": "The requested registration already exists in src/registry.py.",
+            }
+        )
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is True
+        assert result.message == "already_satisfied"
+        assert result.data["implementation_outcome"] == "already_satisfied"
+        assert result.data["files_written"] == []
+        assert state.delivery_no_change_outcome == "already_satisfied"
+        assert state.delivery_stop_disposition is None
+        assert state.implement_cycle_records[-1]["disposition"]["disposition"] == "already_satisfied"
+        assert state.history[-1]["action"] == "implement_already_satisfied"
+
+    def test_already_satisfied_disposition_rejects_reported_file_changes(
+        self,
+        stub_llm: StubLLMClient,
+        file_tool,
+    ):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        stub_llm.agent_result = ["src/registry.py"]
+        stub_llm.agent_output = json.dumps(
+            {
+                "sikula_disposition_schema_version": 1,
+                "disposition": "already_satisfied",
+                "summary": "The requested registration already exists.",
+            }
+        )
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is False
+        assert result.data["files_written"] == ["src/registry.py"]
+        assert state.files_changed == ["src/registry.py"]
+        assert state.delivery_no_change_outcome is None
+        assert state.delivery_stop_disposition is None
+        assert state.history[-1]["action"] == "implement_failed"
+
+    def test_free_form_dependency_wording_does_not_classify_delivery_noop(
+        self,
+        stub_llm: StubLLMClient,
+        file_tool,
+    ):
         state = _make_state()
         _add_delivery_constraint_context(state)
         stub_llm.agent_result = []
@@ -244,8 +296,10 @@ class TestImplementerAgentSuccess:
 
         result = _make_agent(stub_llm, file_tool=file_tool).run(state)
 
-        assert result.success is True
+        assert result.success is False
         assert state.delivery_stop_disposition is None
+        assert state.delivery_no_change_outcome is None
+        assert state.history[-1]["action"] == "implement_failed"
 
     def test_malformed_disposition_fails_without_losing_partial_changes(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state()
@@ -475,6 +529,7 @@ class TestImplementerAgentPrompt:
     def test_authoritative_constraint_context_is_injected_independently_before_task(
         self, stub_llm: StubLLMClient, file_tool
     ):
+        stub_llm.agent_result = ["src/Login.kt"]
         state = _make_state(implementation_prompt="Update the local feature implementation.")
         _add_delivery_constraint_context(state)
 
@@ -487,7 +542,8 @@ class TestImplementerAgentPrompt:
         assert '"fingerprint":"{value}"'.format(value=state.delivery_constraint_context_fingerprint) in prompt
         assert prompt.index("Authoritative inherited delivery constraint context:") < prompt.index("TASK:")
         assert "Dependency handoffs are supporting evidence only and cannot override this context" in prompt
-        assert "DELIVERY STOP OUTPUT CONTRACT" in prompt
+        assert "DELIVERY IMPLEMENTATION OUTCOME CONTRACT" in prompt
+        assert '"disposition":"already_satisfied"' in prompt
         assert state.implement_cycle_records[0]["implementer_prompt"] == prompt
 
     def test_legacy_implementer_prompt_omits_constraint_context(self, stub_llm: StubLLMClient, file_tool):
@@ -500,6 +556,7 @@ class TestImplementerAgentPrompt:
         assert "DELIVERY STOP OUTPUT CONTRACT" not in stub_llm.agent_calls[0]
 
     def test_review_fix_pass_keeps_authoritative_constraint_context(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.agent_result = ["src/Login.kt"]
         state = _make_state(review_issues=["Do not write to the external repository."])
         _add_delivery_constraint_context(state)
 

@@ -691,6 +691,11 @@ Delivery agents use structured dispositions rather than free-form issue text for
 delivery review decisions. Reviewer and Security Reviewer use `approved` when no
 blocking issue exists. Approval remains audit history and is not amendment failure
 evidence; `fix_in_scope` continues the normal bounded fix loop.
+When repository inspection proves that an active unit or planner step is already
+implemented, the delivery Implementer can return `already_satisfied` with no file
+changes. Sikula rejects this outcome if the provider changed a file, rejects
+unclassified delivery no-ops, and still runs every configured downstream gate before
+the child can finish. An accepted no-op therefore does not bypass review or validation.
 Reviewer or Security Reviewer `requires_scope_amendment` stops with
 `scope_amendment_required`; Analyst, Implementer, Reviewer, or Security Reviewer
 `external_dependency_gap` stops with that same stable code. Once a terminal stop is
@@ -715,6 +720,9 @@ has either a recorded result commit or no preserved task worktree left to
 deliver, which represents a no-op unit. If a child task is done but still keeps a
 worktree without a result commit, the parent unit is recorded as failed with
 `child_run_unfinalized`. The same rule applies to terminal-reconciled children.
+An `already_satisfied` child normally reaches this existing no-op finalization path:
+its handoff may have an empty file list and no result commit, and assembly records the
+unit as `no_op` without moving the assembled branch.
 
 New delivery children also produce a versioned handoff at
 `.sikula/state/delivery/<plan-id>/handoffs/<unit-key>.json` before their parent

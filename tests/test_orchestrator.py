@@ -6873,6 +6873,129 @@ class TestOrchestratorInterruptResume:
             ("final_full_task", ["src/current.py"]),
         ]
 
+    def test_delivery_single_pass_already_satisfied_runs_remaining_gates(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=False,
+        )
+
+        def already_satisfied(state: TaskState) -> None:
+            state.delivery_no_change_outcome = "already_satisfied"
+
+        stubs["implementer"].side_effect = already_satisfied
+        stubs["implementer"].result_data = {
+            "files_written": [],
+            "implementation_outcome": "already_satisfied",
+        }
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan_decided=True,
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done is True
+        assert result.failed is False
+        assert result.files_changed == []
+        assert len(stubs["implementer"].calls) == 1
+        assert len(stubs["reviewer"].calls) == 1
+        assert len(stubs["security_reviewer"].calls) == 1
+        assert build.compile_calls == 1
+        assert build.test_calls == 1
+        assert any(record["action"] == "implementation_already_satisfied" for record in result.history)
+
+    def test_delivery_single_pass_rejects_unclassified_no_change_result(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=False,
+        )
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan_decided=True,
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done is False
+        assert result.failed is True
+        assert not stubs["reviewer"].calls
+        assert not stubs["security_reviewer"].calls
+        assert build.compile_calls == 0
+
+    def test_delivery_single_pass_resumes_after_persisted_already_satisfied_outcome(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=False,
+        )
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan_decided=True,
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_no_change_outcome="already_satisfied",
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done is True
+        assert result.failed is False
+        assert not stubs["implementer"].calls
+        assert len(stubs["reviewer"].calls) == 1
+        assert len(stubs["security_reviewer"].calls) == 1
+
+    def test_delivery_step_plan_accepts_only_explicit_already_satisfied_noops(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+
+        def already_satisfied(state: TaskState) -> None:
+            state.delivery_no_change_outcome = "already_satisfied"
+
+        stubs["implementer"].side_effect = already_satisfied
+        stubs["implementer"].result_data = {
+            "files_written": [],
+            "implementation_outcome": "already_satisfied",
+        }
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: verify registration", "Step 2: verify wiring"],
+            plan_decided=True,
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 2},
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done is True
+        assert result.failed is False
+        assert result.files_changed == []
+        assert len(stubs["implementer"].calls) == 2
+        assert [record["action"] for record in result.history].count("step_already_satisfied") == 2
+        assert any(record["action"] == "plan_already_satisfied" for record in result.history)
+
     def test_step_loop_no_changes_advances_to_next_step(self, tmp_path: Path):
         """Step with no file changes must not abort — treat as already implemented and advance."""
         orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=True, run_build=False)

@@ -47,14 +47,24 @@ disposition value and never wrap the object in another JSON structure.\
 """
 
 _IMPLEMENTATION_DISPOSITION_CONTRACT = """\
-DELIVERY STOP OUTPUT CONTRACT:
+DELIVERY IMPLEMENTATION OUTCOME CONTRACT:
+If and only if repository inspection proves that every requirement in the active task
+or current step is already present and no file needs to change, make your final
+response exactly one flat JSON object:
+{"sikula_disposition_schema_version":1,"disposition":"already_satisfied","summary":"<bounded single-line project-relative evidence>"}
+
+Use `already_satisfied` only for a clean no-change result. Do not use it after writing
+files, merely because a previous unit or commit claims the work is complete, or when
+any requirement remains uncertain. Sikula will still run its configured review,
+security, test-writing, and validation gates.
+
 If implementation cannot safely continue because a required change is owned by an
 external repository or unavailable dependency, stop writing immediately and make your
 final response exactly one flat JSON object:
 {"sikula_disposition_schema_version":1,"disposition":"external_dependency_gap","summary":"<one bounded single-line summary>"}
 
 This disposition remains required if you already made partial in-scope changes. Do not
-emit it for ordinary implementation failures, uncertainty, no-change completion, or a
+emit it for ordinary implementation failures, uncertainty, or a
 change that can be made within the current task and write scope. Never emit review-only
 dispositions and never wrap the object in another JSON structure.
 """

@@ -70,6 +70,7 @@ from core.state import (
     StateStore,
     TaskState,
 )
+from core.structured_output import DELIVERY_DISPOSITION_ALREADY_SATISFIED
 from core.synthetic_test_harness_audit import (
     active_findings_for_current_files as active_synthetic_harness_findings_for_current_files,
 )
@@ -164,6 +165,16 @@ _TEST_GATE_AUDIT_SOURCE_SUFFIXES = (
 
 def _phase_scope_label(state: TaskState) -> str:
     return "final full-task " if state.active_scope == _SCOPE_FINAL_FULL_TASK else ""
+
+
+def _delivery_implementation_already_satisfied(state: TaskState) -> bool:
+    return bool(
+        isinstance(state.delivery_plan_id, str)
+        and state.delivery_plan_id
+        and isinstance(state.delivery_unit_id, str)
+        and state.delivery_unit_id
+        and state.delivery_no_change_outcome == DELIVERY_DISPOSITION_ALREADY_SATISFIED
+    )
 
 
 def _agent_session_title(name: str, state: TaskState) -> str:
@@ -813,7 +824,7 @@ class Orchestrator:
         """Phases 2-5 as a single pass when no multi-step plan is in use."""
         # Phase 2: implement (idempotent — skipped if files already changed)
         has_preexisting_changes = bool(state.files_changed)
-        if not state.files_changed:
+        if not state.files_changed and not _delivery_implementation_already_satisfied(state):
             log.info("--- Phase: implement ---")
             result = self._run_agent("implementer", state)
             if state.failed:
@@ -838,11 +849,23 @@ class Orchestrator:
                         "orchestrator", "adopt_worktree_changes", f"{len(dirty)} file(s) adopted from worktree"
                     )
                 else:
-                    log.error("Implementer produced no file changes — aborting task")
-                    state.record("orchestrator", "abort", "implementer produced no file changes")
-                    state.failed = True
-                    self._store.save(state)
-                    return
+                    outcome = (result.data or {}).get("implementation_outcome")
+                    if outcome == DELIVERY_DISPOSITION_ALREADY_SATISFIED and _delivery_implementation_already_satisfied(
+                        state
+                    ):
+                        log.info("Delivery implementation is already satisfied; continuing to configured gates")
+                        state.record(
+                            "orchestrator",
+                            "implementation_already_satisfied",
+                            "no file changes; continuing to configured gates",
+                        )
+                        self._store.save(state)
+                    else:
+                        log.error("Implementer produced no file changes — aborting task")
+                        state.record("orchestrator", "abort", "implementer produced no file changes")
+                        state.failed = True
+                        self._store.save(state)
+                        return
 
         if self._config.run_build and (state.fixer_changed_code or _build_loop_active_for_current_scope(state)):
             self._run_build_fix_loop(state, set_done=True)
@@ -904,7 +927,7 @@ class Orchestrator:
                 return
             state.test_status = "skipped"
             state.check_status = "skipped"
-            state.done = bool(state.files_changed)
+            state.done = bool(state.files_changed) or _delivery_implementation_already_satisfied(state)
             if not state.done:
                 log.warning("Implementation produced no file changes")
             self._store.save(state)
@@ -960,11 +983,17 @@ class Orchestrator:
     def _run_after_plan_completed(self, state: TaskState) -> None:
         """Run whole-task gates that apply after every planned step has completed."""
         if not state.files_changed:
-            log.error("All steps were skipped — no file changes produced — task failed")
-            state.record("orchestrator", "abort", "all steps skipped — no file changes")
-            state.failed = True
-            self._store.save(state)
-            return
+            if not _delivery_implementation_already_satisfied(state):
+                log.error("All steps were skipped — no file changes produced — task failed")
+                state.record("orchestrator", "abort", "all steps skipped — no file changes")
+                state.failed = True
+                self._store.save(state)
+                return
+            state.record(
+                "orchestrator",
+                "plan_already_satisfied",
+                "all steps reported already satisfied; continuing to final configured gates",
+            )
 
         if self._config.run_build and (state.fixer_changed_code or _build_loop_active_for_current_scope(state)):
             state.active_scope = _SCOPE_FINAL_FULL_TASK
@@ -1054,6 +1083,23 @@ class Orchestrator:
                         "orchestrator", "adopt_worktree_changes", f"{len(dirty)} file(s) adopted from worktree"
                     )
                 else:
+                    outcome = (result.data or {}).get("implementation_outcome")
+                    if state.delivery_plan_id and state.delivery_unit_id:
+                        if outcome != DELIVERY_DISPOSITION_ALREADY_SATISFIED or not (
+                            _delivery_implementation_already_satisfied(state)
+                        ):
+                            log.error("Delivery implementer produced an unclassified no-change step")
+                            state.record(
+                                "orchestrator",
+                                "abort",
+                                f"Step {step_num}/{total_steps}: unclassified no-change result",
+                            )
+                            state.failed = True
+                            self._store.save(state)
+                            return False
+                        action = "step_already_satisfied"
+                    else:
+                        action = "step_skipped"
                     log.info(
                         "Implementer made no changes for step %d/%d — advancing to next step",
                         step_num,
@@ -1061,7 +1107,7 @@ class Orchestrator:
                     )
                     state.record(
                         "orchestrator",
-                        "step_skipped",
+                        action,
                         f"Step {step_num}/{total_steps}: no file changes",
                     )
                     state.step_implemented = True

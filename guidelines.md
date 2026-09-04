@@ -440,7 +440,11 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
   A delivery-child approval uses the explicit `approved` disposition; ordinary
   non-delivery review retains the standalone `APPROVED` signal. `approved` is
   positive audit evidence only and must never enter terminal-stop or amendment
-  failure evidence. A malformed
+  failure evidence. A delivery Implementer may report `already_satisfied` only
+  with a clean no-change result after inspecting the active task or step. Sikula
+  must reject that value when any file changed, and an accepted value must still
+  pass every configured review, security, test-writing, and validation gate.
+  Unstructured no-change output remains a failure for delivery children. A malformed
   Reviewer or Security Reviewer disposition may receive exactly one read-only
   protocol retry with the parser error included in its history. That retry must
   not consume a fix iteration or invoke a write agent, and a repeated malformed

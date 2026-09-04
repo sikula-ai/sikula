@@ -7,6 +7,8 @@ import json
 import pytest
 
 from core.structured_output import (
+    DELIVERY_ANALYSIS_DISPOSITIONS,
+    DELIVERY_DISPOSITION_ALREADY_SATISFIED,
     DELIVERY_DISPOSITION_APPROVED,
     DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP,
     DELIVERY_DISPOSITION_FIX_IN_SCOPE,
@@ -70,6 +72,44 @@ def test_parse_delivery_disposition_rejects_approval_from_implementer() -> None:
         parse_delivery_disposition(
             _payload(DELIVERY_DISPOSITION_APPROVED),
             allowed_dispositions=DELIVERY_IMPLEMENTATION_DISPOSITIONS,
+        )
+
+    assert exc_info.value.code == "delivery_disposition.value_invalid"
+
+
+def test_parse_delivery_disposition_accepts_already_satisfied_from_implementer() -> None:
+    parsed = parse_delivery_disposition(
+        _payload(
+            DELIVERY_DISPOSITION_ALREADY_SATISFIED,
+            "The required registration already exists in src/registry.py.",
+        ),
+        allowed_dispositions=DELIVERY_IMPLEMENTATION_DISPOSITIONS,
+    )
+
+    assert parsed is not None
+    assert parsed.to_dict() == {
+        "schema_version": 1,
+        "disposition": DELIVERY_DISPOSITION_ALREADY_SATISFIED,
+        "summary": "The required registration already exists in src/registry.py.",
+        "recommended_action": "continue_validation",
+    }
+
+
+def test_parse_delivery_disposition_rejects_already_satisfied_from_reviewer() -> None:
+    with pytest.raises(DeliveryDispositionParseError) as exc_info:
+        parse_delivery_disposition(
+            _payload(DELIVERY_DISPOSITION_ALREADY_SATISFIED),
+            allowed_dispositions=DELIVERY_REVIEW_DISPOSITIONS,
+        )
+
+    assert exc_info.value.code == "delivery_disposition.value_invalid"
+
+
+def test_parse_delivery_disposition_rejects_already_satisfied_from_analyst() -> None:
+    with pytest.raises(DeliveryDispositionParseError) as exc_info:
+        parse_delivery_disposition(
+            _payload(DELIVERY_DISPOSITION_ALREADY_SATISFIED),
+            allowed_dispositions=DELIVERY_ANALYSIS_DISPOSITIONS,
         )
 
     assert exc_info.value.code == "delivery_disposition.value_invalid"
