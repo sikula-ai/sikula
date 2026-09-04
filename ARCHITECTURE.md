@@ -803,7 +803,9 @@ The Implementer may emit `already_satisfied` only when repository inspection sho
 that the active delivery task or planner step is complete and its provider call has
 a clean no-change result. The agent records this bounded positive outcome, and the
 orchestrator continues through all configured review, security, test-writing, and
-validation gates. A changed-file result carrying `already_satisfied`, or a delivery
+validation gates. With no diff, reviewers independently inspect the current repository
+state against the active task, and the Test Writer inspects its existing coverage. A
+changed-file result carrying `already_satisfied`, or a delivery
 no-op without this explicit outcome, fails closed. Standalone task no-change behavior
 is unchanged.
 `fix_in_scope` keeps the normal bounded fix path.

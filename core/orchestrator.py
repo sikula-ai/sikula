@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from agents.analyst_agent import AnalystAgent
+from agents.delivery_contracts import is_delivery_implementation_already_satisfied
 from agents.fixer_agent import FixerAgent
 from agents.implementer_agent import ImplementerAgent
 from agents.planner_agent import PlannerAgent
@@ -165,16 +166,6 @@ _TEST_GATE_AUDIT_SOURCE_SUFFIXES = (
 
 def _phase_scope_label(state: TaskState) -> str:
     return "final full-task " if state.active_scope == _SCOPE_FINAL_FULL_TASK else ""
-
-
-def _delivery_implementation_already_satisfied(state: TaskState) -> bool:
-    return bool(
-        isinstance(state.delivery_plan_id, str)
-        and state.delivery_plan_id
-        and isinstance(state.delivery_unit_id, str)
-        and state.delivery_unit_id
-        and state.delivery_no_change_outcome == DELIVERY_DISPOSITION_ALREADY_SATISFIED
-    )
 
 
 def _agent_session_title(name: str, state: TaskState) -> str:
@@ -824,7 +815,7 @@ class Orchestrator:
         """Phases 2-5 as a single pass when no multi-step plan is in use."""
         # Phase 2: implement (idempotent — skipped if files already changed)
         has_preexisting_changes = bool(state.files_changed)
-        if not state.files_changed and not _delivery_implementation_already_satisfied(state):
+        if not state.files_changed and not is_delivery_implementation_already_satisfied(state):
             log.info("--- Phase: implement ---")
             result = self._run_agent("implementer", state)
             if state.failed:
@@ -850,8 +841,9 @@ class Orchestrator:
                     )
                 else:
                     outcome = (result.data or {}).get("implementation_outcome")
-                    if outcome == DELIVERY_DISPOSITION_ALREADY_SATISFIED and _delivery_implementation_already_satisfied(
-                        state
+                    if (
+                        outcome == DELIVERY_DISPOSITION_ALREADY_SATISFIED
+                        and is_delivery_implementation_already_satisfied(state)
                     ):
                         log.info("Delivery implementation is already satisfied; continuing to configured gates")
                         state.record(
@@ -927,7 +919,7 @@ class Orchestrator:
                 return
             state.test_status = "skipped"
             state.check_status = "skipped"
-            state.done = bool(state.files_changed) or _delivery_implementation_already_satisfied(state)
+            state.done = bool(state.files_changed) or is_delivery_implementation_already_satisfied(state)
             if not state.done:
                 log.warning("Implementation produced no file changes")
             self._store.save(state)
@@ -983,7 +975,7 @@ class Orchestrator:
     def _run_after_plan_completed(self, state: TaskState) -> None:
         """Run whole-task gates that apply after every planned step has completed."""
         if not state.files_changed:
-            if not _delivery_implementation_already_satisfied(state):
+            if not is_delivery_implementation_already_satisfied(state):
                 log.error("All steps were skipped — no file changes produced — task failed")
                 state.record("orchestrator", "abort", "all steps skipped — no file changes")
                 state.failed = True
@@ -1086,7 +1078,7 @@ class Orchestrator:
                     outcome = (result.data or {}).get("implementation_outcome")
                     if state.delivery_plan_id and state.delivery_unit_id:
                         if outcome != DELIVERY_DISPOSITION_ALREADY_SATISFIED or not (
-                            _delivery_implementation_already_satisfied(state)
+                            is_delivery_implementation_already_satisfied(state)
                         ):
                             log.error("Delivery implementer produced an unclassified no-change step")
                             state.record(

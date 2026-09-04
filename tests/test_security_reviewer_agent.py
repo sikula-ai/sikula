@@ -109,6 +109,18 @@ class TestSecurityReviewerGuards:
         result = _make_agent(stub_llm, file_tool=file_tool).run(state)
         assert not result.success
 
+    def test_delivery_already_satisfied_without_files_runs_review(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = _delivery_approval_output()
+        state = _make_state(files_changed=[], delivery_no_change_outcome="already_satisfied")
+        _add_delivery_constraint_context(state)
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success
+        assert len(stub_llm.readonly_calls) == 1
+        assert "NO-CHANGE DELIVERY SECURITY REVIEW" in stub_llm.readonly_calls[0]
+        assert "no implementation diff" in stub_llm.readonly_calls[0]
+
     def test_no_file_tool_returns_failure(self, stub_llm: StubLLMClient):
         state = _make_state()
         result = _make_agent(stub_llm).run(state)

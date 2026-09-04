@@ -44,6 +44,7 @@ from agents.build_guidance import reviewer_policy as _build_tool_reviewer_policy
 from agents.delivery_contracts import (
     classify_delivery_review_disposition,
     delivery_agent_prompt_context,
+    is_delivery_implementation_already_satisfied,
 )
 from core.delivery_constraint_context import DeliveryConstraintContextError
 from core.delivery_write_scope import DeliveryWriteScopeError
@@ -328,6 +329,16 @@ Verify that all acceptance criteria from the original task survived task splitti
 Report completeness, correctness, and unintended side-effect issues anywhere in the changed branch.\
 """
 
+_DELIVERY_ALREADY_SATISFIED_REVIEW_CONTEXT = """\
+---
+NO-CHANGE DELIVERY REVIEW:
+The Implementer reported `already_satisfied`, so there is no implementation diff.
+Treat that report as a claim to verify, not as approval. Inspect the current repository
+state and approve only if every requirement in the active task or step is already
+implemented correctly. Report missing or incorrect task-required behavior even though
+it was not introduced by a changed file; do not report unrelated pre-existing issues.\
+"""
+
 _SCOPE_FINAL_FULL_TASK = "final_full_task"
 
 
@@ -455,7 +466,8 @@ class ReviewerAgent(BaseAgent):
     def run(self, state: TaskState) -> AgentResult:
         if not state.implementation_prompt:
             return AgentResult(success=False, message="No implementation prompt in state")
-        if not state.files_changed:
+        already_satisfied = is_delivery_implementation_already_satisfied(state)
+        if not state.files_changed and not already_satisfied:
             return AgentResult(success=False, message="No changed files to review")
 
         file_tool = self.tools.get("file")
@@ -491,7 +503,10 @@ class ReviewerAgent(BaseAgent):
                 if len(result.output) > _MAX_DIFF_CHARS:
                     diff += "\n... (diff truncated)"
         if not diff:
-            diff = "(diff not available — use Read tool to inspect changed files)"
+            if already_satisfied and not state.files_changed:
+                diff = "(no implementation diff; inspect the current repository state)"
+            else:
+                diff = "(diff not available — use Read tool to inspect changed files)"
 
         step_scope = ""
         if state.active_scope == _SCOPE_FINAL_FULL_TASK:
@@ -518,6 +533,11 @@ class ReviewerAgent(BaseAgent):
             + "\n\n"
             + (delivery_context.effective_write_scope + "\n\n" if delivery_child else "")
             + (delivery_context.disposition_contract + "\n\n" if delivery_child else "")
+            + (
+                _DELIVERY_ALREADY_SATISFIED_REVIEW_CONTEXT + "\n\n"
+                if already_satisfied and not state.files_changed
+                else ""
+            )
             + step_scope
             + ("\n\n" if step_scope else "")
             + _validation_pipeline_context(self.project_config, state)
@@ -526,7 +546,11 @@ class ReviewerAgent(BaseAgent):
                 task_description=state.task_description,
                 delivery_constraint_context=delivery_context.inherited_constraints,
                 implementation_prompt=state.implementation_prompt,
-                files_changed="\n".join(f"  - {f}" for f in state.files_changed),
+                files_changed=(
+                    "  - (none; Implementer reported already_satisfied)"
+                    if already_satisfied and not state.files_changed
+                    else "\n".join(f"  - {f}" for f in state.files_changed)
+                ),
                 diff=diff,
             )
         )

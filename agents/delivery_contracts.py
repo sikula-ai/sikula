@@ -17,6 +17,7 @@ from core.delivery_write_scope import (
 )
 from core.state import TaskState
 from core.structured_output import (
+    DELIVERY_DISPOSITION_ALREADY_SATISFIED,
     DELIVERY_DISPOSITION_APPROVED,
     DELIVERY_REVIEW_DISPOSITIONS,
     DeliveryDisposition,
@@ -154,6 +155,17 @@ class DeliveryAgentPromptContext:
 class DeliveryReviewDispositionResult:
     disposition: DeliveryDisposition | None
     error_code: str | None
+
+
+def is_delivery_implementation_already_satisfied(state: TaskState) -> bool:
+    """Return whether state carries a valid delivery-child no-change outcome."""
+    return bool(
+        isinstance(state.delivery_plan_id, str)
+        and state.delivery_plan_id
+        and isinstance(state.delivery_unit_id, str)
+        and state.delivery_unit_id
+        and state.delivery_no_change_outcome == DELIVERY_DISPOSITION_ALREADY_SATISFIED
+    )
 
 
 def delivery_agent_prompt_context(

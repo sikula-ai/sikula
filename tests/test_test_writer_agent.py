@@ -65,6 +65,25 @@ class TestTestWriterAgentGuards:
         result = _make_agent(stub_llm, file_tool=file_tool).run(state)
         assert not result.success
 
+    def test_delivery_already_satisfied_without_files_checks_existing_tests(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state(
+            files_changed=[],
+            delivery_plan_id="demo-plan",
+            delivery_unit_id="feature-unit",
+            delivery_no_change_outcome="already_satisfied",
+        )
+
+        result = _make_agent(
+            stub_llm,
+            file_tool=file_tool,
+            project_config=_config_with_test_paths(),
+        ).run(state)
+
+        assert result.success
+        assert len(stub_llm.agent_calls) == 1
+        assert "NO-CHANGE DELIVERY TEST SCOPE" in stub_llm.agent_calls[0]
+        assert "no implementation diff" in stub_llm.agent_calls[0]
+
     def test_no_file_tool_returns_failure(self, stub_llm: StubLLMClient):
         state = _make_state()
         result = _make_agent(stub_llm, project_config=_config_with_test_paths()).run(state)

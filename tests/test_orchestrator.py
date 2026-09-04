@@ -6879,7 +6879,7 @@ class TestOrchestratorInterruptResume:
             run_build=True,
             run_review=True,
             run_security_review=True,
-            run_test_writing=False,
+            run_test_writing=True,
         )
 
         def already_satisfied(state: TaskState) -> None:
@@ -6890,6 +6890,7 @@ class TestOrchestratorInterruptResume:
             "files_written": [],
             "implementation_outcome": "already_satisfied",
         }
+        stubs["test_writer"].side_effect = lambda state: setattr(state, "tests_up_to_date", True)
         _save_state(
             orch,
             implementation_prompt="p",
@@ -6906,6 +6907,7 @@ class TestOrchestratorInterruptResume:
         assert len(stubs["implementer"].calls) == 1
         assert len(stubs["reviewer"].calls) == 1
         assert len(stubs["security_reviewer"].calls) == 1
+        assert len(stubs["test_writer"].calls) == 1
         assert build.compile_calls == 1
         assert build.test_calls == 1
         assert any(record["action"] == "implementation_already_satisfied" for record in result.history)

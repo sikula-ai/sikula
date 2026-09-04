@@ -19,6 +19,7 @@ from agents.base_agent import (
     record_write_path_warnings as _record_write_path_warnings,
     tech_stack as _tech_stack,
 )
+from agents.delivery_contracts import is_delivery_implementation_already_satisfied
 from core.state import TaskState
 from core.synthetic_test_harness_audit import prompt_context_for_records as _synthetic_harness_prompt_context
 
@@ -217,6 +218,8 @@ ORIGINAL TASK DESCRIPTION:
 {task_description}
 {step_scope}
 
+{delivery_no_change_context}
+
 {synthetic_harness_audit_context}
 
 Use the original task description to honor explicit testing requirements.
@@ -268,6 +271,14 @@ behaviour difference), output a brief explanation and make no file changes.
 
 _DEFAULT_CONTEXT_FILES = ["README.md"]
 _SCOPE_FINAL_FULL_TASK = "final_full_task"
+
+_DELIVERY_ALREADY_SATISFIED_TEST_CONTEXT = """\
+NO-CHANGE DELIVERY TEST SCOPE:
+The Implementer reported `already_satisfied`, so there may be no changed production
+file or diff. Treat that report as a claim to verify. Inspect the existing implementation
+and tests for the active task or step. Add tests only when its required behavior lacks
+meaningful coverage in the configured test surface; otherwise make no changes.\
+"""
 
 
 def _scope(state: TaskState) -> str:
@@ -364,7 +375,8 @@ class TestWriterAgent(BaseAgent):
     def run(self, state: TaskState) -> AgentResult:
         if not state.implementation_prompt:
             return AgentResult(success=False, message="No implementation prompt in state")
-        if not state.files_changed:
+        already_satisfied = is_delivery_implementation_already_satisfied(state)
+        if not state.files_changed and not already_satisfied:
             return AgentResult(success=False, message="No changed files to write tests for")
 
         file_tool = self.tools.get("file")
@@ -385,6 +397,7 @@ class TestWriterAgent(BaseAgent):
         coverage_target = self.project_config.get("test_writer", {}).get("coverage_target", _DEFAULT_COVERAGE_TARGET)
         test_surface_policy = _test_surface_policy(self.project_config)
         change_context_files, active_step_context = _change_context_files(state)
+        no_change_delivery_context = already_satisfied and not change_context_files
 
         diff = ""
         if git_tool:
@@ -394,7 +407,10 @@ class TestWriterAgent(BaseAgent):
                 if len(result.output) > _MAX_DIFF_CHARS:
                     diff += "\n... (diff truncated)"
         if not diff:
-            diff = "(diff not available — use Read tool to inspect changed files directly)"
+            if no_change_delivery_context:
+                diff = "(no implementation diff; inspect the current repository state)"
+            else:
+                diff = "(diff not available — use Read tool to inspect changed files directly)"
 
         prompt = AGENT_SECURITY_PREFIX + _AGENT_PROMPT.format(
             tech_stack=_tech_stack(self.project_config),
@@ -406,8 +422,13 @@ class TestWriterAgent(BaseAgent):
             implementation_prompt=state.implementation_prompt,
             task_description=state.task_description,
             step_scope=_step_scope(state),
+            delivery_no_change_context=(_DELIVERY_ALREADY_SATISFIED_TEST_CONTEXT if no_change_delivery_context else ""),
             synthetic_harness_audit_context=_synthetic_harness_prompt_context(state.synthetic_test_harness_records),
-            files_changed="\n".join(f"  - {f}" for f in change_context_files),
+            files_changed=(
+                "  - (none; Implementer reported already_satisfied)"
+                if no_change_delivery_context
+                else "\n".join(f"  - {f}" for f in change_context_files)
+            ),
             diff=diff,
         )
 
