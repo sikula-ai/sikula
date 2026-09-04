@@ -695,14 +695,42 @@ def _unresolved_scope_path_issues(
 ) -> list[DeliveryPrepareWriteIssue]:
     issues: list[DeliveryPrepareWriteIssue] = []
     for unit_index, unit in enumerate(draft.units):
+        if not isinstance(unit.scope_paths, list):
+            issues.append(
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.scope_paths_invalid",
+                    "Generated unit write scope must be a list of project-relative path strings.",
+                    f"units[{unit_index}].scope_paths",
+                )
+            )
+            continue
         for scope_index, scope_path in enumerate(unit.scope_paths):
-            candidate = project_root.joinpath(*PurePosixPath(scope_path).parts)
+            issue_path = f"units[{unit_index}].scope_paths[{scope_index}]"
+            if not isinstance(scope_path, str) or not scope_path.strip():
+                issues.append(
+                    DeliveryPrepareWriteIssue(
+                        "error",
+                        "delivery_prepare.scope_path_invalid",
+                        "Generated write scope path must be a non-empty project-relative string.",
+                        issue_path,
+                    )
+                )
+                continue
             try:
+                candidate = project_root.joinpath(*PurePosixPath(scope_path).parts)
                 entry_exists = candidate.exists() or candidate.is_symlink()
                 parent_exists = candidate.parent.is_dir()
-            except OSError:
-                entry_exists = False
-                parent_exists = False
+            except (OSError, TypeError, ValueError):
+                issues.append(
+                    DeliveryPrepareWriteIssue(
+                        "error",
+                        "delivery_prepare.scope_path_invalid",
+                        "Generated write scope path must be a non-empty project-relative string.",
+                        issue_path,
+                    )
+                )
+                continue
             if entry_exists or parent_exists:
                 continue
             display_path = sanitize_delivery_public_metadata(scope_path) or "<redacted>"
@@ -714,7 +742,7 @@ def _unresolved_scope_path_issues(
                         f"Generated write scope path '{display_path}' has no existing parent directory; "
                         "declare an existing repository path or its nearest existing parent directory."
                     ),
-                    f"units[{unit_index}].scope_paths[{scope_index}]",
+                    issue_path,
                 )
             )
     return issues

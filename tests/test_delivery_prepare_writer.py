@@ -352,6 +352,48 @@ def test_writer_blocks_authored_scope_path_without_existing_parent(tmp_path: Pat
     assert str(tmp_path) not in repr(result.to_dict())
 
 
+@pytest.mark.parametrize(
+    ("scope_paths", "error_code", "error_path"),
+    [
+        (None, "delivery_prepare.scope_paths_invalid", "units[0].scope_paths"),
+        ("core", "delivery_prepare.scope_paths_invalid", "units[0].scope_paths"),
+        ([123], "delivery_prepare.scope_path_invalid", "units[0].scope_paths[0]"),
+        ([""], "delivery_prepare.scope_path_invalid", "units[0].scope_paths[0]"),
+    ],
+)
+def test_writer_blocks_malformed_typed_scope_values(
+    tmp_path: Path,
+    scope_paths: object,
+    error_code: str,
+    error_path: str,
+) -> None:
+    unit = replace(_unit("navigation", title="Update navigation"), scope_paths=scope_paths)
+
+    result = write_delivery_prepare_artifacts(
+        _draft(units=[unit]),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "blocked"
+    assert result.failure_reason == "scope_declaration_blocked"
+    assert result.errors == [
+        DeliveryPrepareWriteIssue(
+            "error",
+            error_code,
+            (
+                "Generated unit write scope must be a list of project-relative path strings."
+                if error_code == "delivery_prepare.scope_paths_invalid"
+                else "Generated write scope path must be a non-empty project-relative string."
+            ),
+            error_path,
+        )
+    ]
+    assert not (tmp_path / ".sikula" / "delivery").exists()
+    assert str(tmp_path) not in repr(result.to_dict())
+
+
 def test_writer_allows_new_scope_file_under_existing_parent(tmp_path: Path) -> None:
     (tmp_path / "generated" / "api").mkdir(parents=True)
 
