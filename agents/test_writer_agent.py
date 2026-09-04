@@ -400,9 +400,10 @@ class TestWriterAgent(BaseAgent):
         coverage_target = self.project_config.get("test_writer", {}).get("coverage_target", _DEFAULT_COVERAGE_TARGET)
         test_surface_policy = _test_surface_policy(self.project_config)
         change_context_files, active_step_context = _change_context_files(state)
-        no_change_delivery_context = (
-            requires_delivery_no_change_verification_context(state) and not change_context_files
-        )
+        no_change_delivery_context = requires_delivery_no_change_verification_context(state)
+        if no_change_delivery_context and state.plan and state.active_scope != _SCOPE_FINAL_FULL_TASK:
+            change_context_files = []
+            active_step_context = True
 
         diff = ""
         if git_tool and (change_context_files or not active_step_context):

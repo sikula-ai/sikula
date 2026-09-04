@@ -196,18 +196,20 @@ class TestTestWriterAgentSuccess:
         assert "src/current.py" in prompt
         assert "src/previous.py" not in prompt
 
+    @pytest.mark.parametrize("step_file_tracking_enabled", [False, True])
     def test_already_satisfied_current_step_does_not_reuse_prior_step_files(
         self,
         stub_llm: StubLLMClient,
         file_tool,
         git_tool,
+        step_file_tracking_enabled: bool,
     ):
         git_tool.diff_head = MagicMock(return_value=ToolResult(success=True, output=""))
         state = _make_state(
             plan=["Change previous module", "Verify current module"],
             current_step=1,
             files_changed=["src/previous.py"],
-            step_file_tracking_enabled=True,
+            step_file_tracking_enabled=step_file_tracking_enabled,
             step_files_changed=[],
             delivery_plan_id="demo-plan",
             delivery_unit_id="feature-unit",
