@@ -104,7 +104,13 @@ Delivery-plan constraints:
   or dependency cycles.
 - Optional metadata fields stream, component, phase, kind, and platform must be non-empty strings
   when present.
-- scope_paths must contain only project-relative paths that stay inside the project.
+- scope_paths are execution-boundary metadata. They must contain only project-relative paths that stay
+  inside the project. They may use an explicit repository path required by the source task or established
+  by supplied project context, but never derive a filesystem path from a package, namespace, module, or
+  import name. Prefer stable existing module or directory ownership boundaries over predictions of
+  concrete files. For a new path, its direct parent directory must already exist. If no reliable ownership
+  boundary can be identified, return an empty list so the repository's configured write scope remains
+  authoritative.
 - asset_paths must contain only paths declared in the source task's canonical direct-list
   `## Assets` section or their project-relative equivalents. Assign every declared source asset
   to at least one relevant unit and do not repeat a path within one unit.

@@ -86,12 +86,16 @@ _DELIVERY_PREPARE_CONSTRAINT_CONFLICT_MESSAGE = (
 _DELIVERY_PREPARE_UNIT_CONTEXT_INCOMPLETE_MESSAGE = (
     "Generated delivery units are missing required source-task values; no source artifacts were finalized."
 )
+_DELIVERY_PREPARE_SCOPE_DECLARATION_FAILED_MESSAGE = (
+    "Generated delivery unit write scope could not be resolved; no source artifacts were finalized."
+)
 _DELIVERY_PREPARE_ASSET_PRESERVATION_FAILURE = "asset_preservation_blocked"
 _DELIVERY_PREPARE_UNIT_READINESS_FAILURE = "unit_readiness_blocked"
 _DELIVERY_PREPARE_PLAN_VALIDATION_FAILURE = "plan_validation_failed"
 _DELIVERY_PREPARE_CONSTRAINT_REVIEW_FAILURE = "constraint_review_required"
 _DELIVERY_PREPARE_CONSTRAINT_CONFLICT_FAILURE = "constraint_conflict"
 _DELIVERY_PREPARE_UNIT_CONTEXT_INCOMPLETE_FAILURE = "unit_context_incomplete"
+_DELIVERY_PREPARE_SCOPE_DECLARATION_FAILURE = "scope_declaration_blocked"
 _DELIVERY_ASSESSMENT_CONTEXT_MISSING_MESSAGE = "Delivery assessment requires the main Sikula command context."
 _DELIVERY_ASSESSMENT_PORTABLE_COMMAND_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
 _DELIVERY_ASSESSMENT_REASON_MESSAGES = {
@@ -1537,6 +1541,8 @@ def _delivery_prepare_writer_failure(failure_reason: str | None) -> tuple[str, s
         return "delivery_prepare.constraint_conflict", _DELIVERY_PREPARE_CONSTRAINT_CONFLICT_MESSAGE
     if failure_reason == _DELIVERY_PREPARE_UNIT_CONTEXT_INCOMPLETE_FAILURE:
         return "delivery_prepare.unit_context_incomplete", _DELIVERY_PREPARE_UNIT_CONTEXT_INCOMPLETE_MESSAGE
+    if failure_reason == _DELIVERY_PREPARE_SCOPE_DECLARATION_FAILURE:
+        return "delivery_prepare.scope_declaration_invalid", _DELIVERY_PREPARE_SCOPE_DECLARATION_FAILED_MESSAGE
     return "delivery_prepare.write_failed", _DELIVERY_PREPARE_WRITE_FAILED_MESSAGE
 
 

@@ -16,7 +16,7 @@ from core.delivery_authoring import (
     DeliveryUnitContextGap,
 )
 from core.delivery_plan import DeliveryPlanSourceTask
-from core.delivery_prepare_writer import write_delivery_prepare_artifacts
+from core.delivery_prepare_writer import DeliveryPrepareWriteIssue, write_delivery_prepare_artifacts
 from core.delivery_unit_metadata import DeliveryUnitBudget
 
 
@@ -297,6 +297,126 @@ def test_write_delivery_prepare_artifacts_writes_valid_plan_and_units(tmp_path: 
     assert not (tmp_path / ".sikula" / "state" / "delivery" / "team-invites").exists()
     assert str(tmp_path) not in repr(result.to_dict())
     assert "Raw prompts" not in repr(result.to_dict())
+
+
+def test_writer_blocks_authored_scope_path_without_existing_parent(tmp_path: Path) -> None:
+    (tmp_path / "app").mkdir()
+    actual_path = (
+        tmp_path
+        / "app"
+        / "production"
+        / "src"
+        / "main"
+        / "kotlin"
+        / "com"
+        / "example"
+        / "app"
+        / "main"
+        / "model"
+        / "Route.kt"
+    )
+    actual_path.parent.mkdir(parents=True)
+    actual_path.write_text("class Route\n", encoding="utf-8")
+
+    result = write_delivery_prepare_artifacts(
+        _draft(
+            units=[
+                _unit(
+                    "navigation",
+                    title="Update navigation",
+                    scope_paths=["app/main/model/Route.kt"],
+                )
+            ]
+        ),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "blocked"
+    assert result.prepared is False
+    assert result.failure_reason == "scope_declaration_blocked"
+    assert result.errors == [
+        DeliveryPrepareWriteIssue(
+            "error",
+            "delivery_prepare.scope_path_unresolved",
+            (
+                "Generated write scope path 'app/main/model/Route.kt' has no existing parent directory; "
+                "declare an existing repository path or its nearest existing parent directory."
+            ),
+            "units[0].scope_paths[0]",
+        )
+    ]
+    assert result.unit_readiness.status == "not_run"
+    assert not (tmp_path / ".sikula" / "delivery").exists()
+    assert str(tmp_path) not in repr(result.to_dict())
+
+
+@pytest.mark.parametrize(
+    ("scope_paths", "error_code", "error_path"),
+    [
+        (None, "delivery_prepare.scope_paths_invalid", "units[0].scope_paths"),
+        ("core", "delivery_prepare.scope_paths_invalid", "units[0].scope_paths"),
+        ([123], "delivery_prepare.scope_path_invalid", "units[0].scope_paths[0]"),
+        ([""], "delivery_prepare.scope_path_invalid", "units[0].scope_paths[0]"),
+    ],
+)
+def test_writer_blocks_malformed_typed_scope_values(
+    tmp_path: Path,
+    scope_paths: object,
+    error_code: str,
+    error_path: str,
+) -> None:
+    unit = replace(_unit("navigation", title="Update navigation"), scope_paths=scope_paths)
+
+    result = write_delivery_prepare_artifacts(
+        _draft(units=[unit]),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "blocked"
+    assert result.failure_reason == "scope_declaration_blocked"
+    assert result.errors == [
+        DeliveryPrepareWriteIssue(
+            "error",
+            error_code,
+            (
+                "Generated unit write scope must be a list of project-relative path strings."
+                if error_code == "delivery_prepare.scope_paths_invalid"
+                else "Generated write scope path must be a non-empty project-relative string."
+            ),
+            error_path,
+        )
+    ]
+    assert not (tmp_path / ".sikula" / "delivery").exists()
+    assert str(tmp_path) not in repr(result.to_dict())
+
+
+def test_writer_allows_new_scope_file_under_existing_parent(tmp_path: Path) -> None:
+    (tmp_path / "generated" / "api").mkdir(parents=True)
+
+    result = write_delivery_prepare_artifacts(
+        _draft(
+            units=[
+                _unit(
+                    "schema",
+                    title="Generate API schema",
+                    scope_paths=["generated/api/schema.json"],
+                )
+            ]
+        ),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "ready"
+    plan = yaml.safe_load(
+        (tmp_path / ".sikula" / "delivery" / "team-invites" / "plan.yaml").read_text(encoding="utf-8")
+    )
+    assert plan["units"][0]["scope_paths"] == ["generated/api/schema.json"]
 
 
 def test_writer_persists_source_task_fingerprint_and_preserved_constraints(tmp_path: Path) -> None:

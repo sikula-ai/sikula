@@ -166,6 +166,20 @@ compile-safe as separate units. Values of `3` or greater are invalid and signal
 that the unit must be split. The other budget fields remain advisory until an
 execution gate is defined for them.
 
+Automatically authored non-empty `scope_paths` must
+name an existing repository entry or a new direct child of an existing
+directory. They are execution-boundary metadata and may use repository paths
+explicitly required by the source task or established by trusted project
+context; the source task does not otherwise need to describe repository layout.
+At this stage they normally represent coarse ownership bounds, not a prediction
+of every concrete file the unit will change. Authoring must not derive paths
+from package, namespace, module, or import names. An unresolved generated path
+blocks artifact publication with the affected unit field; Sikula does not guess
+a replacement or broaden the explicit boundary to the repository default.
+Concrete file selection belongs to later repository-aware analysis within this
+upper bound. This prepare-time check does not change validation or runtime
+semantics for manually authored and existing plans.
+
 `constraints` is required in fresh authoring output and may be empty only when
 the source task contains no hard delivery constraints. Each constraint contains
 `id`, `kind`, a bounded single-line paraphrased `summary`, exact generated
