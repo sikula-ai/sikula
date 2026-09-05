@@ -261,6 +261,21 @@ class ImplementerAgent(BaseAgent):
                             message=msg,
                             data={"files_written": changed},
                         )
+                    remediation_call = state.review_iterations > 0 or state.security_review_iterations > 0
+                    if remediation_call and state.delivery_no_change_outcome != DELIVERY_DISPOSITION_ALREADY_SATISFIED:
+                        state.record(
+                            self.name,
+                            "implement_no_additional_changes",
+                            disposition.summary,
+                        )
+                        return AgentResult(
+                            success=True,
+                            message=DELIVERY_DISPOSITION_ALREADY_SATISFIED,
+                            data={
+                                "files_written": [],
+                                "disposition": disposition.to_dict(),
+                            },
+                        )
                     state.delivery_no_change_outcome = DELIVERY_DISPOSITION_ALREADY_SATISFIED
                     state.record(self.name, "implement_already_satisfied", disposition.summary)
                     return AgentResult(

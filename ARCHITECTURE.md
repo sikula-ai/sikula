@@ -801,7 +801,11 @@ Approval records remain in review-cycle audit history but are excluded from term
 stop and amendment failure evidence.
 The Implementer may emit `already_satisfied` only when repository inspection shows
 that the active delivery task or planner step is complete and its provider call has
-a clean no-change result. The agent records this bounded positive outcome, and the
+a clean no-change result. Only an initial implementation call records this as the
+no-change outcome for the active task or step. The same disposition from a later
+review or security remediation call means that no additional correction is needed;
+it does not replace production-change provenance already established for that scope.
+The agent records the bounded positive outcome, and the
 orchestrator continues through all configured review, security, test-writing, and
 validation gates. With no diff, reviewers independently inspect the current repository
 state against the active task or planner step, and the Test Writer inspects its existing

@@ -259,6 +259,66 @@ class TestImplementerAgentSuccess:
         assert state.implement_cycle_records[-1]["disposition"]["disposition"] == "already_satisfied"
         assert state.history[-1]["action"] == "implement_already_satisfied"
 
+    def test_already_satisfied_remediation_preserves_prior_step_change_provenance(
+        self,
+        stub_llm: StubLLMClient,
+        file_tool,
+    ):
+        state = _make_state(
+            files_changed=["src/registry.py"],
+            plan=["Update the registry"],
+            step_file_tracking_enabled=True,
+            step_files_changed=["src/registry.py"],
+            review_iterations=1,
+        )
+        _add_delivery_constraint_context(state)
+        stub_llm.agent_result = []
+        stub_llm.agent_output = json.dumps(
+            {
+                "sikula_disposition_schema_version": 1,
+                "disposition": "already_satisfied",
+                "summary": "The reported review issue is already resolved in the current step diff.",
+            }
+        )
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is True
+        assert result.data["files_written"] == []
+        assert "implementation_outcome" not in result.data
+        assert state.delivery_no_change_outcome is None
+        assert state.files_changed == ["src/registry.py"]
+        assert state.step_files_changed == ["src/registry.py"]
+        assert state.history[-1]["action"] == "implement_no_additional_changes"
+
+    def test_already_satisfied_remediation_preserves_existing_step_noop(
+        self,
+        stub_llm: StubLLMClient,
+        file_tool,
+    ):
+        state = _make_state(
+            files_changed=[],
+            plan=["Verify the registry"],
+            review_iterations=1,
+            delivery_no_change_outcome="already_satisfied",
+        )
+        _add_delivery_constraint_context(state)
+        stub_llm.agent_result = []
+        stub_llm.agent_output = json.dumps(
+            {
+                "sikula_disposition_schema_version": 1,
+                "disposition": "already_satisfied",
+                "summary": "The reported review issue does not apply to the existing implementation.",
+            }
+        )
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success is True
+        assert result.data["implementation_outcome"] == "already_satisfied"
+        assert state.delivery_no_change_outcome == "already_satisfied"
+        assert state.history[-1]["action"] == "implement_already_satisfied"
+
     def test_already_satisfied_disposition_rejects_reported_file_changes(
         self,
         stub_llm: StubLLMClient,
