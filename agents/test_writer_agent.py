@@ -256,8 +256,9 @@ YOUR TASK:
    cases of that type and add the new case to every one of them. Do not rely on having
    written a dedicated test for the new case — it must also appear in every existing table
    that covers the same type.
-5. Do not write tests for unchanged code — with one exception: callers of modified
-   functions (see step 6).
+5. Do not write tests for unchanged code, except when a NO-CHANGE DELIVERY TEST SCOPE
+   section is present and the required behavior lacks meaningful existing coverage, or
+   for callers of modified functions (see step 6).
 6. Callers of modified functions — for every function whose signature or behaviour was
    changed by this implementation, grep for ALL its callers in production code
    independently — do not rely on the implementation prompt's list of callers or its

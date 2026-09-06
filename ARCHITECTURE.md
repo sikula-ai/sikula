@@ -812,7 +812,8 @@ The agent records the bounded positive outcome, and the
 orchestrator continues through all configured review, security, test-writing, and
 validation gates. With no diff, reviewers independently inspect the current repository
 state against the active task or planner step, and the Test Writer inspects its existing
-coverage. Step-level gates use the current step's file provenance rather than cumulative
+coverage and may add tests when required behavior is not meaningfully covered. Step-level
+gates use the current step's file provenance rather than cumulative
 files from earlier steps. The final full-task gate retains the cumulative view and keeps
 the no-change verification context when every cumulative change is an explicitly recorded
 Test Writer output; any production or unknown-provenance change disables that context. A

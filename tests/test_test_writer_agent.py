@@ -83,6 +83,10 @@ class TestTestWriterAgentGuards:
         assert len(stub_llm.agent_calls) == 1
         assert "NO-CHANGE DELIVERY TEST SCOPE" in stub_llm.agent_calls[0]
         assert "no implementation diff" in stub_llm.agent_calls[0]
+        assert (
+            "Do not write tests for unchanged code, except when a NO-CHANGE DELIVERY TEST SCOPE"
+            in (stub_llm.agent_calls[0])
+        )
 
     def test_no_file_tool_returns_failure(self, stub_llm: StubLLMClient):
         state = _make_state()
