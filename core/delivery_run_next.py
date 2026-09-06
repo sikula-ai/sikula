@@ -11,14 +11,19 @@ from core.delivery_plan import (
     _find_git_root as _find_delivery_git_root,
     delivery_unit_stop_and_follow_up_constraints,
 )
-from core.delivery_progress import DeliveryStatusUnit, get_delivery_status, select_next_delivery_unit
+from core.delivery_progress import (
+    DELIVERY_STOP_AND_FOLLOW_UP_REQUIRED,
+    DeliveryStatusUnit,
+    get_delivery_status,
+    select_next_delivery_unit,
+)
 from core.delivery_public_metadata import (
     project_delivery_public_identity,
     sanitize_delivery_public_metadata,
 )
 from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
 
-DELIVERY_STOP_AND_FOLLOW_UP_REQUIRED_CODE = "delivery.stop_and_follow_up_required"
+DELIVERY_STOP_AND_FOLLOW_UP_REQUIRED_CODE = f"delivery.{DELIVERY_STOP_AND_FOLLOW_UP_REQUIRED}"
 
 
 @dataclass(frozen=True)

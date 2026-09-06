@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from hashlib import sha256
 import json
 from pathlib import Path
 import subprocess
@@ -82,6 +83,28 @@ def _write_plan(root: Path, data: dict | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
     return path
+
+
+def _add_stop_and_follow_up_constraint(root: Path, plan_path: Path, *, unit_id: str) -> None:
+    source_body = "# Delivery source\n\nConfirm production data provenance before implementation.\n"
+    source_path = root / ".sikula" / "tasks" / "delivery-source.md"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text(source_body, encoding="utf-8")
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan["source_task"] = {
+        "path": source_path.relative_to(root).as_posix(),
+        "sha256": f"sha256:{sha256(source_body.encode('utf-8')).hexdigest()}",
+    }
+    plan["constraints"] = [
+        {
+            "id": "production-data-follow-up",
+            "kind": "stop_and_follow_up",
+            "summary": "Production data provenance must be confirmed before implementation.",
+            "unit_ids": [unit_id],
+            "disposition": "preserved",
+        }
+    ]
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
 
 
 def _write_progress(root: Path, plan_id: str, data: dict) -> Path:
@@ -485,6 +508,63 @@ def test_delivery_status_reports_failed_with_child_task_id(tmp_path: Path) -> No
     assert result.next_action == "retry a failed delivery unit with delivery run-next --reset-failed"
     rendered = render_delivery_status(result)
     assert "(run-next: retry with --reset-failed)" in rendered
+
+
+@pytest.mark.parametrize("unit_status", ["running", "failed"])
+def test_delivery_status_plan_stop_overrides_child_recovery_action(tmp_path: Path, unit_status: str) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _add_stop_and_follow_up_constraint(tmp_path, plan_path, unit_id="01-foundation")
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [
+                {"unit_id": "01-foundation", "status": unit_status, "child_task_id": "task-1"},
+            ],
+        },
+    )
+
+    result = get_delivery_status(plan_path)
+    unit = result.units[0]
+    payload = result.to_dict()
+    rendered = render_delivery_status(result)
+
+    assert result.status == unit_status
+    assert result.next_action == (
+        "resolve the stop-and-follow-up prerequisite in the authoritative task input and prepare the plan again"
+    )
+    assert unit.run_next_available is False
+    assert unit.run_next_action is None
+    assert unit.run_next_blocked_reason == "stop_and_follow_up_required"
+    assert payload["units"][0]["run_next_available"] is False
+    assert payload["units"][0]["run_next_blocked_reason"] == "stop_and_follow_up_required"
+    assert "run_next_action" not in payload["units"][0]
+    assert "blocked: resolve prerequisite in the authoritative task input and prepare again" in rendered
+    assert "resume or reconcile linked child" not in rendered
+    assert "retry with --reset-failed" not in rendered
+
+
+def test_delivery_status_plan_stop_blocks_pending_unit_action(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _add_stop_and_follow_up_constraint(tmp_path, plan_path, unit_id="01-foundation")
+
+    result = get_delivery_status(plan_path)
+    unit = result.units[0]
+    payload = result.to_dict()
+
+    assert result.status == "pending"
+    assert result.next_action == (
+        "resolve the stop-and-follow-up prerequisite in the authoritative task input and prepare the plan again"
+    )
+    assert unit.eligible is False
+    assert unit.run_next_blocked_reason == "stop_and_follow_up_required"
+    assert payload["units"][0]["eligible"] is False
+    assert payload["units"][0]["run_next_blocked_reason"] == "stop_and_follow_up_required"
+    assert select_next_delivery_unit(result) is unit
 
 
 @pytest.mark.parametrize(

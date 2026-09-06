@@ -650,6 +650,12 @@ also inspect the selected unit for `stop_and_follow_up`. An unresolved stop retu
 `delivery.stop_and_follow_up_required` before child creation or progress mutation.
 The check is repeated after acquiring the progress lock, and `--reset-failed`
 cannot bypass it.
+`delivery status` derives the same boundary from the current plan. Affected units
+report `run_next_available: false`, omit `run_next_action`, and expose
+`run_next_blocked_reason: stop_and_follow_up_required`, even when progress would
+otherwise advertise resume or retry. Pending affected units are not shown as
+eligible, and the plan-level next action directs the operator to resolve the
+authoritative input and prepare again.
 When `delivery.child_link_failed` occurs, `run-next` returns the child task id and
 deterministic failure code while omitting absolute filesystem paths from JSON/text
 output.

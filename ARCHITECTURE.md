@@ -687,6 +687,11 @@ repeats it against status reloaded under the delivery progress lock. A match ret
 it does not create or resume a child, write progress or events, or permit
 `--reset-failed` to bypass the stop. This protects older and manually authored valid
 plans that did not pass through the current prepare readiness gate.
+The status projection derives this plan-level boundary without mutating progress:
+affected units are not eligible or retryable, expose the stable
+`stop_and_follow_up_required` blocked reason, and omit resume/retry actions. The
+plan next action points back to authoritative-input resolution and preparation, so
+text and JSON automation do not recommend an action that `run-next` must reject.
 At child creation, `run-next` also snapshots the plan's project-relative source-task
 path and fingerprint plus only the bounded inherited constraints that explicitly
 reference the selected unit. A context schema marker distinguishes new children
