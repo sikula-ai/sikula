@@ -36,6 +36,7 @@ DELIVERY_CONSTRAINT_KIND_VALUES = frozenset(
     }
 )
 DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION = "preserved"
+DELIVERY_CONSTRAINT_STOP_AND_FOLLOW_UP_KIND = "stop_and_follow_up"
 MAX_DELIVERY_CONSTRAINTS = 100
 MAX_DELIVERY_CONSTRAINT_UNIT_IDS = 1000
 _DELIVERY_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -296,6 +297,18 @@ def delivery_unit_constraint_context(
     source_task = plan.source_task.to_dict() if plan.source_task else None
     constraints = [constraint.to_context_dict() for constraint in plan.constraints if unit_id in constraint.unit_ids]
     return SUPPORTED_DELIVERY_CONSTRAINT_CONTEXT_SCHEMA_VERSION, source_task, constraints
+
+
+def delivery_unit_stop_and_follow_up_constraints(
+    plan: DeliveryPlan,
+    unit_id: str,
+) -> list[DeliveryConstraint]:
+    """Return unresolved control-flow stops assigned to one delivery unit."""
+    return [
+        constraint
+        for constraint in plan.constraints
+        if constraint.kind == DELIVERY_CONSTRAINT_STOP_AND_FOLLOW_UP_KIND and unit_id in constraint.unit_ids
+    ]
 
 
 @dataclass(frozen=True)

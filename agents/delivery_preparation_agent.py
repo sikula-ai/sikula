@@ -92,6 +92,11 @@ Delivery-plan constraints:
   not merely implementation guidance.
 - Treat explicit trust, permission, secret, privacy, or execution boundaries as security_boundary
   constraints even when they appear inside broader acceptance or implementation prose.
+- Use stop_and_follow_up only when the authoritative task establishes that a required external
+  decision or input is currently unavailable and an affected unit must not start. This kind is an
+  active prepare/runtime blocker, not a conditional reminder. Classify conditional ownership,
+  security, and fallback rules under their corresponding kinds; agents use external_dependency_gap
+  if an external blocker is discovered only during execution.
 - Constraint summaries must be bounded single-line paraphrases. Do not quote source-task text or
   include source excerpts, absolute paths, prompts, provider output, or private data.
 - Each constraint must list every generated unit to which it applies in unit_ids.
@@ -306,6 +311,9 @@ Hard rules:
 - Outside unit_context_gaps.source_literals, do not include source excerpts, task bodies, prompts,
   provider output, diffs, logs, secrets, personal data, or absolute local paths in the JSON result.
 - Do not invent, rename, omit, summarize, or change a supplied constraint or unit id.
+- Treat stop_and_follow_up as an active blocker only when the authoritative task establishes that
+  a required external decision or input is currently unavailable. Do not classify conditional
+  ownership, security, or fallback behavior as an omitted stop_and_follow_up constraint.
 - Return exactly one JSON object and no Markdown outside the JSON.
 
 Verification scope: {verification_scope}
@@ -390,6 +398,8 @@ Hard rules:
 - For omitted gaps, append exactly one new constraint per gap in gap order. Create a stable path-safe
   id, preserve the gap kind and summary exactly, and assign exactly the listed affected_unit_ids.
 - Do not add constraints that are not represented by a supplied gap.
+- A stop_and_follow_up gap represents a currently unavailable prerequisite that blocks execution,
+  not a conditional ownership, security, or fallback reminder.
 - Use preserved only when every assigned candidate unit keeps the rule. Use needs_review when
   consistency cannot be established and conflict when a candidate unit contradicts the rule.
 - Do not include source excerpts, task bodies, prompts, provider output, diffs, logs, secrets,

@@ -315,6 +315,8 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert "Do not include writer-facing path fields" in prompt
     assert "constraints must explicitly list every hard source-task constraint" in prompt
     assert "authoritative_read_only_dependency" in prompt
+    assert "Use stop_and_follow_up only when" in prompt
+    assert "active prepare/runtime blocker" in prompt
     assert '"disposition": "preserved"' in prompt
     assert "Do not write, edit, delete, move, rename, format, or create files." in prompt
     assert "Prefer small units with one primary production surface" in prompt
@@ -371,6 +373,7 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
         "unit_context_gaps": [],
     }
     assert "independent read-only delivery-constraint verifier" in llm.prompts[1]
+    assert "Treat stop_and_follow_up as an active blocker only when" in llm.prompts[1]
     assert '"asset_paths": [' in llm.prompts[1]
     assert ".sikula/task-assets/invite-reference.png" in llm.prompts[1]
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()

@@ -4,13 +4,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from core.delivery_plan import DeliveryBudgetExceeded, DeliveryPlanIssue, _find_git_root as _find_delivery_git_root
+from core.delivery_plan import (
+    DeliveryBudgetExceeded,
+    DeliveryPlan,
+    DeliveryPlanIssue,
+    _find_git_root as _find_delivery_git_root,
+    delivery_unit_stop_and_follow_up_constraints,
+)
 from core.delivery_progress import DeliveryStatusUnit, get_delivery_status, select_next_delivery_unit
 from core.delivery_public_metadata import (
     project_delivery_public_identity,
     sanitize_delivery_public_metadata,
 )
 from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
+
+DELIVERY_STOP_AND_FOLLOW_UP_REQUIRED_CODE = "delivery.stop_and_follow_up_required"
 
 
 @dataclass(frozen=True)
@@ -264,6 +272,11 @@ def preview_delivery_run_next(
                         f"Dry run selected delivery unit {selected_unit.id}; "
                         "no unit was run and delivery progress was not changed."
                     )
+        if selected_unit and status.plan:
+            stop_issues = delivery_stop_and_follow_up_issues(status.plan, selected_unit.id)
+            if stop_issues:
+                errors.extend(stop_issues)
+                message = stop_issues[0].message
         if selected_unit is None:
             code, message = _blocked_run_next_reason(
                 status.status,
@@ -284,11 +297,34 @@ def preview_delivery_run_next(
         dry_run=True,
         status=status.status if status.valid else None,
         progress_exists=status.progress_exists,
-        selected_unit=selected_unit if not errors else None,
+        selected_unit=(
+            selected_unit
+            if not errors or any(issue.code == DELIVERY_STOP_AND_FOLLOW_UP_REQUIRED_CODE for issue in errors)
+            else None
+        ),
         errors=errors,
         warnings=warnings,
         message=message,
     )
+
+
+def delivery_stop_and_follow_up_issues(plan: DeliveryPlan, unit_id: str) -> list[DeliveryPlanIssue]:
+    public_unit_id = project_delivery_public_identity(unit_id)
+    issues: list[DeliveryPlanIssue] = []
+    for constraint in delivery_unit_stop_and_follow_up_constraints(plan, unit_id):
+        public_constraint_id = project_delivery_public_identity(constraint.id)
+        summary = sanitize_delivery_public_metadata(constraint.summary) or "Required follow-up remains unresolved."
+        issues.append(
+            DeliveryPlanIssue(
+                "error",
+                DELIVERY_STOP_AND_FOLLOW_UP_REQUIRED_CODE,
+                f"Delivery unit {public_unit_id} is blocked by unresolved constraint "
+                f"{public_constraint_id}: {summary} Resolve the required follow-up in the authoritative task "
+                "input and prepare the plan again; --reset-failed cannot bypass this stop.",
+                "constraints",
+            )
+        )
+    return issues
 
 
 def _select_running_recovery_unit(status) -> DeliveryStatusUnit | None:

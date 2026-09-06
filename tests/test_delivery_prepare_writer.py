@@ -771,6 +771,53 @@ def test_write_delivery_prepare_artifacts_blocks_unit_readiness_gaps_before_writ
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
 
 
+def test_write_delivery_prepare_artifacts_blocks_stop_and_follow_up_constraints(tmp_path: Path) -> None:
+    source_text = "# Team invites\n\nConfirm the production data source before implementation.\n"
+    source_path = tmp_path / ".sikula" / "tasks" / "source.md"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(source_text, encoding="utf-8")
+    source_task = DeliveryPlanSourceTask(
+        path=".sikula/tasks/source.md",
+        sha256="sha256:" + sha256(source_text.encode("utf-8")).hexdigest(),
+    )
+    constraint = DeliveryAuthoringConstraintDraft(
+        id="production-data-follow-up",
+        kind="stop_and_follow_up",
+        summary="Production data provenance must be confirmed before implementation.",
+        unit_ids=["foundation"],
+        disposition="preserved",
+    )
+
+    result = write_delivery_prepare_artifacts(
+        _draft(constraints=[constraint], source_task=source_task),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+        source_task_description=source_text,
+        source_task_path=source_path,
+    )
+
+    assert result.status == "blocked"
+    assert result.prepared is False
+    assert result.failure_reason == "unit_readiness_blocked"
+    assert [issue.code for issue in result.errors] == [
+        "delivery_prepare.unit_readiness_blocked",
+        "delivery_prepare.stop_and_follow_up_required",
+    ]
+    assert "production-data-follow-up" in result.errors[1].message
+    assert "Production data provenance must be confirmed" in result.errors[1].message
+    assert result.errors[1].path == "constraints[0]"
+    readiness = {unit.unit_id: unit for unit in result.unit_readiness.units}
+    assert result.unit_readiness.status == "blocked"
+    assert readiness["foundation"].status == "blocked"
+    assert readiness["foundation"].readiness_score <= 69
+    assert readiness["foundation"].ready_for_autonomous_delivery is False
+    assert readiness["foundation"].blocking_gap_ids == ["production-data-follow-up"]
+    assert readiness["cli"].status == "ready"
+    assert readiness["cli"].blocking_gap_count == 0
+    assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
 def test_write_delivery_prepare_artifacts_refuses_existing_artifacts_without_force_and_replaces_with_force(
     tmp_path: Path,
 ) -> None:

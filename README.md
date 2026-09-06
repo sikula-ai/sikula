@@ -201,6 +201,12 @@ unit IDs rather than being reported as an artifact-write failure. Published plan
 contain only bounded `preserved`
 constraint metadata. Existing plans without these additive fields remain
 compatible.
+For `stop_and_follow_up`, `preserved` means the prerequisite is still unresolved:
+prepare marks each affected unit blocked and writes no plan artifacts. Existing or
+manually authored plans are checked again by `delivery run-next`, which returns
+`delivery.stop_and_follow_up_required` before creating or resuming a child task.
+Resolve the prerequisite in the authoritative task input and prepare the plan again;
+`--reset-failed` does not bypass this stop.
 
 Generated unit tasks are also checked for source-defined values that must be used
 exactly, such as localization keys, enum values, API field names, and fixed copy.

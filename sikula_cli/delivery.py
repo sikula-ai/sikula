@@ -2986,6 +2986,7 @@ def _run_next_delivery_unit(
     from core.delivery_run_next import (
         DeliveryRunNextExecutionResult,
         _blocked_run_next_reason,
+        delivery_stop_and_follow_up_issues,
         preview_delivery_run_next,
     )
     from core.delivery_write_scope import DeliveryWriteScopeError, resolve_delivery_write_scope
@@ -3064,6 +3065,17 @@ def _run_next_delivery_unit(
             return terminal_result
         running_units = _running_delivery_units(status)
         if len(running_units) == 1:
+            stop_issues = delivery_stop_and_follow_up_issues(status.plan, running_units[0].id)
+            if stop_issues:
+                return _execution_result_from_status(
+                    status,
+                    ran=False,
+                    selected_unit=running_units[0],
+                    progress_path=str(progress_path),
+                    events_path=str(events_path),
+                    errors=[*errors, *stop_issues],
+                    message=stop_issues[0].message,
+                )
             snapshot_issue = _bounded_delivery_run_snapshot_issue(bounded_run_unit_ids, running_units[0])
             if snapshot_issue is not None:
                 return _execution_result_from_status(
@@ -3156,6 +3168,18 @@ def _run_next_delivery_unit(
                 events_path=str(events_path),
                 errors=[*errors, snapshot_issue],
                 message=snapshot_issue.message,
+            )
+
+        stop_issues = delivery_stop_and_follow_up_issues(status.plan, selected_unit.id)
+        if stop_issues:
+            return _execution_result_from_status(
+                status,
+                ran=False,
+                selected_unit=selected_unit,
+                progress_path=str(progress_path),
+                events_path=str(events_path),
+                errors=[*errors, *stop_issues],
+                message=stop_issues[0].message,
             )
 
         dependency_handoffs, handoff_errors = _load_dependency_handoffs(status, selected_unit, root)
@@ -3835,6 +3859,7 @@ def _apply_delivery_preview_execution_guards(
 ):
     from core.delivery_plan import DeliveryPlanIssue
     from core.delivery_progress import get_delivery_status
+    from core.delivery_run_next import delivery_stop_and_follow_up_issues
     from core.delivery_write_scope import DeliveryWriteScopeError, resolve_delivery_write_scope
 
     status = get_delivery_status(plan_file, project_root=project_root)
@@ -3864,6 +3889,18 @@ def _apply_delivery_preview_execution_guards(
             warnings=list(status.warnings) or list(preview.warnings),
             message="Delivery plan is not ready to run.",
         )
+    if status.plan is not None:
+        stop_issues = delivery_stop_and_follow_up_issues(status.plan, selected_unit.id)
+        if stop_issues:
+            return replace(
+                preview,
+                valid=False,
+                ready=False,
+                selected_unit=selected_unit,
+                errors=[*status.errors, *stop_issues],
+                warnings=list(status.warnings),
+                message=stop_issues[0].message,
+            )
     root = Path(status.project_root).resolve()
     child_state_issue = _delivery_preview_child_state_issue(
         cfg=cfg,
