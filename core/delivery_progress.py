@@ -759,6 +759,7 @@ def select_next_delivery_unit(status: DeliveryStatusResult, reset_failed: bool =
                 for unit in status.units
                 if unit.status == "failed"
                 and unit.child_task_id
+                and not unit.stop_and_follow_up_required
                 and unit.failure_code != DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
                 and unit.failure_code not in DELIVERY_TERMINAL_STOP_CODES
             ),
@@ -766,9 +767,40 @@ def select_next_delivery_unit(status: DeliveryStatusResult, reset_failed: bool =
         )
     if status.status == "failed":
         return None
-    # Select a dependency-ready stopped unit so run-next can return its bounded
-    # constraint diagnostic instead of silently skipping plan order.
-    return next((unit for unit in status.units if unit.dependency_ready), None)
+    return next((unit for unit in status.units if unit.eligible), None)
+
+
+def select_delivery_stop_and_follow_up_unit(
+    status: DeliveryStatusResult,
+    *,
+    reset_failed: bool = False,
+) -> DeliveryStatusUnit | None:
+    """Return an actionable plan stop only when no runnable unit supersedes it."""
+    if not status.valid or status.status in {"waiting", "canceled", "done"}:
+        return None
+    running_units = [unit for unit in status.units if unit.status == "running"]
+    if len(running_units) == 1 and running_units[0].stop_and_follow_up_required:
+        return running_units[0]
+    if running_units:
+        return None
+    if reset_failed:
+        return next(
+            (
+                unit
+                for unit in status.units
+                if unit.status == "failed" and unit.child_task_id and unit.stop_and_follow_up_required
+            ),
+            None,
+        )
+    if status.status == "failed":
+        return next(
+            (unit for unit in status.units if unit.status == "failed" and unit.stop_and_follow_up_required),
+            None,
+        )
+    return next(
+        (unit for unit in status.units if unit.dependency_ready and unit.stop_and_follow_up_required),
+        None,
+    )
 
 
 def get_delivery_status(
@@ -1628,11 +1660,10 @@ def _next_action(
         return "inspect canceled delivery progress"
     if status == "done":
         return "review finalized delivery branch" if final_commit else "finalize delivery branch"
-    dependency_ready_unit = next((unit for unit in units if unit.dependency_ready), None)
-    if dependency_ready_unit and dependency_ready_unit.stop_and_follow_up_required:
-        return _stop_and_follow_up_recovery_action()
-    if dependency_ready_unit:
+    if any(unit.eligible for unit in units):
         return "prepare or run an eligible delivery unit with the existing task workflow"
+    if any(unit.dependency_ready and unit.stop_and_follow_up_required for unit in units):
+        return _stop_and_follow_up_recovery_action()
     return "complete prerequisite delivery units"
 
 

@@ -15,6 +15,7 @@ from core.delivery_progress import (
     DELIVERY_STOP_AND_FOLLOW_UP_REQUIRED,
     DeliveryStatusUnit,
     get_delivery_status,
+    select_delivery_stop_and_follow_up_unit,
     select_next_delivery_unit,
 )
 from core.delivery_public_metadata import (
@@ -280,6 +281,12 @@ def preview_delivery_run_next(
         if selected_unit and status.plan:
             stop_issues = delivery_stop_and_follow_up_issues(status.plan, selected_unit.id)
             if stop_issues:
+                errors.extend(stop_issues)
+                message = stop_issues[0].message
+        if selected_unit is None:
+            selected_unit = select_delivery_stop_and_follow_up_unit(status, reset_failed=reset_failed)
+            if selected_unit and status.plan:
+                stop_issues = delivery_stop_and_follow_up_issues(status.plan, selected_unit.id)
                 errors.extend(stop_issues)
                 message = stop_issues[0].message
         if selected_unit is None:

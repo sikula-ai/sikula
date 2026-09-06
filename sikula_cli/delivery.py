@@ -2979,6 +2979,7 @@ def _run_next_delivery_unit(
         make_delivery_progress_event,
         make_delivery_unit_progress,
         read_delivery_progress,
+        select_delivery_stop_and_follow_up_unit,
         select_next_delivery_unit,
         upsert_delivery_unit_progress,
         write_delivery_progress,
@@ -3123,6 +3124,18 @@ def _run_next_delivery_unit(
 
         selected_unit = select_next_delivery_unit(status, reset_failed=reset_failed)
         if selected_unit is None:
+            stopped_unit = select_delivery_stop_and_follow_up_unit(status, reset_failed=reset_failed)
+            if stopped_unit is not None:
+                stop_issues = delivery_stop_and_follow_up_issues(status.plan, stopped_unit.id)
+                return _execution_result_from_status(
+                    status,
+                    ran=False,
+                    selected_unit=stopped_unit,
+                    progress_path=str(progress_path),
+                    events_path=str(events_path),
+                    errors=[*errors, *stop_issues],
+                    message=stop_issues[0].message,
+                )
             code, message = _blocked_run_next_reason(
                 status.status,
                 reset_failed=reset_failed,

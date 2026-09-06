@@ -564,7 +564,25 @@ def test_delivery_status_plan_stop_blocks_pending_unit_action(tmp_path: Path) ->
     assert unit.run_next_blocked_reason == "stop_and_follow_up_required"
     assert payload["units"][0]["eligible"] is False
     assert payload["units"][0]["run_next_blocked_reason"] == "stop_and_follow_up_required"
-    assert select_next_delivery_unit(result) is unit
+    assert select_next_delivery_unit(result) is None
+
+
+def test_delivery_status_plan_stop_does_not_hide_independent_eligible_unit(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan["units"][1]["depends_on"] = []
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+    _add_stop_and_follow_up_constraint(tmp_path, plan_path, unit_id="01-foundation")
+
+    result = get_delivery_status(plan_path)
+    selected = select_next_delivery_unit(result)
+
+    assert result.units[0].eligible is False
+    assert result.units[1].eligible is True
+    assert result.next_action == "prepare or run an eligible delivery unit with the existing task workflow"
+    assert selected is result.units[1]
+    assert selected.id == "02-feature"
 
 
 @pytest.mark.parametrize(

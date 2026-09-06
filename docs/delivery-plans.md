@@ -654,8 +654,9 @@ cannot bypass it.
 report `run_next_available: false`, omit `run_next_action`, and expose
 `run_next_blocked_reason: stop_and_follow_up_required`, even when progress would
 otherwise advertise resume or retry. Pending affected units are not shown as
-eligible, and the plan-level next action directs the operator to resolve the
-authoritative input and prepare again.
+eligible. Independent eligible units remain runnable; when none remain, the
+plan-level next action directs the operator to resolve the authoritative input
+and prepare again.
 When `delivery.child_link_failed` occurs, `run-next` returns the child task id and
 deterministic failure code while omitting absolute filesystem paths from JSON/text
 output.

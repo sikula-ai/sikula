@@ -737,6 +737,23 @@ def test_preview_delivery_run_next_blocks_selected_stop_and_follow_up_unit(tmp_p
     assert not delivery_progress_path(tmp_path, "delivery-run-next-demo").exists()
 
 
+def test_preview_delivery_run_next_skips_stopped_unit_for_independent_runnable_work(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan["units"][1]["depends_on"] = []
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+    _add_stop_and_follow_up_constraint(tmp_path, plan_path, unit_id="01-foundation")
+
+    result = preview_delivery_run_next(plan_path)
+
+    assert result.valid is True
+    assert result.ready is True
+    assert result.selected_unit is not None
+    assert result.selected_unit.id == "02-feature"
+    assert result.errors == []
+
+
 def test_run_next_rechecks_stop_and_follow_up_after_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
