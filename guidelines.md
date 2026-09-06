@@ -443,7 +443,9 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
   failure evidence. A delivery Implementer may report `already_satisfied` only
   with a clean no-change result after inspecting the active task or step. Sikula
   must reject that value when any file changed, and an accepted value must still
-  pass every configured review, security, test-writing, and validation gate.
+  pass every configured review, security, test-writing, and validation gate. A
+  changed-file `already_satisfied` result is a non-retryable invalid Implementer
+  disposition; its writes remain inspectable but cannot be adopted by reset.
   Unstructured no-change output remains a failure for delivery children. A malformed
   Reviewer or Security Reviewer disposition may receive exactly one read-only
   protocol retry with the parser error included in its history. That retry must

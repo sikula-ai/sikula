@@ -342,6 +342,16 @@ class TestImplementerAgentSuccess:
         assert state.files_changed == ["src/registry.py"]
         assert state.delivery_no_change_outcome is None
         assert state.delivery_stop_disposition is None
+        assert state.delivery_disposition_parse_error is not None
+        assert (
+            state.delivery_disposition_parse_error["error_code"]
+            == "delivery_disposition.already_satisfied_with_changes"
+        )
+        assert state.delivery_stop_code_from_parse_error() == "implementer_disposition_invalid"
+        assert (
+            state.implement_cycle_records[-1]["disposition_parse_error"]
+            == "delivery_disposition.already_satisfied_with_changes"
+        )
         assert state.history[-1]["action"] == "implement_failed"
 
     def test_free_form_dependency_wording_does_not_classify_delivery_noop(

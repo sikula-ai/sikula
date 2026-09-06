@@ -253,6 +253,9 @@ class ImplementerAgent(BaseAgent):
                 cycle_record["disposition"] = disposition.to_dict()
                 if disposition.disposition == DELIVERY_DISPOSITION_ALREADY_SATISFIED:
                     if changed:
+                        error_code = "delivery_disposition.already_satisfied_with_changes"
+                        cycle_record["disposition_parse_error"] = error_code
+                        state.record_delivery_disposition_parse_error(self.name, error_code)
                         msg = "Implementer reported already_satisfied after making file changes"
                         state.delivery_no_change_outcome = None
                         state.record(self.name, "implement_failed", msg)

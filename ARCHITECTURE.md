@@ -831,8 +831,9 @@ Analyst, Implementer, Reviewer, or Security Reviewer and keeps that code. A
 terminal disposition stops immediately and cannot be bypassed by inconsistent
 done/failed state or a resumed run; malformed persisted disposition state fails
 before provider execution. When Implementer output recognizably advertises the disposition
-schema key but cannot be parsed—including single-quoted or unquoted key syntax—the agent
-stores only bounded parser error metadata rather than treating it as ordinary prose.
+schema key but cannot be parsed—including single-quoted or unquoted key syntax—or combines
+`already_satisfied` with changed files, the agent stores only bounded invalid-disposition
+metadata rather than treating the output as ordinary prose or accepted implementation.
 Orchestration maps it to terminal `implementer_disposition_invalid`; partial writes
 remain inspectable but cannot pass into review or validation through either direct
 reset or parent `run-next --reset-failed`.
@@ -2212,7 +2213,7 @@ Sikula processes at once is still unsupported.
 | `delivery_budget_stop` | `dict \| None` | Orchestrator | Structured terminal planner budget stop with stable code, budget name, limit, actual count, phase, and timestamp; preserved for audit and parent progress classification |
 | `delivery_stop_code` | `str \| None` | Orchestrator | Closed-set terminal child boundary outcome. Includes scope violation, scope-amendment, external-dependency, and invalid-advertised-Implementer-disposition stops; forces failed/not-done state and blocks unchanged reset recovery. |
 | `delivery_stop_disposition` | `dict \| None` | Delivery agents / Orchestrator | Parser-validated bounded disposition, sanitized summary, recovery action, source, schema version, and timestamp. Raw provider output remains in the agent cycle record and is not projected to parent progress. |
-| `delivery_disposition_parse_error` | `dict \| None` | ImplementerAgent / Orchestrator | Bounded durable evidence that Implementer output advertised the delivery-disposition marker but was malformed: schema version, stable parser error code, source, and timestamp only. Drives terminal `implementer_disposition_invalid` without storing raw output in the control field. |
+| `delivery_disposition_parse_error` | `dict \| None` | ImplementerAgent / Orchestrator | Bounded durable evidence that Implementer output advertised an invalid delivery disposition, whether malformed or semantically inconsistent with its changed files: schema version, stable error code, source, and timestamp only. Drives terminal `implementer_disposition_invalid` without storing raw output in the control field. |
 | `delivery_no_change_outcome` | `str \| None` | ImplementerAgent | Closed positive delivery no-change outcome. The only supported value is `already_satisfied`, accepted only from a parser-validated Implementer result with no changed files. It permits downstream gates and no-op completion but is not a terminal stop or amendment evidence. |
 | `delivery_constraint_context_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Version marker for the inherited-constraint snapshot. New delivery children use the current version even when no constraints apply; legacy and non-delivery state keep `None`. |
 | `delivery_source_task` | `dict[str, str] \| None` | `delivery run-next` / `cmd_run()` | Allowlisted project-relative source-task path and SHA-256 binding copied from the validated parent plan. Raw source task text and absolute paths are never persisted here. |
