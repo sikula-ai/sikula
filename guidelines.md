@@ -463,6 +463,12 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
   most one constraints-only repair may run, it must preserve the complete unit
   draft and every existing constraint identity, and its result must pass a
   second independent verification before deterministic publication.
+- **Stop-and-follow-up constraints are execution blockers.** A preserved
+  `stop_and_follow_up` constraint means the required external decision or input
+  remains unresolved; it must make generated unit readiness blocking. Delivery
+  execution must recheck the selected unit under the progress lock and stop
+  before child creation. It must not treat prompt compliance or
+  `--reset-failed` as a recovery mechanism.
 - **Delivery unit contracts** must be self-contained because child agents cannot
   read the parent source task. Source-defined identifiers and values required
   verbatim must appear in every affected unit task. Independent preparation

@@ -23,6 +23,7 @@ from core.delivery_asset_assignment import (
 )
 from core.delivery_plan import (
     DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION,
+    DELIVERY_CONSTRAINT_STOP_AND_FOLLOW_UP_KIND,
     SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION,
     check_delivery_plan_file,
     delivery_final_branch_for_plan_id,
@@ -38,6 +39,7 @@ _PLAN_VALIDATION_INVALID = "invalid"
 _UNIT_READINESS_NOT_RUN = "not_run"
 _UNIT_READINESS_READY = "ready"
 _UNIT_READINESS_BLOCKED = "blocked"
+_BLOCKED_READINESS_MAX_SCORE = 69
 _FAILURE_ASSET_PRESERVATION_BLOCKED = "asset_preservation_blocked"
 _FAILURE_UNIT_READINESS_BLOCKED = "unit_readiness_blocked"
 _FAILURE_PLAN_VALIDATION_FAILED = "plan_validation_failed"
@@ -459,18 +461,20 @@ def write_delivery_prepare_artifacts(
             ],
         )
     if unit_readiness.status == _UNIT_READINESS_BLOCKED:
+        readiness_errors = [
+            DeliveryPrepareWriteIssue(
+                "error",
+                "delivery_prepare.unit_readiness_blocked",
+                "Generated unit task contracts have blocking readiness gaps.",
+            )
+        ]
+        readiness_errors.extend(_stop_and_follow_up_prepare_issues(draft))
         return _blocked_result(
             paths,
             unit_task_paths=unit_task_paths,
             unit_readiness=unit_readiness,
             failure_reason=_FAILURE_UNIT_READINESS_BLOCKED,
-            errors=[
-                DeliveryPrepareWriteIssue(
-                    "error",
-                    "delivery_prepare.unit_readiness_blocked",
-                    "Generated unit task contracts have blocking readiness gaps.",
-                )
-            ],
+            errors=readiness_errors,
         )
 
     try:
@@ -983,6 +987,14 @@ def _check_unit_readiness(
     *,
     project_config: dict | None,
 ) -> DeliveryPrepareUnitReadinessAggregate:
+    stop_constraint_ids_by_unit: dict[str, list[str]] = {unit.id: [] for unit in draft.units}
+    for constraint in draft.constraints:
+        if constraint.kind != DELIVERY_CONSTRAINT_STOP_AND_FOLLOW_UP_KIND:
+            continue
+        for unit_id in constraint.unit_ids:
+            if unit_id in stop_constraint_ids_by_unit:
+                stop_constraint_ids_by_unit[unit_id].append(constraint.id)
+
     units: list[DeliveryPrepareUnitReadinessSummary] = []
     for unit in draft.units:
         result = check_contract(
@@ -992,7 +1004,14 @@ def _check_unit_readiness(
             project_config=project_config,
             document_kind="task_description",
         )
-        units.append(_unit_readiness_summary(unit.id, unit_task_paths[unit.id], result))
+        units.append(
+            _unit_readiness_summary(
+                unit.id,
+                unit_task_paths[unit.id],
+                result,
+                stop_constraint_ids=stop_constraint_ids_by_unit[unit.id],
+            )
+        )
     status = _UNIT_READINESS_BLOCKED if any(unit.blocking_gap_count > 0 for unit in units) else _UNIT_READINESS_READY
     return DeliveryPrepareUnitReadinessAggregate(status=status, units=units)
 
@@ -1001,19 +1020,44 @@ def _unit_readiness_summary(
     unit_id: str,
     path: str,
     result: ContractCheckResult,
+    *,
+    stop_constraint_ids: list[str] | None = None,
 ) -> DeliveryPrepareUnitReadinessSummary:
     blocking_gap_ids = [gap.id for gap in result.gaps if gap.severity == "blocking"]
+    for constraint_id in stop_constraint_ids or []:
+        if constraint_id not in blocking_gap_ids:
+            blocking_gap_ids.append(constraint_id)
     warning_gap_count = len([gap for gap in result.gaps if gap.severity != "blocking"])
     return DeliveryPrepareUnitReadinessSummary(
         unit_id=unit_id,
         path=path,
-        readiness_score=result.readiness_score,
-        status=result.status,
+        readiness_score=(
+            min(result.readiness_score, _BLOCKED_READINESS_MAX_SCORE) if blocking_gap_ids else result.readiness_score
+        ),
+        status=_UNIT_READINESS_BLOCKED if blocking_gap_ids else result.status,
         ready_for_autonomous_delivery=result.ready_for_autonomous_delivery and not blocking_gap_ids,
         blocking_gap_count=len(blocking_gap_ids),
         warning_gap_count=warning_gap_count,
         blocking_gap_ids=blocking_gap_ids,
     )
+
+
+def _stop_and_follow_up_prepare_issues(draft: DeliveryAuthoringDraft) -> list[DeliveryPrepareWriteIssue]:
+    issues: list[DeliveryPrepareWriteIssue] = []
+    for index, constraint in enumerate(draft.constraints):
+        if constraint.kind != DELIVERY_CONSTRAINT_STOP_AND_FOLLOW_UP_KIND:
+            continue
+        for unit_id in constraint.unit_ids:
+            issues.append(
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.stop_and_follow_up_required",
+                    f"Unit {unit_id} is blocked by unresolved constraint {constraint.id}: {constraint.summary} "
+                    "Resolve the required follow-up in the authoritative task input and prepare the plan again.",
+                    f"constraints[{index}]",
+                )
+            )
+    return issues
 
 
 def _canonicalize_unit_task_markdown_headings(draft: DeliveryAuthoringDraft) -> DeliveryAuthoringDraft:

@@ -9,7 +9,13 @@ import re
 import tempfile
 from typing import Any
 
-from core.delivery_plan import DeliveryBudgetExceeded, DeliveryPlan, DeliveryPlanIssue, check_delivery_plan_file
+from core.delivery_plan import (
+    DeliveryBudgetExceeded,
+    DeliveryPlan,
+    DeliveryPlanIssue,
+    check_delivery_plan_file,
+    delivery_unit_stop_and_follow_up_constraints,
+)
 from core.delivery_public_metadata import (
     project_delivery_public_identity,
     sanitize_delivery_public_metadata,
@@ -26,6 +32,7 @@ from core.state import (
 )
 
 SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION = 1
+DELIVERY_STOP_AND_FOLLOW_UP_REQUIRED = "stop_and_follow_up_required"
 DELIVERY_UNIT_STATUSES = {"pending", "running", "done", "failed", "canceled", "waiting"}
 _DELIVERY_EVENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _DELIVERY_METADATA_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -280,10 +287,13 @@ class DeliveryStatusUnit:
     started_at: str | None = None
     completed_at: str | None = None
     updated_at: str | None = None
+    stop_and_follow_up_required: bool = False
     llm_usage: dict[str, Any] = field(default_factory=empty_llm_usage_summary)
 
     @property
     def run_next_available(self) -> bool:
+        if self.stop_and_follow_up_required:
+            return False
         if self.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE or self.failure_code in DELIVERY_TERMINAL_STOP_CODES:
             return False
         if self.status in ("running", "failed"):
@@ -292,6 +302,8 @@ class DeliveryStatusUnit:
 
     @property
     def run_next_action(self) -> str | None:
+        if self.stop_and_follow_up_required:
+            return None
         if self.status == "running" and self.child_task_id:
             return "resume_or_reconcile"
         if (
@@ -305,6 +317,8 @@ class DeliveryStatusUnit:
 
     @property
     def run_next_blocked_reason(self) -> str | None:
+        if self.stop_and_follow_up_required:
+            return DELIVERY_STOP_AND_FOLLOW_UP_REQUIRED
         if self.status == "failed" and self.failure_code in DELIVERY_TERMINAL_STOP_CODES:
             return self.failure_code
         if self.status == "failed" and self.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE:
@@ -315,6 +329,10 @@ class DeliveryStatusUnit:
 
     @property
     def eligible(self) -> bool:
+        return self.dependency_ready and not self.stop_and_follow_up_required
+
+    @property
+    def dependency_ready(self) -> bool:
         return self.status == "pending" and not self.blocked_by
 
     def to_dict(self) -> dict[str, Any]:
@@ -741,6 +759,7 @@ def select_next_delivery_unit(status: DeliveryStatusResult, reset_failed: bool =
                 for unit in status.units
                 if unit.status == "failed"
                 and unit.child_task_id
+                and not unit.stop_and_follow_up_required
                 and unit.failure_code != DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
                 and unit.failure_code not in DELIVERY_TERMINAL_STOP_CODES
             ),
@@ -749,6 +768,39 @@ def select_next_delivery_unit(status: DeliveryStatusResult, reset_failed: bool =
     if status.status == "failed":
         return None
     return next((unit for unit in status.units if unit.eligible), None)
+
+
+def select_delivery_stop_and_follow_up_unit(
+    status: DeliveryStatusResult,
+    *,
+    reset_failed: bool = False,
+) -> DeliveryStatusUnit | None:
+    """Return an actionable plan stop only when no runnable unit supersedes it."""
+    if not status.valid or status.status in {"waiting", "canceled", "done"}:
+        return None
+    running_units = [unit for unit in status.units if unit.status == "running"]
+    if len(running_units) == 1 and running_units[0].stop_and_follow_up_required:
+        return running_units[0]
+    if running_units:
+        return None
+    if reset_failed:
+        return next(
+            (
+                unit
+                for unit in status.units
+                if unit.status == "failed" and unit.child_task_id and unit.stop_and_follow_up_required
+            ),
+            None,
+        )
+    if status.status == "failed":
+        return next(
+            (unit for unit in status.units if unit.status == "failed" and unit.stop_and_follow_up_required),
+            None,
+        )
+    return next(
+        (unit for unit in status.units if unit.dependency_ready and unit.stop_and_follow_up_required),
+        None,
+    )
 
 
 def get_delivery_status(
@@ -1137,7 +1189,9 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
         for unit in result.units:
             unit_data = unit.to_dict()
             detail = unit.status
-            if unit.status == "running":
+            if unit.stop_and_follow_up_required:
+                detail += " (blocked: resolve prerequisite in the authoritative task input and prepare again)"
+            elif unit.status == "running":
                 if unit.child_task_id:
                     detail += " (run-next: resume or reconcile linked child)"
                 else:
@@ -1530,6 +1584,7 @@ def _build_status_units(
                 started_at=progress_unit.started_at if progress_unit else None,
                 completed_at=progress_unit.completed_at if progress_unit else None,
                 updated_at=progress_unit.updated_at if progress_unit else None,
+                stop_and_follow_up_required=bool(delivery_unit_stop_and_follow_up_constraints(plan, plan_unit.id)),
             )
         )
     return status_units
@@ -1573,12 +1628,16 @@ def _next_action(
     if running_units:
         if len(running_units) > 1:
             return "inspect parent delivery progress; multiple running units need manual reconciliation"
+        if running_units[0].stop_and_follow_up_required:
+            return _stop_and_follow_up_recovery_action()
         if any(u.child_task_id for u in running_units):
             return "run delivery run-next to resume or reconcile the running unit"
         return "inspect parent delivery progress; running unit has no linked child task"
 
     failed_units = [u for u in units if u.status == "failed"]
     if failed_units:
+        if any(u.stop_and_follow_up_required for u in failed_units):
+            return _stop_and_follow_up_recovery_action()
         if any(u.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE for u in failed_units):
             return "split the budget-exceeded unit with delivery amend prepare before continuing"
         for stop_code in (
@@ -1603,7 +1662,13 @@ def _next_action(
         return "review finalized delivery branch" if final_commit else "finalize delivery branch"
     if any(unit.eligible for unit in units):
         return "prepare or run an eligible delivery unit with the existing task workflow"
+    if any(unit.dependency_ready and unit.stop_and_follow_up_required for unit in units):
+        return _stop_and_follow_up_recovery_action()
     return "complete prerequisite delivery units"
+
+
+def _stop_and_follow_up_recovery_action() -> str:
+    return "resolve the stop-and-follow-up prerequisite in the authoritative task input and prepare the plan again"
 
 
 def _format_issue(issue: DeliveryPlanIssue) -> str:

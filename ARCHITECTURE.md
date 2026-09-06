@@ -333,6 +333,17 @@ constraints, while preserving all original constraint identities and disposition
 The repaired list is independently verified once more. A second incomplete result,
 malformed repair, uncertainty, or conflict blocks before filesystem mutation and
 projects the remaining bounded gaps instead of a generic write failure.
+Because `preserved` is the only disposition accepted in a published plan, a
+`stop_and_follow_up` constraint still represents an unresolved control-flow stop.
+Delivery prepare adds its ID to every affected unit's blocking readiness gaps,
+caps the displayed readiness score consistently with other blockers, reports the
+bounded constraint summary, and writes no plan or unit artifacts. Resolving the
+external decision or missing input requires updating the authoritative task input
+and preparing a new plan; constraint repair cannot silently remove the stop.
+Preparation guidance reserves this kind for prerequisites known to be unavailable
+before execution. Conditional ownership, security, and fallback rules retain their
+respective kinds, while an external blocker first discovered by a running child uses
+the existing `external_dependency_gap` disposition.
 The same verification call checks that each generated unit is self-contained for
 source-defined exact identifiers and values because delivery children cannot read
 the parent source task. It may report only bounded complete source-task lines that
@@ -669,6 +680,19 @@ a scope marker keeps the current configured
 production policy. Runtime scope application does not modify
 `sandbox.allowed_test_write_paths`; TestWriter retains the independently configured test
 write policy.
+Before child creation or resume, `run-next` checks the selected unit for preserved
+`stop_and_follow_up` constraints. Preview performs the same check, and execution
+repeats it against status reloaded under the delivery progress lock. A match returns
+`delivery.stop_and_follow_up_required` with bounded constraint identity and summary;
+it does not create or resume a child, write progress or events, or permit
+`--reset-failed` to bypass the stop. This protects older and manually authored valid
+plans that did not pass through the current prepare readiness gate.
+The status projection derives this plan-level boundary without mutating progress:
+affected units are not eligible or retryable, expose the stable
+`stop_and_follow_up_required` blocked reason, and omit resume/retry actions. The
+selector may continue with another independent eligible unit; once none remain,
+the plan next action points back to authoritative-input resolution and preparation,
+so text and JSON automation do not recommend an action that `run-next` must reject.
 At child creation, `run-next` also snapshots the plan's project-relative source-task
 path and fingerprint plus only the bounded inherited constraints that explicitly
 reference the selected unit. A context schema marker distinguishes new children

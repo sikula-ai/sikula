@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from hashlib import sha256
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -9,11 +10,14 @@ from unittest.mock import patch
 import pytest
 
 from core.delivery_authoring import (
+    DeliveryAuthoringConstraintDraft,
     DeliveryAuthoringDerivedPaths,
     DeliveryAuthoringDraft,
     DeliveryAuthoringParseError,
     DeliveryAuthoringUnitDraft,
+    DeliveryConstraintVerification,
 )
+from core.delivery_plan import DeliveryPlanSourceTask
 from core.delivery_prepare_writer import (
     DeliveryPreparePlanValidationSummary,
     DeliveryPrepareUnitReadinessAggregate,
@@ -743,6 +747,58 @@ def test_cmd_delivery_prepare_blocks_unit_readiness_failures_without_artifacts(
     )
     assert "PRIVATE TASK BODY" not in payload_text
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+def test_cmd_delivery_prepare_reports_stop_and_follow_up_blocker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source_body = "# Team invites\n\nConfirm the production data source before implementation.\n"
+    source_path = _write_task(tmp_path, body=source_body)
+    source_task = DeliveryPlanSourceTask(
+        path=source_path.relative_to(tmp_path).as_posix(),
+        sha256="sha256:" + sha256(source_body.encode("utf-8")).hexdigest(),
+    )
+    constraint = DeliveryAuthoringConstraintDraft(
+        id="production-data-follow-up",
+        kind="stop_and_follow_up",
+        summary="Production data provenance must be confirmed before implementation.",
+        unit_ids=["foundation"],
+        disposition="preserved",
+    )
+    draft = replace(
+        _authoring_draft(),
+        constraints=[constraint],
+        source_task=source_task,
+        constraint_verification=DeliveryConstraintVerification(
+            constraints_complete=True,
+            constraints=[constraint],
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    payload = _blocked_payload(
+        _args("tasks/team-invites.md", json_output=True),
+        _cfg(tmp_path),
+        capsys,
+        context=_authoring_context(draft=draft),
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["prepared"] is False
+    assert [issue["code"] for issue in payload["errors"]] == [
+        "delivery_prepare.unit_readiness_blocked",
+        "delivery_prepare.stop_and_follow_up_required",
+    ]
+    assert "production-data-follow-up" in payload["errors"][1]["message"]
+    assert "Production data provenance must be confirmed" in payload["errors"][1]["message"]
+    readiness = {unit["unit_id"]: unit for unit in payload["unit_readiness"]["units"]}
+    assert payload["unit_readiness"]["status"] == "blocked"
+    assert readiness["foundation"]["blocking_gap_ids"] == ["production-data-follow-up"]
+    assert readiness["foundation"]["ready_for_autonomous_delivery"] is False
+    assert readiness["cli"]["blocking_gap_count"] == 0
+    assert payload["written_artifacts"] == []
 
 
 def test_cmd_delivery_prepare_reports_unresolved_scope_path(

@@ -192,6 +192,16 @@ summaries are omitted from public invalid-plan projections. Dispositions are
 `preserved`, `needs_review`, and `conflict`; the writer blocks
 the latter two before creating delivery artifacts. It never publishes raw task
 excerpts, prompts, provider output, absolute paths, or unresolved constraints.
+`preserved` does not resolve a `stop_and_follow_up` constraint: that kind records
+that an external decision or required input must exist before implementation can
+start. Delivery prepare therefore reports each affected unit as blocked, includes
+the bounded constraint ID and summary in text and JSON diagnostics, and writes no
+plan artifacts. Resolve the prerequisite in the authoritative task input and run
+prepare again; constraint repair is not allowed to erase the stop.
+Authoring uses this kind only for prerequisites known to be unavailable before
+execution. Conditional ownership, security, or fallback rules use their respective
+constraint kinds; blockers discovered during a child run use
+`external_dependency_gap`.
 After the first authoring response is parsed, Sikula makes a separate command-free
 read-only verification call with the authoritative source task and every candidate
 unit. The verifier must independently confirm that the constraint list is complete,
@@ -635,6 +645,18 @@ that child task id and a `unit.child_linked` event before agent execution. If th
 update fails, `run-next` stops before agents start and reports
 `delivery.child_link_failed`. It restores parent progress to the pre-start state
 and records an audit event for the failed child-link attempt.
+For compatibility with existing or manually authored plans, dry-run and execution
+also inspect the selected unit for `stop_and_follow_up`. An unresolved stop returns
+`delivery.stop_and_follow_up_required` before child creation or progress mutation.
+The check is repeated after acquiring the progress lock, and `--reset-failed`
+cannot bypass it.
+`delivery status` derives the same boundary from the current plan. Affected units
+report `run_next_available: false`, omit `run_next_action`, and expose
+`run_next_blocked_reason: stop_and_follow_up_required`, even when progress would
+otherwise advertise resume or retry. Pending affected units are not shown as
+eligible. Independent eligible units remain runnable; when none remain, the
+plan-level next action directs the operator to resolve the authoritative input
+and prepare again.
 When `delivery.child_link_failed` occurs, `run-next` returns the child task id and
 deterministic failure code while omitting absolute filesystem paths from JSON/text
 output.

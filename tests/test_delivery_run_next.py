@@ -232,6 +232,28 @@ def _write_plan(root: Path) -> Path:
     return path
 
 
+def _add_stop_and_follow_up_constraint(root: Path, plan_path: Path, *, unit_id: str) -> None:
+    source_body = "# Delivery source\n\nConfirm production data provenance before implementation.\n"
+    source_path = root / ".sikula" / "tasks" / "delivery-source.md"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text(source_body, encoding="utf-8")
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan["source_task"] = {
+        "path": source_path.relative_to(root).as_posix(),
+        "sha256": f"sha256:{sha256(source_body.encode('utf-8')).hexdigest()}",
+    }
+    plan["constraints"] = [
+        {
+            "id": "production-data-follow-up",
+            "kind": "stop_and_follow_up",
+            "summary": "Production data provenance must be confirmed before implementation.",
+            "unit_ids": [unit_id],
+            "disposition": "preserved",
+        }
+    ]
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+
+
 def _resume_child_state(
     *,
     task_id: str = "resume-child",
@@ -691,6 +713,80 @@ def test_preview_delivery_run_next_respects_completed_dependencies(tmp_path: Pat
     assert result.progress_exists is True
 
 
+def test_preview_delivery_run_next_blocks_selected_stop_and_follow_up_unit(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _add_stop_and_follow_up_constraint(tmp_path, plan_path, unit_id="01-foundation")
+
+    result = preview_delivery_run_next(plan_path)
+    payload = result.to_dict()
+    rendered = render_delivery_run_next_preview(result)
+
+    assert result.valid is False
+    assert result.ready is False
+    assert result.selected_unit is not None
+    assert result.selected_unit.id == "01-foundation"
+    assert [issue.code for issue in result.errors] == ["delivery.stop_and_follow_up_required"]
+    assert "production-data-follow-up" in result.errors[0].message
+    assert "Production data provenance must be confirmed" in result.errors[0].message
+    assert "--reset-failed cannot bypass" in result.errors[0].message
+    assert payload["selected_unit"]["id"] == "01-foundation"
+    assert payload["errors"][0]["path"] == "constraints"
+    assert "delivery.stop_and_follow_up_required" in rendered
+    assert "production-data-follow-up" in rendered
+    assert not delivery_progress_path(tmp_path, "delivery-run-next-demo").exists()
+
+
+def test_preview_delivery_run_next_skips_stopped_unit_for_independent_runnable_work(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan["units"][1]["depends_on"] = []
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+    _add_stop_and_follow_up_constraint(tmp_path, plan_path, unit_id="01-foundation")
+
+    result = preview_delivery_run_next(plan_path)
+
+    assert result.valid is True
+    assert result.ready is True
+    assert result.selected_unit is not None
+    assert result.selected_unit.id == "02-feature"
+    assert result.errors == []
+
+
+def test_run_next_rechecks_stop_and_follow_up_after_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import core.delivery_run_next as delivery_run_next_module
+
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    original_preview = delivery_run_next_module.preview_delivery_run_next
+
+    def preview_then_add_stop(*args, **kwargs):
+        preview = original_preview(*args, **kwargs)
+        _add_stop_and_follow_up_constraint(tmp_path, plan_path, unit_id="01-foundation")
+        return preview
+
+    monkeypatch.setattr(delivery_run_next_module, "preview_delivery_run_next", preview_then_add_stop)
+
+    result = _run_next_delivery_unit(
+        _run_next_args(plan_path),
+        _run_next_cfg(tmp_path),
+        _run_next_context(tmp_path, lambda *_args, **_kwargs: pytest.fail("child must not run")),
+        project_root=tmp_path,
+    )
+
+    assert result.ran is False
+    assert result.succeeded is False
+    assert result.selected_unit is not None
+    assert result.selected_unit.id == "01-foundation"
+    assert [issue.code for issue in result.errors] == ["delivery.stop_and_follow_up_required"]
+    assert not delivery_progress_path(tmp_path, "delivery-run-next-demo").exists()
+    assert not delivery_events_path(tmp_path, "delivery-run-next-demo").exists()
+
+
 @pytest.mark.parametrize(
     ("reset_failed", "expected_message"),
     [
@@ -800,6 +896,27 @@ def test_preview_delivery_run_next_selects_failed_unit_with_reset_failed(tmp_pat
     assert result.selected_unit.id == "01-foundation"
     assert result.progress_exists is True
     assert "Dry run selected failed delivery unit 01-foundation" in result.message
+
+
+def test_preview_delivery_run_next_does_not_reset_failed_unit_with_stop_and_follow_up(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    _add_stop_and_follow_up_constraint(tmp_path, plan_path, unit_id="01-foundation")
+    _write_progress(
+        tmp_path,
+        [
+            {"unit_id": "01-foundation", "status": "failed", "child_task_id": "task-abc"},
+        ],
+    )
+
+    result = preview_delivery_run_next(plan_path, reset_failed=True)
+
+    assert result.valid is False
+    assert result.ready is False
+    assert result.selected_unit is not None
+    assert result.selected_unit.id == "01-foundation"
+    assert [issue.code for issue in result.errors] == ["delivery.stop_and_follow_up_required"]
+    assert "--reset-failed cannot bypass" in result.message
 
 
 @pytest.mark.parametrize("reset_failed", [False, True])
