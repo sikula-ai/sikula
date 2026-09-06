@@ -690,6 +690,19 @@ class Orchestrator:
             if path and path not in state.step_files_changed:
                 state.step_files_changed.append(path)
 
+    @staticmethod
+    def _invalidate_delivery_no_change_outcome(state: TaskState, paths: object, *, source: str) -> None:
+        if state.delivery_no_change_outcome is None or not isinstance(paths, (list, tuple, set)):
+            return
+        if not any(isinstance(path, str) and path.strip() for path in paths):
+            return
+        state.delivery_no_change_outcome = None
+        state.record(
+            "orchestrator",
+            "delivery_no_change_invalidated",
+            f"{source} produced production changes",
+        )
+
     def _worktree_dirty_files(self, state: TaskState) -> list[str]:
         """Return project-root-relative paths of uncommitted changes in the worktree.
 
@@ -836,6 +849,7 @@ class Orchestrator:
                         len(dirty),
                     )
                     state.files_changed.extend(dirty)
+                    self._invalidate_delivery_no_change_outcome(state, dirty, source="adopted implementer output")
                     state.record(
                         "orchestrator", "adopt_worktree_changes", f"{len(dirty)} file(s) adopted from worktree"
                     )
@@ -1072,6 +1086,7 @@ class Orchestrator:
                     )
                     state.files_changed.extend(dirty)
                     self._record_step_files_changed(state, dirty)
+                    self._invalidate_delivery_no_change_outcome(state, dirty, source="adopted implementer output")
                     state.record(
                         "orchestrator", "adopt_worktree_changes", f"{len(dirty)} file(s) adopted from worktree"
                     )
@@ -1566,6 +1581,7 @@ class Orchestrator:
                     f"review/test-writer gates preserved; security review invalidated for test-only fix: {paths}",
                 )
             else:
+                self._invalidate_delivery_no_change_outcome(state, fixer_files, source="fixer")
                 state.review_approved = False
                 state.security_approved = False
                 state.review_iterations = 0
@@ -2340,6 +2356,7 @@ class Orchestrator:
             if path not in state.files_changed:
                 state.files_changed.append(path)
         self._record_step_files_changed(state, paths)
+        self._invalidate_delivery_no_change_outcome(state, paths, source="adopted build sync output")
         self._session_code_changed = True
         state.review_approved = False
         state.security_approved = False

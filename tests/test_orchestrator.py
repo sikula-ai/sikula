@@ -6111,6 +6111,37 @@ mod tests {
         assert not state.final_full_task_review_done
         assert any(record["action"] == "test_only_fix" for record in state.history)
 
+    def test_production_fixer_change_invalidates_delivery_no_change_outcome(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        stubs["fixer"].result_data = {"files_written": ["src/main.py"]}
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Verify existing behavior"],
+            plan_decided=True,
+            step_file_tracking_enabled=True,
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_no_change_outcome="already_satisfied",
+            tests_up_to_date=True,
+        )
+
+        assert orch._run_fix_phase(state, "1/3")
+
+        assert state.delivery_no_change_outcome is None
+        assert state.tests_up_to_date is False
+        assert any(record["action"] == "delivery_no_change_invalidated" for record in state.history)
+
     def test_fix_phase_fails_task_when_fixer_result_is_unsuccessful(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path, run_build=True)
         stubs["fixer"].result_success = False

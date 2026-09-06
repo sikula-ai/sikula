@@ -805,6 +805,9 @@ a clean no-change result. Only an initial implementation call records this as th
 no-change outcome for the active task or step. The same disposition from a later
 review or security remediation call means that no additional correction is needed;
 it does not replace production-change provenance already established for that scope.
+Any later accepted production mutation, including retained Fixer output, adopted
+Implementer output, or adopted build-sync output, invalidates the no-change outcome;
+downstream test-only changes do not.
 The agent records the bounded positive outcome, and the
 orchestrator continues through all configured review, security, test-writing, and
 validation gates. With no diff, reviewers independently inspect the current repository
