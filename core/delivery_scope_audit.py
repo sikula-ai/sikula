@@ -1316,6 +1316,24 @@ class DeliveryScopeAudit:
             )
         ]
         violation_count = len(violation_paths) + len(outside_project_paths)
+        reconciled_paths: list[str] = []
+        if resume_recovery and not violation_count and name == "implementer":
+            reconciled_paths = sorted({project_path for _, project_path in production_paths})
+            for path in reconciled_paths:
+                if path not in state.files_changed:
+                    state.files_changed.append(path)
+            if state.plan and state.active_scope != "final_full_task":
+                state.step_file_tracking_enabled = True
+                for path in reconciled_paths:
+                    if path not in state.step_files_changed:
+                        state.step_files_changed.append(path)
+            if reconciled_paths:
+                state.delivery_no_change_outcome = None
+                state.record(
+                    "orchestrator",
+                    "interrupted_implementer_changes_reconciled",
+                    f"{len(reconciled_paths)} path(s) recovered from delivery scope audit",
+                )
         metadata: dict[str, object] = {
             "code": DELIVERY_SCOPE_VIOLATION_CODE if violation_count else "delivery_scope_audit_passed",
             "agent": name,
@@ -1331,6 +1349,7 @@ class DeliveryScopeAudit:
             metadata["outside_project_paths"] = self._bounded_delivery_scope_paths(outside_project_paths)
         if resume_recovery:
             metadata["resume_recovery"] = True
+            metadata["reconciled_changed_count"] = len(reconciled_paths)
         if provider_attempt is not None:
             metadata["audit_boundary"] = "provider_attempt"
             provider = provider_attempt.get("provider")

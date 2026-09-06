@@ -2678,11 +2678,20 @@ mod tests {
             heartbeat_interval_seconds=60,
         )
         state = _scoped_delivery_state(orch, ["src/allowed"])
+        kept = allowed / "kept.py"
+        kept.write_text("prior step\n", encoding="utf-8")
+        state.plan = ["Create shared implementation", "Update shared implementation"]
+        state.plan_decided = True
+        state.current_step = 1
+        state.step_file_tracking_enabled = True
+        state.step_files_changed = []
+        state.files_changed = ["src/allowed/kept.py"]
+        state.delivery_no_change_outcome = "already_satisfied"
         orch._set_delivery_scope_audit_pending(state, "implementer")
         orch._delivery_scope_audit_snapshot(state, "implementer")
         state.start_active_operation("agent", agent="implementer", message="interrupted")
         orch._store.save(state)
-        (allowed / "kept.py").write_text("in scope\n", encoding="utf-8")
+        kept.write_text("updated in current step\n", encoding="utf-8")
         pipeline_calls: list[TaskState] = []
         monkeypatch.setattr(orch, "_loop", pipeline_calls.append)
 
@@ -2695,6 +2704,11 @@ mod tests {
         assert audit["status"] == "passed"
         assert audit["metadata"]["resume_recovery"] is True
         assert audit["metadata"]["production_changed_count"] == 1
+        assert audit["metadata"]["reconciled_changed_count"] == 1
+        assert result.files_changed == ["src/allowed/kept.py"]
+        assert result.step_files_changed == ["src/allowed/kept.py"]
+        assert result.delivery_no_change_outcome is None
+        assert any(record["action"] == "interrupted_implementer_changes_reconciled" for record in result.history)
 
     def test_resume_keeps_interrupted_fixer_test_path_under_test_policy(
         self,
@@ -7120,6 +7134,49 @@ class TestOrchestratorInterruptResume:
         assert result.step_files_changed == ["src/interrupted.py"]
         assert result.delivery_no_change_outcome is None
         assert any(record["action"] == "adopt_worktree_changes" for record in result.history)
+        assert not any(record["action"] == "step_already_satisfied" for record in result.history)
+
+    def test_resumed_step_noop_uses_reconciled_edit_to_previously_changed_path(self, tmp_path: Path, monkeypatch):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+
+        def already_satisfied(state: TaskState) -> None:
+            state.delivery_no_change_outcome = "already_satisfied"
+
+        stubs["implementer"].side_effect = already_satisfied
+        stubs["implementer"].result_data = {
+            "files_written": [],
+            "implementation_outcome": "already_satisfied",
+        }
+        monkeypatch.setattr(orch, "_worktree_dirty_files", lambda _state: ["src/shared.py"])
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Create shared implementation", "Update shared implementation"],
+            plan_decided=True,
+            current_step=1,
+            step_file_tracking_enabled=True,
+            step_files_changed=["src/shared.py"],
+            files_changed=["src/shared.py"],
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 2},
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done is True
+        assert result.failed is False
+        assert result.files_changed == ["src/shared.py"]
+        assert result.step_files_changed == ["src/shared.py"]
+        assert result.delivery_no_change_outcome is None
+        assert not any(record["action"] == "adopt_worktree_changes" for record in result.history)
         assert not any(record["action"] == "step_already_satisfied" for record in result.history)
 
     def test_step_loop_no_changes_advances_to_next_step(self, tmp_path: Path):

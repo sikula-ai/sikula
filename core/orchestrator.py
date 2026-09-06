@@ -1078,6 +1078,11 @@ class Orchestrator:
                 return False
             implementation_files = (result.data or {}).get("files_written", [])
             if not implementation_files:
+                current_step_has_changes = bool(
+                    state.step_file_tracking_enabled is True
+                    and isinstance(state.step_files_changed, list)
+                    and state.step_files_changed
+                )
                 recorded_paths = {
                     normalized
                     for normalized in (_normalize_project_path(str(path)) for path in state.files_changed)
@@ -1098,6 +1103,12 @@ class Orchestrator:
                     self._invalidate_delivery_no_change_outcome(state, dirty, source="adopted implementer output")
                     state.record(
                         "orchestrator", "adopt_worktree_changes", f"{len(dirty)} file(s) adopted from worktree"
+                    )
+                elif current_step_has_changes:
+                    self._invalidate_delivery_no_change_outcome(
+                        state,
+                        state.step_files_changed,
+                        source="reconciled current-step output",
                     )
                 else:
                     outcome = (result.data or {}).get("implementation_outcome")
