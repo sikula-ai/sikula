@@ -1078,10 +1078,19 @@ class Orchestrator:
                 return False
             implementation_files = (result.data or {}).get("files_written", [])
             if not implementation_files:
-                dirty = self._worktree_dirty_files(state) if not state.files_changed else []
+                recorded_paths = {
+                    normalized
+                    for normalized in (_normalize_project_path(str(path)) for path in state.files_changed)
+                    if normalized
+                }
+                dirty = [
+                    path
+                    for path in self._worktree_dirty_files(state)
+                    if _normalize_project_path(path) not in recorded_paths
+                ]
                 if dirty:
                     log.warning(
-                        "Implementer made no new writes but worktree has %d uncommitted file(s) — adopting them",
+                        "Implementer made no new writes but worktree has %d unrecorded file(s) — adopting them",
                         len(dirty),
                     )
                     state.files_changed.extend(dirty)

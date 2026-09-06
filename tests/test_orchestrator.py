@@ -7074,6 +7074,54 @@ class TestOrchestratorInterruptResume:
         assert len(stubs["test_writer"].calls) == 3
         assert any(record["action"] == "step_already_satisfied" for record in result.history)
 
+    def test_resumed_step_noop_adopts_only_unrecorded_dirty_paths(self, tmp_path: Path, monkeypatch):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+
+        def already_satisfied(state: TaskState) -> None:
+            state.delivery_no_change_outcome = "already_satisfied"
+
+        stubs["implementer"].side_effect = already_satisfied
+        stubs["implementer"].result_data = {
+            "files_written": [],
+            "implementation_outcome": "already_satisfied",
+        }
+        monkeypatch.setattr(
+            orch,
+            "_worktree_dirty_files",
+            lambda _state: ["src/previous.py", "src/interrupted.py"],
+        )
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Implement foundation", "Finish interrupted wiring"],
+            plan_decided=True,
+            plan_completed=False,
+            current_step=1,
+            step_file_tracking_enabled=True,
+            step_files_changed=[],
+            files_changed=["src/previous.py"],
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 2},
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done is True
+        assert result.failed is False
+        assert result.files_changed == ["src/previous.py", "src/interrupted.py"]
+        assert result.step_files_changed == ["src/interrupted.py"]
+        assert result.delivery_no_change_outcome is None
+        assert any(record["action"] == "adopt_worktree_changes" for record in result.history)
+        assert not any(record["action"] == "step_already_satisfied" for record in result.history)
+
     def test_step_loop_no_changes_advances_to_next_step(self, tmp_path: Path):
         """Step with no file changes must not abort — treat as already implemented and advance."""
         orch, stubs, _ = _make_orchestrator(tmp_path, run_planner=True, run_build=False)

@@ -808,6 +808,10 @@ it does not replace production-change provenance already established for that sc
 Any later accepted production mutation, including retained Fixer output, adopted
 Implementer output, or adopted build-sync output, invalidates the no-change outcome;
 downstream test-only changes do not.
+When a planned step resumes after an interrupted Implementer call, Sikula reconciles
+dirty paths not already present in cumulative change state into the active step before
+classifying a clean provider return as a no-op; prior-step paths remain attributed only
+to their original steps.
 The agent records the bounded positive outcome, and the
 orchestrator continues through all configured review, security, test-writing, and
 validation gates. With no diff, reviewers independently inspect the current repository
