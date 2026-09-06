@@ -17,6 +17,7 @@ from core.delivery_write_scope import (
 )
 from core.state import TaskState
 from core.structured_output import (
+    DELIVERY_DISPOSITION_ALREADY_SATISFIED,
     DELIVERY_DISPOSITION_APPROVED,
     DELIVERY_REVIEW_DISPOSITIONS,
     DeliveryDisposition,
@@ -47,14 +48,24 @@ disposition value and never wrap the object in another JSON structure.\
 """
 
 _IMPLEMENTATION_DISPOSITION_CONTRACT = """\
-DELIVERY STOP OUTPUT CONTRACT:
+DELIVERY IMPLEMENTATION OUTCOME CONTRACT:
+If and only if repository inspection proves that every requirement in the active task
+or current step is already present and no file needs to change, make your final
+response exactly one flat JSON object:
+{"sikula_disposition_schema_version":1,"disposition":"already_satisfied","summary":"<bounded single-line project-relative evidence>"}
+
+Use `already_satisfied` only for a clean no-change result. Do not use it after writing
+files, merely because a previous unit or commit claims the work is complete, or when
+any requirement remains uncertain. Sikula will still run its configured review,
+security, test-writing, and validation gates.
+
 If implementation cannot safely continue because a required change is owned by an
 external repository or unavailable dependency, stop writing immediately and make your
 final response exactly one flat JSON object:
 {"sikula_disposition_schema_version":1,"disposition":"external_dependency_gap","summary":"<one bounded single-line summary>"}
 
 This disposition remains required if you already made partial in-scope changes. Do not
-emit it for ordinary implementation failures, uncertainty, no-change completion, or a
+emit it for ordinary implementation failures, uncertainty, or a
 change that can be made within the current task and write scope. Never emit review-only
 dispositions and never wrap the object in another JSON structure.
 """
@@ -144,6 +155,32 @@ class DeliveryAgentPromptContext:
 class DeliveryReviewDispositionResult:
     disposition: DeliveryDisposition | None
     error_code: str | None
+
+
+def is_delivery_implementation_already_satisfied(state: TaskState) -> bool:
+    """Return whether state carries a valid delivery-child no-change outcome."""
+    return bool(
+        isinstance(state.delivery_plan_id, str)
+        and state.delivery_plan_id
+        and isinstance(state.delivery_unit_id, str)
+        and state.delivery_unit_id
+        and state.delivery_no_change_outcome == DELIVERY_DISPOSITION_ALREADY_SATISFIED
+    )
+
+
+def requires_delivery_no_change_verification_context(state: TaskState) -> bool:
+    """Return whether the active gate must verify an already-satisfied claim."""
+    if not is_delivery_implementation_already_satisfied(state):
+        return False
+    if state.active_scope != "final_full_task":
+        return True
+
+    if not isinstance(state.files_changed, list) or not isinstance(state.test_files_written, list):
+        return False
+    test_writer_paths = {path for path in state.test_files_written if isinstance(path, str) and path.strip()}
+    return all(
+        isinstance(path, str) and bool(path.strip()) and path in test_writer_paths for path in state.files_changed
+    )
 
 
 def delivery_agent_prompt_context(

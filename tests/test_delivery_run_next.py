@@ -1260,6 +1260,55 @@ def test_cmd_delivery_run_next_runs_selected_unit_and_records_progress(
     assert parsed_events[2]["child_task_id"] == payload["child_task_id"]
 
 
+def test_cmd_delivery_run_next_records_already_satisfied_child_as_noop(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    cfg = _run_next_cfg(tmp_path)
+
+    def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
+        store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
+        state = store.create(
+            "child task",
+            delivery_plan_id=run_args.delivery_plan_id,
+            delivery_unit_id=run_args.delivery_unit_id,
+            delivery_plan_path=run_args.delivery_plan_path,
+            delivery_unit_budget=run_args.delivery_unit_budget,
+            delivery_handoff_schema_version=run_args.delivery_handoff_schema_version,
+            delivery_dependency_handoffs=run_args.delivery_dependency_handoffs,
+        )
+        run_args.created_task_id = state.task_id
+        run_args.delivery_child_created_callback(state.task_id)
+        state.done = True
+        state.delivery_no_change_outcome = "already_satisfied"
+        store.save(state)
+        return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
+
+    cmd_delivery_run_next(
+        _run_next_args(plan_path, json_output=True),
+        cfg,
+        _run_next_context(tmp_path, runner),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["succeeded"] is True
+    assert payload["selected_unit"]["status"] == "done"
+    assert "commit" not in payload["selected_unit"]
+    progress = _load_delivery_progress(tmp_path)
+    unit = progress["units"][0]
+    assert unit["status"] == "done"
+    assert "commit" not in unit
+    handoff = read_delivery_unit_handoff(
+        delivery_unit_handoff_path(tmp_path, "delivery-run-next-demo", "01-foundation"),
+        project_root=tmp_path,
+    )
+    assert handoff is not None
+    assert handoff.result_commit is None
+    assert handoff.files_changed == []
+
+
 def test_cmd_delivery_run_next_reports_child_link_failure_if_parent_progress_link_fails(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

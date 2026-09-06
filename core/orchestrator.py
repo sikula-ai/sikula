@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from agents.analyst_agent import AnalystAgent
+from agents.delivery_contracts import is_delivery_implementation_already_satisfied
 from agents.fixer_agent import FixerAgent
 from agents.implementer_agent import ImplementerAgent
 from agents.planner_agent import PlannerAgent
@@ -70,6 +71,7 @@ from core.state import (
     StateStore,
     TaskState,
 )
+from core.structured_output import DELIVERY_DISPOSITION_ALREADY_SATISFIED
 from core.synthetic_test_harness_audit import (
     active_findings_for_current_files as active_synthetic_harness_findings_for_current_files,
 )
@@ -688,6 +690,19 @@ class Orchestrator:
             if path and path not in state.step_files_changed:
                 state.step_files_changed.append(path)
 
+    @staticmethod
+    def _invalidate_delivery_no_change_outcome(state: TaskState, paths: object, *, source: str) -> None:
+        if state.delivery_no_change_outcome is None or not isinstance(paths, (list, tuple, set)):
+            return
+        if not any(isinstance(path, str) and path.strip() for path in paths):
+            return
+        state.delivery_no_change_outcome = None
+        state.record(
+            "orchestrator",
+            "delivery_no_change_invalidated",
+            f"{source} produced production changes",
+        )
+
     def _worktree_dirty_files(self, state: TaskState) -> list[str]:
         """Return project-root-relative paths of uncommitted changes in the worktree.
 
@@ -813,7 +828,7 @@ class Orchestrator:
         """Phases 2-5 as a single pass when no multi-step plan is in use."""
         # Phase 2: implement (idempotent — skipped if files already changed)
         has_preexisting_changes = bool(state.files_changed)
-        if not state.files_changed:
+        if not state.files_changed and not is_delivery_implementation_already_satisfied(state):
             log.info("--- Phase: implement ---")
             result = self._run_agent("implementer", state)
             if state.failed:
@@ -834,15 +849,29 @@ class Orchestrator:
                         len(dirty),
                     )
                     state.files_changed.extend(dirty)
+                    self._invalidate_delivery_no_change_outcome(state, dirty, source="adopted implementer output")
                     state.record(
                         "orchestrator", "adopt_worktree_changes", f"{len(dirty)} file(s) adopted from worktree"
                     )
                 else:
-                    log.error("Implementer produced no file changes — aborting task")
-                    state.record("orchestrator", "abort", "implementer produced no file changes")
-                    state.failed = True
-                    self._store.save(state)
-                    return
+                    outcome = (result.data or {}).get("implementation_outcome")
+                    if (
+                        outcome == DELIVERY_DISPOSITION_ALREADY_SATISFIED
+                        and is_delivery_implementation_already_satisfied(state)
+                    ):
+                        log.info("Delivery implementation is already satisfied; continuing to configured gates")
+                        state.record(
+                            "orchestrator",
+                            "implementation_already_satisfied",
+                            "no file changes; continuing to configured gates",
+                        )
+                        self._store.save(state)
+                    else:
+                        log.error("Implementer produced no file changes — aborting task")
+                        state.record("orchestrator", "abort", "implementer produced no file changes")
+                        state.failed = True
+                        self._store.save(state)
+                        return
 
         if self._config.run_build and (state.fixer_changed_code or _build_loop_active_for_current_scope(state)):
             self._run_build_fix_loop(state, set_done=True)
@@ -904,7 +933,7 @@ class Orchestrator:
                 return
             state.test_status = "skipped"
             state.check_status = "skipped"
-            state.done = bool(state.files_changed)
+            state.done = bool(state.files_changed) or is_delivery_implementation_already_satisfied(state)
             if not state.done:
                 log.warning("Implementation produced no file changes")
             self._store.save(state)
@@ -960,11 +989,17 @@ class Orchestrator:
     def _run_after_plan_completed(self, state: TaskState) -> None:
         """Run whole-task gates that apply after every planned step has completed."""
         if not state.files_changed:
-            log.error("All steps were skipped — no file changes produced — task failed")
-            state.record("orchestrator", "abort", "all steps skipped — no file changes")
-            state.failed = True
-            self._store.save(state)
-            return
+            if not is_delivery_implementation_already_satisfied(state):
+                log.error("All steps were skipped — no file changes produced — task failed")
+                state.record("orchestrator", "abort", "all steps skipped — no file changes")
+                state.failed = True
+                self._store.save(state)
+                return
+            state.record(
+                "orchestrator",
+                "plan_already_satisfied",
+                "all steps reported already satisfied; continuing to final configured gates",
+            )
 
         if self._config.run_build and (state.fixer_changed_code or _build_loop_active_for_current_scope(state)):
             state.active_scope = _SCOPE_FINAL_FULL_TASK
@@ -1041,19 +1076,58 @@ class Orchestrator:
                 state.failed = True
                 self._store.save(state)
                 return False
-            if not state.files_changed:
-                dirty = self._worktree_dirty_files(state)
+            implementation_files = (result.data or {}).get("files_written", [])
+            if not implementation_files:
+                current_step_has_changes = bool(
+                    state.step_file_tracking_enabled is True
+                    and isinstance(state.step_files_changed, list)
+                    and state.step_files_changed
+                )
+                recorded_paths = {
+                    normalized
+                    for normalized in (_normalize_project_path(str(path)) for path in state.files_changed)
+                    if normalized
+                }
+                dirty = [
+                    path
+                    for path in self._worktree_dirty_files(state)
+                    if _normalize_project_path(path) not in recorded_paths
+                ]
                 if dirty:
                     log.warning(
-                        "Implementer made no new writes but worktree has %d uncommitted file(s) — adopting them",
+                        "Implementer made no new writes but worktree has %d unrecorded file(s) — adopting them",
                         len(dirty),
                     )
                     state.files_changed.extend(dirty)
                     self._record_step_files_changed(state, dirty)
+                    self._invalidate_delivery_no_change_outcome(state, dirty, source="adopted implementer output")
                     state.record(
                         "orchestrator", "adopt_worktree_changes", f"{len(dirty)} file(s) adopted from worktree"
                     )
+                elif current_step_has_changes:
+                    self._invalidate_delivery_no_change_outcome(
+                        state,
+                        state.step_files_changed,
+                        source="reconciled current-step output",
+                    )
                 else:
+                    outcome = (result.data or {}).get("implementation_outcome")
+                    if state.delivery_plan_id and state.delivery_unit_id:
+                        if outcome != DELIVERY_DISPOSITION_ALREADY_SATISFIED or not (
+                            is_delivery_implementation_already_satisfied(state)
+                        ):
+                            log.error("Delivery implementer produced an unclassified no-change step")
+                            state.record(
+                                "orchestrator",
+                                "abort",
+                                f"Step {step_num}/{total_steps}: unclassified no-change result",
+                            )
+                            state.failed = True
+                            self._store.save(state)
+                            return False
+                        action = "step_already_satisfied"
+                    else:
+                        action = "step_skipped"
                     log.info(
                         "Implementer made no changes for step %d/%d — advancing to next step",
                         step_num,
@@ -1061,12 +1135,13 @@ class Orchestrator:
                     )
                     state.record(
                         "orchestrator",
-                        "step_skipped",
+                        action,
                         f"Step {step_num}/{total_steps}: no file changes",
                     )
                     state.step_implemented = True
                     self._store.save(state)
-                    return True
+                    if action == "step_skipped":
+                        return True
             state.step_implemented = True
             self._store.save(state)
 
@@ -1526,6 +1601,7 @@ class Orchestrator:
                     f"review/test-writer gates preserved; security review invalidated for test-only fix: {paths}",
                 )
             else:
+                self._invalidate_delivery_no_change_outcome(state, fixer_files, source="fixer")
                 state.review_approved = False
                 state.security_approved = False
                 state.review_iterations = 0
@@ -2300,6 +2376,7 @@ class Orchestrator:
             if path not in state.files_changed:
                 state.files_changed.append(path)
         self._record_step_files_changed(state, paths)
+        self._invalidate_delivery_no_change_outcome(state, paths, source="adopted build sync output")
         self._session_code_changed = True
         state.review_approved = False
         state.security_approved = False

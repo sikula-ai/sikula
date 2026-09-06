@@ -21,6 +21,7 @@ from agents.delivery_contracts import delivery_agent_prompt_context
 from core.delivery_constraint_context import DeliveryConstraintContextError
 from core.state import TaskState
 from core.structured_output import (
+    DELIVERY_DISPOSITION_ALREADY_SATISFIED,
     DELIVERY_IMPLEMENTATION_DISPOSITIONS,
     DeliveryDispositionParseError,
     parse_delivery_disposition,
@@ -250,6 +251,45 @@ class ImplementerAgent(BaseAgent):
                 )
             if disposition is not None:
                 cycle_record["disposition"] = disposition.to_dict()
+                if disposition.disposition == DELIVERY_DISPOSITION_ALREADY_SATISFIED:
+                    if changed:
+                        error_code = "delivery_disposition.already_satisfied_with_changes"
+                        cycle_record["disposition_parse_error"] = error_code
+                        state.record_delivery_disposition_parse_error(self.name, error_code)
+                        msg = "Implementer reported already_satisfied after making file changes"
+                        state.delivery_no_change_outcome = None
+                        state.record(self.name, "implement_failed", msg)
+                        return AgentResult(
+                            success=False,
+                            message=msg,
+                            data={"files_written": changed},
+                        )
+                    remediation_call = state.review_iterations > 0 or state.security_review_iterations > 0
+                    if remediation_call and state.delivery_no_change_outcome != DELIVERY_DISPOSITION_ALREADY_SATISFIED:
+                        state.record(
+                            self.name,
+                            "implement_no_additional_changes",
+                            disposition.summary,
+                        )
+                        return AgentResult(
+                            success=True,
+                            message=DELIVERY_DISPOSITION_ALREADY_SATISFIED,
+                            data={
+                                "files_written": [],
+                                "disposition": disposition.to_dict(),
+                            },
+                        )
+                    state.delivery_no_change_outcome = DELIVERY_DISPOSITION_ALREADY_SATISFIED
+                    state.record(self.name, "implement_already_satisfied", disposition.summary)
+                    return AgentResult(
+                        success=True,
+                        message=DELIVERY_DISPOSITION_ALREADY_SATISFIED,
+                        data={
+                            "files_written": [],
+                            "implementation_outcome": DELIVERY_DISPOSITION_ALREADY_SATISFIED,
+                            "disposition": disposition.to_dict(),
+                        },
+                    )
                 state.set_delivery_stop_disposition(self.name, disposition)
                 return AgentResult(
                     success=False,
@@ -261,10 +301,13 @@ class ImplementerAgent(BaseAgent):
                 )
 
         if not changed:
+            state.delivery_no_change_outcome = None
             msg = "Agent made no file changes"
-            state.record(self.name, "implement_skipped", msg)
-            return AgentResult(success=True, message=msg)
+            action = "implement_failed" if delivery_child else "implement_skipped"
+            state.record(self.name, action, msg)
+            return AgentResult(success=not delivery_child, message=msg)
 
+        state.delivery_no_change_outcome = None
         state.record(self.name, "implement", f"files changed: {changed}")
         return AgentResult(
             success=True,

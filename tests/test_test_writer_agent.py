@@ -65,6 +65,29 @@ class TestTestWriterAgentGuards:
         result = _make_agent(stub_llm, file_tool=file_tool).run(state)
         assert not result.success
 
+    def test_delivery_already_satisfied_without_files_checks_existing_tests(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state(
+            files_changed=[],
+            delivery_plan_id="demo-plan",
+            delivery_unit_id="feature-unit",
+            delivery_no_change_outcome="already_satisfied",
+        )
+
+        result = _make_agent(
+            stub_llm,
+            file_tool=file_tool,
+            project_config=_config_with_test_paths(),
+        ).run(state)
+
+        assert result.success
+        assert len(stub_llm.agent_calls) == 1
+        assert "NO-CHANGE DELIVERY TEST SCOPE" in stub_llm.agent_calls[0]
+        assert "no implementation diff" in stub_llm.agent_calls[0]
+        assert (
+            "Do not write tests for unchanged code, except when a NO-CHANGE DELIVERY TEST SCOPE"
+            in (stub_llm.agent_calls[0])
+        )
+
     def test_no_file_tool_returns_failure(self, stub_llm: StubLLMClient):
         state = _make_state()
         result = _make_agent(stub_llm, project_config=_config_with_test_paths()).run(state)
@@ -175,6 +198,39 @@ class TestTestWriterAgentSuccess:
         git_tool.diff_head.assert_called_once_with(["src/current.py"])
         prompt = stub_llm.agent_calls[0]
         assert "src/current.py" in prompt
+        assert "src/previous.py" not in prompt
+
+    @pytest.mark.parametrize("step_file_tracking_enabled", [False, True])
+    def test_already_satisfied_current_step_does_not_reuse_prior_step_files(
+        self,
+        stub_llm: StubLLMClient,
+        file_tool,
+        git_tool,
+        step_file_tracking_enabled: bool,
+    ):
+        git_tool.diff_head = MagicMock(return_value=ToolResult(success=True, output=""))
+        state = _make_state(
+            plan=["Change previous module", "Verify current module"],
+            current_step=1,
+            files_changed=["src/previous.py"],
+            step_file_tracking_enabled=step_file_tracking_enabled,
+            step_files_changed=[],
+            delivery_plan_id="demo-plan",
+            delivery_unit_id="feature-unit",
+            delivery_no_change_outcome="already_satisfied",
+        )
+
+        result = _make_agent(
+            stub_llm,
+            file_tool=file_tool,
+            git_tool=git_tool,
+            project_config=_config_with_test_paths(),
+        ).run(state)
+
+        assert result.success
+        git_tool.diff_head.assert_not_called()
+        prompt = stub_llm.agent_calls[0]
+        assert "NO-CHANGE DELIVERY TEST SCOPE" in prompt
         assert "src/previous.py" not in prompt
 
     def test_final_scope_uses_complete_change_context(self, stub_llm: StubLLMClient, file_tool, git_tool):

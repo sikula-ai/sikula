@@ -2678,11 +2678,20 @@ mod tests {
             heartbeat_interval_seconds=60,
         )
         state = _scoped_delivery_state(orch, ["src/allowed"])
+        kept = allowed / "kept.py"
+        kept.write_text("prior step\n", encoding="utf-8")
+        state.plan = ["Create shared implementation", "Update shared implementation"]
+        state.plan_decided = True
+        state.current_step = 1
+        state.step_file_tracking_enabled = True
+        state.step_files_changed = []
+        state.files_changed = ["src/allowed/kept.py"]
+        state.delivery_no_change_outcome = "already_satisfied"
         orch._set_delivery_scope_audit_pending(state, "implementer")
         orch._delivery_scope_audit_snapshot(state, "implementer")
         state.start_active_operation("agent", agent="implementer", message="interrupted")
         orch._store.save(state)
-        (allowed / "kept.py").write_text("in scope\n", encoding="utf-8")
+        kept.write_text("updated in current step\n", encoding="utf-8")
         pipeline_calls: list[TaskState] = []
         monkeypatch.setattr(orch, "_loop", pipeline_calls.append)
 
@@ -2695,6 +2704,11 @@ mod tests {
         assert audit["status"] == "passed"
         assert audit["metadata"]["resume_recovery"] is True
         assert audit["metadata"]["production_changed_count"] == 1
+        assert audit["metadata"]["reconciled_changed_count"] == 1
+        assert result.files_changed == ["src/allowed/kept.py"]
+        assert result.step_files_changed == ["src/allowed/kept.py"]
+        assert result.delivery_no_change_outcome is None
+        assert any(record["action"] == "interrupted_implementer_changes_reconciled" for record in result.history)
 
     def test_resume_keeps_interrupted_fixer_test_path_under_test_policy(
         self,
@@ -6111,6 +6125,37 @@ mod tests {
         assert not state.final_full_task_review_done
         assert any(record["action"] == "test_only_fix" for record in state.history)
 
+    def test_production_fixer_change_invalidates_delivery_no_change_outcome(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_test_write_paths": ["tests/"]},
+            },
+        )
+        stubs["fixer"].result_data = {"files_written": ["src/main.py"]}
+        state = _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Verify existing behavior"],
+            plan_decided=True,
+            step_file_tracking_enabled=True,
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_no_change_outcome="already_satisfied",
+            tests_up_to_date=True,
+        )
+
+        assert orch._run_fix_phase(state, "1/3")
+
+        assert state.delivery_no_change_outcome is None
+        assert state.tests_up_to_date is False
+        assert any(record["action"] == "delivery_no_change_invalidated" for record in state.history)
+
     def test_fix_phase_fails_task_when_fixer_result_is_unsuccessful(self, tmp_path: Path):
         orch, stubs, _ = _make_orchestrator(tmp_path, run_build=True)
         stubs["fixer"].result_success = False
@@ -6872,6 +6917,267 @@ class TestOrchestratorInterruptResume:
             (None, ["src/current.py"]),
             ("final_full_task", ["src/current.py"]),
         ]
+
+    def test_delivery_single_pass_already_satisfied_runs_remaining_gates(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+        )
+
+        def already_satisfied(state: TaskState) -> None:
+            state.delivery_no_change_outcome = "already_satisfied"
+
+        stubs["implementer"].side_effect = already_satisfied
+        stubs["implementer"].result_data = {
+            "files_written": [],
+            "implementation_outcome": "already_satisfied",
+        }
+        stubs["test_writer"].side_effect = lambda state: setattr(state, "tests_up_to_date", True)
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan_decided=True,
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done is True
+        assert result.failed is False
+        assert result.files_changed == []
+        assert len(stubs["implementer"].calls) == 1
+        assert len(stubs["reviewer"].calls) == 1
+        assert len(stubs["security_reviewer"].calls) == 1
+        assert len(stubs["test_writer"].calls) == 1
+        assert build.compile_calls == 1
+        assert build.test_calls == 1
+        assert any(record["action"] == "implementation_already_satisfied" for record in result.history)
+
+    def test_delivery_single_pass_rejects_unclassified_no_change_result(self, tmp_path: Path):
+        orch, stubs, build = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=False,
+        )
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan_decided=True,
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done is False
+        assert result.failed is True
+        assert not stubs["reviewer"].calls
+        assert not stubs["security_reviewer"].calls
+        assert build.compile_calls == 0
+
+    def test_delivery_single_pass_resumes_after_persisted_already_satisfied_outcome(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=False,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=False,
+        )
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan_decided=True,
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_no_change_outcome="already_satisfied",
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done is True
+        assert result.failed is False
+        assert not stubs["implementer"].calls
+        assert len(stubs["reviewer"].calls) == 1
+        assert len(stubs["security_reviewer"].calls) == 1
+
+    def test_delivery_step_plan_accepts_only_explicit_already_satisfied_noops(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+
+        def already_satisfied(state: TaskState) -> None:
+            state.delivery_no_change_outcome = "already_satisfied"
+
+        stubs["implementer"].side_effect = already_satisfied
+        stubs["implementer"].result_data = {
+            "files_written": [],
+            "implementation_outcome": "already_satisfied",
+        }
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Step 1: verify registration", "Step 2: verify wiring"],
+            plan_decided=True,
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 2},
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done is True
+        assert result.failed is False
+        assert result.files_changed == []
+        assert len(stubs["implementer"].calls) == 2
+        assert [record["action"] for record in result.history].count("step_already_satisfied") == 2
+        assert any(record["action"] == "plan_already_satisfied" for record in result.history)
+
+    def test_delivery_no_change_step_after_prior_edit_runs_step_and_final_gates(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=False,
+            run_review=True,
+            run_security_review=True,
+            run_test_writing=True,
+        )
+
+        def implement_step(state: TaskState) -> None:
+            if state.current_step == 0:
+                stubs["implementer"].result_data = None
+                state.files_changed.append("src/step0.py")
+                return
+            stubs["implementer"].result_data = {
+                "files_written": [],
+                "implementation_outcome": "already_satisfied",
+            }
+            state.delivery_no_change_outcome = "already_satisfied"
+
+        stubs["implementer"].side_effect = implement_step
+        stubs["test_writer"].side_effect = lambda state: setattr(state, "tests_up_to_date", True)
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Implement foundation", "Verify existing wiring"],
+            plan_decided=True,
+            step_file_tracking_enabled=True,
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 2},
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done is True
+        assert result.failed is False
+        assert result.files_changed == ["src/step0.py"]
+        assert len(stubs["implementer"].calls) == 2
+        assert len(stubs["reviewer"].calls) == 3
+        assert len(stubs["security_reviewer"].calls) == 3
+        assert len(stubs["test_writer"].calls) == 3
+        assert any(record["action"] == "step_already_satisfied" for record in result.history)
+
+    def test_resumed_step_noop_adopts_only_unrecorded_dirty_paths(self, tmp_path: Path, monkeypatch):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+
+        def already_satisfied(state: TaskState) -> None:
+            state.delivery_no_change_outcome = "already_satisfied"
+
+        stubs["implementer"].side_effect = already_satisfied
+        stubs["implementer"].result_data = {
+            "files_written": [],
+            "implementation_outcome": "already_satisfied",
+        }
+        monkeypatch.setattr(
+            orch,
+            "_worktree_dirty_files",
+            lambda _state: ["src/previous.py", "src/interrupted.py"],
+        )
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Implement foundation", "Finish interrupted wiring"],
+            plan_decided=True,
+            plan_completed=False,
+            current_step=1,
+            step_file_tracking_enabled=True,
+            step_files_changed=[],
+            files_changed=["src/previous.py"],
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 2},
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done is True
+        assert result.failed is False
+        assert result.files_changed == ["src/previous.py", "src/interrupted.py"]
+        assert result.step_files_changed == ["src/interrupted.py"]
+        assert result.delivery_no_change_outcome is None
+        assert any(record["action"] == "adopt_worktree_changes" for record in result.history)
+        assert not any(record["action"] == "step_already_satisfied" for record in result.history)
+
+    def test_resumed_step_noop_uses_reconciled_edit_to_previously_changed_path(self, tmp_path: Path, monkeypatch):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_planner=True,
+            run_build=False,
+            run_review=False,
+            run_security_review=False,
+            run_test_writing=False,
+        )
+
+        def already_satisfied(state: TaskState) -> None:
+            state.delivery_no_change_outcome = "already_satisfied"
+
+        stubs["implementer"].side_effect = already_satisfied
+        stubs["implementer"].result_data = {
+            "files_written": [],
+            "implementation_outcome": "already_satisfied",
+        }
+        monkeypatch.setattr(orch, "_worktree_dirty_files", lambda _state: ["src/shared.py"])
+        _save_state(
+            orch,
+            implementation_prompt="p",
+            plan=["Create shared implementation", "Update shared implementation"],
+            plan_decided=True,
+            current_step=1,
+            step_file_tracking_enabled=True,
+            step_files_changed=["src/shared.py"],
+            files_changed=["src/shared.py"],
+            delivery_plan_id="plan-1",
+            delivery_unit_id="unit-1",
+            delivery_unit_budget={"max_planner_steps": 2},
+        )
+
+        result = orch.run(task_id="t1")
+
+        assert result.done is True
+        assert result.failed is False
+        assert result.files_changed == ["src/shared.py"]
+        assert result.step_files_changed == ["src/shared.py"]
+        assert result.delivery_no_change_outcome is None
+        assert not any(record["action"] == "adopt_worktree_changes" for record in result.history)
+        assert not any(record["action"] == "step_already_satisfied" for record in result.history)
 
     def test_step_loop_no_changes_advances_to_next_step(self, tmp_path: Path):
         """Step with no file changes must not abort — treat as already implemented and advance."""

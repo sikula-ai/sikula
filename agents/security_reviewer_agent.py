@@ -26,6 +26,8 @@ from agents.base_agent import (
 from agents.delivery_contracts import (
     classify_delivery_review_disposition,
     delivery_agent_prompt_context,
+    is_delivery_implementation_already_satisfied,
+    requires_delivery_no_change_verification_context,
 )
 from core.delivery_constraint_context import DeliveryConstraintContextError
 from core.delivery_write_scope import DeliveryWriteScopeError
@@ -187,6 +189,18 @@ Trace trust boundaries through all changed production code and any changed tests
 that affect security-sensitive behavior.\
 """
 
+_DELIVERY_ALREADY_SATISFIED_SECURITY_CONTEXT = """\
+---
+NO-CHANGE DELIVERY SECURITY REVIEW:
+The Implementer reported `already_satisfied` for the active task or step, so that
+implementation scope produced no new files. A displayed diff may contain earlier planner
+steps or downstream test changes. Treat the report as a claim to verify, not as approval.
+Inspect the current repository state and approve only if the active task-required behavior
+already satisfies the applicable security boundaries. Report blocking security defects in
+that required behavior even though they were not introduced by a changed file; ignore
+unrelated pre-existing issues.\
+"""
+
 _SCOPE_FINAL_FULL_TASK = "final_full_task"
 
 
@@ -202,7 +216,9 @@ class SecurityReviewerAgent(BaseAgent):
     def run(self, state: TaskState) -> AgentResult:
         if not state.implementation_prompt:
             return AgentResult(success=False, message="No implementation prompt in state")
-        if not state.files_changed:
+        already_satisfied = is_delivery_implementation_already_satisfied(state)
+        verify_no_change = requires_delivery_no_change_verification_context(state)
+        if not state.files_changed and not already_satisfied:
             return AgentResult(success=False, message="No changed files to review")
 
         file_tool = self.tools.get("file")
@@ -242,7 +258,10 @@ class SecurityReviewerAgent(BaseAgent):
                 if len(result.output) > _MAX_DIFF_CHARS:
                     diff += "\n... (diff truncated)"
         if not diff:
-            diff = "(diff not available — use Read tool to inspect changed files)"
+            if verify_no_change:
+                diff = "(no implementation diff; inspect the current repository state)"
+            else:
+                diff = "(diff not available — use Read tool to inspect changed files)"
 
         raw_context = self.project_config.get("security", {}).get("context", "").strip()
         security_context = f"\n\nProject security context:\n{raw_context}" if raw_context else ""
@@ -271,13 +290,18 @@ class SecurityReviewerAgent(BaseAgent):
             + "\n\n"
             + (delivery_context.effective_write_scope + "\n\n" if delivery_child else "")
             + (delivery_context.disposition_contract + "\n\n" if delivery_child else "")
+            + (_DELIVERY_ALREADY_SATISFIED_SECURITY_CONTEXT + "\n\n" if verify_no_change else "")
             + step_scope
             + ("\n\n" if step_scope else "")
             + _USER_SECURITY.format(
                 task_description=state.task_description,
                 delivery_constraint_context=delivery_context.inherited_constraints,
                 implementation_prompt=state.implementation_prompt,
-                files_changed="\n".join(f"  - {f}" for f in state.files_changed),
+                files_changed=(
+                    "  - (none; Implementer reported already_satisfied)"
+                    if already_satisfied and not state.files_changed
+                    else "\n".join(f"  - {f}" for f in state.files_changed)
+                ),
                 diff=diff,
             )
         )

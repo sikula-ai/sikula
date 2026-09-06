@@ -4475,8 +4475,18 @@ class TestCmdRunChildDeliveryMetadata:
         assert loaded.failed is True
         assert loaded.delivery_budget_stop == state.delivery_budget_stop
 
+    @pytest.mark.parametrize(
+        "error_code",
+        [
+            "delivery_disposition.keys_invalid",
+            "delivery_disposition.already_satisfied_with_changes",
+        ],
+    )
     def test_cmd_run_reset_failed_blocks_invalid_implementer_disposition(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        error_code: str,
     ) -> None:
         from core.state import TaskState
 
@@ -4493,7 +4503,7 @@ class TestCmdRunChildDeliveryMetadata:
         )
         state.record_delivery_disposition_parse_error(
             "implementer",
-            "delivery_disposition.keys_invalid",
+            error_code,
         )
         state.failed = True
         store.save(state)

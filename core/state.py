@@ -523,6 +523,7 @@ class TaskState:
     delivery_stop_code: Optional[str] = None
     delivery_stop_disposition: Optional[dict] = None
     delivery_disposition_parse_error: Optional[dict] = None
+    delivery_no_change_outcome: Optional[str] = None
     delivery_constraint_context_schema_version: Optional[int] = None
     delivery_source_task: Optional[dict[str, str]] = None
     delivery_inherited_constraints: list[dict] = field(default_factory=list)

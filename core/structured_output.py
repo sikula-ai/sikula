@@ -22,6 +22,7 @@ _DELIVERY_DISPOSITION_MARKDOWN = MarkdownIt("commonmark")
 
 DELIVERY_DISPOSITION_SCHEMA_VERSION = 1
 DELIVERY_DISPOSITION_APPROVED = "approved"
+DELIVERY_DISPOSITION_ALREADY_SATISFIED = "already_satisfied"
 DELIVERY_DISPOSITION_FIX_IN_SCOPE = "fix_in_scope"
 DELIVERY_DISPOSITION_REQUIRES_SCOPE_AMENDMENT = "requires_scope_amendment"
 DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP = "external_dependency_gap"
@@ -33,7 +34,16 @@ DELIVERY_REVIEW_ACTION_DISPOSITIONS = frozenset(
     }
 )
 DELIVERY_REVIEW_DISPOSITIONS = DELIVERY_REVIEW_ACTION_DISPOSITIONS | {DELIVERY_DISPOSITION_APPROVED}
-DELIVERY_IMPLEMENTATION_DISPOSITIONS = frozenset({DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP})
+DELIVERY_ANALYSIS_DISPOSITIONS = frozenset({DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP})
+DELIVERY_IMPLEMENTATION_DISPOSITIONS = frozenset(
+    {
+        DELIVERY_DISPOSITION_ALREADY_SATISFIED,
+        DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP,
+    }
+)
+_DELIVERY_DISPOSITIONS = (
+    DELIVERY_REVIEW_DISPOSITIONS | DELIVERY_ANALYSIS_DISPOSITIONS | DELIVERY_IMPLEMENTATION_DISPOSITIONS
+)
 MAX_DELIVERY_DISPOSITION_SUMMARY_CHARS = 500
 
 _DELIVERY_DISPOSITION_KEYS = frozenset(
@@ -45,6 +55,7 @@ _DELIVERY_DISPOSITION_KEYS = frozenset(
 )
 _DELIVERY_DISPOSITION_ACTIONS = {
     DELIVERY_DISPOSITION_APPROVED: "continue",
+    DELIVERY_DISPOSITION_ALREADY_SATISFIED: "continue_validation",
     DELIVERY_DISPOSITION_FIX_IN_SCOPE: "bounded_fix",
     DELIVERY_DISPOSITION_REQUIRES_SCOPE_AMENDMENT: "delivery_amend_prepare",
     DELIVERY_DISPOSITION_EXTERNAL_DEPENDENCY_GAP: "external_dependency_follow_up",
@@ -189,7 +200,7 @@ def parse_delivery_disposition(
             "delivery_disposition.marker_ambiguous",
             "Delivery disposition must advertise exactly one schema marker.",
         )
-    if not allowed_dispositions or not allowed_dispositions.issubset(DELIVERY_REVIEW_DISPOSITIONS):
+    if not allowed_dispositions or not allowed_dispositions.issubset(_DELIVERY_DISPOSITIONS):
         raise ValueError("allowed delivery dispositions must be a non-empty supported set")
 
     json_text = _terminal_delivery_disposition_json(output)

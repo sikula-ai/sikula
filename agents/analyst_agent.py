@@ -33,7 +33,7 @@ from core.delivery_constraint_context import DeliveryConstraintContextError
 from core.delivery_handoff import DeliveryHandoffError, parse_delivery_unit_handoff
 from core.state import TaskState
 from core.structured_output import (
-    DELIVERY_IMPLEMENTATION_DISPOSITIONS,
+    DELIVERY_ANALYSIS_DISPOSITIONS,
     DeliveryDispositionParseError,
     parse_delivery_disposition,
 )
@@ -453,7 +453,7 @@ class AnalystAgent(BaseAgent):
                 try:
                     disposition = parse_delivery_disposition(
                         prompt,
-                        allowed_dispositions=DELIVERY_IMPLEMENTATION_DISPOSITIONS,
+                        allowed_dispositions=DELIVERY_ANALYSIS_DISPOSITIONS,
                     )
                 except DeliveryDispositionParseError as exc:
                     disposition_error = exc.code

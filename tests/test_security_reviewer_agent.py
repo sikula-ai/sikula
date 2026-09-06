@@ -109,6 +109,72 @@ class TestSecurityReviewerGuards:
         result = _make_agent(stub_llm, file_tool=file_tool).run(state)
         assert not result.success
 
+    def test_delivery_already_satisfied_without_files_runs_review(self, stub_llm: StubLLMClient, file_tool):
+        stub_llm.readonly_result = _delivery_approval_output()
+        state = _make_state(files_changed=[], delivery_no_change_outcome="already_satisfied")
+        _add_delivery_constraint_context(state)
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success
+        assert len(stub_llm.readonly_calls) == 1
+        assert "NO-CHANGE DELIVERY SECURITY REVIEW" in stub_llm.readonly_calls[0]
+        assert "no implementation diff" in stub_llm.readonly_calls[0]
+
+    def test_delivery_already_satisfied_step_after_prior_edits_keeps_no_change_review_context(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
+        stub_llm.readonly_result = _delivery_approval_output()
+        state = _make_state(
+            files_changed=["src/earlier.py"],
+            plan=["Change earlier behavior", "Verify existing wiring"],
+            current_step=1,
+            step_file_tracking_enabled=True,
+            step_files_changed=[],
+            delivery_no_change_outcome="already_satisfied",
+        )
+        _add_delivery_constraint_context(state)
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success
+        assert "NO-CHANGE DELIVERY SECURITY REVIEW" in stub_llm.readonly_calls[0]
+        assert "displayed diff may contain earlier planner" in stub_llm.readonly_calls[0]
+
+    def test_delivery_already_satisfied_final_review_keeps_context_for_test_writer_only_diff(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
+        stub_llm.readonly_result = _delivery_approval_output()
+        state = _make_state(
+            files_changed=["tests/test_existing_behavior.py"],
+            test_files_written=["tests/test_existing_behavior.py"],
+            delivery_no_change_outcome="already_satisfied",
+            active_scope="final_full_task",
+        )
+        _add_delivery_constraint_context(state)
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success
+        assert "NO-CHANGE DELIVERY SECURITY REVIEW" in stub_llm.readonly_calls[0]
+
+    def test_delivery_already_satisfied_final_review_rejects_unknown_change_provenance(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
+        stub_llm.readonly_result = _delivery_approval_output()
+        state = _make_state(
+            files_changed=["tests/test_existing_behavior.py", "src/production.py"],
+            test_files_written=["tests/test_existing_behavior.py"],
+            delivery_no_change_outcome="already_satisfied",
+            active_scope="final_full_task",
+        )
+        _add_delivery_constraint_context(state)
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert result.success
+        assert "NO-CHANGE DELIVERY SECURITY REVIEW" not in stub_llm.readonly_calls[0]
+
     def test_no_file_tool_returns_failure(self, stub_llm: StubLLMClient):
         state = _make_state()
         result = _make_agent(stub_llm).run(state)
