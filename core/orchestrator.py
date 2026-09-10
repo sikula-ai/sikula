@@ -531,7 +531,7 @@ class Orchestrator:
         if active_invocation and delivery_quarantine_has_incomplete_move(state.delivery_quarantine_records):
             message = (
                 "An interrupted file quarantine requires explicit cleanup before this delivery child can resume. Run "
-                f"`sikula cleanup {state.task_id} --quarantine-only --force`, then retry with `--reset-failed`."
+                f"`sikula cleanup {state.task_id} --quarantine-only --force` and follow its reported next action."
             )
             state.record("orchestrator", "delivery_quarantine_cleanup_required", message)
             state.failed = True
@@ -1510,6 +1510,7 @@ class Orchestrator:
         log.info(f"--- Phase: fix ({progress}) ---")
         validation_before = self._validation_error_state_snapshot(state)
         test_gate_before = self._test_execution_gate_snapshot()
+        quarantine_record_start = len(state.delivery_quarantine_records)
         fixer_result = self._run_agent("fixer", state)
         if state.failed:
             return False
@@ -1612,6 +1613,14 @@ class Orchestrator:
         self._mark_build_sync_stale_if_needed(fixer_files, "fixer", state)
         if fixer_files:
             self._apply_fixer_change_gate_effects(state, fixer_files, record_test_only=True)
+            quarantined_paths = [
+                record["path"]
+                for record in state.delivery_quarantine_records[quarantine_record_start:]
+                if isinstance(record, dict)
+                and record.get("status") == "quarantined"
+                and isinstance(record.get("path"), str)
+            ]
+            self._prune_clean_test_state_paths(state, quarantined_paths)
             self._store.save(state)
         elif gate_findings:
             self._store.save(state)
@@ -2984,6 +2993,7 @@ class Orchestrator:
                 state.files_changed.append(result.path)
             self._mark_build_sync_stale_if_needed([result.path], "fixer quarantine", state)
             self._apply_fixer_change_gate_effects(state, [result.path], record_test_only=False)
+            self._prune_clean_test_state_paths(state, [result.path])
             state.record("fixer", "file_quarantined", result.path)
             self._store.save(state)
 

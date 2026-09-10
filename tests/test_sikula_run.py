@@ -1944,6 +1944,7 @@ class TestCmdCleanup:
             ),
             quarantine_summary=lambda _root, _task_id: (1, 8),
             remove_quarantine=lambda _root, _task_id: 1,
+            quarantine_entry_retained=lambda _root, _task_id, _quarantine_id: True,
         )
 
         cleanup_cli.cmd_cleanup(
@@ -1959,7 +1960,7 @@ class TestCmdCleanup:
         assert worktree.exists()
         assert loaded.failed is True
         assert loaded.delivery_quarantine_records[0]["status"] == "cleaned"
-        assert loaded.files_changed == ["src/Scratch.kt"]
+        assert loaded.files_changed == []
         assert loaded.build_synced is False
         assert loaded.fixer_changed_code is True
         assert loaded.delivery_no_change_outcome is None
@@ -1973,6 +1974,42 @@ class TestCmdCleanup:
         output = capsys.readouterr().out
         assert "Removed retained file quarantine: 1 file(s)" in output
         assert "sikula run --task-id abc123 --reset-failed" in output
+
+    def test_quarantine_only_cleanup_rejects_interruption_before_move(self, tmp_path: Path, capsys):
+        import sikula_cli.cleanup as cleanup_cli
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        store, state = _saved_state(tmp_path, worktree=worktree)
+        state.failed = True
+        state.delivery_quarantine_records = [{"status": "moving", "path": "src/Scratch.kt", "quarantine_id": "1" * 32}]
+        store.save(state)
+        context = cleanup_cli.CleanupContext(
+            resolve_state_dir=lambda _cfg: tmp_path / ".sikula" / "state",
+            find_git_root=lambda _path: tmp_path,
+            quarantine_summary=lambda _root, _task_id: (0, 0),
+            remove_quarantine=lambda _root, _task_id: (_ for _ in ()).throw(
+                AssertionError("pre-move interruption must not remove quarantine storage")
+            ),
+            quarantine_entry_retained=lambda _root, _task_id, _quarantine_id: False,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cleanup_cli.cmd_cleanup(
+                _cleanup_args(force=True, quarantine_only=True),
+                _run_cfg(tmp_path),
+                context,
+            )
+
+        assert exc_info.value.code == 1
+        loaded = store.load("abc123")
+        assert loaded is not None
+        assert loaded.delivery_quarantine_records[0]["status"] == "moving"
+        assert loaded.worktree_path == str(worktree)
+        assert worktree.exists()
+        output = capsys.readouterr().out
+        assert "stopped before the file reached retained storage" in output
+        assert "normal cleanup with --discard" in output
 
     def test_cleanup_force_removes_retained_file_quarantine(self, tmp_path: Path, capsys):
         import sikula_cli.cleanup as cleanup_cli

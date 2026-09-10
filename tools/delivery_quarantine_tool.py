@@ -17,6 +17,7 @@ from core.delivery_quarantine import (
     DeliveryQuarantineError,
     DeliveryQuarantineResult,
     delivery_quarantine_task_namespace,
+    valid_delivery_quarantine_id,
 )
 from core.validation_artifacts import (
     DeliveryScopeSnapshotError,
@@ -188,6 +189,52 @@ def task_quarantine_summary(git_root: Path, task_id: str) -> tuple[int, int]:
         raise DeliveryQuarantineError(
             "delivery_quarantine.cleanup_unavailable",
             "Sikula could not inspect the task quarantine.",
+        ) from exc
+
+
+def task_quarantine_entry_retained(git_root: Path, task_id: str, quarantine_id: str) -> bool:
+    """Return whether one recorded move reached its private quarantine entry."""
+
+    if not valid_delivery_quarantine_id(quarantine_id):
+        raise DeliveryQuarantineError(
+            "delivery_quarantine.cleanup_invalid",
+            "The recorded quarantine identifier is invalid.",
+        )
+    path = _task_quarantine_path(git_root, task_id)
+    try:
+        if not _quarantine_path_exists(path):
+            return False
+        _validate_existing_quarantine_path(path)
+        operation = path / quarantine_id
+        try:
+            operation_value = operation.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if (
+            not stat.S_ISDIR(operation_value.st_mode)
+            or stat.S_IMODE(operation_value.st_mode) & 0o077
+            or operation_value.st_uid != os.geteuid()
+        ):
+            raise DeliveryQuarantineError(
+                "delivery_quarantine.cleanup_invalid",
+                "The recorded quarantine operation is not a private directory.",
+            )
+        try:
+            entry_value = (operation / "entry").stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(entry_value.st_mode):
+            raise DeliveryQuarantineError(
+                "delivery_quarantine.cleanup_invalid",
+                "The recorded quarantine entry is not a regular file.",
+            )
+        return True
+    except DeliveryQuarantineError:
+        raise
+    except OSError as exc:
+        raise DeliveryQuarantineError(
+            "delivery_quarantine.cleanup_unavailable",
+            "Sikula could not inspect the recorded quarantine operation.",
         ) from exc
 
 

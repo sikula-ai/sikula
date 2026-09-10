@@ -684,6 +684,43 @@ class TestDeliveryProductionScopeAudit:
         assert task_quarantine_summary(tmp_project, state.task_id) == (1, 0)
 
     @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    def test_delivery_fixer_quarantine_prunes_clean_path_from_net_changes(self, tmp_project: Path):
+        scratch = tmp_project / "src" / "Scratch.kt"
+
+        def create_scratch() -> tuple[list[str], str]:
+            scratch.write_text("", encoding="utf-8")
+            return (
+                [],
+                '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/Scratch.kt"}',
+            )
+
+        client = ObservedWriteClient(tmp_project, [create_scratch])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_write_paths": ["src"]},
+            },
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client,
+            orch._tools,
+            orch._agent_project_config,
+            quarantine_executor=orch._execute_fixer_quarantine,
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.errors = ["EmptyKotlinFile: src/Scratch.kt can be removed"]
+
+        assert orch._run_fix_phase(state, "1/3") is True
+
+        assert not scratch.exists()
+        assert state.files_changed == []
+        assert state.delivery_quarantine_records[-1]["status"] == "quarantined"
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
     def test_delivery_fixer_test_quarantine_preserves_review_and_test_writer_gates(self, tmp_project: Path):
         scratch = tmp_project / "tests" / "test_scratch.py"
         scratch.parent.mkdir()

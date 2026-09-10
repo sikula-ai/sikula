@@ -15,6 +15,7 @@ from tools.delivery_quarantine_tool import (
     delivery_quarantine_supported,
     quarantine_agent_created_file,
     remove_task_quarantine,
+    task_quarantine_entry_retained,
     task_quarantine_summary,
 )
 
@@ -74,8 +75,10 @@ def test_quarantine_moves_owned_untracked_file_without_unlink(tmp_path: Path, mo
     assert result.path == "src/Scratch.kt"
     assert not source.exists()
     assert checkpoints == [("moving", True), ("complete", False)]
+    assert task_quarantine_entry_retained(tmp_path, "task-a", result.quarantine_id) is True
     assert task_quarantine_summary(tmp_path, "task-a") == (1, len(b"scratch\n"))
     assert remove_task_quarantine(tmp_path, "task-a") == 1
+    assert task_quarantine_entry_retained(tmp_path, "task-a", result.quarantine_id) is False
     assert task_quarantine_summary(tmp_path, "task-a") == (0, 0)
 
 

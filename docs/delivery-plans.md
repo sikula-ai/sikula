@@ -1019,7 +1019,10 @@ non-isolated runs, or Fixer test-triage subpasses.
 If a process is interrupted while a quarantine move is recorded, run
 `sikula cleanup <task-id> --quarantine-only --force` to remove only retained quarantine
 storage while preserving the child worktree, followed by
-`sikula run --task-id <task-id> --reset-failed` to resume with stale gates rerun.
+`sikula run --task-id <task-id> --reset-failed` to resume with stale gates rerun. This
+resume path is available only when the retained entry proves the move completed. If the
+process stopped before rename, cleanup fails closed and preserves the worktree for explicit
+inspection or normal cleanup with `--discard`.
 
 ## Repository Scope
 
