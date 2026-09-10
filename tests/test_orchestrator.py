@@ -922,6 +922,50 @@ class TestDeliveryProductionScopeAudit:
         assert scratch.read_text(encoding="utf-8") == "operator content\n"
         assert state.delivery_quarantine_candidates == []
 
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    def test_failed_fixer_file_operation_records_writes_and_invalidates_gates(self, tmp_project: Path):
+        changed_file = tmp_project / "src" / "changed.py"
+
+        def change_then_emit_malformed_operation() -> tuple[list[str], str]:
+            changed_file.write_text("changed = True\n", encoding="utf-8")
+            return (["src/changed.py"], "sikula_file_operation_schema_version: invalid")
+
+        client = ObservedWriteClient(tmp_project, [change_then_emit_malformed_operation])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_write_paths": ["src"]},
+            },
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client,
+            orch._tools,
+            orch._agent_project_config,
+            quarantine_executor=orch._execute_fixer_quarantine,
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.files_changed = ["src/existing.py"]
+        state.active_scope = "final_full_task"
+        state.review_approved = True
+        state.security_approved = True
+        state.tests_up_to_date = True
+        state.final_full_task_review_done = True
+        state.errors = ["Fix the production file"]
+
+        result = orch._run_agent("fixer", state)
+
+        assert not result.success
+        assert result.data["file_operation_error"] == "delivery_quarantine.output_invalid"
+        assert state.files_changed == ["src/existing.py", "src/changed.py"]
+        assert not state.review_approved
+        assert not state.security_approved
+        assert not state.tests_up_to_date
+        assert not state.final_full_task_review_done
+
     def test_resume_blocks_on_interrupted_quarantine_move(self, tmp_project: Path, monkeypatch) -> None:
         orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src"])
         state = _scoped_delivery_state(orch, ["src"])

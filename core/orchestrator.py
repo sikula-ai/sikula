@@ -1637,7 +1637,11 @@ class Orchestrator:
                 and record.get("status") == "quarantined"
                 and isinstance(record.get("path"), str)
             ]
-            self._prune_clean_test_state_paths(state, quarantined_paths)
+            self._prune_clean_test_state_paths(
+                state,
+                quarantined_paths,
+                git_env=delivery_scope_git_env(),
+            )
             self._store.save(state)
         elif gate_findings:
             self._store.save(state)
@@ -1964,7 +1968,12 @@ class Orchestrator:
         except OSError:
             return None
 
-    def _read_git_head_project_text(self, path: str) -> str | None:
+    def _read_git_head_project_text(
+        self,
+        path: str,
+        *,
+        git_env: dict[str, str] | None = None,
+    ) -> str | None:
         normalized = _normalize_project_path(path)
         if not normalized:
             return None
@@ -1974,7 +1983,7 @@ class Orchestrator:
                 capture_output=True,
                 text=True,
                 cwd=self._config.project_root,
-                env=delivery_scope_git_env(),
+                env=git_env,
             )
         except OSError:
             return None
@@ -2064,7 +2073,12 @@ class Orchestrator:
             }
         )
 
-    def _path_has_pending_changes(self, path: str) -> bool:
+    def _path_has_pending_changes(
+        self,
+        path: str,
+        *,
+        git_env: dict[str, str] | None = None,
+    ) -> bool:
         normalized = _normalize_project_path(path)
         if not normalized:
             return False
@@ -2074,13 +2088,13 @@ class Orchestrator:
                 capture_output=True,
                 text=True,
                 cwd=self._config.project_root,
-                env=delivery_scope_git_env(),
+                env=git_env,
             )
         except OSError:
             result = None
         if result is not None and result.returncode == 0:
             return bool(result.stdout.strip())
-        return self._read_project_text(normalized) != self._read_git_head_project_text(normalized)
+        return self._read_project_text(normalized) != self._read_git_head_project_text(normalized, git_env=git_env)
 
     def _prune_clean_test_state_paths(
         self,
@@ -2088,11 +2102,12 @@ class Orchestrator:
         paths: list[str],
         *,
         before_snapshot: dict[str, str | None] | None = None,
+        git_env: dict[str, str] | None = None,
     ) -> None:
         clean_paths = {
             path
             for path in (_normalize_project_path(candidate) for candidate in paths)
-            if path and not self._path_has_pending_changes(path)
+            if path and not self._path_has_pending_changes(path, git_env=git_env)
         }
         if not clean_paths:
             return
@@ -2942,6 +2957,19 @@ class Orchestrator:
             log.error(f"{name} failed: {result.message} ({elapsed})")
         data = result.data if isinstance(result.data, dict) else {}
         self._record_step_files_changed(state, data.get("files_written", []))
+        if name == "fixer" and not result.success and isinstance(data.get("file_operation_error"), str):
+            reported_files = data.get("files_written", [])
+            fixer_files = (
+                {path for raw_path in reported_files for path in [str(raw_path).strip()] if path}
+                if isinstance(reported_files, (list, tuple, set))
+                else set()
+            )
+            if fixer_files:
+                for path in sorted(fixer_files):
+                    if path not in state.files_changed:
+                        state.files_changed.append(path)
+                self._mark_build_sync_stale_if_needed(fixer_files, "fixer", state)
+                self._apply_fixer_change_gate_effects(state, fixer_files, record_test_only=True)
         self._store.save(state)
         return result
 
@@ -3012,7 +3040,11 @@ class Orchestrator:
                 state.files_changed.append(result.path)
             self._mark_build_sync_stale_if_needed([result.path], "fixer quarantine", state)
             self._apply_fixer_change_gate_effects(state, [result.path], record_test_only=False)
-            self._prune_clean_test_state_paths(state, [result.path])
+            self._prune_clean_test_state_paths(
+                state,
+                [result.path],
+                git_env=delivery_scope_git_env(),
+            )
             state.record("fixer", "file_quarantined", result.path)
             self._store.save(state)
 
