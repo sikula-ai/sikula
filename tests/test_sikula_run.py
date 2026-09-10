@@ -1928,6 +1928,9 @@ class TestCmdCleanup:
         state.tests_up_to_date = True
         state.final_full_task_review_done = True
         state.delivery_no_change_outcome = "already_satisfied"
+        state.files_changed = ["src/Scratch.kt", "src/Keep.kt"]
+        state.step_files_changed = ["src/Scratch.kt", "src/Keep.kt"]
+        state.test_files_written = ["src/Scratch.kt"]
         state.delivery_quarantine_records = [{"status": "moving", "path": "src/Scratch.kt", "quarantine_id": "1" * 32}]
         store.save(state)
         context = cleanup_cli.CleanupContext(
@@ -1960,7 +1963,9 @@ class TestCmdCleanup:
         assert worktree.exists()
         assert loaded.failed is True
         assert loaded.delivery_quarantine_records[0]["status"] == "cleaned"
-        assert loaded.files_changed == []
+        assert loaded.files_changed == ["src/Keep.kt"]
+        assert loaded.step_files_changed == ["src/Keep.kt"]
+        assert loaded.test_files_written == []
         assert loaded.build_synced is False
         assert loaded.fixer_changed_code is True
         assert loaded.delivery_no_change_outcome is None

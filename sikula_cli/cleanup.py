@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sys
 
 from core import worktree as core_worktree
@@ -104,6 +104,31 @@ def _cleanup_context(context: CleanupContext | None = None) -> CleanupContext:
     return context or CleanupContext()
 
 
+def _prune_absent_quarantine_paths(state, records: list[dict]) -> None:
+    if not state.worktree_path:
+        return
+    worktree = Path(state.worktree_path)
+    absent: set[str] = set()
+    for record in records:
+        path = record.get("path")
+        if not isinstance(path, str):
+            continue
+        parsed = PurePosixPath(path)
+        if parsed.is_absolute() or not parsed.parts or any(part in {"", ".", ".."} for part in parsed.parts):
+            continue
+        try:
+            worktree.joinpath(*parsed.parts).lstat()
+        except FileNotFoundError:
+            absent.add(path)
+        except OSError:
+            continue
+    if not absent:
+        return
+    state.files_changed = [path for path in state.files_changed if path not in absent]
+    state.step_files_changed = [path for path in state.step_files_changed if path not in absent]
+    state.test_files_written = [path for path in state.test_files_written if path not in absent]
+
+
 def cmd_cleanup(args: argparse.Namespace, cfg: dict, context: CleanupContext | None = None) -> None:
     """Remove a task worktree, optionally deleting the persisted state as well."""
     context = _cleanup_context(context)
@@ -183,6 +208,7 @@ def cmd_cleanup(args: argparse.Namespace, cfg: dict, context: CleanupContext | N
             for record in active_quarantine_records:
                 record["status"] = "cleaned"
             if interrupted_records:
+                _prune_absent_quarantine_paths(state, interrupted_records)
                 state.build_synced = False
                 state.fixer_changed_code = True
                 state.delivery_no_change_outcome = None

@@ -1022,7 +1022,9 @@ storage while preserving the child worktree, followed by
 `sikula run --task-id <task-id> --reset-failed` to resume with stale gates rerun. This
 resume path is available only when the retained entry proves the move completed. If the
 process stopped before rename, cleanup fails closed and preserves the worktree for explicit
-inspection or normal cleanup with `--discard`.
+inspection or normal cleanup with `--discard`. On resume, a unit with no remaining net
+changes must still provide the normal explicit `already_satisfied` outcome before it can
+complete.
 
 ## Repository Scope
 

@@ -720,6 +720,11 @@ class TestDeliveryProductionScopeAudit:
         assert state.files_changed == []
         assert state.delivery_quarantine_records[-1]["status"] == "quarantined"
 
+        assert orch._run_build_fix_loop(state, set_done=True) is False
+        assert state.done is False
+        assert state.failed is True
+        assert state.history[-1]["action"] == "delivery_no_change_unclassified"
+
     @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
     def test_delivery_fixer_test_quarantine_preserves_review_and_test_writer_gates(self, tmp_project: Path):
         scratch = tmp_project / "tests" / "test_scratch.py"
