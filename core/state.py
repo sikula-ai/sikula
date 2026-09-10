@@ -536,6 +536,8 @@ class TaskState:
     delivery_effective_write_exact_file_paths: Optional[list[str]] = None
     delivery_runtime_write_scope_binding: Optional[dict] = None
     delivery_scope_audit_pending: Optional[dict] = None
+    delivery_quarantine_candidates: list[dict] = field(default_factory=list)
+    delivery_quarantine_records: list[dict] = field(default_factory=list)
     delivery_handoff_schema_version: Optional[int] = None
     delivery_dependency_handoffs: list[dict] = field(default_factory=list)
     worktree_path: Optional[str] = None

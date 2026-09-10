@@ -37,6 +37,7 @@ import fnmatch
 import logging
 import os
 import posixpath
+import secrets
 import subprocess
 import time
 from dataclasses import dataclass
@@ -59,6 +60,11 @@ from core.delivery_scope_audit import (
     DeliveryScopeProviderAttemptStopped,
     DeliveryScopeToolMutationStopped,
     delivery_scope_audit_recovery_required as delivery_scope_audit_recovery_required,
+)
+from core.delivery_quarantine import (
+    DeliveryQuarantineError,
+    DeliveryQuarantineResult,
+    delivery_quarantine_has_incomplete_move,
 )
 from core.delivery_unit_metadata import delivery_unit_planner_step_limit
 from core.diagnostics import diagnostic_excerpt
@@ -95,6 +101,7 @@ from tools.cargo_tool import CargoTool
 from tools.gradle_android_tool import AndroidGradleTool
 from tools.node_tool import NodeTool
 from tools.python_tool import PythonTool
+from tools.delivery_quarantine_tool import DeliveryQuarantineTool
 
 log = logging.getLogger(__name__)
 
@@ -437,6 +444,9 @@ class Orchestrator:
 
         self._session_code_changed = False
         self._reviewer_ran_this_session = False
+        self._delivery_quarantine_tool = DeliveryQuarantineTool(root)
+        quarantine_supported = self._delivery_quarantine_tool.supported()
+        self._delivery_quarantine_session_id = secrets.token_hex(16) if quarantine_supported else None
         # Agent registry — add new agents here
         self._agents = {
             "analyst": AnalystAgent(_llm("analyst"), self._tools, pc),
@@ -445,13 +455,19 @@ class Orchestrator:
             "reviewer": ReviewerAgent(_llm("reviewer"), self._tools, pc),
             "security_reviewer": SecurityReviewerAgent(_llm("security_reviewer"), self._tools, pc),
             "test_writer": TestWriterAgent(_llm("test_writer"), self._tools, pc),
-            "fixer": FixerAgent(_llm("fixer"), self._tools, pc),
+            "fixer": FixerAgent(
+                _llm("fixer"),
+                self._tools,
+                pc,
+                quarantine_executor=self._execute_fixer_quarantine if quarantine_supported else None,
+            ),
         }
         self._delivery_scope_audit = DeliveryScopeAudit(
             config=config,
             store=state_store,
             tools=self._tools,
             agents=lambda: self._agents,
+            quarantine_session_id=self._delivery_quarantine_session_id,
         )
 
     # ------------------------------------------------------------------
@@ -511,6 +527,14 @@ class Orchestrator:
             state.config_snapshot = self._config_snapshot
         self._store.save(state)
         if resume_scope_violation:
+            return state
+        if active_invocation and delivery_quarantine_has_incomplete_move(state.delivery_quarantine_records):
+            message = (
+                "An interrupted file quarantine requires explicit task cleanup before this delivery child can resume."
+            )
+            state.record("orchestrator", "delivery_quarantine_recovery_required", message)
+            state.failed = True
+            self._store.save(state)
             return state
         if self._abort_on_delivery_terminal_stop(state):
             return state
@@ -1586,29 +1610,7 @@ class Orchestrator:
                 fixer_files = first_pass_remaining_files | retry_files
         self._mark_build_sync_stale_if_needed(fixer_files, "fixer", state)
         if fixer_files:
-            test_only_fix = self._fixer_change_is_test_only(fixer_files)
-            self._session_code_changed = True
-            state.fixer_changed_code = True
-            if test_only_fix:
-                paths = ", ".join(sorted(fixer_files))
-                state.security_approved = False
-                state.security_review_iterations = 0
-                if state.active_scope == _SCOPE_FINAL_FULL_TASK:
-                    state.final_full_task_review_done = False
-                state.record(
-                    "orchestrator",
-                    "test_only_fix",
-                    f"review/test-writer gates preserved; security review invalidated for test-only fix: {paths}",
-                )
-            else:
-                self._invalidate_delivery_no_change_outcome(state, fixer_files, source="fixer")
-                state.review_approved = False
-                state.security_approved = False
-                state.review_iterations = 0
-                state.security_review_iterations = 0
-                state.tests_up_to_date = False
-                if state.active_scope == _SCOPE_FINAL_FULL_TASK:
-                    state.final_full_task_review_done = False
+            self._apply_fixer_change_gate_effects(state, fixer_files, record_test_only=True)
             self._store.save(state)
         elif gate_findings:
             self._store.save(state)
@@ -1705,6 +1707,40 @@ class Orchestrator:
         return bool(paths) and all(
             self._is_configured_test_write_path(path) and _path_looks_like_test_artifact(path) for path in paths
         )
+
+    def _apply_fixer_change_gate_effects(
+        self,
+        state: TaskState,
+        files_written,
+        *,
+        record_test_only: bool,
+    ) -> None:
+        paths = {str(path) for path in files_written if str(path).strip()}
+        if not paths:
+            return
+        self._session_code_changed = True
+        state.fixer_changed_code = True
+        if self._fixer_change_is_test_only(paths):
+            state.security_approved = False
+            state.security_review_iterations = 0
+            if state.active_scope == _SCOPE_FINAL_FULL_TASK:
+                state.final_full_task_review_done = False
+            if record_test_only:
+                state.record(
+                    "orchestrator",
+                    "test_only_fix",
+                    "review/test-writer gates preserved; security review invalidated for test-only fix: "
+                    + ", ".join(sorted(paths)),
+                )
+            return
+        self._invalidate_delivery_no_change_outcome(state, paths, source="fixer")
+        state.review_approved = False
+        state.security_approved = False
+        state.review_iterations = 0
+        state.security_review_iterations = 0
+        state.tests_up_to_date = False
+        if state.active_scope == _SCOPE_FINAL_FULL_TASK:
+            state.final_full_task_review_done = False
 
     def _test_execution_gate_snapshot(self) -> dict[str, str | None]:
         snapshot: dict[str, str | None] = {}
@@ -2785,6 +2821,7 @@ class Orchestrator:
         delivery_scope_policy: DeliveryScopeAuditPolicy | None = None
         try:
             if delivery_scope_enabled:
+                self._delivery_scope_audit.start_quarantine_session(state)
                 delivery_scope_policy = self._delivery_scope_audit_policy(state, name)
                 self._set_delivery_scope_audit_pending(state, name, policy=delivery_scope_policy)
             delivery_scope_before = self._delivery_scope_audit_snapshot(
@@ -2878,6 +2915,88 @@ class Orchestrator:
         self._record_step_files_changed(state, data.get("files_written", []))
         self._store.save(state)
         return result
+
+    def _execute_fixer_quarantine(
+        self,
+        state: TaskState,
+        path: str,
+        active_write_paths: list[str],
+    ) -> DeliveryQuarantineResult:
+        """Execute one Fixer request against its just-audited provider authority."""
+
+        try:
+            if self._delivery_quarantine_session_id is None:
+                raise DeliveryScopeSnapshotError("Reversible quarantine is unavailable on this platform.")
+            policy = self._delivery_scope_audit.consume_verified_provider_attempt_policy(
+                "fixer",
+                tuple(active_write_paths),
+            )
+        except DeliveryScopeSnapshotError as exc:
+            raise DeliveryQuarantineError(
+                "delivery_quarantine.scope_unavailable",
+                "The Fixer quarantine request has no matching audited write scope.",
+            ) from exc
+
+        provenance = next(
+            (
+                record
+                for record in state.delivery_quarantine_candidates
+                if isinstance(record, dict)
+                and record.get("path") == path
+                and record.get("session_id") == self._delivery_quarantine_session_id
+            ),
+            None,
+        )
+        if provenance is None:
+            raise DeliveryQuarantineError(
+                "delivery_quarantine.provenance_missing",
+                "The requested file was not created by a successful provider attempt in this process.",
+            )
+
+        resolved_roots = [root for root, _exact in policy.resolved_production_roots]
+        resolved_roots.extend(policy.resolved_test_write_paths)
+        exact_roots = [root for root, exact in policy.resolved_production_roots if exact]
+
+        def before_move(intent: dict[str, object]) -> None:
+            state.delivery_quarantine_candidates = [
+                record
+                for record in state.delivery_quarantine_candidates
+                if not (isinstance(record, dict) and record.get("path") == path)
+            ]
+            state.delivery_quarantine_records.append(
+                {
+                    **intent,
+                    "requested_by": "fixer",
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            state.record("fixer", "file_quarantine_started", path)
+            self._store.save(state)
+
+        def after_move(result: DeliveryQuarantineResult) -> None:
+            for record in reversed(state.delivery_quarantine_records):
+                if isinstance(record, dict) and record.get("quarantine_id") == result.quarantine_id:
+                    record["status"] = "quarantined"
+                    record["completed_at"] = datetime.now(timezone.utc).isoformat()
+                    break
+            if result.path not in state.files_changed:
+                state.files_changed.append(result.path)
+            self._mark_build_sync_stale_if_needed([result.path], "fixer quarantine", state)
+            self._apply_fixer_change_gate_effects(state, [result.path], record_test_only=False)
+            state.record("fixer", "file_quarantined", result.path)
+            self._store.save(state)
+
+        return self._delivery_quarantine_tool.quarantine(
+            state.task_id,
+            path,
+            provenance,
+            session_id=self._delivery_quarantine_session_id,
+            active_write_paths=resolved_roots,
+            exact_file_paths=exact_roots,
+            git_root=policy.root,
+            before_move=before_move,
+            after_move=after_move,
+        )
 
     def _run_delivery_review_agent(self, name: str, state: TaskState):
         """Retry one malformed delivery review without consuming a fix attempt."""

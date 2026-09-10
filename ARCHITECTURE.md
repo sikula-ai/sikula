@@ -21,6 +21,7 @@
 | `FixerAgent` | `agents/fixer_agent.py` | Runs the configured LLM as an autonomous agent to fix build or test errors |
 | `FileTool` | `tools/file_tool.py` | Read / write files; enforces sandbox whitelist for direct file-tool calls |
 | `GitTool` | `tools/git_tool.py` | `diff_head(paths=None)` — called by reviewer, security_reviewer, and test_writer agents to obtain the live diff when `state.review_diff` is not set; optional project-relative paths constrain the diff with literal Git pathspecs, while absolute and parent-traversing paths fail closed |
+| `DeliveryQuarantineTool` | `tools/delivery_quarantine_tool.py` | POSIX-only, descriptor-relative move of one audited agent-created ordinary-untracked delivery file into persistent private quarantine; physical removal is reserved for explicit cleanup/delete |
 | `BuildTool` | `tools/base_tool.py` | **Abstract interface** for platform build systems — implement per platform |
 | `GradleBaseTool` | `tools/gradle_tool.py` | Shared Gradle mechanics (`_run`, `run_check`, `is_build_config_file`); subclassed by Android and JVM variants |
 | `AndroidGradleTool` | `tools/gradle_android_tool.py` | `BuildTool` implementation for Android / Gradle |
@@ -141,6 +142,11 @@ so a user's shell is not left inside a deleted tree. Shared git/worktree primiti
 as root detection, dirty checks, path containment, worktree removal, current-branch
 inspection, and commit resolution live in `core/worktree.py`; `sikula.py` keeps
 compatibility wrappers for existing tests and command contexts.
+If a delivery Fixer retained files in the task quarantine, dry-run output reports their
+bounded count and byte size. `--force` removes that exact task namespace and records the
+cleanup before state is retained or deleted. Quarantine lives under
+`<git-common-dir>/sikula/quarantine/<opaque-task-id>/`, so it is outside the assembled tree
+and survives child-worktree finalization until this explicit cleanup.
 
 **Status/show/summary commands:** `sikula status`, `sikula show`, and
 `sikula summary` parser registration
@@ -2074,6 +2080,16 @@ Build, test, sync, and check error blobs are diagnostic excerpts, not plain tail
 preserves failure-marker blocks from long command output so the fixer still sees the concrete
 compiler diagnostic, failing test, assertion, panic, traceback, or tool error even when the
 build tool prints many lines after the failure.
+For modern isolated delivery children on supported POSIX filesystems, a non-triage Fixer
+may request one `quarantine_untracked` operation in its structured output. The provider call
+does not execute the mutation. After that call passes the provider-independent scope audit,
+the orchestrator consumes its exact captured write policy and current-process provenance;
+`DeliveryQuarantineTool` then moves the matching ordinary-untracked, single-link regular
+file outside the worktree. The intent is persisted before the move and completion is
+persisted immediately afterward, invalidating build sync and semantic gates like any other
+Fixer change. An interrupted `moving` record blocks resume until explicit cleanup. Standard,
+non-isolated, Windows, and internal test-triage Fixer runs never receive or parse this
+protocol. Quarantined bytes are not unlinked by the pipeline.
 For test failures, and for build/check failures whose diagnostics reference only test files
 or recognized test targets, the fixer is explicitly told to decide whether the failure is
 caused by production behaviour or by an incorrect/stale test. Target-only diagnostics are
@@ -2256,6 +2272,8 @@ Sikula processes at once is still unsupported.
 | `delivery_effective_write_exact_file_paths` | `list[str] \| None` | `delivery run-next` / `cmd_run()` | Schema-v2 subset that preserves exact-file semantics in the persisted upper bound. Runtime construction stops if an entry is missing or has become a directory in the authoritative child tree. |
 | `delivery_runtime_write_scope_binding` | `dict \| None` | `cmd_run()` | Versioned immutable post-assembly production-scope binding. A `bound` value stores canonical lexical roots together with their resolved project-relative identities and exact-file kinds; a `denied` value records failed initial construction. Resume validates the original identities and can derive only a narrower active scope without replacing the binding. Legacy children keep `None`, and amendment evidence falls back to their creation-time upper bound. |
 | `delivery_scope_audit_pending` | `dict \| None` | Orchestrator | Dedicated versioned control marker containing the active delivery write actor (Implementer/Fixer or an allowlisted deterministic mutation phase), authoritative project prefix, immutable pre-call Git commit ID, absolute Git/common-directory bindings, Git-reference and Git-ignore fingerprints, typed lexical and resolved production roots, and lexical and resolved Fixer test-write roots authorized for that invocation. It is persisted before the private sparse worktree baseline and cleared only after the post-mutation or resume audit result is saved. Resume accepts only the current complete marker schema, verifies that Git discovery and reference authority still match those bindings, computes Git candidates against the saved commit, audits its immutable policy before applying current runtime-scope changes, and never derives or broadens authority from current `HEAD`, errors, config, filesystem aliases, or `active_operation`; malformed, incomplete, unsupported, unavailable, retargeted, mutated-ref, or orphaned marker/baseline state fails closed. |
+| `delivery_quarantine_candidates` | `list[dict]` | Delivery scope audit / Orchestrator | Current-process, bounded quarantine authority for ordinary-untracked regular files first observed after a successful Implementer or Fixer provider attempt. Each record binds a project-relative path to digest, mode, filesystem identity, and a random process-session token stored only in private task state. A new process uses a different token and clears the list, failed or violating attempts cannot mint authority, and starting a move consumes the matching record before filesystem mutation. |
+| `delivery_quarantine_records` | `list[dict]` | Orchestrator / cleanup | Durable audit and recovery state for requested file quarantine. `moving` is saved before rename and blocks resume after interruption; `quarantined` proves the bytes were moved outside the worktree and semantic gates were invalidated; explicit forced cleanup/delete changes retained entries to `cleaned`. Records contain bounded path and file metadata, never file contents or the private storage path. |
 | `delivery_handoff_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Opt-in schema marker set on newly created delivery children. Legacy children keep `None`, so terminal reconciliation does not fabricate or require a handoff for state created by older versions. |
 | `delivery_dependency_handoffs` | `list[dict]` | `delivery run-next` / `cmd_run()` | Validated, fingerprinted, allowlisted snapshots from the child unit's completed dependency closure. `AnalystAgent` consumes them as supporting evidence; malformed resume-state entries are ignored and recorded as warnings rather than injected into prompts. |
 | `config_snapshot` | `dict` | `cmd_run()` / Orchestrator | Effective run configuration captured on first run before agents start (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `planner.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. It is also saved for contract-gate failures that exit before `Orchestrator.run()`. Visible in `show <task_id>`. |

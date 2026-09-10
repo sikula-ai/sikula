@@ -1007,6 +1007,16 @@ continue to use the separate test-write policy; snapshot content is retained onl
 bounded, non-binary files whose platform-specific mixed source/test classification needs
 it.
 
+On supported POSIX systems, a non-triage Fixer may ask Sikula to quarantine one
+ordinary-untracked file that a successful audited agent attempt created in the current
+process. Sikula verifies the file identity and exact active write scope, then moves the
+file out of the child worktree without deleting its contents. Tracked, staged, ignored,
+linked, pre-existing, stale, private, or cross-session files are rejected. The retained
+copy is outside the assembled Git tree and remains available until an explicit
+`sikula cleanup <task-id> --force` or `sikula delete <task-id> --force`; the corresponding
+dry run reports its count and size. The capability is not advertised on Windows,
+non-isolated runs, or Fixer test-triage subpasses.
+
 ## Repository Scope
 
 The MVP supports one Git repository. If `repositories` is omitted, Sikula treats

@@ -16,7 +16,9 @@ from core.structured_output import (
     DELIVERY_IMPLEMENTATION_DISPOSITIONS,
     DELIVERY_REVIEW_DISPOSITIONS,
     DeliveryDispositionParseError,
+    FixerFileOperationParseError,
     parse_delivery_disposition,
+    parse_fixer_file_operation,
 )
 
 
@@ -28,6 +30,36 @@ def _payload(disposition: str, summary: object = "A bounded follow-up is require
             "summary": summary,
         }
     )
+
+
+def test_parse_fixer_file_operation_accepts_one_fenced_request_with_prose() -> None:
+    parsed = parse_fixer_file_operation(
+        "The empty generated file should be removed.\n"
+        "```json\n"
+        '{"sikula_file_operation_schema_version":1,'
+        '"operation":"quarantine_untracked","path":"src/Scratch.kt"}\n'
+        "```"
+    )
+
+    assert parsed is not None
+    assert parsed.to_dict() == {
+        "schema_version": 1,
+        "operation": "quarantine_untracked",
+        "path": "src/Scratch.kt",
+    }
+
+
+def test_parse_fixer_file_operation_ignores_output_without_marker() -> None:
+    assert parse_fixer_file_operation("Removed the obsolete file.") is None
+
+
+def test_parse_fixer_file_operation_rejects_multiple_requests() -> None:
+    request = '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/Scratch.kt"}'
+
+    with pytest.raises(FixerFileOperationParseError) as exc_info:
+        parse_fixer_file_operation(f"{request}\n{request}")
+
+    assert exc_info.value.code == "delivery_quarantine.marker_ambiguous"
 
 
 @pytest.mark.parametrize(

@@ -29,8 +29,9 @@ log = logging.getLogger(__name__)
 
 DELIVERY_SCOPE_AUDIT_SNAPSHOT = "delivery_scope_audit_before"
 DELIVERY_SCOPE_ATTEMPT_AUDIT_SNAPSHOT = "delivery_scope_attempt_before"
-DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION = 8
+DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION = 9
 DELIVERY_SCOPE_AUDIT_PATH_LIMIT = 100
+DELIVERY_QUARANTINE_CANDIDATE_LIMIT = 200
 DELIVERY_SCOPE_VIOLATION_CODE = DELIVERY_STOP_UNIT_SCOPE_VIOLATION
 DELIVERY_SCOPE_TOOL_ACTORS = frozenset(
     {
@@ -188,12 +189,16 @@ class DeliveryScopeAudit:
         store: StateStore,
         tools: dict[str, object],
         agents: Callable[[], dict[str, object]],
+        quarantine_session_id: str | None = None,
     ) -> None:
         self._config = config
         self._store = store
         self._tools = tools
         self._agents_provider = agents
+        self._quarantine_session_id = quarantine_session_id
         self._delivery_scope_roots_cache: tuple[tuple[str, bool], ...] | None = None
+        self._verified_provider_attempt_policy: tuple[str, DeliveryScopeAuditPolicy] | None = None
+        self._quarantine_session_tasks: set[str] = set()
 
     @property
     def _agents(self) -> dict[str, object]:
@@ -304,6 +309,48 @@ class DeliveryScopeAudit:
         attempt: dict[str, object],
     ):
         return self._delivery_scope_provider_attempt_boundary(state, name, policy, attempt)
+
+    def start_quarantine_session(self, state: TaskState) -> None:
+        """Discard persisted move authority when a task enters a new process session."""
+
+        if state.task_id in self._quarantine_session_tasks:
+            return
+        self._quarantine_session_tasks.add(state.task_id)
+        records = state.delivery_quarantine_candidates
+        if not isinstance(records, list) or any(
+            not isinstance(record, dict) or record.get("session_id") != self._quarantine_session_id
+            for record in records
+        ):
+            state.delivery_quarantine_candidates = []
+            state.record(
+                "orchestrator",
+                "delivery_quarantine_authority_reset",
+                "stale file-quarantine authority cleared for a new process session",
+            )
+
+    def consume_verified_provider_attempt_policy(
+        self,
+        name: str,
+        active_write_paths: tuple[str, ...],
+    ) -> DeliveryScopeAuditPolicy:
+        """Consume the exact policy verified around the latest provider attempt."""
+
+        verified = self._verified_provider_attempt_policy
+        self._verified_provider_attempt_policy = None
+        if verified is None or verified[0] != name:
+            raise DeliveryScopeSnapshotError("Verified provider-attempt scope is unavailable.")
+        policy = verified[1]
+        captured = tuple(
+            dict.fromkeys(
+                [
+                    *(path for path, _exact_file in policy.production_roots),
+                    *policy.active_test_write_paths,
+                ]
+            )
+        )
+        if captured != active_write_paths:
+            raise DeliveryScopeSnapshotError("Verified provider-attempt scope does not match the Fixer request.")
+        return policy
 
     def tool_mutation_boundary(self, state: TaskState, phase: str):
         return self._delivery_scope_tool_mutation_boundary(state, phase)
@@ -783,6 +830,7 @@ class DeliveryScopeAudit:
         git_ignore_fingerprint: str | None = None,
         git_ref_fingerprint: str | None = None,
         provider_attempt: dict[str, object] | None = None,
+        provider_succeeded: bool = False,
         tool_phase: str | None = None,
     ) -> bool:
         if before is None:
@@ -828,6 +876,7 @@ class DeliveryScopeAudit:
                 after=after,
                 policy=policy,
                 provider_attempt=provider_attempt,
+                provider_succeeded=provider_succeeded,
                 tool_phase=tool_phase,
             )
         except DeliveryScopeSnapshotError:
@@ -843,6 +892,7 @@ class DeliveryScopeAudit:
     ) -> Iterator[None]:
         if state.delivery_stop_code == DELIVERY_STOP_UNIT_SCOPE_VIOLATION:
             raise DeliveryScopeProviderAttemptStopped(DELIVERY_SCOPE_VIOLATION_CODE)
+        self._verified_provider_attempt_policy = None
         previous_pending = state.delivery_scope_audit_pending
         try:
             policy = self._delivery_scope_provider_attempt_policy(state, name, policy)
@@ -877,6 +927,7 @@ class DeliveryScopeAudit:
         try:
             yield
         except BaseException as provider_error:
+            self._verified_provider_attempt_policy = None
             stopped = self._audit_delivery_scope_after_mutation(
                 state,
                 name,
@@ -888,6 +939,7 @@ class DeliveryScopeAudit:
                 git_ignore_fingerprint=binding.ignore_fingerprint,
                 git_ref_fingerprint=binding.ref_fingerprint,
                 provider_attempt=attempt,
+                provider_succeeded=False,
             )
             self._store.save(state)
             self._restore_delivery_scope_outer_pending(state, previous_pending)
@@ -906,11 +958,14 @@ class DeliveryScopeAudit:
                 git_ignore_fingerprint=binding.ignore_fingerprint,
                 git_ref_fingerprint=binding.ref_fingerprint,
                 provider_attempt=attempt,
+                provider_succeeded=True,
             )
             self._store.save(state)
             self._restore_delivery_scope_outer_pending(state, previous_pending)
             if stopped:
+                self._verified_provider_attempt_policy = None
                 raise DeliveryScopeProviderAttemptStopped(DELIVERY_SCOPE_VIOLATION_CODE)
+            self._verified_provider_attempt_policy = (name, policy)
 
     def _restore_delivery_scope_outer_pending(
         self,
@@ -1283,6 +1338,7 @@ class DeliveryScopeAudit:
         policy: DeliveryScopeAuditPolicy,
         resume_recovery: bool = False,
         provider_attempt: dict[str, object] | None = None,
+        provider_succeeded: bool = False,
         tool_phase: str | None = None,
     ) -> bool:
         project_paths: list[tuple[str, str]] = []
@@ -1316,6 +1372,15 @@ class DeliveryScopeAudit:
             )
         ]
         violation_count = len(violation_paths) + len(outside_project_paths)
+        quarantine_candidates: list[str] = []
+        if provider_attempt is not None and name in {"implementer", "fixer"}:
+            quarantine_candidates = self._update_delivery_quarantine_candidates(
+                state,
+                project_paths,
+                before=before,
+                after=after,
+                trusted=provider_succeeded and not violation_count,
+            )
         reconciled_paths: list[str] = []
         if resume_recovery and not violation_count and name == "implementer":
             reconciled_paths = sorted({project_path for _, project_path in production_paths})
@@ -1361,6 +1426,7 @@ class DeliveryScopeAudit:
                 metadata["provider_attempt"] = attempt
             if isinstance(max_attempts, int) and not isinstance(max_attempts, bool) and max_attempts > 0:
                 metadata["provider_max_attempts"] = max_attempts
+            metadata["quarantine_candidate_count"] = len(quarantine_candidates)
         if tool_phase is not None:
             metadata["audit_boundary"] = "tool_mutation"
             metadata["tool_phase"] = tool_phase
@@ -1398,3 +1464,73 @@ class DeliveryScopeAudit:
         )
         self._store.save(state)
         return True
+
+    def _update_delivery_quarantine_candidates(
+        self,
+        state: TaskState,
+        project_paths: list[tuple[str, str]],
+        *,
+        before: dict,
+        after: dict,
+        trusted: bool,
+    ) -> list[str]:
+        if not self._quarantine_session_id:
+            state.delivery_quarantine_candidates = []
+            return []
+        owned = {
+            record["path"]: dict(record)
+            for record in state.delivery_quarantine_candidates
+            if isinstance(record, dict)
+            and isinstance(record.get("path"), str)
+            and record.get("session_id") == self._quarantine_session_id
+        }
+        preexisting_identities = {
+            snapshot.identity
+            for snapshot in before.values()
+            if snapshot is not None and snapshot.exists and snapshot.identity is not None
+        }
+        created: list[str] = []
+        for audit_path, project_path in project_paths:
+            before_snapshot = before.get(audit_path)
+            after_snapshot = after.get(audit_path)
+            if not trusted:
+                owned.pop(project_path, None)
+                continue
+            valid_after = bool(
+                after_snapshot is not None
+                and after_snapshot.exists
+                and after_snapshot.status == "untracked"
+                and after_snapshot.symlink_target is None
+                and isinstance(after_snapshot.digest, str)
+                and after_snapshot.digest.startswith("sha256:")
+                and isinstance(after_snapshot.mode, int)
+                and after_snapshot.identity is not None
+            )
+            if not valid_after:
+                owned.pop(project_path, None)
+                continue
+            retained = project_path in owned and bool(
+                before_snapshot is not None
+                and before_snapshot.status == "untracked"
+                and before_snapshot.identity == after_snapshot.identity
+            )
+            created_now = bool(
+                (before_snapshot is None or before_snapshot.status != "untracked")
+                and after_snapshot.identity not in preexisting_identities
+            )
+            if not (retained or created_now):
+                owned.pop(project_path, None)
+                continue
+            if project_path not in owned:
+                created.append(project_path)
+            owned[project_path] = {
+                "path": project_path,
+                "digest": after_snapshot.digest,
+                "mode": after_snapshot.mode,
+                "identity": list(after_snapshot.identity),
+                "session_id": self._quarantine_session_id,
+            }
+        state.delivery_quarantine_candidates = [
+            owned[path] for path in sorted(owned)[:DELIVERY_QUARANTINE_CANDIDATE_LIMIT]
+        ]
+        return created

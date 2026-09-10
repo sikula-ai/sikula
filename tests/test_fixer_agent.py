@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 from agents.base_agent import AGENT_SECURITY_PREFIX
 from agents.fixer_agent import (
@@ -26,6 +27,7 @@ from agents.fixer_agent import (
     _write_paths_for_state,
 )
 from core.delivery_constraint_context import delivery_constraint_context_fingerprint
+from core.delivery_quarantine import DeliveryQuarantineResult
 from core.state import TaskState
 from tests.conftest import StubLLMClient
 
@@ -40,11 +42,21 @@ def _make_state(**kwargs) -> TaskState:
     return TaskState(**defaults)
 
 
-def _make_agent(llm: StubLLMClient, file_tool=None, project_config: dict | None = None) -> FixerAgent:
+def _make_agent(
+    llm: StubLLMClient,
+    file_tool=None,
+    project_config: dict | None = None,
+    quarantine_executor: Callable | None = None,
+) -> FixerAgent:
     tools = {}
     if file_tool is not None:
         tools["file"] = file_tool
-    return FixerAgent(llm=llm, tools=tools, project_config=project_config or {})
+    return FixerAgent(
+        llm=llm,
+        tools=tools,
+        project_config=project_config or {},
+        quarantine_executor=quarantine_executor,
+    )
 
 
 def _add_delivery_constraint_context(state: TaskState) -> None:
@@ -142,6 +154,90 @@ class TestFixerAgentGuards:
         state.errors = ["compile error"]
         result = _make_agent(stub_llm).run(state)
         assert not result.success
+
+    def test_delivery_fixer_can_request_reversible_quarantine(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        state.delivery_write_scope_schema_version = 1
+        state.worktree_path = str(file_tool._root)
+        state.worktree_base = str(file_tool._root)
+        state.errors = ["EmptyKotlinFile: src/Scratch.kt can be removed"]
+        stub_llm.agent_output = (
+            '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/Scratch.kt"}'
+        )
+        calls: list[tuple[str, list[str]]] = []
+
+        def quarantine(_state: TaskState, path: str, roots: list[str]) -> DeliveryQuarantineResult:
+            calls.append((path, roots))
+            return DeliveryQuarantineResult(
+                path=path,
+                quarantine_id="1" * 32,
+                digest="sha256:" + "2" * 64,
+                mode=0o644,
+                size=0,
+            )
+
+        result = _make_agent(
+            stub_llm,
+            file_tool=file_tool,
+            project_config={"sandbox": {"allowed_write_paths": ["src/"]}},
+            quarantine_executor=quarantine,
+        ).run(state)
+
+        assert result.success
+        assert result.data["files_written"] == ["src/Scratch.kt"]
+        assert calls == [("src/Scratch.kt", ["src/"])]
+        assert "reversible quarantine" in stub_llm.agent_calls[0]
+        assert state.fix_cycle_records[0]["file_quarantined"]["path"] == "src/Scratch.kt"
+
+    def test_standard_fixer_does_not_parse_quarantine_protocol(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        state.errors = ["compile error"]
+        stub_llm.agent_output = (
+            '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/Scratch.kt"}'
+        )
+        called = False
+
+        def quarantine(_state: TaskState, _path: str, _roots: list[str]) -> DeliveryQuarantineResult:
+            nonlocal called
+            called = True
+            raise AssertionError("standard Fixer must not execute delivery quarantine")
+
+        result = _make_agent(
+            stub_llm,
+            file_tool=file_tool,
+            project_config={"sandbox": {"allowed_write_paths": ["src/"]}},
+            quarantine_executor=quarantine,
+        ).run(state)
+
+        assert not result.success
+        assert called is False
+        assert "reversible quarantine" not in stub_llm.agent_calls[0]
+
+    def test_delivery_fixer_without_platform_executor_does_not_parse_quarantine_protocol(
+        self,
+        stub_llm: StubLLMClient,
+        file_tool,
+    ):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        state.delivery_write_scope_schema_version = 1
+        state.worktree_path = str(file_tool._root)
+        state.worktree_base = str(file_tool._root)
+        state.errors = ["EmptyKotlinFile: src/Scratch.kt can be removed"]
+        stub_llm.agent_output = (
+            '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/Scratch.kt"}'
+        )
+
+        result = _make_agent(
+            stub_llm,
+            file_tool=file_tool,
+            project_config={"sandbox": {"allowed_write_paths": ["src/"]}},
+        ).run(state)
+
+        assert not result.success
+        assert "reversible quarantine" not in stub_llm.agent_calls[0]
+        assert "file_operation_error" not in state.fix_cycle_records[0]
 
     def test_rejects_invalid_delivery_constraint_context_before_provider_call(
         self,
