@@ -1985,6 +1985,9 @@ class TestCmdCleanup:
 
         worktree = tmp_path / "wt"
         worktree.mkdir()
+        scratch = worktree / "src" / "Scratch.kt"
+        scratch.parent.mkdir()
+        scratch.write_text("scratch\n", encoding="utf-8")
         store, state = _saved_state(tmp_path, worktree=worktree)
         state.failed = True
         state.delivery_quarantine_records = [{"status": "moving", "path": "src/Scratch.kt", "quarantine_id": "1" * 32}]
@@ -2015,6 +2018,39 @@ class TestCmdCleanup:
         output = capsys.readouterr().out
         assert "stopped before the file reached retained storage" in output
         assert "normal cleanup with --discard" in output
+
+    def test_quarantine_only_cleanup_reconciles_removed_interrupted_move(self, tmp_path: Path, capsys):
+        import sikula_cli.cleanup as cleanup_cli
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        store, state = _saved_state(tmp_path, worktree=worktree)
+        state.failed = True
+        state.review_approved = True
+        state.delivery_quarantine_records = [{"status": "moving", "path": "src/Scratch.kt", "quarantine_id": "1" * 32}]
+        store.save(state)
+        removed: list[tuple[Path, str]] = []
+        context = cleanup_cli.CleanupContext(
+            resolve_state_dir=lambda _cfg: tmp_path / ".sikula" / "state",
+            find_git_root=lambda _path: tmp_path,
+            quarantine_summary=lambda _root, _task_id: (0, 0),
+            remove_quarantine=lambda root, task_id: removed.append((root, task_id)) or 0,
+            quarantine_entry_retained=lambda _root, _task_id, _quarantine_id: False,
+        )
+
+        cleanup_cli.cmd_cleanup(
+            _cleanup_args(force=True, quarantine_only=True),
+            _run_cfg(tmp_path),
+            context,
+        )
+
+        loaded = store.load("abc123")
+        assert loaded is not None
+        assert removed == [(tmp_path, "abc123")]
+        assert loaded.delivery_quarantine_records[0]["status"] == "cleaned"
+        assert loaded.review_approved is False
+        assert loaded.history[-1]["action"] == "delivery_quarantine_interrupted_cleanup"
+        assert "Removed retained file quarantine: 0 file(s)" in capsys.readouterr().out
 
     def test_cleanup_force_removes_retained_file_quarantine(self, tmp_path: Path, capsys):
         import sikula_cli.cleanup as cleanup_cli

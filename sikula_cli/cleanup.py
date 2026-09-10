@@ -104,9 +104,9 @@ def _cleanup_context(context: CleanupContext | None = None) -> CleanupContext:
     return context or CleanupContext()
 
 
-def _prune_absent_quarantine_paths(state, records: list[dict]) -> None:
+def _absent_quarantine_paths(state, records: list[dict]) -> set[str]:
     if not state.worktree_path:
-        return
+        return set()
     worktree = Path(state.worktree_path)
     absent: set[str] = set()
     for record in records:
@@ -122,6 +122,11 @@ def _prune_absent_quarantine_paths(state, records: list[dict]) -> None:
             absent.add(path)
         except OSError:
             continue
+    return absent
+
+
+def _prune_absent_quarantine_paths(state, records: list[dict]) -> None:
+    absent = _absent_quarantine_paths(state, records)
     if not absent:
         return
     state.files_changed = [path for path in state.files_changed if path not in absent]
@@ -173,17 +178,20 @@ def cmd_cleanup(args: argparse.Namespace, cfg: dict, context: CleanupContext | N
     interrupted_move_missing = False
     if quarantine_only and interrupted_records:
         try:
-            interrupted_move_missing = any(
-                not context.quarantine_entry_retained(
+            missing_records = [
+                record
+                for record in interrupted_records
+                if not context.quarantine_entry_retained(
                     git_root,
                     state.task_id,
                     str(record.get("quarantine_id") or ""),
                 )
-                for record in interrupted_records
-            )
+            ]
         except DeliveryQuarantineError as exc:
             print(f"Could not inspect interrupted file quarantine ({exc.code}).")
             sys.exit(1)
+        absent_paths = _absent_quarantine_paths(state, missing_records)
+        interrupted_move_missing = any(record.get("path") not in absent_paths for record in missing_records)
 
     print(f"Task {state.task_id}: {action.upper()}{' (dry run)' if dry_run else ''}")
 
