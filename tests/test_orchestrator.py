@@ -684,7 +684,20 @@ class TestDeliveryProductionScopeAudit:
         assert task_quarantine_summary(tmp_project, state.task_id) == (1, 0)
 
     @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
-    def test_delivery_fixer_quarantine_prunes_clean_path_from_net_changes(self, tmp_project: Path):
+    @pytest.mark.parametrize(
+        ("prior_files", "step_tracking", "set_done"),
+        [
+            ([], False, True),
+            (["src/earlier.py"], True, False),
+        ],
+    )
+    def test_delivery_fixer_quarantine_rejects_unclassified_no_change_scope(
+        self,
+        tmp_project: Path,
+        prior_files: list[str],
+        step_tracking: bool,
+        set_done: bool,
+    ):
         scratch = tmp_project / "src" / "Scratch.kt"
 
         def create_scratch() -> tuple[list[str], str]:
@@ -712,15 +725,19 @@ class TestDeliveryProductionScopeAudit:
         state = _scoped_delivery_state(orch, ["src"])
         state.worktree_path = str(tmp_project)
         state.worktree_base = str(tmp_project)
+        state.files_changed = list(prior_files)
+        state.step_file_tracking_enabled = step_tracking
+        state.step_files_changed = []
         state.errors = ["EmptyKotlinFile: src/Scratch.kt can be removed"]
 
         assert orch._run_fix_phase(state, "1/3") is True
 
         assert not scratch.exists()
-        assert state.files_changed == []
+        assert state.files_changed == prior_files
+        assert state.step_files_changed == []
         assert state.delivery_quarantine_records[-1]["status"] == "quarantined"
 
-        assert orch._run_build_fix_loop(state, set_done=True) is False
+        assert orch._run_build_fix_loop(state, set_done=set_done) is False
         assert state.done is False
         assert state.failed is True
         assert state.history[-1]["action"] == "delivery_no_change_unclassified"

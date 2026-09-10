@@ -1341,21 +1341,23 @@ class Orchestrator:
             # Passing build (and tests/checks if enabled)
             state.build_loop_key = None
             state.build_loop_start_iteration = 0
+            delivery_change_paths = state.files_changed if set_done else state.step_files_changed
+            if (
+                state.delivery_plan_id
+                and state.delivery_unit_id
+                and not delivery_change_paths
+                and not is_delivery_implementation_already_satisfied(state)
+            ):
+                scope = "unit" if set_done else "current planner step"
+                message = (
+                    f"Delivery validation passed, but quarantine removed every {scope} implementation change "
+                    "without an explicit already-satisfied outcome."
+                )
+                state.record("orchestrator", "delivery_no_change_unclassified", message)
+                state.failed = True
+                self._store.save(state)
+                return False
             if set_done:
-                if (
-                    state.delivery_plan_id
-                    and state.delivery_unit_id
-                    and not state.files_changed
-                    and not is_delivery_implementation_already_satisfied(state)
-                ):
-                    message = (
-                        "Delivery validation passed, but quarantine removed every implementation change "
-                        "without an explicit already-satisfied outcome."
-                    )
-                    state.record("orchestrator", "delivery_no_change_unclassified", message)
-                    state.failed = True
-                    self._store.save(state)
-                    return False
                 state.done = True
             self._store.save(state)
             return True

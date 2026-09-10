@@ -529,8 +529,8 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
   retained entry proves that rename completed. It preserves the child worktree and
   conservatively invalidates its pipeline gates. A pre-rename interruption must remain
   blocked because cleanup cannot safely remove the original worktree file. Quarantine must
-  not let a delivery child complete with neither a net implementation diff nor an explicit
-  parser-validated `already_satisfied` outcome.
+  not let a delivery child or current planner step complete with neither a net
+  implementation diff nor an explicit parser-validated `already_satisfied` outcome.
   This reversible operation reduces accidental-loss risk but is not an OS isolation
   boundary against an adversarial concurrent process running as the same user.
 - **`ReviewerAgent` and `SecurityReviewerAgent`** must never write files — use `run_readonly_agent()` only.

@@ -2099,9 +2099,9 @@ Fixer change. Clean quarantined paths are removed from the net `files_changed` p
 their audit remains in `delivery_quarantine_records`. An interrupted `moving` record blocks
 resume until explicit cleanup confirms that the retained entry exists. Standard,
 non-isolated, Windows, and internal test-triage Fixer runs never receive or parse this
-protocol. Quarantined bytes are not unlinked by the pipeline. A delivery child whose only
-changes were quarantined cannot complete unless its Implementer supplied the existing
-parser-validated `already_satisfied` outcome.
+protocol. Quarantined bytes are not unlinked by the pipeline. A delivery child or current
+planner step whose only changes were quarantined cannot complete unless its Implementer
+supplied the existing parser-validated `already_satisfied` outcome.
 For test failures, and for build/check failures whose diagnostics reference only test files
 or recognized test targets, the fixer is explicitly told to decide whether the failure is
 caused by production behaviour or by an incorrect/stale test. Target-only diagnostics are
