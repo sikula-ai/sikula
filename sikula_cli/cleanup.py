@@ -154,7 +154,7 @@ def cmd_cleanup(args: argparse.Namespace, cfg: dict, context: CleanupContext | N
         [
             record
             for record in quarantine_records
-            if isinstance(record, dict) and record.get("status") in {"moving", "quarantined"}
+            if isinstance(record, dict) and record.get("status") in {"moving", "quarantined", "aborted"}
         ]
         if isinstance(quarantine_records, list)
         else []
