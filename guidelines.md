@@ -525,6 +525,8 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
   owns Git/filesystem checks and moves the verified inode into an owner-only task
   quarantine under the repository Git common directory. The pipeline must not unlink the
   content. Only explicit forced `cleanup`/`delete` removes the retained quarantine.
+  Interrupted `moving` state must be clearable through quarantine-only cleanup that
+  preserves the child worktree and conservatively invalidates its pipeline gates.
   This reversible operation reduces accidental-loss risk but is not an OS isolation
   boundary against an adversarial concurrent process running as the same user.
 - **`ReviewerAgent` and `SecurityReviewerAgent`** must never write files — use `run_readonly_agent()` only.

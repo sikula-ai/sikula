@@ -530,9 +530,10 @@ class Orchestrator:
             return state
         if active_invocation and delivery_quarantine_has_incomplete_move(state.delivery_quarantine_records):
             message = (
-                "An interrupted file quarantine requires explicit task cleanup before this delivery child can resume."
+                "An interrupted file quarantine requires explicit cleanup before this delivery child can resume. Run "
+                f"`sikula cleanup {state.task_id} --quarantine-only --force`, then retry with `--reset-failed`."
             )
-            state.record("orchestrator", "delivery_quarantine_recovery_required", message)
+            state.record("orchestrator", "delivery_quarantine_cleanup_required", message)
             state.failed = True
             self._store.save(state)
             return state

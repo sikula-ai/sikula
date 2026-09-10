@@ -828,7 +828,7 @@ class TestDeliveryProductionScopeAudit:
         assert result.failed is True
         assert pipeline_calls == []
         assert not any(stub.calls for stub in stubs.values())
-        assert result.history[-1]["action"] == "delivery_quarantine_recovery_required"
+        assert result.history[-1]["action"] == "delivery_quarantine_cleanup_required"
 
     def test_presync_out_of_scope_write_is_terminal_before_analysis(self, tmp_project: Path):
         allowed = tmp_project / "src" / "allowed"

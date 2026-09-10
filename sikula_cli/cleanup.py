@@ -31,9 +31,15 @@ def register_parser(subparsers) -> tuple[argparse.ArgumentParser, argparse.Argum
         default=False,
         help="Allow removing a dirty worktree and discarding uncommitted changes.",
     )
+    cleanup_p.add_argument(
+        "--quarantine-only",
+        action="store_true",
+        default=False,
+        help="Remove retained quarantine files without removing the task worktree or state.",
+    )
 
     delete_p = subparsers.add_parser("delete", help="Delete a task worktree and its state JSON")
-    delete_p.set_defaults(delete_state=True)
+    delete_p.set_defaults(delete_state=True, quarantine_only=False)
     delete_p.add_argument("task_id")
     delete_p.add_argument(
         "--force",
@@ -99,7 +105,8 @@ def cmd_cleanup(args: argparse.Namespace, cfg: dict, context: CleanupContext | N
         print(f"Task {args.task_id} not found")
         sys.exit(1)
 
-    action = "delete" if args.delete_state else "cleanup"
+    quarantine_only = bool(getattr(args, "quarantine_only", False))
+    action = "quarantine cleanup" if quarantine_only else ("delete" if args.delete_state else "cleanup")
     dry_run = not args.force
     removed_worktree = False
     clear_worktree_refs = False
@@ -129,6 +136,51 @@ def cmd_cleanup(args: argparse.Namespace, cfg: dict, context: CleanupContext | N
             sys.exit(1)
 
     print(f"Task {state.task_id}: {action.upper()}{' (dry run)' if dry_run else ''}")
+
+    if quarantine_only:
+        if not has_quarantine_state:
+            print("Task has no active retained file quarantine.")
+        elif dry_run:
+            print(f"Would remove retained file quarantine: {quarantine_count} file(s), {quarantine_bytes} byte(s)")
+            print("Would preserve the task worktree and state.")
+        else:
+            try:
+                removed_quarantine = context.remove_quarantine(git_root, state.task_id)
+            except DeliveryQuarantineError as exc:
+                print(f"Failed to remove retained file quarantine ({exc.code}).")
+                sys.exit(1)
+            interrupted_records = [record for record in active_quarantine_records if record.get("status") == "moving"]
+            state.delivery_quarantine_candidates = []
+            for record in active_quarantine_records:
+                record["status"] = "cleaned"
+            if interrupted_records:
+                for record in interrupted_records:
+                    path = record.get("path")
+                    if isinstance(path, str) and path and path not in state.files_changed:
+                        state.files_changed.append(path)
+                state.build_synced = False
+                state.fixer_changed_code = True
+                state.delivery_no_change_outcome = None
+                state.review_approved = False
+                state.security_approved = False
+                state.review_iterations = 0
+                state.security_review_iterations = 0
+                state.tests_up_to_date = False
+                state.final_full_task_review_done = False
+            state.record(
+                "sikula",
+                "delivery_quarantine_interrupted_cleanup"
+                if interrupted_records
+                else "delivery_quarantine_cleanup",
+                f"removed {removed_quarantine} retained file(s) without removing the task worktree",
+            )
+            store.save(state)
+            print(f"Removed retained file quarantine: {removed_quarantine} file(s)")
+            if interrupted_records:
+                print(f"Resume with: sikula run --task-id {state.task_id} --reset-failed")
+        if dry_run:
+            print("No changes made. Re-run with --force to apply.")
+        return
 
     if state.worktree_base or state.worktree_path:
         worktree_base = Path(state.worktree_base or state.worktree_path)

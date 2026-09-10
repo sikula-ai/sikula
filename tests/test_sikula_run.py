@@ -117,9 +117,15 @@ class TestCleanupCliModule:
 
         cleanup_args = parser.parse_args(["cleanup", "abc123"])
         assert cleanup_args.delete_state is False
+        assert cleanup_args.quarantine_only is False
+
+        quarantine_args = parser.parse_args(["cleanup", "abc123", "--quarantine-only"])
+        assert quarantine_args.delete_state is False
+        assert quarantine_args.quarantine_only is True
 
         delete_args = parser.parse_args(["delete", "abc123"])
         assert delete_args.delete_state is True
+        assert delete_args.quarantine_only is False
 
     def test_default_git_helpers(self, tmp_path: Path, monkeypatch):
         import core.worktree as worktree
@@ -1852,7 +1858,7 @@ def _run_args(**kwargs):
 
 
 def _cleanup_args(**kwargs):
-    defaults = dict(task_id="abc123", force=False, discard=False, delete_state=False)
+    defaults = dict(task_id="abc123", force=False, discard=False, delete_state=False, quarantine_only=False)
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
 
@@ -1907,6 +1913,67 @@ def _saved_state(tmp_path: Path, *, worktree: Path | None = None):
 
 
 class TestCmdCleanup:
+    def test_quarantine_only_cleanup_preserves_worktree_and_invalidates_gates(self, tmp_path: Path, capsys):
+        import sikula_cli.cleanup as cleanup_cli
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        store, state = _saved_state(tmp_path, worktree=worktree)
+        state.failed = True
+        state.build_synced = True
+        state.review_approved = True
+        state.review_iterations = 2
+        state.security_approved = True
+        state.security_review_iterations = 2
+        state.tests_up_to_date = True
+        state.final_full_task_review_done = True
+        state.delivery_no_change_outcome = "already_satisfied"
+        state.delivery_quarantine_records = [{"status": "moving", "path": "src/Scratch.kt", "quarantine_id": "1" * 32}]
+        store.save(state)
+        context = cleanup_cli.CleanupContext(
+            resolve_state_dir=lambda _cfg: tmp_path / ".sikula" / "state",
+            path_is_within=lambda _path, _base: (_ for _ in ()).throw(
+                AssertionError("quarantine-only cleanup must not inspect worktree containment")
+            ),
+            worktree_dirty=lambda _path: (_ for _ in ()).throw(
+                AssertionError("quarantine-only cleanup must not inspect worktree dirtiness")
+            ),
+            find_git_root=lambda _path: tmp_path,
+            remove_worktree=lambda _worktree, _root, *, force: (_ for _ in ()).throw(
+                AssertionError("quarantine-only cleanup must preserve the worktree")
+            ),
+            quarantine_summary=lambda _root, _task_id: (1, 8),
+            remove_quarantine=lambda _root, _task_id: 1,
+        )
+
+        cleanup_cli.cmd_cleanup(
+            _cleanup_args(force=True, quarantine_only=True),
+            _run_cfg(tmp_path),
+            context,
+        )
+
+        loaded = store.load("abc123")
+        assert loaded is not None
+        assert loaded.worktree_path == str(worktree)
+        assert loaded.worktree_base == str(worktree)
+        assert worktree.exists()
+        assert loaded.failed is True
+        assert loaded.delivery_quarantine_records[0]["status"] == "cleaned"
+        assert loaded.files_changed == ["src/Scratch.kt"]
+        assert loaded.build_synced is False
+        assert loaded.fixer_changed_code is True
+        assert loaded.delivery_no_change_outcome is None
+        assert loaded.review_approved is False
+        assert loaded.security_approved is False
+        assert loaded.review_iterations == 0
+        assert loaded.security_review_iterations == 0
+        assert loaded.tests_up_to_date is False
+        assert loaded.final_full_task_review_done is False
+        assert loaded.history[-1]["action"] == "delivery_quarantine_interrupted_cleanup"
+        output = capsys.readouterr().out
+        assert "Removed retained file quarantine: 1 file(s)" in output
+        assert "sikula run --task-id abc123 --reset-failed" in output
+
     def test_cleanup_force_removes_retained_file_quarantine(self, tmp_path: Path, capsys):
         import sikula_cli.cleanup as cleanup_cli
 

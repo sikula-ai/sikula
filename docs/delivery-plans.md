@@ -1016,6 +1016,10 @@ copy is outside the assembled Git tree and remains available until an explicit
 `sikula cleanup <task-id> --force` or `sikula delete <task-id> --force`; the corresponding
 dry run reports its count and size. The capability is not advertised on Windows,
 non-isolated runs, or Fixer test-triage subpasses.
+If a process is interrupted while a quarantine move is recorded, run
+`sikula cleanup <task-id> --quarantine-only --force` to remove only retained quarantine
+storage while preserving the child worktree, followed by
+`sikula run --task-id <task-id> --reset-failed` to resume with stale gates rerun.
 
 ## Repository Scope
 
