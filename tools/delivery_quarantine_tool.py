@@ -117,6 +117,7 @@ def quarantine_agent_created_file(
             "delivery_quarantine.checkpoint_failed",
             "Sikula could not persist quarantine intent before moving the file.",
             quarantine_id=quarantine_id,
+            move_not_started=True,
         ) from exc
 
     try:
@@ -134,6 +135,22 @@ def quarantine_agent_created_file(
                 "The requested file changed before Sikula could quarantine it.",
                 quarantine_id=quarantine_id,
             )
+    except DeliveryQuarantineError as exc:
+        raise DeliveryQuarantineError(
+            exc.code,
+            str(exc),
+            quarantine_id=quarantine_id,
+            move_not_started=True,
+        ) from exc
+    except (OSError, RuntimeError) as exc:
+        raise DeliveryQuarantineError(
+            "delivery_quarantine.move_failed",
+            "Sikula could not revalidate the file before moving it into private quarantine.",
+            quarantine_id=quarantine_id,
+            move_not_started=True,
+        ) from exc
+
+    try:
         _move_to_quarantine(
             root,
             Path(binding.common_dir),

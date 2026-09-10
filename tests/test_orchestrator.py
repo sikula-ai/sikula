@@ -6,7 +6,7 @@ import os
 import subprocess
 import stat
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
@@ -37,6 +37,7 @@ from core.test_execution_gate_audit import detect_new_test_execution_gates
 from core.validation_artifacts import DeliveryScopeSnapshotError, delivery_scope_git_binding
 from tools.base_tool import Sandbox, ToolResult
 from tools.cargo_tool import CargoTool
+from tools import delivery_quarantine_tool as delivery_quarantine_tool_module
 from tools.delivery_quarantine_tool import delivery_quarantine_supported, task_quarantine_summary
 from tools.gradle_android_tool import AndroidGradleTool
 from tools.node_tool import NodeTool
@@ -965,6 +966,57 @@ class TestDeliveryProductionScopeAudit:
         assert not state.security_approved
         assert not state.tests_up_to_date
         assert not state.final_full_task_review_done
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    def test_known_pre_move_failure_aborts_quarantine_checkpoint(self, tmp_project: Path, monkeypatch):
+        scratch = tmp_project / "src" / "Scratch.kt"
+
+        def create_scratch() -> tuple[list[str], str]:
+            scratch.write_text("", encoding="utf-8")
+            return (
+                [],
+                '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/Scratch.kt"}',
+            )
+
+        real_binding = delivery_quarantine_tool_module.delivery_scope_git_binding
+        binding_calls = 0
+
+        def changed_second_binding(root: Path):
+            nonlocal binding_calls
+            binding_calls += 1
+            binding = real_binding(root)
+            if binding_calls == 2:
+                return replace(binding, ref_fingerprint=f"{binding.ref_fingerprint}-changed")
+            return binding
+
+        monkeypatch.setattr(delivery_quarantine_tool_module, "delivery_scope_git_binding", changed_second_binding)
+        client = ObservedWriteClient(tmp_project, [create_scratch])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_write_paths": ["src"]},
+            },
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client,
+            orch._tools,
+            orch._agent_project_config,
+            quarantine_executor=orch._execute_fixer_quarantine,
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.errors = ["EmptyKotlinFile: src/Scratch.kt can be removed"]
+
+        result = orch._run_agent("fixer", state)
+
+        assert not result.success
+        assert result.data["file_operation_error"] == "delivery_quarantine.git_state_changed"
+        assert scratch.exists()
+        assert state.delivery_quarantine_records[-1]["status"] == "aborted"
+        assert state.history[-1]["action"] == "file_operation_failed"
 
     def test_resume_blocks_on_interrupted_quarantine_move(self, tmp_project: Path, monkeypatch) -> None:
         orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src"])

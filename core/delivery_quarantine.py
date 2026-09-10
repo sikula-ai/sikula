@@ -17,9 +17,17 @@ _QUARANTINE_ID_RE = re.compile(r"[0-9a-f]{32}")
 class DeliveryQuarantineError(RuntimeError):
     """Raised when a requested quarantine move cannot be completed safely."""
 
-    def __init__(self, code: str, message: str, *, quarantine_id: str | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        quarantine_id: str | None = None,
+        move_not_started: bool = False,
+    ) -> None:
         self.code = code
         self.quarantine_id = quarantine_id
+        self.move_not_started = move_not_started
         super().__init__(message)
 
 
@@ -59,6 +67,7 @@ def delivery_quarantine_has_incomplete_move(records: object) -> bool:
             "moving",
             "quarantined",
             "cleaned",
+            "aborted",
         }:
             return True
         if record["status"] == "moving":

@@ -2104,11 +2104,18 @@ class Orchestrator:
         before_snapshot: dict[str, str | None] | None = None,
         git_env: dict[str, str] | None = None,
     ) -> None:
-        clean_paths = {
-            path
-            for path in (_normalize_project_path(candidate) for candidate in paths)
-            if path and not self._path_has_pending_changes(path, git_env=git_env)
-        }
+        clean_paths: set[str] = set()
+        for candidate in paths:
+            path = _normalize_project_path(candidate)
+            if not path:
+                continue
+            pending = (
+                self._path_has_pending_changes(path)
+                if git_env is None
+                else self._path_has_pending_changes(path, git_env=git_env)
+            )
+            if not pending:
+                clean_paths.add(path)
         if not clean_paths:
             return
         snapshot = (
@@ -3048,17 +3055,33 @@ class Orchestrator:
             state.record("fixer", "file_quarantined", result.path)
             self._store.save(state)
 
-        return self._delivery_quarantine_tool.quarantine(
-            state.task_id,
-            path,
-            provenance,
-            session_id=self._delivery_quarantine_session_id,
-            active_write_paths=resolved_roots,
-            exact_file_paths=exact_roots,
-            git_root=policy.root,
-            before_move=before_move,
-            after_move=after_move,
-        )
+        try:
+            return self._delivery_quarantine_tool.quarantine(
+                state.task_id,
+                path,
+                provenance,
+                session_id=self._delivery_quarantine_session_id,
+                active_write_paths=resolved_roots,
+                exact_file_paths=exact_roots,
+                git_root=policy.root,
+                before_move=before_move,
+                after_move=after_move,
+            )
+        except DeliveryQuarantineError as exc:
+            if exc.move_not_started and exc.quarantine_id:
+                for record in reversed(state.delivery_quarantine_records):
+                    if (
+                        isinstance(record, dict)
+                        and record.get("quarantine_id") == exc.quarantine_id
+                        and record.get("status") == "moving"
+                    ):
+                        record["status"] = "aborted"
+                        record["failure_code"] = exc.code
+                        record["aborted_at"] = datetime.now(timezone.utc).isoformat()
+                        state.record("fixer", "file_quarantine_aborted", path)
+                        self._store.save(state)
+                        break
+            raise
 
     def _run_delivery_review_agent(self, name: str, state: TaskState):
         """Retry one malformed delivery review without consuming a fix attempt."""
