@@ -11,6 +11,7 @@ import subprocess
 import pytest
 
 from core.delivery_quarantine import DeliveryQuarantineError
+from tools import delivery_quarantine_tool as delivery_quarantine_tool_module
 from tools.delivery_quarantine_tool import (
     delivery_quarantine_supported,
     quarantine_agent_created_file,
@@ -215,4 +216,32 @@ def test_quarantine_checkpoint_failure_keeps_source(tmp_path: Path) -> None:
         )
 
     assert exc_info.value.code == "delivery_quarantine.checkpoint_failed"
+    assert source.exists()
+
+
+def test_quarantine_marks_storage_failure_before_rename(tmp_path: Path, monkeypatch) -> None:
+    _init_repo(tmp_path)
+    source = tmp_path / "Scratch.kt"
+    source.write_text("scratch\n", encoding="utf-8")
+
+    def fail_before_rename(*_args, **_kwargs):
+        raise OSError("storage unavailable")
+
+    monkeypatch.setattr(delivery_quarantine_tool_module, "_create_private_directory", fail_before_rename)
+
+    with pytest.raises(DeliveryQuarantineError) as exc_info:
+        quarantine_agent_created_file(
+            tmp_path,
+            "task-a",
+            "Scratch.kt",
+            _provenance(source, "Scratch.kt", "session-a"),
+            session_id="session-a",
+            active_write_paths=["."],
+            exact_file_paths=[],
+            before_move=lambda _intent: None,
+            after_move=lambda _result: None,
+        )
+
+    assert exc_info.value.code == "delivery_quarantine.move_failed"
+    assert exc_info.value.move_not_started is True
     assert source.exists()

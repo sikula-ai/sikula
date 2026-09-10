@@ -517,7 +517,14 @@ def _move_to_quarantine(
                 "The requested file changed while Sikula moved it into quarantine.",
                 quarantine_id=quarantine_id,
             )
-    except DeliveryQuarantineError:
+    except DeliveryQuarantineError as exc:
+        if not moved:
+            raise DeliveryQuarantineError(
+                exc.code,
+                str(exc),
+                quarantine_id=quarantine_id,
+                move_not_started=True,
+            ) from exc
         raise
     except OSError as exc:
         if moved:
@@ -526,6 +533,7 @@ def _move_to_quarantine(
             "delivery_quarantine.move_failed",
             "Sikula could not move the requested file into private quarantine.",
             quarantine_id=quarantine_id,
+            move_not_started=not moved,
         ) from exc
     finally:
         for descriptor in reversed(destination_descriptors):
