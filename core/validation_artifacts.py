@@ -141,10 +141,14 @@ def _delivery_scope_git_env(
 
 def delivery_scope_git_env(
     *,
-    root: Path,
-    git_dir: Path,
+    root: Path | None = None,
+    git_dir: Path | None = None,
 ) -> dict[str, str]:
-    """Return the sanitized Git environment shared by delivery boundary checks."""
+    """Return the sanitized Git environment shared by delivery boundary checks.
+
+    Omit the explicit binding when Git should discover the repository from the
+    command's working directory.
+    """
 
     return _delivery_scope_git_env(root=root, git_dir=git_dir)
 

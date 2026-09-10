@@ -684,6 +684,54 @@ class TestDeliveryProductionScopeAudit:
         assert task_quarantine_summary(tmp_project, state.task_id) == (1, 0)
 
     @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    def test_delivery_fixer_quarantine_prunes_with_authoritative_git_index(
+        self,
+        tmp_project: Path,
+        monkeypatch,
+    ):
+        scratch = tmp_project / "src" / "Scratch.kt"
+        alternate_index = tmp_project / ".alternate-index"
+        alternate_env = dict(os.environ)
+        alternate_env["GIT_INDEX_FILE"] = str(alternate_index)
+        scratch.write_text("", encoding="utf-8")
+        subprocess.run(["git", "add", "src/Scratch.kt"], cwd=tmp_project, check=True, env=alternate_env)
+        scratch.unlink()
+        monkeypatch.setenv("GIT_INDEX_FILE", str(alternate_index))
+
+        def create_scratch() -> tuple[list[str], str]:
+            scratch.write_text("", encoding="utf-8")
+            return (
+                [],
+                '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/Scratch.kt"}',
+            )
+
+        client = ObservedWriteClient(tmp_project, [create_scratch])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_write_paths": ["src"]},
+            },
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client,
+            orch._tools,
+            orch._agent_project_config,
+            quarantine_executor=orch._execute_fixer_quarantine,
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.errors = ["EmptyKotlinFile: src/Scratch.kt can be removed"]
+
+        result = orch._run_fix_phase(state, "1/3")
+
+        assert result is True
+        assert not scratch.exists()
+        assert state.files_changed == []
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
     @pytest.mark.parametrize(
         ("prior_files", "step_tracking", "set_done"),
         [

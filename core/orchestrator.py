@@ -89,6 +89,7 @@ from core.test_execution_gate_audit import (
 )
 from core.validation_artifacts import (
     DeliveryScopeSnapshotError,
+    delivery_scope_git_env,
     detect_validation_artifacts,
     restore_validation_artifacts,
     snapshot_validation_dirty_files,
@@ -1973,6 +1974,7 @@ class Orchestrator:
                 capture_output=True,
                 text=True,
                 cwd=self._config.project_root,
+                env=delivery_scope_git_env(),
             )
         except OSError:
             return None
@@ -2072,6 +2074,7 @@ class Orchestrator:
                 capture_output=True,
                 text=True,
                 cwd=self._config.project_root,
+                env=delivery_scope_git_env(),
             )
         except OSError:
             result = None
