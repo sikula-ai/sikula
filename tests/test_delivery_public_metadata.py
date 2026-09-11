@@ -1,5 +1,6 @@
 from core.delivery_public_metadata import (
     REDACTED_DELIVERY_PUBLIC_METADATA,
+    contains_delivery_source_excerpt,
     is_safe_delivery_public_metadata,
     project_delivery_public_identity,
     sanitize_delivery_public_metadata,
@@ -74,3 +75,35 @@ def test_delivery_public_identity_projection_is_stable_and_correlation_safe() ->
     assert project_delivery_public_identity("safe-unit") == "safe-unit"
     assert project_delivery_public_identity("GET /users") == "GET /users"
     assert project_delivery_public_identity("\ud800") is not None
+
+
+def test_delivery_source_excerpt_allows_generic_source_phrase_in_expanded_summary() -> None:
+    source_text = """\
+# Resource task
+
+## Out of scope
+
+- Non-standard-library dependencies.
+- Network access or shell execution.
+"""
+
+    assert not contains_delivery_source_excerpt(
+        "Maintain Python 3.10 compatibility and importability without optional or non-standard-library dependencies.",
+        source_text,
+    )
+    assert not contains_delivery_source_excerpt(
+        "Resource processing and CLI behavior must not perform network access or shell execution.",
+        source_text,
+    )
+
+
+def test_delivery_source_excerpt_rejects_copied_or_lightly_wrapped_source_text() -> None:
+    source_rule = "Only the protocol repository may change protocol files."
+    source_text = f"# Task\n\n- {source_rule}\n"
+
+    assert contains_delivery_source_excerpt(source_rule, source_text)
+    assert contains_delivery_source_excerpt(f"Requirement: {source_rule}", source_text)
+    assert contains_delivery_source_excerpt(
+        "The protocol repository may change protocol files.",
+        source_text,
+    )
