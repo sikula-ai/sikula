@@ -529,6 +529,7 @@ def _move_to_quarantine(
     except OSError as exc:
         if moved:
             _restore_quarantine_entry(source_descriptors[-1], PurePosixPath(path).name, destination_descriptors[-1])
+            moved = False
         raise DeliveryQuarantineError(
             "delivery_quarantine.move_failed",
             "Sikula could not move the requested file into private quarantine.",

@@ -2897,6 +2897,7 @@ class Orchestrator:
         previous_title = set_session_title(_agent_session_title(name, state)) if callable(set_session_title) else None
         previous_write_attempt_boundary = None
         provider_attempt_stopped = False
+        quarantined_result_paths: list[str] = []
         if delivery_scope_policy is not None and callable(set_write_attempt_boundary):
             previous_write_attempt_boundary = set_write_attempt_boundary(
                 lambda attempt: self._delivery_scope_provider_attempt_boundary(
@@ -2935,6 +2936,27 @@ class Orchestrator:
                     delivery_scope_before,
                     delivery_scope_policy,
                 )
+                if name == "fixer":
+                    result_data = result.data if isinstance(result.data, dict) else {}
+                    raw_reported_paths = result_data.get("files_written", [])
+                    reported_paths = (
+                        {str(path).strip() for path in raw_reported_paths if str(path).strip()}
+                        if isinstance(raw_reported_paths, (list, tuple, set))
+                        else set()
+                    )
+                    quarantined_result_paths = [
+                        str(record["path"])
+                        for record in state.delivery_quarantine_records
+                        if isinstance(record, dict)
+                        and record.get("status") == "quarantined"
+                        and isinstance(record.get("path"), str)
+                        and record.get("path") in reported_paths
+                    ]
+                    self._prune_clean_test_state_paths(
+                        state,
+                        quarantined_result_paths,
+                        git_env=delivery_scope_git_env(),
+                    )
                 if delivery_scope_enabled:
                     self._clear_delivery_scope_audit_pending(state)
                 if scope_audit_stopped:
@@ -2963,7 +2985,11 @@ class Orchestrator:
         else:
             log.error(f"{name} failed: {result.message} ({elapsed})")
         data = result.data if isinstance(result.data, dict) else {}
-        self._record_step_files_changed(state, data.get("files_written", []))
+        step_files_written = data.get("files_written", [])
+        if quarantined_result_paths and isinstance(step_files_written, (list, tuple, set)):
+            quarantined_path_set = set(quarantined_result_paths)
+            step_files_written = [path for path in step_files_written if path not in quarantined_path_set]
+        self._record_step_files_changed(state, step_files_written)
         if name == "fixer" and not result.success and isinstance(data.get("file_operation_error"), str):
             reported_files = data.get("files_written", [])
             fixer_files = (

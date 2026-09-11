@@ -644,7 +644,7 @@ def _delivery_disposition(disposition: str) -> DeliveryDisposition:
 
 class TestDeliveryProductionScopeAudit:
     @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
-    def test_delivery_fixer_quarantines_agent_created_untracked_file(self, tmp_project: Path):
+    def test_delivery_fixer_quarantines_agent_created_untracked_file(self, tmp_project: Path, monkeypatch):
         scratch = tmp_project / "src" / "Scratch.kt"
 
         def create_scratch() -> tuple[list[str], str]:
@@ -673,6 +673,14 @@ class TestDeliveryProductionScopeAudit:
         state.worktree_path = str(tmp_project)
         state.worktree_base = str(tmp_project)
         state.errors = ["EmptyKotlinFile: src/Scratch.kt can be removed"]
+        cleared_files_changed: list[list[str]] = []
+        clear_pending = orch._clear_delivery_scope_audit_pending
+
+        def capture_clear_pending(current: TaskState) -> None:
+            cleared_files_changed.append(list(current.files_changed))
+            clear_pending(current)
+
+        monkeypatch.setattr(orch, "_clear_delivery_scope_audit_pending", capture_clear_pending)
 
         result = orch._run_agent("fixer", state)
 
@@ -681,6 +689,8 @@ class TestDeliveryProductionScopeAudit:
         assert not scratch.exists()
         assert state.delivery_quarantine_candidates == []
         assert state.delivery_quarantine_records[-1]["status"] == "quarantined"
+        assert cleared_files_changed == [[]]
+        assert state.files_changed == []
         assert state.fixer_changed_code is True
         assert task_quarantine_summary(tmp_project, state.task_id) == (1, 0)
 

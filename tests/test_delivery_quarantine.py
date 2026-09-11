@@ -245,3 +245,35 @@ def test_quarantine_marks_storage_failure_before_rename(tmp_path: Path, monkeypa
     assert exc_info.value.code == "delivery_quarantine.move_failed"
     assert exc_info.value.move_not_started is True
     assert source.exists()
+
+
+def test_quarantine_marks_successfully_restored_post_rename_failure_not_started(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _init_repo(tmp_path)
+    source = tmp_path / "Scratch.kt"
+    source.write_text("scratch\n", encoding="utf-8")
+
+    def fail_after_rename(_parent: int) -> dict[str, object]:
+        raise OSError("inspection unavailable")
+
+    monkeypatch.setattr(delivery_quarantine_tool_module, "_inspect_quarantine_entry", fail_after_rename)
+
+    with pytest.raises(DeliveryQuarantineError) as exc_info:
+        quarantine_agent_created_file(
+            tmp_path,
+            "task-a",
+            "Scratch.kt",
+            _provenance(source, "Scratch.kt", "session-a"),
+            session_id="session-a",
+            active_write_paths=["."],
+            exact_file_paths=[],
+            before_move=lambda _intent: None,
+            after_move=lambda _result: None,
+        )
+
+    assert exc_info.value.code == "delivery_quarantine.move_failed"
+    assert exc_info.value.move_not_started is True
+    assert source.read_text(encoding="utf-8") == "scratch\n"
+    assert task_quarantine_summary(tmp_path, "task-a") == (0, 0)
