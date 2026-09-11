@@ -6,7 +6,7 @@ import os
 import subprocess
 import stat
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
@@ -37,6 +37,8 @@ from core.test_execution_gate_audit import detect_new_test_execution_gates
 from core.validation_artifacts import DeliveryScopeSnapshotError, delivery_scope_git_binding
 from tools.base_tool import Sandbox, ToolResult
 from tools.cargo_tool import CargoTool
+from tools import delivery_quarantine_tool as delivery_quarantine_tool_module
+from tools.delivery_quarantine_tool import delivery_quarantine_supported, task_quarantine_summary
 from tools.gradle_android_tool import AndroidGradleTool
 from tools.node_tool import NodeTool
 from tools.python_tool import PythonTool
@@ -641,6 +643,446 @@ def _delivery_disposition(disposition: str) -> DeliveryDisposition:
 
 
 class TestDeliveryProductionScopeAudit:
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    def test_delivery_fixer_quarantines_agent_created_untracked_file(self, tmp_project: Path, monkeypatch):
+        scratch = tmp_project / "src" / "Scratch.kt"
+
+        def create_scratch() -> tuple[list[str], str]:
+            scratch.write_text("", encoding="utf-8")
+            return (
+                [],
+                '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/Scratch.kt"}',
+            )
+
+        client = ObservedWriteClient(tmp_project, [create_scratch])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_write_paths": ["src"]},
+            },
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client,
+            orch._tools,
+            orch._agent_project_config,
+            quarantine_executor=orch._execute_fixer_quarantine,
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.errors = ["EmptyKotlinFile: src/Scratch.kt can be removed"]
+        cleared_files_changed: list[list[str]] = []
+        clear_pending = orch._clear_delivery_scope_audit_pending
+
+        def capture_clear_pending(current: TaskState) -> None:
+            cleared_files_changed.append(list(current.files_changed))
+            clear_pending(current)
+
+        monkeypatch.setattr(orch, "_clear_delivery_scope_audit_pending", capture_clear_pending)
+
+        result = orch._run_agent("fixer", state)
+
+        assert result.success
+        assert result.data["files_written"] == ["src/Scratch.kt"]
+        assert not scratch.exists()
+        assert state.delivery_quarantine_candidates == []
+        assert state.delivery_quarantine_records[-1]["status"] == "quarantined"
+        assert cleared_files_changed == [[]]
+        assert state.files_changed == []
+        assert state.fixer_changed_code is True
+        assert task_quarantine_summary(tmp_project, state.task_id) == (1, 0)
+
+    def test_later_fixer_write_to_previously_quarantined_path_tracks_current_step(self, tmp_project: Path):
+        scratch = tmp_project / "src" / "Scratch.kt"
+
+        def recreate_scratch() -> tuple[list[str], str]:
+            scratch.write_text("replacement\n", encoding="utf-8")
+            return ["src/Scratch.kt"], "Recreated the required source file."
+
+        client = ObservedWriteClient(tmp_project, [recreate_scratch])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_write_paths": ["src"]},
+            },
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client,
+            orch._tools,
+            orch._agent_project_config,
+            quarantine_executor=orch._execute_fixer_quarantine,
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.plan = ["Recreate the required source file"]
+        state.step_file_tracking_enabled = True
+        state.step_files_changed = []
+        state.delivery_quarantine_records = [
+            {"status": "quarantined", "path": "src/Scratch.kt", "quarantine_id": "1" * 32}
+        ]
+        state.errors = ["Required source file is missing"]
+
+        result = orch._run_agent("fixer", state)
+
+        assert result.success
+        assert scratch.read_text(encoding="utf-8") == "replacement\n"
+        assert state.files_changed == ["src/Scratch.kt"]
+        assert state.step_files_changed == ["src/Scratch.kt"]
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    def test_delivery_fixer_quarantine_prunes_with_authoritative_git_index(
+        self,
+        tmp_project: Path,
+        monkeypatch,
+    ):
+        scratch = tmp_project / "src" / "Scratch.kt"
+        alternate_index = tmp_project / ".alternate-index"
+        alternate_env = dict(os.environ)
+        alternate_env["GIT_INDEX_FILE"] = str(alternate_index)
+        scratch.write_text("", encoding="utf-8")
+        subprocess.run(["git", "add", "src/Scratch.kt"], cwd=tmp_project, check=True, env=alternate_env)
+        scratch.unlink()
+        monkeypatch.setenv("GIT_INDEX_FILE", str(alternate_index))
+
+        def create_scratch() -> tuple[list[str], str]:
+            scratch.write_text("", encoding="utf-8")
+            return (
+                [],
+                '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/Scratch.kt"}',
+            )
+
+        client = ObservedWriteClient(tmp_project, [create_scratch])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_write_paths": ["src"]},
+            },
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client,
+            orch._tools,
+            orch._agent_project_config,
+            quarantine_executor=orch._execute_fixer_quarantine,
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.errors = ["EmptyKotlinFile: src/Scratch.kt can be removed"]
+
+        result = orch._run_fix_phase(state, "1/3")
+
+        assert result is True
+        assert not scratch.exists()
+        assert state.files_changed == []
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    @pytest.mark.parametrize(
+        ("prior_files", "step_tracking", "set_done"),
+        [
+            ([], False, True),
+            (["src/earlier.py"], True, False),
+        ],
+    )
+    def test_delivery_fixer_quarantine_rejects_unclassified_no_change_scope(
+        self,
+        tmp_project: Path,
+        prior_files: list[str],
+        step_tracking: bool,
+        set_done: bool,
+    ):
+        scratch = tmp_project / "src" / "Scratch.kt"
+
+        def create_scratch() -> tuple[list[str], str]:
+            scratch.write_text("", encoding="utf-8")
+            return (
+                [],
+                '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/Scratch.kt"}',
+            )
+
+        client = ObservedWriteClient(tmp_project, [create_scratch])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_write_paths": ["src"]},
+            },
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client,
+            orch._tools,
+            orch._agent_project_config,
+            quarantine_executor=orch._execute_fixer_quarantine,
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.files_changed = list(prior_files)
+        state.step_file_tracking_enabled = step_tracking
+        state.step_files_changed = []
+        state.errors = ["EmptyKotlinFile: src/Scratch.kt can be removed"]
+
+        assert orch._run_fix_phase(state, "1/3") is True
+
+        assert not scratch.exists()
+        assert state.files_changed == prior_files
+        assert state.step_files_changed == []
+        assert state.delivery_quarantine_records[-1]["status"] == "quarantined"
+
+        assert orch._run_build_fix_loop(state, set_done=set_done) is False
+        assert state.done is False
+        assert state.failed is True
+        assert state.history[-1]["action"] == "delivery_no_change_unclassified"
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    def test_delivery_fixer_test_quarantine_preserves_review_and_test_writer_gates(self, tmp_project: Path):
+        scratch = tmp_project / "tests" / "test_scratch.py"
+        scratch.parent.mkdir()
+
+        def create_scratch() -> tuple[list[str], str]:
+            scratch.write_text("", encoding="utf-8")
+            return (
+                [],
+                '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked",'
+                '"path":"tests/test_scratch.py"}',
+            )
+
+        client = ObservedWriteClient(tmp_project, [create_scratch])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {
+                    "allowed_write_paths": ["src"],
+                    "allowed_test_write_paths": ["tests"],
+                },
+            },
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client,
+            orch._tools,
+            orch._agent_project_config,
+            quarantine_executor=orch._execute_fixer_quarantine,
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.check_errors = ["lint failed"]
+        state.review_approved = True
+        state.review_iterations = 2
+        state.security_approved = True
+        state.security_review_iterations = 2
+        state.tests_up_to_date = True
+
+        result = orch._run_agent("fixer", state)
+
+        assert result.success
+        assert not scratch.exists()
+        assert state.review_approved is True
+        assert state.review_iterations == 2
+        assert state.tests_up_to_date is True
+        assert state.security_approved is False
+        assert state.security_review_iterations == 0
+
+    def test_failed_provider_attempt_does_not_mint_quarantine_authority(self, tmp_project: Path):
+        scratch = tmp_project / "src" / "Scratch.kt"
+
+        def create_then_fail() -> tuple[list[str], str]:
+            scratch.write_text("", encoding="utf-8")
+            raise RuntimeError("provider failed")
+
+        client = ObservedWriteClient(tmp_project, [create_then_fail])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_write_paths": ["src"]},
+            },
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client,
+            orch._tools,
+            orch._agent_project_config,
+            quarantine_executor=orch._execute_fixer_quarantine,
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.errors = ["EmptyKotlinFile: src/Scratch.kt can be removed"]
+
+        result = orch._run_agent("fixer", state)
+
+        assert not result.success
+        assert scratch.exists()
+        assert state.delivery_quarantine_candidates == []
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    def test_preexisting_ignored_file_renamed_by_fixer_cannot_be_quarantined(self, tmp_project: Path):
+        ignored = tmp_project / "src" / "operator.tmp"
+        scratch = tmp_project / "src" / "Scratch.kt"
+        (tmp_project / ".gitignore").write_text("src/operator.tmp\n", encoding="utf-8")
+        subprocess.run(["git", "add", ".gitignore"], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "ignore operator file"],
+            cwd=tmp_project,
+            check=True,
+            capture_output=True,
+        )
+        ignored.write_text("operator content\n", encoding="utf-8")
+
+        def rename_ignored_file() -> tuple[list[str], str]:
+            ignored.rename(scratch)
+            return (
+                [],
+                '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/Scratch.kt"}',
+            )
+
+        client = ObservedWriteClient(tmp_project, [rename_ignored_file])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_write_paths": ["src"]},
+            },
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client,
+            orch._tools,
+            orch._agent_project_config,
+            quarantine_executor=orch._execute_fixer_quarantine,
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.errors = ["EmptyKotlinFile: src/Scratch.kt can be removed"]
+
+        result = orch._run_agent("fixer", state)
+
+        assert not result.success
+        assert result.data["file_operation_error"] == "delivery_quarantine.provenance_missing"
+        assert scratch.read_text(encoding="utf-8") == "operator content\n"
+        assert state.delivery_quarantine_candidates == []
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    def test_failed_fixer_file_operation_records_writes_and_invalidates_gates(self, tmp_project: Path):
+        changed_file = tmp_project / "src" / "changed.py"
+
+        def change_then_emit_malformed_operation() -> tuple[list[str], str]:
+            changed_file.write_text("changed = True\n", encoding="utf-8")
+            return (["src/changed.py"], "sikula_file_operation_schema_version: invalid")
+
+        client = ObservedWriteClient(tmp_project, [change_then_emit_malformed_operation])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_write_paths": ["src"]},
+            },
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client,
+            orch._tools,
+            orch._agent_project_config,
+            quarantine_executor=orch._execute_fixer_quarantine,
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.files_changed = ["src/existing.py"]
+        state.active_scope = "final_full_task"
+        state.review_approved = True
+        state.security_approved = True
+        state.tests_up_to_date = True
+        state.final_full_task_review_done = True
+        state.errors = ["Fix the production file"]
+
+        result = orch._run_agent("fixer", state)
+
+        assert not result.success
+        assert result.data["file_operation_error"] == "delivery_quarantine.output_invalid"
+        assert state.files_changed == ["src/existing.py", "src/changed.py"]
+        assert not state.review_approved
+        assert not state.security_approved
+        assert not state.tests_up_to_date
+        assert not state.final_full_task_review_done
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    def test_known_pre_move_failure_aborts_quarantine_checkpoint(self, tmp_project: Path, monkeypatch):
+        scratch = tmp_project / "src" / "Scratch.kt"
+
+        def create_scratch() -> tuple[list[str], str]:
+            scratch.write_text("", encoding="utf-8")
+            return (
+                [],
+                '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/Scratch.kt"}',
+            )
+
+        real_binding = delivery_quarantine_tool_module.delivery_scope_git_binding
+        binding_calls = 0
+
+        def changed_second_binding(root: Path):
+            nonlocal binding_calls
+            binding_calls += 1
+            binding = real_binding(root)
+            if binding_calls == 2:
+                return replace(binding, ref_fingerprint=f"{binding.ref_fingerprint}-changed")
+            return binding
+
+        monkeypatch.setattr(delivery_quarantine_tool_module, "delivery_scope_git_binding", changed_second_binding)
+        client = ObservedWriteClient(tmp_project, [create_scratch])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_write_paths": ["src"]},
+            },
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client,
+            orch._tools,
+            orch._agent_project_config,
+            quarantine_executor=orch._execute_fixer_quarantine,
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.errors = ["EmptyKotlinFile: src/Scratch.kt can be removed"]
+
+        result = orch._run_agent("fixer", state)
+
+        assert not result.success
+        assert result.data["file_operation_error"] == "delivery_quarantine.git_state_changed"
+        assert scratch.exists()
+        assert state.delivery_quarantine_records[-1]["status"] == "aborted"
+        assert state.history[-1]["action"] == "file_operation_failed"
+
+    def test_resume_blocks_on_interrupted_quarantine_move(self, tmp_project: Path, monkeypatch) -> None:
+        orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src"])
+        state = _scoped_delivery_state(orch, ["src"])
+        state.delivery_quarantine_records = [{"status": "moving", "path": "src/Scratch.kt", "quarantine_id": "1" * 32}]
+        orch._store.save(state)
+        pipeline_calls: list[TaskState] = []
+        monkeypatch.setattr(orch, "_loop", pipeline_calls.append)
+
+        result = orch.run(task_id=state.task_id)
+
+        assert result.failed is True
+        assert pipeline_calls == []
+        assert not any(stub.calls for stub in stubs.values())
+        assert result.history[-1]["action"] == "delivery_quarantine_cleanup_required"
+
     def test_presync_out_of_scope_write_is_terminal_before_analysis(self, tmp_project: Path):
         allowed = tmp_project / "src" / "allowed"
         allowed.mkdir()
@@ -1941,6 +2383,7 @@ class TestDeliveryProductionScopeAudit:
         "pending",
         [
             {"schema_version": True, "agent": "implementer"},
+            {"schema_version": 8, "agent": "implementer"},
             {
                 "schema_version": 4,
                 "agent": "implementer",
@@ -1977,28 +2420,28 @@ class TestDeliveryProductionScopeAudit:
         "pending",
         [
             {
-                "schema_version": 8,
+                "schema_version": delivery_scope_audit_module.DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION,
                 "agent": "implementer",
                 "project_prefix": ".",
                 "production_roots": [{"path": "src/allowed", "exact_file": False}],
                 "active_test_write_paths": [],
             },
             {
-                "schema_version": 8,
+                "schema_version": delivery_scope_audit_module.DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION,
                 "agent": "implementer",
                 "project_prefix": ".",
                 "production_roots": [{"path": "src/allowed", "resolved_path": "../outside", "exact_file": False}],
                 "active_test_write_paths": [],
             },
             {
-                "schema_version": 8,
+                "schema_version": delivery_scope_audit_module.DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION,
                 "agent": "implementer",
                 "project_prefix": ".",
                 "production_roots": [{"path": ".", "resolved_path": ".", "exact_file": True}],
                 "active_test_write_paths": [],
             },
             {
-                "schema_version": 8,
+                "schema_version": delivery_scope_audit_module.DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION,
                 "agent": "implementer",
                 "project_prefix": ".",
                 "production_roots": [{"path": "src/allowed", "resolved_path": "src/allowed", "exact_file": False}],
@@ -2037,7 +2480,7 @@ class TestDeliveryProductionScopeAudit:
         state = _scoped_delivery_state(orch, ["src/allowed"])
         orch._delivery_scope_audit_snapshot(state, "implementer")
         state.delivery_scope_audit_pending = {
-            "schema_version": 8,
+            "schema_version": delivery_scope_audit_module.DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION,
             "agent": "implementer",
             "project_prefix": ".",
             **_git_scope_binding_fields(tmp_project),
@@ -2065,7 +2508,7 @@ class TestDeliveryProductionScopeAudit:
         state = _scoped_delivery_state(orch, ["src/allowed"])
         orch._delivery_scope_audit_snapshot(state, "implementer")
         state.delivery_scope_audit_pending = {
-            "schema_version": 8,
+            "schema_version": delivery_scope_audit_module.DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION,
             "agent": "implementer",
             "project_prefix": ".",
             **_git_scope_binding_fields(tmp_project),
@@ -2094,7 +2537,7 @@ class TestDeliveryProductionScopeAudit:
         state = _scoped_delivery_state(orch, ["src/allowed"])
         orch._delivery_scope_audit_snapshot(state, "implementer")
         state.delivery_scope_audit_pending = {
-            "schema_version": 8,
+            "schema_version": delivery_scope_audit_module.DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION,
             "agent": "implementer",
             "project_prefix": ".",
             **_git_scope_binding_fields(tmp_project),
@@ -2122,7 +2565,7 @@ class TestDeliveryProductionScopeAudit:
         state = _scoped_delivery_state(orch, ["src/allowed"])
         orch._delivery_scope_audit_snapshot(state, "implementer")
         state.delivery_scope_audit_pending = {
-            "schema_version": 8,
+            "schema_version": delivery_scope_audit_module.DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION,
             "agent": "implementer",
             "project_prefix": ".",
             **_git_scope_binding_fields(tmp_project),
@@ -2150,7 +2593,7 @@ class TestDeliveryProductionScopeAudit:
         state = _scoped_delivery_state(orch, ["src/allowed"])
         orch._delivery_scope_audit_snapshot(state, "implementer")
         state.delivery_scope_audit_pending = {
-            "schema_version": 8,
+            "schema_version": delivery_scope_audit_module.DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION,
             "agent": "implementer",
             "project_prefix": ".",
             **_git_scope_binding_fields(tmp_project),
@@ -2223,7 +2666,7 @@ class TestDeliveryProductionScopeAudit:
         assert interrupted is not None
         assert interrupted.active_operation is None
         assert interrupted.delivery_scope_audit_pending == {
-            "schema_version": 8,
+            "schema_version": delivery_scope_audit_module.DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION,
             "agent": agent_name,
             "project_prefix": ".",
             **_git_scope_binding_fields(tmp_project),
@@ -2320,7 +2763,7 @@ class TestDeliveryProductionScopeAudit:
         policy = orch._delivery_scope_audit_policy(state, "implementer")
         orch._set_delivery_scope_audit_pending(state, "implementer", policy=policy)
         assert state.delivery_scope_audit_pending == {
-            "schema_version": 8,
+            "schema_version": delivery_scope_audit_module.DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION,
             "agent": "implementer",
             "project_prefix": ".",
             **_git_scope_binding_fields(tmp_project),
@@ -2579,7 +3022,7 @@ mod tests {
         assert interrupted is not None
         pending = interrupted.delivery_scope_audit_pending
         assert isinstance(pending, dict)
-        assert pending["schema_version"] == 8
+        assert pending["schema_version"] == delivery_scope_audit_module.DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION
         assert pending["snapshot_name"] == "delivery_scope_attempt_before"
         assert pending["production_roots"] == []
         assert pending["active_test_write_paths"] == [{"path": "tests", "resolved_path": "tests"}]
@@ -2733,7 +3176,7 @@ mod tests {
         state = _scoped_delivery_state(orch, ["src/allowed"])
         orch._set_delivery_scope_audit_pending(state, "fixer")
         assert state.delivery_scope_audit_pending == {
-            "schema_version": 8,
+            "schema_version": delivery_scope_audit_module.DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION,
             "agent": "fixer",
             "project_prefix": ".",
             **_git_scope_binding_fields(tmp_project),
@@ -2783,7 +3226,7 @@ mod tests {
         state.errors = ["compile failed"]
         orch._set_delivery_scope_audit_pending(state, "fixer")
         assert state.delivery_scope_audit_pending == {
-            "schema_version": 8,
+            "schema_version": delivery_scope_audit_module.DELIVERY_SCOPE_AUDIT_PENDING_SCHEMA_VERSION,
             "agent": "fixer",
             "project_prefix": ".",
             **_git_scope_binding_fields(tmp_project),

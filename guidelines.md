@@ -514,6 +514,25 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
   Missing re-triage output after another generated-test edit should be recoverable by
   restoring that pass and retrying once before validation is run again; a repeated omission
   should remain auditable without blocking an otherwise valid task solely on prompt format.
+- **Delivery Fixer quarantine** is the only supported removal path for ordinary-untracked
+  files created by a successful, provider-independent audited attempt in the current
+  process. It is offered only to modern isolated delivery children on platforms with
+  descriptor-relative no-follow filesystem operations, and not during Fixer's internal
+  test-triage subpasses. The agent may request one canonical project-relative file within
+  the exact audited write scope; tracked, staged, ignored, linked, non-regular,
+  pre-existing, private-metadata, stale-identity, or cross-session candidates fail closed.
+  The orchestrator owns authorization and durable state transitions; the injected tool
+  owns Git/filesystem checks and moves the verified inode into an owner-only task
+  quarantine under the repository Git common directory. The pipeline must not unlink the
+  content. Only explicit forced `cleanup`/`delete` removes the retained quarantine.
+  Quarantine-only cleanup may clear an interrupted `moving` state only when its exact
+  retained entry proves that rename completed. It preserves the child worktree and
+  conservatively invalidates its pipeline gates. A pre-rename interruption must remain
+  blocked because cleanup cannot safely remove the original worktree file. Quarantine must
+  not let a delivery child or current planner step complete with neither a net
+  implementation diff nor an explicit parser-validated `already_satisfied` outcome.
+  This reversible operation reduces accidental-loss risk but is not an OS isolation
+  boundary against an adversarial concurrent process running as the same user.
 - **`ReviewerAgent` and `SecurityReviewerAgent`** must never write files — use `run_readonly_agent()` only.
 - **`SecurityReviewerAgent`** fail-safe: non-delivery output with no `APPROVED` signal, no `## Warnings` section, and no `## Security Issues` section is blocking. Delivery output always requires a valid disposition, including warning-only output; a missing disposition is a protocol error subject only to the bounded read-only retry. Never relax this — ambiguous output from the security reviewer must always fail closed.
 

@@ -908,6 +908,7 @@ def test_delivery_scope_path_fallback_uses_path_stat_identity(
     snapshot = snapshot_delivery_scope_files(tmp_path)
 
     assert "nested/file.txt" in snapshot
+    assert snapshot["nested/file.txt"].identity is None
 
 
 def test_delivery_scope_path_fallback_rejects_file_replacement(

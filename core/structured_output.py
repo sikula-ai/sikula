@@ -19,6 +19,10 @@ _DELIVERY_DISPOSITION_ADVERTISEMENT_RE = re.compile(
 )
 _DELIVERY_DISPOSITION_FENCE_CLOSE_RE = re.compile(r"`{3,}|~{3,}")
 _DELIVERY_DISPOSITION_MARKDOWN = MarkdownIt("commonmark")
+_FIXER_FILE_OPERATION_ADVERTISEMENT_RE = re.compile(
+    r'(?<![A-Za-z0-9_])(?:"sikula_file_operation_schema_version"|'
+    r"'sikula_file_operation_schema_version'|sikula_file_operation_schema_version)[ \t\r\n]*:"
+)
 
 DELIVERY_DISPOSITION_SCHEMA_VERSION = 1
 DELIVERY_DISPOSITION_APPROVED = "approved"
@@ -45,6 +49,8 @@ _DELIVERY_DISPOSITIONS = (
     DELIVERY_REVIEW_DISPOSITIONS | DELIVERY_ANALYSIS_DISPOSITIONS | DELIVERY_IMPLEMENTATION_DISPOSITIONS
 )
 MAX_DELIVERY_DISPOSITION_SUMMARY_CHARS = 500
+FIXER_FILE_OPERATION_SCHEMA_VERSION = 1
+MAX_FIXER_FILE_OPERATION_PATH_CHARS = 500
 
 _DELIVERY_DISPOSITION_KEYS = frozenset(
     {
@@ -75,6 +81,14 @@ class DeliveryDispositionParseError(ValueError):
         super().__init__(message)
 
 
+class FixerFileOperationParseError(ValueError):
+    """Raised when an advertised Fixer file operation is not safe to consume."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message)
+
+
 @dataclass(frozen=True)
 class DeliveryDisposition:
     schema_version: int
@@ -88,6 +102,20 @@ class DeliveryDisposition:
             "disposition": self.disposition,
             "summary": self.summary,
             "recommended_action": self.recommended_action,
+        }
+
+
+@dataclass(frozen=True)
+class FixerFileOperation:
+    schema_version: int
+    operation: str
+    path: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "operation": self.operation,
+            "path": self.path,
         }
 
 
@@ -268,6 +296,77 @@ def parse_delivery_disposition(
         disposition=disposition,
         summary=sanitized_summary,
         recommended_action=recommended_action,
+    )
+
+
+def parse_fixer_file_operation(output: object) -> FixerFileOperation | None:
+    """Parse one optional, unambiguous Fixer quarantine request."""
+
+    if not isinstance(output, str):
+        return None
+    marker_count = len(_FIXER_FILE_OPERATION_ADVERTISEMENT_RE.findall(output))
+    if marker_count == 0:
+        return None
+    if marker_count != 1:
+        raise FixerFileOperationParseError(
+            "delivery_quarantine.marker_ambiguous",
+            "Fixer output must advertise exactly one file-operation schema marker.",
+        )
+    try:
+        payload = load_schema_json_object(
+            output,
+            required_keys=frozenset(
+                {
+                    "sikula_file_operation_schema_version",
+                    "operation",
+                    "path",
+                }
+            ),
+            object_pairs_hook=_object_pairs_without_duplicates,
+            parse_constant=_reject_json_constant,
+            output_name="Fixer file operation",
+        )
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise FixerFileOperationParseError(
+            "delivery_quarantine.output_invalid",
+            "Fixer file operation must be one unambiguous JSON object.",
+        ) from exc
+    if frozenset(payload) != {
+        "sikula_file_operation_schema_version",
+        "operation",
+        "path",
+    }:
+        raise FixerFileOperationParseError(
+            "delivery_quarantine.keys_invalid",
+            "Fixer file operation contains missing or unsupported fields.",
+        )
+    schema_version = payload.get("sikula_file_operation_schema_version")
+    if type(schema_version) is not int or schema_version != FIXER_FILE_OPERATION_SCHEMA_VERSION:
+        raise FixerFileOperationParseError(
+            "delivery_quarantine.schema_unsupported",
+            "Fixer file operation uses an unsupported schema version.",
+        )
+    operation = payload.get("operation")
+    if operation != "quarantine_untracked":
+        raise FixerFileOperationParseError(
+            "delivery_quarantine.operation_invalid",
+            "Fixer file operation is not supported.",
+        )
+    path = payload.get("path")
+    if (
+        not isinstance(path, str)
+        or not path.strip()
+        or len(path.strip()) > MAX_FIXER_FILE_OPERATION_PATH_CHARS
+        or len(path.strip().splitlines()) != 1
+    ):
+        raise FixerFileOperationParseError(
+            "delivery_quarantine.path_invalid",
+            "Fixer file operation path must be one bounded non-empty line.",
+        )
+    return FixerFileOperation(
+        schema_version=FIXER_FILE_OPERATION_SCHEMA_VERSION,
+        operation=operation,
+        path=path.strip(),
     )
 
 

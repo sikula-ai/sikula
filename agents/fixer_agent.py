@@ -14,7 +14,7 @@ import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import unquote
 
 from agents.base_agent import (
@@ -29,7 +29,9 @@ from agents.base_agent import (
 from agents.build_guidance import write_agent_constraints as _write_agent_constraints
 from agents.delivery_contracts import delivery_agent_prompt_context
 from core.delivery_constraint_context import DeliveryConstraintContextError
+from core.delivery_quarantine import DeliveryQuarantineError, DeliveryQuarantineResult
 from core.state import TaskState
+from core.structured_output import FixerFileOperationParseError, parse_fixer_file_operation
 from core.synthetic_test_harness_audit import prompt_context_for_records as _synthetic_harness_prompt_context
 from core.validation_artifacts import (
     detect_validation_artifacts,
@@ -66,6 +68,7 @@ CONSTRAINTS — follow strictly:
   or rewrite delivery asset placement unless the error explicitly requires it.
   Do not invent missing provenance, license, or target information during a fix.
 {test_constraint}
+{quarantine_constraint}
 
 ORIGINAL TASK (for context):
 {task_description}
@@ -271,6 +274,16 @@ GENERATED TEST RE-TRIAGE RECOVERY:
 _CHECK_TEST_CONSTRAINT = """\
 - You MAY modify production or test files if the check errors explicitly reference them
 - Fix ONLY the files named in the check errors — nothing else"""
+
+_DELIVERY_QUARANTINE_CONSTRAINT = """\
+- If the only correct fix is removing one untracked file that this delivery run created, do not
+  use shell deletion. Request Sikula's reversible quarantine by emitting exactly one JSON object:
+  {"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"project/relative/file"}
+- The request is accepted only for a verified agent-created ordinary file inside this exact write
+  scope. Sikula moves it outside the worktree and retains its contents until explicit cleanup.
+- Request at most one quarantine operation in this response. Do not request it for tracked files,
+  directories, links, pre-existing files, or files outside the active write scope.
+"""
 
 _DEFAULT_CONTEXT_FILES = ["README.md"]
 _TESTABILITY_GAP_MARKER = "TESTABILITY GAP:"
@@ -930,6 +943,17 @@ def _record_generated_test_fix_attempt(state: TaskState, paths: list[str]) -> No
 class FixerAgent(BaseAgent):
     name = "fixer"
 
+    def __init__(
+        self,
+        llm,
+        tools: dict[str, Any],
+        project_config: dict | None = None,
+        *,
+        quarantine_executor: Callable[[TaskState, str, list[str]], DeliveryQuarantineResult] | None = None,
+    ) -> None:
+        super().__init__(llm, tools, project_config)
+        self._quarantine_executor = quarantine_executor
+
     def delivery_scope_active_test_write_paths(self, state: TaskState) -> list[str]:
         """Return test roots that may be writable during this complete fixer invocation."""
         file_tool = self.tools.get("file")
@@ -972,6 +996,15 @@ class FixerAgent(BaseAgent):
         agent_cwd = Path(file_tool._root)
         test_origin_validation = _is_test_origin_validation_failure(state, sandbox, agent_cwd)
         uses_test_failure_triage = _uses_test_failure_triage(state, sandbox, agent_cwd)
+        quarantine_enabled = bool(
+            callable(self._quarantine_executor)
+            and state.delivery_plan_id
+            and state.delivery_unit_id
+            and state.delivery_write_scope_schema_version is not None
+            and state.worktree_path
+            and state.worktree_base
+            and not uses_test_failure_triage
+        )
         triage_scope = None
         if test_origin_validation:
             triage_scope = "test_origin_validation"
@@ -1021,6 +1054,7 @@ class FixerAgent(BaseAgent):
                 allowed_write_paths=allowed_str,
                 build_tool_constraints=_write_agent_constraints(self.project_config),
                 test_constraint=test_constraint,
+                quarantine_constraint=_DELIVERY_QUARANTINE_CONSTRAINT if quarantine_enabled else "",
                 task_description=state.task_description,
                 delivery_constraint_context=delivery_context.inherited_constraints,
                 implementation_prompt=state.implementation_prompt or "(not available)",
@@ -1108,6 +1142,30 @@ class FixerAgent(BaseAgent):
             if generated_test_retriage:
                 record["generated_test_retriage"] = generated_test_retriage
             state.fix_cycle_records.append(record)
+            if quarantine_enabled:
+                try:
+                    operation = parse_fixer_file_operation(fixer_output)
+                    if operation is not None:
+                        result = self._quarantine_executor(state, operation.path, allowed_write_paths)
+                        changed = list(dict.fromkeys([*changed, result.path]))
+                        record["files_written"] = changed
+                        record["file_quarantined"] = result.to_dict()
+                except (FixerFileOperationParseError, DeliveryQuarantineError) as exc:
+                    code = exc.code
+                    record["file_operation_error"] = code
+                    state.record(self.name, "file_operation_failed", code)
+                    return (
+                        AgentResult(
+                            success=False,
+                            message=f"Fixer file operation failed ({code})",
+                            data={"files_written": changed, "file_operation_error": code},
+                        ),
+                        changed,
+                        fixer_output,
+                        dirty_before,
+                        artifact_before,
+                        allowed_write_paths,
+                    )
             for gap in _parse_testability_gaps(fixer_output):
                 state.record_testability_gap(
                     self.name,

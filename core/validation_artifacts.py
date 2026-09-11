@@ -27,6 +27,7 @@ class FileSnapshot:
     mode: int | None
     symlink_target: str | None = None
     digest: str | None = None
+    identity: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,20 @@ def _delivery_scope_git_env(
     if index_path is not None:
         env["GIT_INDEX_FILE"] = str(index_path)
     return env
+
+
+def delivery_scope_git_env(
+    *,
+    root: Path | None = None,
+    git_dir: Path | None = None,
+) -> dict[str, str]:
+    """Return the sanitized Git environment shared by delivery boundary checks.
+
+    Omit the explicit binding when Git should discover the repository from the
+    command's working directory.
+    """
+
+    return _delivery_scope_git_env(root=root, git_dir=git_dir)
 
 
 def _delivery_scope_link_like(entry_stat) -> bool:
@@ -354,7 +369,7 @@ def snapshot_delivery_scope_files(
         expected_ref_fingerprint,
     )
     _validate_delivery_scope_ignore_fingerprint(root, bound_git_dir, expected_ignore_fingerprint)
-    dirty_paths = _delivery_scope_dirty_paths(root, baseline, bound_git_dir)
+    dirty_paths, untracked_paths = _delivery_scope_dirty_paths(root, baseline, bound_git_dir)
     ignored_file_paths, ignored_directory_roots = _delivery_scope_ignored_paths(root, bound_git_dir)
     _validate_delivery_scope_ignore_fingerprint(root, bound_git_dir, expected_ignore_fingerprint)
     _validate_delivery_scope_git_ref_fingerprint(
@@ -458,6 +473,7 @@ def snapshot_delivery_scope_files(
                 retain_content=retain_content(normalized),
                 expected_identity=(entry_stat.st_dev, entry_stat.st_ino) if directory_fd is not None else None,
                 dir_fd=directory_fd,
+                status="untracked" if normalized in untracked_paths else "filesystem",
             )
             if fallback_before is not None:
                 fallback_after = Path(path).stat(follow_symlinks=False)
@@ -996,7 +1012,7 @@ def _validate_delivery_scope_ignore_fingerprint(root: Path, git_dir: Path, expec
         raise DeliveryScopeSnapshotError("Delivery scope audit Git ignore metadata changed during the mutation.")
 
 
-def _delivery_scope_dirty_paths(root: Path, git_baseline: str, git_dir: Path) -> set[str]:
+def _delivery_scope_dirty_paths(root: Path, git_baseline: str, git_dir: Path) -> tuple[set[str], set[str]]:
     if _DELIVERY_SCOPE_GIT_OBJECT_ID.fullmatch(git_baseline) is None:
         raise DeliveryScopeSnapshotError("Delivery scope audit received an invalid Git baseline.")
     env = _delivery_scope_git_env(root=root, git_dir=git_dir)
@@ -1035,11 +1051,12 @@ def _delivery_scope_dirty_paths(root: Path, git_baseline: str, git_dir: Path) ->
         if values is None:
             raise DeliveryScopeSnapshotError("Delivery scope audit could not query Git changes.")
         paths.update(_validated_delivery_scope_git_path(value) for value in values)
-    paths.update(_delivery_scope_worktree_paths(root, git_baseline, git_dir))
-    return paths
+    worktree_paths, untracked_paths = _delivery_scope_worktree_paths(root, git_baseline, git_dir)
+    paths.update(worktree_paths)
+    return paths, untracked_paths
 
 
-def _delivery_scope_worktree_paths(root: Path, git_baseline: str, git_dir: Path) -> set[str]:
+def _delivery_scope_worktree_paths(root: Path, git_baseline: str, git_dir: Path) -> tuple[set[str], set[str]]:
     """Return worktree changes through an index rebuilt from the immutable baseline."""
     descriptor = -1
     index_path: Path | None = None
@@ -1068,12 +1085,16 @@ def _delivery_scope_worktree_paths(root: Path, git_baseline: str, git_dir: Path)
             ["ls-files", "--others", "--exclude-standard", "-z", "--", "."],
         )
         paths: set[str] = set()
-        for command in commands:
+        untracked_paths: set[str] = set()
+        for index, command in enumerate(commands):
             values = _git_paths_z(root, command, env=env)
             if values is None:
                 raise DeliveryScopeSnapshotError("Delivery scope audit could not query trusted Git changes.")
-            paths.update(_validated_delivery_scope_git_path(value) for value in values)
-        return paths
+            normalized = {_validated_delivery_scope_git_path(value) for value in values}
+            paths.update(normalized)
+            if index == 1:
+                untracked_paths.update(normalized)
+        return paths, untracked_paths
     except DeliveryScopeSnapshotError:
         raise
     except OSError as exc:
@@ -1172,6 +1193,7 @@ def _snapshot_delivery_scope_regular_file(
     retain_content: bool,
     expected_identity: tuple[int, int] | None = None,
     dir_fd: int | None = None,
+    status: str = "filesystem",
 ) -> FileSnapshot:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     chunks: list[bytes] | None = [] if retain_content else None
@@ -1203,11 +1225,12 @@ def _snapshot_delivery_scope_regular_file(
     except OSError as exc:
         raise DeliveryScopeSnapshotError("Delivery scope audit could not read a project file.") from exc
     return FileSnapshot(
-        status="filesystem",
+        status=status,
         exists=True,
         content=b"".join(chunks) if chunks is not None else None,
         mode=mode,
         digest="sha256:" + digest.hexdigest(),
+        identity=(opened_stat.st_dev, opened_stat.st_ino) if dir_fd is not None else None,
     )
 
 
@@ -1222,6 +1245,7 @@ def serialize_delivery_scope_snapshot(snapshot: dict[str, FileSnapshot]) -> dict
                 "mode": value.mode,
                 "symlink_target": value.symlink_target,
                 "digest": value.digest,
+                "identity": list(value.identity) if value.identity is not None else None,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1244,11 +1268,20 @@ def deserialize_delivery_scope_snapshot(snapshot: dict[str, str | None]) -> dict
             mode = value.get("mode")
             symlink_target = value.get("symlink_target")
             digest = value.get("digest")
+            identity = value.get("identity")
             if (
                 not isinstance(status, str)
                 or (mode is not None and type(mode) is not int)
                 or (symlink_target is not None and not isinstance(symlink_target, str))
                 or (digest is not None and not isinstance(digest, str))
+                or (
+                    identity is not None
+                    and (
+                        not isinstance(identity, list)
+                        or len(identity) != 2
+                        or not all(type(part) is int and part >= 0 for part in identity)
+                    )
+                )
             ):
                 raise ValueError("invalid snapshot value")
             result[path] = FileSnapshot(
@@ -1258,6 +1291,7 @@ def deserialize_delivery_scope_snapshot(snapshot: dict[str, str | None]) -> dict
                 mode=mode,
                 symlink_target=symlink_target,
                 digest=digest,
+                identity=tuple(identity) if identity is not None else None,
             )
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise DeliveryScopeSnapshotError("Persisted delivery scope audit snapshot is malformed.") from exc
