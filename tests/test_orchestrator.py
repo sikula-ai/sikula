@@ -694,6 +694,46 @@ class TestDeliveryProductionScopeAudit:
         assert state.fixer_changed_code is True
         assert task_quarantine_summary(tmp_project, state.task_id) == (1, 0)
 
+    def test_later_fixer_write_to_previously_quarantined_path_tracks_current_step(self, tmp_project: Path):
+        scratch = tmp_project / "src" / "Scratch.kt"
+
+        def recreate_scratch() -> tuple[list[str], str]:
+            scratch.write_text("replacement\n", encoding="utf-8")
+            return ["src/Scratch.kt"], "Recreated the required source file."
+
+        client = ObservedWriteClient(tmp_project, [recreate_scratch])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_write_paths": ["src"]},
+            },
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client,
+            orch._tools,
+            orch._agent_project_config,
+            quarantine_executor=orch._execute_fixer_quarantine,
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.plan = ["Recreate the required source file"]
+        state.step_file_tracking_enabled = True
+        state.step_files_changed = []
+        state.delivery_quarantine_records = [
+            {"status": "quarantined", "path": "src/Scratch.kt", "quarantine_id": "1" * 32}
+        ]
+        state.errors = ["Required source file is missing"]
+
+        result = orch._run_agent("fixer", state)
+
+        assert result.success
+        assert scratch.read_text(encoding="utf-8") == "replacement\n"
+        assert state.files_changed == ["src/Scratch.kt"]
+        assert state.step_files_changed == ["src/Scratch.kt"]
+
     @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
     def test_delivery_fixer_quarantine_prunes_with_authoritative_git_index(
         self,

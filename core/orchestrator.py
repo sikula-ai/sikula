@@ -2897,6 +2897,7 @@ class Orchestrator:
         previous_title = set_session_title(_agent_session_title(name, state)) if callable(set_session_title) else None
         previous_write_attempt_boundary = None
         provider_attempt_stopped = False
+        quarantine_record_start = len(state.delivery_quarantine_records)
         quarantined_result_paths: list[str] = []
         if delivery_scope_policy is not None and callable(set_write_attempt_boundary):
             previous_write_attempt_boundary = set_write_attempt_boundary(
@@ -2946,7 +2947,7 @@ class Orchestrator:
                     )
                     quarantined_result_paths = [
                         str(record["path"])
-                        for record in state.delivery_quarantine_records
+                        for record in state.delivery_quarantine_records[quarantine_record_start:]
                         if isinstance(record, dict)
                         and record.get("status") == "quarantined"
                         and isinstance(record.get("path"), str)
