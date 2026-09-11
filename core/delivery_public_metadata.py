@@ -25,7 +25,6 @@ _HTTP_ROUTE_PREFIX_RE = re.compile(
 _HTTP_ROUTE_SUFFIX_RE = re.compile(r"(?i)^\s+(?:endpoint|route)\b")
 _REDACTED_IDENTITY_TOKEN_RE = re.compile(r"^<redacted:[0-9a-f]{12}>$")
 _DELIVERY_SOURCE_EXCERPT_MIN_LENGTH = 24
-_DELIVERY_SOURCE_LINE_MIN_CANDIDATE_COVERAGE = 0.75
 _MARKDOWN_LINE_PREFIX_RE = re.compile(r"^(?:>{1,3}\s*|#{1,6}\s+|[-+*]\s+|\d+[.)]\s+|\[[ xX]\]\s+)")
 
 
@@ -59,12 +58,7 @@ def contains_delivery_source_excerpt(value: str, source_text: str) -> bool:
         source_line = _normalize_delivery_source_excerpt(raw_line, strip_markdown_prefix=True)
         if len(source_line) < _DELIVERY_SOURCE_EXCERPT_MIN_LENGTH:
             continue
-        if candidate in source_line:
-            return True
-        if (
-            source_line in candidate
-            and len(source_line) / len(candidate) >= _DELIVERY_SOURCE_LINE_MIN_CANDIDATE_COVERAGE
-        ):
+        if candidate in source_line or source_line in candidate:
             return True
     return False
 

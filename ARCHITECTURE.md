@@ -332,9 +332,11 @@ The authoring schema requires an explicit `constraints` list. Each inherited
 hard constraint has a stable ID, one supported kind, a bounded paraphrased
 summary, exact generated-unit references, and a disposition. Deterministic
 authoring validation rejects a substantive summary copied from a source-task
-line before the independent verifier runs. Plan checking repeats that comparison
-against the fingerprinted authoritative source and omits a rejected summary from
-public projections, including invalid-plan JSON. `needs_review`
+line before the independent verifier runs. That specific parse failure receives
+one fresh authoring attempt with explicit paraphrasing feedback; the rejected
+draft remains local audit evidence and is never published. Plan checking repeats
+the comparison against the fingerprinted authoritative source and omits a rejected
+summary from public projections, including invalid-plan JSON. `needs_review`
 and `conflict` dispositions block before filesystem mutation; only
 `preserved` constraints can enter a published plan. After the authoring call, a
 second command-free read-only generation call independently compares the full

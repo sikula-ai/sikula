@@ -33,6 +33,14 @@ DeliveryPreparationAuditRecorder = Callable[[dict[str, Any]], None]
 
 _DEFAULT_MAX_GUIDELINES_CHARS = 3000
 
+_DELIVERY_AUTHORING_SOURCE_EXCERPT_RETRY = """\
+
+Your previous draft was rejected because at least one constraints[].summary copied a complete
+source-task line. Return one fresh complete draft using the same schema and requirements. Rephrase
+every constraint summary in your own words while preserving its meaning; do not copy any complete
+source-task line into constraint metadata. Do not include the rejected draft or discuss the error.
+"""
+
 _DELIVERY_AUTHORING_PROMPT = """\
 You are Sikula's read-only delivery-plan authoring assistant.
 
@@ -610,45 +618,56 @@ class DeliveryPreparationAgent:
         audit_recorder: DeliveryPreparationAuditRecorder | None = None,
     ) -> DeliveryAuthoringDraft:
         root = Path(project_root).resolve()
-        prompt = read_only_agent_prompt(
-            self._build_authoring_prompt(
-                task_description=task_description,
-                task_path=task_path,
-                plan_id=plan_id,
-                project_root=root,
-                output_dir=output_dir,
-                project_context=project_context,
-            )
+        authoring_prompt = self._build_authoring_prompt(
+            task_description=task_description,
+            task_path=task_path,
+            plan_id=plan_id,
+            project_root=root,
+            output_dir=output_dir,
+            project_context=project_context,
         )
-        try:
-            output = self.llm.generate("", prompt)
-        except Exception as exc:
-            self._record_failure(
-                audit_recorder,
-                prompt=prompt,
-                output=None,
-                error=exc,
-                error_code="delivery_prepare.authoring_failed",
+        draft: DeliveryAuthoringDraft | None = None
+        prompt = ""
+        output = ""
+        for round_index in (1, 2):
+            prompt = read_only_agent_prompt(
+                authoring_prompt + (_DELIVERY_AUTHORING_SOURCE_EXCERPT_RETRY if round_index == 2 else "")
             )
-            raise DeliveryPreparationAgentError("Delivery authoring assistant failed.") from None
+            try:
+                output = self.llm.generate("", prompt)
+            except Exception as exc:
+                self._record_failure(
+                    audit_recorder,
+                    prompt=prompt,
+                    output=None,
+                    error=exc,
+                    error_code="delivery_prepare.authoring_failed",
+                    round_index=round_index,
+                )
+                raise DeliveryPreparationAgentError("Delivery authoring assistant failed.") from None
 
-        try:
-            draft = parse_delivery_authoring_output(
-                output,
-                expected_plan_id=plan_id,
-                project_root=root,
-                output_dir=output_dir,
-                source_task_description=task_description,
-            )
-        except DeliveryAuthoringParseError as exc:
-            self._record_failure(
-                audit_recorder,
-                prompt=prompt,
-                output=output,
-                error=exc,
-                error_code=exc.code,
-            )
-            raise
+            try:
+                draft = parse_delivery_authoring_output(
+                    output,
+                    expected_plan_id=plan_id,
+                    project_root=root,
+                    output_dir=output_dir,
+                    source_task_description=task_description,
+                )
+            except DeliveryAuthoringParseError as exc:
+                self._record_failure(
+                    audit_recorder,
+                    prompt=prompt,
+                    output=output,
+                    error=exc,
+                    error_code=exc.code,
+                    round_index=round_index,
+                )
+                if exc.code == "delivery_authoring.constraint_summary_source_excerpt" and round_index == 1:
+                    continue
+                raise
+            break
+        assert draft is not None
 
         source_task_path = self._project_relative_path(task_path, root)
         if source_task_path != "<outside-project>":
@@ -660,7 +679,7 @@ class DeliveryPreparationAgent:
                 ),
             )
 
-        self._record_success(audit_recorder, prompt=prompt, output=output, draft=draft)
+        self._record_success(audit_recorder, prompt=prompt, output=output, draft=draft, round_index=round_index)
         verification = self._verify_constraint_continuity(
             authority_description=task_description,
             constraints=draft.constraints,
@@ -1204,13 +1223,14 @@ class DeliveryPreparationAgent:
         prompt: str,
         output: str,
         draft: DeliveryAuthoringDraft,
+        round_index: int,
     ) -> None:
         if audit_recorder is None:
             return
         audit_recorder(
             {
                 "phase": "delivery_prepare_authoring",
-                "round_index": 1,
+                "round_index": round_index,
                 "prompt": prompt,
                 "raw_output": output,
                 "parsed": {
@@ -1232,6 +1252,7 @@ class DeliveryPreparationAgent:
         output: str | None,
         error: Exception,
         error_code: str,
+        round_index: int,
     ) -> None:
         if audit_recorder is None:
             return
@@ -1244,7 +1265,7 @@ class DeliveryPreparationAgent:
         audit_recorder(
             {
                 "phase": "delivery_prepare_authoring",
-                "round_index": 1,
+                "round_index": round_index,
                 "prompt": prompt,
                 "raw_output": output,
                 "parsed": parsed,

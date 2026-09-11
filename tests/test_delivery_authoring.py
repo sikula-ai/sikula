@@ -1563,32 +1563,6 @@ def test_parse_delivery_authoring_output_accepts_paraphrased_constraint_summary(
     assert draft.constraints[0].summary == "Protocol edits stay under external repository ownership."
 
 
-def test_parse_delivery_authoring_output_accepts_expanded_generic_source_phrase(tmp_path: Path) -> None:
-    summary = (
-        "Maintain Python 3.10 compatibility and importability without optional or non-standard-library dependencies."
-    )
-    data = _draft_data()
-    data["constraints"] = [
-        {
-            "id": "runtime-compatibility",
-            "kind": "prohibited_fallback",
-            "summary": summary,
-            "unit_ids": ["foundation"],
-            "disposition": "preserved",
-        }
-    ]
-
-    draft = parse_delivery_authoring_output(
-        json.dumps(data),
-        expected_plan_id="team-invites",
-        project_root=tmp_path,
-        output_dir=".sikula/delivery/team-invites",
-        source_task_description="# Task\n\n## Out of scope\n\n- Non-standard-library dependencies.\n",
-    )
-
-    assert draft.constraints[0].summary == summary
-
-
 def test_parse_delivery_authoring_output_rejects_invalid_expected_plan_id(tmp_path: Path) -> None:
     with pytest.raises(DeliveryAuthoringParseError) as exc_info:
         parse_delivery_authoring_output(

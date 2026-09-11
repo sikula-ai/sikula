@@ -704,7 +704,7 @@ def test_author_delivery_plan_rejects_repair_that_rephrases_omitted_gap(tmp_path
     assert exc_info.value.code == "delivery_constraint_repair.omitted_constraint_mismatch"
 
 
-def test_author_delivery_plan_rejects_source_excerpt_before_constraint_verification(tmp_path: Path) -> None:
+def test_author_delivery_plan_retries_source_excerpt_once_then_rejects(tmp_path: Path) -> None:
     source_rule = "Only the protocol repository may change protocol files."
     authored = json.loads(_authoring_output())
     authored["constraints"] = [
@@ -717,7 +717,9 @@ def test_author_delivery_plan_rejects_source_excerpt_before_constraint_verificat
         }
     ]
     llm = CapturingLLM(json.dumps(authored))
+    llm.outputs = [json.dumps(authored), json.dumps(authored)]
     agent = DeliveryPreparationAgent(llm=llm)
+    audit_records: list[dict] = []
 
     with pytest.raises(DeliveryAuthoringParseError) as exc_info:
         agent.author_delivery_plan(
@@ -726,10 +728,66 @@ def test_author_delivery_plan_rejects_source_excerpt_before_constraint_verificat
             plan_id="team-invites",
             project_root=tmp_path,
             output_dir=".sikula/delivery/team-invites",
+            audit_recorder=audit_records.append,
         )
 
     assert exc_info.value.code == "delivery_authoring.constraint_summary_source_excerpt"
-    assert len(llm.prompts) == 1
+    assert len(llm.prompts) == 2
+    assert "Your previous draft was rejected" in llm.prompts[1]
+    assert [record["round_index"] for record in audit_records] == [1, 2]
+    assert all(record["parsed"]["status"] == "failed" for record in audit_records)
+
+
+def test_author_delivery_plan_repairs_source_excerpt_with_feedback_retry(tmp_path: Path) -> None:
+    source_rule = "Non-standard-library dependencies."
+    copied_summary = (
+        "Maintain Python compatibility and importability without optional or non-standard-library dependencies."
+    )
+    repaired_summary = "Keep runtime dependencies confined to Python's standard library."
+    authored = json.loads(_authoring_output())
+    authored["constraints"] = [
+        {
+            "id": "standard-library-only",
+            "kind": "security_boundary",
+            "summary": copied_summary,
+            "unit_ids": ["foundation"],
+            "disposition": "preserved",
+        }
+    ]
+    repaired = json.loads(json.dumps(authored))
+    repaired["constraints"][0]["summary"] = repaired_summary
+    verification = {
+        "constraints_complete": True,
+        "constraints": repaired["constraints"],
+        "constraint_gaps": [],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+    }
+    llm = CapturingLLM(json.dumps(authored))
+    llm.outputs = [json.dumps(authored), json.dumps(repaired), json.dumps(verification)]
+    audit_records: list[dict] = []
+
+    draft = DeliveryPreparationAgent(llm=llm).author_delivery_plan(
+        task_description=f"# Task\n\n## Out of scope\n\n- {source_rule}\n",
+        task_path=".sikula/tasks/team-invites.md",
+        plan_id="team-invites",
+        project_root=tmp_path,
+        output_dir=".sikula/delivery/team-invites",
+        audit_recorder=audit_records.append,
+    )
+
+    assert draft.constraints[0].summary == repaired_summary
+    assert len(llm.prompts) == 3
+    assert "Your previous draft was rejected" in llm.prompts[1]
+    assert copied_summary not in llm.prompts[1]
+    assert [record["phase"] for record in audit_records] == [
+        "delivery_prepare_authoring",
+        "delivery_prepare_authoring",
+        "delivery_prepare_constraint_verification",
+    ]
+    assert [record["round_index"] for record in audit_records] == [1, 2, 1]
+    assert audit_records[0]["parsed"]["status"] == "failed"
+    assert audit_records[1]["parsed"]["status"] == "parsed"
 
 
 def test_author_delivery_plan_fails_safely_when_constraint_verifier_provider_fails(tmp_path: Path) -> None:
