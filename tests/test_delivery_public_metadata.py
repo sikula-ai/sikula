@@ -1,5 +1,6 @@
 from core.delivery_public_metadata import (
     REDACTED_DELIVERY_PUBLIC_METADATA,
+    contains_delivery_source_excerpt,
     is_safe_delivery_public_metadata,
     project_delivery_public_identity,
     sanitize_delivery_public_metadata,
@@ -74,3 +75,16 @@ def test_delivery_public_identity_projection_is_stable_and_correlation_safe() ->
     assert project_delivery_public_identity("safe-unit") == "safe-unit"
     assert project_delivery_public_identity("GET /users") == "GET /users"
     assert project_delivery_public_identity("\ud800") is not None
+
+
+def test_delivery_source_excerpt_rejects_copied_or_padded_source_text() -> None:
+    source_rule = "Only the protocol repository may change protocol files."
+    source_text = f"# Task\n\n- {source_rule}\n"
+
+    assert contains_delivery_source_excerpt(source_rule, source_text)
+    assert contains_delivery_source_excerpt(f"Requirement: {source_rule}", source_text)
+    assert contains_delivery_source_excerpt(
+        f"This bounded metadata adds substantial unrelated padding before the exact rule: {source_rule} "
+        "It also adds substantial unrelated padding after the exact rule so the copied source line is a small part.",
+        source_text,
+    )

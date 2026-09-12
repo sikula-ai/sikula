@@ -187,8 +187,10 @@ the source task contains no hard delivery constraints. Each constraint contains
 `repository_ownership`, `authoritative_read_only_dependency`,
 `stop_and_follow_up`, `security_boundary`, and `prohibited_fallback`.
 Sikula deterministically rejects substantive summary text copied from a source-task
-line both during authoring and whenever the published plan is checked. Rejected
-summaries are omitted from public invalid-plan projections. Dispositions are
+line both during authoring and whenever the published plan is checked. Authoring
+gets one bounded retry with explicit paraphrasing feedback for this specific
+failure; rejected summaries remain local audit evidence and are omitted from public
+invalid-plan projections. Dispositions are
 `preserved`, `needs_review`, and `conflict`; the writer blocks
 the latter two before creating delivery artifacts. It never publishes raw task
 excerpts, prompts, provider output, absolute paths, or unresolved constraints.
