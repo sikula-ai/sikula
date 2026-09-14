@@ -1011,6 +1011,11 @@ class TestReviewerAgentPrompt:
             "fifth-command",
         ]
 
+    def test_validation_command_extraction_joins_shell_continuations(self):
+        text = "## Validation\n```bash\npython3 -m pytest \\\n  tests/unit -q\n```\n"
+
+        assert extract_validation_commands(text) == ["python3 -m pytest tests/unit -q"]
+
     def test_validation_command_extraction_requires_markdown_list_marker(self):
         text = (
             "## Validation\n"

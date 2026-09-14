@@ -100,18 +100,32 @@ def _extract_validation_section_commands(
 ) -> None:
     opening_fence = ""
     code_fence_kind = ""
+    continued_shell_parts: list[str] = []
     for line in lines:
         stripped = line.strip()
         fence_match = FENCED_BLOCK_RE.match(line)
         if opening_fence:
             if is_fenced_block_closer(line, opening_fence):
+                if continued_shell_parts:
+                    add(" ".join(continued_shell_parts))
+                    continued_shell_parts.clear()
                 opening_fence = ""
                 code_fence_kind = ""
                 continue
             if fence_match:
                 continue
-            if code_fence_kind == "shell" and not stripped.startswith("#"):
-                add(stripped)
+            if code_fence_kind == "shell":
+                if stripped.startswith("#"):
+                    if continued_shell_parts:
+                        add(" ".join(continued_shell_parts))
+                        continued_shell_parts.clear()
+                    continue
+                trailing_backslashes = len(stripped) - len(stripped.rstrip("\\"))
+                continues = trailing_backslashes % 2 == 1
+                continued_shell_parts.append(stripped[:-1].rstrip() if continues else stripped)
+                if not continues:
+                    add(" ".join(continued_shell_parts))
+                    continued_shell_parts.clear()
             elif code_fence_kind == "transcript" and stripped.startswith("$"):
                 add(stripped)
             continue
@@ -136,6 +150,8 @@ def _extract_validation_section_commands(
         inline_match = re.match(r"`([^`\n]+)`", list_item)
         if inline_match:
             add(inline_match.group(1))
+    if continued_shell_parts:
+        add(" ".join(continued_shell_parts))
 
 
 def _option_value(tokens: list[str], names: set[str]) -> str:
