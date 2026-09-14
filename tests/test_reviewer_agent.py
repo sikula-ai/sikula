@@ -1011,8 +1011,16 @@ class TestReviewerAgentPrompt:
             "fifth-command",
         ]
 
-    def test_validation_command_extraction_joins_shell_continuations(self):
-        text = "## Validation\n```bash\npython3 -m pytest \\\n  tests/unit -q\n```\n"
+    @pytest.mark.parametrize(
+        "command_block",
+        [
+            "```bash\npython3 -m pytest \\\n  tests/unit -q\n```",
+            "$ python3 -m pytest \\\n  tests/unit -q",
+            "```console\n$ python3 -m pytest \\\n  tests/unit -q\n2 passed\n```",
+        ],
+    )
+    def test_validation_command_extraction_joins_shell_continuations(self, command_block: str):
+        text = f"## Validation\n{command_block}\n"
 
         assert extract_validation_commands(text) == ["python3 -m pytest tests/unit -q"]
 

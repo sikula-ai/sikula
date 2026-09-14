@@ -100,15 +100,26 @@ def _extract_validation_section_commands(
 ) -> None:
     opening_fence = ""
     code_fence_kind = ""
-    continued_shell_parts: list[str] = []
+    command_parts: list[str] = []
+
+    def flush_command() -> None:
+        if command_parts:
+            add(" ".join(command_parts))
+            command_parts.clear()
+
+    def consume_command_line(value: str) -> None:
+        trailing_backslashes = len(value) - len(value.rstrip("\\"))
+        continues = trailing_backslashes % 2 == 1
+        command_parts.append(value[:-1].rstrip() if continues else value)
+        if not continues:
+            flush_command()
+
     for line in lines:
         stripped = line.strip()
         fence_match = FENCED_BLOCK_RE.match(line)
         if opening_fence:
             if is_fenced_block_closer(line, opening_fence):
-                if continued_shell_parts:
-                    add(" ".join(continued_shell_parts))
-                    continued_shell_parts.clear()
+                flush_command()
                 opening_fence = ""
                 code_fence_kind = ""
                 continue
@@ -116,20 +127,14 @@ def _extract_validation_section_commands(
                 continue
             if code_fence_kind == "shell":
                 if stripped.startswith("#"):
-                    if continued_shell_parts:
-                        add(" ".join(continued_shell_parts))
-                        continued_shell_parts.clear()
+                    flush_command()
                     continue
-                trailing_backslashes = len(stripped) - len(stripped.rstrip("\\"))
-                continues = trailing_backslashes % 2 == 1
-                continued_shell_parts.append(stripped[:-1].rstrip() if continues else stripped)
-                if not continues:
-                    add(" ".join(continued_shell_parts))
-                    continued_shell_parts.clear()
-            elif code_fence_kind == "transcript" and stripped.startswith("$"):
-                add(stripped)
+                consume_command_line(stripped)
+            elif code_fence_kind == "transcript" and (command_parts or stripped.startswith("$")):
+                consume_command_line(stripped)
             continue
         if fence_match:
+            flush_command()
             opening_fence = fence_match.group(1)
             lang = line[fence_match.end() :].strip().lower()
             if lang in _SHELL_FENCE_LANGS:
@@ -140,8 +145,8 @@ def _extract_validation_section_commands(
         if not stripped:
             continue
 
-        if stripped.startswith("$"):
-            add(stripped)
+        if command_parts or stripped.startswith("$"):
+            consume_command_line(stripped)
             continue
         list_match = re.match(r"^(?:[-*+]|\d+[.)])\s+", stripped)
         if not list_match or not allow_inline_list:
@@ -150,8 +155,7 @@ def _extract_validation_section_commands(
         inline_match = re.match(r"`([^`\n]+)`", list_item)
         if inline_match:
             add(inline_match.group(1))
-    if continued_shell_parts:
-        add(" ".join(continued_shell_parts))
+    flush_command()
 
 
 def _option_value(tokens: list[str], names: set[str]) -> str:
