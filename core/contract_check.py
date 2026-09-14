@@ -1688,11 +1688,17 @@ def _task_description_answer_entry_lines(entries: list[tuple[ClarifyingQuestion,
     return lines
 
 
-def _insert_or_append_section_entries(lines: list[str], section: str, entries: list[str]) -> None:
+def _insert_or_append_section_entries(
+    lines: list[str],
+    section: str,
+    entries: list[str],
+    *,
+    direct_content_only: bool = False,
+) -> None:
     normalized_section = _normalize_heading(section)
     section_start: int | None = None
     section_end = len(lines)
-    heading_scanner = MarkdownHeadingScanner()
+    heading_scanner = MarkdownHeadingScanner(ignore_fenced_blocks=direct_content_only)
     for index, line in enumerate(lines):
         heading = heading_scanner.match(line)
         if heading is None or heading.is_text:
@@ -1704,8 +1710,10 @@ def _insert_or_append_section_entries(lines: list[str], section: str, entries: l
             section_level = heading.level
             section_end = index + 1
             while section_end < len(lines):
+                if direct_content_only and heading_scanner.match(lines[section_end]) is not None:
+                    break
                 next_heading = _HEADING_RE.match(lines[section_end])
-                if next_heading and len(next_heading.group(1)) <= section_level:
+                if not direct_content_only and next_heading and len(next_heading.group(1)) <= section_level:
                     break
                 section_end += 1
             break
@@ -1749,7 +1757,12 @@ def _enrich_implementation_contract_markdown(
         current_markdown = "\n".join(lines)
         validation_entries = _implementation_validation_entry_lines(project_context, current_markdown)
         if validation_entries:
-            _insert_or_append_section_entries(lines, "Validation", validation_entries)
+            _insert_or_append_section_entries(
+                lines,
+                "Validation",
+                validation_entries,
+                direct_content_only=True,
+            )
 
     current_markdown = "\n".join(lines)
     asset_manifest_entries = _implementation_asset_manifest_entry_lines(asset_references or [], current_markdown)
