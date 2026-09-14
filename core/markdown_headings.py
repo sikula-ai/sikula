@@ -11,6 +11,14 @@ TEXT_HEADING_RE = re.compile(r"^\s{0,3}([A-Za-z][A-Za-z0-9 /&_-]{1,60}):\s*$")
 FENCED_BLOCK_RE = re.compile(r"^\s{0,3}(```+|~~~+)")
 
 
+def is_fenced_block_closer(line: str, opening_marker: str) -> bool:
+    match = FENCED_BLOCK_RE.match(line)
+    if match is None:
+        return False
+    marker = match.group(1)
+    return marker[0] == opening_marker[0] and len(marker) >= len(opening_marker) and not line[match.end() :].strip()
+
+
 @dataclass(frozen=True)
 class MarkdownHeading:
     raw: str
@@ -39,16 +47,20 @@ class MarkdownHeadingScanner:
 
     def __init__(self, *, ignore_fenced_blocks: bool = False) -> None:
         self._ignore_fenced_blocks = ignore_fenced_blocks
-        self._in_fenced_block = False
+        self._fenced_block_marker: str | None = None
         self._seen_heading = False
         self._seen_content_before_heading = False
 
     def match(self, line: str) -> MarkdownHeading | None:
-        if self._ignore_fenced_blocks and FENCED_BLOCK_RE.match(line):
-            self._in_fenced_block = not self._in_fenced_block
-            return None
-        if self._ignore_fenced_blocks and self._in_fenced_block:
-            return None
+        if self._ignore_fenced_blocks:
+            fence_match = FENCED_BLOCK_RE.match(line)
+            if self._fenced_block_marker is not None:
+                if is_fenced_block_closer(line, self._fenced_block_marker):
+                    self._fenced_block_marker = None
+                return None
+            if fence_match is not None:
+                self._fenced_block_marker = fence_match.group(1)
+                return None
 
         markdown_heading = MARKDOWN_HEADING_RE.match(line)
         if markdown_heading:

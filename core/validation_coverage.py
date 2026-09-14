@@ -7,7 +7,7 @@ import re
 import shlex
 from pathlib import Path
 
-from core.markdown_headings import FENCED_BLOCK_RE, MarkdownHeadingScanner
+from core.markdown_headings import FENCED_BLOCK_RE, MarkdownHeadingScanner, is_fenced_block_closer
 from core.state import TaskState
 
 INTERNAL_PIPELINE_CONFIG_KEY = "__sikula_effective_pipeline"
@@ -98,28 +98,30 @@ def _extract_validation_section_commands(
     *,
     allow_inline_list: bool,
 ) -> None:
-    in_code_fence = False
+    opening_fence = ""
     code_fence_kind = ""
     for line in lines:
         stripped = line.strip()
         fence_match = FENCED_BLOCK_RE.match(line)
-        if fence_match:
-            if in_code_fence:
-                in_code_fence = False
+        if opening_fence:
+            if is_fenced_block_closer(line, opening_fence):
+                opening_fence = ""
                 code_fence_kind = ""
-            else:
-                lang = line[fence_match.end() :].strip().lower()
-                in_code_fence = True
-                if lang in _SHELL_FENCE_LANGS:
-                    code_fence_kind = "shell"
-                elif lang in _TRANSCRIPT_FENCE_LANGS:
-                    code_fence_kind = "transcript"
-            continue
-        if in_code_fence:
+                continue
+            if fence_match:
+                continue
             if code_fence_kind == "shell" and not stripped.startswith("#"):
                 add(stripped)
             elif code_fence_kind == "transcript" and stripped.startswith("$"):
                 add(stripped)
+            continue
+        if fence_match:
+            opening_fence = fence_match.group(1)
+            lang = line[fence_match.end() :].strip().lower()
+            if lang in _SHELL_FENCE_LANGS:
+                code_fence_kind = "shell"
+            elif lang in _TRANSCRIPT_FENCE_LANGS:
+                code_fence_kind = "transcript"
             continue
         if not stripped:
             continue

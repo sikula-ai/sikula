@@ -969,6 +969,43 @@ class TestReviewerAgentPrompt:
 
         assert extract_validation_commands(text) == ["pytest tests/unit", "ruff check ."]
 
+    def test_validation_command_extraction_matches_fenced_code_closers(self):
+        text = (
+            "## Notes\n"
+            "````markdown\n"
+            "```bash\n"
+            "## Validation\n"
+            "- `not-a-real-command`\n"
+            "```\n"
+            "````\n"
+            "## Validation\n"
+            "````bash\n"
+            "first-command\n"
+            "```\n"
+            "second-command\n"
+            "````\n"
+            "## Verification\n"
+            "~~~shell\n"
+            "third-command\n"
+            "```\n"
+            "fourth-command\n"
+            "~~~\n"
+            "## Checks\n"
+            "```shell\n"
+            "fifth-command\n"
+            "````\n"
+            "## Notes\n"
+            "- `not-a-validation-command`\n"
+        )
+
+        assert extract_validation_commands(text) == [
+            "first-command",
+            "second-command",
+            "third-command",
+            "fourth-command",
+            "fifth-command",
+        ]
+
     def test_validation_command_extraction_requires_markdown_list_marker(self):
         text = (
             "## Validation\n"
