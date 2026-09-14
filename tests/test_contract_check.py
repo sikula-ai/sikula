@@ -2295,6 +2295,8 @@ def test_prepare_implementation_contract_updates_h1_sections_after_prose_preambl
     assert "- Stack: Python" in prepared
     assert "- Known constraints: Keep the change isolated to search UI state." in prepared
     assert "- `ruff check .`" in prepared
+    assert result.check_result.validation["task_commands"] == ["pytest"]
+    assert result.check_result.validation["coverage_gaps"] == []
 
 
 def test_prepare_implementation_contract_does_not_use_inferred_asset_root_for_validation(tmp_path: Path):

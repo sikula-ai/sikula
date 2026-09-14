@@ -30,6 +30,7 @@ from core.task_assets import (
 )
 from core.state import TaskState
 from core.validation_coverage import (
+    VALIDATION_SECTION_HEADINGS,
     configured_validation_commands,
     extract_validation_commands,
     validation_command_coverage,
@@ -117,14 +118,7 @@ _SECTION_ALIASES = {
         "coverage",
         "verification",
     },
-    "validation": {
-        "validation",
-        "verification",
-        "checks",
-        "check",
-        "before merge",
-        "how to validate",
-    },
+    "validation": set(VALIDATION_SECTION_HEADINGS),
     "reviewer_focus": {
         "reviewer focus",
         "review focus",

@@ -765,9 +765,9 @@ class TestReviewerAgentPrompt:
         state = _make_state(
             task_description=(
                 "Add config validation.\n\n"
-                "Acceptance criteria:\n"
-                "- Run `cargo fmt --all -- --check`.\n"
-                "- Run `cargo test --workspace --all-features`.\n"
+                "## Validation\n"
+                "- `cargo fmt --all -- --check`\n"
+                "- `cargo test --workspace --all-features`\n"
             )
         )
         config = {
@@ -795,9 +795,7 @@ class TestReviewerAgentPrompt:
     def test_validation_pipeline_context_marks_near_match_uncovered(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state(
-            task_description=(
-                "Add config validation.\n\nAcceptance criteria:\n- Run `cargo test --workspace --all-features`.\n"
-            )
+            task_description="Add config validation.\n\n## Validation\n\n- `cargo test --workspace --all-features`\n"
         )
         config = {
             "project": {"build_tool": "cargo"},
@@ -816,7 +814,7 @@ class TestReviewerAgentPrompt:
     def test_validation_pipeline_context_marks_uncovered_task_command(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
         state = _make_state(
-            task_description="Add export support. Acceptance: run `cargo run -p codegen_tool -- fixtures/`."
+            task_description="Add export support.\n\n## Validation\n\n- `cargo run -p codegen_tool -- fixtures/`"
         )
         config = {
             "project": {"build_tool": "cargo"},
@@ -834,7 +832,7 @@ class TestReviewerAgentPrompt:
 
     def test_validation_pipeline_context_respects_disabled_checks(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"
-        state = _make_state(task_description="Format the project. Run `ruff format --check .`.")
+        state = _make_state(task_description="Format the project.\n\n## Validation\n\n- `ruff format --check .`")
         config = {
             "run_checks": False,
             "project": {"build_tool": "python"},
@@ -852,7 +850,7 @@ class TestReviewerAgentPrompt:
         stub_llm.readonly_result = "APPROVED"
         state = _make_state(
             review_mode="review_report",
-            task_description="Review branch. Run `cargo test --workspace` before merge.",
+            task_description="Review branch.\n\n## Verification\n\n- `cargo test --workspace`",
         )
         config = {
             "project": {"build_tool": "cargo"},
@@ -871,7 +869,7 @@ class TestReviewerAgentPrompt:
         stub_llm.readonly_result = "APPROVED"
         state = _make_state(
             review_mode="review_fix",
-            task_description="Review branch. Run `cargo test --workspace --all-features` before merge.",
+            task_description="Review branch.\n\n## Verification\n\n- `cargo test --workspace --all-features`",
         )
         config = {
             "project": {"build_tool": "cargo"},
@@ -902,23 +900,122 @@ class TestReviewerAgentPrompt:
             "```markdown\nnpm test\n```\n"
             "Run: `cargo test --workspace`\n"
             "```bash\n$ ruff check .\n# comment\n```\n"
+            "## Validation\n"
+            "- `mix test`\n"
+            "- `bundle exec rspec`\n"
+            "```bash\nruff check .\n```\n"
         )
 
         assert extract_validation_commands(text) == [
-            "cargo run -p codegen_tool -- fixtures/",
-            "cargo test --workspace",
+            "mix test",
+            "bundle exec rspec",
             "ruff check .",
         ]
+
+    def test_validation_command_extraction_ignores_behavioral_cli_invocations(self):
+        text = (
+            "## Acceptance criteria\n"
+            "- `python3 -m resource_tool <value>` uses the shared resource-path behavior.\n"
+            "- `python3 -m resource_tool <value>` exits with status 2 for invalid input.\n"
+            "- Valid input produces exactly one JSON object.\n"
+            "\n"
+            "## Validation\n"
+            "- `python3 -m unittest discover -s tests -v`\n"
+        )
+
+        assert extract_validation_commands(text) == ["python3 -m unittest discover -s tests -v"]
+
+    def test_validation_command_extraction_ignores_result_wording_outside_validation_section(self):
+        text = "- `cargo test --workspace` exits with status 0.\n- `ruff check .` outputs no diagnostics.\n"
+
+        assert extract_validation_commands(text) == []
+
+    def test_validation_command_extraction_supports_shared_heading_aliases_and_levels(self):
+        text = (
+            "Task preamble.\n"
+            "### Validation\n"
+            "- `future-platform verify`\n"
+            "## Checks\n"
+            "- Inspect `artifact.json` after validation.\n"
+            "- `second-platform check`\n"
+            "# Test plan\n"
+            "$ third-platform test\n"
+            "## Tests\n"
+            "- `FourthPlatformTest` covers the behavior.\n"
+            "```shell\n"
+            "fourth-platform test\n"
+            "```\n"
+        )
+
+        assert extract_validation_commands(text) == [
+            "future-platform verify",
+            "second-platform check",
+            "third-platform test",
+            "fourth-platform test",
+        ]
+
+    def test_validation_command_extraction_distinguishes_transcript_output(self):
+        text = (
+            "## Validation\n"
+            "```console\n"
+            "$ pytest tests/unit\n"
+            "2 passed in 0.10s\n"
+            "```\n"
+            "```terminal\n"
+            "$ ruff check .\n"
+            "All checks passed!\n"
+            "```\n"
+        )
+
+        assert extract_validation_commands(text) == ["pytest tests/unit", "ruff check ."]
+
+    def test_validation_command_extraction_requires_markdown_list_marker(self):
+        text = (
+            "## Validation\n"
+            "`not-a-list command` describes behavior.\n"
+            "+ `plus-list command`\n"
+            "1. `ordered-list command`\n"
+        )
+
+        assert extract_validation_commands(text) == ["plus-list command", "ordered-list command"]
+
+    def test_validation_command_extraction_requires_unambiguous_legacy_test_commands(self):
+        text = (
+            "## Tests\n"
+            "- `ParserRejectsInvalidInput`\n"
+            "- `cargo test --workspace` exits with status 0.\n"
+            "$ cargo test --workspace\n"
+            "## Test plan\n"
+            "```bash\n"
+            "ruff check .\n"
+            "```\n"
+        )
+
+        assert extract_validation_commands(text) == ["cargo test --workspace", "ruff check ."]
+
+    def test_validation_command_extraction_uses_nearest_heading(self):
+        text = (
+            "## Validation\n"
+            "- `root-check`\n"
+            "### Tests\n"
+            "- `ParserRejectsInvalidInput` covers invalid input.\n"
+            "$ nested-test-command\n"
+            "### Notes\n"
+            "- `not-a-validation-command`\n"
+        )
+
+        assert extract_validation_commands(text) == ["root-check", "nested-test-command"]
 
     def test_validation_command_extraction_handles_shell_edge_cases(self):
         text = (
             "`cargo test`,\n"
             "`python should`,\n"
             "$ ruff check .\n"
-            "Verification:\n"
-            "pytest\n"
-            "python parser should reject invalid input\n"
+            "## Verification\n"
+            "- `cargo test`\n"
             "```bash\n"
+            "$ ruff check .\n"
+            "# comment\n"
             "python 'unterminated\n"
             "swift evolve\n"
             "```\n"
@@ -926,10 +1023,9 @@ class TestReviewerAgentPrompt:
 
         assert extract_validation_commands(text) == [
             "cargo test",
-            "python should",
             "ruff check .",
-            "pytest",
             "python 'unterminated",
+            "swift evolve",
         ]
 
     def test_validation_command_extraction_ignores_prose_starting_with_tool_names(self):
@@ -942,19 +1038,17 @@ class TestReviewerAgentPrompt:
             "cargo clippy should not be described as prose here.\n"
         )
 
-        assert extract_validation_commands(text) == [
-            "cargo test --workspace",
-        ]
+        assert extract_validation_commands(text) == []
 
     def test_validation_command_extraction_supports_validation_block_headings(self):
         text = (
             "## Verification\n"
             "\n"
-            "cargo test --workspace\n"
+            "- `cargo test --workspace`\n"
             "\n"
-            "ruff check .\n"
-            "Implementation notes:\n"
-            "pytest remains configured.\n"
+            "```bash\nruff check .\n```\n"
+            "## Implementation notes\n"
+            "- `pytest` remains configured.\n"
         )
 
         assert extract_validation_commands(text) == [
@@ -963,26 +1057,26 @@ class TestReviewerAgentPrompt:
         ]
 
     def test_validation_command_extraction_preserves_validation_block_across_blank_separators(self):
-        text = "## Verification\n\n\ncargo test --workspace\n"
+        text = "## Verification\n\n\n- `cargo test --workspace`\n"
 
         assert extract_validation_commands(text) == ["cargo test --workspace"]
 
     def test_validation_command_extraction_closes_validation_block_on_non_command_content(self):
-        text = "## Verification\n\nNotes:\ncargo test --workspace\n"
+        text = "## Verification\n\n## Notes\n\n- `cargo test --workspace`\n"
 
         assert extract_validation_commands(text) == []
 
     def test_validation_command_extraction_supports_prompted_bare_commands(self):
-        text = "$ pytest tests/unit\n"
+        text = "$ pytest outside\n\n## Validation\n\n$ pytest tests/unit\n"
 
         assert extract_validation_commands(text) == [
             "pytest tests/unit",
         ]
 
-    def test_validation_command_extraction_rejects_bare_tool_names(self):
+    def test_validation_command_extraction_ignores_inline_commands_outside_section(self):
         text = "Run `cargo` and `npm` prose checks, but `pytest` before merge.\n"
 
-        assert extract_validation_commands(text) == ["pytest"]
+        assert extract_validation_commands(text) == []
 
     def test_validation_command_matching_keeps_scripts_and_targets_distinct(self):
         assert validation_commands_equivalent("`cargo test`", "cargo test") == (True, "exact")
@@ -1273,7 +1367,9 @@ class TestReviewerAgentPrompt:
 
     def test_validation_coverage_gaps_reports_only_uncovered_commands(self):
         state = _make_state(
-            task_description=("Run `cargo test --workspace` and `cargo run -p codegen_tool -- fixtures/` before merge.")
+            task_description=(
+                "## Validation\n\n- `cargo test --workspace`\n- `cargo run -p codegen_tool -- fixtures/`\n"
+            )
         )
         config = {
             "project": {"build_tool": "cargo"},

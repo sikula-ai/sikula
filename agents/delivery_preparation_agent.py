@@ -147,7 +147,11 @@ Delivery-plan constraints:
   Goal, Current behavior, Desired behavior, Acceptance criteria, Security and privacy, Reviewer focus,
   Out of scope, and Validation.
 - Validation sections must include explicit commands that match or are directly supported by the
-  source task or configured validation commands.
+  source task or configured validation commands. Write each command as a list item beginning with
+  the backticked command, as shown in the output schema.
+- Preserve validation commands explicitly required by the source task. Otherwise use only the
+  configured validation commands listed above; do not invent manual runtime, example, smoke-test,
+  or comparison commands. Put non-command inspection guidance under Reviewer focus instead.
 - Unit task Markdown must not include an asset-root section (`## Assets`, `## Asset`,
   `## Task assets`, or `## Task asset`), `## Asset manifest`, or sikula:generated-* markers.
   Deterministic writer code renders assigned source declarations from asset_paths.
@@ -545,7 +549,8 @@ Replacement constraints:
   `## Task assets`, or `## Task asset`); deterministic Sikula code renders the assigned
   declarations from the selected unit.
 - Keep acceptance criteria observable and validation commands supported by the source unit or
-  configured project context.
+  configured project context. In `## Validation`, write each command as a list item beginning with
+  the backticked command, as shown below.
 
 Return this JSON shape:
 {{

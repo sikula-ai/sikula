@@ -245,7 +245,11 @@ inside the project, and must not contain parent-directory (`..`) traversal.
 Unit Markdown must include non-empty Goal, Current behavior,
 Desired behavior, Acceptance criteria, Security/privacy, Reviewer focus, Out of
 scope, and Verification sections; Verification must include explicit validation
-commands. `## Assets`, `## Asset manifest`, and `sikula:generated-*` markers are
+commands as backticked Markdown list items, shell code fences, or `$`-prompted
+lines. Command-like examples outside recognized validation sections are not
+validation requirements. Legacy `Test`, `Tests`, and `Test plan` sections require
+a shell fence or `$` prompt to distinguish commands from test identifiers.
+`## Assets`, `## Asset manifest`, and `sikula:generated-*` markers are
 rejected in assistant-authored unit Markdown; source task assets are assigned
 with `asset_paths` and rendered by the writer.
 

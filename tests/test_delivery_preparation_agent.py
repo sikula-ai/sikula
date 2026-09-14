@@ -327,6 +327,9 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     assert "where applicable" not in prompt
     assert "must include all of these exact contract-ready section headings" in prompt
     assert "Validation sections must include explicit commands" in prompt
+    assert "list item beginning with" in prompt
+    assert "do not invent manual runtime, example, smoke-test" in prompt
+    assert "Put non-command inspection guidance under Reviewer focus" in prompt
     assert "asset_paths must contain only paths declared" in prompt
     assert "scope_paths are execution-boundary metadata" in prompt
     assert "explicit repository path required by the source task" in prompt
@@ -892,6 +895,7 @@ def test_author_delivery_amendment_uses_plain_generation_and_records_audit(tmp_p
     assert "assign every declared path to at least one" in prompt
     assert "absolute in-project declaration, use its project-relative equivalent" in prompt
     assert "Replacement task_markdown must not include an asset-root section" in prompt
+    assert "In `## Validation`, write each command as a list item beginning with" in prompt
     assert audit_records[0]["phase"] == "delivery_amend_prepare_authoring"
     assert audit_records[0]["parsed"]["replacement_ids"] == ["invite-storage", "invite-cli"]
 

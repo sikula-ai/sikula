@@ -2,47 +2,31 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import re
 import shlex
 from pathlib import Path
 
+from core.markdown_headings import FENCED_BLOCK_RE, MarkdownHeadingScanner
 from core.state import TaskState
 
 INTERNAL_PIPELINE_CONFIG_KEY = "__sikula_effective_pipeline"
 
-_VALIDATION_COMMAND_RE = re.compile(
-    r"^(?:"
-    r"\./gradlew|gradlew|gradle|"
-    r"\./mvnw|mvnw|mvn|"
-    r"cargo|"
-    r"python|python3|pytest|ruff|"
-    r"xcodebuild|swift|swiftlint|"
-    r"npm|npx|yarn|pnpm|bun|"
-    r"go|dotnet|make"
-    r")(?:\s|$)"
-)
-_VALIDATION_CONTEXT_RE = re.compile(
-    r"\b(run|verify|verification|validate|validation|check|test|format|lint|acceptance|before merge)\b",
-    re.IGNORECASE,
-)
-_SHELL_FENCE_LANGS = {"", "bash", "sh", "shell", "zsh", "console", "terminal"}
-_PROSE_MARKERS = {
-    "are",
-    "can",
-    "cannot",
-    "can't",
-    "could",
-    "is",
-    "must",
-    "need",
-    "needs",
-    "should",
-    "will",
-    "would",
-}
-_VALIDATION_BLOCK_HEADING_RE = re.compile(
-    r"^(?:verification|validation|checks?|tests?|test plan|acceptance|before merge)$",
-    re.IGNORECASE,
+_SHELL_FENCE_LANGS = {"", "bash", "sh", "shell", "zsh"}
+_TRANSCRIPT_FENCE_LANGS = {"console", "terminal"}
+_AMBIGUOUS_VALIDATION_SECTION_HEADINGS = {"test", "test plan", "tests"}
+VALIDATION_SECTION_HEADINGS = frozenset(
+    {
+        "before merge",
+        "check",
+        "checks",
+        "how to validate",
+        "test",
+        "test plan",
+        "tests",
+        "validation",
+        "verification",
+    }
 )
 _PACKAGE_SCRIPT_SHORTCUT_MANAGERS = {"npm", "pnpm", "yarn"}
 _PACKAGE_SCRIPT_SHORTCUTS = {"test"}
@@ -63,7 +47,6 @@ _PACKAGE_RUN_SHORTHAND_SCRIPTS = {
     "type-check",
     "typecheck",
 }
-_STANDALONE_VALIDATION_COMMANDS = {"pytest", "swiftlint"}
 _PYTHON_MODULE_ALIASES = {"pytest", "ruff"}
 
 
@@ -85,90 +68,72 @@ def _normalize_command(command: str) -> str:
     return command.rstrip(",;:")
 
 
-def _looks_like_validation_command(command: str, *, reject_prose: bool = False) -> bool:
-    normalized = _normalize_command(command)
-    if not normalized or "\n" in normalized:
-        return False
-    if not _VALIDATION_COMMAND_RE.match(normalized):
-        return False
-    tokens = _shell_tokens(normalized)
-    if len(tokens) < 2:
-        first = tokens[0].removeprefix("./").rsplit("/", 1)[-1]
-        return first in _STANDALONE_VALIDATION_COMMANDS
-    if reject_prose and any(token.lower().strip(".,;:") in _PROSE_MARKERS for token in tokens[1:]):
-        return False
-    first = tokens[0].removeprefix("./").rsplit("/", 1)[-1]
-    second = tokens[1].lower()
-    if first == "make" and second in {"sure", "certain"}:
-        return False
-    if first == "go" and second not in {"build", "test", "vet", "fmt", "run", "mod", "generate", "tool"}:
-        return False
-    if first == "swift" and second not in {"build", "test", "run", "package"}:
-        return False
-    return True
-
-
 def extract_validation_commands(text: str) -> list[str]:
     commands: list[str] = []
 
-    def add(command: str, *, reject_prose: bool = False) -> None:
+    def add(command: str) -> None:
         normalized = _normalize_command(command)
-        if (
-            normalized
-            and _looks_like_validation_command(normalized, reject_prose=reject_prose)
-            and normalized not in commands
-        ):
+        if normalized and "\n" not in normalized and normalized not in commands:
             commands.append(normalized)
 
-    in_code_fence = False
-    code_fence_is_shell = False
-    in_validation_command_block = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
+    lines = text.splitlines()
+    scanner = MarkdownHeadingScanner(ignore_fenced_blocks=True)
+    headings = [(idx, heading) for idx, line in enumerate(lines) if (heading := scanner.match(line)) is not None]
+    for idx, (line_idx, heading) in enumerate(headings):
+        if heading.is_document_title or heading.normalized not in VALIDATION_SECTION_HEADINGS:
             continue
-        if stripped.startswith("```"):
-            if in_code_fence:
-                in_code_fence = False
-                code_fence_is_shell = False
-            else:
-                lang = stripped[3:].strip().lower()
-                in_code_fence = True
-                code_fence_is_shell = lang in _SHELL_FENCE_LANGS
-            continue
-        if in_code_fence:
-            if code_fence_is_shell and not stripped.startswith("#"):
-                add(stripped)
-            continue
-
-        stripped = re.sub(r"^[-*]\s+", "", stripped)
-        stripped = re.sub(r"^\d+[.)]\s+", "", stripped)
-        has_inline_command = bool(re.search(r"`[^`\n]+`", stripped))
-        starts_with_inline_command = bool(re.match(r"`[^`\n]+`", stripped))
-        context_text = re.sub(r"`[^`\n]+`", "", stripped)
-        has_validation_context = bool(_VALIDATION_CONTEXT_RE.search(context_text))
-        heading = stripped.lstrip("#").strip().rstrip(":")
-        opens_validation_block = (
-            not has_inline_command
-            and has_validation_context
-            and (stripped.endswith(":") or _VALIDATION_BLOCK_HEADING_RE.fullmatch(heading) is not None)
+        end_idx = headings[idx + 1][0] if idx + 1 < len(headings) else len(lines)
+        _extract_validation_section_commands(
+            lines[line_idx + 1 : end_idx],
+            add,
+            allow_inline_list=heading.normalized not in _AMBIGUOUS_VALIDATION_SECTION_HEADINGS,
         )
-        if has_validation_context or starts_with_inline_command:
-            for match in re.finditer(r"`([^`\n]+)`", stripped):
-                add(match.group(1))
-        if ":" in stripped:
-            prefix, _, rest = stripped.partition(":")
-            if _VALIDATION_CONTEXT_RE.search(prefix) and "`" not in rest:
-                add(rest, reject_prose=True)
-        if stripped.startswith("$") or (in_validation_command_block and not has_inline_command):
-            before_count = len(commands)
-            add(stripped, reject_prose=not stripped.startswith("$"))
-            if len(commands) == before_count and not opens_validation_block:
-                in_validation_command_block = False
-        if opens_validation_block:
-            in_validation_command_block = True
 
     return commands
+
+
+def _extract_validation_section_commands(
+    lines: list[str],
+    add: Callable[[str], None],
+    *,
+    allow_inline_list: bool,
+) -> None:
+    in_code_fence = False
+    code_fence_kind = ""
+    for line in lines:
+        stripped = line.strip()
+        fence_match = FENCED_BLOCK_RE.match(line)
+        if fence_match:
+            if in_code_fence:
+                in_code_fence = False
+                code_fence_kind = ""
+            else:
+                lang = line[fence_match.end() :].strip().lower()
+                in_code_fence = True
+                if lang in _SHELL_FENCE_LANGS:
+                    code_fence_kind = "shell"
+                elif lang in _TRANSCRIPT_FENCE_LANGS:
+                    code_fence_kind = "transcript"
+            continue
+        if in_code_fence:
+            if code_fence_kind == "shell" and not stripped.startswith("#"):
+                add(stripped)
+            elif code_fence_kind == "transcript" and stripped.startswith("$"):
+                add(stripped)
+            continue
+        if not stripped:
+            continue
+
+        if stripped.startswith("$"):
+            add(stripped)
+            continue
+        list_match = re.match(r"^(?:[-*+]|\d+[.)])\s+", stripped)
+        if not list_match or not allow_inline_list:
+            continue
+        list_item = stripped[list_match.end() :]
+        inline_match = re.match(r"`([^`\n]+)`", list_item)
+        if inline_match:
+            add(inline_match.group(1))
 
 
 def _option_value(tokens: list[str], names: set[str]) -> str:

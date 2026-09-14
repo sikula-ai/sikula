@@ -299,6 +299,23 @@ def test_write_delivery_prepare_artifacts_writes_valid_plan_and_units(tmp_path: 
     assert "Raw prompts" not in repr(result.to_dict())
 
 
+def test_write_delivery_prepare_artifacts_ignores_behavioral_cli_invocation_for_coverage(tmp_path: Path) -> None:
+    task_markdown = _ready_task_markdown("Expose CLI behavior").replace(
+        "## Acceptance criteria\n",
+        "## Acceptance criteria\n\n- `python3 -m resource_tool <value>` uses the shared resource-path behavior.\n",
+    )
+
+    result = write_delivery_prepare_artifacts(
+        _draft(units=[_unit("cli", task_markdown=task_markdown)]),
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "ready"
+    assert result.unit_readiness.units[0].blocking_gap_ids == []
+
+
 def test_writer_blocks_authored_scope_path_without_existing_parent(tmp_path: Path) -> None:
     (tmp_path / "app").mkdir()
     actual_path = (
