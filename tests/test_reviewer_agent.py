@@ -954,6 +954,11 @@ class TestReviewerAgentPrompt:
             "fourth-platform test",
         ]
 
+    def test_validation_command_extraction_accepts_leading_h1_section(self):
+        text = "# Validation\n\n- `cargo test --workspace`\n"
+
+        assert extract_validation_commands(text) == ["cargo test --workspace"]
+
     def test_validation_command_extraction_distinguishes_transcript_output(self):
         text = (
             "## Validation\n"

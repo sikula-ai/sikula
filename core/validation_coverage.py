@@ -80,7 +80,7 @@ def extract_validation_commands(text: str) -> list[str]:
     scanner = MarkdownHeadingScanner(ignore_fenced_blocks=True)
     headings = [(idx, heading) for idx, line in enumerate(lines) if (heading := scanner.match(line)) is not None]
     for idx, (line_idx, heading) in enumerate(headings):
-        if heading.is_document_title or heading.normalized not in VALIDATION_SECTION_HEADINGS:
+        if heading.normalized not in VALIDATION_SECTION_HEADINGS:
             continue
         end_idx = headings[idx + 1][0] if idx + 1 < len(headings) else len(lines)
         _extract_validation_section_commands(
