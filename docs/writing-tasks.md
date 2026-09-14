@@ -178,9 +178,25 @@ remain open questions. If the
 project has a configured
 Sikula build/test/check pipeline and those phases are enabled for a normal
 `sikula run`, the task does not need to repeat those commands unless it requires
-additional project-specific validation. Disabled validation phases do not count
-as contract readiness coverage. The readiness score is a preflight signal, not a
-guarantee that the task will succeed.
+additional project-specific validation or an exact invocation. Put such
+requirements in a `## Validation` or
+`## Verification` section as backticked Markdown list items:
+
+```markdown
+## Validation
+
+- `python3 -m pytest tests/unit -q`
+- `python3 -m ruff check .`
+```
+
+Shell code fences and `$`-prompted command lines are also accepted. Text outside
+a recognized validation section is treated as descriptive, including CLI usage
+examples. In the legacy `Test`, `Tests`, and `Test plan` section aliases, use a
+shell fence or `$` prompt because standalone backticked names may be test case
+identifiers rather than commands.
+Disabled validation phases do not count as contract readiness coverage. The
+readiness score is a preflight signal, not a guarantee that the task will
+succeed.
 Normal `sikula run TASK_FILE` assumes `TASK_FILE` is the delivery task or
 implementation contract you want to execute. It records the same check as a
 compact, warning-only state snapshot and prints a one-line summary before

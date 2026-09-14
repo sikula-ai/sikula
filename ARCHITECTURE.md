@@ -2612,12 +2612,19 @@ Use `fix_command` only for deterministic, idempotent formatters (e.g. `ruff form
 
 Do not rely on task descriptions to execute validation commands. Agents may mention or
 review them, but only configured build/test/check commands are executable pipeline steps.
-Validation command extraction is intentionally explicit: commands are recognized from
-backticks, shell code fences, `$`-prompted lines, or command lists under validation-oriented
-headings/prefixes such as `Verification:` or `Run:`; Markdown blank separator lines after
-the heading are allowed. Prose that happens to start with a tool name is not treated as a
-command, and bare tool names such as `cargo` or `npm` are not treated as executable
-validation commands.
+Validation command extraction is intentionally structural and platform-independent.
+Canonical output uses `## Validation` or `## Verification`; the shared heading semantics
+also preserve existing accepted aliases and heading levels. Commands in a recognized section
+must use a list item beginning with a backticked command, a shell code fence, or a
+`$`-prompted line. List items accept Markdown unordered (`-`, `*`, `+`) and ordered markers;
+`console` and `terminal` transcript fences extract only `$`-prompted lines, not command
+output. Each heading owns content only until the next heading, so a nested section uses its
+own semantics. Ambiguous legacy `Test`, `Tests`, and `Test plan` sections accept commands
+only from shell fences or `$`-prompted lines so backticked test names do not become commands.
+Command-like text elsewhere is descriptive, including runtime examples and result wording,
+and does not create a coverage requirement. The extractor does not
+maintain executable, subcommand, or prose-verb allowlists, so a future platform's exact
+configured command works without parser changes.
 When `sikula run` task text requires a validation command that is not represented by the
 effective pipeline config, Sikula reports a validation coverage gap instead of asking an
 agent to run the command manually. In `sikula review` modes, commands found in PR/review

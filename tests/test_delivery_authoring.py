@@ -220,6 +220,18 @@ def test_parse_delivery_authoring_output_accepts_valid_json_object(tmp_path: Pat
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
 
 
+def test_parse_delivery_authoring_output_accepts_legacy_validation_heading(tmp_path: Path) -> None:
+    data = _draft_data()
+    data["units"][0]["task_markdown"] = data["units"][0]["task_markdown"].replace(
+        "## Validation",
+        "## Checks",
+    )
+
+    draft = _parse(json.dumps(data), tmp_path)
+
+    assert draft.units[0].id == "foundation"
+
+
 def test_parse_delivery_authoring_output_accepts_single_fenced_json_block(tmp_path: Path) -> None:
     output = f"```json\n{json.dumps(_draft_data())}\n```"
 

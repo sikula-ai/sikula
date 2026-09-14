@@ -3729,7 +3729,7 @@ class TestOrchestratorLoop:
         )
 
         result = orch.run(
-            task_description="Add export support. Acceptance: run `cargo run -p codegen_tool -- fixtures/`."
+            task_description="Add export support.\n\n## Validation\n\n- `cargo run -p codegen_tool -- fixtures/`"
         )
 
         assert result.failed
@@ -3754,7 +3754,9 @@ class TestOrchestratorLoop:
             },
         )
 
-        result = orch.run(task_description="Update config loader. Run `cargo test --workspace --all-features`.")
+        result = orch.run(
+            task_description="Update config loader.\n\n## Validation\n\n- `cargo test --workspace --all-features`"
+        )
 
         assert result.failed
         assert not stubs["analyst"].calls
@@ -3762,6 +3764,29 @@ class TestOrchestratorLoop:
             entry["phase"] == "validation_coverage"
             and entry["status"] == "failed"
             and "cargo test --workspace --all-features" in entry.get("error_excerpt", "")
+            for entry in result.validation_cycle_records
+        )
+
+    def test_validator_result_wording_fails_before_agents(self, tmp_path: Path):
+        orch, stubs, _ = _make_orchestrator(
+            tmp_path,
+            run_build=True,
+            run_tests=True,
+            run_checks=True,
+            project_config={
+                "project": {"build_tool": "cargo"},
+                "build": {"test_command": "cargo test"},
+            },
+        )
+
+        result = orch.run(task_description="## Validation\n\n- `cargo test --workspace` exits with status 0.")
+
+        assert result.failed
+        assert not stubs["analyst"].calls
+        assert any(
+            entry["phase"] == "validation_coverage"
+            and entry["status"] == "failed"
+            and "cargo test --workspace" in entry.get("error_excerpt", "")
             for entry in result.validation_cycle_records
         )
 
@@ -3780,7 +3805,7 @@ class TestOrchestratorLoop:
         )
         stubs["implementer"].side_effect = lambda state: state.files_changed.append("src/index.ts")
 
-        result = orch.run(task_description="## Verification\n\npnpm run typecheck\npnpm test\n")
+        result = orch.run(task_description="## Verification\n\n- `pnpm run typecheck`\n- `pnpm test`\n")
 
         assert result.done
         assert not result.failed
@@ -3799,7 +3824,7 @@ class TestOrchestratorLoop:
             },
         )
 
-        result = orch.run(task_description="## Verification\n\ncargo test --workspace --all-features\n")
+        result = orch.run(task_description="## Verification\n\n- `cargo test --workspace --all-features`\n")
 
         assert result.failed
         assert not stubs["analyst"].calls
@@ -3825,7 +3850,7 @@ class TestOrchestratorLoop:
             orch,
             review_mode="unknown",
         )
-        state.task_description = "Update parser. Run `cargo test --workspace --all-features`."
+        state.task_description = "Update parser.\n\n## Validation\n\n- `cargo test --workspace --all-features`"
         orch._store.save(state)
 
         result = orch.run(task_id="t1")

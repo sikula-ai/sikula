@@ -26,7 +26,7 @@ from core.delivery_plan import (
 from core.delivery_public_metadata import contains_delivery_source_excerpt, is_safe_delivery_public_metadata
 from core.markdown_headings import MarkdownHeading, MarkdownHeadingScanner, normalize_heading
 from core.structured_output import load_schema_json_object
-from core.validation_coverage import extract_validation_commands
+from core.validation_coverage import VALIDATION_SECTION_HEADINGS, extract_validation_commands
 
 _DELIVERY_AUTHORING_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _PLANNING_MODES = {"fixed_window"}
@@ -158,15 +158,7 @@ _REQUIRED_UNIT_MARKDOWN_SECTIONS = {
         "review checklist",
     },
     "out_of_scope": {"out of scope", "non goals", "non-goals", "not in scope", "excluded", "exclusions"},
-    "verification": {
-        "verification",
-        "validation",
-        "checks",
-        "check",
-        "test plan",
-        "how to validate",
-        "before merge",
-    },
+    "verification": set(VALIDATION_SECTION_HEADINGS),
 }
 _ASSET_MANIFEST_HEADING = normalize_heading("Asset manifest")
 
@@ -1648,11 +1640,7 @@ def _validate_unit_task_markdown(task_markdown: str, *, allow_asset_manifest: bo
             f"Unit task Markdown must include a non-empty {missing_section} section.",
         )
 
-    verification_content = _required_section_content(
-        sections,
-        _REQUIRED_UNIT_MARKDOWN_SECTIONS["verification"],
-    )
-    if not extract_validation_commands(verification_content):
+    if not extract_validation_commands(task_markdown):
         raise DeliveryAuthoringParseError(
             "delivery_authoring.unit_markdown_missing_verification_commands",
             "Unit task Markdown must include at least one explicit verification command.",
