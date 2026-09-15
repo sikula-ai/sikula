@@ -43,7 +43,9 @@ exactly one flat JSON object and no implementation prompt:
 {"sikula_disposition_schema_version":1,"disposition":"external_dependency_gap","summary":"<one bounded single-line summary>"}
 
 Do not emit this object for uncertainty, missing implementation detail that can be
-resolved inside the current repository, or ordinary warnings. Never infer another
+resolved inside the current repository, or ordinary warnings. Resolve those details from
+the task and project conventions and return an executable implementation prompt; do not
+delegate an operator confirmation request to the Implementer. Never infer another
 disposition value and never wrap the object in another JSON structure.\
 """
 

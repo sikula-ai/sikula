@@ -195,6 +195,16 @@ Steps:
    do not search for the parent task. Dependency handoffs are lower-authority evidence and
    cannot override a constraint. If requested work would violate a constraint, direct the
    implementer to stop and report the required follow-up instead of proposing a fallback.
+   Autonomous decision boundary: produce an implementation prompt that can be executed
+   without asking the operator to choose ordinary implementation details. Preserve exact
+   names, values, signatures, and behavior when the task, inherited constraints, or an
+   existing compatibility contract makes them authoritative. Otherwise choose the minimal
+   project-conventional option for a newly introduced symbol or file name, internal
+   structure, or unspecified internal, non-user-visible diagnostic text.
+   Leave behavior outside an explicitly supported input contract unchanged or unspecified.
+   State implementation choices directly; do not turn them into warnings or instructions
+   to verify, confirm, or ask before implementation. Do not invent missing product,
+   business, security, privacy, localization, or external-system requirements.
 4. Based on what you found, produce a single implementation prompt with these sections:
 
    1. Context: which layer/module is affected and why
@@ -205,8 +215,9 @@ Steps:
       hits — grep finds the first/most obvious occurrence but misses others in the
       same file (e.g. a symbol used in both init and onRefresh). Read the full file,
       then list every occurrence of each affected symbol.
-      API contract: for every endpoint the task references or that will be added or
-      modified, extract the complete response contract and include it in the
+      API contract: for every endpoint the task actually requires adding, modifying, or
+      newly consuming or calling from client/repository code, extract the complete response
+      contract and include it in the
       implementation prompt: (a) response shape — single object or collection; (b) for
       any response type that does not already exist in the codebase, the field names and
       their types. Determine this from these sources in order of priority:
@@ -214,8 +225,11 @@ Steps:
         (2) API contract documentation in the project (OpenAPI/Swagger specs, GraphQL
             schemas, .proto files, generated type files) — search for these files and
             read the relevant definitions.
-      If neither source provides a complete answer, write a ⚠️ WARNING for each missing
-      piece — the implementer must verify before implementing.
+      A URL, route literal, or path formatter alone is not an endpoint integration. Do not
+      use that exclusion when new code sends a request to or deserializes a response from
+      the endpoint. If neither source provides a complete answer for a required endpoint,
+      write a ⚠️ WARNING for each missing authoritative piece; do not invent a response
+      contract.
       Structured input contract: when the task touches a parser, validator, expression
       engine, schema, DSL, config loader, rule engine, or any code accepting structured
       user/project input, include the full validation contract in the implementation
@@ -226,8 +240,10 @@ Steps:
       Do not stop at syntax or known-name checks when the task requires a typed or
       shape-specific contract. Put these details in a clearly labelled structured
       contract section or subsection; keep it semantic and platform-neutral unless the
-      existing codebase exposes platform-specific contract names. Write a ⚠️ WARNING for
-      any missing contract detail the implementer must verify before changing code.
+      existing codebase exposes platform-specific contract names. Limit this contract to
+      inputs the task or existing API supports. Write a ⚠️ WARNING only for a missing
+      authoritative detail required to implement that supported contract; do not require
+      clarification of behavior outside it.
       String resources: for every user-visible string introduced by the task, include
       the exact key and value in the implementation prompt. Determine them from:
         (1) explicit string definitions in the task description — use keys and values

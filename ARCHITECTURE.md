@@ -1595,6 +1595,17 @@ the retry is still invalid, the orchestrator fails the task before planner or im
   production and its definition is removed.
 - *Completeness* — for every file listed in Required Changes, the agent reads the full file
   before finalising the change list; grep results alone are not sufficient.
+- *Autonomous implementation decisions* — exact names, values, signatures, and behavior
+  remain authoritative when declared by the task, inherited constraints, or an existing
+  compatibility contract. Otherwise the Analyst chooses a minimal project-conventional
+  name or structure for newly introduced code and passes an executable decision to the
+  Implementer. It leaves behavior outside the supported input contract unchanged or
+  unspecified and does not turn unspecified internal, non-user-visible diagnostic text or
+  a new symbol name into an operator-confirmation request. User-visible copy and
+  localization-managed values remain subject to the string-resource contract. A URL or
+  route literal does not by itself imply an endpoint integration, but new client or
+  repository code that calls an existing endpoint still requires its authoritative response
+  contract.
 - *Structured input contracts* — for parsers, validators, expression engines, schemas, DSLs,
   config loaders, and rule engines, the implementation prompt must include accepted inputs,
   rejected inputs, expected result types for typed contexts, scope rules, literal handling, and
@@ -1618,6 +1629,13 @@ the retry is still invalid, the orchestrator fails the task before planner or im
 The LLM runs as an autonomous agent with file tools (`Read`, `Edit`, `Write`, `LS`, `Glob`,
 read-only `Bash` — grep/find/ls only), navigating the codebase and making changes directly.
 No file content is passed in the prompt.
+The Implementer preserves every authoritative requirement and concrete implementation choice
+passed by the Analyst, unless it conflicts with higher-authority contracts or the inspected
+codebase. It makes a minimal project-conventional choice only when the implementation prompt
+leaves an ordinary detail unresolved or asks for operator confirmation about that ordinary
+detail; it does not revisit an Analyst decision merely because the upstream task left that
+detail open. Missing product, API, localization, security, privacy, or external-system
+contracts remain blocking and must not be filled through this fallback.
 
 **Sandbox (four layers):**
 - *Git isolation* — each run works in a dedicated worktree and branch; all changes are
