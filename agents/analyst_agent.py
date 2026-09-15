@@ -200,10 +200,11 @@ Steps:
    names, values, signatures, and behavior when the task, inherited constraints, or an
    existing compatibility contract makes them authoritative. Otherwise choose the minimal
    project-conventional option for a newly introduced symbol or file name, internal
-   structure, or unspecified error text. Leave behavior outside an explicitly supported
-   input contract unchanged or unspecified. State implementation choices directly; do not
-   turn them into warnings or instructions to verify, confirm, or ask before implementation.
-   Do not invent missing product, business, security, privacy, or external-system requirements.
+   structure, or unspecified internal, non-user-visible diagnostic text.
+   Leave behavior outside an explicitly supported input contract unchanged or unspecified.
+   State implementation choices directly; do not turn them into warnings or instructions
+   to verify, confirm, or ask before implementation. Do not invent missing product,
+   business, security, privacy, localization, or external-system requirements.
 4. Based on what you found, produce a single implementation prompt with these sections:
 
    1. Context: which layer/module is affected and why

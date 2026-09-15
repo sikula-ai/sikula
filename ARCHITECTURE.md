@@ -1600,10 +1600,12 @@ the retry is still invalid, the orchestrator fails the task before planner or im
   compatibility contract. Otherwise the Analyst chooses a minimal project-conventional
   name or structure for newly introduced code and passes an executable decision to the
   Implementer. It leaves behavior outside the supported input contract unchanged or
-  unspecified and does not turn unspecified error text or a new symbol name into an
-  operator-confirmation request. A URL or route literal does not by itself imply an endpoint
-  integration, but new client or repository code that calls an existing endpoint still
-  requires its authoritative response contract.
+  unspecified and does not turn unspecified internal, non-user-visible diagnostic text or
+  a new symbol name into an operator-confirmation request. User-visible copy and
+  localization-managed values remain subject to the string-resource contract. A URL or
+  route literal does not by itself imply an endpoint integration, but new client or
+  repository code that calls an existing endpoint still requires its authoritative response
+  contract.
 - *Structured input contracts* — for parsers, validators, expression engines, schemas, DSLs,
   config loaders, and rule engines, the implementation prompt must include accepted inputs,
   rejected inputs, expected result types for typed contexts, scope rules, literal handling, and

@@ -379,6 +379,7 @@ class TestAnalystAgentRun:
         prompt = task_state.analyst_prompt
         assert "without asking the operator to choose ordinary implementation details" in prompt
         assert "newly introduced symbol or file name" in prompt
+        assert "unspecified internal, non-user-visible diagnostic text" in prompt
         assert "newly consuming or calling from client/repository code" in prompt
         assert "A URL, route literal, or path formatter alone is not an endpoint integration" in prompt
         assert "sends a request to or deserializes a response" in prompt
