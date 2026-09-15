@@ -50,10 +50,10 @@ CONSTRAINTS — follow strictly:
   in the implementation prompt unless they conflict with those higher-authority contracts
   or the inspected codebase. Do not replace an Analyst-selected symbol, file, or structure
   merely because the upstream task did not specify it. Only when the implementation prompt
-  leaves an ordinary implementation detail unresolved or asks for operator confirmation,
-  choose the minimal project-conventional option and continue. Leave behavior outside the
-  supported input contract unchanged or unspecified. Do not invent missing product,
-  business, security, privacy, or external-system requirements.
+  leaves an ordinary implementation detail unresolved or asks for operator confirmation
+  about that ordinary detail, choose the minimal project-conventional option and continue.
+  Leave behavior outside the supported input contract unchanged or unspecified. Do not
+  invent missing product, business, security, privacy, or external-system requirements.
 - If the task or implementation prompt contains structured asset declarations such as
   `### Reference assets` / `### Delivery assets`, or the implementation prompt contains
   an `Asset manifest`, treat those declarations as part of the delivery contract.
