@@ -135,6 +135,22 @@ class TestImplementerAgentSuccess:
         assert prompt.startswith("PROVIDER BOUNDARY\n")
         assert stub_llm.agent_calls[0] == prompt
 
+    def test_prompt_preserves_analyst_decisions_and_resolves_unassigned_details(
+        self, stub_llm: StubLLMClient, file_tool
+    ):
+        stub_llm.agent_result = ["src/Login.kt"]
+        state = _make_state()
+
+        _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        prompt = stub_llm.agent_calls[0]
+        assert "Follow concrete implementation choices" in prompt
+        assert "Do not replace an Analyst-selected symbol" in prompt
+        assert "leaves an ordinary implementation detail unresolved" in prompt
+        assert "Leave behavior outside the" in prompt
+        assert "supported input contract unchanged" in prompt
+        assert "operator confirmation" in prompt
+
     def test_changed_files_added_to_state(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["src/Login.kt", "src/di/Module.kt"]
         state = _make_state()

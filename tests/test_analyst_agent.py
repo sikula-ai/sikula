@@ -205,6 +205,7 @@ class TestAnalystAgentRun:
         assert "preserve every listed constraint" in task_state.analyst_prompt
         normalized_prompt = " ".join(task_state.analyst_prompt.split())
         assert "direct the implementer to stop and report the required follow-up" in normalized_prompt
+        assert "do not delegate an operator confirmation request to the Implementer" in normalized_prompt
         assert "DELIVERY STOP OUTPUT CONTRACT" in task_state.analyst_prompt
 
     def test_legacy_analyst_prompt_omits_delivery_disposition_contract(
@@ -367,6 +368,22 @@ class TestAnalystAgentRun:
         assert "platform-neutral" in task_state.analyst_prompt
         assert "materially different rejected input" in task_state.analyst_prompt
         assert "classes" in task_state.analyst_prompt
+
+    def test_analyst_prompt_resolves_non_authoritative_implementation_decisions(
+        self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
+    ):
+        stub_llm.readonly_result = VALID_ANALYST_PROMPT
+
+        _make_agent(stub_llm, file_tool).run(task_state)
+
+        prompt = task_state.analyst_prompt
+        assert "without asking the operator to choose ordinary implementation details" in prompt
+        assert "newly introduced symbol or file name" in prompt
+        assert "newly consuming or calling from client/repository code" in prompt
+        assert "A URL, route literal, or path formatter alone is not an endpoint integration" in prompt
+        assert "sends a request to or deserializes a response" in prompt
+        assert "Leave behavior outside an explicitly supported" in prompt
+        assert "clarification of behavior outside it" in prompt
 
     def test_analyst_prompt_requires_asset_manifest_obligations(
         self, stub_llm: StubLLMClient, task_state: TaskState, file_tool
