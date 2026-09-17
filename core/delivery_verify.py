@@ -242,15 +242,41 @@ def verify_delivery_plan(
             )
             progress = mark_delivery_verification(progress, running)
             write_delivery_progress(progress_path, progress)
-            append_delivery_progress_event(
-                events_path,
-                DeliveryProgressEvent(
-                    plan_id=plan_id,
-                    event_type="verification.running",
-                    timestamp=running.started_at or _now(),
-                    commit=identity.candidate_commit,
-                ),
+            running_event = DeliveryProgressEvent(
+                plan_id=plan_id,
+                event_type="verification.running",
+                timestamp=running.started_at or _now(),
+                commit=identity.candidate_commit,
             )
+            if not _safe_append_progress_event(events_path, running_event):
+                blocked_record = replace(
+                    running,
+                    status="blocked",
+                    stop_code="delivery_verification.event_unavailable",
+                    completed_at=_now(),
+                )
+                progress = mark_delivery_verification(progress, blocked_record)
+                write_delivery_progress(progress_path, progress)
+                _safe_append_progress_event(
+                    events_path,
+                    DeliveryProgressEvent(
+                        plan_id=plan_id,
+                        event_type="verification.blocked",
+                        timestamp=blocked_record.completed_at or _now(),
+                        commit=identity.candidate_commit,
+                    ),
+                )
+                _safe_append_audit(
+                    evidence_path,
+                    {"event": "event_unavailable", "record": blocked_record.to_dict()},
+                    project_root=root,
+                )
+                return _result_from_record(
+                    status,
+                    blocked_record,
+                    succeeded=False,
+                    next_action="resolve_delivery_verification_blocker",
+                )
             if not _safe_append_audit(
                 evidence_path,
                 {"event": "running", "record": running.to_dict()},
@@ -264,7 +290,7 @@ def verify_delivery_plan(
                 )
                 progress = mark_delivery_verification(progress, blocked_record)
                 write_delivery_progress(progress_path, progress)
-                append_delivery_progress_event(
+                _safe_append_progress_event(
                     events_path,
                     DeliveryProgressEvent(
                         plan_id=plan_id,
@@ -756,6 +782,14 @@ def _persist_terminal_if_current(
             return True
     except DeliveryProgressLockError:
         return False
+
+
+def _safe_append_progress_event(path: Path, event: DeliveryProgressEvent) -> bool:
+    try:
+        append_delivery_progress_event(path, event)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return True
 
 
 def _ensure_verification_progress_event(

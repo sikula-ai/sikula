@@ -921,6 +921,70 @@ def test_delivery_verification_repairs_missing_terminal_event_on_reuse(
     ]
 
 
+def test_delivery_verification_blocks_and_recovers_when_running_event_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    unit_commit = _git_commit_all(tmp_path, "delivery unit")
+    write_delivery_progress(
+        delivery_progress_path(tmp_path, "demo"),
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="demo",
+            units=[make_delivery_unit_progress("unit", "done", commit=unit_commit)],
+            assembly_base_commit=base,
+        ),
+    )
+    config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
+    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'
+    llm = _ReadonlyLLM([approval])
+    reviewer = DeliveryIntegrationReviewAgent(llm, config)
+    append_event = delivery_verify_module.append_delivery_progress_event
+
+    def fail_event(_path: Path, _event: DeliveryProgressEvent) -> None:
+        raise OSError("event storage unavailable")
+
+    monkeypatch.setattr(delivery_verify_module, "append_delivery_progress_event", fail_event)
+    blocked = verify_delivery_plan(
+        plan_path,
+        config,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        semantic_reviewer=reviewer,
+        security_reviewer=None,
+        project_root=tmp_path,
+    )
+
+    progress, errors = read_delivery_progress(delivery_progress_path(tmp_path, "demo"), plan_id="demo")
+    assert progress is not None and not errors and progress.verification is not None
+    assert blocked.succeeded is False
+    assert blocked.stop_code == "delivery_verification.event_unavailable"
+    assert progress.verification.status == "blocked"
+    assert llm.calls == []
+
+    monkeypatch.setattr(delivery_verify_module, "append_delivery_progress_event", append_event)
+    repaired = verify_delivery_plan(
+        plan_path,
+        config,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        semantic_reviewer=reviewer,
+        security_reviewer=None,
+        project_root=tmp_path,
+    )
+
+    events = [
+        json.loads(line) for line in delivery_events_path(tmp_path, "demo").read_text(encoding="utf-8").splitlines()
+    ]
+    assert repaired.succeeded is True
+    assert len(llm.calls) == 1
+    assert [event["event_type"] for event in events if event["event_type"].startswith("verification.")] == [
+        "verification.blocked",
+        "verification.running",
+        "verification.passed",
+    ]
+
+
 def test_delivery_verification_records_blocked_event_when_audit_setup_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
