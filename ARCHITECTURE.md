@@ -373,8 +373,12 @@ ordinary CLI output exposes only the unit ID and missing-value count.
 The agent adds
 `source_task.path` and a SHA-256 fingerprint deterministically from the task
 input rather than trusting model output. Plan checking rejects stale source
-fingerprints, malformed constraint metadata, unresolved dispositions, unknown
-unit references, and constraints still assigned to superseded units. Existing
+fingerprints and source paths under environment, VCS, or standard Sikula
+runtime/report roots before reading them. The final gate also rejects configured
+state/report roots and platform environment files before assembly or provider
+invocation. Plan checking rejects malformed constraint metadata, unresolved
+dispositions, unknown unit references, and constraints still assigned to
+superseded units. Existing
 plans without this additive metadata remain valid.
 The same parsed authoring units carry bounded `asset_paths` assignments. Unlike
 semantic constraints, asset continuity is verified deterministically: the writer
@@ -561,7 +565,10 @@ delivery-plan MVP primitive. Its CLI wrapper lives in `sikula_cli/delivery.py`;
 deterministic validation is implemented by `core/delivery_plan.py`. It validates
 tracked `.sikula/delivery/<slug>/plan.yaml` files without creating
 `TaskState`, starting agents, creating worktrees, preparing contracts, or
-updating branches. The validator checks schema version, required plan metadata,
+updating branches. For schema-version-2 plans the command also loads an available
+runtime config without requiring one and applies the final-gate readiness checks;
+absent settings use the same runtime defaults as execution. The validator checks
+schema version, required plan metadata,
 delivery unit IDs, unit task paths, dependency references/cycles, optional stream
 references, optional monorepo component metadata, unit scope paths, optional
 unit sizing/risk/budget metadata, and the MVP single-repository boundary.
@@ -1018,22 +1025,98 @@ finalization engine. An already current finalized plan returns idempotently
 without duplicating its finalization event. Dry-run uses the existing run-next
 and finalize previews and does not mutate state or Git. JSON output is one
 compact aggregate projection rather than accumulated child state; child
-machine-readable output is redirected to stderr. This coordinator adds no
-whole-plan LLM review or validation pass, so quality gates and audit state remain
-owned by each ordinary unit run.
+machine-readable output is redirected to stderr. For schema-version-2 plans,
+completion hands off to the final integration gate described below before
+deterministic finalization. Legacy schema-version-1 plans retain the direct
+finalize path.
+
+**Delivery final integration gate:** newly prepared plans use schema version 2
+and declare `verification.mode: final_gate`; schema version 1 remains a readable
+legacy policy with no implied verification. `core/delivery_verify.py` owns one
+bounded root integration-node execution, while `core/delivery_verification.py`
+owns readiness and immutable identity construction,
+`core/delivery_verification_validation.py` owns validation policy/reuse, and
+`agents/delivery_integration_review_agent.py` owns the read-only semantic and
+security protocols. Unknown schema-2 policy values fail closed.
+
+The gate captures dependency-ordered assembly under the delivery progress lock,
+parses and hashes one immutable plan byte snapshot, captures and hashes the exact
+source text used by the attempt, records a `running` attempt, then releases the
+lock. Its identity binds candidate commit/tree, source hash, those parsed plan
+bytes, completed-unit/handoff scope, effective validation config,
+applicable reviewer extra-rules paths and security context, and verification
+policy. Validation and reviewer calls run in a detached worktree for that exact
+commit, preserve the configured project prefix for nested projects, and disable
+Git replacement objects. Configured reviewer rules are loaded from that candidate
+through the configured `sandbox.allowed_read_paths`, which are stated in the
+reviewer prompt and bound into gate identity. This first milestone invokes an
+autonomous integration reviewer only when those paths include `.`, because the
+provider boundary cannot yet enforce a narrower cross-provider read scope; narrower
+configuration fails readiness before unit execution. Private source-task paths are
+rejected by readiness before unit execution and rechecked during capture. The reviewer packet
+includes the enabled validation phases and effective commands that produced its
+phase results. Missing or unreadable rules fail closed. Before persisting a
+terminal result, the gate reacquires the lock and recomputes every identity plus
+the assembled branch ref;
+mismatches are stale and never authorize the newer candidate. Persistence also
+matches the current attempt number, so an older concurrent attempt cannot
+overwrite a newer one. Status
+projection compares passed evidence with the current plan and effective config;
+mismatches are reported as `stale` and direct execution reruns the gate.
+
+Exact-tree child validation may be reused only with the same enabled build/test/
+check policy and successful final child evidence. Missing or unequal evidence
+causes normal platform BuildTool validation to execute. Final-only configured
+checks always execute without enabling a disabled sync phase, and enabled presync
+remains independent of `run_build`.
+Gitignored environment files needed by validation are removed before reviewer
+workspace setup or provider execution. Semantic approval is mandatory; a
+separate security approval is mandatory for plans marked by security constraints
+or risk tags.
+The candidate's repository configuration must match the exact configuration
+source loaded by the command; a delivery unit that changes it blocks the gate
+before validation and requires a fresh command context. Automatic `delivery run`
+verification does not retry an unchanged candidate after an actionable reviewer
+disposition; the recorded repair, amendment, dependency, or human-review action
+must occur first.
+Both providers use `run_readonly_agent`, exact-final-line structured output, one
+bounded malformed-protocol retry, and fail closed on uncertainty or mutation.
+
+Delivery progress stores only current candidate identity, attempt, compact
+phase statuses, safe counts, timestamps, stop code, and a project-relative local
+audit reference. The append-only local audit owns private source prompts,
+provider output, validation diagnostics, parser failures, and interruptions. Its
+file is created without following the file or any parent symlink and remains
+owner-readable only. Repeating verification for the exact current pass returns
+before assembly, preserving any matching finalization metadata.
+Reviewer failures preserve statuses for validation and earlier reviews that
+already completed, and status maps actionable review dispositions to their
+specific recovery operation rather than recommending an identical retry.
+Any unit, assembly, or amendment change invalidates current evidence. Covered
+finalization accepts only the exact passed candidate and never invokes an LLM or
+synthesizes a post-review commit. The first gate measures source text, rendered
+plan context, effective validation and final-check policy, applicable reviewer
+rules, security context, and bounded protocol overhead. It also checks each exact
+rendered reviewer prompt immediately before provider execution. Oversized
+authority packets fail with `delivery_verification.hierarchy_required`; recursive
+checkpoint scheduling and unbounded authority graphs remain future extensions.
 
 **Delivery final branch command:** `sikula delivery finalize PLAN_FILE` is the
 explicit final branch assembly step for a completed delivery plan. Its CLI
 wrapper lives in `sikula_cli/delivery.py`; deterministic preflight and Git ref
 updates are implemented by `core/delivery_finalize.py`. Finalize requires the
-plan status to be `done`, reconciles legacy or interrupted progress through the
+plan status to be `done`. It reconciles legacy schema-version-1 progress through the
 same dependency-ordered assembly engine, verifies the resulting ancestry, and
 records the assembled commit as final. Existing diverged or checked-out final
 branches are rejected; Sikula does not force-update them. The command records
 only compact parent metadata in delivery progress: assembly state, final branch,
 final commit, finalized timestamp, and append-only assembly/finalization events. It does
 not embed child task state, prompts, provider output, diffs, logs, or validation
-records. Any later unit progress update clears finalization metadata because the
+records. For schema-version-2 plans, finalize requires the current passing gate
+identity and records that exact candidate without assembly or provider calls.
+It revalidates the complete gate identity and final branch ref immediately before
+persisting finalization metadata so an external Git ref move fails closed.
+Any later unit progress update clears finalization metadata because the
 recorded final branch is a snapshot of a specific completed unit set.
 `--dry-run` performs the same preflight without mutating Git refs or progress.
 Its projection exposes `final_commit` only when the candidate already contains
@@ -2813,6 +2896,11 @@ See [Providers](docs/providers.md) for provider setup and the extension entry po
 | `generate(system, user) -> str` | PlannerAgent, DeliveryPreparationAgent | Single-shot text generation; returns the model's text response |
 | `run_readonly_agent(prompt, cwd) -> str` | AnalystAgent, ReviewerAgent, SecurityReviewerAgent | Runs the model as an autonomous read-only agent in `cwd`; returns text output (stdout) |
 | `run_agent(prompt, cwd) -> tuple[list[str], str]` | ImplementerAgent, TestWriterAgent, FixerAgent | Runs the model as an autonomous agent with file read/write tools in `cwd`; returns `(changed_file_paths, agent_text_output)` — paths via git diff, text best-effort |
+
+Providers that create project-local settings for read-only calls override the
+optional `prepare_readonly_agent_workspace(cwd)` hook. Final integration
+verification invokes it before its immutable workspace baseline; the subsequent
+provider call must be idempotent and any later mutation fails the gate.
 
 Providers that must create or update project-local files before a write-capable call
 override the optional `prepare_write_agent_workspace(cwd)` hook. The operation must be

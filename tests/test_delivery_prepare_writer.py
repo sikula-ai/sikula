@@ -20,7 +20,18 @@ from core.delivery_prepare_writer import DeliveryPrepareWriteIssue, write_delive
 from core.delivery_unit_metadata import DeliveryUnitBudget
 
 
+_TEST_SOURCE_TEXT = "# Delivery source task\n"
+_TEST_SOURCE_TASK = DeliveryPlanSourceTask(
+    path=".sikula/tasks/delivery-source.md",
+    sha256="sha256:" + sha256(_TEST_SOURCE_TEXT.encode("utf-8")).hexdigest(),
+)
+
+
 def _project_config(root: Path) -> dict:
+    source_path = root / _TEST_SOURCE_TASK.path
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    if not source_path.exists():
+        source_path.write_text(_TEST_SOURCE_TEXT, encoding="utf-8")
     return {
         "project": {"build_tool": "python", "root_path": str(root)},
         "run_build": True,
@@ -166,11 +177,10 @@ def _draft(
         ],
         planning_mode=planning_mode,
         constraints=constraint_values,
-        source_task=source_task,
-        constraint_verification=(
-            DeliveryConstraintVerification(constraints_complete=True, constraints=list(constraint_values))
-            if source_task is not None
-            else None
+        source_task=source_task or _TEST_SOURCE_TASK,
+        constraint_verification=DeliveryConstraintVerification(
+            constraints_complete=True,
+            constraints=list(constraint_values),
         ),
     )
 
@@ -254,12 +264,14 @@ def test_write_delivery_prepare_artifacts_writes_valid_plan_and_units(tmp_path: 
     assert all(unit.blocking_gap_count == 0 for unit in result.unit_readiness.units)
     assert all(unit.ready_for_autonomous_delivery for unit in result.unit_readiness.units)
     assert plan_data == {
-        "schema_version": 1,
+        "schema_version": 2,
         "plan_id": "team-invites",
         "title": "Team invites delivery",
         "planning_mode": "fixed_window",
         "final_branch": "sikula/delivery/team-invites",
         "repositories": [{"id": "main", "root": "."}],
+        "source_task": _TEST_SOURCE_TASK.to_dict(),
+        "verification": {"mode": "final_gate"},
         "streams": ["backend", "frontend"],
         "units": [
             {
@@ -716,7 +728,7 @@ def test_write_delivery_prepare_artifacts_omits_absent_optional_fields(tmp_path:
         draft,
         output_dir=".sikula/delivery/team-invites",
         project_root=tmp_path,
-        project_config=None,
+        project_config=_project_config(tmp_path),
     )
 
     plan_file = tmp_path / ".sikula" / "delivery" / "team-invites" / "plan.yaml"
@@ -1138,7 +1150,7 @@ def test_write_delivery_prepare_artifacts_rejects_unsafe_output_paths(
     assert result.paths.plan_file == ""
     assert result.paths.units_dir == ""
     assert result.paths.unit_task_paths == {}
-    assert not (tmp_path / ".sikula").exists()
+    assert not (tmp_path / ".sikula" / "delivery").exists()
 
 
 def test_write_delivery_prepare_artifacts_rejects_invalid_generated_final_branch(tmp_path: Path) -> None:

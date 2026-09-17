@@ -330,6 +330,8 @@ def test_delivery_plan_check_rejects_invalid_inherited_constraints(
         ("unsafe_metadata", "source_task.path_metadata_invalid"),
         ("parent_traversal", "source_task.path_parent_traversal"),
         ("missing_file", "source_task.read_failed"),
+        ("private_env", "source_task.private_path"),
+        ("private_runtime", "source_task.private_path"),
     ],
 )
 def test_delivery_plan_check_rejects_source_task_boundary_cases(
@@ -349,6 +351,16 @@ def test_delivery_plan_check_rejects_source_task_boundary_cases(
         data["source_task"]["path"] = ".sikula/tasks/../tasks/source-task.md"
     elif case == "missing_file":
         data["source_task"]["path"] = ".sikula/tasks/missing.md"
+    elif case in {"private_env", "private_runtime"}:
+        relative = ".env" if case == "private_env" else ".sikula/state/private.json"
+        private_source = tmp_path / relative
+        private_source.parent.mkdir(parents=True, exist_ok=True)
+        private_text = "PRIVATE=value\n"
+        private_source.write_text(private_text, encoding="utf-8")
+        data["source_task"] = {
+            "path": relative,
+            "sha256": "sha256:" + sha256(private_text.encode("utf-8")).hexdigest(),
+        }
 
     result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
 
@@ -651,13 +663,60 @@ def test_delivery_plan_check_does_not_warn_for_low_risk_narrow_unit(tmp_path: Pa
 def test_delivery_plan_check_rejects_unsupported_schema_version(tmp_path: Path) -> None:
     _git_init(tmp_path)
     data = _base_plan(tmp_path)
-    data["schema_version"] = 2
+    data["schema_version"] = 3
     plan_path = _write_plan(tmp_path, data)
 
     result = check_delivery_plan_file(plan_path)
 
     assert result.valid is False
     assert "schema_version.unsupported" in _codes(result)
+
+
+def test_delivery_plan_check_accepts_schema_v2_final_gate_policy(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["schema_version"] = 2
+    data["source_task"] = _write_source_task(tmp_path)
+    data["verification"] = {"mode": "final_gate"}
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is True
+    assert result.plan is not None
+    assert result.plan.requires_final_verification is True
+    assert result.plan.verification is not None
+    assert result.plan.verification.to_dict() == {"mode": "final_gate"}
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "verification", "expected_code"),
+    [
+        (1, {"mode": "final_gate"}, "verification.schema_version_required"),
+        (2, None, "verification.required"),
+        (2, {"mode": "unknown"}, "verification.mode_invalid"),
+        (2, {"mode": "final_gate", "extra": True}, "verification.keys_invalid"),
+    ],
+)
+def test_delivery_plan_check_rejects_invalid_verification_policy(
+    tmp_path: Path,
+    schema_version: int,
+    verification: object,
+    expected_code: str,
+) -> None:
+    _git_init(tmp_path)
+    data = _base_plan(tmp_path)
+    data["schema_version"] = schema_version
+    if schema_version == 2:
+        data["source_task"] = _write_source_task(tmp_path)
+    if verification is not None:
+        data["verification"] = verification
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path)
+
+    assert result.valid is False
+    assert expected_code in _codes(result)
 
 
 def test_delivery_plan_check_rejects_plan_id_that_cannot_be_used_for_state_path(tmp_path: Path) -> None:
@@ -1260,7 +1319,7 @@ def test_delivery_check_cli_exits_nonzero_for_invalid_plan(tmp_path: Path, capsy
     assert "Status: invalid" in capsys.readouterr().out
 
 
-def test_main_dispatches_delivery_check_without_loading_project_config(tmp_path: Path) -> None:
+def test_main_dispatches_delivery_check_with_optional_project_config(tmp_path: Path) -> None:
     plan_path = tmp_path / "plan.yaml"
     plan_path.write_text("schema_version: 1\n", encoding="utf-8")
 
@@ -1269,5 +1328,5 @@ def test_main_dispatches_delivery_check_without_loading_project_config(tmp_path:
             with patch("sikula.cmd_delivery_check") as delivery_check:
                 main()
 
-    load_config.assert_not_called()
+    load_config.assert_called_once_with(None, required=False)
     delivery_check.assert_called_once()

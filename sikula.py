@@ -21,6 +21,7 @@ Delivery-plan workflow after assessment:
   sikula delivery run-next .sikula/delivery/my-plan/plan.yaml --dry-run
   sikula delivery run-next .sikula/delivery/my-plan/plan.yaml
   sikula delivery run .sikula/delivery/my-plan/plan.yaml
+  sikula delivery verify .sikula/delivery/my-plan/plan.yaml
   sikula delivery finalize .sikula/delivery/my-plan/plan.yaml --dry-run
   sikula delivery finalize .sikula/delivery/my-plan/plan.yaml
 
@@ -272,34 +273,9 @@ def _build_tool_class(cfg: dict):
     tests/test_platform_onboarding.py. Also extend the test execution gate audit
     registry if the platform brings new test skip idioms.
     """
-    platform = cfg.get("project", {}).get("build_tool", "gradle-android")
-    if platform == "python":
-        from tools.python_tool import PythonTool
+    from tools.build_factory import build_tool_class
 
-        return PythonTool
-    if platform == "cargo":
-        from tools.cargo_tool import CargoTool
-
-        return CargoTool
-    if platform == "node":
-        from tools.node_tool import NodeTool
-
-        return NodeTool
-    if platform == "xcodebuild":
-        from tools.xcode_tool import XcodeTool
-
-        return XcodeTool
-    if platform == "gradle-jvm":
-        from tools.gradle_jvm_tool import JvmGradleTool
-
-        return JvmGradleTool
-    if platform == "maven":
-        from tools.maven_tool import MavenTool
-
-        return MavenTool
-    from tools.gradle_android_tool import AndroidGradleTool
-
-    return AndroidGradleTool
+    return build_tool_class(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -1049,6 +1025,7 @@ def _run_config_snapshot(cfg: dict, overrides: dict | None = None) -> dict:
 
     return {
         "project": cfg.get("project", {}).get("name"),
+        "project_build_tool": cfg.get("project", {}).get("build_tool", "gradle-android"),
         "run_presync": _run_phase_flag(cfg, overrides, "run_presync"),
         "run_planner": _run_phase_flag(cfg, overrides, "run_planner"),
         "run_review": _run_phase_flag(cfg, overrides, "run_review"),
@@ -3376,7 +3353,7 @@ def cmd_delivery_check(args: argparse.Namespace, cfg: dict) -> None:
 
 
 def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
-    return cli_delivery.cmd_delivery_status(args, cfg)
+    return cli_delivery.cmd_delivery_status(args, _delivery_verification_effective_config(args, cfg))
 
 
 def _run_delivery_assessment(
@@ -3527,7 +3504,75 @@ def cmd_delivery_amend_apply(args: argparse.Namespace, cfg: dict) -> None:
 
 
 def cmd_delivery_finalize(args: argparse.Namespace, cfg: dict) -> None:
-    return cli_delivery.cmd_delivery_finalize(args, cfg)
+    return cli_delivery.cmd_delivery_finalize(args, _delivery_verification_effective_config(args, cfg))
+
+
+def _run_delivery_verification(args: argparse.Namespace, cfg: dict):
+    from agents.delivery_integration_review_agent import DeliveryIntegrationReviewAgent
+    from core.delivery_verify import verify_delivery_plan
+    from core.delivery_progress import get_delivery_status
+    from core.delivery_verification import check_delivery_verification_readiness
+    from core.llm_client import create_llm_client
+    from core.state import JsonStateStore
+
+    effective_cfg = _delivery_verification_effective_config(args, cfg)
+    project_root = Path(effective_cfg["project"]["root_path"]).resolve()
+    status = get_delivery_status(args.plan_file, project_root=project_root)
+    readiness = check_delivery_verification_readiness(status, effective_cfg)
+    parsed = _parse_agent_llm_overrides(
+        getattr(args, "agent_model", None),
+        getattr(args, "agent_provider", None),
+        getattr(args, "agent_timeout", None),
+        valid_agents=set(_VALID_AGENTS),
+    )
+    overrides = {"agent_llms": parsed}
+    base_llm_cfg = effective_cfg.get("llm", {}) if isinstance(effective_cfg.get("llm"), dict) else {}
+    agents: dict[str, DeliveryIntegrationReviewAgent] = {}
+    if readiness.required and readiness.ready and status.status == "done":
+        agent_names = ["reviewer"]
+        if readiness.security_required:
+            agent_names.append("security_reviewer")
+        for name in agent_names:
+            effective_llm = _effective_agent_llm_cfg(effective_cfg, overrides, name)
+            usage_records: list[dict[str, object]] = []
+            llm_config = _make_llm_config(base_llm_cfg, effective_llm)
+            llm_config.usage_observer = lambda record, records=usage_records: records.append(dict(record))
+            agents[name] = DeliveryIntegrationReviewAgent(
+                create_llm_client(llm_config),
+                project_config=effective_cfg,
+                usage_records=usage_records,
+            )
+    return verify_delivery_plan(
+        args.plan_file,
+        effective_cfg,
+        state_store=JsonStateStore(_resolve_state_dir(effective_cfg)),
+        semantic_reviewer=agents.get("reviewer"),
+        security_reviewer=agents.get("security_reviewer"),
+        project_root=project_root,
+    )
+
+
+def _delivery_verification_effective_config(args: argparse.Namespace, cfg: dict) -> dict:
+    parsed = _parse_agent_llm_overrides(
+        getattr(args, "agent_model", None),
+        getattr(args, "agent_provider", None),
+        getattr(args, "agent_timeout", None),
+        valid_agents=set(_VALID_AGENTS),
+    )
+    effective = {**cfg, "agents": {**cfg.get("agents", {})}}
+    for name in ("reviewer", "security_reviewer"):
+        if name not in parsed:
+            continue
+        current = cfg.get("agents", {}).get(name, {})
+        effective["agents"][name] = {
+            **current,
+            "llm": {**current.get("llm", {}), **parsed[name]},
+        }
+    return effective
+
+
+def cmd_delivery_verify(args: argparse.Namespace, cfg: dict) -> None:
+    return cli_delivery.cmd_delivery_verify(args, cfg, _delivery_run_next_context(cfg))
 
 
 def _run_delivery_child_task(args: argparse.Namespace, cfg: dict) -> cli_delivery.DeliveryChildRunResult:
@@ -3551,6 +3596,8 @@ def _delivery_run_next_context(cfg: dict) -> cli_delivery.DeliveryRunNextContext
         resolve_state_dir=_resolve_state_dir,
         state_store=JsonStateStore(_resolve_state_dir(cfg)),
         run_amendment_authoring=_run_delivery_amend_prepare_authoring,
+        verify_plan=_run_delivery_verification,
+        verification_config=_delivery_verification_effective_config,
     )
 
 
@@ -3613,9 +3660,9 @@ def main() -> None:
         cmd_init(args)
         return
 
-    if args.command == "delivery" and args.delivery_command in {None, "check"}:
+    if args.command == "delivery" and args.delivery_command is None:
         cfg = {}
-    elif args.command == "delivery" and args.delivery_command == "status":
+    elif args.command == "delivery" and args.delivery_command in {"check", "status"}:
         if args.config:
             cfg = _load_runtime_config(args.config, required=False)
         else:
@@ -3663,6 +3710,8 @@ def main() -> None:
             cmd_delivery_run_next(args, cfg)
         elif args.delivery_command == "run":
             cmd_delivery_run(args, cfg)
+        elif args.delivery_command == "verify":
+            cmd_delivery_verify(args, cfg)
         elif args.delivery_command == "finalize":
             cmd_delivery_finalize(args, cfg)
         elif args.delivery_command == "amend" and args.delivery_amend_command == "prepare":

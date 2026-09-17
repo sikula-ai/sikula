@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sikula delivery verification result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sikula_version",
+    "command",
+    "privacy_mode",
+    "plan_path",
+    "project_root",
+    "valid",
+    "ready",
+    "succeeded",
+    "status",
+    "semantic_status",
+    "security_required",
+    "security_status",
+    "validation_reused",
+    "validation_executed",
+    "finding_count",
+    "errors",
+    "warnings"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "sikula_version": {"type": "string", "minLength": 1, "maxLength": 200},
+    "command": {"const": "delivery.verify"},
+    "privacy_mode": {"const": "public_metadata"},
+    "plan_path": {"type": "string", "minLength": 1, "maxLength": 500},
+    "project_root": {"type": ["string", "null"], "enum": [".", null]},
+    "valid": {"type": "boolean"},
+    "ready": {"type": "boolean"},
+    "succeeded": {"type": "boolean"},
+    "status": {
+      "enum": ["not_required", "pending", "running", "passed", "failed", "blocked", "stale", "interrupted"]
+    },
+    "gate_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "candidate_commit": {"type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"},
+    "candidate_tree": {"type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"},
+    "attempt": {"type": "integer", "minimum": 1},
+    "semantic_status": {"enum": ["not_run", "approved", "rejected", "blocked"]},
+    "security_required": {"type": "boolean"},
+    "security_status": {"enum": ["not_run", "approved", "rejected", "blocked"]},
+    "validation_reused": {"type": "boolean"},
+    "validation_executed": {"type": "boolean"},
+    "finding_count": {"type": "integer", "minimum": 0},
+    "stop_code": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*$", "maxLength": 200},
+    "next_action": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*$", "maxLength": 200},
+    "errors": {"type": "array", "items": {"$ref": "#/$defs/issue"}},
+    "warnings": {"type": "array", "items": {"$ref": "#/$defs/issue"}}
+  },
+  "$defs": {
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["severity", "code", "message"],
+      "properties": {
+        "severity": {"enum": ["error", "warning"]},
+        "code": {"type": "string", "minLength": 1, "maxLength": 200},
+        "message": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "path": {"type": "string", "minLength": 1, "maxLength": 500}
+      }
+    }
+  }
+}

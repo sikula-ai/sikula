@@ -3,13 +3,130 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import contextmanager
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
+from typing import Iterator
 
 
 class WorktreeEnvironmentCopyError(RuntimeError):
     """Raised when an environment file cannot be copied without escaping its worktree."""
+
+
+class DetachedWorktreeError(RuntimeError):
+    """Raised when an internal detached worktree cannot be managed safely."""
+
+
+def delivery_verification_git_env() -> dict[str, str]:
+    """Return a repository-discovered Git environment without replacement objects."""
+
+    env = dict(os.environ)
+    for key in (
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    ):
+        env.pop(key, None)
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return env
+
+
+@contextmanager
+def detached_delivery_verification_worktree(project_root: Path, commit: str) -> Iterator[Path]:
+    """Create a detached candidate worktree and yield its configured project root."""
+
+    root = project_root.resolve(strict=True)
+    env = delivery_verification_git_env()
+    top_level = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+    if top_level.returncode != 0 or not top_level.stdout.strip():
+        raise DetachedWorktreeError("Delivery verification could not resolve the repository root.")
+    try:
+        git_root = Path(top_level.stdout.strip()).resolve(strict=True)
+        project_prefix = root.relative_to(git_root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise DetachedWorktreeError("Delivery verification project root is outside its repository.") from exc
+
+    parent = root / ".sikula" / "worktrees" / "delivery-verification"
+    _prepare_private_worktree_parent(root, parent)
+    worktree = Path(tempfile.mkdtemp(prefix="candidate-", dir=parent))
+    added = False
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "add", "--detach", str(worktree), commit],
+            cwd=git_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        if result.returncode != 0:
+            raise DetachedWorktreeError("Delivery verification could not create its isolated worktree.")
+        added = True
+        if worktree.is_symlink() or not worktree.is_dir():
+            raise DetachedWorktreeError("Delivery verification worktree has an unsafe filesystem identity.")
+        candidate_root = worktree
+        for part in project_prefix.parts:
+            candidate_root /= part
+            if candidate_root.is_symlink() or not candidate_root.is_dir():
+                raise DetachedWorktreeError("Delivery verification project root is unavailable in the candidate.")
+        try:
+            candidate_root.resolve(strict=True).relative_to(worktree.resolve(strict=True))
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise DetachedWorktreeError("Delivery verification project root escapes the candidate worktree.") from exc
+        yield candidate_root
+    finally:
+        cleanup_failed = False
+        if added:
+            cleanup = subprocess.run(
+                ["git", "worktree", "remove", "--force", str(worktree)],
+                cwd=git_root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+            cleanup_failed = cleanup.returncode != 0
+        if worktree.exists() and not cleanup_failed:
+            shutil.rmtree(worktree, ignore_errors=True)
+        if cleanup_failed:
+            raise DetachedWorktreeError("Delivery verification could not clean up its isolated worktree.")
+
+
+def _prepare_private_worktree_parent(root: Path, parent: Path) -> None:
+    current = root
+    for part in parent.relative_to(root).parts:
+        current /= part
+        created = False
+        try:
+            if current.is_symlink():
+                raise DetachedWorktreeError("Delivery verification worktree parent contains a symlink.")
+            if current.exists() and not current.is_dir():
+                raise DetachedWorktreeError("Delivery verification worktree parent is not a directory.")
+            if not current.exists():
+                current.mkdir(mode=0o700)
+                created = True
+            if created:
+                os.chmod(current, 0o700)
+        except DetachedWorktreeError:
+            raise
+        except OSError as exc:
+            raise DetachedWorktreeError("Delivery verification worktree parent is unavailable.") from exc
 
 
 def copy_worktree_environment_file(source: Path, destination: Path, worktree_root: Path) -> bool:
@@ -211,12 +328,18 @@ def current_branch_name(git_root: Path) -> tuple[str | None, str | None]:
     return None, "unknown"
 
 
-def branch_checked_out(git_root: Path, branch: str) -> bool:
+def branch_checked_out(
+    git_root: Path,
+    branch: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> bool:
     result = subprocess.run(
         ["git", "worktree", "list", "--porcelain"],
         capture_output=True,
         text=True,
         cwd=git_root,
+        env=env,
     )
     if result.returncode != 0:
         return True
@@ -224,24 +347,36 @@ def branch_checked_out(git_root: Path, branch: str) -> bool:
     return any(line.strip() == branch_ref for line in result.stdout.splitlines())
 
 
-def resolve_git_commit(git_root: Path, ref: str) -> tuple[str | None, str]:
+def resolve_git_commit(
+    git_root: Path,
+    ref: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> tuple[str | None, str]:
     r = subprocess.run(
         ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
         capture_output=True,
         text=True,
         cwd=git_root,
+        env=env,
     )
     if r.returncode == 0 and r.stdout.strip():
         return r.stdout.strip().splitlines()[0], ""
     return None, _short_audit_line(r.stderr.strip() or r.stdout.strip() or "unknown revision")
 
 
-def git_path_lines(git_root: Path, args: list[str]) -> tuple[list[str], str | None]:
+def git_path_lines(
+    git_root: Path,
+    args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+) -> tuple[list[str], str | None]:
     r = subprocess.run(
         ["git", *args],
         capture_output=True,
         text=True,
         cwd=git_root,
+        env=env,
     )
     if r.returncode != 0:
         return [], _short_audit_line(r.stderr.strip() or r.stdout.strip() or "git command failed")
@@ -280,15 +415,20 @@ def current_worktree_changes(
     git_root: Path,
     *,
     exclude_paths: Sequence[Path] | None = None,
+    git_env: dict[str, str] | None = None,
 ) -> tuple[list[str], list[str], list[str], str | None]:
     excluded_prefixes = git_excluded_path_prefixes(git_root, exclude_paths)
-    staged, error = git_path_lines(git_root, ["diff", "--cached", "--name-only"])
+    staged, error = git_path_lines(git_root, ["diff", "--cached", "--name-only"], env=git_env)
     if error:
         return [], [], [], error
-    unstaged, error = git_path_lines(git_root, ["diff", "--name-only"])
+    unstaged, error = git_path_lines(git_root, ["diff", "--name-only"], env=git_env)
     if error:
         return [], [], [], error
-    untracked, error = git_path_lines(git_root, ["ls-files", "--others", "--exclude-standard"])
+    untracked, error = git_path_lines(
+        git_root,
+        ["ls-files", "--others", "--exclude-standard"],
+        env=git_env,
+    )
     if error:
         return [], [], [], error
     staged = filter_git_paths(staged, excluded_prefixes)

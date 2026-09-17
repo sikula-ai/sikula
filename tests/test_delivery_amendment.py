@@ -1270,6 +1270,36 @@ def test_pending_middle_split_preserves_progress_and_rewires_to_all_leaves(tmp_p
         )
 
 
+@pytest.mark.delivery_amendment_git
+def test_amendment_preserves_schema_v2_verification_policy(tmp_path: Path) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    source_path = tmp_path / ".sikula" / "tasks" / "source.md"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_text = "# Source task\n\nDeliver the complete integration.\n"
+    source_path.write_text(source_text, encoding="utf-8")
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan["schema_version"] = 2
+    plan["source_task"] = {
+        "path": source_path.relative_to(tmp_path).as_posix(),
+        "sha256": f"sha256:{hashlib.sha256(source_text.encode('utf-8')).hexdigest()}",
+    }
+    plan["verification"] = {"mode": "final_gate"}
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+    proposal, _ = create_delivery_amendment_proposal(
+        plan_path, "c", _draft(), project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    result = apply_delivery_amendment(
+        plan_path, proposal.proposal_id, project_root=tmp_path, proposal_root=proposal_root
+    )
+
+    amended = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    assert result.applied is True
+    assert amended["schema_version"] == 2
+    assert amended["verification"] == {"mode": "final_gate"}
+    assert amended["source_task"] == plan["source_task"]
+
+
 def test_amendment_preserves_assigned_target_assets_in_replacement_tasks(tmp_path: Path) -> None:
     plan_path, _, proposal_root = _setup(tmp_path)
     asset_path = ".sikula/task-assets/success-check.svg"

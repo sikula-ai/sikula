@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from hashlib import sha256
 import json
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -174,7 +174,26 @@ def _authoring_context(
             raise failure
         if invalid_result:
             return object()
-        return draft or _authoring_draft(plan_id=kwargs["selected_plan_id"])
+        authored = draft or _authoring_draft(plan_id=kwargs["selected_plan_id"])
+        if authored.source_task is None:
+            audit_path = getattr(authored, "audit_path", None)
+            task_path = Path(kwargs["task_path"])
+            root = Path(kwargs["project_root"])
+            task_text = kwargs["task_description"]
+            authored = replace(
+                authored,
+                source_task=DeliveryPlanSourceTask(
+                    path=task_path.relative_to(root).as_posix(),
+                    sha256="sha256:" + sha256(task_text.encode("utf-8")).hexdigest(),
+                ),
+                constraint_verification=DeliveryConstraintVerification(
+                    constraints_complete=True,
+                    constraints=list(authored.constraints),
+                ),
+            )
+            if audit_path is not None:
+                setattr(authored, "audit_path", audit_path)
+        return authored
 
     return DeliveryPrepareContext(run_authoring_assistant=run_authoring_assistant)
 

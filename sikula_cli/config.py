@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from hashlib import sha256
 from pathlib import Path
 import sys
 
@@ -187,4 +188,7 @@ def load_config(path: Path) -> dict:
     if not path.exists():
         print(f"Config not found: {path}")
         sys.exit(1)
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+    source = path.read_text(encoding="utf-8")
+    config = yaml.safe_load(source)
+    config["_config_source_fingerprint"] = f"sha256:{sha256(source.encode('utf-8')).hexdigest()}"
+    return config

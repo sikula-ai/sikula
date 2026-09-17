@@ -21,6 +21,11 @@ from core.delivery_public_metadata import (
     sanitize_delivery_public_metadata,
 )
 from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE, DeliveryUnitBudget
+from core.delivery_verification_model import (
+    DeliveryVerificationRecord,
+    delivery_verification_recovery_action,
+    parse_delivery_verification_record,
+)
 from core.llm_usage import aggregate_llm_usage, empty_llm_usage_summary, merge_llm_usage_summaries
 from core.state import (
     DELIVERY_STOP_EXTERNAL_DEPENDENCY_GAP,
@@ -30,6 +35,7 @@ from core.state import (
     DELIVERY_TERMINAL_STOP_CODES,
     JsonStateStore,
 )
+from core.version import sikula_version
 
 SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION = 1
 DELIVERY_STOP_AND_FOLLOW_UP_REQUIRED = "stop_and_follow_up_required"
@@ -125,6 +131,7 @@ class DeliveryProgress:
     final_branch: str | None = None
     final_commit: str | None = None
     finalized_at: str | None = None
+    verification: DeliveryVerificationRecord | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -146,6 +153,8 @@ class DeliveryProgress:
             value = getattr(self, key)
             if value:
                 data[key] = value
+        if self.verification:
+            data["verification"] = self.verification.to_dict()
         return data
 
 
@@ -417,6 +426,10 @@ class DeliveryStatusResult:
     final_branch: str | None = None
     final_commit: str | None = None
     finalized_at: str | None = None
+    verification_status: str = "not_required"
+    verification: DeliveryVerificationRecord | None = None
+    plan_fingerprint: str | None = None
+    plan_bytes: int | None = None
     llm_usage: dict[str, Any] = field(default_factory=empty_llm_usage_summary)
 
     @property
@@ -433,6 +446,10 @@ class DeliveryStatusResult:
             project_root = "."
 
         data: dict[str, Any] = {
+            "schema_version": 1,
+            "sikula_version": sikula_version(),
+            "command": "delivery.status",
+            "privacy_mode": "public_metadata",
             "plan_path": plan_path,
             "project_root": project_root,
             "progress_path": progress_path,
@@ -452,6 +469,28 @@ class DeliveryStatusResult:
         }
         if self.next_action:
             data["next_action"] = sanitize_delivery_public_metadata(self.next_action)
+        verification_data: dict[str, Any] = {
+            "required": bool(self.plan and self.plan.requires_final_verification),
+            "status": self.verification_status,
+        }
+        if self.verification:
+            verification_data.update(
+                {
+                    "gate_id": self.verification.gate_id,
+                    "candidate_commit": self.verification.candidate_commit,
+                    "candidate_tree": self.verification.candidate_tree,
+                    "attempt": self.verification.attempt,
+                    "semantic_status": self.verification.semantic_status,
+                    "security_required": self.verification.security_required,
+                    "security_status": self.verification.security_status,
+                    "validation_reused": self.verification.validation_reused,
+                    "validation_executed": self.verification.validation_executed,
+                    "finding_count": self.verification.finding_count,
+                }
+            )
+            if self.verification.stop_code:
+                verification_data["stop_code"] = self.verification.stop_code
+        data["verification"] = verification_data
         for key in (
             "assembly_base_commit",
             "assembled_commit",
@@ -612,7 +651,7 @@ def upsert_delivery_unit_progress(
         final_branch = None
         final_commit = None
         finalized_at = None
-    return DeliveryProgress(
+    updated = DeliveryProgress(
         schema_version=progress.schema_version,
         plan_id=progress.plan_id,
         units=units,
@@ -625,7 +664,10 @@ def upsert_delivery_unit_progress(
         final_branch=final_branch,
         final_commit=final_commit,
         finalized_at=finalized_at,
+        verification=progress.verification if units == progress.units else None,
     )
+    _validate_progress(updated)
+    return updated
 
 
 def make_delivery_unit_progress(
@@ -706,7 +748,7 @@ def mark_delivery_assembly(
     if status == "failed" and not error_code:
         raise ValueError("failed delivery assembly requires an error code")
     timestamp = timestamp or _utc_now()
-    return DeliveryProgress(
+    updated = DeliveryProgress(
         schema_version=progress.schema_version,
         plan_id=progress.plan_id,
         units=list(progress.units),
@@ -719,7 +761,14 @@ def mark_delivery_assembly(
         final_branch=None,
         final_commit=None,
         finalized_at=None,
+        verification=(
+            progress.verification
+            if progress.assembled_commit == assembled_commit and progress.assembly_status == status
+            else None
+        ),
     )
+    _validate_progress(updated)
+    return updated
 
 
 def mark_delivery_finalized(
@@ -744,7 +793,35 @@ def mark_delivery_finalized(
         final_branch=final_branch,
         final_commit=final_commit,
         finalized_at=timestamp,
+        verification=progress.verification,
     )
+
+
+def mark_delivery_verification(
+    progress: DeliveryProgress,
+    verification: DeliveryVerificationRecord,
+) -> DeliveryProgress:
+    _validate_progress(progress)
+    parse_delivery_verification_record(verification.to_dict())
+    if progress.assembly_status != "ready" or progress.assembled_commit != verification.candidate_commit:
+        raise ValueError("delivery verification must match the current assembled candidate")
+    updated = DeliveryProgress(
+        schema_version=progress.schema_version,
+        plan_id=progress.plan_id,
+        units=list(progress.units),
+        assembly_base_commit=progress.assembly_base_commit,
+        assembled_commit=progress.assembled_commit,
+        assembly_status=progress.assembly_status,
+        assembly_unit_id=progress.assembly_unit_id,
+        assembly_error_code=progress.assembly_error_code,
+        assembly_updated_at=progress.assembly_updated_at,
+        final_branch=None,
+        final_commit=None,
+        finalized_at=None,
+        verification=verification,
+    )
+    _validate_progress(updated)
+    return updated
 
 
 def select_next_delivery_unit(status: DeliveryStatusResult, reset_failed: bool = False) -> DeliveryStatusUnit | None:
@@ -815,7 +892,7 @@ def get_delivery_status(
     progress_path: Path | None = None
     progress_exists = False
 
-    if plan is None or check_result.project_root is None or errors:
+    if plan is None or check_result.project_root is None or not _DELIVERY_PROGRESS_PLAN_ID_RE.fullmatch(plan.plan_id):
         return DeliveryStatusResult(
             plan_path=check_result.plan_path,
             project_root=check_result.project_root,
@@ -825,6 +902,8 @@ def get_delivery_status(
             errors=errors,
             warnings=warnings,
             plan=plan,
+            plan_fingerprint=check_result.plan_fingerprint,
+            plan_bytes=check_result.plan_bytes,
             units=[],
             next_action="fix delivery plan validation errors",
         )
@@ -834,7 +913,40 @@ def get_delivery_status(
     progress_exists = progress_path.exists()
     progress: DeliveryProgress | None = None
     if progress_exists:
-        progress = _load_delivery_progress(progress_path, plan_id=plan.plan_id, errors=errors)
+        progress_errors: list[DeliveryPlanIssue] = []
+        progress = _load_delivery_progress(progress_path, plan_id=plan.plan_id, errors=progress_errors)
+        errors.extend(progress_errors)
+
+    if errors:
+        verification = progress.verification if progress else None
+        return DeliveryStatusResult(
+            plan_path=check_result.plan_path,
+            project_root=check_result.project_root,
+            progress_path=str(progress_path),
+            progress_exists=progress_exists,
+            status="invalid",
+            errors=errors,
+            warnings=warnings,
+            plan=plan,
+            units=[],
+            next_action="fix delivery plan validation errors",
+            assembly_base_commit=progress.assembly_base_commit if progress else None,
+            assembled_commit=progress.assembled_commit if progress else None,
+            assembly_status=progress.assembly_status if progress else None,
+            final_branch=progress.final_branch if progress else None,
+            final_commit=progress.final_commit if progress else None,
+            finalized_at=progress.finalized_at if progress else None,
+            verification_status=(
+                "stale"
+                if verification is not None
+                else "pending"
+                if plan.requires_final_verification
+                else "not_required"
+            ),
+            verification=verification,
+            plan_fingerprint=check_result.plan_fingerprint,
+            plan_bytes=check_result.plan_bytes,
+        )
 
     _validate_amendment_progress(plan, progress, errors)
     units = _build_status_units(plan, progress, warnings)
@@ -848,6 +960,20 @@ def get_delivery_status(
     assembly_unit_id = progress.assembly_unit_id if progress else None
     assembly_error_code = progress.assembly_error_code if progress else None
     assembly_updated_at = progress.assembly_updated_at if progress else None
+    verification = progress.verification if progress else None
+    verification_status = (
+        verification.status
+        if verification is not None
+        else "pending"
+        if plan.requires_final_verification
+        else "not_required"
+    )
+    if verification is not None and (
+        verification.plan_fingerprint != check_result.plan_fingerprint
+        or assembly_status != "ready"
+        or assembled_commit != verification.candidate_commit
+    ):
+        verification_status = "stale"
     return DeliveryStatusResult(
         plan_path=check_result.plan_path,
         project_root=check_result.project_root,
@@ -864,6 +990,9 @@ def get_delivery_status(
             final_commit=final_commit,
             assembly_status=assembly_status,
             assembly_unit_id=assembly_unit_id,
+            verification_required=plan.requires_final_verification,
+            verification_status=verification_status,
+            verification_stop_code=verification.stop_code if verification else None,
         ),
         assembly_base_commit=assembly_base_commit,
         assembled_commit=assembled_commit,
@@ -874,6 +1003,10 @@ def get_delivery_status(
         final_branch=final_branch,
         final_commit=final_commit,
         finalized_at=finalized_at,
+        verification_status=verification_status,
+        verification=verification,
+        plan_fingerprint=check_result.plan_fingerprint,
+        plan_bytes=check_result.plan_bytes,
     )
 
 
@@ -989,6 +1122,18 @@ def _validate_progress(progress: DeliveryProgress) -> None:
             raise ValueError("failed delivery assembly metadata requires an error code")
     elif progress.assembly_unit_id or progress.assembly_error_code:
         raise ValueError("delivery assembly failure metadata requires failed status")
+    if progress.verification is not None:
+        parse_delivery_verification_record(progress.verification.to_dict())
+        if progress.assembly_status != "ready" or progress.assembled_commit != progress.verification.candidate_commit:
+            raise ValueError("delivery verification does not match the assembled candidate")
+        if progress.verification.passed:
+            if progress.verification.semantic_status != "approved":
+                raise ValueError("passed delivery verification requires semantic approval")
+            if progress.verification.security_required and progress.verification.security_status != "approved":
+                raise ValueError("passed delivery verification requires security approval")
+    if progress.final_commit and progress.verification is not None:
+        if not progress.verification.passed or progress.final_commit != progress.verification.candidate_commit:
+            raise ValueError("finalized verified delivery must match a passing candidate")
 
 
 def _validate_unit_progress(unit: DeliveryUnitProgress) -> None:
@@ -1143,6 +1288,10 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
                 f"Final branch: {plan_data['final_branch']}",
             ]
         )
+    verification = projection["verification"]
+    lines.append(f"Verification: {verification['status']}")
+    if verification.get("gate_id"):
+        lines.append(f"Verification gate: {verification['gate_id']}")
     assembled_commit = projection.get("assembled_commit")
     if assembled_commit:
         assembly_detail = f"{plan_data['final_branch']} @ {assembled_commit}" if plan_data else assembled_commit
@@ -1341,7 +1490,27 @@ def _load_delivery_progress(path: Path, *, plan_id: str, errors: list[DeliveryPl
         units.append(unit)
     if errors:
         return None
-    progress = DeliveryProgress(schema_version=schema_version, plan_id=plan_id, units=units, **progress_metadata)
+    verification = None
+    if data.get("verification") is not None:
+        try:
+            verification = parse_delivery_verification_record(data["verification"])
+        except ValueError:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "progress.verification_invalid",
+                    "Delivery verification progress is malformed or unsupported.",
+                    "verification",
+                )
+            )
+            return None
+    progress = DeliveryProgress(
+        schema_version=schema_version,
+        plan_id=plan_id,
+        units=units,
+        verification=verification,
+        **progress_metadata,
+    )
     try:
         _validate_progress(progress)
     except ValueError:
@@ -1615,13 +1784,19 @@ def _next_action(
     final_commit: str | None = None,
     assembly_status: str | None = None,
     assembly_unit_id: str | None = None,
+    verification_required: bool = False,
+    verification_status: str = "not_required",
+    verification_stop_code: str | None = None,
 ) -> str:
     if status == "invalid":
         return "fix delivery plan status errors"
     if assembly_status == "failed":
         safe_unit_id = project_delivery_public_identity(assembly_unit_id)
         unit_detail = f" for unit {safe_unit_id}" if safe_unit_id else ""
-        command = "delivery finalize" if status == "done" else "delivery run-next"
+        if status == "done":
+            command = "delivery verify" if verification_required else "delivery finalize"
+        else:
+            command = "delivery run-next"
         return f"resolve delivery branch assembly{unit_detail}, then rerun {command}"
 
     running_units = [u for u in units if u.status == "running"]
@@ -1659,7 +1834,25 @@ def _next_action(
     if status == "canceled":
         return "inspect canceled delivery progress"
     if status == "done":
-        return "review finalized delivery branch" if final_commit else "finalize delivery branch"
+        if final_commit:
+            return "review finalized delivery branch"
+        if verification_status in {"failed", "blocked"} and verification_stop_code:
+            recovery_action = delivery_verification_recovery_action(verification_stop_code)
+            if recovery_action == "add_delivery_repair_unit":
+                return "add a delivery repair unit before rerunning delivery verification"
+            if recovery_action == "prepare_delivery_amendment":
+                return "prepare a delivery amendment before rerunning delivery verification"
+            if recovery_action == "resolve_external_dependency":
+                return "resolve the external dependency before rerunning delivery verification"
+            if recovery_action == "request_human_review":
+                return "request human review before rerunning delivery verification"
+            if recovery_action == "restart_with_candidate_config":
+                return "start a fresh command from a checkout whose config matches the assembled candidate"
+        if verification_status in {"pending", "failed", "blocked", "stale", "interrupted"}:
+            return "verify the assembled delivery with delivery verify"
+        if verification_status == "running":
+            return "inspect the running delivery verification with delivery status"
+        return "finalize delivery branch"
     if any(unit.eligible for unit in units):
         return "prepare or run an eligible delivery unit with the existing task workflow"
     if any(unit.dependency_ready and unit.stop_and_follow_up_required for unit in units):

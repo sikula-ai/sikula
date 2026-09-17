@@ -230,7 +230,10 @@ the source values through ordinary CLI output.
 
 For successful authoring, deterministic code adds `source_task.path` and
 `source_task.sha256` to `plan.yaml` from the actual task input. `delivery check`
-recomputes the UTF-8 task hash and rejects stale fingerprints. Published
+recomputes the UTF-8 task hash and rejects stale fingerprints. Source paths in
+environment files, VCS metadata, or Sikula runtime/report roots are invalid;
+verification also applies configured state/report roots and platform environment
+files before assembly or reviewer invocation. Published
 constraint entries must use `preserved`, reference known non-superseded units,
 and remain bounded. The fields are additive: existing plans without
 `source_task` or `constraints` stay valid, while any plan that declares
@@ -838,14 +841,87 @@ use the existing `status`, `run-next`, and amendment commands for other recovery
 decisions, then rerun `delivery run`.
 
 Reaching a unit or elapsed limit is a successful resumable stop, not a failed
-plan. A plan that becomes `done` is finalized automatically through the same
-finalization engine as `delivery finalize`. Rerunning an already current
+plan. For a schema-version-2 plan that becomes `done`, the coordinator first
+runs the required final integration gate and finalizes only its passing exact
+candidate. Rerunning an already current
 finalized plan is idempotent and does not append another finalization event.
-`--dry-run` previews the next unit or finalization preflight without creating
+`--dry-run` previews the next unit, verification, or finalization preflight without creating
 state, worktrees, commits, or refs. `--json` emits one compact aggregate
 document; child JSON is kept on stderr rather than nested into the public
 result. Runtime agent model, provider, and timeout overrides are forwarded to
-each child in the same way as `run-next`.
+each child in the same way as `run-next`; reviewer and security-reviewer
+overrides also govern the final gate.
+
+Verify a completed assembled candidate explicitly:
+
+```bash
+sikula delivery verify .sikula/delivery/<slug>/plan.yaml
+sikula delivery verify .sikula/delivery/<slug>/plan.yaml --json
+```
+
+Newly prepared plans use `schema_version: 2` with
+`verification: {mode: final_gate}`. Verification binds its result to the exact
+candidate commit and tree, source-task hash, plan content, completed-unit scope,
+effective validation configuration, and policy. Long validation and read-only
+provider calls run in a detached candidate worktree without holding the delivery
+progress lock; short capture and completion sections revalidate the binding
+under that lock. A concurrent amendment, unit update, ref move, source change,
+plan change, or config change makes the attempt stale. Plan parsing and hashing
+use the same immutable byte snapshot, and status projects a previous pass as
+`stale` whenever its identity no longer matches current plan or configuration.
+
+The source text is captured and checked against its declared hash before the long
+attempt begins. Integration review honors `reviewer.extra_rules`; required
+security review also honors `security_reviewer.extra_rules` and `security.context`.
+Those applicable settings participate in gate identity, configured rule files are
+read from the exact candidate, and an older concurrent attempt cannot replace a
+newer attempt's result. Reviewer provider or model overrides also participate in
+that identity. After a standalone `delivery verify` with `--agent-provider` or
+`--agent-model`, pass the same overrides to `delivery status` and `delivery
+finalize` so those commands evaluate the same gate configuration.
+
+`delivery check` loads project configuration when one is available so it can
+reject unsupported build tools or reviewer providers before unit execution. It
+does not require a config file, instantiate a provider, or run a command; omitted
+settings use Sikula's normal runtime defaults.
+
+Exact-tree child validation is reused only when its enabled phases and effective
+policy match. Otherwise the gate reruns configured build, tests, and named
+checks; configured presync runs even when build is disabled, and configured
+final-only checks always run without implicitly enabling sync. Environment files
+copied only for validation are removed before reviewer setup. Every covered candidate receives
+a read-only semantic integration assessment. Plans with a `security_boundary`
+constraint or any retained security, privacy, authorization, or
+execution-boundary risk tag, including one on a superseded unit, additionally
+require an independent read-only security approval.
+Malformed output gets one bounded format retry and never becomes approval.
+If a later reviewer fails, status retains completed validation and earlier review
+phases. Rejected review dispositions select repair, amendment, external-dependency,
+or human-review recovery instead of recommending an unchanged verification retry.
+
+Optional final-only checks use the normal platform BuildTool command boundary:
+
+```yaml
+delivery:
+  verification:
+    final_checks:
+      - name: integration-contracts
+        command: python3 -m pytest tests/integration -q
+```
+
+The first implementation supports one bounded final authority packet: source
+task, rendered plan context, active-unit count, validation and final-check policy,
+applicable reviewer rules, security context, and protocol overhead have
+conservative limits. The exact rendered prompt is checked again before each
+provider call. Exceeding a limit fails with
+`delivery_verification.hierarchy_required`; content is not truncated. Recursive
+verification nodes and automatically scheduled checkpoints are not implemented
+yet. This first milestone requires `sandbox.allowed_read_paths` to include `.`;
+narrower read scopes fail readiness because the autonomous provider boundary cannot
+enforce them consistently across providers. The packet shows the enabled validation
+phases and effective commands behind the reported results. Repeating verification
+for an unchanged current pass reuses it before assembly, so an already recorded
+finalization remains intact.
 
 Preview final delivery branch creation after every unit is done:
 
@@ -861,14 +937,18 @@ sikula delivery finalize .sikula/delivery/<slug>/plan.yaml
 sikula delivery finalize .sikula/delivery/<slug>/plan.yaml --json
 ```
 
-`finalize` requires the delivery plan status to be `done`. It verifies and, for
-legacy or interrupted progress, reconciles all completed unit results through
+`finalize` requires the delivery plan status to be `done`. For legacy
+schema-version-1 plans it reconciles completed unit results through
 the same dependency-ordered assembly engine. The assembled branch commit,
 rather than the operator's current `HEAD`, becomes the final commit. Existing
 diverged or checked-out branches are rejected. A branch ahead of the assembly
 base is trusted only when progress records an expected assembled commit;
 otherwise it is treated as stale and rejected. Sikula never force-updates these
-branches. No-op plans retain the recorded assembly base. Like `run-next`,
+branches. For schema-version-2 plans, finalize performs no assembly, validation,
+or provider call: it accepts only the exact candidate with current passing gate
+evidence, revalidates the final branch immediately before recording finalization,
+and otherwise recommends `delivery verify`. No-op legacy plans retain
+the recorded assembly base. Like `run-next`,
 `finalize` loads project runtime config because it mutates Git refs and parent
 delivery progress. `--dry-run` validates static ref and commit preconditions
 without writing refs, Git objects, or progress. A newly encountered merge
@@ -883,9 +963,10 @@ Any later unit progress update clears the recorded final branch metadata, so an
 extended or rerun delivery plan must be finalized again after it returns to
 `done`.
 
-The MVP validator checks:
+The validator checks:
 
-- `schema_version: 1`,
+- legacy `schema_version: 1`, or `schema_version: 2` with the required recognized
+  `verification.mode: final_gate` policy,
 - required plan metadata such as `plan_id`, `title`, and a valid local-branch
   `final_branch`,
 - delivery unit IDs,
@@ -909,11 +990,13 @@ and finalization timestamp.
 Example:
 
 ```yaml
-schema_version: 1
+schema_version: 2
 plan_id: checkout-redesign
 title: Checkout redesign
 planning_mode: fixed_window
 final_branch: sikula/delivery/checkout-redesign
+verification:
+  mode: final_gate
 streams:
   - id: backend
     label: Backend
@@ -1050,7 +1133,7 @@ can coordinate cross-repo branches, locks, validation, and result sets.
 ## Privacy
 
 `delivery prepare --json`, `delivery check --json`, `delivery status --json`,
-`delivery run-next --json`, `delivery run --json`, and
+`delivery run-next --json`, `delivery run --json`, `delivery verify --json`, and
 `delivery finalize --json` return allowlisted metadata such as written artifact
 paths, plan validation status, unit readiness, plan metadata, validation issues,
 unit paths, compact progress fields, selected child task IDs, handoff
@@ -1059,10 +1142,12 @@ pointers when available. They do not embed child task state, source task bodies,
 unit task file bodies, prompts, provider output, diffs, logs, validation output,
 credentials, tokens, or source excerpts. Privacy-safe projections such as
 `delivery prepare --json`, `delivery status --json`, `delivery run-next --json`,
-and `delivery run --json` use project-relative paths for local delivery
-artifacts where possible. Operator/audit commands such as
-`delivery check --json` and `delivery finalize --json` may include local plan,
-progress, or events paths. The parent plan path stored in the child task state
+`delivery run --json`, and `delivery verify --json` use project-relative paths for local delivery
+artifacts where possible. The `delivery verify --json` contract is published as
+`docs/schemas/delivery-verification-result.v1.schema.json`; extended status, run,
+and finalize projections include their projection schema version, Sikula version,
+command identity, and privacy mode. The operator-oriented `delivery check --json`
+may still include a local plan path. The parent plan path stored in the child task state
 is saved as a project-relative path (`delivery_plan_path`). This metadata is
 strictly allowlisted state metadata and does not expose raw prompts, provider
 output, diffs, logs, or source excerpts.
