@@ -419,11 +419,10 @@ def cmd_delivery_check(args: argparse.Namespace, cfg: dict) -> None:
     from core.delivery_plan import check_delivery_plan_file, render_delivery_plan_check
     from core.delivery_verification import check_delivery_verification_readiness
 
-    project_root_raw = cfg.get("project", {}).get("root_path") if isinstance(cfg, dict) else None
-    project_root = Path(project_root_raw).resolve() if project_root_raw else None
+    effective_cfg, project_root = _delivery_plan_config_context(args, cfg)
     result = check_delivery_plan_file(args.plan_file, project_root=project_root)
     if result.valid and result.plan and result.plan.requires_final_verification:
-        readiness = check_delivery_verification_readiness(result, cfg)
+        readiness = check_delivery_verification_readiness(result, effective_cfg)
         if not readiness.ready:
             result = replace(result, errors=readiness.errors, warnings=readiness.warnings)
     if args.json:
@@ -438,18 +437,21 @@ def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
     from core.delivery_progress import get_delivery_status, render_delivery_status, with_delivery_llm_usage
     from core.delivery_verification import with_delivery_verification_readiness
 
-    parse_agent_llm_overrides(
+    overrides = parse_agent_llm_overrides(
         getattr(args, "agent_model", None),
         getattr(args, "agent_provider", None),
         None,
         valid_agents={"reviewer", "security_reviewer"},
     )
-    project_root_raw = cfg.get("project", {}).get("root_path") if isinstance(cfg, dict) else None
-    configured_project_root = Path(project_root_raw).resolve() if project_root_raw else None
+    effective_cfg, configured_project_root = _delivery_plan_config_context(args, cfg)
+    if effective_cfg is not cfg and overrides:
+        effective_cfg = {
+            "agents": {name: {"llm": values} for name, values in overrides.items()},
+        }
     result = get_delivery_status(args.plan_file, project_root=configured_project_root)
-    result = with_delivery_verification_readiness(result, cfg)
+    result = with_delivery_verification_readiness(result, effective_cfg)
     project_root = Path(result.project_root).resolve() if result.project_root else None
-    task_state_dir = _configured_delivery_task_state_dir(cfg, project_root)
+    task_state_dir = _configured_delivery_task_state_dir(effective_cfg, project_root)
     result = with_delivery_llm_usage(result, task_state_dir=task_state_dir)
     if args.json:
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
@@ -457,6 +459,19 @@ def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
         print(render_delivery_status(result), end="")
     if not result.valid:
         sys.exit(1)
+
+
+def _delivery_plan_config_context(args: argparse.Namespace, cfg: dict) -> tuple[dict, Path | None]:
+    if not isinstance(cfg, dict):
+        return {}, None
+    project = cfg.get("project")
+    project_root_raw = project.get("root_path") if isinstance(project, dict) else None
+    if not project_root_raw:
+        return cfg, None
+    configured_root = Path(project_root_raw).resolve()
+    if getattr(args, "config", None) or _path_is_within(Path(args.plan_file), configured_root):
+        return cfg, configured_root
+    return {}, None
 
 
 def _configured_delivery_task_state_dir(cfg: dict, project_root: Path | None) -> Path | None:

@@ -709,6 +709,63 @@ def test_delivery_check_and_status_use_configured_nested_project_root(
     assert status_result["errors"] == []
 
 
+def test_delivery_check_and_status_ignore_unrelated_discovered_config(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    current_project = tmp_path / "current"
+    selected_project = tmp_path / "selected"
+    current_project.mkdir()
+    selected_project.mkdir()
+    _git_init(current_project)
+    _git_init(selected_project)
+    plan_path = _write_plan(selected_project)
+    config = _config(current_project)
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        json=True,
+        config=None,
+        agent_model=None,
+        agent_provider=None,
+    )
+
+    cmd_delivery_check(args, config)
+    check_result = json.loads(capsys.readouterr().out)
+    cmd_delivery_status(args, config)
+    status_result = json.loads(capsys.readouterr().out)
+
+    assert check_result["valid"] is True
+    assert Path(check_result["project_root"]).resolve() == selected_project.resolve()
+    assert status_result["valid"] is True
+    assert status_result["project_root"] == "."
+
+
+def test_delivery_check_keeps_explicit_config_project_boundary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configured_project = tmp_path / "configured"
+    selected_project = tmp_path / "selected"
+    configured_project.mkdir()
+    selected_project.mkdir()
+    _git_init(configured_project)
+    _git_init(selected_project)
+    plan_path = _write_plan(selected_project)
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        json=True,
+        config=str(configured_project / ".sikula" / "config.yaml"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_check(args, _config(configured_project))
+
+    result = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert result["valid"] is False
+    assert "plan.path_outside_project" in {error["code"] for error in result["errors"]}
+
+
 def test_schema_v2_finalize_rechecks_branch_before_persisting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
