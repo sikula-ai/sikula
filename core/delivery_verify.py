@@ -328,6 +328,7 @@ def verify_delivery_plan(
             succeeded=False,
             next_action="resolve_delivery_verification_blocker",
         )
+    deferred_validation_evidence: dict[str, Any] | None = None
     deferred_review_evidence: dict[str, Any] | None = None
     try:
         terminal = _execute_gate(
@@ -342,6 +343,9 @@ def verify_delivery_plan(
             semantic_reviewer=semantic_reviewer,
             security_reviewer=security_reviewer,
         )
+    except _GateValidationAuditUnavailable as exc:
+        terminal = exc.terminal
+        deferred_validation_evidence = exc.validation_evidence
     except _GateReviewAuditUnavailable as exc:
         terminal = exc.terminal
         deferred_review_evidence = exc.review_evidence
@@ -373,6 +377,8 @@ def verify_delivery_plan(
         )
 
     terminal_audit: dict[str, Any] = {"event": terminal.status, "record": terminal.to_dict()}
+    if deferred_validation_evidence is not None:
+        terminal_audit["validation_evidence"] = deferred_validation_evidence
     if deferred_review_evidence is not None:
         terminal_audit["review_evidence"] = deferred_review_evidence
     if not _safe_append_audit(evidence_path, terminal_audit, project_root=root):
@@ -498,11 +504,14 @@ def _execute_gate(
             )
             validation_before = _review_snapshot(worktree, project_config, exclude_ephemeral_paths=True)
             validation = run_delivery_verification_validation(worktree, project_config, reusable=reusable)
-            _append_audit(
-                evidence_path,
-                {"event": "validation", "result": _validation_audit(validation)},
-                project_root=root,
-            )
+            validation_evidence = {"event": "validation", "result": _validation_audit(validation)}
+            if not _safe_append_audit(evidence_path, validation_evidence, project_root=root):
+                terminal = _review_blocked(
+                    running,
+                    validation,
+                    "delivery_verification.audit_unavailable",
+                )
+                raise _GateValidationAuditUnavailable(terminal, validation_evidence)
             validation_workspace_unchanged = _review_workspace_unchanged(
                 worktree,
                 project_config,
@@ -1014,6 +1023,13 @@ class _ReviewAuditUnavailable(RuntimeError):
         self.review_evidence = review_evidence
         self.phase_status = phase_status
         self.finding_count = finding_count
+
+
+class _GateValidationAuditUnavailable(RuntimeError):
+    def __init__(self, terminal: DeliveryVerificationRecord, validation_evidence: dict[str, Any]) -> None:
+        super().__init__("Delivery verification validation evidence requires terminal fallback persistence.")
+        self.terminal = terminal
+        self.validation_evidence = validation_evidence
 
 
 class _GateReviewAuditUnavailable(RuntimeError):

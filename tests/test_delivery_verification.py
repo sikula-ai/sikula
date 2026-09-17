@@ -54,6 +54,7 @@ from core.delivery_verification_review import (
     parse_delivery_integration_review,
 )
 from core.delivery_verification_validation import (
+    DeliveryVerificationValidationRecord,
     DeliveryVerificationValidationResult,
     reusable_delivery_validation,
     run_delivery_verification_validation,
@@ -1419,6 +1420,82 @@ def test_terminal_audit_failure_preserves_completed_gate_phases(
     assert progress.verification.semantic_status == "approved"
     assert progress.verification.security_status == "rejected"
     assert progress.verification.finding_count == 1
+
+
+def test_validation_audit_failure_preserves_evidence_in_terminal_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    unit_commit = _git_commit_all(tmp_path, "delivery unit")
+    progress_path = delivery_progress_path(tmp_path, "demo")
+    write_delivery_progress(
+        progress_path,
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="demo",
+            units=[make_delivery_unit_progress("unit", "done", commit=unit_commit)],
+            assembly_base_commit=base,
+        ),
+    )
+    validation_record = DeliveryVerificationValidationRecord(
+        phase="test",
+        name="tests",
+        status="passed",
+        source="executed",
+        policy_fingerprint="sha256:" + "d" * 64,
+        elapsed_s=1.25,
+    )
+    validation = DeliveryVerificationValidationResult(
+        passed=True,
+        reused=False,
+        executed=True,
+        records=[validation_record],
+    )
+    monkeypatch.setattr(
+        "core.delivery_verify.run_delivery_verification_validation",
+        lambda *args, **kwargs: validation,
+    )
+    original_safe_append = _safe_append_audit
+    failed = False
+
+    def fail_validation_append_once(path: Path, value: dict[str, object], *, project_root: Path) -> bool:
+        nonlocal failed
+        if value.get("event") == "validation" and not failed:
+            failed = True
+            return False
+        return original_safe_append(path, value, project_root=project_root)
+
+    monkeypatch.setattr("core.delivery_verify._safe_append_audit", fail_validation_append_once)
+    config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
+    reviewer = DeliveryIntegrationReviewAgent(_ReadonlyLLM([]), config)
+
+    result = verify_delivery_plan(
+        plan_path,
+        config,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        semantic_reviewer=reviewer,
+        security_reviewer=None,
+        project_root=tmp_path,
+    )
+
+    progress, errors = read_delivery_progress(progress_path, plan_id="demo")
+    audit_records = [
+        json.loads(line)
+        for line in (progress_path.parent / "verification.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    fallback = next(record for record in audit_records if "validation_evidence" in record)
+    assert result.status == "blocked"
+    assert result.stop_code == "delivery_verification.audit_unavailable"
+    assert result.validation_reused is False
+    assert result.validation_executed is True
+    assert progress is not None and not errors and progress.verification is not None
+    assert progress.verification.validation_executed is True
+    assert fallback["event"] == "blocked"
+    assert fallback["validation_evidence"]["event"] == "validation"
+    assert fallback["validation_evidence"]["result"]["records"] == [validation_record.to_dict()]
+    assert reviewer.llm.calls == []
 
 
 def test_review_audit_failure_preserves_evidence_in_terminal_fallback(
