@@ -142,6 +142,67 @@ def test_preview_delivery_assembly_validates_without_creating_branch(tmp_path: P
     assert _status(tmp_path) == ""
 
 
+def test_preview_delivery_assembly_reports_conflict_without_mutating_repository(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    base = _commit(tmp_path, "shared.txt", "base\n")
+    main_branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "-q", "-b", "unit-a", base], cwd=tmp_path, check=True)
+    unit_a = _commit(tmp_path, "shared.txt", "unit a\n")
+    subprocess.run(["git", "checkout", "-q", "-b", "unit-b", base], cwd=tmp_path, check=True)
+    unit_b = _commit(tmp_path, "shared.txt", "unit b\n")
+    subprocess.run(["git", "checkout", "-q", main_branch], cwd=tmp_path, check=True)
+    head_before = _rev_parse(tmp_path, "HEAD")
+    objects_before = subprocess.run(
+        ["git", "count-objects", "-v"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    result = preview_delivery_assembly(
+        tmp_path,
+        branch="sikula/delivery/demo",
+        base_commit=base,
+        expected_commit=None,
+        units=[
+            DeliveryAssemblyUnit("unit-a", unit_a),
+            DeliveryAssemblyUnit("unit-b", unit_b),
+        ],
+        detect_conflicts=True,
+    )
+
+    assert result.success is False
+    assert result.failed_unit_id == "unit-b"
+    assert result.error
+    assert result.error.code == "delivery.assembly_conflict"
+    assert _rev_parse(tmp_path, "HEAD") == head_before
+    assert _status(tmp_path) == ""
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", "refs/heads/sikula/delivery/demo"],
+            cwd=tmp_path,
+        ).returncode
+        == 1
+    )
+    assert (
+        subprocess.run(
+            ["git", "count-objects", "-v"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == objects_before
+    )
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Windows paths cannot contain newlines")
 @pytest.mark.delivery_amendment_git
 def test_preview_delivery_artifacts_supports_newline_in_repository_path(tmp_path: Path) -> None:
@@ -1517,6 +1578,49 @@ def test_assemble_delivery_commits_merges_independent_results_and_preserves_ance
     assert repeated.success is True
     assert repeated.assembled_commit == result.assembled_commit
     assert [outcome.outcome for outcome in repeated.outcomes] == ["already_applied", "already_applied"]
+
+
+def test_assemble_delivery_commits_ignores_replacement_objects(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    base = _commit(tmp_path, "base.txt", "base\n")
+    main_branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "-q", "-b", "unit-a", base], cwd=tmp_path, check=True)
+    unit_a = _commit(tmp_path, "a.txt", "unit a\n")
+    subprocess.run(["git", "checkout", "-q", "-b", "unit-b", base], cwd=tmp_path, check=True)
+    unit_b = _commit(tmp_path, "b.txt", "original unit b\n")
+    subprocess.run(["git", "checkout", "-q", "-b", "replacement", base], cwd=tmp_path, check=True)
+    replacement = _commit(tmp_path, "b.txt", "replacement unit b\n")
+    subprocess.run(["git", "replace", unit_b, replacement], cwd=tmp_path, check=True)
+    subprocess.run(["git", "checkout", "-q", main_branch], cwd=tmp_path, check=True)
+
+    result = assemble_delivery_commits(
+        tmp_path,
+        plan_id="demo",
+        branch="sikula/delivery/demo",
+        base_commit=base,
+        expected_commit=None,
+        units=[
+            DeliveryAssemblyUnit("unit-a", unit_a),
+            DeliveryAssemblyUnit("unit-b", unit_b),
+        ],
+    )
+
+    assert result.success is True
+    assert result.assembled_commit is not None
+    content = subprocess.run(
+        ["git", "--no-replace-objects", "show", f"{result.assembled_commit}:b.txt"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert content == "original unit b\n"
 
 
 def test_assemble_delivery_commits_reports_conflict_without_leaving_git_state(tmp_path: Path) -> None:

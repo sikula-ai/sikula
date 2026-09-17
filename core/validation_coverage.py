@@ -412,7 +412,19 @@ def _default_test_command(project_config: dict) -> str | None:
 
 def configured_validation_commands(project_config: dict, state: TaskState) -> list[dict[str, str]]:
     flags = pipeline_flags(project_config, state)
-    if not flags["run_build"]:
+    return effective_validation_commands(project_config, **flags)
+
+
+def effective_validation_commands(
+    project_config: dict,
+    *,
+    run_build: bool,
+    run_tests: bool,
+    run_checks: bool,
+) -> list[dict[str, str]]:
+    """Project the effective build, test, and check commands for a pipeline policy."""
+
+    if not run_build:
         return []
 
     build = project_config.get("build", {})
@@ -423,10 +435,10 @@ def configured_validation_commands(project_config: dict, state: TaskState) -> li
         commands.append({"phase": "build", "name": "compile", "command": _normalize_command(str(compile_command))})
 
     test_command = _default_test_command(project_config)
-    if flags["run_tests"] and test_command:
+    if run_tests and test_command:
         commands.append({"phase": "test", "name": "tests", "command": _normalize_command(str(test_command))})
 
-    if flags["run_checks"]:
+    if run_checks:
         for idx, check in enumerate(build.get("checks") or [], start=1):
             if not isinstance(check, dict):
                 continue

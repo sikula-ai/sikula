@@ -569,6 +569,9 @@ class LLMClient:
         direct client use remains supported.
         """
 
+    def prepare_readonly_agent_workspace(self, cwd: Path) -> None:
+        """Create stable provider-owned files before an external read-only audit."""
+
     def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
         """Run as an autonomous agent with read-only tools in `cwd`. Returns text output."""
         raise NotImplementedError
@@ -959,6 +962,10 @@ class ClaudeClient(LLMClient):
         return _call_with_retry("generate", _call, self._config, "generate", input_chars=len(prompt))
 
     def prepare_write_agent_workspace(self, cwd: Path) -> None:
+        _reject_tracked_provider_settings(cwd, ".claude/settings.json")
+        _claude_write_settings(cwd)
+
+    def prepare_readonly_agent_workspace(self, cwd: Path) -> None:
         _reject_tracked_provider_settings(cwd, ".claude/settings.json")
         _claude_write_settings(cwd)
 
@@ -2150,6 +2157,10 @@ class GeminiClient(LLMClient):
     def prepare_write_agent_workspace(self, cwd: Path) -> None:
         _reject_tracked_provider_settings(cwd, ".gemini/settings.json")
         _gemini_write_settings(cwd, _GEMINI_SETTINGS_IMPLEMENTER)
+
+    def prepare_readonly_agent_workspace(self, cwd: Path) -> None:
+        _reject_tracked_provider_settings(cwd, ".gemini/settings.json")
+        _gemini_write_settings(cwd, _GEMINI_SETTINGS_READONLY)
 
     def generate(self, system: str, user: str) -> str:
         prompt = f"{system}\n\n{user}"

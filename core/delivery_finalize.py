@@ -8,6 +8,7 @@ from typing import Any
 
 from core.delivery_assembly import delivery_assembly_branch_is_symbolic
 from core.delivery_plan import DeliveryPlanIssue
+from core.delivery_public_metadata import sanitize_delivery_public_metadata
 from core.delivery_progress import (
     DeliveryProgressEvent,
     DeliveryProgressLockError,
@@ -23,7 +24,8 @@ from core.delivery_progress import (
     read_delivery_progress,
     write_delivery_progress,
 )
-from core.worktree import branch_checked_out
+from core.worktree import branch_checked_out, delivery_verification_git_env
+from core.version import sikula_version
 
 _UNSET: Any = object()
 
@@ -47,22 +49,27 @@ class DeliveryFinalizeResult:
     message: str
 
     def to_dict(self) -> dict[str, Any]:
+        root = Path(self.project_root).resolve() if self.project_root else None
         return {
-            "plan_path": self.plan_path,
-            "project_root": self.project_root,
+            "schema_version": 1,
+            "sikula_version": sikula_version(),
+            "command": "delivery.finalize",
+            "privacy_mode": "public_metadata",
+            "plan_path": _public_finalize_path(self.plan_path, root),
+            "project_root": "." if root else None,
             "valid": self.valid,
             "ready": self.ready,
             "dry_run": self.dry_run,
             "finalized": self.finalized,
             "status": self.status,
             "progress_exists": self.progress_exists,
-            "final_branch": self.final_branch,
-            "final_commit": self.final_commit,
-            "progress_path": self.progress_path,
-            "events_path": self.events_path,
-            "errors": [issue.to_dict() for issue in self.errors],
-            "warnings": [issue.to_dict() for issue in self.warnings],
-            "message": self.message,
+            "final_branch": sanitize_delivery_public_metadata(self.final_branch),
+            "final_commit": sanitize_delivery_public_metadata(self.final_commit),
+            "progress_path": _public_finalize_path(self.progress_path, root),
+            "events_path": _public_finalize_path(self.events_path, root),
+            "errors": [_public_finalize_issue(issue, root).to_dict() for issue in self.errors],
+            "warnings": [_public_finalize_issue(issue, root).to_dict() for issue in self.warnings],
+            "message": sanitize_delivery_public_metadata(self.message),
         }
 
 
@@ -72,14 +79,29 @@ class _FinalizePreflight:
     plan_id: str | None
 
 
-def preview_delivery_finalize(path: str | Path, *, project_root: Path | None = None) -> DeliveryFinalizeResult:
-    preflight = _preflight_delivery_finalize(path, project_root=project_root, dry_run=True)
+def preview_delivery_finalize(
+    path: str | Path,
+    *,
+    project_root: Path | None = None,
+    project_config: dict[str, Any] | None = None,
+) -> DeliveryFinalizeResult:
+    preflight = _preflight_delivery_finalize(
+        path,
+        project_root=project_root,
+        project_config=project_config,
+        dry_run=True,
+    )
     return preflight.result
 
 
-def finalize_delivery_plan(path: str | Path, *, project_root: Path | None = None) -> DeliveryFinalizeResult:
+def finalize_delivery_plan(
+    path: str | Path,
+    *,
+    project_root: Path | None = None,
+    project_config: dict[str, Any] | None = None,
+) -> DeliveryFinalizeResult:
     current_status = get_delivery_status(path, project_root=project_root)
-    if delivery_finalization_is_current(current_status):
+    if delivery_finalization_is_current(current_status, project_config=project_config):
         initial_result = _current_finalization_result(current_status)
         assert current_status.plan is not None
         assert current_status.project_root is not None
@@ -90,7 +112,12 @@ def finalize_delivery_plan(path: str | Path, *, project_root: Path | None = None
         if _finalization_event_exists(events_path, current_status):
             return initial_result
     else:
-        preflight = _preflight_delivery_finalize(path, project_root=project_root, dry_run=False)
+        preflight = _preflight_delivery_finalize(
+            path,
+            project_root=project_root,
+            project_config=project_config,
+            dry_run=False,
+        )
         if not preflight.result.ready or preflight.plan_id is None or preflight.result.project_root is None:
             return preflight.result
         initial_result = preflight.result
@@ -116,10 +143,15 @@ def finalize_delivery_plan(path: str | Path, *, project_root: Path | None = None
 
     with lock:
         current_status = get_delivery_status(path, project_root=project_root)
-        if delivery_finalization_is_current(current_status):
+        if delivery_finalization_is_current(current_status, project_config=project_config):
             _repair_finalization_event(events_path, current_status)
             return _current_finalization_result(current_status)
-        preflight = _preflight_delivery_finalize(path, project_root=project_root, dry_run=False)
+        preflight = _preflight_delivery_finalize(
+            path,
+            project_root=project_root,
+            project_config=project_config,
+            dry_run=False,
+        )
         result = preflight.result
         if not result.ready or preflight.plan_id is None or result.project_root is None:
             return result
@@ -151,13 +183,18 @@ def finalize_delivery_plan(path: str | Path, *, project_root: Path | None = None
                 message="Delivery progress could not be updated.",
             )
 
-        progress, commit, assembly_error = _assemble_for_finalize(
-            root=root,
-            status=get_delivery_status(path, project_root=project_root),
-            progress=progress,
-            progress_path=progress_path,
-            events_path=events_path,
-        )
+        current_status = get_delivery_status(path, project_root=project_root)
+        if current_status.plan and current_status.plan.requires_final_verification:
+            commit = progress.verification.candidate_commit if progress.verification else None
+            assembly_error = None
+        else:
+            progress, commit, assembly_error = assemble_delivery_candidate(
+                root=root,
+                status=current_status,
+                progress=progress,
+                progress_path=progress_path,
+                events_path=events_path,
+            )
         if assembly_error is not None or commit is None:
             return _replace_result(
                 result,
@@ -171,6 +208,19 @@ def finalize_delivery_plan(path: str | Path, *, project_root: Path | None = None
                     else "Delivery assembly did not produce a final branch commit."
                 ),
             )
+
+        if current_status.plan and current_status.plan.requires_final_verification:
+            current_status = get_delivery_status(path, project_root=project_root)
+            verification_issue = _final_verification_issue(root, current_status, project_config)
+            if verification_issue is not None:
+                return _replace_result(
+                    result,
+                    ready=False,
+                    finalized=False,
+                    final_commit=None,
+                    errors=[*result.errors, verification_issue],
+                    message="Delivery verification changed before finalization could be recorded.",
+                )
 
         progress = mark_delivery_finalized(progress, final_branch=branch, final_commit=commit)
         write_delivery_progress(progress_path, progress)
@@ -205,7 +255,11 @@ def finalize_delivery_plan(path: str | Path, *, project_root: Path | None = None
         )
 
 
-def delivery_finalization_is_current(status: DeliveryStatusResult) -> bool:
+def delivery_finalization_is_current(
+    status: DeliveryStatusResult,
+    *,
+    project_config: dict[str, Any] | None = None,
+) -> bool:
     if not (
         status.valid
         and status.status == "done"
@@ -219,6 +273,10 @@ def delivery_finalization_is_current(status: DeliveryStatusResult) -> bool:
     ):
         return False
     root = Path(status.project_root).resolve()
+    if getattr(status.plan, "requires_final_verification", False) and (
+        _final_verification_issue(root, status, project_config) is not None
+    ):
+        return False
     try:
         if delivery_assembly_branch_is_symbolic(root, status.final_branch):
             return False
@@ -330,6 +388,7 @@ def _preflight_delivery_finalize(
     path: str | Path,
     *,
     project_root: Path | None,
+    project_config: dict[str, Any] | None,
     dry_run: bool,
 ) -> _FinalizePreflight:
     status = get_delivery_status(path, project_root=project_root)
@@ -375,11 +434,22 @@ def _preflight_delivery_finalize(
                 assembled_commit=status.assembled_commit,
             )
         )
-        if not errors:
-            assembly_issue = _finalize_assembly_preview_issue(root, status)
+        if not errors and status.plan and status.plan.requires_final_verification:
+            verification_issue = _final_verification_issue(root, status, project_config)
+            if verification_issue is not None:
+                errors.append(verification_issue)
+            else:
+                commit = status.verification.candidate_commit if status.verification else None
+                message = (
+                    f"Dry run would finalize verified candidate {commit} on {branch}."
+                    if dry_run
+                    else f"Verified delivery candidate {commit} is ready to finalize on {branch}."
+                )
+        if not errors and status.plan and not status.plan.requires_final_verification:
+            assembly_issue = preview_delivery_assembly_issue(root, status)
             if assembly_issue is not None:
                 errors.append(assembly_issue)
-        if not errors:
+        if not errors and status.plan and not status.plan.requires_final_verification:
             candidate = _final_commit_candidate(
                 root,
                 branch=branch,
@@ -435,7 +505,76 @@ def _preflight_delivery_finalize(
     )
 
 
-def _finalize_assembly_preview_issue(root: Path, status: Any) -> DeliveryPlanIssue | None:
+def _final_verification_issue(
+    root: Path,
+    status: DeliveryStatusResult,
+    project_config: dict[str, Any] | None,
+) -> DeliveryPlanIssue | None:
+    verification = status.verification
+    if project_config is None:
+        return DeliveryPlanIssue(
+            "error",
+            "delivery_verification.config_unavailable",
+            "Finalization requires the effective verification configuration.",
+        )
+    if verification is None or not verification.passed:
+        return DeliveryPlanIssue(
+            "error",
+            "delivery_verification.required",
+            "Run delivery verify successfully before finalizing this plan.",
+        )
+    if status.assembly_status != "ready" or status.assembled_commit != verification.candidate_commit:
+        return DeliveryPlanIssue(
+            "error",
+            "delivery_verification.stale",
+            "The passing verification does not match the current assembled candidate.",
+        )
+    from core.delivery_verification import build_delivery_verification_identity
+
+    try:
+        identity = build_delivery_verification_identity(
+            status,
+            project_config,
+            candidate_commit=verification.candidate_commit,
+        )
+    except (OSError, RuntimeError, ValueError):
+        return DeliveryPlanIssue(
+            "error",
+            "delivery_verification.identity_unavailable",
+            "The verified candidate identity could not be revalidated.",
+        )
+    for key in (
+        "gate_id",
+        "candidate_commit",
+        "candidate_tree",
+        "source_fingerprint",
+        "plan_fingerprint",
+        "completed_scope_fingerprint",
+        "config_fingerprint",
+        "policy_fingerprint",
+    ):
+        if getattr(verification, key) != getattr(identity, key):
+            return DeliveryPlanIssue(
+                "error",
+                "delivery_verification.stale",
+                "The passing verification is stale; rerun delivery verify.",
+            )
+    branch_commit = _resolve_commit(root, f"refs/heads/{status.plan.final_branch}")
+    if branch_commit != verification.candidate_commit:
+        return DeliveryPlanIssue(
+            "error",
+            "delivery_verification.ref_changed",
+            "The assembled branch moved after verification; rerun delivery verify.",
+        )
+    return None
+
+
+def preview_delivery_assembly_issue(
+    root: Path,
+    status: Any,
+    *,
+    detect_conflicts: bool = False,
+) -> DeliveryPlanIssue | None:
     from core.delivery_assembly import (
         ordered_delivery_assembly_units,
         preview_delivery_assembly,
@@ -451,8 +590,9 @@ def _finalize_assembly_preview_issue(root: Path, status: Any) -> DeliveryPlanIss
         base_commit=status.assembly_base_commit or "HEAD",
         expected_commit=status.assembled_commit,
         units=ordered_delivery_assembly_units(status.plan, completed_commits),
+        detect_conflicts=detect_conflicts,
     )
-    if preview.error is not None and preview.error.code == "delivery.assembly_git_unsupported":
+    if preview.error is not None and (detect_conflicts or preview.error.code == "delivery.assembly_git_unsupported"):
         return preview.error
     failed_unit = next((unit for unit in status.units if unit.id == status.assembly_unit_id), None)
     return recorded_delivery_assembly_conflict_issue(
@@ -601,13 +741,14 @@ def _commit_contains_completed_units(root: Path, candidate: str, units) -> bool:
     return True
 
 
-def _assemble_for_finalize(
+def assemble_delivery_candidate(
     *,
     root: Path,
     status,
     progress,
     progress_path: Path,
     events_path: Path,
+    git_env: dict[str, str] | None = None,
 ):
     from core.delivery_assembly import assemble_delivery_commits, ordered_delivery_assembly_units
 
@@ -641,6 +782,7 @@ def _assemble_for_finalize(
         base_commit=base_commit,
         expected_commit=progress.assembled_commit,
         units=units,
+        git_env=git_env,
     )
     if result.success and result.assembled_commit is not None:
         progress = mark_delivery_assembly(
@@ -735,6 +877,7 @@ def _resolve_commit(root: Path, ref: str) -> str | None:
         cwd=root,
         capture_output=True,
         text=True,
+        env=delivery_verification_git_env(),
     )
     if result.returncode != 0:
         return None
@@ -748,6 +891,7 @@ def _git_commit_is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
         cwd=root,
         capture_output=True,
         text=True,
+        env=delivery_verification_git_env(),
     )
     return result.returncode == 0
 
@@ -782,3 +926,29 @@ def _replace_result(
 
 def _format_issue(issue: DeliveryPlanIssue) -> str:
     return issue.to_public_text()
+
+
+def _public_finalize_path(value: str | None, root: Path | None) -> str | None:
+    if value is None:
+        return None
+    if root is not None:
+        try:
+            return Path(value).resolve().relative_to(root).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            pass
+    return sanitize_delivery_public_metadata(Path(value).name)
+
+
+def _public_finalize_issue(issue: DeliveryPlanIssue, root: Path | None) -> DeliveryPlanIssue:
+    message = issue.message
+    path = issue.path
+    if root is not None:
+        message = message.replace(str(root), ".")
+        if path and Path(path).is_absolute():
+            path = _public_finalize_path(path, root)
+    return DeliveryPlanIssue(
+        issue.severity,
+        sanitize_delivery_public_metadata(issue.code) or "delivery.error",
+        sanitize_delivery_public_metadata(message) or "Delivery operation failed.",
+        sanitize_delivery_public_metadata(path),
+    )

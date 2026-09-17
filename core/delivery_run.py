@@ -13,6 +13,7 @@ from core.delivery_public_metadata import (
     project_delivery_public_identity,
     sanitize_delivery_public_metadata,
 )
+from core.version import sikula_version
 
 DELIVERY_RUN_BLOCKED = "delivery.run.blocked"
 DELIVERY_RUN_COMPLETED = "delivery.run.completed"
@@ -54,6 +55,10 @@ class DeliveryRunResult:
     def to_dict(self) -> dict[str, Any]:
         root = Path(self.project_root).resolve() if self.project_root and self.project_root != "." else None
         return {
+            "schema_version": 1,
+            "sikula_version": sikula_version(),
+            "command": "delivery.run",
+            "privacy_mode": "public_metadata",
             "plan_path": _public_path(self.plan_path, root),
             "project_root": "." if root else self.project_root,
             "valid": self.valid,

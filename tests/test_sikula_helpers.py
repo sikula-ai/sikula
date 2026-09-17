@@ -273,6 +273,7 @@ class TestLoadConfig:
         cfg.write_text("project:\n  name: test\n")
         result = load_config(cfg)
         assert result["project"]["name"] == "test"
+        assert result["_config_source_fingerprint"].startswith("sha256:")
 
     def test_missing_file_exits(self, tmp_path: Path):
         with pytest.raises(SystemExit) as exc:

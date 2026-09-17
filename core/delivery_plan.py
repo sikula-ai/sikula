@@ -24,8 +24,13 @@ from core.delivery_unit_metadata import (
     DeliveryUnitBudget,
 )
 
-SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION = 1
+LEGACY_DELIVERY_PLAN_SCHEMA_VERSION = 1
+SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION = 2
+SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSIONS = frozenset(
+    {LEGACY_DELIVERY_PLAN_SCHEMA_VERSION, SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION}
+)
 SUPPORTED_DELIVERY_CONSTRAINT_CONTEXT_SCHEMA_VERSION = 1
+DELIVERY_VERIFICATION_MODE_FINAL_GATE = "final_gate"
 DELIVERY_CONSTRAINT_KIND_VALUES = frozenset(
     {
         "authoritative_read_only_dependency",
@@ -41,6 +46,22 @@ MAX_DELIVERY_CONSTRAINTS = 100
 MAX_DELIVERY_CONSTRAINT_UNIT_IDS = 1000
 _DELIVERY_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _DELIVERY_SOURCE_TASK_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_DELIVERY_PRIVATE_SOURCE_PATHS = (
+    (".git",),
+    (".hg",),
+    (".svn",),
+    (".sikula", "state"),
+    (".sikula", "worktrees"),
+    (".sikula", "contract-reports"),
+    (".venv",),
+    ("venv",),
+    (".tox",),
+    (".nox",),
+    (".pytest_cache",),
+    (".ruff_cache",),
+    ("__pycache__",),
+    ("node_modules",),
+)
 MAX_DELIVERY_UNIT_ID_LENGTH = 1000
 _GIT_REF_FORBIDDEN_CHARS_RE = re.compile(r"[\000-\037\177 ~^:?*\[\\]")
 _SPLIT_RECOMMENDED_TAG_SET = frozenset({"external_execution_boundary", "structured_output_contract", "cli_surface"})
@@ -68,6 +89,26 @@ def is_valid_delivery_branch_name(branch: str) -> bool:
         if not part or part.startswith(".") or part.casefold().endswith(".lock"):
             return False
     return True
+
+
+def is_private_delivery_source_task_path(path_value: str) -> bool:
+    """Return whether a portable source-task path names runtime or private data."""
+    for parts in (PurePosixPath(path_value).parts, PureWindowsPath(path_value).parts):
+        normalized = tuple(part.casefold() for part in parts if part not in {"", ".", "/", "\\"})
+        if any(
+            normalized[index : index + len(private)] == private
+            for private in _DELIVERY_PRIVATE_SOURCE_PATHS
+            for index in range(len(normalized) - len(private) + 1)
+        ):
+            return True
+        if normalized and (
+            normalized[-1] == ".env"
+            or normalized[-1].startswith(".env.")
+            or normalized[-1] == ".coverage"
+            or normalized[-1].startswith(".coverage.")
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -116,6 +157,14 @@ class DeliveryPlanSourceTask:
 
     def to_dict(self) -> dict[str, str]:
         return {"path": self.path, "sha256": self.sha256}
+
+
+@dataclass(frozen=True)
+class DeliveryVerificationPolicy:
+    mode: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"mode": self.mode}
 
 
 @dataclass(frozen=True)
@@ -266,6 +315,7 @@ class DeliveryPlan:
     constraints: list[DeliveryConstraint] = field(default_factory=list)
     source_task: DeliveryPlanSourceTask | None = None
     planning_mode: str | None = None
+    verification: DeliveryVerificationPolicy | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -286,7 +336,13 @@ class DeliveryPlan:
             data["constraints"] = [constraint.to_dict() for constraint in self.constraints]
         if self.planning_mode:
             data["planning_mode"] = self.planning_mode
+        if self.verification:
+            data["verification"] = self.verification.to_dict()
         return data
+
+    @property
+    def requires_final_verification(self) -> bool:
+        return bool(self.verification and self.verification.mode == DELIVERY_VERIFICATION_MODE_FINAL_GATE)
 
 
 def delivery_unit_constraint_context(
@@ -318,6 +374,8 @@ class DeliveryPlanCheckResult:
     errors: list[DeliveryPlanIssue]
     warnings: list[DeliveryPlanIssue]
     plan: DeliveryPlan | None = None
+    plan_fingerprint: str | None = None
+    plan_bytes: int | None = None
 
     @property
     def valid(self) -> bool:
@@ -365,7 +423,7 @@ def check_delivery_plan_file(path: str | Path, *, project_root: Path | None = No
             )
         )
 
-    data = _load_plan_yaml(plan_path, errors)
+    data, plan_fingerprint, plan_bytes = _load_plan_yaml(plan_path, errors)
     plan: DeliveryPlan | None = None
     if isinstance(data, dict):
         plan = _parse_delivery_plan(
@@ -382,6 +440,8 @@ def check_delivery_plan_file(path: str | Path, *, project_root: Path | None = No
         errors=errors,
         warnings=warnings,
         plan=plan,
+        plan_fingerprint=plan_fingerprint,
+        plan_bytes=plan_bytes,
     )
 
 
@@ -447,25 +507,29 @@ def _format_issue(issue: DeliveryPlanIssue) -> str:
     return issue.to_public_text()
 
 
-def _load_plan_yaml(path: Path, errors: list[DeliveryPlanIssue]) -> Any:
+def _load_plan_yaml(
+    path: Path,
+    errors: list[DeliveryPlanIssue],
+) -> tuple[Any, str | None, int | None]:
     if not path.exists():
         errors.append(DeliveryPlanIssue("error", "plan.missing", f"Plan file not found: {path}"))
-        return None
+        return None, None, None
     if not path.is_file():
         errors.append(DeliveryPlanIssue("error", "plan.not_file", f"Plan path is not a file: {path}"))
-        return None
+        return None, None, None
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw = path.read_bytes()
+        data = yaml.safe_load(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError) as exc:
         errors.append(DeliveryPlanIssue("error", "plan.read_failed", f"Failed to read plan file: {exc}"))
-        return None
+        return None, None, None
     except yaml.YAMLError as exc:
         errors.append(DeliveryPlanIssue("error", "plan.parse_failed", _safe_yaml_error_message(exc)))
-        return None
+        return None, None, None
     if not isinstance(data, dict):
         errors.append(DeliveryPlanIssue("error", "plan.invalid_type", "Delivery plan must be a YAML mapping."))
-        return None
-    return data
+        return None, None, None
+    return data, "sha256:" + sha256(raw).hexdigest(), len(raw)
 
 
 def _safe_yaml_error_message(exc: yaml.YAMLError) -> str:
@@ -490,15 +554,12 @@ def _parse_delivery_plan(
     virtual_task_paths: frozenset[str],
 ) -> DeliveryPlan | None:
     schema_version = _require_int(data, "schema_version", "schema_version", errors)
-    if schema_version is not None and schema_version != SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION:
+    if schema_version is not None and schema_version not in SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSIONS:
         errors.append(
             DeliveryPlanIssue(
                 "error",
                 "schema_version.unsupported",
-                (
-                    f"Unsupported delivery plan schema_version {schema_version}; "
-                    f"expected {SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION}."
-                ),
+                (f"Unsupported delivery plan schema_version {schema_version}; expected 1 or 2."),
                 "schema_version",
             )
         )
@@ -525,6 +586,11 @@ def _parse_delivery_plan(
             )
         )
     planning_mode = _optional_string(data, "planning_mode", "planning_mode", errors)
+    verification = _parse_verification_policy(
+        data.get("verification"),
+        schema_version=schema_version,
+        errors=errors,
+    )
     repositories = _parse_repositories(data.get("repositories"), errors)
     repo_ids = {repo.id for repo in repositories}
     source_task, source_task_description = _parse_source_task(
@@ -532,6 +598,15 @@ def _parse_delivery_plan(
         project_root=project_root,
         errors=errors,
     )
+    if schema_version == SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION and source_task is None:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "verification.source_task_required",
+                "Verified delivery plans require an immutable source_task fingerprint.",
+                "source_task",
+            )
+        )
     stream_ids = _parse_streams(data.get("streams"), errors)
     components = _parse_components(
         data.get("components"),
@@ -584,7 +659,61 @@ def _parse_delivery_plan(
         constraints=constraints,
         source_task=source_task,
         planning_mode=planning_mode,
+        verification=verification,
     )
+
+
+def _parse_verification_policy(
+    value: Any,
+    *,
+    schema_version: int | None,
+    errors: list[DeliveryPlanIssue],
+) -> DeliveryVerificationPolicy | None:
+    if schema_version == LEGACY_DELIVERY_PLAN_SCHEMA_VERSION:
+        if value is not None:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "verification.schema_version_required",
+                    "Delivery verification policy requires delivery plan schema_version 2.",
+                    "verification",
+                )
+            )
+        return None
+    if schema_version != SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION:
+        return None
+    if not isinstance(value, dict):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "verification.required",
+                "Delivery plan schema_version 2 requires a verification policy.",
+                "verification",
+            )
+        )
+        return None
+    unknown = sorted(set(value) - {"mode"})
+    if unknown:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "verification.keys_invalid",
+                "Delivery verification policy contains unsupported fields.",
+                "verification",
+            )
+        )
+    mode = value.get("mode")
+    if mode != DELIVERY_VERIFICATION_MODE_FINAL_GATE:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "verification.mode_invalid",
+                "Delivery verification mode must be final_gate.",
+                "verification.mode",
+            )
+        )
+        return None
+    return DeliveryVerificationPolicy(mode=mode)
 
 
 def _parse_repositories(value: Any, errors: list[DeliveryPlanIssue]) -> list[DeliveryRepository]:
@@ -694,6 +823,16 @@ def _parse_source_task(
     )
     if len(errors) != path_error_count:
         return None, None
+    if is_private_delivery_source_task_path(source_path):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "source_task.private_path",
+                "source_task.path must not reference environment, VCS, or Sikula runtime artifacts.",
+                "source_task.path",
+            )
+        )
+        return None, None
     if not _DELIVERY_SOURCE_TASK_SHA256_RE.fullmatch(source_sha256):
         errors.append(
             DeliveryPlanIssue(
@@ -706,6 +845,16 @@ def _parse_source_task(
         return None, None
 
     source_file = project_root / source_path
+    if _source_task_resolves_to_private_root(source_file, project_root):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "source_task.private_path",
+                "source_task.path must not resolve into environment, VCS, or Sikula runtime artifacts.",
+                "source_task.path",
+            )
+        )
+        return None, None
     try:
         if source_file.is_symlink():
             errors.append(
@@ -740,6 +889,14 @@ def _parse_source_task(
         )
         source_text = None
     return DeliveryPlanSourceTask(path=source_path, sha256=source_sha256), source_text
+
+
+def _source_task_resolves_to_private_root(source_file: Path, project_root: Path) -> bool:
+    try:
+        relative = source_file.resolve(strict=False).relative_to(project_root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return True
+    return is_private_delivery_source_task_path(relative.as_posix())
 
 
 def _parse_streams(value: Any, errors: list[DeliveryPlanIssue]) -> list[str]:

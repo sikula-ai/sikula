@@ -320,6 +320,55 @@ def test_preview_delivery_run_keeps_finalize_blocker_when_recorded_branch_diverg
     assert result.errors == [issue]
 
 
+def test_preview_delivery_run_preflights_schema_v2_assembly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = _status(["done"])
+    status.plan.requires_final_verification = True
+    status.verification_status = "pending"
+    issue = DeliveryPlanIssue(
+        "error",
+        "delivery.assembly_conflict",
+        "Delivery unit unit-1 conflicts with the assembled branch.",
+    )
+
+    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    monkeypatch.setattr(
+        "core.delivery_verification.with_delivery_verification_readiness",
+        lambda current, config: current,
+    )
+    monkeypatch.setattr(
+        "core.delivery_finalize.preview_delivery_assembly_issue",
+        lambda *args, **kwargs: issue,
+    )
+
+    result = _preview_delivery_run(_args(dry_run=True), {}, project_root=Path("/project"))
+
+    assert result.ready is False
+    assert result.stop_code == DELIVERY_RUN_BLOCKED
+    assert result.errors == [issue]
+
+
+def test_preview_delivery_run_does_not_offer_actionable_verification_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = _status(["done"])
+    status.plan.requires_final_verification = True
+    status.verification_status = "failed"
+    status.verification = SimpleNamespace(stop_code="delivery_verification.scope_amendment_required")
+    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    monkeypatch.setattr(
+        "core.delivery_verification.with_delivery_verification_readiness",
+        lambda current, config: current,
+    )
+
+    result = _preview_delivery_run(_args(dry_run=True), {}, project_root=Path("/project"))
+
+    assert result.ready is False
+    assert result.stop_code == "delivery_verification.scope_amendment_required"
+    assert result.errors[0].code == result.stop_code
+
+
 def test_current_finalization_requires_recorded_branch_to_match_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -707,6 +756,246 @@ def test_finalize_delivery_run_routes_current_finalization_through_finalizer(
     assert result.finalized is True
     assert result.stop_code == DELIVERY_RUN_COMPLETED
     assert seen == ["finalize"]
+
+
+def test_finalize_delivery_run_verifies_schema_v2_before_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = _status(["done"])
+    status.plan.requires_final_verification = True
+    status.verification_status = "pending"
+    calls: list[str] = []
+
+    def verify(args, cfg):
+        calls.append("verify")
+        status.verification_status = "passed"
+        return SimpleNamespace(succeeded=True, stop_code=None, errors=[], warnings=[])
+
+    context = SimpleNamespace(verify_plan=verify)
+    monkeypatch.setattr(
+        "core.delivery_verification.with_delivery_verification_readiness",
+        lambda current, cfg: current,
+    )
+    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    monkeypatch.setattr(
+        "core.delivery_finalize.preview_delivery_finalize",
+        lambda *args, **kwargs: SimpleNamespace(ready=True, errors=[], warnings=[]),
+    )
+    monkeypatch.setattr(
+        "core.delivery_finalize.finalize_delivery_plan",
+        lambda *args, **kwargs: SimpleNamespace(
+            finalized=True,
+            final_branch="sikula/delivery/demo",
+            final_commit="a" * 40,
+            errors=[],
+            warnings=[],
+            message="Finalized.",
+        ),
+    )
+
+    result = _finalize_delivery_run(
+        _args(),
+        cfg={},
+        context=context,
+        status=status,
+        project_root=Path("/project"),
+        max_units=1,
+        max_elapsed_minutes=None,
+        units_attempted=1,
+        units_succeeded=1,
+        last_unit=None,
+        child_task_id=None,
+    )
+
+    assert calls == ["verify"]
+    assert result.finalized is True
+    assert result.succeeded is True
+
+
+@pytest.mark.parametrize(
+    "stop_code",
+    [
+        "delivery_verification.repair_required",
+        "delivery_verification.scope_amendment_required",
+        "delivery_verification.external_dependency_gap",
+        "delivery_verification.human_review_required",
+    ],
+)
+def test_finalize_delivery_run_does_not_retry_actionable_verification_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    stop_code: str,
+) -> None:
+    status = _status(["done"])
+    status.plan.requires_final_verification = True
+    status.verification_status = "failed"
+    status.verification = SimpleNamespace(stop_code=stop_code)
+    calls: list[str] = []
+
+    def verify(args, cfg):
+        calls.append("verify")
+        return SimpleNamespace(succeeded=True, stop_code=None, errors=[], warnings=[])
+
+    monkeypatch.setattr(
+        "core.delivery_verification.with_delivery_verification_readiness",
+        lambda current, cfg: current,
+    )
+    result = _finalize_delivery_run(
+        _args(),
+        cfg={},
+        context=SimpleNamespace(verify_plan=verify),
+        status=status,
+        project_root=Path("/project"),
+        max_units=1,
+        max_elapsed_minutes=None,
+        units_attempted=0,
+        units_succeeded=0,
+        last_unit=None,
+        child_task_id=None,
+    )
+
+    assert calls == []
+    assert result.succeeded is False
+    assert result.stop_code == stop_code
+    assert result.errors[0].code == stop_code
+
+
+def test_finalize_delivery_run_does_not_retry_blocked_config_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    status = _status(["done"])
+    status.plan.requires_final_verification = True
+    status.verification_status = "blocked"
+    status.verification = SimpleNamespace(stop_code="delivery_verification.config_changed")
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "core.delivery_verification.with_delivery_verification_readiness",
+        lambda current, cfg: current,
+    )
+    result = _finalize_delivery_run(
+        _args(),
+        cfg={},
+        context=SimpleNamespace(verify_plan=lambda args, cfg: calls.append("verify")),
+        status=status,
+        project_root=Path("/project"),
+        max_units=1,
+        max_elapsed_minutes=None,
+        units_attempted=0,
+        units_succeeded=0,
+        last_unit=None,
+        child_task_id=None,
+    )
+
+    assert calls == []
+    assert result.succeeded is False
+    assert result.stop_code == "delivery_verification.config_changed"
+
+
+def test_finalize_delivery_run_retries_technical_verification_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = _status(["done"])
+    status.plan.requires_final_verification = True
+    status.verification_status = "failed"
+    status.verification = SimpleNamespace(stop_code="delivery_verification.validation_failed")
+    calls: list[str] = []
+
+    def verify(args, cfg):
+        calls.append("verify")
+        status.verification_status = "passed"
+        return SimpleNamespace(succeeded=True, stop_code=None, errors=[], warnings=[])
+
+    monkeypatch.setattr(
+        "core.delivery_verification.with_delivery_verification_readiness",
+        lambda current, cfg: current,
+    )
+    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    monkeypatch.setattr(
+        "core.delivery_finalize.preview_delivery_finalize",
+        lambda *args, **kwargs: SimpleNamespace(ready=True, errors=[], warnings=[]),
+    )
+    monkeypatch.setattr(
+        "core.delivery_finalize.finalize_delivery_plan",
+        lambda *args, **kwargs: SimpleNamespace(
+            finalized=True,
+            final_branch="sikula/delivery/demo",
+            final_commit="a" * 40,
+            errors=[],
+            warnings=[],
+            message="Finalized.",
+        ),
+    )
+
+    result = _finalize_delivery_run(
+        _args(),
+        cfg={},
+        context=SimpleNamespace(verify_plan=verify),
+        status=status,
+        project_root=Path("/project"),
+        max_units=1,
+        max_elapsed_minutes=None,
+        units_attempted=0,
+        units_succeeded=0,
+        last_unit=None,
+        child_task_id=None,
+    )
+
+    assert calls == ["verify"]
+    assert result.succeeded is True
+
+
+@pytest.mark.parametrize("verification_status", ["passed", "failed"])
+def test_finalize_delivery_run_reverifies_projected_stale_record(
+    monkeypatch: pytest.MonkeyPatch,
+    verification_status: str,
+) -> None:
+    status = _status(["done"])
+    status.plan.requires_final_verification = True
+    status.verification_status = verification_status
+    status.verification = SimpleNamespace(stop_code="delivery_verification.config_changed")
+    calls: list[str] = []
+
+    def project(current, cfg):
+        current.verification_status = "stale"
+        return current
+
+    def verify(args, cfg):
+        calls.append("verify")
+        status.verification_status = "passed"
+        return SimpleNamespace(succeeded=True, stop_code=None, errors=[], warnings=[])
+
+    monkeypatch.setattr("core.delivery_verification.with_delivery_verification_readiness", project)
+    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    monkeypatch.setattr(
+        "core.delivery_finalize.preview_delivery_finalize",
+        lambda *args, **kwargs: SimpleNamespace(ready=True, errors=[], warnings=[]),
+    )
+    monkeypatch.setattr(
+        "core.delivery_finalize.finalize_delivery_plan",
+        lambda *args, **kwargs: SimpleNamespace(
+            finalized=True,
+            final_branch="sikula/delivery/demo",
+            final_commit="a" * 40,
+            errors=[],
+            warnings=[],
+            message="Finalized.",
+        ),
+    )
+
+    result = _finalize_delivery_run(
+        _args(),
+        cfg={"run_tests": False},
+        context=SimpleNamespace(verify_plan=verify),
+        status=status,
+        project_root=Path("/project"),
+        max_units=1,
+        max_elapsed_minutes=None,
+        units_attempted=0,
+        units_succeeded=0,
+        last_unit=None,
+        child_task_id=None,
+    )
+
+    assert calls == ["verify"]
+    assert result.succeeded is True
 
 
 def test_finalize_delivery_run_stops_on_blocked_preflight(monkeypatch: pytest.MonkeyPatch) -> None:

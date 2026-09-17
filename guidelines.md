@@ -838,6 +838,24 @@ python3 -m ruff format .
   it; an exact-file root cannot become a directory prefix after dependency
   assembly. The winning terminal failure code selects recovery, and
   `--reset-failed` must not bypass scope, amendment, or external-dependency stops.
+- **Never** finalize a schema-version-2 delivery plan from per-unit success or
+  Git ancestry alone. Require current final-gate evidence bound to the exact
+  candidate tree, source, immutable parsed-plan byte snapshot, completed scope,
+  policy, and effective validation configuration. Project mismatched passed
+  evidence as stale. Finalize remains deterministic and must not invoke a provider.
+- **Never** truncate an oversized final integration authority packet into a
+  passing review. Count rendered plan context, validation/check policy, applicable
+  reviewer rules, security context, and the exact final prompt in addition to the
+  source. Return the hierarchy-required stop until recursive checkpoint support
+  exists. Integration and security reviewers remain physically read-only,
+  use exact-final-line structured dispositions, receive at most one format retry,
+  and cannot infer approval from empty, malformed, or uncertain output.
+- **Never** expose final-gate source text, prompts, provider output, validation
+  output, diffs, child state, credentials, or absolute paths through delivery
+  status or JSON. Keep private material in append-only local evidence and publish
+  only the versioned allowlisted projection. Create that evidence owner-only
+  without following the final file or any parent link, and remove validation-only
+  environment files before preparing or invoking a reviewer workspace.
 - **Never** use real provider-backed nested `sikula run` or `sikula review --fix` delivery flows as tests or validation commands unless a task explicitly targets that behavior and isolates all state and providers.
 - **Always** add `from __future__ import annotations` immediately after the optional
   module docstring and before all other imports.

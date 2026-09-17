@@ -11,7 +11,7 @@ import tempfile
 from typing import Iterator
 
 from core.delivery_plan import DeliveryPlan, DeliveryPlanIssue
-from core.worktree import branch_checked_out, resolve_git_commit
+from core.worktree import branch_checked_out, delivery_verification_git_env, resolve_git_commit
 
 _OBJECT_ID_RE = re.compile(r"^[0-9a-f]{40,64}$")
 
@@ -176,21 +176,25 @@ def assemble_delivery_commits(
     base_commit: str,
     expected_commit: str | None,
     units: list[DeliveryAssemblyUnit],
+    git_env: dict[str, str] | None = None,
 ) -> DeliveryAssemblyResult:
     root = project_root.resolve()
+    env = dict(git_env) if git_env is not None else delivery_verification_git_env()
     preflight = preview_delivery_assembly(
         root,
         branch=branch,
         base_commit=base_commit,
         expected_commit=expected_commit,
         units=units,
+        detect_conflicts=False,
+        git_env=env,
     )
     if not preflight.success:
         return preflight
     base = preflight.base_commit
-    current = _branch_commit(root, branch)
+    current = _branch_commit(root, branch, env=env)
     if current is None:
-        if not _update_ref(root, branch, base, None):
+        if not _update_ref(root, branch, base, None, env=env):
             return _failure(
                 branch,
                 base,
@@ -199,8 +203,8 @@ def assemble_delivery_commits(
                 "Git refused to create the delivery assembly branch.",
             )
         current = base
-    elif not expected_commit and _is_ancestor(root, current, base) and current != base:
-        if not _update_ref(root, branch, base, current):
+    elif not expected_commit and _is_ancestor(root, current, base, env=env) and current != base:
+        if not _update_ref(root, branch, base, current, env=env):
             return _failure(
                 branch,
                 base,
@@ -216,7 +220,7 @@ def assemble_delivery_commits(
             outcomes.append(DeliveryAssemblyOutcome(unit.unit_id, "no_op", None, current))
             continue
 
-        result_commit, _ = resolve_git_commit(root, unit.commit)
+        result_commit, _ = resolve_git_commit(root, unit.commit, env=env)
         if result_commit is None:
             return _failure(
                 branch,
@@ -227,11 +231,11 @@ def assemble_delivery_commits(
                 failed_unit_id=unit.unit_id,
                 outcomes=outcomes,
             )
-        if _is_ancestor(root, result_commit, current):
+        if _is_ancestor(root, result_commit, current, env=env):
             outcomes.append(DeliveryAssemblyOutcome(unit.unit_id, "already_applied", result_commit, current))
             continue
-        if _is_ancestor(root, current, result_commit):
-            if not _update_ref(root, branch, result_commit, current):
+        if _is_ancestor(root, current, result_commit, env=env):
+            if not _update_ref(root, branch, result_commit, current, env=env):
                 return _failure(
                     branch,
                     base,
@@ -245,7 +249,14 @@ def assemble_delivery_commits(
             outcomes.append(DeliveryAssemblyOutcome(unit.unit_id, "fast_forward", result_commit, current))
             continue
 
-        merged_commit, merge_error = _merge_commits(root, plan_id, unit.unit_id, current, result_commit)
+        merged_commit, merge_error = _merge_commits(
+            root,
+            plan_id,
+            unit.unit_id,
+            current,
+            result_commit,
+            env=env,
+        )
         if merge_error is not None:
             return DeliveryAssemblyResult(
                 success=False,
@@ -256,7 +267,7 @@ def assemble_delivery_commits(
                 failed_unit_id=unit.unit_id,
                 error=merge_error,
             )
-        if merged_commit is None or not _update_ref(root, branch, merged_commit, current):
+        if merged_commit is None or not _update_ref(root, branch, merged_commit, current, env=env):
             return _failure(
                 branch,
                 base,
@@ -646,14 +657,17 @@ def preview_delivery_assembly(
     expected_commit: str | None,
     units: list[DeliveryAssemblyUnit],
     allow_checked_out: bool = False,
+    detect_conflicts: bool = False,
+    git_env: dict[str, str] | None = None,
 ) -> DeliveryAssemblyResult:
     root = project_root.resolve()
-    base, _ = resolve_git_commit(root, base_commit)
+    env = dict(git_env) if git_env is not None else delivery_verification_git_env()
+    base, _ = resolve_git_commit(root, base_commit, env=env)
     if base is None:
         return _failure(
             branch, base_commit, None, "delivery.assembly_base_missing", "Delivery assembly base commit is missing."
         )
-    if not _valid_branch_name(root, branch):
+    if not _valid_branch_name(root, branch, env=env):
         return _failure(
             branch,
             base,
@@ -661,7 +675,7 @@ def preview_delivery_assembly(
             "delivery.assembly_branch_invalid",
             "Delivery final_branch is not a valid local branch name.",
         )
-    if delivery_assembly_branch_is_symbolic(root, branch):
+    if delivery_assembly_branch_is_symbolic(root, branch, env=env):
         return _failure(
             branch,
             base,
@@ -670,8 +684,8 @@ def preview_delivery_assembly(
             "Delivery final_branch must be a direct ref, not a symbolic ref.",
         )
 
-    current = _branch_commit(root, branch)
-    if current is not None and not allow_checked_out and branch_checked_out(root, branch):
+    current = _branch_commit(root, branch, env=env)
+    if current is not None and not allow_checked_out and branch_checked_out(root, branch, env=env):
         return _failure(
             branch,
             base,
@@ -680,7 +694,7 @@ def preview_delivery_assembly(
             "Delivery assembly branch is checked out; switch that worktree away before retrying.",
         )
     if expected_commit:
-        expected, _ = resolve_git_commit(root, expected_commit)
+        expected, _ = resolve_git_commit(root, expected_commit, env=env)
         if expected is None:
             return _failure(
                 branch,
@@ -697,7 +711,7 @@ def preview_delivery_assembly(
                 "delivery.assembly_branch_missing",
                 "Delivery assembly branch is missing after assembly progress was recorded.",
             )
-        if not _is_ancestor(root, expected, current):
+        if not _is_ancestor(root, expected, current, env=env):
             return _failure(
                 branch,
                 base,
@@ -706,7 +720,7 @@ def preview_delivery_assembly(
                 "Delivery assembly branch diverged from recorded assembly progress.",
             )
     elif current is not None:
-        branch_contains_base = _is_ancestor(root, base, current)
+        branch_contains_base = _is_ancestor(root, base, current, env=env)
         if branch_contains_base and current != base:
             return _failure(
                 branch,
@@ -715,7 +729,7 @@ def preview_delivery_assembly(
                 "delivery.assembly_branch_diverged",
                 "Delivery assembly branch is ahead of the base without recorded assembly progress.",
             )
-        if not branch_contains_base and not _is_ancestor(root, current, base):
+        if not branch_contains_base and not _is_ancestor(root, current, base, env=env):
             return _failure(
                 branch,
                 base,
@@ -726,7 +740,7 @@ def preview_delivery_assembly(
 
     resolved_units: list[tuple[DeliveryAssemblyUnit, str | None]] = []
     for unit in units:
-        resolved_commit = resolve_git_commit(root, unit.commit)[0] if unit.commit else None
+        resolved_commit = resolve_git_commit(root, unit.commit, env=env)[0] if unit.commit else None
         if unit.commit and resolved_commit is None:
             return _failure(
                 branch,
@@ -739,29 +753,58 @@ def preview_delivery_assembly(
         resolved_units.append((unit, resolved_commit))
 
     initialized_commit = current or base
-    if current is not None and not expected_commit and current != base and _is_ancestor(root, current, base):
+    if current is not None and not expected_commit and current != base and _is_ancestor(root, current, base, env=env):
         initialized_commit = base
 
-    prospective_commit = initialized_commit
-    for unit, resolved_commit in resolved_units:
-        if resolved_commit is None or _is_ancestor(root, resolved_commit, prospective_commit):
-            continue
-        if _is_ancestor(root, prospective_commit, resolved_commit):
-            prospective_commit = resolved_commit
-            continue
-        if not _merge_tree_write_tree_supported(root, base):
-            return _failure(
-                branch,
-                base,
-                current or base,
-                "delivery.assembly_git_unsupported",
-                (
-                    "Delivery assembly requires Git 2.38 or newer with "
-                    "git merge-tree --write-tree support when unit commits need a merge."
-                ),
-                failed_unit_id=unit.unit_id,
+    with _delivery_assembly_preview_env(root, git_env=env) as preview_env:
+        prospective_commit = initialized_commit
+        for unit, resolved_commit in resolved_units:
+            if resolved_commit is None or _is_ancestor(root, resolved_commit, prospective_commit, env=preview_env):
+                continue
+            if _is_ancestor(root, prospective_commit, resolved_commit, env=preview_env):
+                prospective_commit = resolved_commit
+                continue
+            if preview_env is None or not _merge_tree_write_tree_supported(root, base, env=preview_env):
+                return _failure(
+                    branch,
+                    base,
+                    current or base,
+                    "delivery.assembly_git_unsupported",
+                    (
+                        "Delivery assembly requires Git 2.38 or newer with "
+                        "git merge-tree --write-tree support when unit commits need a merge."
+                    ),
+                    failed_unit_id=unit.unit_id,
+                )
+            if not detect_conflicts:
+                break
+            merged_commit, merge_error = _merge_commits(
+                root,
+                "preview",
+                unit.unit_id,
+                prospective_commit,
+                resolved_commit,
+                env=preview_env,
             )
-        break
+            if merge_error is not None:
+                return DeliveryAssemblyResult(
+                    success=False,
+                    branch=branch,
+                    base_commit=base,
+                    assembled_commit=current or base,
+                    failed_unit_id=unit.unit_id,
+                    error=merge_error,
+                )
+            if merged_commit is None:
+                return _failure(
+                    branch,
+                    base,
+                    current or base,
+                    "delivery.assembly_git_failed",
+                    "Git could not preview the assembled delivery commit.",
+                    failed_unit_id=unit.unit_id,
+                )
+            prospective_commit = merged_commit
     return DeliveryAssemblyResult(
         success=True,
         branch=branch,
@@ -776,11 +819,14 @@ def _merge_commits(
     unit_id: str,
     current: str,
     result_commit: str,
+    *,
+    env: dict[str, str] | None = None,
 ) -> tuple[str | None, DeliveryPlanIssue | None]:
     try:
         merge = subprocess.run(
             ["git", "merge-tree", "--write-tree", "--no-messages", current, result_commit],
             cwd=root,
+            env=env,
             capture_output=True,
             text=True,
         )
@@ -826,6 +872,7 @@ def _merge_commits(
                 message,
             ],
             cwd=root,
+            env=env,
             capture_output=True,
             text=True,
         )
@@ -1486,31 +1533,88 @@ def _failure(
     )
 
 
-def _valid_branch_name(root: Path, branch: str) -> bool:
+def _valid_branch_name(root: Path, branch: str, *, env: dict[str, str] | None = None) -> bool:
     result = subprocess.run(
         ["git", "check-ref-format", f"refs/heads/{branch}"],
         cwd=root,
+        env=env,
         capture_output=True,
         text=True,
     )
     return result.returncode == 0
 
 
-def delivery_assembly_branch_is_symbolic(root: Path, branch: str) -> bool:
+def delivery_assembly_branch_is_symbolic(
+    root: Path,
+    branch: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> bool:
     result = subprocess.run(
         ["git", "symbolic-ref", "--quiet", f"refs/heads/{branch}"],
         cwd=root,
+        env=env,
         capture_output=True,
         text=True,
     )
     return result.returncode == 0
 
 
-def _merge_tree_write_tree_supported(root: Path, commit: str) -> bool:
+@contextmanager
+def _delivery_assembly_preview_env(
+    root: Path,
+    *,
+    git_env: dict[str, str] | None = None,
+) -> Iterator[dict[str, str] | None]:
+    env = dict(git_env) if git_env is not None else delivery_verification_git_env()
+    for key in ("GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+        env.pop(key, None)
+    try:
+        common_dir_result = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        yield None
+        return
+    if common_dir_result.returncode != 0 or not common_dir_result.stdout.strip():
+        yield None
+        return
+    common_dir = Path(common_dir_result.stdout.strip())
+    if not common_dir.is_absolute():
+        common_dir = root / common_dir
+    try:
+        object_dir = common_dir.resolve(strict=True) / "objects"
+        if not object_dir.is_dir():
+            yield None
+            return
+        temp_context = tempfile.TemporaryDirectory(prefix="sikula-delivery-assembly-preview-")
+        preview_objects = Path(temp_context.name) / "objects"
+        preview_objects.mkdir()
+    except OSError:
+        yield None
+        return
+    preview_env = dict(env)
+    preview_env["GIT_OBJECT_DIRECTORY"] = str(preview_objects)
+    preview_env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(object_dir)
+    with temp_context:
+        yield preview_env
+
+
+def _merge_tree_write_tree_supported(
+    root: Path,
+    commit: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> bool:
     try:
         result = subprocess.run(
             ["git", "merge-tree", "--write-tree", "--no-messages", commit, commit],
             cwd=root,
+            env=env,
             capture_output=True,
             text=True,
         )
@@ -1520,28 +1624,43 @@ def _merge_tree_write_tree_supported(root: Path, commit: str) -> bool:
     return bool(_OBJECT_ID_RE.fullmatch(tree))
 
 
-def _branch_commit(root: Path, branch: str) -> str | None:
-    commit, _ = resolve_git_commit(root, f"refs/heads/{branch}")
+def _branch_commit(root: Path, branch: str, *, env: dict[str, str] | None = None) -> str | None:
+    commit, _ = resolve_git_commit(root, f"refs/heads/{branch}", env=env)
     return commit
 
 
-def _is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
+def _is_ancestor(
+    root: Path,
+    ancestor: str,
+    descendant: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> bool:
     result = subprocess.run(
         ["git", "merge-base", "--is-ancestor", ancestor, descendant],
         cwd=root,
+        env=env,
         capture_output=True,
         text=True,
     )
     return result.returncode == 0
 
 
-def _update_ref(root: Path, branch: str, target: str, expected: str | None) -> bool:
-    if branch_checked_out(root, branch) or delivery_assembly_branch_is_symbolic(root, branch):
+def _update_ref(
+    root: Path,
+    branch: str,
+    target: str,
+    expected: str | None,
+    *,
+    env: dict[str, str] | None = None,
+) -> bool:
+    if branch_checked_out(root, branch, env=env) or delivery_assembly_branch_is_symbolic(root, branch, env=env):
         return False
     expected_oid = expected if expected is not None else "0" * len(target)
     result = subprocess.run(
         ["git", "update-ref", "--no-deref", f"refs/heads/{branch}", target, expected_oid],
         cwd=root,
+        env=env,
         capture_output=True,
         text=True,
     )

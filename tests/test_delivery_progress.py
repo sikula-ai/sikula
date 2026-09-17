@@ -33,6 +33,7 @@ from core.delivery_progress import (
     upsert_delivery_unit_progress,
     with_delivery_llm_usage,
     write_delivery_progress,
+    _next_action,
 )
 from core.state import JsonStateStore, TaskState
 from sikula import main
@@ -884,6 +885,55 @@ def test_delivery_status_reports_done_when_all_units_are_done(tmp_path: Path) ->
     assert result.next_action == "finalize delivery branch"
 
 
+@pytest.mark.parametrize(
+    ("disposition", "expected"),
+    [
+        ("repair_required", "add a delivery repair unit before rerunning delivery verification"),
+        ("scope_amendment_required", "prepare a delivery amendment before rerunning delivery verification"),
+        ("external_dependency_gap", "resolve the external dependency before rerunning delivery verification"),
+        ("human_review_required", "request human review before rerunning delivery verification"),
+    ],
+)
+def test_delivery_status_uses_verification_disposition_recovery(
+    disposition: str,
+    expected: str,
+) -> None:
+    assert (
+        _next_action(
+            "done",
+            [],
+            verification_status="failed",
+            verification_stop_code=f"delivery_verification.{disposition}",
+        )
+        == expected
+    )
+
+
+def test_delivery_status_requires_fresh_context_for_candidate_config_drift() -> None:
+    assert (
+        _next_action(
+            "done",
+            [],
+            verification_status="blocked",
+            verification_stop_code="delivery_verification.config_changed",
+        )
+        == "start a fresh command from a checkout whose config matches the assembled candidate"
+    )
+
+
+def test_delivery_status_routes_verification_assembly_failure_back_to_verify() -> None:
+    assert (
+        _next_action(
+            "done",
+            [],
+            assembly_status="failed",
+            assembly_unit_id="unit-a",
+            verification_required=True,
+        )
+        == "resolve delivery branch assembly for unit unit-a, then rerun delivery verify"
+    )
+
+
 def test_delivery_status_reports_finalized_branch_metadata(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
@@ -1095,6 +1145,63 @@ def test_delivery_status_reports_invalid_plan_without_progress_path(tmp_path: Pa
     assert "Progress:" not in rendered
 
 
+def test_delivery_status_preserves_stale_verification_when_source_changes(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    source_body = "# Source task\n\nDeliver the requested behavior.\n"
+    source_path = tmp_path / ".sikula" / "tasks" / "source.md"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text(source_body, encoding="utf-8")
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan["schema_version"] = 2
+    plan["source_task"] = {
+        "path": source_path.relative_to(tmp_path).as_posix(),
+        "sha256": f"sha256:{sha256(source_body.encode('utf-8')).hexdigest()}",
+    }
+    plan["verification"] = {"mode": "final_gate"}
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
+    checked = get_delivery_status(plan_path, project_root=tmp_path)
+    assert checked.valid is True and checked.plan_fingerprint is not None
+    commit = "a" * 40
+    identity = "sha256:" + "b" * 64
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [],
+            "assembly_base_commit": commit,
+            "assembled_commit": commit,
+            "assembly_status": "ready",
+            "verification": {
+                "schema_version": 1,
+                "gate_id": identity,
+                "candidate_commit": commit,
+                "candidate_tree": "c" * 40,
+                "source_fingerprint": plan["source_task"]["sha256"],
+                "plan_fingerprint": checked.plan_fingerprint,
+                "completed_scope_fingerprint": identity,
+                "config_fingerprint": identity,
+                "policy_fingerprint": identity,
+                "status": "passed",
+                "attempt": 1,
+                "semantic_status": "approved",
+            },
+        },
+    )
+    source_path.write_text(source_body + "Changed.\n", encoding="utf-8")
+
+    result = get_delivery_status(plan_path, project_root=tmp_path)
+
+    assert result.valid is False
+    assert "source_task.hash_mismatch" in _error_codes(result)
+    assert result.progress_exists is True
+    assert result.verification is not None
+    assert result.verification_status == "stale"
+    assert result.to_dict()["verification"]["status"] == "stale"
+
+
 def test_delivery_status_reports_invalid_progress_json(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
@@ -1107,6 +1214,50 @@ def test_delivery_status_reports_invalid_progress_json(tmp_path: Path) -> None:
     assert result.valid is False
     assert result.status == "invalid"
     assert "progress.parse_failed" in _error_codes(result)
+
+
+@pytest.mark.parametrize(("field", "value"), [("semantic_status", []), ("security_status", {})])
+def test_delivery_status_rejects_non_string_verification_review_status(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    commit = "a" * 40
+    identity = "sha256:" + "b" * 64
+    verification = {
+        "schema_version": 1,
+        "gate_id": identity,
+        "candidate_commit": commit,
+        "candidate_tree": "c" * 40,
+        "source_fingerprint": identity,
+        "plan_fingerprint": identity,
+        "completed_scope_fingerprint": identity,
+        "config_fingerprint": identity,
+        "policy_fingerprint": identity,
+        "status": "running",
+        "attempt": 1,
+        field: value,
+    }
+    _write_progress(
+        tmp_path,
+        "delivery-status-demo",
+        {
+            "schema_version": 1,
+            "plan_id": "delivery-status-demo",
+            "units": [],
+            "assembly_base_commit": commit,
+            "assembled_commit": commit,
+            "assembly_status": "ready",
+            "verification": verification,
+        },
+    )
+
+    result = get_delivery_status(plan_path)
+
+    assert result.valid is False
+    assert "progress.verification_invalid" in _error_codes(result)
 
 
 def test_delivery_status_rejects_inconsistent_assembly_metadata(tmp_path: Path) -> None:

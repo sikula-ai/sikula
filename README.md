@@ -156,6 +156,8 @@ sikula delivery run .sikula/delivery/my-task/plan.yaml --max-units 3
 sikula delivery run .sikula/delivery/my-task/plan.yaml \
   --max-elapsed-minutes 60
 sikula delivery run .sikula/delivery/my-task/plan.yaml --reset-failed
+sikula delivery verify .sikula/delivery/my-task/plan.yaml
+sikula delivery verify .sikula/delivery/my-task/plan.yaml --json
 sikula delivery finalize .sikula/delivery/my-task/plan.yaml --dry-run
 sikula delivery finalize .sikula/delivery/my-task/plan.yaml
 ```
@@ -252,6 +254,15 @@ Each explicit `delivery run --reset-failed` invocation retries the current
 ordinary retryable failed child once and continues only after that retry
 succeeds; a later failure stops again and requires another explicit invocation.
 `run-next` remains available for explicit one-unit execution and recovery.
+Newly prepared delivery plans require a final integration gate for the exact
+assembled commit. `delivery run` invokes it after the last unit, or the
+operator can run `delivery verify` explicitly. The gate conservatively reuses
+exact-tree child validation or reruns enabled build, test, and check phases,
+then performs a read-only whole-candidate review and a separate security review
+for security-sensitive plans. `delivery finalize` never invokes an LLM and
+requires a current pass whenever the final-gate policy applies. Existing legacy
+plans retain their direct-finalization behavior. This is a bounded final gate;
+automatic hierarchical checkpoints for plans beyond its limits are later work.
 Task completion output and `delivery status` report provider invocation counts,
 failed attempts, measured provider time, content-free input/output sizes, and
 explicit provider-reported token usage when available. Unavailable token data

@@ -205,6 +205,20 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
     delivery_status_p = delivery_sub.add_parser("status", help="Show delivery plan progress")
     delivery_status_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
     delivery_status_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
+    delivery_status_p.add_argument(
+        "--agent-model",
+        action="append",
+        default=None,
+        metavar="AGENT=MODEL",
+        help="Match a reviewer model override used by delivery verify",
+    )
+    delivery_status_p.add_argument(
+        "--agent-provider",
+        action="append",
+        default=None,
+        metavar="AGENT=PROVIDER",
+        help="Match a reviewer provider override used by delivery verify",
+    )
 
     delivery_run_next_p = delivery_sub.add_parser("run-next", help="Run the next eligible delivery unit")
     delivery_run_next_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
@@ -302,6 +316,34 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
         help="Override timeout for each child run",
     )
 
+    delivery_verify_p = delivery_sub.add_parser(
+        "verify",
+        help="Verify the exact assembled delivery candidate before finalization",
+    )
+    delivery_verify_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
+    delivery_verify_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
+    delivery_verify_p.add_argument(
+        "--agent-model",
+        action="append",
+        default=None,
+        metavar="AGENT=MODEL",
+        help="Override model for reviewer or security_reviewer",
+    )
+    delivery_verify_p.add_argument(
+        "--agent-provider",
+        action="append",
+        default=None,
+        metavar="AGENT=PROVIDER",
+        help="Override provider for reviewer or security_reviewer",
+    )
+    delivery_verify_p.add_argument(
+        "--agent-timeout",
+        action="append",
+        default=None,
+        metavar="AGENT=SECONDS",
+        help="Override timeout for reviewer or security_reviewer",
+    )
+
     delivery_finalize_p = delivery_sub.add_parser("finalize", help="Create or update a delivery plan final branch")
     delivery_finalize_p.add_argument("plan_file", metavar="PLAN_FILE", help="Path to .sikula/delivery/*/plan.yaml")
     delivery_finalize_p.add_argument(
@@ -311,6 +353,20 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
         help="Preview final branch updates without writing delivery progress or Git refs",
     )
     delivery_finalize_p.add_argument("--json", action="store_true", default=False, help="Print structured JSON output")
+    delivery_finalize_p.add_argument(
+        "--agent-model",
+        action="append",
+        default=None,
+        metavar="AGENT=MODEL",
+        help="Match a reviewer model override used by delivery verify",
+    )
+    delivery_finalize_p.add_argument(
+        "--agent-provider",
+        action="append",
+        default=None,
+        metavar="AGENT=PROVIDER",
+        help="Match a reviewer provider override used by delivery verify",
+    )
 
     delivery_amend_p = delivery_sub.add_parser("amend", help="Safely amend an existing delivery plan")
     delivery_amend_sub = delivery_amend_p.add_subparsers(dest="delivery_amend_command")
@@ -361,8 +417,14 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
 
 def cmd_delivery_check(args: argparse.Namespace, cfg: dict) -> None:
     from core.delivery_plan import check_delivery_plan_file, render_delivery_plan_check
+    from core.delivery_verification import check_delivery_verification_readiness
 
-    result = check_delivery_plan_file(args.plan_file)
+    effective_cfg, project_root = _delivery_plan_config_context(args, cfg)
+    result = check_delivery_plan_file(args.plan_file, project_root=project_root)
+    if result.valid and result.plan and result.plan.requires_final_verification:
+        readiness = check_delivery_verification_readiness(result, effective_cfg)
+        if not readiness.ready:
+            result = replace(result, errors=readiness.errors, warnings=readiness.warnings)
     if args.json:
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
     else:
@@ -373,10 +435,23 @@ def cmd_delivery_check(args: argparse.Namespace, cfg: dict) -> None:
 
 def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
     from core.delivery_progress import get_delivery_status, render_delivery_status, with_delivery_llm_usage
+    from core.delivery_verification import with_delivery_verification_readiness
 
-    result = get_delivery_status(args.plan_file)
+    overrides = parse_agent_llm_overrides(
+        getattr(args, "agent_model", None),
+        getattr(args, "agent_provider", None),
+        None,
+        valid_agents={"reviewer", "security_reviewer"},
+    )
+    effective_cfg, configured_project_root = _delivery_plan_config_context(args, cfg)
+    if effective_cfg is not cfg and overrides:
+        effective_cfg = {
+            "agents": {name: {"llm": values} for name, values in overrides.items()},
+        }
+    result = get_delivery_status(args.plan_file, project_root=configured_project_root)
+    result = with_delivery_verification_readiness(result, effective_cfg)
     project_root = Path(result.project_root).resolve() if result.project_root else None
-    task_state_dir = _configured_delivery_task_state_dir(cfg, project_root)
+    task_state_dir = _configured_delivery_task_state_dir(effective_cfg, project_root)
     result = with_delivery_llm_usage(result, task_state_dir=task_state_dir)
     if args.json:
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
@@ -384,6 +459,19 @@ def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
         print(render_delivery_status(result), end="")
     if not result.valid:
         sys.exit(1)
+
+
+def _delivery_plan_config_context(args: argparse.Namespace, cfg: dict) -> tuple[dict, Path | None]:
+    if not isinstance(cfg, dict):
+        return {}, None
+    project = cfg.get("project")
+    project_root_raw = project.get("root_path") if isinstance(project, dict) else None
+    if not project_root_raw:
+        return cfg, None
+    configured_root = Path(project_root_raw).resolve()
+    if getattr(args, "config", None) or _path_is_within(Path(args.plan_file), configured_root):
+        return cfg, configured_root
+    return {}, None
 
 
 def _configured_delivery_task_state_dir(cfg: dict, project_root: Path | None) -> Path | None:
@@ -2129,6 +2217,8 @@ def cmd_delivery_run(
     from core.delivery_run import render_delivery_run
 
     _validate_delivery_run_agent_overrides(args)
+    if context is not None and context.verification_config is not None:
+        cfg = context.verification_config(args, cfg)
     project_root_raw = cfg.get("project", {}).get("root_path") if isinstance(cfg, dict) else None
     project_root = Path(project_root_raw).resolve() if project_root_raw else None
     if getattr(args, "dry_run", False):
@@ -2141,6 +2231,28 @@ def cmd_delivery_run(
 
     _print_delivery_result(result, json_output=args.json, render=render_delivery_run)
     if (result.dry_run and not result.ready) or (not result.dry_run and not result.succeeded):
+        sys.exit(1)
+
+
+def cmd_delivery_verify(
+    args: argparse.Namespace,
+    cfg: dict,
+    context: DeliveryRunNextContext | None = None,
+) -> None:
+    from core.delivery_verify import render_delivery_verify
+
+    parse_agent_llm_overrides(
+        getattr(args, "agent_model", None),
+        getattr(args, "agent_provider", None),
+        getattr(args, "agent_timeout", None),
+        valid_agents={"reviewer", "security_reviewer"},
+    )
+    if context is None or context.verify_plan is None:
+        print("delivery verify execution requires the main Sikula command context.")
+        sys.exit(2)
+    result = context.verify_plan(args, cfg)
+    _print_delivery_result(result, json_output=args.json, render=render_delivery_verify)
+    if not result.succeeded:
         sys.exit(1)
 
 
@@ -2160,7 +2272,7 @@ def _preview_delivery_run(
     context: DeliveryRunNextContext | None = None,
     project_root: Path | None,
 ):
-    from core.delivery_finalize import preview_delivery_finalize
+    from core.delivery_finalize import preview_delivery_assembly_issue, preview_delivery_finalize
     from core.delivery_progress import get_delivery_status
     from core.delivery_run import (
         DELIVERY_RUN_BLOCKED,
@@ -2168,8 +2280,10 @@ def _preview_delivery_run(
         DELIVERY_RUN_PREVIEW,
     )
     from core.delivery_run_next import preview_delivery_run_next
+    from core.delivery_verification import with_delivery_verification_readiness
 
     status = get_delivery_status(args.plan_file, project_root=project_root)
+    status = with_delivery_verification_readiness(status, cfg)
     max_units = _delivery_run_unit_limit(args, status)
     if not status.valid:
         return _delivery_run_result(
@@ -2186,7 +2300,7 @@ def _preview_delivery_run(
         )
 
     if status.status == "done":
-        already_finalized = _delivery_run_is_current_finalization(status)
+        already_finalized = _delivery_run_is_current_finalization(status, cfg)
         if already_finalized:
             return _delivery_run_result(
                 status=status,
@@ -2204,7 +2318,64 @@ def _preview_delivery_run(
                 warnings=status.warnings,
                 message="Delivery plan is already finalized at the current assembled commit.",
             )
-        final_preview = preview_delivery_finalize(args.plan_file, project_root=project_root)
+        verification_stop_code = _delivery_verification_recovery_stop_code(status)
+        if verification_stop_code is not None:
+            issue = DeliveryPlanIssue(
+                "error",
+                verification_stop_code,
+                "Delivery verification requires its recorded recovery action before it can run again.",
+            )
+            return _delivery_run_result(
+                status=status,
+                max_units=max_units,
+                max_elapsed_minutes=getattr(args, "max_elapsed_minutes", None),
+                dry_run=True,
+                ready=False,
+                succeeded=False,
+                stop_code=verification_stop_code,
+                errors=[issue],
+                warnings=status.warnings,
+                message=issue.message,
+            )
+        if (
+            status.plan
+            and getattr(status.plan, "requires_final_verification", False)
+            and getattr(status, "verification_status", "pending") != "passed"
+        ):
+            assembly_issue = preview_delivery_assembly_issue(
+                Path(status.project_root),
+                status,
+                detect_conflicts=True,
+            )
+            if assembly_issue is not None:
+                return _delivery_run_result(
+                    status=status,
+                    max_units=max_units,
+                    max_elapsed_minutes=getattr(args, "max_elapsed_minutes", None),
+                    dry_run=True,
+                    ready=False,
+                    succeeded=False,
+                    stop_code=DELIVERY_RUN_BLOCKED,
+                    errors=[*status.errors, assembly_issue],
+                    warnings=status.warnings,
+                    message=assembly_issue.message,
+                )
+            return _delivery_run_result(
+                status=status,
+                max_units=max_units,
+                max_elapsed_minutes=getattr(args, "max_elapsed_minutes", None),
+                dry_run=True,
+                ready=True,
+                succeeded=False,
+                stop_code=DELIVERY_RUN_PREVIEW,
+                warnings=status.warnings,
+                message="Dry run would verify the exact assembled candidate before finalization.",
+            )
+        final_preview = preview_delivery_finalize(
+            args.plan_file,
+            project_root=project_root,
+            project_config=cfg,
+        )
         return _delivery_run_result(
             status=status,
             max_units=max_units,
@@ -2311,6 +2482,8 @@ def _run_delivery_plan(
         if status.status == "done":
             return _finalize_delivery_run(
                 args,
+                cfg=cfg,
+                context=context,
                 status=status,
                 project_root=project_root,
                 max_units=max_units,
@@ -2439,13 +2612,87 @@ def _finalize_delivery_run(
     units_succeeded: int,
     last_unit,
     child_task_id: str | None,
+    cfg: dict | None = None,
+    context: DeliveryRunNextContext | None = None,
 ):
     from core.delivery_finalize import finalize_delivery_plan, preview_delivery_finalize
     from core.delivery_progress import get_delivery_status
     from core.delivery_run import DELIVERY_RUN_COMPLETED, DELIVERY_RUN_FINALIZE_FAILED
+    from core.delivery_verification import with_delivery_verification_readiness
 
-    if not _delivery_run_is_current_finalization(status):
-        preview = preview_delivery_finalize(args.plan_file, project_root=project_root)
+    if status.plan and getattr(status.plan, "requires_final_verification", False):
+        status = with_delivery_verification_readiness(status, cfg or {})
+
+    if (
+        status.plan
+        and getattr(status.plan, "requires_final_verification", False)
+        and getattr(status, "verification_status", "pending") != "passed"
+    ):
+        verification_stop_code = _delivery_verification_recovery_stop_code(status)
+        if verification_stop_code is not None:
+            issue = DeliveryPlanIssue(
+                "error",
+                verification_stop_code,
+                "Delivery verification requires its recorded recovery action before it can run again.",
+            )
+            return _delivery_run_result(
+                status=status,
+                max_units=max_units,
+                max_elapsed_minutes=max_elapsed_minutes,
+                started=units_attempted > 0,
+                units_attempted=units_attempted,
+                units_succeeded=units_succeeded,
+                last_unit=last_unit,
+                child_task_id=child_task_id,
+                stop_code=verification_stop_code,
+                errors=[issue],
+                warnings=status.warnings,
+                message=issue.message,
+            )
+        if context is None or context.verify_plan is None:
+            return _delivery_run_result(
+                status=status,
+                max_units=max_units,
+                max_elapsed_minutes=max_elapsed_minutes,
+                started=units_attempted > 0,
+                units_attempted=units_attempted,
+                units_succeeded=units_succeeded,
+                last_unit=last_unit,
+                child_task_id=child_task_id,
+                stop_code=DELIVERY_RUN_FINALIZE_FAILED,
+                errors=[
+                    DeliveryPlanIssue(
+                        "error",
+                        "delivery_verification.context_unavailable",
+                        "Delivery verification execution context is unavailable.",
+                    )
+                ],
+                warnings=status.warnings,
+                message="Delivery units completed, but final verification is unavailable.",
+            )
+        verification = context.verify_plan(args, cfg or {})
+        status = get_delivery_status(args.plan_file, project_root=project_root)
+        if not verification.succeeded:
+            return _delivery_run_result(
+                status=status,
+                max_units=max_units,
+                max_elapsed_minutes=max_elapsed_minutes,
+                started=units_attempted > 0,
+                units_attempted=units_attempted,
+                units_succeeded=units_succeeded,
+                last_unit=last_unit,
+                child_task_id=child_task_id,
+                stop_code=verification.stop_code or DELIVERY_RUN_FINALIZE_FAILED,
+                errors=list(verification.errors),
+                warnings=list(verification.warnings),
+                message="Delivery units completed, but final verification did not pass.",
+            )
+    if not _delivery_run_is_current_finalization(status, cfg):
+        preview = preview_delivery_finalize(
+            args.plan_file,
+            project_root=project_root,
+            project_config=cfg,
+        )
         if not preview.ready:
             return _delivery_run_result(
                 status=status,
@@ -2464,7 +2711,11 @@ def _finalize_delivery_run(
                 message="Delivery units completed, but finalization preflight is blocked.",
             )
 
-    final_result = finalize_delivery_plan(args.plan_file, project_root=project_root)
+    final_result = finalize_delivery_plan(
+        args.plan_file,
+        project_root=project_root,
+        project_config=cfg,
+    )
     updated_status = get_delivery_status(args.plan_file, project_root=project_root)
     return _delivery_run_result(
         status=updated_status,
@@ -2492,10 +2743,23 @@ def _finalize_delivery_run(
     )
 
 
-def _delivery_run_is_current_finalization(status) -> bool:
+def _delivery_verification_recovery_stop_code(status) -> str | None:
+    from core.delivery_verification_model import delivery_verification_recovery_action
+
+    verification_status = getattr(status, "verification_status", "pending")
+    verification = getattr(status, "verification", None)
+    stop_code = getattr(verification, "stop_code", None)
+    if verification_status not in {"failed", "blocked"} or not isinstance(stop_code, str):
+        return None
+    if delivery_verification_recovery_action(stop_code) == "retry_delivery_verification":
+        return None
+    return stop_code
+
+
+def _delivery_run_is_current_finalization(status, cfg: dict | None = None) -> bool:
     from core.delivery_finalize import delivery_finalization_is_current
 
-    return delivery_finalization_is_current(status)
+    return delivery_finalization_is_current(status, project_config=cfg)
 
 
 def _delivery_run_unit_limit(args: argparse.Namespace, status) -> int:
@@ -2579,16 +2843,22 @@ def _delivery_run_result(
 def cmd_delivery_finalize(args: argparse.Namespace, cfg: dict) -> None:
     from core.delivery_finalize import finalize_delivery_plan, preview_delivery_finalize, render_delivery_finalize
 
+    parse_agent_llm_overrides(
+        getattr(args, "agent_model", None),
+        getattr(args, "agent_provider", None),
+        None,
+        valid_agents={"reviewer", "security_reviewer"},
+    )
     project_root_raw = cfg.get("project", {}).get("root_path") if isinstance(cfg, dict) else None
     project_root = Path(project_root_raw).resolve() if project_root_raw else None
     if getattr(args, "dry_run", False):
-        result = preview_delivery_finalize(args.plan_file, project_root=project_root)
+        result = preview_delivery_finalize(args.plan_file, project_root=project_root, project_config=cfg)
         _print_delivery_result(result, json_output=args.json, render=render_delivery_finalize)
         if not result.ready:
             sys.exit(1)
         return
 
-    result = finalize_delivery_plan(args.plan_file, project_root=project_root)
+    result = finalize_delivery_plan(args.plan_file, project_root=project_root, project_config=cfg)
     _print_delivery_result(result, json_output=args.json, render=render_delivery_finalize)
     if not result.finalized:
         sys.exit(1)
@@ -2613,6 +2883,8 @@ class DeliveryRunNextContext:
     resolve_state_dir: Callable[[dict], Path]
     state_store: StateStore
     run_amendment_authoring: Callable[..., DeliveryAmendmentAuthoringDraft] | None = None
+    verify_plan: Callable[[argparse.Namespace, dict], Any] | None = None
+    verification_config: Callable[[argparse.Namespace, dict], dict] | None = None
 
 
 @dataclass(frozen=True)
@@ -2635,6 +2907,8 @@ def cmd_delivery_run_next(
     )
 
     _validate_delivery_run_next_agent_overrides(args)
+    if context is not None and context.verification_config is not None:
+        cfg = context.verification_config(args, cfg)
     project_root_raw = cfg.get("project", {}).get("root_path") if isinstance(cfg, dict) else None
     project_root = Path(project_root_raw).resolve() if project_root_raw else None
     if getattr(args, "dry_run", False) and getattr(args, "prepare_budget_split", False):
@@ -2991,13 +3265,25 @@ def _run_next_delivery_unit(
         preview_delivery_run_next,
     )
     from core.delivery_write_scope import DeliveryWriteScopeError, resolve_delivery_write_scope
+    from core.delivery_verification import with_delivery_verification_readiness
 
     reset_failed = bool(getattr(args, "reset_failed", False))
     preflight = preview_delivery_run_next(args.plan_file, project_root=project_root, reset_failed=reset_failed)
     status = get_delivery_status(args.plan_file, project_root=project_root)
+    status = with_delivery_verification_readiness(status, cfg)
     terminal_result = _execution_result_from_terminal_stop(status)
     if terminal_result is not None:
         return terminal_result
+    if not status.valid:
+        return _execution_result_from_status(
+            status,
+            ran=False,
+            selected_unit=preflight.selected_unit,
+            progress_path=status.progress_path,
+            events_path=None,
+            errors=list(status.errors),
+            message="Delivery plan is not ready to run.",
+        )
 
     if not preflight.valid:
         budget_split_recovery = bool(getattr(args, "prepare_budget_split", False)) and any(
@@ -3050,6 +3336,7 @@ def _run_next_delivery_unit(
 
     with lock:
         status = get_delivery_status(args.plan_file, project_root=project_root)
+        status = with_delivery_verification_readiness(status, cfg)
         errors = list(status.errors)
         if status.plan is None or status.project_root is None:
             return _execution_result_from_status(
@@ -3058,6 +3345,16 @@ def _run_next_delivery_unit(
                 selected_unit=None,
                 progress_path=None,
                 events_path=None,
+                errors=errors,
+                message="Delivery plan is not ready to run.",
+            )
+        if not status.valid:
+            return _execution_result_from_status(
+                status,
+                ran=False,
+                selected_unit=None,
+                progress_path=str(progress_path),
+                events_path=str(events_path),
                 errors=errors,
                 message="Delivery plan is not ready to run.",
             )
@@ -3874,8 +4171,10 @@ def _apply_delivery_preview_execution_guards(
     from core.delivery_progress import get_delivery_status
     from core.delivery_run_next import delivery_stop_and_follow_up_issues
     from core.delivery_write_scope import DeliveryWriteScopeError, resolve_delivery_write_scope
+    from core.delivery_verification import with_delivery_verification_readiness
 
     status = get_delivery_status(plan_file, project_root=project_root)
+    status = with_delivery_verification_readiness(status, cfg)
     terminal_stop = _delivery_terminal_stop(status)
     if terminal_stop is not None:
         terminal_stop_unit, terminal_stop_issue = terminal_stop

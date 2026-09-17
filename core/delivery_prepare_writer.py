@@ -24,6 +24,7 @@ from core.delivery_asset_assignment import (
 from core.delivery_plan import (
     DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION,
     DELIVERY_CONSTRAINT_STOP_AND_FOLLOW_UP_KIND,
+    DELIVERY_VERIFICATION_MODE_FINAL_GATE,
     SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION,
     check_delivery_plan_file,
     delivery_final_branch_for_plan_id,
@@ -813,12 +814,21 @@ def _constraint_verification_stop_issues(draft: DeliveryAuthoringDraft) -> list[
                     f"constraint_verification.constraints[{index}].disposition",
                 )
             ]
-        if constraint.disposition != DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION:
+        if constraint.disposition == "needs_review":
             return [
                 DeliveryPrepareWriteIssue(
                     "error",
                     "delivery_prepare.constraint_review_required",
                     "Independent constraint verification requires operator review.",
+                    f"constraint_verification.constraints[{index}].disposition",
+                )
+            ]
+        if constraint.disposition != DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION:
+            return [
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.constraint_disposition_invalid",
+                    "Independent constraint verification returned an unsupported disposition.",
                     f"constraint_verification.constraints[{index}].disposition",
                 )
             ]
@@ -1105,6 +1115,7 @@ def _render_plan_yaml(draft: DeliveryAuthoringDraft, unit_task_paths: dict[str, 
         plan_data["planning_mode"] = draft.planning_mode
     plan_data["final_branch"] = delivery_final_branch_for_plan_id(draft.plan_id)
     plan_data["repositories"] = [{"id": "main", "root": "."}]
+    plan_data["verification"] = {"mode": DELIVERY_VERIFICATION_MODE_FINAL_GATE}
     if draft.source_task:
         plan_data["source_task"] = draft.source_task.to_dict()
     if draft.constraints:
