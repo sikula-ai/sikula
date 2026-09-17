@@ -109,8 +109,12 @@ class _FailingReadonlyLLM:
 
 
 class _WorkspaceSetupFailingReadonlyLLM(_ReadonlyLLM):
+    def __init__(self, outputs: list[str], error: Exception | None = None) -> None:
+        super().__init__(outputs)
+        self.error = error or LLMConfigurationError("tracked provider settings conflict")
+
     def prepare_readonly_agent_workspace(self, cwd: Path) -> None:
-        raise LLMConfigurationError("tracked provider settings conflict")
+        raise self.error
 
 
 class _BuildTool:
@@ -1603,9 +1607,17 @@ def test_delivery_verification_rejects_ignored_readonly_provider_mutation(
     assert result.stop_code == "delivery_verification.readonly_mutation"
 
 
+@pytest.mark.parametrize(
+    "setup_error",
+    [
+        LLMConfigurationError("tracked provider settings conflict"),
+        PermissionError("provider settings are not writable"),
+    ],
+)
 def test_delivery_verification_classifies_reviewer_workspace_setup_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    setup_error: Exception,
 ) -> None:
     base = _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
@@ -1625,7 +1637,7 @@ def test_delivery_verification_classifies_reviewer_workspace_setup_failure(
         lambda *args, **kwargs: validation,
     )
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
-    llm = _WorkspaceSetupFailingReadonlyLLM([])
+    llm = _WorkspaceSetupFailingReadonlyLLM([], setup_error)
 
     result = verify_delivery_plan(
         plan_path,
@@ -1643,6 +1655,59 @@ def test_delivery_verification_classifies_reviewer_workspace_setup_failure(
     assert result.validation_executed is True
     assert result.semantic_status == "blocked"
     assert llm.calls == []
+
+
+def test_security_workspace_setup_failure_preserves_semantic_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path, risk_tags=["privacy"])
+    unit_commit = _git_commit_all(tmp_path, "delivery unit")
+    progress_path = delivery_progress_path(tmp_path, "demo")
+    write_delivery_progress(
+        progress_path,
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="demo",
+            units=[make_delivery_unit_progress("unit", "done", commit=unit_commit)],
+            assembly_base_commit=base,
+        ),
+    )
+    validation = DeliveryVerificationValidationResult(passed=True, reused=False, executed=True)
+    monkeypatch.setattr(
+        "core.delivery_verify.run_delivery_verification_validation",
+        lambda *args, **kwargs: validation,
+    )
+    config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
+    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'
+    semantic_llm = _ReadonlyLLM([approval])
+    security_llm = _WorkspaceSetupFailingReadonlyLLM(
+        [],
+        PermissionError("provider settings are not writable"),
+    )
+
+    result = verify_delivery_plan(
+        plan_path,
+        config,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        semantic_reviewer=DeliveryIntegrationReviewAgent(semantic_llm, config),
+        security_reviewer=DeliveryIntegrationReviewAgent(security_llm, config),
+        project_root=tmp_path,
+    )
+
+    progress, errors = read_delivery_progress(progress_path, plan_id="demo")
+    assert result.status == "blocked"
+    assert result.stop_code == "delivery_verification.security_workspace_unavailable"
+    assert result.validation_executed is True
+    assert result.semantic_status == "approved"
+    assert result.security_status == "blocked"
+    assert len(semantic_llm.calls) == 1
+    assert security_llm.calls == []
+    assert progress is not None and not errors and progress.verification is not None
+    assert progress.verification.validation_executed is True
+    assert progress.verification.semantic_status == "approved"
+    assert progress.verification.security_status == "blocked"
 
 
 def test_delivery_verification_rejects_candidate_symlink_escape(tmp_path: Path) -> None:

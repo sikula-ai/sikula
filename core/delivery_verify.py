@@ -540,7 +540,7 @@ def _execute_gate(
 
             try:
                 semantic_reviewer.prepare_workspace(worktree)
-            except LLMConfigurationError:
+            except (LLMConfigurationError, OSError):
                 return _review_blocked(
                     running,
                     validation,
@@ -598,7 +598,7 @@ def _execute_gate(
                     )
                 try:
                     security_reviewer.prepare_workspace(worktree)
-                except LLMConfigurationError:
+                except (LLMConfigurationError, OSError):
                     return _review_blocked(
                         running,
                         validation,
