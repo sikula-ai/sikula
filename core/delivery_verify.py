@@ -302,6 +302,7 @@ def verify_delivery_plan(
             succeeded=False,
             next_action="resolve_delivery_verification_blocker",
         )
+    deferred_review_evidence: dict[str, Any] | None = None
     try:
         terminal = _execute_gate(
             root=root,
@@ -315,6 +316,9 @@ def verify_delivery_plan(
             semantic_reviewer=semantic_reviewer,
             security_reviewer=security_reviewer,
         )
+    except _GateReviewAuditUnavailable as exc:
+        terminal = exc.terminal
+        deferred_review_evidence = exc.review_evidence
     except (KeyboardInterrupt, SystemExit):
         terminal = replace(
             running,
@@ -342,11 +346,10 @@ def verify_delivery_plan(
             project_root=root,
         )
 
-    if not _safe_append_audit(
-        evidence_path,
-        {"event": terminal.status, "record": terminal.to_dict()},
-        project_root=root,
-    ):
+    terminal_audit: dict[str, Any] = {"event": terminal.status, "record": terminal.to_dict()}
+    if deferred_review_evidence is not None:
+        terminal_audit["review_evidence"] = deferred_review_evidence
+    if not _safe_append_audit(evidence_path, terminal_audit, project_root=root):
         terminal = replace(
             terminal,
             status="blocked",
@@ -617,11 +620,6 @@ def _execute_gate(
                 completed_at=_now(),
             )
     except DeliveryIntegrationReviewAgentError as exc:
-        _append_audit(
-            evidence_path,
-            {"event": "review_failed", "code": exc.code, "attempts": _attempt_audit(exc.attempts)},
-            project_root=root,
-        )
         return _review_blocked(
             running,
             validation,
@@ -629,6 +627,17 @@ def _execute_gate(
             semantic_status="blocked" if active_review == "semantic" else semantic_status,
             security_status="blocked" if active_review == "security" else security_status,
         )
+    except _ReviewAuditUnavailable as exc:
+        phase_status = exc.phase_status
+        terminal = _review_blocked(
+            running,
+            validation,
+            "delivery_verification.audit_unavailable",
+            semantic_status=phase_status if active_review == "semantic" else semantic_status,
+            security_status=phase_status if active_review == "security" else security_status,
+        )
+        terminal = replace(terminal, finding_count=exc.finding_count)
+        raise _GateReviewAuditUnavailable(terminal, exc.review_evidence) from None
     except DeliveryScopeSnapshotError:
         return _review_blocked(
             running,
@@ -671,23 +680,33 @@ def _run_review(
             candidate_tree=identity.candidate_tree,
             known_unit_ids=known_unit_ids,
         )
-    except DeliveryIntegrationReviewAgentError:
-        _safe_append_audit(
-            evidence_path,
-            {"event": f"{kind}_review_usage", "usage": reviewer.consume_usage_records()},
-            project_root=audit_root,
-        )
-        raise
-    _append_audit(
-        evidence_path,
-        {
-            "event": f"{kind}_review",
-            "assessment": result.assessment.to_dict(),
-            "attempts": _attempt_audit(result.attempts),
+    except DeliveryIntegrationReviewAgentError as exc:
+        review_evidence = {
+            "event": "review_failed",
+            "kind": kind,
+            "code": exc.code,
+            "attempts": _attempt_audit(exc.attempts),
             "usage": reviewer.consume_usage_records(),
-        },
-        project_root=audit_root,
-    )
+        }
+        if not _safe_append_audit(evidence_path, review_evidence, project_root=audit_root):
+            raise _ReviewAuditUnavailable(
+                review_evidence,
+                phase_status="blocked",
+                finding_count=0,
+            ) from exc
+        raise
+    review_evidence = {
+        "event": f"{kind}_review",
+        "assessment": result.assessment.to_dict(),
+        "attempts": _attempt_audit(result.attempts),
+        "usage": reviewer.consume_usage_records(),
+    }
+    if not _safe_append_audit(evidence_path, review_evidence, project_root=audit_root):
+        raise _ReviewAuditUnavailable(
+            review_evidence,
+            phase_status="approved" if result.assessment.approved else "rejected",
+            finding_count=len(result.assessment.findings),
+        )
     return result
 
 
@@ -947,6 +966,27 @@ def _read_bound_source_task(
 
 class _PrivateSourceTaskError(ValueError):
     pass
+
+
+class _ReviewAuditUnavailable(RuntimeError):
+    def __init__(
+        self,
+        review_evidence: dict[str, Any],
+        *,
+        phase_status: str,
+        finding_count: int,
+    ) -> None:
+        super().__init__("Delivery verification review evidence could not be persisted.")
+        self.review_evidence = review_evidence
+        self.phase_status = phase_status
+        self.finding_count = finding_count
+
+
+class _GateReviewAuditUnavailable(RuntimeError):
+    def __init__(self, terminal: DeliveryVerificationRecord, review_evidence: dict[str, Any]) -> None:
+        super().__init__("Delivery verification review evidence requires terminal fallback persistence.")
+        self.terminal = terminal
+        self.review_evidence = review_evidence
 
 
 def _copy_environment_files(root: Path, worktree: Path, project_config: dict[str, Any]) -> list[Path]:

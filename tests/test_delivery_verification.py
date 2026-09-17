@@ -1300,6 +1300,71 @@ def test_terminal_audit_failure_preserves_completed_gate_phases(
     assert progress.verification.finding_count == 1
 
 
+def test_review_audit_failure_preserves_evidence_in_terminal_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    unit_commit = _git_commit_all(tmp_path, "delivery unit")
+    progress_path = delivery_progress_path(tmp_path, "demo")
+    write_delivery_progress(
+        progress_path,
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="demo",
+            units=[make_delivery_unit_progress("unit", "done", commit=unit_commit)],
+            assembly_base_commit=base,
+        ),
+    )
+    config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
+    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'
+    usage = {"agent": "reviewer", "reported_tokens": 42}
+    reviewer = DeliveryIntegrationReviewAgent(
+        _ReadonlyLLM([approval]),
+        config,
+        usage_records=[usage],
+    )
+    original_safe_append = _safe_append_audit
+    failed = False
+
+    def fail_review_append_once(path: Path, value: dict[str, object], *, project_root: Path) -> bool:
+        nonlocal failed
+        if value.get("event") == "semantic_review" and not failed:
+            failed = True
+            return False
+        return original_safe_append(path, value, project_root=project_root)
+
+    monkeypatch.setattr("core.delivery_verify._safe_append_audit", fail_review_append_once)
+
+    result = verify_delivery_plan(
+        plan_path,
+        config,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        semantic_reviewer=reviewer,
+        security_reviewer=None,
+        project_root=tmp_path,
+    )
+
+    progress, errors = read_delivery_progress(progress_path, plan_id="demo")
+    audit_records = [
+        json.loads(line)
+        for line in (progress_path.parent / "verification.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    fallback = next(record for record in audit_records if "review_evidence" in record)
+    assert result.status == "blocked"
+    assert result.stop_code == "delivery_verification.audit_unavailable"
+    assert result.semantic_status == "approved"
+    assert progress is not None and not errors and progress.verification is not None
+    assert progress.verification.semantic_status == "approved"
+    assert fallback["event"] == "blocked"
+    assert fallback["review_evidence"]["event"] == "semantic_review"
+    assert fallback["review_evidence"]["assessment"]["disposition"] == "approved"
+    assert fallback["review_evidence"]["attempts"][0]["output"] == approval
+    assert fallback["review_evidence"]["usage"] == [usage]
+    assert reviewer.consume_usage_records() == []
+
+
 @pytest.mark.parametrize("ignored_root", [".provider", ".venv"])
 def test_delivery_verification_rejects_ignored_readonly_provider_mutation(
     tmp_path: Path,
