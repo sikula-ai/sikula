@@ -89,16 +89,26 @@ def _read_regular_file(root: Path, path: Path, limit: int) -> bytes:
         expected = locations[-1][1]
         if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino) or not stat.S_ISREG(opened.st_mode):
             raise PermissionError("Context identity changed.")
+        if (opened.st_size, opened.st_mtime_ns) != (expected.st_size, expected.st_mtime_ns):
+            raise PermissionError("Context changed before inspection.")
         content = stream.read(limit)
         after = os.fstat(stream.fileno())
+        # Windows Python 3.12 can give lstat() and fstat() different ctime meanings.
+        # Compare ctime only within each API's before/after snapshots.
         if (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
-            expected.st_size,
-            expected.st_mtime_ns,
-            expected.st_ctime_ns,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
         ):
             raise PermissionError("Context changed during inspection.")
     for location, before in locations:
         after = location.lstat()
         if (before.st_dev, before.st_ino, before.st_mode) != (after.st_dev, after.st_ino, after.st_mode):
             raise PermissionError("Context path changed during inspection.")
+        if stat.S_ISREG(before.st_mode) and (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise PermissionError("Context changed during inspection.")
     return content
