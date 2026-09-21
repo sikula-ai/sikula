@@ -562,6 +562,68 @@ def test_delivery_prepare_cli_authors_artifacts_then_check_succeeds(
     assert "PRIVATE accounting rationale" not in plan_path.read_text()
 
 
+def test_delivery_prepare_cli_audits_failed_context_and_blocks_before_correction(
+    git_project: Path,
+    seq_fake_llm,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    task_path = git_project / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True, exist_ok=True)
+    source_text = "# Team invites\n\nPrepare tracked delivery artifacts.\n"
+    task_path.write_text(source_text, encoding="utf-8")
+    _write_project_config(git_project)
+    evidence_path = git_project / "project-context.md"
+    evidence_path.write_text("PRIVATE project context.", encoding="utf-8")
+    requested_paths = [evidence_path.name, "missing-context.md"]
+    authored = _delivery_prepare_authoring_output(source_text)
+    review = {
+        "constraints_complete": True,
+        "constraints": [],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+        "obligations_complete": True,
+        "obligations": _prepare_obligations(source_text),
+        "source_accounting": _prepare_accounting(source_text),
+        "unit_contract_gaps": [{"unit_id": "prepare-artifacts", "summary": "Verify the existing artifact format."}],
+        "context_paths": requested_paths,
+    }
+    fake = seq_fake_llm(
+        generate_responses=[
+            authored,
+            json.dumps(review),
+            authored,
+            json.dumps({**review, "unit_contract_gaps": [], "context_paths": []}),
+        ]
+    )
+    monkeypatch.chdir(git_project)
+    with (
+        patch("core.llm_client.create_llm_client", return_value=fake),
+        patch.object(fake, "generate", wraps=fake.generate) as generate,
+        patch("sys.argv", ["sikula", "delivery", "prepare", ".sikula/tasks/team-invites.md", "--json"]),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main()
+    payload_text = capsys.readouterr().out
+    payload = json.loads(payload_text)
+    assert exc_info.value.code == 1
+    assert payload["status"] == "blocked"
+    assert payload["prepared"] is False
+    assert [issue["code"] for issue in payload["errors"]] == ["delivery_prepare.context_unavailable"]
+    assert "PRIVATE" not in payload_text
+    assert all(path not in payload_text for path in requested_paths)
+    assert generate.call_count == 2
+    assert not (git_project / ".sikula" / "delivery" / "team-invites").exists()
+    audit_path = git_project / ".sikula" / "contract-reports" / "team-invites.delivery-prepare.auto-llm.jsonl"
+    records = [json.loads(line)["record"] for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 3
+    assert records[-1]["phase"] == "delivery_prepare_context_retrieval"
+    assert records[-1]["parsed"]["error_code"] == "delivery_prepare.context_unavailable"
+    assert records[-1]["requested_paths"] == requested_paths
+    assert [item["status"] for item in records[-1]["retrieved"]["files"]] == ["read", "denied"]
+    assert records[-1]["retrieved"]["files"][0]["text"] == "PRIVATE project context."
+
+
 def test_delivery_prepare_cli_preserves_constraints_and_assets_from_one_source_snapshot(
     git_project: Path,
     seq_fake_llm,

@@ -2098,8 +2098,124 @@ def test_authored_blockers_require_bounded_correction_and_independent_approval(
         assert not (tmp_path / ".sikula/delivery/team-invites").exists()
 
 
-@pytest.mark.parametrize("context_available", [True, False])
-def test_bounded_contract_recovery_uses_local_evidence_and_reverifies(tmp_path: Path, context_available: bool) -> None:
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "denied",
+        "unavailable",
+        "too_large",
+        "partial",
+        "no_reader",
+        "exception",
+        "invalid_response",
+        "invalid_files",
+        "invalid_entry",
+        "invalid_scope",
+    ],
+)
+@pytest.mark.parametrize("flow", ["plan", "amendment"])
+def test_failed_required_context_blocks_before_further_provider_calls(tmp_path: Path, failure: str, flow: str) -> None:
+    from core.delivery_prepare_writer import write_delivery_prepare_artifacts
+
+    paths = ["core/common.py", "core/store.py"]
+    unit_id = "foundation" if flow == "plan" else "invite-storage"
+    authored = json.loads(_authoring_output() if flow == "plan" else _amendment_output())
+    obligation = {
+        "id": "persist-invites",
+        "summary": "Invitation records persist across process restarts.",
+        "source_fragment_ids": ["source-1-1-0123456789ab"],
+        "unit_ids": ["oversized"],
+    }
+    if flow == "plan":
+        authored["units"][0]["asset_paths"] = []
+        authored["units"][0]["scope_paths"] = []
+    else:
+        authored["obligation_assignments"] = {obligation["id"]: [unit_id]}
+    review = {
+        "constraints_complete": True,
+        "constraints": [],
+        "obligations_complete": True,
+        "obligations": authored["obligations"]
+        if flow == "plan"
+        else [{**obligation, "unit_ids": [unit_id], "disposition": "preserved"}],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+        "unit_contract_gaps": [{"unit_id": unit_id, "summary": "Verify the persistence mechanism."}],
+        "context_paths": paths,
+    }
+    # Subsequent responses would claim success without reading the requested evidence.
+    llm = CapturingLLM(json.dumps(authored))
+    llm.outputs = [
+        json.dumps(authored),
+        json.dumps(review),
+        json.dumps(authored),
+        json.dumps({**review, "unit_contract_gaps": [], "context_paths": []}),
+    ]
+    retrieved = {"files": [{"path": paths[0], "status": "read", "text": "PRIVATE project evidence"}]}
+    if failure != "partial":
+        retrieved["files"].append({"request_index": 1, "status": failure})
+    if failure == "invalid_response":
+        retrieved = None
+    elif failure == "invalid_files":
+        retrieved = {"files": None}
+    elif failure == "invalid_entry":
+        retrieved["files"][1] = None
+    elif failure == "invalid_scope":
+        retrieved = {"status": "read_scope_invalid"}
+    reads: list[list[str]] = []
+
+    def read_context(root: Path, requested_paths: list[str]):
+        assert root == tmp_path.resolve()
+        reads.append(requested_paths)
+        if failure == "exception":
+            raise OSError("PRIVATE local context reader failure")
+        return retrieved
+
+    agent = DeliveryPreparationAgent(llm, context_reader=None if failure == "no_reader" else read_context)
+    audit: list[dict] = []
+    if flow == "plan":
+        draft = _author_delivery_plan(agent, tmp_path=tmp_path, audit_records=audit)
+    else:
+        draft = agent.author_delivery_amendment(
+            plan_id="team-invites",
+            target_unit_id="oversized",
+            target_task_description="Persist invitations.",
+            target_unit={"id": "oversized"},
+            downstream_units=[],
+            project_root=tmp_path,
+            applicable_obligations=[obligation],
+            audit_recorder=audit.append,
+        )
+    assert draft.constraint_verification is not None
+    assert draft.constraint_verification.context_unavailable is True
+    assert draft.constraint_verification.context_paths == paths
+    assert len(llm.prompts) == 2
+    assert reads == ([] if failure == "no_reader" else [paths])
+    prefix = "delivery_prepare" if flow == "plan" else "delivery_amend"
+    assert len(audit) == 3
+    assert audit[-1]["phase"] == prefix + "_context_retrieval"
+    assert audit[-1]["parsed"]["error_code"] == prefix + ".context_unavailable"
+    assert audit[-1]["requested_paths"] == paths
+    if failure == "invalid_response":
+        assert audit[-1]["retrieved"] == {"status": "context_reader_invalid"}
+    elif failure == "no_reader":
+        assert audit[-1]["retrieved"] == {"status": "context_reader_unavailable"}
+    elif failure == "exception":
+        assert audit[-1]["retrieved"] == {"status": "context_reader_failed", "error_type": "OSError"}
+    else:
+        assert audit[-1]["retrieved"] == retrieved
+    if flow == "plan":
+        result = write_delivery_prepare_artifacts(
+            draft, output_dir=".sikula/delivery/team-invites", project_root=tmp_path, project_config={}
+        )
+        assert result.prepared is False
+        assert [issue.code for issue in result.errors] == ["delivery_prepare.context_unavailable"]
+        assert "PRIVATE" not in json.dumps(result.to_dict())
+    assert not (tmp_path / ".sikula/delivery/team-invites").exists()
+
+
+@pytest.mark.parametrize("gaps_resolved", [True, False])
+def test_bounded_contract_recovery_uses_local_evidence_and_reverifies(tmp_path: Path, gaps_resolved: bool) -> None:
     authored = json.loads(_authoring_output())
     repaired = json.loads(_authoring_output())
     repaired["units"][0]["task_markdown"] += "\nUse the existing invite store for persistence.\n"
@@ -2124,7 +2240,7 @@ def test_bounded_contract_recovery_uses_local_evidence_and_reverifies(tmp_path: 
                 "constraints": [],
                 "unit_context_complete": True,
                 "unit_context_gaps": [],
-                "unit_contract_gaps": [] if context_available else first_review["unit_contract_gaps"],
+                "unit_contract_gaps": [] if gaps_resolved else first_review["unit_contract_gaps"],
             }
         ),
     ]
@@ -2132,8 +2248,6 @@ def test_bounded_contract_recovery_uses_local_evidence_and_reverifies(tmp_path: 
 
     def read_context(root, paths):
         reads.append((root, paths))
-        if not context_available:
-            return {"files": [{"request_index": 0, "status": "denied"}]}
         return {"files": [{"path": paths[0], "status": "read", "text": "def store_invite(): pass"}]}
 
     audit = []
@@ -2142,13 +2256,10 @@ def test_bounded_contract_recovery_uses_local_evidence_and_reverifies(tmp_path: 
     )
     assert len(llm.prompts) == 4
     assert reads == [(tmp_path.resolve(), ["agents/invite_store.py"])]
-    if context_available:
-        assert "def store_invite" in llm.prompts[2] and "def store_invite" in llm.prompts[3]
-    else:
-        assert '"status": "denied"' in llm.prompts[2] and '"status": "denied"' in llm.prompts[3]
+    assert "def store_invite" in llm.prompts[2] and "def store_invite" in llm.prompts[3]
     assert draft.units[0].task_markdown.endswith("Use the existing invite store for persistence.")
-    assert bool(draft.constraint_verification.unit_contract_gaps) is (not context_available)
-    assert draft.constraint_verification.context_unavailable is (not context_available)
+    assert bool(draft.constraint_verification.unit_contract_gaps) is (not gaps_resolved)
+    assert draft.constraint_verification.context_unavailable is False
     assert [record["phase"] for record in audit] == [
         "delivery_prepare_authoring",
         "delivery_prepare_constraint_verification",
@@ -2186,6 +2297,12 @@ def test_draft_recovery_cannot_expand_authority(change: str, tmp_path: Path) -> 
     }
     llm = CapturingLLM(json.dumps(authored))
     llm.outputs = [json.dumps(authored), json.dumps(first_review), json.dumps(repaired)]
+    agent = DeliveryPreparationAgent(
+        llm,
+        context_reader=lambda root, paths: {
+            "files": [{"path": paths[0], "status": "read", "text": "Project context."}]
+        },
+    )
     with pytest.raises(DeliveryAuthoringParseError):
-        _author_delivery_plan(DeliveryPreparationAgent(llm), tmp_path=tmp_path)
+        _author_delivery_plan(agent, tmp_path=tmp_path)
     assert len(llm.prompts) == 3

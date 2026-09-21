@@ -1651,6 +1651,7 @@ def test_constrained_middle_split_reassigns_constraint_to_every_replacement(tmp_
         ("incomplete", "delivery_amend.constraint_verification_incomplete"),
         ("conflict", "delivery_amend.constraint_conflict"),
         ("needs_review", "delivery_amend.constraint_review_required"),
+        ("context_unavailable", "delivery_amend.context_unavailable"),
     ],
 )
 def test_constrained_amendment_rejects_untrusted_verification(
@@ -1668,7 +1669,7 @@ def test_constrained_amendment_rejects_untrusted_verification(
                 kind="authoritative_read_only_dependency",
                 summary="Protocol changes remain owned by the external protocol project.",
                 unit_ids=["c-1", "c-2", "c-3"],
-                disposition="preserved" if case == "incomplete" else case,
+                disposition="preserved" if case in {"incomplete", "context_unavailable"} else case,
             )
         ]
     draft = replace(
@@ -1676,6 +1677,7 @@ def test_constrained_amendment_rejects_untrusted_verification(
         constraint_verification=DeliveryConstraintVerification(
             constraints_complete=case != "incomplete",
             constraints=verification_constraints,
+            context_unavailable=case == "context_unavailable",
         ),
     )
 

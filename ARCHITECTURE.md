@@ -398,6 +398,9 @@ The command layer injects a bounded `tools/delivery_context_tool.py` reader, whi
 uses the configured Sandbox read scope and never invokes a shell or provider.
 The verifier may request eight regular project files (16 KB each, 64 KB total);
 private runtime/environment paths, links, binary data, and oversized files are excluded.
+If any requested evidence cannot be read, preparation stops before correction or
+another verification call. This runtime blocker cannot be cleared by provider approval;
+preparation must be retried after the required evidence becomes accessible.
 Requested evidence, failures, and correction attempts remain in local audit; no
 context or free-form rationale enters ordinary public projections. Known prerequisite
 stops preempt verification and correction calls. A verifier-discovered prerequisite

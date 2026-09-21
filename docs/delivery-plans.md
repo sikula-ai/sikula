@@ -267,7 +267,10 @@ protocol, and context capability failures do not imply a new product requirement
 Unresolved source or contract gaps report `delivery_prepare.authority_unresolved`;
 required evidence unavailable within the read capability reports
 `delivery_prepare.context_unavailable` (or `delivery_amend.context_unavailable`
-during amendment preparation). Private audit retains the failed retrieval details.
+during amendment preparation). Any failed required read stops before correction or
+another verifier call; provider approval cannot waive missing evidence. Retry
+preparation after the required evidence becomes accessible. Private audit retains
+the failed retrieval details.
 
 The metadata-only constraint repair does not rewrite unit tasks. Separately, the same independent
 verification pass checks that each unit task is self-contained for source-defined

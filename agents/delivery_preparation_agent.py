@@ -1006,6 +1006,46 @@ class DeliveryPreparationAgent:
             payload["planning_mode"] = draft.planning_mode
         return payload
 
+    def _read_recovery_context(
+        self,
+        root: Path,
+        paths: list[str],
+        *,
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+        audit_prefix: str,
+    ) -> dict[str, Any] | None:
+        try:
+            retrieved = (
+                self.context_reader(root, paths)
+                if self.context_reader is not None
+                else {"status": "context_reader_unavailable"}
+            )
+        except Exception as exc:
+            retrieved = {"status": "context_reader_failed", "error_type": type(exc).__name__}
+        if not isinstance(retrieved, dict):
+            retrieved = {"status": "context_reader_invalid"}
+        files = retrieved.get("files")
+        if (
+            isinstance(files, list)
+            and len(files) == len(paths)
+            and all(isinstance(item, dict) and item.get("status") == "read" for item in files)
+        ):
+            return retrieved
+        # Required evidence is a runtime gate; a later provider response cannot waive it.
+        if audit_recorder is not None:
+            audit_recorder(
+                {
+                    "phase": f"{audit_prefix}_context_retrieval",
+                    "round_index": 1,
+                    "prompt": None,
+                    "raw_output": None,
+                    "requested_paths": list(paths),
+                    "retrieved": retrieved,
+                    "parsed": {"status": "failed", "error_code": f"{audit_prefix}.context_unavailable"},
+                }
+            )
+        return None
+
     def _recover_draft(
         self,
         draft: DeliveryAuthoringDraft,
@@ -1019,11 +1059,15 @@ class DeliveryPreparationAgent:
     ) -> DeliveryAuthoringDraft:
         context = dict(project_context)
         if verification.context_paths:
-            context["retrieved"] = (
-                self.context_reader(root, verification.context_paths)
-                if self.context_reader is not None
-                else {"status": "context_reader_unavailable"}
+            retrieved = self._read_recovery_context(
+                root,
+                verification.context_paths,
+                audit_recorder=audit_recorder,
+                audit_prefix="delivery_prepare",
             )
+            if retrieved is None:
+                return replace(draft, constraint_verification=replace(verification, context_unavailable=True))
+            context["retrieved"] = retrieved
         gaps = {
             "constraints": [item.to_plan_dict() for item in verification.constraints],
             "constraint_gaps": [gap.to_dict() for gap in verification.constraint_gaps],
@@ -1463,11 +1507,15 @@ Authoritative source:
     ) -> DeliveryAmendmentAuthoringDraft:
         context = dict(inspection_context)
         if verification.context_paths:
-            context["retrieved"] = (
-                self.context_reader(root, verification.context_paths)
-                if self.context_reader is not None
-                else {"status": "context_reader_unavailable"}
+            retrieved = self._read_recovery_context(
+                root,
+                verification.context_paths,
+                audit_recorder=audit_recorder,
+                audit_prefix="delivery_amend",
             )
+            if retrieved is None:
+                return replace(draft, constraint_verification=replace(verification, context_unavailable=True))
+            context["retrieved"] = retrieved
         candidate = {
             "plan_id": draft.plan_id,
             "target_unit_id": draft.target_unit_id,
@@ -1688,17 +1736,6 @@ Authoritative source:
             )
             raise
 
-        retrieved = (project_context or {}).get("retrieved")
-        if retrieved is not None:
-            files = retrieved.get("files", [])
-            retrieval_failed = not files or any(item.get("status") != "read" for item in files)
-            still_unresolved = (
-                self._needs_draft_recovery(verification)
-                or not verification.constraints_complete
-                or not verification.obligations_complete
-                or not verification.unit_context_complete
-            )
-            verification = replace(verification, context_unavailable=retrieval_failed and still_unresolved)
         self._record_constraint_verification_success(
             audit_recorder,
             phase=audit_phase,
