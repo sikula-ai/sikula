@@ -252,6 +252,11 @@ def _amendment_output(*, target_unit_id: str = "oversized") -> str:
     )
 
 
+def _account_constraints(payload: dict) -> None:
+    payload["source_accounting"] = [dict(record) for record in payload["source_accounting"]]
+    payload["source_accounting"][0]["constraint_ids"] = [item["id"] for item in payload["constraints"]]
+
+
 def _assessment_output() -> str:
     return json.dumps(
         {
@@ -481,6 +486,9 @@ def test_author_delivery_plan_repairs_one_omitted_constraint_and_reverifies(tmp_
         "unit_ids": ["foundation"],
         "disposition": "preserved",
     }
+    repaired = json.loads(_authoring_output(task_description=task_description))
+    repaired["constraints"] = [repaired_constraint]
+    _account_constraints(repaired)
     llm = CapturingLLM(_authoring_output(task_description=task_description))
     llm.outputs = [
         _authoring_output(task_description=task_description),
@@ -493,7 +501,7 @@ def test_author_delivery_plan_repairs_one_omitted_constraint_and_reverifies(tmp_
                 "unit_context_gaps": [],
             }
         ),
-        json.dumps({"constraints": [repaired_constraint]}),
+        json.dumps(repaired),
         json.dumps(
             {
                 "constraints_complete": True,
@@ -522,17 +530,91 @@ def test_author_delivery_plan_repairs_one_omitted_constraint_and_reverifies(tmp_
     assert draft.units[0].asset_paths == [".sikula/task-assets/invite-reference.png"]
     assert len(llm.prompts) == 4
     assert "Only the protocol repository may change protocol files." in llm.prompts[1]
-    assert "Repair only the structured constraint list" in llm.prompts[2]
-    assert json.dumps([gap], indent=2, sort_keys=True) in llm.prompts[2]
-    assert "source_task_to_units_after_bounded_repair" in llm.prompts[3]
+    assert "bounded delivery draft correction assistant" in llm.prompts[2]
+    assert draft.source_accounting[0].constraint_ids == [repaired_constraint["id"]]
+    assert "source_task_to_units_after_bounded_recovery" in llm.prompts[3]
     assert [record["phase"] for record in audit_records] == [
         "delivery_prepare_authoring",
         "delivery_prepare_constraint_verification",
-        "delivery_prepare_constraint_repair",
+        "delivery_prepare_draft_recovery",
         "delivery_prepare_constraint_verification",
     ]
     assert [record["round_index"] for record in audit_records] == [1, 1, 1, 2]
     assert audit_records[1]["parsed"]["constraint_gaps"] == [gap]
+
+
+@pytest.mark.parametrize("change", ["append", "move_existing", "rewrite_unrelated"])
+def test_constraint_recovery_preserves_unrelated_source_mappings(tmp_path: Path, change: str) -> None:
+    source = (
+        "# Invitations\n\nBuild persistence inside the application repository.\n\n"
+        "## Protocol\n\nUse the authoritative protocol library.\n"
+    )
+    authored = json.loads(_authoring_output(task_description=source))
+    existing = {
+        "id": "ownership",
+        "kind": "repository_ownership",
+        "summary": "Invitation changes remain locally owned.",
+        "unit_ids": ["foundation"],
+        "disposition": "preserved",
+    }
+    added = {**existing, "id": "protocol", "summary": "Protocol behavior remains defined by its existing library."}
+    authored["constraints"] = [existing]
+    _account_constraints(authored)
+    corrected = json.loads(json.dumps(authored))
+    corrected["constraints"].append(added)
+    corrected["source_accounting"][1].update(
+        disposition="mapped", constraint_ids=["protocol"], rationale="The protocol rule binds the new constraint."
+    )
+    if change == "move_existing":
+        corrected["source_accounting"][0]["constraint_ids"] = ["protocol"]
+        corrected["source_accounting"][1]["constraint_ids"].append("ownership")
+    elif change == "rewrite_unrelated":
+        corrected["source_accounting"][0]["rationale"] = "An unrelated interpretation replaced the accepted one."
+    review = {
+        "constraints_complete": False,
+        "constraints": authored["constraints"],
+        "constraint_gaps": [
+            {
+                "reason": "omitted",
+                "kind": added["kind"],
+                "summary": added["summary"],
+                "affected_unit_ids": ["foundation"],
+            }
+        ],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+    }
+    llm = CapturingLLM(json.dumps(authored))
+    llm.outputs = [
+        json.dumps(authored),
+        json.dumps(review),
+        json.dumps(corrected),
+        json.dumps(
+            {**review, "constraints_complete": True, "constraints": corrected["constraints"], "constraint_gaps": []}
+        ),
+    ]
+    agent = DeliveryPreparationAgent(llm)
+    audit: list[dict] = []
+    arguments = {
+        "task_description": source,
+        "task_path": ".sikula/tasks/team-invites.md",
+        "plan_id": "team-invites",
+        "project_root": tmp_path,
+        "output_dir": ".sikula/delivery/team-invites",
+        "audit_recorder": audit.append,
+    }
+
+    if change == "append":
+        draft = agent.author_delivery_plan(**arguments)
+        assert draft.source_accounting[0].constraint_ids == ["ownership"]
+        assert draft.source_accounting[1].constraint_ids == ["protocol"]
+        assert len(llm.prompts) == 4
+    else:
+        with pytest.raises(DeliveryAuthoringParseError) as error:
+            agent.author_delivery_plan(**arguments)
+        assert error.value.code == "delivery_prepare.recovery_scope_changed"
+        assert len(llm.prompts) == 3
+        assert audit[-1]["parsed"]["status"] == "failed"
 
 
 def test_author_delivery_plan_adds_missing_exact_source_values_and_reverifies(tmp_path: Path) -> None:
@@ -621,6 +703,7 @@ def test_author_delivery_plan_repairs_only_identified_missing_assignment(tmp_pat
         "disposition": "preserved",
     }
     authored["constraints"] = [existing]
+    _account_constraints(authored)
     gap = {
         "reason": "incompletely_assigned",
         "constraint_id": "protocol-authority",
@@ -671,6 +754,7 @@ def test_author_delivery_plan_bounds_recovery_of_conflicting_verification(tmp_pa
         "disposition": "preserved",
     }
     authored["constraints"] = [existing]
+    _account_constraints(authored)
     conflicting = {**existing, "disposition": "conflict"}
     gap = {
         "reason": "omitted",
@@ -700,6 +784,7 @@ def test_author_delivery_plan_bounds_recovery_of_conflicting_verification(tmp_pa
         "disposition": "preserved",
     }
     repaired = {**authored, "constraints": [existing, added]}
+    _account_constraints(repaired)
     llm.outputs.extend(
         [
             json.dumps(repaired),
@@ -731,6 +816,7 @@ def test_author_delivery_plan_rejects_repair_that_rewrites_existing_constraint(t
         "disposition": "preserved",
     }
     authored["constraints"] = [existing]
+    _account_constraints(authored)
     gap = {
         "reason": "omitted",
         "kind": "security_boundary",
@@ -745,6 +831,8 @@ def test_author_delivery_plan_rejects_repair_that_rewrites_existing_constraint(t
         "unit_ids": ["foundation"],
         "disposition": "preserved",
     }
+    repaired = {**authored, "constraints": [rewritten, addition]}
+    _account_constraints(repaired)
     llm = CapturingLLM(json.dumps(authored))
     llm.outputs = [
         json.dumps(authored),
@@ -757,7 +845,7 @@ def test_author_delivery_plan_rejects_repair_that_rewrites_existing_constraint(t
                 "unit_context_gaps": [],
             }
         ),
-        json.dumps({"constraints": [rewritten, addition]}),
+        json.dumps(repaired),
     ]
     audit_records: list[dict] = []
 
@@ -770,7 +858,7 @@ def test_author_delivery_plan_rejects_repair_that_rewrites_existing_constraint(t
 
     assert exc_info.value.code == "delivery_constraint_repair.existing_constraint_changed"
     assert len(llm.prompts) == 3
-    assert audit_records[-1]["phase"] == "delivery_prepare_constraint_repair"
+    assert audit_records[-1]["phase"] == "delivery_prepare_draft_recovery"
     assert audit_records[-1]["parsed"]["status"] == "failed"
 
 
@@ -781,6 +869,17 @@ def test_author_delivery_plan_rejects_repair_that_rephrases_omitted_gap(tmp_path
         "summary": "Protocol file changes remain owned by the protocol repository.",
         "affected_unit_ids": ["foundation"],
     }
+    repaired = json.loads(_authoring_output())
+    repaired["constraints"] = [
+        {
+            "id": "protocol-repository-ownership",
+            "kind": gap["kind"],
+            "summary": "A different ownership rule.",
+            "unit_ids": gap["affected_unit_ids"],
+            "disposition": "preserved",
+        }
+    ]
+    _account_constraints(repaired)
     llm = CapturingLLM(_authoring_output())
     llm.outputs = [
         _authoring_output(),
@@ -793,19 +892,7 @@ def test_author_delivery_plan_rejects_repair_that_rephrases_omitted_gap(tmp_path
                 "unit_context_gaps": [],
             }
         ),
-        json.dumps(
-            {
-                "constraints": [
-                    {
-                        "id": "protocol-repository-ownership",
-                        "kind": gap["kind"],
-                        "summary": "A different ownership rule.",
-                        "unit_ids": gap["affected_unit_ids"],
-                        "disposition": "preserved",
-                    }
-                ]
-            }
-        ),
+        json.dumps(repaired),
     ]
 
     with pytest.raises(DeliveryAuthoringParseError) as exc_info:
@@ -866,6 +953,7 @@ def test_author_delivery_plan_repairs_source_excerpt_with_feedback_retry(tmp_pat
             "disposition": "preserved",
         }
     ]
+    _account_constraints(authored)
     repaired = json.loads(json.dumps(authored))
     repaired["constraints"][0]["summary"] = repaired_summary
     verification = {
@@ -975,12 +1063,14 @@ def test_author_delivery_plan_rejects_constraint_verifier_identity_mismatch(tmp_
             "disposition": "preserved",
         }
     ]
+    _account_constraints(authored)
     llm = CapturingLLM(
         json.dumps(authored),
         verification_output=json.dumps(
             {
                 "constraints_complete": True,
                 "constraints": [],
+                "source_accounting": [{**record, "constraint_ids": []} for record in authored["source_accounting"]],
                 "unit_context_complete": True,
                 "unit_context_gaps": [],
             }
@@ -1811,6 +1901,48 @@ def test_missing_source_accounting_gets_one_bounded_authoring_correction(tmp_pat
 
 
 @pytest.mark.parametrize("retry_succeeds", [True, False])
+def test_unmapped_constraint_gets_one_audited_authoring_retry(tmp_path: Path, retry_succeeds: bool) -> None:
+    authored = json.loads(_authoring_output())
+    authored["constraints"] = [
+        {
+            "id": "ownership",
+            "kind": "repository_ownership",
+            "summary": "Protocol changes remain externally owned.",
+            "unit_ids": ["foundation"],
+            "disposition": "preserved",
+        }
+    ]
+    invalid_output = json.dumps(authored)
+    _account_constraints(authored)
+    llm = CapturingLLM(invalid_output)
+    llm.outputs = [
+        invalid_output,
+        json.dumps(authored) if retry_succeeds else invalid_output,
+        json.dumps(
+            {
+                "constraints_complete": True,
+                "constraints": authored["constraints"],
+                "unit_context_complete": True,
+                "unit_context_gaps": [],
+            }
+        ),
+    ]
+    audit: list[dict] = []
+
+    if retry_succeeds:
+        draft = _author_delivery_plan(DeliveryPreparationAgent(llm), tmp_path=tmp_path, audit_records=audit)
+        assert draft.source_accounting[0].constraint_ids == ["ownership"]
+    else:
+        with pytest.raises(DeliveryAuthoringParseError) as error:
+            _author_delivery_plan(DeliveryPreparationAgent(llm), tmp_path=tmp_path, audit_records=audit)
+        assert error.value.code == "source_accounting.constraints_incomplete"
+    assert len(llm.prompts) == len(audit) == (3 if retry_succeeds else 2)
+    assert audit[0]["raw_output"] == invalid_output
+    assert audit[0]["parsed"]["error_code"] == "source_accounting.constraints_incomplete"
+    assert not (tmp_path / ".sikula/delivery/team-invites").exists()
+
+
+@pytest.mark.parametrize("retry_succeeds", [True, False])
 def test_invalid_rationale_encoding_is_audited_with_one_authoring_retry(tmp_path: Path, retry_succeeds: bool) -> None:
     correct = _authoring_output()
     invalid = json.loads(correct)
@@ -1896,6 +2028,7 @@ def test_authored_blockers_require_bounded_correction_and_independent_approval(
                 "disposition": "preserved",
             }
         ]
+        _account_constraints(authored)
     review = {
         "constraints_complete": True,
         "constraints": authored["constraints"],
@@ -2042,6 +2175,8 @@ def test_draft_recovery_cannot_expand_authority(change: str, tmp_path: Path) -> 
         }
         authored["constraints"] = [constraint]
         repaired["constraints"] = [{**constraint, "summary": "External code may be copied locally."}]
+        _account_constraints(authored)
+        _account_constraints(repaired)
     first_review = {
         "constraints_complete": True,
         "constraints": authored["constraints"],

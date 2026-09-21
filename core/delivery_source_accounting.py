@@ -52,7 +52,7 @@ def parse_source_accounting(
     private_rationales: bool,
     allow_unresolved: bool = False,
 ) -> list[DeliverySourceAccounting]:
-    """Validate exhaustive coverage and both directions of obligation references."""
+    """Validate exhaustive source and constraint coverage and obligation provenance."""
     if not isinstance(value, list) or len(value) > MAX_DELIVERY_AUTHORITY_FRAGMENTS:
         raise SourceAccountingError("invalid", "Source accounting must be a bounded list.")
     fields = {"source_fragment_id", "disposition", "obligation_ids", "constraint_ids", "rationale_sha256"}
@@ -104,6 +104,10 @@ def parse_source_accounting(
     if seen != fragment_ids:
         raise SourceAccountingError(
             "incomplete", "Every authoritative source fragment needs an explicit accounting record."
+        )
+    if {constraint_id for record in records for constraint_id in record.constraint_ids} != constraint_ids:
+        raise SourceAccountingError(
+            "constraints_incomplete", "Every declared constraint must reference at least one source fragment."
         )
     return records
 

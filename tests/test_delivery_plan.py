@@ -1435,7 +1435,9 @@ def test_main_dispatches_delivery_check_with_optional_project_config(tmp_path: P
     delivery_check.assert_called_once()
 
 
-@pytest.mark.parametrize("mutation", [None, "missing", "duplicate", "stale", "private_rationale"])
+@pytest.mark.parametrize(
+    "mutation", [None, "missing", "duplicate", "stale", "private_rationale", "unmapped_constraint", "legacy"]
+)
 def test_plan_checks_exhaustive_source_accounting(tmp_path: Path, mutation) -> None:
     from core.delivery_source_accounting import parse_source_accounting
 
@@ -1452,6 +1454,15 @@ def test_plan_checks_exhaustive_source_accounting(tmp_path: Path, mutation) -> N
             "unit_ids": ["01-domain"],
         }
     ]
+    data["constraints"] = [
+        {
+            "id": "export-privacy",
+            "kind": "security_boundary",
+            "summary": "Exports keep data within the permitted access boundary.",
+            "unit_ids": ["01-domain"],
+            "disposition": "preserved",
+        }
+    ]
     records = [
         {
             "source_fragment_id": fragment.id,
@@ -1462,11 +1473,12 @@ def test_plan_checks_exhaustive_source_accounting(tmp_path: Path, mutation) -> N
         }
         for index, fragment in enumerate(fragments)
     ]
+    records[-1]["constraint_ids"] = ["export-privacy"]
     parsed = parse_source_accounting(
         records,
         fragment_ids={fragment.id for fragment in fragments},
         obligation_sources={"safe-export": {fragment.id for fragment in fragments[1:]}},
-        constraint_ids=set(),
+        constraint_ids={"export-privacy"},
         private_rationales=True,
     )
     data["source_accounting"] = [record.to_dict() for record in parsed]
@@ -1478,11 +1490,19 @@ def test_plan_checks_exhaustive_source_accounting(tmp_path: Path, mutation) -> N
         data["source_accounting"][-1]["source_fragment_id"] = "source-old"
     elif mutation == "private_rationale":
         data["source_accounting"][0]["rationale"] = "PRIVATE source interpretation."
+    elif mutation == "unmapped_constraint":
+        data["source_accounting"][-1]["constraint_ids"] = []
+    elif mutation == "legacy":
+        data.pop("source_accounting")
     result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
-    assert result.valid is (mutation is None)
+    assert result.valid is (mutation in {None, "legacy"})
     assert "PRIVATE source interpretation" not in str(result.to_dict())
     if mutation is None:
         assert result.plan.source_accounting is not None
         assert result.plan.to_dict()["source_accounting"] == data["source_accounting"]
+    elif mutation == "legacy":
+        assert result.plan.source_accounting is None
     else:
         assert any(code.startswith("source_accounting.") for code in _codes(result))
+        if mutation == "unmapped_constraint":
+            assert "source_accounting.constraints_incomplete" in _codes(result)

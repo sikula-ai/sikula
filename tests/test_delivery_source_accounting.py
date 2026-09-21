@@ -126,3 +126,47 @@ def test_one_fragment_can_map_to_multiple_outcomes_and_one_outcome_to_multiple_f
         private_rationales=True,
     )
     assert result[-1].obligation_ids == ["export", "filter"]
+
+
+@pytest.mark.parametrize("private", [True, False])
+@pytest.mark.parametrize("coverage", ["none", "partial", "empty-source"])
+def test_every_constraint_requires_source_accounting(private: bool, coverage: str) -> None:
+    fragments, obligations, records = _case()
+    if coverage == "partial":
+        records[-1]["constraint_ids"] = ["ownership"]
+    if coverage == "empty-source":
+        fragments, obligations, records = [], {}, []
+    if not private:
+        for record in records:
+            rationale = record.pop("rationale")
+            record["rationale_sha256"] = "sha256:" + sha256(rationale.encode("utf-8")).hexdigest()
+
+    with pytest.raises(SourceAccountingError) as error:
+        parse_source_accounting(
+            records,
+            fragment_ids={fragment.id for fragment in fragments},
+            obligation_sources=obligations,
+            constraint_ids={"ownership", "security"},
+            private_rationales=private,
+        )
+
+    assert error.value.code == "source_accounting.constraints_incomplete"
+
+
+def test_constraints_can_share_fragments_without_obligation_owners() -> None:
+    fragments, _, records = _case()
+    for record in records:
+        record["obligation_ids"] = []
+    records[-2]["constraint_ids"] = ["ownership", "security"]
+    records[-1]["constraint_ids"] = ["security"]
+
+    parsed = parse_source_accounting(
+        records,
+        fragment_ids={fragment.id for fragment in fragments},
+        obligation_sources={},
+        constraint_ids={"ownership", "security"},
+        private_rationales=True,
+    )
+
+    assert parsed[-2].constraint_ids == ["ownership", "security"]
+    assert parsed[-1].constraint_ids == ["security"]

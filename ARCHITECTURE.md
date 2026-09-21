@@ -346,7 +346,8 @@ source task, declared constraints, and complete candidate unit contracts. Its
 strict result must echo the constraint identities and assignments exactly,
 confirm completeness, and classify every disposition. An incomplete result must
 identify bounded `omitted` or `incompletely_assigned` gaps with affected unit IDs;
-a bare negative completeness claim is invalid. Sikula gives metadata-only gaps to one
+a bare negative completeness claim is invalid. Where no new source mapping is needed,
+Sikula gives metadata-only gaps to one
 constraints-only repair call that cannot alter units, dependencies, task Markdown,
 scope, assets, sizing, risk, or budgets. Deterministic validation permits only one
 new constraint per omitted gap and only the missing assignments named for existing
@@ -368,7 +369,8 @@ Obligations are valid only in schema-version-2 plans with final-gate verificatio
 older plans remain readable only without obligations. Fresh authoring requires exhaustive
 `source_accounting`, including explicit context-only decisions and private rationales.
 `core/delivery_source_accounting.py` checks exact fragment membership, unique records,
-and bidirectional obligation references; independent verification assesses meaning.
+bidirectional obligation references, and at least one source-fragment mapping for
+every declared constraint; independent verification assesses meaning.
 Published records retain rationale hashes, with text only in the preparation audit.
 Rationales must encode as UTF-8 before hashing; malformed model text follows the
 audited parser-failure path and the existing bounded authoring retry.
@@ -389,6 +391,9 @@ Author and verifier dispositions remain separate. A `needs_review` or `conflict`
 from either assessment requires bounded correction even when the other says
 `preserved`; publication requires both the corrected draft and its independent
 verification to preserve every constraint and obligation.
+When accounting is present, an omitted constraint uses this correction round to add
+both the constraint and its source mappings. Unrelated existing mappings stay unchanged;
+new constraint references and their private rationale are independently verified.
 The command layer injects a bounded `tools/delivery_context_tool.py` reader, which
 uses the configured Sandbox read scope and never invokes a shell or provider.
 The verifier may request eight regular project files (16 KB each, 64 KB total);

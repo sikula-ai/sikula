@@ -592,6 +592,7 @@ def test_delivery_prepare_cli_preserves_constraints_and_assets_from_one_source_s
     }
     authored = json.loads(_delivery_prepare_authoring_output(task_path.read_text(encoding="utf-8")))
     authored["constraints"] = [constraint]
+    authored["source_accounting"][0]["constraint_ids"] = [constraint["id"]]
     authored["units"][0]["asset_paths"] = [asset_path]
     fake = seq_fake_llm(
         generate_responses=[
@@ -604,7 +605,7 @@ def test_delivery_prepare_cli_preserves_constraints_and_assets_from_one_source_s
                     "unit_context_gaps": [],
                     "obligations_complete": True,
                     "obligations": _prepare_obligations(task_path.read_text(encoding="utf-8")),
-                    "source_accounting": _prepare_accounting(task_path.read_text(encoding="utf-8")),
+                    "source_accounting": authored["source_accounting"],
                     "obligation_gaps": [],
                 }
             ),
@@ -807,6 +808,9 @@ def test_delivery_prepare_cli_repairs_an_omitted_constraint_before_writing(
         "unit_ids": ["prepare-artifacts"],
         "disposition": "preserved",
     }
+    repaired = json.loads(_delivery_prepare_authoring_output(task_path.read_text(encoding="utf-8")))
+    repaired["constraints"] = [constraint]
+    repaired["source_accounting"][0]["constraint_ids"] = [constraint["id"]]
     fake = seq_fake_llm(
         generate_responses=[
             _delivery_prepare_authoring_output(task_path.read_text(encoding="utf-8")),
@@ -823,7 +827,7 @@ def test_delivery_prepare_cli_repairs_an_omitted_constraint_before_writing(
                     "obligation_gaps": [],
                 }
             ),
-            json.dumps({"constraints": [constraint]}),
+            json.dumps(repaired),
             json.dumps(
                 {
                     "constraints_complete": True,
@@ -833,7 +837,7 @@ def test_delivery_prepare_cli_repairs_an_omitted_constraint_before_writing(
                     "unit_context_gaps": [],
                     "obligations_complete": True,
                     "obligations": _prepare_obligations(task_path.read_text(encoding="utf-8")),
-                    "source_accounting": _prepare_accounting(task_path.read_text(encoding="utf-8")),
+                    "source_accounting": repaired["source_accounting"],
                     "obligation_gaps": [],
                 }
             ),
@@ -855,12 +859,13 @@ def test_delivery_prepare_cli_repairs_an_omitted_constraint_before_writing(
     plan_path = git_project / ".sikula" / "delivery" / "team-invites" / "plan.yaml"
     plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
     assert plan["constraints"] == [constraint]
+    assert plan["source_accounting"][0]["constraint_ids"] == [constraint["id"]]
     audit_path = git_project / ".sikula" / "contract-reports" / "team-invites.delivery-prepare.auto-llm.jsonl"
     audit_records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
     assert [record["record"]["phase"] for record in audit_records] == [
         "delivery_prepare_authoring",
         "delivery_prepare_constraint_verification",
-        "delivery_prepare_constraint_repair",
+        "delivery_prepare_draft_recovery",
         "delivery_prepare_constraint_verification",
     ]
     assert audit_records[-1]["record"]["round_index"] == 2
@@ -898,6 +903,9 @@ def test_delivery_prepare_cli_blocks_with_gaps_when_constraint_repair_remains_in
         "summary": "The existing protocol contract remains authoritative.",
         "affected_unit_ids": ["prepare-artifacts"],
     }
+    repaired = json.loads(_delivery_prepare_authoring_output(task_path.read_text(encoding="utf-8")))
+    repaired["constraints"] = [repaired_constraint]
+    repaired["source_accounting"][0]["constraint_ids"] = [repaired_constraint["id"]]
     fake = seq_fake_llm(
         generate_responses=[
             _delivery_prepare_authoring_output(task_path.read_text(encoding="utf-8")),
@@ -914,7 +922,7 @@ def test_delivery_prepare_cli_blocks_with_gaps_when_constraint_repair_remains_in
                     "obligation_gaps": [],
                 }
             ),
-            json.dumps({"constraints": [repaired_constraint]}),
+            json.dumps(repaired),
             json.dumps(
                 {
                     "constraints_complete": False,
@@ -924,7 +932,7 @@ def test_delivery_prepare_cli_blocks_with_gaps_when_constraint_repair_remains_in
                     "unit_context_gaps": [],
                     "obligations_complete": True,
                     "obligations": _prepare_obligations(task_path.read_text(encoding="utf-8")),
-                    "source_accounting": _prepare_accounting(task_path.read_text(encoding="utf-8")),
+                    "source_accounting": repaired["source_accounting"],
                     "obligation_gaps": [],
                 }
             ),

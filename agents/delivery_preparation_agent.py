@@ -107,7 +107,8 @@ Delivery-plan constraints:
   Each record has source_fragment_id, disposition (mapped, context_only, unresolved), obligation_ids,
   constraint_ids, and a bounded private rationale. Mapped records reference requirements; context_only
   records explain why the fragment adds none. Unresolved records block publication. Obligation links
-  must agree in both directions with source_fragment_ids. Headings need a context record, not a fake
+  must agree in both directions with source_fragment_ids. Every declared constraint must appear in
+  constraint_ids of at least one mapped source fragment. Headings need a context record, not a fake
   obligation. Preserve every prohibition and prerequisite. Do not invent an unavailable dependency.
 - Resolve ordinary choices from supplied authorized project context. Never invent external contracts
   or product intent; a confirmed stop takes precedence over correction attempts.
@@ -220,7 +221,7 @@ Return this JSON shape:
   "title": "Short delivery plan title",
   "planning_mode": "fixed_window",
   "warnings": [],
-  "source_accounting": [{{"source_fragment_id":"exact-supplied-id","disposition":"mapped","obligation_ids":["stable-obligation-id"],"constraint_ids":[],"rationale":"Private explanation of this mapping"}}],
+  "source_accounting": [{{"source_fragment_id":"exact-supplied-id","disposition":"mapped","obligation_ids":["stable-obligation-id"],"constraint_ids":["stable-constraint-id"],"rationale":"Private explanation of this mapping"}}],
   "constraints": [
     {{
       "id": "stable-constraint-id",
@@ -786,6 +787,7 @@ class DeliveryPreparationAgent:
                     _DELIVERY_AUTHORING_SOURCE_EXCERPT_RETRY
                     + "\nAlso correct any missing or invalid source_accounting records and requirement cross-references.\n"
                     + "Every source-accounting rationale must be valid UTF-8 text without lone surrogate code points.\n"
+                    + "Map every declared constraint to at least one source-accounting record.\n"
                     if round_index == 2
                     else ""
                 )
@@ -868,8 +870,13 @@ class DeliveryPreparationAgent:
             verify_unit_context=True,
             verify_obligations=True,
         )
-        needs_draft_recovery = self._needs_draft_recovery(verification) or any(
-            item.disposition != "preserved" for item in (*draft.constraints, *draft.obligations)
+        needs_draft_recovery = (
+            self._needs_draft_recovery(verification)
+            or any(item.disposition != "preserved" for item in (*draft.constraints, *draft.obligations))
+            or (
+                draft.source_accounting is not None
+                and any(gap.reason == "omitted" for gap in verification.constraint_gaps)
+            )
         )
         if (
             verification.constraints_complete
@@ -1039,6 +1046,9 @@ or missing assignments. Existing needs_review/conflict dispositions may become p
 resolved. Treat needs_review/conflict in either the candidate or independent findings as a blocker,
 even when the other assessment says preserved. Resolve disagreements using the accepted authority
 and supplied evidence; leave unresolved decisions explicit in the corrected candidate.
+Map every newly added constraint to its authoritative source fragments in source_accounting.
+Outside reported source-accounting gaps, preserve existing mappings and only append new constraint
+references with their rationales.
 Correct the affected source-accounting records and their private rationales. Leave unaffected
 records unchanged. All obligations must be collectively implemented by their assigned unit contracts.
 Never reinterpret a prohibition, invent a dependency/API/product choice, or create substitute work.
@@ -1163,10 +1173,27 @@ Authoritative source:
             if record.disposition == "unresolved"
         )
         corrected = {record.source_fragment_id: record for record in repaired.source_accounting or []}
+        new_constraint_ids = {item.id for item in repaired.constraints} - {item.id for item in original.constraints}
         for record in original.source_accounting or []:
+            if record.source_fragment_id in changed_fragments:
+                continue
+            after = corrected.get(record.source_fragment_id)
+            if after == record:
+                continue
+            if after is None:
+                reject()
+            added_refs = set(after.constraint_ids) - set(record.constraint_ids)
+            if not added_refs or not added_refs <= new_constraint_ids:
+                reject()
             if (
-                record.source_fragment_id not in changed_fragments
-                and corrected.get(record.source_fragment_id) != record
+                replace(
+                    after,
+                    constraint_ids=[ref for ref in after.constraint_ids if ref not in added_refs],
+                    disposition=record.disposition,
+                    rationale=record.rationale,
+                    rationale_sha256=record.rationale_sha256,
+                )
+                != record
             ):
                 reject()
 
