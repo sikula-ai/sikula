@@ -646,8 +646,9 @@ def _parse_delivery_plan(
         source_task_description=source_task_description,
         errors=errors,
     )
+    raw_obligations = data.get("obligations")
     obligations = _parse_obligations(
-        data.get("obligations"),
+        raw_obligations,
         units=units,
         source_task_description=source_task_description,
         errors=errors,
@@ -673,6 +674,15 @@ def _parse_delivery_plan(
             )
         except SourceAccountingError as exc:
             errors.append(DeliveryPlanIssue("error", exc.code, str(exc), "source_accounting"))
+    elif isinstance(raw_obligations, list) and raw_obligations:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "source_accounting.required",
+                "Plans with source-bound obligations require exhaustive source accounting.",
+                "source_accounting",
+            )
+        )
     if isinstance(raw_constraints, list) and raw_constraints and source_task is None:
         errors.append(
             DeliveryPlanIssue(
@@ -682,7 +692,6 @@ def _parse_delivery_plan(
                 "source_task",
             )
         )
-    raw_obligations = data.get("obligations")
     if isinstance(raw_obligations, list) and raw_obligations and source_task is None:
         errors.append(
             DeliveryPlanIssue(

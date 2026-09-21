@@ -705,6 +705,18 @@ def test_delivery_plan_check_binds_obligations_to_source_fragments_and_active_un
             "unit_ids": ["01-domain", "02-api"],
         }
     ]
+    data["source_accounting"] = [
+        {
+            "source_fragment_id": fragment.id,
+            "disposition": "mapped" if fragment.id in data["obligations"][0]["source_fragment_ids"] else "context_only",
+            "obligation_ids": ["reject-invalid-carts"]
+            if fragment.id in data["obligations"][0]["source_fragment_ids"]
+            else [],
+            "constraint_ids": [],
+            "rationale_sha256": "sha256:" + sha256(b"Source coverage rationale.").hexdigest(),
+        }
+        for fragment in delivery_authority_fragments(source_text)
+    ]
 
     result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
 
@@ -1436,7 +1448,20 @@ def test_main_dispatches_delivery_check_with_optional_project_config(tmp_path: P
 
 
 @pytest.mark.parametrize(
-    "mutation", [None, "missing", "duplicate", "stale", "private_rationale", "unmapped_constraint", "legacy"]
+    "mutation",
+    [
+        None,
+        "missing",
+        "duplicate",
+        "stale",
+        "private_rationale",
+        "unmapped_constraint",
+        "absent",
+        "null",
+        "empty",
+        "legacy",
+        "legacy_empty_obligations",
+    ],
 )
 def test_plan_checks_exhaustive_source_accounting(tmp_path: Path, mutation) -> None:
     from core.delivery_source_accounting import parse_source_accounting
@@ -1492,17 +1517,27 @@ def test_plan_checks_exhaustive_source_accounting(tmp_path: Path, mutation) -> N
         data["source_accounting"][0]["rationale"] = "PRIVATE source interpretation."
     elif mutation == "unmapped_constraint":
         data["source_accounting"][-1]["constraint_ids"] = []
-    elif mutation == "legacy":
+    elif mutation in {"absent", "legacy", "legacy_empty_obligations"}:
         data.pop("source_accounting")
+        if mutation == "legacy":
+            data.pop("obligations")
+        elif mutation == "legacy_empty_obligations":
+            data["obligations"] = []
+    elif mutation == "null":
+        data["source_accounting"] = None
+    elif mutation == "empty":
+        data["source_accounting"] = []
     result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
-    assert result.valid is (mutation in {None, "legacy"})
+    assert result.valid is (mutation in {None, "legacy", "legacy_empty_obligations"})
     assert "PRIVATE source interpretation" not in str(result.to_dict())
     if mutation is None:
         assert result.plan.source_accounting is not None
         assert result.plan.to_dict()["source_accounting"] == data["source_accounting"]
-    elif mutation == "legacy":
+    elif mutation in {"legacy", "legacy_empty_obligations"}:
         assert result.plan.source_accounting is None
     else:
         assert any(code.startswith("source_accounting.") for code in _codes(result))
         if mutation == "unmapped_constraint":
             assert "source_accounting.constraints_incomplete" in _codes(result)
+        elif mutation == "absent":
+            assert "source_accounting.required" in _codes(result)

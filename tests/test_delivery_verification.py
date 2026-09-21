@@ -228,6 +228,15 @@ def _write_plan(
                     "unit_ids": ["unit"],
                 }
             ]
+            data["source_accounting"] = [
+                {
+                    "source_fragment_id": data["obligations"][0]["source_fragment_ids"][0],
+                    "disposition": "mapped",
+                    "obligation_ids": ["deliver-source-behavior"],
+                    "constraint_ids": [],
+                    "rationale_sha256": "sha256:" + sha256(b"PRIVATE ACCOUNTING RATIONALE").hexdigest(),
+                }
+            ]
     plan_path = root / ".sikula" / "delivery" / "demo" / "plan.yaml"
     plan_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     return plan_path
@@ -613,20 +622,13 @@ def test_schema_v2_finalize_requires_exact_passing_gate(tmp_path: Path) -> None:
     assert any(issue.code == "delivery_verification.stale" for issue in stale.errors)
 
 
-def test_final_gate_persists_bounded_obligation_closure(tmp_path: Path) -> None:
+@pytest.mark.parametrize("accounting_change", ["rationale", "removed"])
+def test_final_gate_persists_bounded_obligation_closure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], accounting_change: str
+) -> None:
     base = _git_init(tmp_path)
     plan_path = _write_plan(tmp_path, with_obligation=True)
     plan = yaml.safe_load(plan_path.read_text())
-    plan["source_accounting"] = [
-        {
-            "source_fragment_id": plan["obligations"][0]["source_fragment_ids"][0],
-            "disposition": "mapped",
-            "obligation_ids": ["deliver-source-behavior"],
-            "constraint_ids": [],
-            "rationale_sha256": "sha256:" + sha256(b"PRIVATE ACCOUNTING RATIONALE").hexdigest(),
-        }
-    ]
-    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False))
     unit_commit = _git_commit_all(tmp_path, "delivery unit")
     progress = DeliveryProgress(
         schema_version=1,
@@ -663,13 +665,40 @@ def test_final_gate_persists_bounded_obligation_closure(tmp_path: Path) -> None:
     assert "source_accounting" in llm.calls[0][0]
     assert "PRIVATE ACCOUNTING RATIONALE" not in llm.calls[0][0]
 
-    plan["source_accounting"][0]["rationale_sha256"] = "sha256:" + "f" * 64
+    progress_path = delivery_progress_path(tmp_path, "demo")
+    progress_before = progress_path.read_bytes()
+    if accounting_change == "removed":
+        plan.pop("source_accounting")
+    else:
+        plan["source_accounting"][0]["rationale_sha256"] = "sha256:" + "f" * 64
     plan_path.write_text(yaml.safe_dump(plan, sort_keys=False))
     status = with_delivery_verification_readiness(get_delivery_status(plan_path), config)
-    assert status.verification_status == "stale"
+    if accounting_change == "removed":
+        assert status.valid is False
+        assert any(issue.code == "source_accounting.required" for issue in status.errors)
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_delivery_check(argparse.Namespace(plan_file=str(plan_path), json=True), config)
+        assert exc_info.value.code == 1
+        checked = json.loads(capsys.readouterr().out)
+        assert checked["valid"] is False
+        assert any(issue["code"] == "source_accounting.required" for issue in checked["errors"])
+        retried = verify_delivery_plan(
+            plan_path,
+            config,
+            state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+            semantic_reviewer=DeliveryIntegrationReviewAgent(llm, config),
+            security_reviewer=None,
+            project_root=tmp_path,
+        )
+        assert retried.succeeded is False
+        assert any(issue.code == "source_accounting.required" for issue in retried.errors)
+    else:
+        assert status.verification_status == "stale"
     finalized = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=config)
     assert finalized.finalized is False
-    assert any(issue.code == "delivery_verification.stale" for issue in finalized.errors)
+    expected_code = "source_accounting.required" if accounting_change == "removed" else "delivery_verification.stale"
+    assert any(issue.code == expected_code for issue in finalized.errors)
+    assert progress_path.read_bytes() == progress_before
     assert len(llm.calls) == 1
 
 
@@ -2291,11 +2320,23 @@ def test_verification_readiness_counts_obligation_response_template(
             "source_fragment_ids": [source_ref],
             "unit_ids": ["unit"],
         }
-        for index in range(230)
+        for index in range(110)
+    ]
+    data["source_accounting"] = [
+        {
+            "source_fragment_id": source_ref,
+            "disposition": "mapped",
+            "obligation_ids": [item["id"] for item in data["obligations"]],
+            "constraint_ids": [],
+            "rationale_sha256": "sha256:" + sha256(b"Source behavior rationale.").hexdigest(),
+        }
     ]
     plan_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     status = get_delivery_status(plan_path)
     config = _config(tmp_path)
+    # Keep source and plan individually bounded while the full prompt needs the response template count.
+    (tmp_path / "review-rules.md").write_text("r" * 80_000, encoding="utf-8")
+    config["reviewer"] = {"extra_rules": "review-rules.md"}
     assert status.valid is True
     llm = _ReadonlyLLM([])
     reviewer = DeliveryIntegrationReviewAgent(llm, config)

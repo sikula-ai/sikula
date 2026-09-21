@@ -240,8 +240,11 @@ records explain why a heading or other context introduces no requirement; the
 independent verifier can reject that decision. Unknown, duplicate, missing, or
 unresolved records cannot publish. The plan retains only the mapping and
 `rationale_sha256`; rationale text remains in the private preparation audit.
-Existing plans without source accounting retain their legacy interpretation;
-they do not acquire fabricated coverage. Accounting changes alter the plan
+Every plan with non-empty `obligations` must include exhaustive `source_accounting`,
+including hand-authored and edited plans. Omitting it reports
+`source_accounting.required` and blocks checking, verification, and finalization.
+Existing plans without obligations retain their legacy interpretation without
+source accounting; they do not acquire fabricated coverage. Accounting changes alter the plan
 fingerprint and invalidate incompatible final-gate evidence.
 
 For a concrete unit-contract gap, an unresolved interpretation, or a disputed
@@ -1076,6 +1079,14 @@ obligations:
     unit_ids:
       - 01-domain-model
       - 02-api
+source_accounting:
+  # Include one record for every source fragment, including context-only fragments.
+  - source_fragment_id: source-18-20-0123456789ab
+    disposition: mapped
+    obligation_ids:
+      - reject-invalid-carts
+    constraint_ids: []
+    rationale_sha256: sha256:<fingerprint-of-private-rationale>
 streams:
   - id: backend
     label: Backend

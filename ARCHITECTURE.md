@@ -368,6 +368,8 @@ summary, provenance references, and active owners without copying source text.
 Obligations are valid only in schema-version-2 plans with final-gate verification;
 older plans remain readable only without obligations. Fresh authoring requires exhaustive
 `source_accounting`, including explicit context-only decisions and private rationales.
+Plan checking also requires source accounting whenever obligations are non-empty,
+including hand-authored and edited plans; omitting it blocks verification and finalization.
 `core/delivery_source_accounting.py` checks exact fragment membership, unique records,
 bidirectional obligation references, and at least one source-fragment mapping for
 every declared constraint; independent verification assesses meaning.

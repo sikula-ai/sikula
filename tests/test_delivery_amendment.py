@@ -332,6 +332,18 @@ def _add_target_constraint(root: Path, plan_path: Path) -> None:
             "unit_ids": ["c"],
         }
     ]
+    plan["source_accounting"] = [
+        {
+            "source_fragment_id": fragment.id,
+            "disposition": "mapped",
+            "obligation_ids": ["preserve-protocol-boundary"]
+            if fragment.id in plan["obligations"][0]["source_fragment_ids"]
+            else [],
+            "constraint_ids": ["protocol-authority", "foundation-boundary"],
+            "rationale_sha256": "sha256:" + hashlib.sha256(b"Source authority rationale.").hexdigest(),
+        }
+        for fragment in delivery_authority_fragments(source_text)
+    ]
     plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
 
 
