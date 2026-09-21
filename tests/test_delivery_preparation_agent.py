@@ -15,9 +15,44 @@ from core.delivery_authoring import (
     DeliveryAmendmentAuthoringDraft,
     DeliveryAssessmentDraft,
     DeliveryAuthoringDraft,
+    DeliveryAuthoringObligationDraft,
     DeliveryAuthoringParseError,
     DeliveryAuthoringUnitDraft,
+    DeliveryObligationGap,
 )
+from core.delivery_obligations import delivery_authority_fragments
+
+
+_DEFAULT_TASK_DESCRIPTION = "Add team invite authoring without exposing raw task text."
+
+
+def test_obligation_repair_combines_multiple_missing_owner_gaps() -> None:
+    original = DeliveryAuthoringObligationDraft(
+        id="deliver-invites",
+        summary="Team invitations are delivered safely.",
+        source_fragment_ids=["source-1-1-0123456789ab"],
+        unit_ids=["foundation"],
+        disposition="preserved",
+    )
+    repaired = DeliveryAuthoringObligationDraft(
+        id=original.id,
+        summary=original.summary,
+        source_fragment_ids=original.source_fragment_ids,
+        unit_ids=["foundation", "api", "client"],
+        disposition="preserved",
+    )
+    gaps = [
+        DeliveryObligationGap(
+            reason="incompletely_assigned",
+            obligation_id=original.id,
+            summary=original.summary,
+            source_fragment_ids=original.source_fragment_ids,
+            affected_unit_ids=[unit_id],
+        )
+        for unit_id in ("api", "client")
+    ]
+
+    DeliveryPreparationAgent._assert_obligation_repair([original], [repaired], gaps)
 
 
 class CapturingLLM:
@@ -46,6 +81,22 @@ class CapturingLLM:
         output = self.outputs[min(len(self.prompts) - 1, len(self.outputs) - 1)]
         if isinstance(output, Exception):
             raise output
+        try:
+            payload = json.loads(output)
+            authored = json.loads(self.outputs[0])
+        except (json.JSONDecodeError, TypeError):
+            return output
+        if isinstance(payload, dict) and "constraints_complete" in payload:
+            obligations = authored.get("obligations", []) if isinstance(authored, dict) else []
+            accounting_marker = "Source accounting input (null means legacy/amendment context):\n```json\n"
+            if accounting_marker in user:
+                accounting = json.JSONDecoder().raw_decode(user.split(accounting_marker, 1)[1])[0]
+                if accounting is not None:
+                    payload.setdefault("source_accounting", accounting)
+            payload.setdefault("obligations_complete", True)
+            payload.setdefault("obligation_gaps", [])
+            payload.setdefault("obligations", obligations)
+            return json.dumps(payload)
         return output
 
     def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
@@ -119,11 +170,22 @@ def _authoring_output(
     *,
     planning_mode: str | None = "fixed_window",
     warnings: list[str] | None = None,
+    task_description: str = _DEFAULT_TASK_DESCRIPTION,
 ) -> str:
+    source_fragment_id = delivery_authority_fragments(task_description)[0].id
     data = {
         "plan_id": "team-invites",
         "title": "Team invites delivery",
         "constraints": [],
+        "obligations": [
+            {
+                "id": "deliver-team-invites",
+                "summary": "The requested team invite behavior is delivered without exposing private task data.",
+                "source_fragment_ids": [source_fragment_id],
+                "unit_ids": ["foundation"],
+                "disposition": "preserved",
+            }
+        ],
         "units": [
             {
                 "id": "foundation",
@@ -138,6 +200,18 @@ def _authoring_output(
             }
         ],
     }
+    data["source_accounting"] = [
+        {
+            "source_fragment_id": fragment.id,
+            "disposition": "mapped" if fragment.id == source_fragment_id else "context_only",
+            "obligation_ids": ["deliver-team-invites"] if fragment.id == source_fragment_id else [],
+            "constraint_ids": [],
+            "rationale": "Fixture requirement mapping."
+            if fragment.id == source_fragment_id
+            else "Fixture explanatory context.",
+        }
+        for fragment in delivery_authority_fragments(task_description)
+    ]
     if planning_mode is not None:
         data["planning_mode"] = planning_mode
     if warnings is not None:
@@ -219,7 +293,7 @@ def _author_delivery_plan(
     audit_records: list[dict] | None = None,
 ) -> DeliveryAuthoringDraft:
     return agent.author_delivery_plan(
-        task_description="Add team invite authoring without exposing raw task text.",
+        task_description=_DEFAULT_TASK_DESCRIPTION,
         task_path=task_path,
         plan_id="team-invites",
         project_root=tmp_path,
@@ -361,12 +435,18 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
         "plan_id": "team-invites",
         "unit_ids": ["foundation"],
         "unit_count": 1,
+        "obligation_ids": ["deliver-team-invites"],
+        "obligation_count": 1,
         "planning_mode": "fixed_window",
         "warnings": ["Review before writing artifacts."],
     }
     verification_record = audit_records[1]
     assert verification_record["phase"] == "delivery_prepare_constraint_verification"
     assert verification_record["parsed"] == {
+        "source_accounting": [record.to_verification_dict() for record in draft.source_accounting],
+        "source_accounting_gaps": [],
+        "unit_contract_gaps": [],
+        "context_paths": [],
         "status": "parsed",
         "constraints_complete": True,
         "constraint_ids": [],
@@ -374,8 +454,12 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
         "constraint_gaps": [],
         "unit_context_complete": True,
         "unit_context_gaps": [],
+        "obligations_complete": True,
+        "obligation_ids": ["deliver-team-invites"],
+        "obligation_dispositions": ["preserved"],
+        "obligation_gaps": [],
     }
-    assert "independent read-only delivery-constraint verifier" in llm.prompts[1]
+    assert "independent read-only delivery authority verifier" in llm.prompts[1]
     assert "Treat stop_and_follow_up as an active blocker only when" in llm.prompts[1]
     assert '"asset_paths": [' in llm.prompts[1]
     assert ".sikula/task-assets/invite-reference.png" in llm.prompts[1]
@@ -383,6 +467,7 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
 
 
 def test_author_delivery_plan_repairs_one_omitted_constraint_and_reverifies(tmp_path: Path) -> None:
+    task_description = "Only the protocol repository may change protocol files."
     gap = {
         "reason": "omitted",
         "kind": "repository_ownership",
@@ -396,9 +481,9 @@ def test_author_delivery_plan_repairs_one_omitted_constraint_and_reverifies(tmp_
         "unit_ids": ["foundation"],
         "disposition": "preserved",
     }
-    llm = CapturingLLM(_authoring_output())
+    llm = CapturingLLM(_authoring_output(task_description=task_description))
     llm.outputs = [
-        _authoring_output(),
+        _authoring_output(task_description=task_description),
         json.dumps(
             {
                 "constraints_complete": False,
@@ -423,7 +508,7 @@ def test_author_delivery_plan_repairs_one_omitted_constraint_and_reverifies(tmp_
     audit_records: list[dict] = []
 
     draft = agent.author_delivery_plan(
-        task_description="Only the protocol repository may change protocol files.",
+        task_description=task_description,
         task_path=".sikula/tasks/team-invites.md",
         plan_id="team-invites",
         project_root=tmp_path,
@@ -453,7 +538,8 @@ def test_author_delivery_plan_repairs_one_omitted_constraint_and_reverifies(tmp_
 def test_author_delivery_plan_adds_missing_exact_source_values_and_reverifies(tmp_path: Path) -> None:
     first_literal = '- <resource.title> — "Resource"'
     second_literal = '- <resource.submit> — "Save"'
-    authored = json.loads(_authoring_output())
+    task_description = f"# Resource\n\n## Context\n\nLocalization keys:\n\n{first_literal}\n{second_literal}\n"
+    authored = json.loads(_authoring_output(task_description=task_description))
     authored["units"][0]["task_markdown"] = _unit_markdown("Foundation").replace(
         "Prepare the delivery unit.",
         "Prepare the delivery unit using the provided localization keys.",
@@ -488,7 +574,7 @@ def test_author_delivery_plan_adds_missing_exact_source_values_and_reverifies(tm
 
     agent = DeliveryPreparationAgent(llm=llm)
     draft = agent.author_delivery_plan(
-        task_description=(f"# Resource\n\n## Context\n\nLocalization keys:\n\n{first_literal}\n{second_literal}\n"),
+        task_description=task_description,
         task_path=".sikula/tasks/resource.md",
         plan_id="team-invites",
         project_root=tmp_path,
@@ -575,7 +661,7 @@ def test_author_delivery_plan_repairs_only_identified_missing_assignment(tmp_pat
     assert draft.units[1].asset_paths == []
 
 
-def test_author_delivery_plan_does_not_repair_incomplete_conflicting_verification(tmp_path: Path) -> None:
+def test_author_delivery_plan_bounds_recovery_of_conflicting_verification(tmp_path: Path) -> None:
     authored = json.loads(_authoring_output())
     existing = {
         "id": "protocol-authority",
@@ -606,10 +692,31 @@ def test_author_delivery_plan_does_not_repair_incomplete_conflicting_verificatio
         ),
     ]
 
+    added = {
+        "id": "credential-boundary",
+        "kind": gap["kind"],
+        "summary": gap["summary"],
+        "unit_ids": gap["affected_unit_ids"],
+        "disposition": "preserved",
+    }
+    repaired = {**authored, "constraints": [existing, added]}
+    llm.outputs.extend(
+        [
+            json.dumps(repaired),
+            json.dumps(
+                {
+                    "constraints_complete": True,
+                    "constraints": [conflicting, added],
+                    "unit_context_complete": True,
+                    "unit_context_gaps": [],
+                }
+            ),
+        ]
+    )
     draft = _author_delivery_plan(DeliveryPreparationAgent(llm=llm), tmp_path=tmp_path)
 
-    assert len(llm.prompts) == 2
-    assert [constraint.to_plan_dict() for constraint in draft.constraints] == [existing]
+    assert len(llm.prompts) == 4
+    assert [constraint.to_plan_dict() for constraint in draft.constraints] == [existing, added]
     assert draft.constraint_verification is not None
     assert draft.constraint_verification.constraints[0].disposition == "conflict"
 
@@ -709,7 +816,8 @@ def test_author_delivery_plan_rejects_repair_that_rephrases_omitted_gap(tmp_path
 
 def test_author_delivery_plan_retries_source_excerpt_once_then_rejects(tmp_path: Path) -> None:
     source_rule = "Only the protocol repository may change protocol files."
-    authored = json.loads(_authoring_output())
+    task_description = f"# Task\n\n- {source_rule}\n"
+    authored = json.loads(_authoring_output(task_description=task_description))
     authored["constraints"] = [
         {
             "id": "protocol-authority",
@@ -726,7 +834,7 @@ def test_author_delivery_plan_retries_source_excerpt_once_then_rejects(tmp_path:
 
     with pytest.raises(DeliveryAuthoringParseError) as exc_info:
         agent.author_delivery_plan(
-            task_description=f"# Task\n\n- {source_rule}\n",
+            task_description=task_description,
             task_path=".sikula/tasks/team-invites.md",
             plan_id="team-invites",
             project_root=tmp_path,
@@ -747,7 +855,8 @@ def test_author_delivery_plan_repairs_source_excerpt_with_feedback_retry(tmp_pat
         "Maintain Python compatibility and importability without optional or non-standard-library dependencies."
     )
     repaired_summary = "Keep runtime dependencies confined to Python's standard library."
-    authored = json.loads(_authoring_output())
+    task_description = f"# Task\n\n## Out of scope\n\n- {source_rule}\n"
+    authored = json.loads(_authoring_output(task_description=task_description))
     authored["constraints"] = [
         {
             "id": "standard-library-only",
@@ -771,7 +880,7 @@ def test_author_delivery_plan_repairs_source_excerpt_with_feedback_retry(tmp_pat
     audit_records: list[dict] = []
 
     draft = DeliveryPreparationAgent(llm=llm).author_delivery_plan(
-        task_description=f"# Task\n\n## Out of scope\n\n- {source_rule}\n",
+        task_description=task_description,
         task_path=".sikula/tasks/team-invites.md",
         plan_id="team-invites",
         project_root=tmp_path,
@@ -791,6 +900,39 @@ def test_author_delivery_plan_repairs_source_excerpt_with_feedback_retry(tmp_pat
     assert [record["round_index"] for record in audit_records] == [1, 2, 1]
     assert audit_records[0]["parsed"]["status"] == "failed"
     assert audit_records[1]["parsed"]["status"] == "parsed"
+
+
+def test_author_delivery_plan_repairs_obligation_excerpt_with_specific_feedback(tmp_path: Path) -> None:
+    source_outcome = "Invitations expire after twenty four hours."
+    task_description = f"# Task\n\n## Acceptance criteria\n\n- {source_outcome}\n"
+    authored = json.loads(_authoring_output(task_description=task_description))
+    authored["obligations"][0]["summary"] = source_outcome
+    repaired = json.loads(json.dumps(authored))
+    repaired["obligations"][0]["summary"] = "Invitation validity ends after the required lifetime."
+    verification = {
+        "constraints_complete": True,
+        "constraints": [],
+        "constraint_gaps": [],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+        "obligations_complete": True,
+        "obligations": repaired["obligations"],
+        "obligation_gaps": [],
+    }
+    llm = CapturingLLM(json.dumps(authored))
+    llm.outputs = [json.dumps(authored), json.dumps(repaired), json.dumps(verification)]
+
+    draft = DeliveryPreparationAgent(llm=llm).author_delivery_plan(
+        task_description=task_description,
+        task_path=".sikula/tasks/team-invites.md",
+        plan_id="team-invites",
+        project_root=tmp_path,
+        output_dir=".sikula/delivery/team-invites",
+    )
+
+    assert draft.obligations[0].summary == repaired["obligations"][0]["summary"]
+    assert "obligations[].summary" in llm.prompts[1]
+    assert len(llm.prompts) == 3
 
 
 def test_author_delivery_plan_fails_safely_when_constraint_verifier_provider_fails(tmp_path: Path) -> None:
@@ -947,6 +1089,197 @@ def test_author_delivery_amendment_verifies_applicable_constraints_without_failu
     assert len(llm.prompts) == 2
     assert json.dumps(constraints, indent=2, sort_keys=True) in llm.prompts[0]
     assert "amendment_target_to_replacements" in llm.prompts[1]
+
+
+@pytest.mark.parametrize("retained_owners", [[], ["existing-storage"]])
+def test_author_delivery_amendment_verifies_applicable_obligations_without_constraints(
+    tmp_path: Path,
+    retained_owners: list[str],
+) -> None:
+    obligation = {
+        "id": "deliver-invites",
+        "summary": "Replacement units preserve the required invitation outcome.",
+        "source_fragment_ids": ["source-1-1-0123456789ab"],
+        "unit_ids": [*retained_owners, "oversized"],
+    }
+    verification_output = json.dumps(
+        {
+            "constraints_complete": True,
+            "constraints": [],
+            "obligations_complete": True,
+            "obligation_gaps": [],
+            "obligations": [
+                {
+                    **obligation,
+                    "unit_ids": ["invite-storage", "invite-cli"],
+                    "disposition": "preserved",
+                }
+            ],
+        }
+    )
+    authored = json.loads(_amendment_output())
+    authored["obligation_assignments"] = {obligation["id"]: ["invite-storage", "invite-cli"]}
+    llm = CapturingLLM(json.dumps(authored), verification_output=verification_output)
+    agent = DeliveryPreparationAgent(llm=llm)
+
+    draft = agent.author_delivery_amendment(
+        plan_id="team-invites",
+        target_unit_id="oversized",
+        target_task_description="Split the selected obligation-bearing unit.",
+        target_unit={"id": "oversized", "depends_on": []},
+        downstream_units=[],
+        project_root=tmp_path,
+        applicable_obligations=[obligation],
+    )
+
+    assert draft.constraint_verification is not None
+    assert draft.constraint_verification.obligations_complete is True
+    assert [item.unit_ids for item in draft.constraint_verification.obligations] == [["invite-storage", "invite-cli"]]
+    assert len(llm.prompts) == 2
+    assert "Use disposition preserved only when its assigned replacement contracts collectively" in llm.prompts[1]
+    assert "preserve the target contract's entire contribution" in llm.prompts[1]
+    assert "Do not require replacements to duplicate those contributions" in llm.prompts[1]
+    assert json.dumps({"target_unit_id": "oversized", "inherited_obligations": [obligation]}) in llm.prompts[1]
+    assert json.dumps([obligation], indent=2, sort_keys=True) in llm.prompts[0]
+
+
+@pytest.mark.parametrize("result", ["resolved", "unresolved", "scope_changed", "owners_changed", "external_stop"])
+def test_amendment_contract_recovery_is_bounded_and_preserves_authority(tmp_path: Path, result: str) -> None:
+    obligation = {
+        "id": "persist-invites",
+        "summary": "Invitation records persist across process restarts.",
+        "source_fragment_ids": ["source-1-1-0123456789ab"],
+        "unit_ids": ["oversized"],
+    }
+    authored = json.loads(_amendment_output())
+    authored["obligation_assignments"] = {"persist-invites": ["invite-storage"]}
+    repaired = json.loads(json.dumps(authored))
+    repaired["replacement_units"][0]["task_markdown"] += "\nPersist invites using the existing store.\n"
+    review = {
+        "constraints_complete": True,
+        "constraints": [],
+        "obligations_complete": True,
+        "obligations": [{**obligation, "unit_ids": ["invite-storage"], "disposition": "needs_review"}],
+        "unit_contract_gaps": [{"unit_id": "invite-storage", "summary": "Persistence is missing."}],
+        "context_paths": ["core/store.py"],
+    }
+    final_review = json.loads(json.dumps(review))
+    if result == "resolved":
+        final_review["unit_contract_gaps"] = []
+        final_review["context_paths"] = []
+        final_review["obligations"][0]["disposition"] = "preserved"
+    elif result == "scope_changed":
+        repaired["replacement_units"][0]["scope_paths"] = ["."]
+    elif result == "owners_changed":
+        repaired["obligation_assignments"] = {"persist-invites": ["invite-cli"]}
+    elif result == "external_stop":
+        repaired = {
+            "plan_id": "team-invites",
+            "target_unit_id": "oversized",
+            "replacement_units": [],
+            "disposition": "external_dependency_follow_up_required",
+            "summary": "The authoritative storage library is unavailable.",
+        }
+    llm = CapturingLLM(json.dumps(authored))
+    llm.outputs = [json.dumps(item) for item in (authored, review, repaired, final_review)]
+    reads = []
+
+    def read_context(root, paths):
+        reads.append((root, paths))
+        return {"files": [{"path": paths[0], "status": "read", "text": "def save_invite(): pass"}]}
+
+    audit = []
+    agent = DeliveryPreparationAgent(llm, context_reader=read_context)
+
+    def run():
+        return agent.author_delivery_amendment(
+            plan_id="team-invites",
+            target_unit_id="oversized",
+            target_task_description="Persist invitations.",
+            target_unit={"id": "oversized"},
+            downstream_units=[],
+            project_root=tmp_path,
+            applicable_obligations=[obligation],
+            audit_recorder=audit.append,
+        )
+
+    if result in {"scope_changed", "owners_changed"}:
+        with pytest.raises(DeliveryAuthoringParseError, match="unrelated identity"):
+            run()
+        assert len(llm.prompts) == 3
+        assert audit[-1]["parsed"]["error_code"] == "delivery_amend.recovery_scope_changed"
+    else:
+        draft = run()
+        if result == "external_stop":
+            assert len(llm.prompts) == 3
+            assert draft.disposition == "external_dependency_follow_up_required"
+            assert draft.replacement_units == []
+        else:
+            assert len(llm.prompts) == 4
+            assert draft.constraint_verification.obligations[0].disposition == (
+                "preserved" if result == "resolved" else "needs_review"
+            )
+            assert draft.obligation_assignments == {"persist-invites": ["invite-storage"]}
+            assert "def save_invite" in llm.prompts[3]
+        assert audit[2]["phase"] == "delivery_amend_draft_recovery"
+    assert reads == [(tmp_path.resolve(), ["core/store.py"])]
+    assert "def save_invite" in llm.prompts[2]
+
+
+def test_amendment_known_stop_preempts_all_provider_calls(tmp_path: Path) -> None:
+    llm = CapturingLLM(_amendment_output())
+    draft = DeliveryPreparationAgent(llm).author_delivery_amendment(
+        plan_id="team-invites",
+        target_unit_id="oversized",
+        target_task_description="Do not substitute the library.",
+        target_unit={"id": "oversized"},
+        downstream_units=[],
+        project_root=tmp_path,
+        applicable_constraints=[{"id": "missing-library", "kind": "stop_and_follow_up"}],
+    )
+    assert llm.prompts == []
+    assert draft.disposition == "external_dependency_follow_up_required"
+    assert draft.replacement_units == []
+
+
+def test_amendment_verifier_stop_preempts_correction(tmp_path: Path) -> None:
+    constraint = {
+        "id": "protocol-owner",
+        "kind": "authoritative_read_only_dependency",
+        "summary": "The protocol contract is maintained outside this project.",
+        "unit_ids": ["oversized"],
+        "disposition": "preserved",
+    }
+    llm = CapturingLLM(
+        _amendment_output(),
+        verification_output=json.dumps(
+            {
+                "constraints_complete": False,
+                "constraints": [{**constraint, "unit_ids": ["invite-storage", "invite-cli"]}],
+                "constraint_gaps": [
+                    {
+                        "reason": "omitted",
+                        "kind": "stop_and_follow_up",
+                        "affected_unit_ids": ["invite-storage"],
+                        "summary": "The authoritative protocol library is unavailable.",
+                    }
+                ],
+                "context_paths": ["private/unavailable-library.py"],
+            }
+        ),
+    )
+    draft = DeliveryPreparationAgent(llm).author_delivery_amendment(
+        plan_id="team-invites",
+        target_unit_id="oversized",
+        target_task_description="Preserve external ownership.",
+        target_unit={"id": "oversized"},
+        downstream_units=[],
+        project_root=tmp_path,
+        applicable_constraints=[constraint],
+    )
+    assert len(llm.prompts) == 2
+    assert draft.disposition == "external_dependency_follow_up_required"
+    assert draft.replacement_units == []
 
 
 def test_author_delivery_amendment_accepts_fenced_output_after_prose(tmp_path: Path) -> None:
@@ -1336,3 +1669,388 @@ def test_assess_delivery_mode_wraps_provider_failure_with_safe_exception(tmp_pat
     assert audit_records[0]["phase"] == "delivery_assessment"
     assert audit_records[0]["raw_output"] is None
     assert audit_records[0]["parsed"]["error_code"] == "delivery_assessment.authoring_failed"
+
+
+def test_known_external_prerequisite_stops_before_verification_or_recovery(tmp_path: Path) -> None:
+    authored = json.loads(_authoring_output())
+    authored["constraints"] = [
+        {
+            "id": "missing-library",
+            "kind": "stop_and_follow_up",
+            "summary": "The required external library is unavailable; local substitutes are prohibited.",
+            "unit_ids": ["foundation"],
+            "disposition": "preserved",
+        }
+    ]
+    authored.pop("source_accounting")  # A terminal stop takes precedence over incomplete bookkeeping.
+    authored.pop("obligations")
+    llm = CapturingLLM(json.dumps(authored))
+    draft = _author_delivery_plan(DeliveryPreparationAgent(llm), tmp_path=tmp_path)
+    assert len(llm.prompts) == 1
+    assert draft.constraint_verification is None
+    assert draft.constraints[0].kind == "stop_and_follow_up"
+
+
+def test_known_stop_with_private_summary_is_rejected_without_authoring_retry(tmp_path: Path) -> None:
+    authored = json.loads(_authoring_output())
+    authored["constraints"] = [
+        {
+            "id": "unavailable-library",
+            "kind": "stop_and_follow_up",
+            "summary": _DEFAULT_TASK_DESCRIPTION,
+            "unit_ids": ["foundation"],
+            "disposition": "preserved",
+        }
+    ]
+    llm = CapturingLLM(json.dumps(authored))
+    with pytest.raises(DeliveryAuthoringParseError) as error:
+        _author_delivery_plan(DeliveryPreparationAgent(llm), tmp_path=tmp_path)
+    assert error.value.code == "delivery_authoring.stop_and_follow_up_summary_invalid"
+    assert len(llm.prompts) == 1
+
+
+@pytest.mark.parametrize("other_disposition", [None, "needs_review", "conflict"])
+def test_prerequisite_discovered_during_draft_correction_stops_without_reverification(
+    tmp_path: Path,
+    other_disposition: str | None,
+) -> None:
+    from core.delivery_prepare_writer import write_delivery_prepare_artifacts
+
+    authored = json.loads(_authoring_output())
+    corrected = json.loads(_authoring_output())
+    corrected["constraints"] = [
+        {
+            "id": "missing-library",
+            "kind": "stop_and_follow_up",
+            "unit_ids": ["foundation"],
+            "summary": "The authoritative library is unavailable and must not be replaced locally.",
+            "disposition": "preserved",
+        }
+    ]
+    corrected.pop("obligations")
+    corrected.pop("source_accounting")
+    if other_disposition is not None:
+        corrected["constraints"].append(
+            {
+                "id": "ownership",
+                "kind": "repository_ownership",
+                "unit_ids": ["foundation"],
+                "summary": "Changes remain within the accepted project ownership.",
+                "disposition": other_disposition,
+            }
+        )
+    review = {
+        "constraints_complete": True,
+        "constraints": [],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+        "unit_contract_gaps": [{"unit_id": "foundation", "summary": "Resolve the required persistence mechanism."}],
+    }
+    llm = CapturingLLM(json.dumps(authored))
+    llm.outputs = [json.dumps(item) for item in (authored, review, corrected)]
+    audit = []
+    draft = _author_delivery_plan(DeliveryPreparationAgent(llm), tmp_path=tmp_path, audit_records=audit)
+    assert len(llm.prompts) == 3
+    assert draft.constraints[0].kind == "stop_and_follow_up"
+    assert audit[-1]["phase"] == "delivery_prepare_draft_recovery"
+    result = write_delivery_prepare_artifacts(
+        draft,
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config={},
+    )
+    assert not result.prepared
+    assert any(issue.code == "delivery_prepare.stop_and_follow_up_required" for issue in result.errors)
+    assert not (tmp_path / ".sikula/delivery/team-invites/plan.yaml").exists()
+
+
+def test_verifier_external_prerequisite_preempts_obligation_repair(tmp_path: Path) -> None:
+    authored = json.loads(_authoring_output())
+    verification = {
+        "constraints_complete": False,
+        "constraints": [],
+        "constraint_gaps": [
+            {
+                "reason": "omitted",
+                "kind": "stop_and_follow_up",
+                "summary": "An unavailable toolkit requires external follow-up.",
+                "affected_unit_ids": ["foundation"],
+            }
+        ],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+        "obligations_complete": False,
+        "obligations": authored["obligations"],
+        "obligation_gaps": [
+            {
+                "reason": "omitted",
+                "summary": "Preserve progress reporting.",
+                "source_fragment_ids": authored["obligations"][0]["source_fragment_ids"],
+                "affected_unit_ids": ["foundation"],
+            }
+        ],
+    }
+    llm = CapturingLLM(json.dumps(authored), verification_output=json.dumps(verification))
+    draft = _author_delivery_plan(DeliveryPreparationAgent(llm), tmp_path=tmp_path)
+    assert len(llm.prompts) == 2
+    assert draft.constraint_verification.constraint_gaps[0].kind == "stop_and_follow_up"
+
+
+def test_missing_source_accounting_gets_one_bounded_authoring_correction(tmp_path: Path) -> None:
+    correct = _authoring_output()
+    missing = json.loads(correct)
+    missing.pop("source_accounting")
+    llm = CapturingLLM(json.dumps(missing))
+    llm.outputs.insert(1, correct)
+    audit = []
+    draft = _author_delivery_plan(DeliveryPreparationAgent(llm), tmp_path=tmp_path, audit_records=audit)
+    assert len(llm.prompts) == 3
+    assert draft.source_accounting
+    assert audit[0]["parsed"]["error_code"] == "source_accounting.invalid"
+    assert audit[1]["round_index"] == 2
+
+
+@pytest.mark.parametrize("retry_succeeds", [True, False])
+def test_invalid_rationale_encoding_is_audited_with_one_authoring_retry(tmp_path: Path, retry_succeeds: bool) -> None:
+    correct = _authoring_output()
+    invalid = json.loads(correct)
+    invalid["source_accounting"][0]["rationale"] = "Private rationale with a lone surrogate: \ud800"
+    output = json.dumps(invalid)
+    llm = CapturingLLM(output)
+    llm.outputs.insert(1, correct if retry_succeeds else output)
+    audit: list[dict] = []
+    agent = DeliveryPreparationAgent(llm)
+
+    if retry_succeeds:
+        draft = _author_delivery_plan(agent, tmp_path=tmp_path, audit_records=audit)
+        assert draft.source_accounting
+        assert draft.source_accounting[0].rationale == "Fixture requirement mapping."
+        assert [record["parsed"]["status"] for record in audit] == ["failed", "parsed", "parsed"]
+        assert [record["round_index"] for record in audit] == [1, 2, 1]
+    else:
+        with pytest.raises(DeliveryAuthoringParseError) as error:
+            _author_delivery_plan(agent, tmp_path=tmp_path, audit_records=audit)
+        assert error.value.code == "source_accounting.rationale_invalid"
+        assert [record["parsed"]["status"] for record in audit] == ["failed", "failed"]
+        assert [record["round_index"] for record in audit] == [1, 2]
+    assert len(llm.prompts) == len(audit) == (3 if retry_succeeds else 2)
+    for index, record in enumerate(audit):
+        assert record["prompt"] == llm.prompts[index]
+        if record["parsed"]["status"] == "failed":
+            assert record["phase"] == "delivery_prepare_authoring"
+            assert record["raw_output"] == output
+            assert record["parsed"]["error_code"] == "source_accounting.rationale_invalid"
+            assert record["parsed"]["error_type"] == "DeliveryAuthoringParseError"
+            assert "Private rationale" not in record["parsed"]["error"]
+    json.dumps(audit).encode("utf-8")
+    assert not (tmp_path / ".sikula/delivery/team-invites").exists()
+
+
+def test_invalid_verifier_rationale_encoding_preserves_failure_audit(tmp_path: Path) -> None:
+    authored = json.loads(_authoring_output())
+    authored["source_accounting"][0]["rationale"] = "Private verifier rationale: \udfff"
+    review = {
+        "constraints_complete": True,
+        "constraints": [],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+        "source_accounting": authored["source_accounting"],
+    }
+    llm = CapturingLLM(_authoring_output(), verification_output=json.dumps(review))
+    audit: list[dict] = []
+
+    with pytest.raises(DeliveryAuthoringParseError) as error:
+        _author_delivery_plan(DeliveryPreparationAgent(llm), tmp_path=tmp_path, audit_records=audit)
+
+    assert error.value.code == "source_accounting.rationale_invalid"
+    assert len(llm.prompts) == len(audit) == 2
+    assert audit[-1]["phase"] == "delivery_prepare_constraint_verification"
+    assert audit[-1]["prompt"] == llm.prompts[-1]
+    assert json.loads(audit[-1]["raw_output"])["source_accounting"] == review["source_accounting"]
+    assert audit[-1]["parsed"]["status"] == "failed"
+    assert audit[-1]["parsed"]["error_code"] == error.value.code
+    assert "Private verifier rationale" not in str(error.value)
+
+
+@pytest.mark.parametrize("requirement_kind", ["constraints", "obligations"])
+@pytest.mark.parametrize("authored_disposition", ["needs_review", "conflict"])
+@pytest.mark.parametrize("recovery_result", ["resolved", "author_unresolved", "verifier_unresolved"])
+def test_authored_blockers_require_bounded_correction_and_independent_approval(
+    tmp_path: Path, requirement_kind: str, authored_disposition: str, recovery_result: str
+) -> None:
+    from core.delivery_prepare_writer import write_delivery_prepare_artifacts
+
+    source_path = tmp_path / ".sikula/tasks/team-invites.md"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(_DEFAULT_TASK_DESCRIPTION, encoding="utf-8")
+    authored = json.loads(_authoring_output())
+    authored["units"][0]["asset_paths"] = []
+    authored["units"][0]["scope_paths"] = []
+    if requirement_kind == "constraints":
+        authored["constraints"] = [
+            {
+                "id": "protocol-authority",
+                "kind": "repository_ownership",
+                "summary": "Protocol changes remain externally owned.",
+                "unit_ids": ["foundation"],
+                "disposition": "preserved",
+            }
+        ]
+    review = {
+        "constraints_complete": True,
+        "constraints": authored["constraints"],
+        "obligations_complete": True,
+        "obligations": authored["obligations"],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+    }
+    review_output = json.dumps(review)
+    authored[requirement_kind][0]["disposition"] = authored_disposition
+    authored_output = json.dumps(authored)
+    corrected = json.loads(authored_output)
+    if recovery_result != "author_unresolved":
+        corrected[requirement_kind][0]["disposition"] = "preserved"
+        corrected["units"][0]["task_markdown"] += "\nUse the existing invite store for persistence.\n"
+    final_review = json.loads(review_output)
+    if recovery_result == "verifier_unresolved":
+        final_review[requirement_kind][0]["disposition"] = authored_disposition
+    llm = CapturingLLM(authored_output)
+    llm.outputs = [authored_output, review_output, json.dumps(corrected), json.dumps(final_review)]
+    audit: list[dict] = []
+
+    draft = _author_delivery_plan(DeliveryPreparationAgent(llm), tmp_path=tmp_path, audit_records=audit)
+
+    assert len(llm.prompts) == 4
+    assert [record["phase"] for record in audit] == [
+        "delivery_prepare_authoring",
+        "delivery_prepare_constraint_verification",
+        "delivery_prepare_draft_recovery",
+        "delivery_prepare_constraint_verification",
+    ]
+    candidate, findings = llm.prompts[2].split("\n\nCandidate:\n", 1)[1].split("\n\nIndependent findings:\n", 1)
+    assert json.loads(candidate)[requirement_kind][0]["disposition"] == authored_disposition
+    assert (
+        json.loads(findings.split("\n\nAuthorized context:\n", 1)[0])[requirement_kind][0]["disposition"] == "preserved"
+    )
+    assert getattr(draft, requirement_kind)[0].disposition == corrected[requirement_kind][0]["disposition"]
+    assert draft.constraint_verification is not None
+    assert (
+        getattr(draft.constraint_verification, requirement_kind)[0].disposition
+        == final_review[requirement_kind][0]["disposition"]
+    )
+    assert draft.units[0].task_markdown == corrected["units"][0]["task_markdown"].strip()
+
+    result = write_delivery_prepare_artifacts(
+        draft,
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config={
+            "project": {"build_tool": "python", "root_path": str(tmp_path)},
+            "build": {"test_command": "python3 -m pytest tests/test_delivery_preparation_agent.py"},
+        },
+    )
+
+    assert result.prepared is (recovery_result == "resolved"), (result.errors, result.unit_readiness.to_dict())
+    if recovery_result == "resolved":
+        assert (tmp_path / ".sikula/delivery/team-invites/plan.yaml").is_file()
+    else:
+        expected_code = (
+            "delivery_prepare.obligation_unresolved"
+            if requirement_kind == "obligations"
+            else "delivery_prepare.constraint_conflict"
+            if authored_disposition == "conflict"
+            else "delivery_prepare.constraint_review_required"
+        )
+        assert [issue.code for issue in result.errors] == [expected_code]
+        assert not (tmp_path / ".sikula/delivery/team-invites").exists()
+
+
+@pytest.mark.parametrize("context_available", [True, False])
+def test_bounded_contract_recovery_uses_local_evidence_and_reverifies(tmp_path: Path, context_available: bool) -> None:
+    authored = json.loads(_authoring_output())
+    repaired = json.loads(_authoring_output())
+    repaired["units"][0]["task_markdown"] += "\nUse the existing invite store for persistence.\n"
+    first_review = {
+        "constraints_complete": True,
+        "constraints": [],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+        "unit_contract_gaps": [
+            {"unit_id": "foundation", "summary": "The contract lacks the required persistence behavior."}
+        ],
+        "context_paths": ["agents/invite_store.py"],
+    }
+    llm = CapturingLLM(json.dumps(authored))
+    llm.outputs = [
+        json.dumps(authored),
+        json.dumps(first_review),
+        json.dumps(repaired),
+        json.dumps(
+            {
+                "constraints_complete": True,
+                "constraints": [],
+                "unit_context_complete": True,
+                "unit_context_gaps": [],
+                "unit_contract_gaps": [] if context_available else first_review["unit_contract_gaps"],
+            }
+        ),
+    ]
+    reads = []
+
+    def read_context(root, paths):
+        reads.append((root, paths))
+        if not context_available:
+            return {"files": [{"request_index": 0, "status": "denied"}]}
+        return {"files": [{"path": paths[0], "status": "read", "text": "def store_invite(): pass"}]}
+
+    audit = []
+    draft = _author_delivery_plan(
+        DeliveryPreparationAgent(llm, context_reader=read_context), tmp_path=tmp_path, audit_records=audit
+    )
+    assert len(llm.prompts) == 4
+    assert reads == [(tmp_path.resolve(), ["agents/invite_store.py"])]
+    if context_available:
+        assert "def store_invite" in llm.prompts[2] and "def store_invite" in llm.prompts[3]
+    else:
+        assert '"status": "denied"' in llm.prompts[2] and '"status": "denied"' in llm.prompts[3]
+    assert draft.units[0].task_markdown.endswith("Use the existing invite store for persistence.")
+    assert bool(draft.constraint_verification.unit_contract_gaps) is (not context_available)
+    assert draft.constraint_verification.context_unavailable is (not context_available)
+    assert [record["phase"] for record in audit] == [
+        "delivery_prepare_authoring",
+        "delivery_prepare_constraint_verification",
+        "delivery_prepare_draft_recovery",
+        "delivery_prepare_constraint_verification",
+    ]
+
+
+@pytest.mark.parametrize("change", ["scope", "unrelated_contract", "constraint_meaning"])
+def test_draft_recovery_cannot_expand_authority(change: str, tmp_path: Path) -> None:
+    authored = json.loads(_authoring_output())
+    repaired = json.loads(_authoring_output())
+    if change == "scope":
+        repaired["units"][0]["scope_paths"] = ["."]
+    elif change == "unrelated_contract":
+        repaired["units"][0]["task_markdown"] += "\nInvent a replacement library.\n"
+    else:
+        constraint = {
+            "id": "ownership",
+            "kind": "repository_ownership",
+            "summary": "External code stays outside this task.",
+            "unit_ids": ["foundation"],
+            "disposition": "preserved",
+        }
+        authored["constraints"] = [constraint]
+        repaired["constraints"] = [{**constraint, "summary": "External code may be copied locally."}]
+    first_review = {
+        "constraints_complete": True,
+        "constraints": authored["constraints"],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+        "context_paths": ["README.md"],
+    }
+    llm = CapturingLLM(json.dumps(authored))
+    llm.outputs = [json.dumps(authored), json.dumps(first_review), json.dumps(repaired)]
+    with pytest.raises(DeliveryAuthoringParseError):
+        _author_delivery_plan(DeliveryPreparationAgent(llm), tmp_path=tmp_path)
+    assert len(llm.prompts) == 3

@@ -29,6 +29,7 @@ from core.delivery_assembly import (
     rollback_delivery_artifacts,
 )
 from core.delivery_authoring import (
+    parse_obligation_assignments,
     DeliveryAmendmentAuthoringDraft,
     DeliveryAuthoringParseError,
     DeliveryAuthoringUnitDraft,
@@ -291,6 +292,7 @@ class DeliveryAmendmentProposal:
     rewired_unit_ids: list[str] = field(default_factory=list)
     amend_reason: str | None = None
     budget_exceeded: DeliveryBudgetExceeded | None = None
+    obligation_assignments: dict[str, list[str]] = field(default_factory=dict)
 
     @property
     def replacement_ids(self) -> list[str]:
@@ -321,6 +323,8 @@ class DeliveryAmendmentProposal:
             data["amend_reason"] = self.amend_reason
         if self.budget_exceeded:
             data["budget_exceeded"] = self.budget_exceeded.to_dict()
+        if self.obligation_assignments:
+            data["obligation_assignments"] = {key: list(value) for key, value in self.obligation_assignments.items()}
         return data
 
 
@@ -457,6 +461,11 @@ def inspect_delivery_amendment_target(
         raise DeliveryAmendmentError(
             "delivery_amend.target_unknown",
             f"Delivery plan has no unit with id {target_unit_id}.",
+        )
+    if any(item.kind == "stop_and_follow_up" and target_unit_id in item.unit_ids for item in status.plan.constraints):
+        raise DeliveryAmendmentError(
+            "delivery_amend.external_dependency_follow_up_required",
+            "Resolve the external prerequisite in authoritative input before preparing an amendment.",
         )
     _validate_amendment_target_task_source(
         target.task_path,
@@ -1152,6 +1161,7 @@ def create_delivery_amendment_proposal(
         source_assembled_commit=source_snapshot.assembled_commit,
         created_at=timestamp,
         replacement_units=replacement_units,
+        obligation_assignments=draft.obligation_assignments,
         amend_reason=amend_reason,
         budget_exceeded=budget_exceeded,
     )
@@ -1172,6 +1182,8 @@ def create_delivery_amendment_proposal(
         "replacement_units": [unit.to_dict() for unit in replacement_units],
         "amended_plan_fingerprint": hashlib.sha256(amended_plan_content).hexdigest(),
     }
+    if draft.obligation_assignments:
+        proposal_payload["obligation_assignments"] = draft.obligation_assignments
     if rewired_ids:
         proposal_payload["rewired_unit_ids"] = rewired_ids
     if amend_reason:
@@ -1193,6 +1205,7 @@ def create_delivery_amendment_proposal(
         source_assembled_commit=proposal_payload["source_assembled_commit"],
         created_at=timestamp,
         replacement_units=replacement_units,
+        obligation_assignments=draft.obligation_assignments,
         amended_plan_fingerprint=proposal_payload["amended_plan_fingerprint"],
         rewired_unit_ids=rewired_ids,
         amend_reason=amend_reason,
@@ -1247,16 +1260,40 @@ def _validate_amendment_constraint_verification(
     draft: DeliveryAmendmentAuthoringDraft,
 ) -> None:
     replacement_ids = [unit.id for unit in draft.replacement_units]
-    applicable = [constraint for constraint in context.plan.constraints if context.target.id in constraint.unit_ids]
-    if not applicable:
+    applicable_constraints = [
+        constraint for constraint in context.plan.constraints if context.target.id in constraint.unit_ids
+    ]
+    applicable_obligations = [
+        obligation for obligation in context.plan.obligations if context.target.id in obligation.unit_ids
+    ]
+    if not applicable_constraints and not applicable_obligations:
         return
     verification = draft.constraint_verification
     if verification is None:
+        if not applicable_constraints:
+            raise DeliveryAmendmentError(
+                "delivery_amend.obligation_verification_required",
+                "Applicable obligations must be independently verified before an amendment can be published.",
+            )
         raise DeliveryAmendmentError(
             "delivery_amend.constraint_verification_required",
             "Applicable constraints must be independently verified before an amendment can be published.",
         )
-    expected = [(constraint.id, constraint.kind, constraint.summary, replacement_ids) for constraint in applicable]
+    if any(item.kind == "stop_and_follow_up" for item in verification.constraints) or any(
+        gap.kind == "stop_and_follow_up" for gap in verification.constraint_gaps
+    ):
+        raise DeliveryAmendmentError(
+            "delivery_amend.external_dependency_follow_up_required",
+            "Independent verification identified an unresolved external prerequisite.",
+        )
+    if verification.context_unavailable or verification.context_paths:
+        raise DeliveryAmendmentError(
+            "delivery_amend.context_unavailable",
+            "Required project evidence remains unavailable within the bounded read capability; inspect the private audit before retrying preparation.",
+        )
+    expected = [
+        (constraint.id, constraint.kind, constraint.summary, replacement_ids) for constraint in applicable_constraints
+    ]
     actual = [
         (constraint.id, constraint.kind, constraint.summary, constraint.unit_ids)
         for constraint in verification.constraints
@@ -1281,6 +1318,57 @@ def _validate_amendment_constraint_verification(
             raise DeliveryAmendmentError(
                 "delivery_amend.constraint_review_required",
                 "Amendment constraint verification requires operator review.",
+            )
+    if draft.obligation_assignments and set(draft.obligation_assignments) != {
+        item.id for item in applicable_obligations
+    }:
+        raise DeliveryAmendmentError(
+            "delivery_amend.obligation_assignments_invalid",
+            "Assignments must match the applicable inherited obligations.",
+        )
+    try:
+        parse_obligation_assignments(draft.obligation_assignments, set(replacement_ids))
+    except ValueError:
+        raise DeliveryAmendmentError(
+            "delivery_amend.obligation_assignments_invalid", "Replacement obligation owners are invalid."
+        ) from None
+    expected_obligations = [
+        (
+            obligation.id,
+            obligation.summary,
+            obligation.source_fragment_ids,
+            draft.obligation_assignments.get(obligation.id, replacement_ids),
+        )
+        for obligation in applicable_obligations
+    ]
+    actual_obligations = [
+        (obligation.id, obligation.summary, obligation.source_fragment_ids, obligation.unit_ids)
+        for obligation in verification.obligations
+    ]
+    if actual_obligations != expected_obligations:
+        raise DeliveryAmendmentError(
+            "delivery_amend.obligation_verification_invalid",
+            "Amendment obligation verification does not match the target's applicable obligations.",
+        )
+    if verification.unit_contract_gaps:
+        raise DeliveryAmendmentError(
+            "delivery_amend.obligation_review_required", "Replacement contract outcomes remain unresolved."
+        )
+    if not verification.obligations_complete:
+        raise DeliveryAmendmentError(
+            "delivery_amend.obligation_verification_incomplete",
+            "Independent verification found an omitted amendment obligation outcome.",
+        )
+    for obligation in verification.obligations:
+        if obligation.disposition == "conflict":
+            raise DeliveryAmendmentError(
+                "delivery_amend.obligation_conflict",
+                "A replacement unit conflicts with an inherited delivery obligation.",
+            )
+        if obligation.disposition != "preserved":
+            raise DeliveryAmendmentError(
+                "delivery_amend.obligation_review_required",
+                "Amendment obligation verification requires operator review.",
             )
 
 
@@ -1764,6 +1852,7 @@ def load_delivery_amendment_proposal(
         "source_assembled_commit",
         "created_at",
         "replacement_units",
+        "obligation_assignments",
         "amended_plan_fingerprint",
         "rewired_unit_ids",
         "amend_reason",
@@ -1811,6 +1900,7 @@ def load_delivery_amendment_proposal(
         source_assembled_commit=source_assembled_commit,
         created_at=created_at,
         replacement_units=units,
+        obligation_assignments=_proposal_obligation_assignments(data.get("obligation_assignments", {}), units),
         amended_plan_fingerprint=amended_plan_fingerprint,
         rewired_unit_ids=rewired_unit_ids,
         amend_reason=amend_reason,
@@ -1825,6 +1915,15 @@ def load_delivery_amendment_proposal(
             "Proposal content does not match its proposal id.",
         )
     return proposal
+
+
+def _proposal_obligation_assignments(value: Any, units: list[DeliveryAmendmentProposalUnit]) -> dict[str, list[str]]:
+    try:
+        return parse_obligation_assignments(value, {unit.id for unit in units})
+    except ValueError:
+        raise DeliveryAmendmentError(
+            "delivery_amend.obligation_assignments_invalid", "Proposal obligation assignments are invalid."
+        ) from None
 
 
 def _preflight_applied_amendment(
@@ -2264,6 +2363,35 @@ def _amended_plan_data(
                     if inherited_id not in reassigned_unit_ids:
                         reassigned_unit_ids.append(inherited_id)
             constraint["unit_ids"] = reassigned_unit_ids
+    applicable_ids = {item.id for item in context.plan.obligations if proposal.target_unit_id in item.unit_ids}
+    if proposal.obligation_assignments and set(proposal.obligation_assignments) != applicable_ids:
+        raise DeliveryAmendmentError(
+            "delivery_amend.obligation_assignments_invalid",
+            "Proposal obligation assignments no longer match the target.",
+        )
+    obligations = amended.get("obligations")
+    if obligations is not None:
+        if not isinstance(obligations, list):
+            raise DeliveryAmendmentError("delivery_amend.plan_invalid", "Delivery plan obligations are malformed.")
+        for obligation in obligations:
+            if not isinstance(obligation, dict) or not isinstance(obligation.get("unit_ids"), list):
+                raise DeliveryAmendmentError(
+                    "delivery_amend.plan_invalid",
+                    "Delivery plan obligations are malformed.",
+                )
+            if proposal.target_unit_id not in obligation["unit_ids"]:
+                continue
+            reassigned_unit_ids = []
+            for unit_id in obligation["unit_ids"]:
+                inherited_ids = (
+                    proposal.obligation_assignments.get(obligation["id"], replacement_ids)
+                    if unit_id == proposal.target_unit_id
+                    else [unit_id]
+                )
+                for inherited_id in inherited_ids:
+                    if inherited_id not in reassigned_unit_ids:
+                        reassigned_unit_ids.append(inherited_id)
+            obligation["unit_ids"] = reassigned_unit_ids
     rewired: list[str] = []
     for item in units:
         if (

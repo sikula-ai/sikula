@@ -604,6 +604,8 @@ def _prepare_delivery_amendment(
         errors=[DeliveryPlanIssue(issue.severity, issue.code, issue.message, issue.path) for issue in errors],
         message="Delivery amendment proposal preparation is blocked.",
     )
+    if any(issue.code == "delivery_amend.external_dependency_follow_up_required" for issue in result.errors):
+        return replace(result, recommended_action="external_dependency_follow_up")
     if target is not None and not result.errors:
         if failure_evidence is not None and failure_evidence.requires_external_follow_up:
             return _external_dependency_follow_up_result(result)
@@ -699,6 +701,8 @@ def _prepare_delivery_amendment(
                     message="Delivery amendment authoring returned an invalid proposal.",
                 )
             except DeliveryAmendmentError as exc:
+                if exc.issue.code == "delivery_amend.external_dependency_follow_up_required":
+                    return _external_dependency_follow_up_result(result, audit_path=getattr(draft, "audit_path", None))
                 result = replace(
                     result,
                     audit_path=getattr(draft, "audit_path", None),
@@ -1617,6 +1621,16 @@ def _delivery_prepare_issues_from_writer(issues: list[Any]) -> list[DeliveryPrep
 
 
 def _delivery_prepare_writer_failure(failure_reason: str | None) -> tuple[str, str]:
+    if failure_reason == "context_unavailable":
+        return (
+            "delivery_prepare.context_unavailable",
+            "Required project evidence could not be resolved within the bounded read capability.",
+        )
+    if failure_reason == "authority_unresolved":
+        return (
+            "delivery_prepare.authority_unresolved",
+            "Source or contract gaps remain after bounded preparation correction.",
+        )
     if failure_reason == _DELIVERY_PREPARE_ASSET_PRESERVATION_FAILURE:
         return "delivery_prepare.asset_preservation_blocked", _DELIVERY_PREPARE_ASSET_PRESERVATION_FAILED_MESSAGE
     if failure_reason == _DELIVERY_PREPARE_UNIT_READINESS_FAILURE:

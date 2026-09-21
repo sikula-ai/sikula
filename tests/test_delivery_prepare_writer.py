@@ -10,11 +10,13 @@ import yaml
 from core.delivery_authoring import (
     DeliveryAuthoringConstraintDraft,
     DeliveryAuthoringDraft,
+    DeliveryAuthoringObligationDraft,
     DeliveryAuthoringUnitDraft,
     DeliveryConstraintGap,
     DeliveryConstraintVerification,
     DeliveryUnitContextGap,
 )
+from core.delivery_obligations import delivery_authority_fragments
 from core.delivery_plan import DeliveryPlanSourceTask
 from core.delivery_prepare_writer import DeliveryPrepareWriteIssue, write_delivery_prepare_artifacts
 from core.delivery_unit_metadata import DeliveryUnitBudget
@@ -625,6 +627,49 @@ def test_writer_blocks_untrusted_independent_constraint_verification(
 
     assert result.status == "blocked"
     assert result.errors[0].code == expected_code
+
+
+@pytest.mark.parametrize("authored_disposition", ["needs_review", "conflict"])
+def test_writer_blocks_unresolved_authored_obligation_even_when_verifier_preserves_it(
+    tmp_path: Path,
+    authored_disposition: str,
+) -> None:
+    source_text = "# Task\n\n## Acceptance criteria\n\n- Invitations are delivered safely.\n"
+    source_path = tmp_path / ".sikula" / "tasks" / "source.md"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(source_text, encoding="utf-8")
+    source_task = DeliveryPlanSourceTask(
+        path=".sikula/tasks/source.md",
+        sha256="sha256:" + sha256(source_text.encode("utf-8")).hexdigest(),
+    )
+    authored = DeliveryAuthoringObligationDraft(
+        id="deliver-invitations",
+        summary="Invitation delivery remains safe.",
+        source_fragment_ids=[delivery_authority_fragments(source_text)[-1].id],
+        unit_ids=["foundation"],
+        disposition=authored_disposition,
+    )
+    verified = replace(authored, disposition="preserved")
+    draft = _draft(units=[_unit("foundation")], source_task=source_task)
+    draft.obligations = [authored]
+    draft.constraint_verification = DeliveryConstraintVerification(
+        constraints_complete=True,
+        constraints=[],
+        obligations_complete=True,
+        obligations=[verified],
+    )
+
+    result = write_delivery_prepare_artifacts(
+        draft,
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=_project_config(tmp_path),
+    )
+
+    assert result.status == "blocked"
+    assert result.errors[0].code == "delivery_prepare.obligation_unresolved"
+    assert result.errors[0].path == "obligations[0].disposition"
+    assert not (tmp_path / ".sikula" / "delivery" / "team-invites" / "plan.yaml").exists()
 
 
 @pytest.mark.parametrize(
@@ -1330,3 +1375,57 @@ def test_writer_blocks_before_writing_when_source_asset_is_remote(tmp_path: Path
     assert result.status == "blocked"
     assert result.errors[0].code == "delivery_prepare.source_asset_path_invalid"
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+@pytest.mark.parametrize("outcome", ["resolved", "semantic_gap", "context_unavailable"])
+def test_writer_publishes_only_independently_verified_accounting_without_rationale(
+    tmp_path: Path, outcome: str
+) -> None:
+    from core.delivery_source_accounting import parse_source_accounting
+
+    config = _project_config(tmp_path)
+    fragment = delivery_authority_fragments(_TEST_SOURCE_TEXT)[0]
+    accounting = parse_source_accounting(
+        [
+            {
+                "source_fragment_id": fragment.id,
+                "disposition": "context_only",
+                "obligation_ids": [],
+                "constraint_ids": [],
+                "rationale": "PRIVATE explanation: this heading introduces the source task.",
+            }
+        ],
+        fragment_ids={fragment.id},
+        obligation_sources={},
+        constraint_ids=set(),
+        private_rationales=True,
+    )
+    draft = _draft(units=[_unit("foundation")])
+    draft.source_accounting = accounting
+    draft.constraint_verification = replace(
+        draft.constraint_verification,
+        source_accounting=accounting,
+        source_accounting_gaps=[{"source_fragment_id": fragment.id, "summary": "PRIVATE unresolved classification."}]
+        if outcome == "semantic_gap"
+        else [],
+        context_unavailable=outcome == "context_unavailable",
+    )
+    result = write_delivery_prepare_artifacts(
+        draft,
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config=config,
+        source_task_description=_TEST_SOURCE_TEXT,
+    )
+    assert result.prepared is (outcome == "resolved")
+    assert "PRIVATE" not in str(result.to_dict())
+    plan_path = tmp_path / ".sikula/delivery/team-invites/plan.yaml"
+    if outcome != "resolved":
+        assert not plan_path.exists()
+        expected = "context_unavailable" if outcome == "context_unavailable" else "authority_unresolved"
+        assert result.failure_reason == expected
+        assert result.errors[0].code == "delivery_prepare." + expected
+    else:
+        text = plan_path.read_text()
+        assert "PRIVATE" not in text
+        assert yaml.safe_load(text)["source_accounting"] == [record.to_dict() for record in accounting]

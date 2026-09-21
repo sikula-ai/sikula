@@ -15,6 +15,15 @@ from core.delivery_public_metadata import (
     project_delivery_public_identity,
     sanitize_delivery_public_metadata,
 )
+from core.delivery_obligations import (
+    MAX_DELIVERY_AUTHORITY_FRAGMENTS,
+    MAX_DELIVERY_OBLIGATIONS,
+    MAX_DELIVERY_OBLIGATION_SOURCE_REFS,
+    MAX_DELIVERY_OBLIGATION_UNIT_IDS,
+    DeliveryObligation,
+    delivery_authority_fragment_map,
+)
+from core.delivery_source_accounting import DeliverySourceAccounting, SourceAccountingError, parse_source_accounting
 from core.delivery_unit_metadata import (
     DELIVERY_UNIT_BUDGET_FIELDS,
     DELIVERY_UNIT_RISK_TAG_VALUES,
@@ -313,6 +322,8 @@ class DeliveryPlan:
     stream_ids: list[str] = field(default_factory=list)
     components: list[DeliveryComponent] = field(default_factory=list)
     constraints: list[DeliveryConstraint] = field(default_factory=list)
+    obligations: list[DeliveryObligation] = field(default_factory=list)
+    source_accounting: list[DeliverySourceAccounting] | None = None
     source_task: DeliveryPlanSourceTask | None = None
     planning_mode: str | None = None
     verification: DeliveryVerificationPolicy | None = None
@@ -334,6 +345,10 @@ class DeliveryPlan:
             data["source_task"] = self.source_task.to_dict()
         if self.constraints:
             data["constraints"] = [constraint.to_dict() for constraint in self.constraints]
+        if self.obligations:
+            data["obligations"] = [obligation.to_dict() for obligation in self.obligations]
+        if self.source_accounting is not None:
+            data["source_accounting"] = [record.to_dict(public=True) for record in self.source_accounting]
         if self.planning_mode:
             data["planning_mode"] = self.planning_mode
         if self.verification:
@@ -631,6 +646,33 @@ def _parse_delivery_plan(
         source_task_description=source_task_description,
         errors=errors,
     )
+    obligations = _parse_obligations(
+        data.get("obligations"),
+        units=units,
+        source_task_description=source_task_description,
+        errors=errors,
+    )
+    source_accounting = None
+    if "source_accounting" in data:
+        if source_task is None or schema_version != SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION or verification is None:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "source_accounting.authority_required",
+                    "Source accounting requires source-backed final-gate verification.",
+                    "source_accounting",
+                )
+            )
+        try:
+            source_accounting = parse_source_accounting(
+                data["source_accounting"],
+                fragment_ids=set(delivery_authority_fragment_map(source_task_description or "")),
+                obligation_sources={item.id: set(item.source_fragment_ids) for item in obligations},
+                constraint_ids={item.id for item in constraints},
+                private_rationales=False,
+            )
+        except SourceAccountingError as exc:
+            errors.append(DeliveryPlanIssue("error", exc.code, str(exc), "source_accounting"))
     if isinstance(raw_constraints, list) and raw_constraints and source_task is None:
         errors.append(
             DeliveryPlanIssue(
@@ -638,6 +680,33 @@ def _parse_delivery_plan(
                 "constraints.source_task_required",
                 "Plans with inherited constraints must include a valid source_task fingerprint.",
                 "source_task",
+            )
+        )
+    raw_obligations = data.get("obligations")
+    if isinstance(raw_obligations, list) and raw_obligations and source_task is None:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "obligations.source_task_required",
+                "Source-bound obligations require a valid source_task fingerprint.",
+                "obligations",
+            )
+        )
+    if (
+        isinstance(raw_obligations, list)
+        and raw_obligations
+        and not (
+            schema_version == SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION
+            and verification is not None
+            and verification.mode == DELIVERY_VERIFICATION_MODE_FINAL_GATE
+        )
+    ):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "obligations.verification_required",
+                "Source-bound obligations require schema_version 2 with final-gate verification.",
+                "obligations",
             )
         )
 
@@ -657,6 +726,8 @@ def _parse_delivery_plan(
         stream_ids=stream_ids,
         components=components,
         constraints=constraints,
+        obligations=obligations,
+        source_accounting=source_accounting,
         source_task=source_task,
         planning_mode=planning_mode,
         verification=verification,
@@ -1339,6 +1410,211 @@ def _parse_constraints(
                 )
             )
     return constraints
+
+
+def _parse_obligations(
+    value: Any,
+    *,
+    units: list[DeliveryPlanUnit],
+    source_task_description: str | None,
+    errors: list[DeliveryPlanIssue],
+) -> list[DeliveryObligation]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "obligations.invalid_type",
+                "obligations must be a list of source-bound delivery outcomes.",
+                "obligations",
+            )
+        )
+        return []
+    if len(value) > MAX_DELIVERY_OBLIGATIONS:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "obligations.too_many",
+                f"obligations must contain at most {MAX_DELIVERY_OBLIGATIONS} entries.",
+                "obligations",
+            )
+        )
+        value = value[:MAX_DELIVERY_OBLIGATIONS]
+
+    unit_by_id = {unit.id: unit for unit in units}
+    fragments = delivery_authority_fragment_map(source_task_description or "")
+    if len(fragments) > MAX_DELIVERY_AUTHORITY_FRAGMENTS:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "obligations.authority_too_large",
+                "The source task has too many authority fragments for one delivery plan.",
+                "obligations",
+            )
+        )
+        return []
+    seen_ids: set[str] = set()
+    obligations: list[DeliveryObligation] = []
+    for index, item in enumerate(value):
+        item_error_count = len(errors)
+        path = f"obligations[{index}]"
+        if not isinstance(item, dict):
+            errors.append(
+                DeliveryPlanIssue("error", "obligations.item_invalid", "Each obligation must be a mapping.", path)
+            )
+            continue
+        unknown = set(item) - {"id", "summary", "source_fragment_ids", "unit_ids"}
+        if unknown:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "obligations.unknown_field",
+                    "Obligation contains an unsupported field.",
+                    f"{path}.{sorted(str(field) for field in unknown)[0]}",
+                )
+            )
+        obligation_id = _require_string(item, "id", f"{path}.id", errors)
+        summary = _require_string(item, "summary", f"{path}.summary", errors)
+        source_fragment_ids = _obligation_string_list(
+            item.get("source_fragment_ids"),
+            path=f"{path}.source_fragment_ids",
+            max_items=MAX_DELIVERY_OBLIGATION_SOURCE_REFS,
+            errors=errors,
+        )
+        unit_ids = _obligation_string_list(
+            item.get("unit_ids"),
+            path=f"{path}.unit_ids",
+            max_items=MAX_DELIVERY_OBLIGATION_UNIT_IDS,
+            errors=errors,
+        )
+        if obligation_id:
+            folded = obligation_id.casefold()
+            if len(obligation_id) > MAX_DELIVERY_UNIT_ID_LENGTH or not _DELIVERY_PLAN_ID_RE.fullmatch(obligation_id):
+                errors.append(
+                    DeliveryPlanIssue(
+                        "error",
+                        "obligations.id_invalid",
+                        "Obligation id must be a stable path-safe identifier.",
+                        f"{path}.id",
+                    )
+                )
+            elif folded in seen_ids:
+                errors.append(
+                    DeliveryPlanIssue(
+                        "error",
+                        "obligations.id_duplicate",
+                        "Obligation ids must be unique ignoring case.",
+                        f"{path}.id",
+                    )
+                )
+            else:
+                seen_ids.add(folded)
+        if summary and (
+            not is_safe_delivery_public_metadata(summary)
+            or contains_delivery_source_excerpt(summary, source_task_description or "")
+        ):
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "obligations.summary_invalid",
+                    "Obligation summary must be bounded public metadata without copying source text.",
+                    f"{path}.summary",
+                )
+            )
+            summary = None
+        if not source_fragment_ids:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "obligations.source_refs_empty",
+                    "Each obligation must reference at least one authoritative source fragment.",
+                    f"{path}.source_fragment_ids",
+                )
+            )
+        for ref_index, fragment_id in enumerate(source_fragment_ids):
+            if fragment_id not in fragments:
+                errors.append(
+                    DeliveryPlanIssue(
+                        "error",
+                        "obligations.source_ref_unknown",
+                        "Obligation references an unknown or stale source fragment.",
+                        f"{path}.source_fragment_ids[{ref_index}]",
+                    )
+                )
+        if not unit_ids:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "obligations.unit_ids_empty",
+                    "Each obligation must be owned by at least one delivery unit.",
+                    f"{path}.unit_ids",
+                )
+            )
+        for unit_index, unit_id in enumerate(unit_ids):
+            unit = unit_by_id.get(unit_id)
+            unit_path = f"{path}.unit_ids[{unit_index}]"
+            if unit is None:
+                errors.append(
+                    DeliveryPlanIssue(
+                        "error",
+                        "obligations.unit_unknown",
+                        "Obligation unit_ids must reference known delivery units.",
+                        unit_path,
+                    )
+                )
+            elif unit.superseded:
+                errors.append(
+                    DeliveryPlanIssue(
+                        "error",
+                        "obligations.unit_superseded",
+                        "Obligations must be reassigned before an owning unit is superseded.",
+                        unit_path,
+                    )
+                )
+        # Rejected plans still have public projections. Only retain obligations
+        # whose metadata and provenance were checked against a verified source.
+        if len(errors) != item_error_count or source_task_description is None:
+            continue
+        if obligation_id and summary and source_fragment_ids and unit_ids:
+            obligations.append(
+                DeliveryObligation(
+                    id=obligation_id,
+                    summary=summary,
+                    source_fragment_ids=source_fragment_ids,
+                    unit_ids=unit_ids,
+                )
+            )
+    return obligations
+
+
+def _obligation_string_list(
+    value: Any,
+    *,
+    path: str,
+    max_items: int,
+    errors: list[DeliveryPlanIssue],
+) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+        errors.append(
+            DeliveryPlanIssue("error", "obligations.list_invalid", "Obligation references must be strings.", path)
+        )
+        return []
+    if len(value) > max_items:
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "obligations.list_too_many",
+                f"Obligation reference list must contain at most {max_items} entries.",
+                path,
+            )
+        )
+        value = value[:max_items]
+    if len(set(value)) != len(value):
+        errors.append(
+            DeliveryPlanIssue("error", "obligations.list_duplicate", "Obligation references must be unique.", path)
+        )
+    return list(value)
 
 
 def _validate_task_path(

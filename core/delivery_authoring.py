@@ -23,6 +23,14 @@ from core.delivery_plan import (
     MAX_DELIVERY_UNIT_ID_LENGTH,
     DeliveryPlanSourceTask,
 )
+from core.delivery_obligations import (
+    MAX_DELIVERY_AUTHORITY_FRAGMENTS,
+    MAX_DELIVERY_OBLIGATIONS,
+    MAX_DELIVERY_OBLIGATION_SOURCE_REFS,
+    MAX_DELIVERY_OBLIGATION_UNIT_IDS,
+    delivery_authority_fragment_map,
+)
+from core.delivery_source_accounting import DeliverySourceAccounting, SourceAccountingError, parse_source_accounting
 from core.delivery_public_metadata import contains_delivery_source_excerpt, is_safe_delivery_public_metadata
 from core.markdown_headings import MarkdownHeading, MarkdownHeadingScanner, normalize_heading
 from core.structured_output import load_schema_json_object
@@ -81,11 +89,21 @@ MAX_DELIVERY_UNIT_CONTEXT_GAPS = 100
 MAX_DELIVERY_UNIT_CONTEXT_LITERALS = 100
 MAX_DELIVERY_UNIT_CONTEXT_LITERAL_LENGTH = 1000
 MAX_DELIVERY_UNIT_CONTEXT_TOTAL_LENGTH = 20_000
-_TOP_LEVEL_FIELDS = {"plan_id", "title", "units", "planning_mode", "warnings", "constraints"}
+_TOP_LEVEL_FIELDS = {
+    "plan_id",
+    "title",
+    "units",
+    "planning_mode",
+    "warnings",
+    "constraints",
+    "obligations",
+    "source_accounting",
+}
 _AMENDMENT_TOP_LEVEL_FIELDS = {
     "plan_id",
     "target_unit_id",
     "replacement_units",
+    "obligation_assignments",
     "disposition",
     "summary",
     "amend_reason",
@@ -98,6 +116,13 @@ _CONSTRAINT_VERIFICATION_TOP_LEVEL_FIELDS = {
     "constraint_gaps",
     "unit_context_complete",
     "unit_context_gaps",
+    "obligations_complete",
+    "obligations",
+    "obligation_gaps",
+    "source_accounting",
+    "source_accounting_gaps",
+    "unit_contract_gaps",
+    "context_paths",
 }
 _ASSESSMENT_TOP_LEVEL_FIELDS = {"recommended_mode", "reason_codes", "units"}
 _ASSESSMENT_SCHEMA_KEYS = frozenset({"recommended_mode", "reason_codes"})
@@ -119,9 +144,12 @@ _UNIT_FIELDS = {
     "budget",
 }
 _CONSTRAINT_FIELDS = {"id", "kind", "summary", "unit_ids", "disposition"}
+_OBLIGATION_FIELDS = {"id", "summary", "source_fragment_ids", "unit_ids", "disposition"}
+_OBLIGATION_GAP_FIELDS = {"reason", "obligation_id", "summary", "source_fragment_ids", "affected_unit_ids"}
 _CONSTRAINT_GAP_FIELDS = {"reason", "constraint_id", "kind", "summary", "affected_unit_ids"}
 _UNIT_CONTEXT_GAP_FIELDS = {"unit_id", "source_literals"}
 _CONSTRAINT_REPAIR_TOP_LEVEL_FIELDS = {"constraints"}
+_OBLIGATION_REPAIR_TOP_LEVEL_FIELDS = {"obligations"}
 _AUTHORING_SCHEMA_KEYS = frozenset({"plan_id", "title", "units"})
 _AMENDMENT_SCHEMA_KEYS = frozenset({"plan_id", "target_unit_id", "replacement_units"})
 _CONSTRAINT_VERIFICATION_SCHEMA_KEYS = frozenset({"constraints_complete", "constraints"})
@@ -200,6 +228,48 @@ class DeliveryAuthoringConstraintDraft:
 
 
 @dataclass(frozen=True)
+class DeliveryAuthoringObligationDraft:
+    id: str
+    summary: str
+    source_fragment_ids: list[str]
+    unit_ids: list[str]
+    disposition: str
+
+    def to_plan_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "summary": self.summary,
+            "source_fragment_ids": list(self.source_fragment_ids),
+            "unit_ids": list(self.unit_ids),
+        }
+
+    def to_verification_dict(self) -> dict[str, Any]:
+        data = self.to_plan_dict()
+        data["disposition"] = self.disposition
+        return data
+
+
+@dataclass(frozen=True)
+class DeliveryObligationGap:
+    reason: str
+    summary: str
+    source_fragment_ids: list[str]
+    affected_unit_ids: list[str]
+    obligation_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "reason": self.reason,
+            "summary": self.summary,
+            "source_fragment_ids": list(self.source_fragment_ids),
+            "affected_unit_ids": list(self.affected_unit_ids),
+        }
+        if self.obligation_id is not None:
+            data["obligation_id"] = self.obligation_id
+        return data
+
+
+@dataclass(frozen=True)
 class DeliveryConstraintGap:
     reason: str
     kind: str
@@ -238,6 +308,14 @@ class DeliveryConstraintVerification:
     constraint_gaps: list[DeliveryConstraintGap] = field(default_factory=list)
     unit_context_complete: bool = True
     unit_context_gaps: list[DeliveryUnitContextGap] = field(default_factory=list)
+    obligations_complete: bool = True
+    obligations: list[DeliveryAuthoringObligationDraft] = field(default_factory=list)
+    obligation_gaps: list[DeliveryObligationGap] = field(default_factory=list)
+    source_accounting: list[DeliverySourceAccounting] | None = None
+    source_accounting_gaps: list[dict[str, str]] = field(default_factory=list)
+    unit_contract_gaps: list[dict[str, str]] = field(default_factory=list)
+    context_paths: list[str] = field(default_factory=list)
+    context_unavailable: bool = False  # Determined by local retrieval, never by model output.
 
 
 @dataclass
@@ -249,6 +327,8 @@ class DeliveryAuthoringDraft:
     warnings: list[str] = field(default_factory=list)
     audit_records: list[dict[str, Any]] = field(default_factory=list)
     constraints: list[DeliveryAuthoringConstraintDraft] = field(default_factory=list)
+    obligations: list[DeliveryAuthoringObligationDraft] = field(default_factory=list)
+    source_accounting: list[DeliverySourceAccounting] | None = None
     source_task: DeliveryPlanSourceTask | None = None
     constraint_verification: DeliveryConstraintVerification | None = None
 
@@ -265,6 +345,7 @@ class DeliveryAmendmentAuthoringDraft:
     disposition: str | None = None
     summary: str | None = None
     constraint_verification: DeliveryConstraintVerification | None = None
+    obligation_assignments: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -353,6 +434,8 @@ def parse_delivery_authoring_output(
     project_root: str | Path,
     output_dir: str | Path,
     source_task_description: str | None = None,
+    require_obligations: bool = False,
+    require_source_accounting: bool = False,
 ) -> DeliveryAuthoringDraft:
     root = _resolve_project_root(project_root)
     selected_plan_id = _expected_plan_id(expected_plan_id, output_dir=output_dir, project_root=root)
@@ -380,6 +463,16 @@ def parse_delivery_authoring_output(
         unit_ids={unit.id for unit in units},
         source_task_description=source_task_description,
     )
+    obligations = (
+        []
+        if any(item.kind == "stop_and_follow_up" for item in constraints)
+        else _parse_obligations(
+            data.get("obligations"),
+            unit_ids={unit.id for unit in units},
+            source_task_description=source_task_description,
+            required=require_obligations,
+        )
+    )
 
     return DeliveryAuthoringDraft(
         plan_id=plan_id,
@@ -388,6 +481,10 @@ def parse_delivery_authoring_output(
         planning_mode=planning_mode,
         warnings=warnings,
         constraints=constraints,
+        obligations=obligations,
+        source_accounting=_parse_source_accounting(
+            data, source_task_description, obligations, constraints, required=require_source_accounting
+        ),
     )
 
 
@@ -398,6 +495,9 @@ def parse_delivery_constraint_verification_output(
     source_task_description: str | None = None,
     unit_task_markdown_by_id: dict[str, str] | None = None,
     require_unit_context: bool = False,
+    require_source_accounting: bool = False,
+    require_obligations: bool = False,
+    known_obligation_source_fragment_ids: set[str] | None = None,
 ) -> DeliveryConstraintVerification:
     data = _parse_output_object(output, schema_keys=_CONSTRAINT_VERIFICATION_SCHEMA_KEYS)
     _reject_unknown_fields(data, _CONSTRAINT_VERIFICATION_TOP_LEVEL_FIELDS, "constraint verification")
@@ -448,13 +548,128 @@ def parse_delivery_constraint_verification_output(
             "delivery_unit_context_verification.gaps_required",
             "Incomplete unit-context verification must identify missing source literals.",
         )
+    obligations_complete = data.get("obligations_complete")
+    if require_obligations and type(obligations_complete) is not bool:
+        raise DeliveryAuthoringParseError(
+            "delivery_obligation_verification.complete_invalid",
+            "obligations_complete must be a boolean.",
+        )
+    if type(obligations_complete) is not bool:
+        obligations_complete = True
+    obligations = _parse_obligations(
+        data.get("obligations"),
+        unit_ids=unit_ids,
+        source_task_description=(None if known_obligation_source_fragment_ids is not None else source_task_description),
+        required=require_obligations,
+        known_source_fragment_ids=known_obligation_source_fragment_ids,
+    )
+    obligation_gaps = _parse_obligation_gaps(
+        data.get("obligation_gaps", []),
+        obligations=obligations,
+        unit_ids=unit_ids,
+        source_task_description=(None if known_obligation_source_fragment_ids is not None else source_task_description),
+        known_source_fragment_ids=known_obligation_source_fragment_ids,
+    )
+    if obligations_complete and obligation_gaps:
+        raise DeliveryAuthoringParseError(
+            "delivery_obligation_verification.gaps_unexpected",
+            "Complete obligation verification must not report obligation gaps.",
+        )
+    if not obligations_complete and not obligation_gaps:
+        raise DeliveryAuthoringParseError(
+            "delivery_obligation_verification.gaps_required",
+            "Incomplete obligation verification must identify at least one actionable gap.",
+        )
     return DeliveryConstraintVerification(
         constraints_complete=constraints_complete,
         constraints=constraints,
         constraint_gaps=constraint_gaps,
         unit_context_complete=unit_context_complete,
         unit_context_gaps=unit_context_gaps,
+        obligations_complete=obligations_complete,
+        obligations=obligations,
+        obligation_gaps=obligation_gaps,
+        source_accounting=_parse_source_accounting(
+            data, source_task_description, obligations, constraints, required=require_source_accounting
+        )
+        if require_source_accounting or data.get("source_accounting")
+        else None,
+        source_accounting_gaps=_parse_authority_gaps(
+            data.get("source_accounting_gaps", []),
+            "source_fragment_id",
+            set(delivery_authority_fragment_map(source_task_description or "")),
+        ),
+        unit_contract_gaps=_parse_authority_gaps(data.get("unit_contract_gaps", []), "unit_id", unit_ids),
+        context_paths=_parse_context_paths(data.get("context_paths", [])),
     )
+
+
+def _parse_source_accounting(
+    data: dict[str, Any],
+    source: str | None,
+    obligations: list[DeliveryAuthoringObligationDraft],
+    constraints: list[DeliveryAuthoringConstraintDraft],
+    *,
+    required: bool,
+) -> list[DeliverySourceAccounting] | None:
+    gaps = data.get("constraint_gaps", [])
+    if any(item.kind == "stop_and_follow_up" for item in constraints) or (
+        isinstance(gaps, list)
+        and any(isinstance(gap, dict) and gap.get("kind") == "stop_and_follow_up" for gap in gaps)
+    ):
+        return None  # A known prerequisite stop preempts further authoring work.
+    if "source_accounting" not in data and not required:
+        return None
+    try:
+        return parse_source_accounting(
+            data.get("source_accounting"),
+            fragment_ids=set(delivery_authority_fragment_map(source or "")),
+            obligation_sources={item.id: set(item.source_fragment_ids) for item in obligations},
+            constraint_ids={item.id for item in constraints},
+            private_rationales=True,
+            allow_unresolved=True,
+        )
+    except SourceAccountingError as exc:
+        raise DeliveryAuthoringParseError(exc.code, str(exc)) from None
+
+
+def _parse_authority_gaps(value: Any, identity_key: str, allowed: set[str]) -> list[dict[str, str]]:
+    if not isinstance(value, list) or len(value) > MAX_DELIVERY_AUTHORITY_FRAGMENTS:
+        raise DeliveryAuthoringParseError("delivery_authority.gaps_invalid", "Authority gaps must be a bounded list.")
+    gaps = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {identity_key, "summary"}:
+            raise DeliveryAuthoringParseError("delivery_authority.gaps_invalid", "Authority gap fields are invalid.")
+        identity = item[identity_key]
+        summary = item["summary"]
+        if (
+            not isinstance(identity, str)
+            or identity not in allowed
+            or identity in seen
+            or not isinstance(summary, str)
+            or not summary.strip()
+            or len(summary) > 2000
+        ):
+            raise DeliveryAuthoringParseError(
+                "delivery_authority.gaps_invalid",
+                "Authority gaps require known unique identities and bounded explanations.",
+            )
+        seen.add(identity)
+        gaps.append(dict(item))
+    return gaps
+
+
+def _parse_context_paths(value: Any) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or len(value) > 8
+        or any(not isinstance(path, str) or not path.strip() or len(path) > 512 for path in value)
+    ):
+        raise DeliveryAuthoringParseError(
+            "delivery_authority.context_invalid", "Context requests must be a bounded path list."
+        )
+    return list(dict.fromkeys(value))
 
 
 def apply_delivery_unit_context_gaps(
@@ -493,6 +708,22 @@ def parse_delivery_constraint_repair_output(
         data,
         unit_ids=unit_ids,
         source_task_description=source_task_description,
+    )
+
+
+def parse_delivery_obligation_repair_output(
+    output: str,
+    *,
+    unit_ids: set[str],
+    source_task_description: str,
+) -> list[DeliveryAuthoringObligationDraft]:
+    data = _parse_output_object(output, schema_keys=frozenset({"obligations"}))
+    _reject_unknown_fields(data, _OBLIGATION_REPAIR_TOP_LEVEL_FIELDS, "obligation repair")
+    return _parse_obligations(
+        data.get("obligations"),
+        unit_ids=unit_ids,
+        source_task_description=source_task_description,
+        required=True,
     )
 
 
@@ -568,12 +799,38 @@ def parse_delivery_amendment_authoring_output(
         plan_id=plan_id,
         target_unit_id=target_unit_id,
         replacement_units=replacement_units,
+        obligation_assignments=parse_obligation_assignments(
+            data.get("obligation_assignments", {}), {unit.id for unit in replacement_units}
+        ),
         disposition=disposition,
         summary=summary,
         amend_reason=amend_reason,
         budget_exceeded=budget_exceeded,
         warnings=warnings,
     )
+
+
+def parse_obligation_assignments(value: Any, unit_ids: set[str]) -> dict[str, list[str]]:
+    if not isinstance(value, dict) or len(value) > MAX_DELIVERY_OBLIGATIONS:
+        raise DeliveryAuthoringParseError(
+            "delivery_amend.obligation_assignments_invalid", "Obligation assignments must be a bounded mapping."
+        )
+    result = {}
+    for key, owners in value.items():
+        if (
+            not isinstance(key, str)
+            or not _DELIVERY_AUTHORING_ID_RE.fullmatch(key)
+            or not isinstance(owners, list)
+            or not owners
+            or len(owners) > MAX_DELIVERY_OBLIGATION_UNIT_IDS
+            or any(not isinstance(owner, str) or owner not in unit_ids for owner in owners)
+            or len(owners) != len(set(owners))
+        ):
+            raise DeliveryAuthoringParseError(
+                "delivery_amend.obligation_assignments_invalid", "Obligations require known unique replacement owners."
+            )
+        result[key] = list(owners)
+    return result
 
 
 def _parse_budget_exceeded(value: Any) -> dict[str, Any] | None:
@@ -815,6 +1072,7 @@ def _parse_constraints(
             "constraints contains too many inherited hard constraints.",
         )
 
+    advertised_stop = any(isinstance(item, dict) and item.get("kind") == "stop_and_follow_up" for item in value)
     constraints: list[DeliveryAuthoringConstraintDraft] = []
     seen_ids: set[str] = set()
     for index, item in enumerate(value):
@@ -848,7 +1106,9 @@ def _parse_constraints(
         summary = _bounded_authoring_string(item, "summary", f"{constraint_path}.summary")
         if source_task_description is not None and contains_delivery_source_excerpt(summary, source_task_description):
             raise DeliveryAuthoringParseError(
-                "delivery_authoring.constraint_summary_source_excerpt",
+                "delivery_authoring.stop_and_follow_up_summary_invalid"
+                if advertised_stop
+                else "delivery_authoring.constraint_summary_source_excerpt",
                 "Constraint summaries must paraphrase source-task rules without copying source text.",
             )
         applies_to = _require_string_list(item, "unit_ids", f"{constraint_path}.unit_ids")
@@ -888,6 +1148,109 @@ def _parse_constraints(
             )
         )
     return constraints
+
+
+def _parse_obligations(
+    value: Any,
+    *,
+    unit_ids: set[str],
+    source_task_description: str | None,
+    required: bool,
+    known_source_fragment_ids: set[str] | None = None,
+) -> list[DeliveryAuthoringObligationDraft]:
+    if value is None and not required:
+        return []
+    if not isinstance(value, list):
+        raise DeliveryAuthoringParseError(
+            "delivery_authoring.obligations_required",
+            "obligations must explicitly map source requirements to delivery units.",
+        )
+    if not value:
+        return []
+    if len(value) > MAX_DELIVERY_OBLIGATIONS:
+        raise DeliveryAuthoringParseError(
+            "delivery_authoring.obligations_too_many",
+            "obligations contains too many source outcomes.",
+        )
+    fragments = (
+        known_source_fragment_ids
+        if known_source_fragment_ids is not None
+        else set(delivery_authority_fragment_map(source_task_description or ""))
+    )
+    if len(fragments) > MAX_DELIVERY_AUTHORITY_FRAGMENTS:
+        raise DeliveryAuthoringParseError(
+            "delivery_authoring.authority_too_large",
+            "The source task has too many authority fragments for one delivery plan.",
+        )
+    obligations: list[DeliveryAuthoringObligationDraft] = []
+    seen_ids: set[str] = set()
+    for index, item in enumerate(value):
+        path = f"obligations[{index}]"
+        if not isinstance(item, dict):
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.obligation_not_object",
+                "Obligation entries must be JSON objects.",
+            )
+        _reject_unknown_fields(item, _OBLIGATION_FIELDS, path)
+        obligation_id = _require_string(item, "id", f"{path}.id")
+        if len(obligation_id) > MAX_DELIVERY_UNIT_ID_LENGTH or not _DELIVERY_AUTHORING_ID_RE.fullmatch(obligation_id):
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.obligation_id_invalid",
+                "Obligation ids must use only letters, numbers, dots, underscores, and hyphens.",
+            )
+        folded = obligation_id.casefold()
+        if folded in seen_ids:
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.obligation_id_duplicate",
+                "Obligation ids must be case-insensitively unique.",
+            )
+        seen_ids.add(folded)
+        summary = _bounded_authoring_string(item, "summary", f"{path}.summary")
+        if source_task_description is not None and contains_delivery_source_excerpt(summary, source_task_description):
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.obligation_summary_source_excerpt",
+                "Obligation summaries must paraphrase source requirements without copying source text.",
+            )
+        source_fragment_ids = _require_string_list(item, "source_fragment_ids", f"{path}.source_fragment_ids")
+        if not source_fragment_ids or len(source_fragment_ids) > MAX_DELIVERY_OBLIGATION_SOURCE_REFS:
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.obligation_source_refs_invalid",
+                "Each obligation must reference a bounded non-empty source fragment list.",
+            )
+        if len(source_fragment_ids) != len(set(source_fragment_ids)) or any(
+            fragment_id not in fragments for fragment_id in source_fragment_ids
+        ):
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.obligation_source_ref_unknown",
+                "Obligation source_fragment_ids must reference the supplied authoritative fragments.",
+            )
+        applies_to = _require_string_list(item, "unit_ids", f"{path}.unit_ids")
+        if not applies_to or len(applies_to) > MAX_DELIVERY_OBLIGATION_UNIT_IDS:
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.obligation_units_invalid",
+                "Each obligation must identify a bounded non-empty owner unit list.",
+            )
+        if len(applies_to) != len(set(applies_to)) or any(unit_id not in unit_ids for unit_id in applies_to):
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.obligation_unit_unknown",
+                "Obligation unit_ids must reference generated delivery units only.",
+            )
+        disposition = _require_string(item, "disposition", f"{path}.disposition")
+        if disposition not in DELIVERY_CONSTRAINT_DRAFT_DISPOSITIONS:
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.obligation_disposition_invalid",
+                "Obligation disposition must be preserved, needs_review, or conflict.",
+            )
+        obligations.append(
+            DeliveryAuthoringObligationDraft(
+                id=obligation_id,
+                summary=summary,
+                source_fragment_ids=source_fragment_ids,
+                unit_ids=applies_to,
+                disposition=disposition,
+            )
+        )
+    return obligations
 
 
 def _parse_constraint_gaps(
@@ -1008,6 +1371,119 @@ def _parse_constraint_gaps(
                 constraint_id=constraint_id,
                 kind=kind,
                 summary=summary,
+                affected_unit_ids=affected_unit_ids,
+            )
+        )
+    return gaps
+
+
+def _parse_obligation_gaps(
+    value: Any,
+    *,
+    obligations: list[DeliveryAuthoringObligationDraft],
+    unit_ids: set[str],
+    source_task_description: str | None,
+    known_source_fragment_ids: set[str] | None = None,
+) -> list[DeliveryObligationGap]:
+    if not isinstance(value, list) or len(value) > MAX_DELIVERY_OBLIGATIONS:
+        raise DeliveryAuthoringParseError(
+            "delivery_obligation_verification.gaps_invalid",
+            "obligation_gaps must be a bounded list.",
+        )
+    fragments = (
+        known_source_fragment_ids
+        if known_source_fragment_ids is not None
+        else set(delivery_authority_fragment_map(source_task_description or ""))
+    )
+    obligations_by_id = {obligation.id: obligation for obligation in obligations}
+    gaps: list[DeliveryObligationGap] = []
+    seen: set[tuple[str, str | None, str, tuple[str, ...], tuple[str, ...]]] = set()
+    for index, item in enumerate(value):
+        path = f"obligation_gaps[{index}]"
+        if not isinstance(item, dict):
+            raise DeliveryAuthoringParseError(
+                "delivery_obligation_verification.gap_not_object",
+                "Obligation gap entries must be JSON objects.",
+            )
+        _reject_unknown_fields(item, _OBLIGATION_GAP_FIELDS, path)
+        reason = _require_string(item, "reason", f"{path}.reason")
+        if reason not in DELIVERY_CONSTRAINT_GAP_REASONS:
+            raise DeliveryAuthoringParseError(
+                "delivery_obligation_verification.gap_reason_invalid",
+                "Obligation gap reason must be omitted or incompletely_assigned.",
+            )
+        summary = _bounded_authoring_string(item, "summary", f"{path}.summary")
+        if source_task_description is not None and contains_delivery_source_excerpt(summary, source_task_description):
+            raise DeliveryAuthoringParseError(
+                "delivery_obligation_verification.gap_summary_source_excerpt",
+                "Obligation gap summaries must paraphrase source requirements.",
+            )
+        source_fragment_ids = _require_string_list(item, "source_fragment_ids", f"{path}.source_fragment_ids")
+        if (
+            not source_fragment_ids
+            or len(source_fragment_ids) > MAX_DELIVERY_OBLIGATION_SOURCE_REFS
+            or len(source_fragment_ids) != len(set(source_fragment_ids))
+            or any(fragment_id not in fragments for fragment_id in source_fragment_ids)
+        ):
+            raise DeliveryAuthoringParseError(
+                "delivery_obligation_verification.gap_source_refs_invalid",
+                "Obligation gaps must reference known authoritative source fragments.",
+            )
+        affected_unit_ids = _require_string_list(item, "affected_unit_ids", f"{path}.affected_unit_ids")
+        if (
+            not affected_unit_ids
+            or len(affected_unit_ids) > MAX_DELIVERY_OBLIGATION_UNIT_IDS
+            or len(affected_unit_ids) != len(set(affected_unit_ids))
+            or any(unit_id not in unit_ids for unit_id in affected_unit_ids)
+        ):
+            raise DeliveryAuthoringParseError(
+                "delivery_obligation_verification.gap_units_invalid",
+                "Obligation gaps must identify known affected units.",
+            )
+        raw_id = item.get("obligation_id")
+        obligation_id = raw_id if isinstance(raw_id, str) and raw_id else None
+        if reason == "omitted":
+            if raw_id is not None:
+                raise DeliveryAuthoringParseError(
+                    "delivery_obligation_verification.gap_id_unexpected",
+                    "Omitted obligation gaps must not identify an existing obligation.",
+                )
+        else:
+            existing = obligations_by_id.get(obligation_id or "")
+            if existing is None:
+                raise DeliveryAuthoringParseError(
+                    "delivery_obligation_verification.gap_id_invalid",
+                    "Incomplete obligation gaps must identify an existing obligation.",
+                )
+            if existing.summary != summary or existing.source_fragment_ids != source_fragment_ids:
+                raise DeliveryAuthoringParseError(
+                    "delivery_obligation_verification.gap_mismatch",
+                    "Incomplete obligation gaps must preserve the supplied summary and source references.",
+                )
+            if any(unit_id in existing.unit_ids for unit_id in affected_unit_ids):
+                raise DeliveryAuthoringParseError(
+                    "delivery_obligation_verification.gap_assignment_existing",
+                    "Incomplete obligation gaps may identify only missing unit assignments.",
+                )
+        identity = (
+            reason,
+            obligation_id,
+            summary,
+            tuple(source_fragment_ids),
+            tuple(affected_unit_ids),
+        )
+        if identity in seen:
+            raise DeliveryAuthoringParseError(
+                "delivery_obligation_verification.gap_duplicate",
+                "Obligation gaps must not contain duplicate entries.",
+            )
+        seen.add(identity)
+        gaps.append(
+            DeliveryObligationGap(
+                reason=reason,
+                obligation_id=obligation_id,
+                summary=summary,
+                source_fragment_ids=source_fragment_ids,
                 affected_unit_ids=affected_unit_ids,
             )
         )

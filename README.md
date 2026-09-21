@@ -191,8 +191,9 @@ rules.
 Freshly authored plans are bound to the source task path and content hash. The
 authoring draft must explicitly classify inherited hard constraints such as
 repository ownership, authoritative read-only dependencies, stop-and-follow-up
-rules, security boundaries, and prohibited fallbacks. Ambiguous or conflicting
-constraints stop preparation for operator review. A separate read-only
+rules, security boundaries, and prohibited fallbacks. Correctable ambiguity or
+contract gaps receive bounded preparation recovery; confirmed external prerequisites
+stop immediately. A separate read-only
 verification pass compares the source task, declared constraints, and generated
 units before anything is published, so an authored empty list cannot silently
 drop a governing rule. When that pass identifies a concrete omitted or incompletely
@@ -259,7 +260,13 @@ assembled commit. `delivery run` invokes it after the last unit, or the
 operator can run `delivery verify` explicitly. The gate conservatively reuses
 exact-tree child validation or reruns enabled build, test, and check phases,
 then performs a read-only whole-candidate review and a separate security review
-for security-sensitive plans. `delivery finalize` never invokes an LLM and
+for security-sensitive plans. Freshly prepared plans bind source requirements
+to stable obligation IDs and owning units; whole-candidate approval requires a
+terminal satisfied result for every obligation. Fresh authoring also accounts for every
+source fragment, including independently verified context-only decisions. Obligations
+may be delivered collectively by their assigned units; amendments preserve that
+ownership without requiring each replacement to deliver the entire outcome.
+`delivery finalize` never invokes an LLM and
 requires a current pass whenever the final-gate policy applies. Existing legacy
 plans retain their direct-finalization behavior. This is a bounded final gate;
 automatic hierarchical checkpoints for plans beyond its limits are later work.

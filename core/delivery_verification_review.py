@@ -7,7 +7,8 @@ from typing import Any
 from core.delivery_public_metadata import is_safe_delivery_public_metadata
 
 
-DELIVERY_INTEGRATION_REVIEW_SCHEMA_VERSION = 1
+DELIVERY_INTEGRATION_REVIEW_SCHEMA_VERSION = 2
+_LEGACY_DELIVERY_INTEGRATION_REVIEW_SCHEMA_VERSION = 1
 DELIVERY_INTEGRATION_REVIEW_DISPOSITIONS = frozenset(
     {
         "approved",
@@ -20,6 +21,7 @@ DELIVERY_INTEGRATION_REVIEW_DISPOSITIONS = frozenset(
 MAX_DELIVERY_INTEGRATION_FINDINGS = 20
 MAX_DELIVERY_INTEGRATION_SUMMARY_CHARS = 500
 MAX_DELIVERY_INTEGRATION_FINDING_UNIT_IDS = 50
+DELIVERY_OBLIGATION_OUTCOMES = frozenset({"satisfied", "missing", "conflicting", "uncertain"})
 
 
 class DeliveryIntegrationReviewParseError(ValueError):
@@ -34,9 +36,24 @@ class DeliveryIntegrationFinding:
     code: str
     summary: str
     unit_ids: list[str] = field(default_factory=list)
+    obligation_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"code": self.code, "summary": self.summary, "unit_ids": list(self.unit_ids)}
+        return {
+            "code": self.code,
+            "summary": self.summary,
+            "unit_ids": list(self.unit_ids),
+            "obligation_ids": list(self.obligation_ids),
+        }
+
+
+@dataclass(frozen=True)
+class DeliveryObligationAssessment:
+    id: str
+    outcome: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"id": self.id, "outcome": self.outcome}
 
 
 @dataclass(frozen=True)
@@ -44,6 +61,7 @@ class DeliveryIntegrationAssessment:
     disposition: str
     summary: str
     findings: list[DeliveryIntegrationFinding] = field(default_factory=list)
+    obligation_results: list[DeliveryObligationAssessment] = field(default_factory=list)
 
     @property
     def approved(self) -> bool:
@@ -55,14 +73,31 @@ class DeliveryIntegrationAssessment:
             "disposition": self.disposition,
             "summary": self.summary,
             "findings": [finding.to_dict() for finding in self.findings],
+            "obligation_results": [result.to_dict() for result in self.obligation_results],
         }
+
+
+def delivery_integration_review_control_example(known_obligation_ids: set[str]) -> str:
+    """Render the response template shared by reviewer prompts and preflight sizing."""
+
+    assessment = DeliveryIntegrationAssessment(
+        disposition="approved",
+        summary="One bounded single-line summary",
+        obligation_results=[
+            DeliveryObligationAssessment(id=obligation_id, outcome="satisfied")
+            for obligation_id in sorted(known_obligation_ids)
+        ],
+    )
+    return json.dumps(assessment.to_dict(), separators=(",", ":"))
 
 
 def parse_delivery_integration_review(
     output: str,
     *,
     known_unit_ids: set[str],
+    known_obligation_ids: set[str] | None = None,
 ) -> DeliveryIntegrationAssessment:
+    obligation_ids = set(known_obligation_ids or set())
     if not isinstance(output, str) or not output.strip():
         raise DeliveryIntegrationReviewParseError(
             "delivery_verification.review_output_empty",
@@ -81,16 +116,23 @@ def parse_delivery_integration_review(
             "delivery_verification.review_json_invalid",
             "Integration reviewer disposition must be a JSON object.",
         )
-    if set(payload) != {"schema_version", "disposition", "summary", "findings"}:
+    schema_version = payload.get("schema_version")
+    legacy = schema_version == _LEGACY_DELIVERY_INTEGRATION_REVIEW_SCHEMA_VERSION
+    expected_keys = (
+        {"schema_version", "disposition", "summary", "findings"}
+        if legacy
+        else {"schema_version", "disposition", "summary", "findings", "obligation_results"}
+    )
+    if set(payload) != expected_keys:
         raise DeliveryIntegrationReviewParseError(
             "delivery_verification.review_keys_invalid",
             "Integration reviewer disposition fields are invalid.",
         )
-    schema_version = payload["schema_version"]
     if (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
-        or schema_version != DELIVERY_INTEGRATION_REVIEW_SCHEMA_VERSION
+        or schema_version
+        not in {_LEGACY_DELIVERY_INTEGRATION_REVIEW_SCHEMA_VERSION, DELIVERY_INTEGRATION_REVIEW_SCHEMA_VERSION}
     ):
         raise DeliveryIntegrationReviewParseError(
             "delivery_verification.review_schema_unsupported",
@@ -109,9 +151,24 @@ def parse_delivery_integration_review(
             "delivery_verification.review_findings_invalid",
             "Integration reviewer findings must be a bounded list.",
         )
+    if legacy and obligation_ids:
+        raise DeliveryIntegrationReviewParseError(
+            "delivery_verification.review_schema_unsupported",
+            "Source-bound obligations require integration review schema version 2.",
+        )
     findings = [
-        _parse_finding(value, index=index, known_unit_ids=known_unit_ids) for index, value in enumerate(raw_findings)
+        _parse_finding(
+            value,
+            index=index,
+            known_unit_ids=known_unit_ids,
+            known_obligation_ids=obligation_ids,
+            legacy=legacy,
+        )
+        for index, value in enumerate(raw_findings)
     ]
+    obligation_results = (
+        [] if legacy else _parse_obligation_results(payload["obligation_results"], known_obligation_ids=obligation_ids)
+    )
     if disposition == "approved" and findings:
         raise DeliveryIntegrationReviewParseError(
             "delivery_verification.review_approval_invalid",
@@ -122,7 +179,24 @@ def parse_delivery_integration_review(
             "delivery_verification.review_findings_required",
             "A non-approved integration review requires at least one finding.",
         )
-    return DeliveryIntegrationAssessment(disposition=disposition, summary=summary, findings=findings)
+    if disposition == "approved" and any(result.outcome != "satisfied" for result in obligation_results):
+        raise DeliveryIntegrationReviewParseError(
+            "delivery_verification.review_approval_invalid",
+            "Approved integration review requires every obligation to be satisfied.",
+        )
+    unresolved_ids = {result.id for result in obligation_results if result.outcome != "satisfied"}
+    finding_obligation_ids = {obligation_id for finding in findings for obligation_id in finding.obligation_ids}
+    if not unresolved_ids.issubset(finding_obligation_ids):
+        raise DeliveryIntegrationReviewParseError(
+            "delivery_verification.review_obligation_findings_invalid",
+            "Every unresolved obligation must be referenced by a blocking finding.",
+        )
+    return DeliveryIntegrationAssessment(
+        disposition=disposition,
+        summary=summary,
+        findings=findings,
+        obligation_results=obligation_results,
+    )
 
 
 def _parse_finding(
@@ -130,8 +204,20 @@ def _parse_finding(
     *,
     index: int,
     known_unit_ids: set[str],
+    known_obligation_ids: set[str],
+    legacy: bool,
 ) -> DeliveryIntegrationFinding:
-    if not isinstance(value, dict) or set(value) != {"code", "summary", "unit_ids"}:
+    expected_fields = (
+        {"code", "summary", "unit_ids"}
+        if legacy
+        else {
+            "code",
+            "summary",
+            "unit_ids",
+            "obligation_ids",
+        }
+    )
+    if not isinstance(value, dict) or set(value) != expected_fields:
         raise DeliveryIntegrationReviewParseError(
             "delivery_verification.review_findings_invalid",
             f"Integration reviewer finding {index + 1} has invalid fields.",
@@ -149,7 +235,59 @@ def _parse_finding(
             "delivery_verification.review_findings_invalid",
             f"Integration reviewer finding {index + 1} references invalid units.",
         )
-    return DeliveryIntegrationFinding(code=code, summary=summary, unit_ids=unit_ids)
+    obligation_ids = [] if legacy else value["obligation_ids"]
+    if (
+        not isinstance(obligation_ids, list)
+        or len(obligation_ids) > MAX_DELIVERY_INTEGRATION_FINDING_UNIT_IDS
+        or any(not isinstance(item, str) or item not in known_obligation_ids for item in obligation_ids)
+        or len(set(obligation_ids)) != len(obligation_ids)
+    ):
+        raise DeliveryIntegrationReviewParseError(
+            "delivery_verification.review_findings_invalid",
+            f"Integration reviewer finding {index + 1} references invalid obligations.",
+        )
+    return DeliveryIntegrationFinding(
+        code=code,
+        summary=summary,
+        unit_ids=unit_ids,
+        obligation_ids=obligation_ids,
+    )
+
+
+def _parse_obligation_results(
+    value: Any,
+    *,
+    known_obligation_ids: set[str],
+) -> list[DeliveryObligationAssessment]:
+    if not isinstance(value, list) or len(value) != len(known_obligation_ids):
+        raise DeliveryIntegrationReviewParseError(
+            "delivery_verification.review_obligations_invalid",
+            "Integration review must assess every source-bound obligation exactly once.",
+        )
+    results: list[DeliveryObligationAssessment] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"id", "outcome"}:
+            raise DeliveryIntegrationReviewParseError(
+                "delivery_verification.review_obligations_invalid",
+                "Integration obligation result fields are invalid.",
+            )
+        obligation_id = item["id"]
+        outcome = item["outcome"]
+        if (
+            not isinstance(obligation_id, str)
+            or obligation_id not in known_obligation_ids
+            or obligation_id in seen
+            or not isinstance(outcome, str)
+            or outcome not in DELIVERY_OBLIGATION_OUTCOMES
+        ):
+            raise DeliveryIntegrationReviewParseError(
+                "delivery_verification.review_obligations_invalid",
+                "Integration obligation result is invalid or duplicated.",
+            )
+        seen.add(obligation_id)
+        results.append(DeliveryObligationAssessment(id=obligation_id, outcome=outcome))
+    return results
 
 
 def _bounded_metadata(value: Any, label: str, *, max_chars: int = MAX_DELIVERY_INTEGRATION_SUMMARY_CHARS) -> str:

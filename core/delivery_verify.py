@@ -44,6 +44,7 @@ from core.delivery_verification import (
 )
 from core.delivery_verification_model import (
     DeliveryVerificationRecord,
+    delivery_verification_covers_obligations,
     delivery_verification_recovery_action,
 )
 from core.delivery_verification_validation import (
@@ -70,7 +71,7 @@ from tools.base_tool import Sandbox
 from tools.build_factory import create_build_tool
 
 
-DELIVERY_VERIFY_RESULT_SCHEMA_VERSION = 1
+DELIVERY_VERIFY_RESULT_SCHEMA_VERSION = 2
 DELIVERY_VERIFY_PRIVACY_MODE = "public_metadata"
 
 
@@ -92,6 +93,9 @@ class DeliveryVerifyResult:
     validation_reused: bool = False
     validation_executed: bool = False
     finding_count: int = 0
+    obligation_count: int = 0
+    obligation_satisfied_count: int = 0
+    obligation_gap_count: int = 0
     stop_code: str | None = None
     next_action: str | None = None
     errors: tuple[DeliveryPlanIssue, ...] = ()
@@ -122,6 +126,9 @@ class DeliveryVerifyResult:
             "validation_reused": self.validation_reused,
             "validation_executed": self.validation_executed,
             "finding_count": self.finding_count,
+            "obligation_count": self.obligation_count,
+            "obligation_satisfied_count": self.obligation_satisfied_count,
+            "obligation_gap_count": self.obligation_gap_count,
             "errors": [_public_issue(issue) for issue in self.errors],
             "warnings": [_public_issue(issue) for issue in self.warnings],
         }
@@ -198,7 +205,11 @@ def verify_delivery_plan(
                     existing_identity = None
                 if (
                     existing_identity is not None
-                    and _record_matches_identity(existing, existing_identity)
+                    and _record_matches_identity(
+                        existing,
+                        existing_identity,
+                        obligation_count=len(status.plan.obligations),
+                    )
                     and _assembly_ref_matches(root, status, existing.candidate_commit)
                 ):
                     return _result_from_record(status, existing, succeeded=True, next_action="finalize_delivery")
@@ -229,7 +240,15 @@ def verify_delivery_plan(
             except (OSError, UnicodeError, ValueError):
                 return _blocked_result(status, "delivery_verification.source_changed")
             existing = progress.verification
-            if existing and existing.passed and _record_matches_identity(existing, identity):
+            if (
+                existing
+                and existing.passed
+                and _record_matches_identity(
+                    existing,
+                    identity,
+                    obligation_count=len(status.plan.obligations),
+                )
+            ):
                 return _result_from_record(status, existing, succeeded=True, next_action="finalize_delivery")
             attempt = existing.attempt + 1 if existing and existing.gate_id == identity.gate_id else 1
             running = _record_for_identity(
@@ -237,6 +256,7 @@ def verify_delivery_plan(
                 status="running",
                 attempt=attempt,
                 security_required=readiness.security_required,
+                obligation_count=len(status.plan.obligations),
                 evidence_path=evidence_reference,
                 started_at=_now(),
             )
@@ -446,6 +466,12 @@ def render_delivery_verify(result: DeliveryVerifyResult) -> str:
             f"Security review: {data['security_status']}",
         ]
     )
+    if data["obligation_count"]:
+        lines.append(
+            "Obligations: "
+            f"{data['obligation_satisfied_count']}/{data['obligation_count']} satisfied, "
+            f"{data['obligation_gap_count']} gap(s)"
+        )
     if data.get("stop_code"):
         lines.append(f"Stop code: {data['stop_code']}")
     if data["errors"]:
@@ -479,6 +505,8 @@ def _execute_gate(
     active_review: str | None = None
     semantic_status = "not_run"
     security_status = "not_run"
+    obligation_satisfied_count = 0
+    obligation_gap_count = 0
     try:
         with detached_delivery_verification_worktree(root, identity.candidate_commit) as worktree:
             copied_environment_files = _copy_environment_files(root, worktree, project_config)
@@ -549,6 +577,7 @@ def _execute_gate(
                 )
             plan_context = delivery_verification_plan_context(status)
             known_unit_ids = {unit.id for unit in status.plan.units if not unit.superseded}
+            known_obligation_ids = {obligation.id for obligation in status.plan.obligations}
             semantic_before = _review_snapshot(worktree, project_config)
             active_review = "semantic"
             semantic = _run_review(
@@ -560,10 +589,15 @@ def _execute_gate(
                 validation=validation,
                 identity=identity,
                 known_unit_ids=known_unit_ids,
+                known_obligation_ids=known_obligation_ids,
                 evidence_path=evidence_path,
                 audit_root=root,
             )
             semantic_status = "approved" if semantic.assessment.approved else "rejected"
+            obligation_satisfied_count = sum(
+                result.outcome == "satisfied" for result in semantic.assessment.obligation_results
+            )
+            obligation_gap_count = len(semantic.assessment.obligation_results) - obligation_satisfied_count
             if not _review_workspace_unchanged(worktree, project_config, semantic_before) or not _candidate_is_clean(
                 worktree, identity.candidate_commit
             ):
@@ -582,6 +616,8 @@ def _execute_gate(
                     validation_reused=validation.reused,
                     validation_executed=validation.executed,
                     finding_count=len(semantic.assessment.findings),
+                    obligation_satisfied_count=obligation_satisfied_count,
+                    obligation_gap_count=obligation_gap_count,
                     stop_code=f"delivery_verification.{semantic.assessment.disposition}",
                     completed_at=_now(),
                 )
@@ -595,6 +631,8 @@ def _execute_gate(
                         "delivery_verification.security_unavailable",
                         semantic_status=semantic_status,
                         security_status="blocked",
+                        obligation_satisfied_count=obligation_satisfied_count,
+                        obligation_gap_count=obligation_gap_count,
                     )
                 try:
                     security_reviewer.prepare_workspace(worktree)
@@ -605,6 +643,8 @@ def _execute_gate(
                         "delivery_verification.security_workspace_unavailable",
                         semantic_status=semantic_status,
                         security_status="blocked",
+                        obligation_satisfied_count=obligation_satisfied_count,
+                        obligation_gap_count=obligation_gap_count,
                     )
                 security_before = _review_snapshot(worktree, project_config)
                 active_review = "security"
@@ -617,6 +657,7 @@ def _execute_gate(
                     validation=validation,
                     identity=identity,
                     known_unit_ids=known_unit_ids,
+                    known_obligation_ids=set(),
                     evidence_path=evidence_path,
                     audit_root=root,
                 )
@@ -630,6 +671,8 @@ def _execute_gate(
                         "delivery_verification.readonly_mutation",
                         semantic_status=semantic_status,
                         security_status="blocked",
+                        obligation_satisfied_count=obligation_satisfied_count,
+                        obligation_gap_count=obligation_gap_count,
                     )
                 if not security.assessment.approved:
                     return replace(
@@ -640,6 +683,8 @@ def _execute_gate(
                         validation_reused=validation.reused,
                         validation_executed=validation.executed,
                         finding_count=len(security.assessment.findings),
+                        obligation_satisfied_count=obligation_satisfied_count,
+                        obligation_gap_count=obligation_gap_count,
                         stop_code=f"delivery_verification.{security.assessment.disposition}",
                         completed_at=_now(),
                     )
@@ -652,6 +697,8 @@ def _execute_gate(
                 validation_reused=validation.reused,
                 validation_executed=validation.executed,
                 finding_count=finding_count,
+                obligation_satisfied_count=obligation_satisfied_count,
+                obligation_gap_count=obligation_gap_count,
                 completed_at=_now(),
             )
     except DeliveryIntegrationReviewAgentError as exc:
@@ -661,6 +708,8 @@ def _execute_gate(
             exc.code,
             semantic_status="blocked" if active_review == "semantic" else semantic_status,
             security_status="blocked" if active_review == "security" else security_status,
+            obligation_satisfied_count=obligation_satisfied_count,
+            obligation_gap_count=obligation_gap_count,
         )
     except _ReviewAuditUnavailable as exc:
         phase_status = exc.phase_status
@@ -670,6 +719,10 @@ def _execute_gate(
             "delivery_verification.audit_unavailable",
             semantic_status=phase_status if active_review == "semantic" else semantic_status,
             security_status=phase_status if active_review == "security" else security_status,
+            obligation_satisfied_count=(
+                exc.obligation_satisfied_count if active_review == "semantic" else obligation_satisfied_count
+            ),
+            obligation_gap_count=(exc.obligation_gap_count if active_review == "semantic" else obligation_gap_count),
         )
         terminal = replace(terminal, finding_count=exc.finding_count)
         raise _GateReviewAuditUnavailable(terminal, exc.review_evidence) from None
@@ -680,6 +733,8 @@ def _execute_gate(
             "delivery_verification.workspace_audit_unavailable",
             semantic_status=semantic_status,
             security_status=security_status,
+            obligation_satisfied_count=obligation_satisfied_count,
+            obligation_gap_count=obligation_gap_count,
         )
     except DetachedWorktreeError:
         return _review_blocked(
@@ -688,6 +743,8 @@ def _execute_gate(
             "delivery_verification.worktree_unavailable",
             semantic_status=semantic_status,
             security_status=security_status,
+            obligation_satisfied_count=obligation_satisfied_count,
+            obligation_gap_count=obligation_gap_count,
         )
 
 
@@ -701,6 +758,7 @@ def _run_review(
     validation: DeliveryVerificationValidationResult,
     identity: DeliveryVerificationIdentity,
     known_unit_ids: set[str],
+    known_obligation_ids: set[str],
     evidence_path: Path,
     audit_root: Path,
 ) -> DeliveryIntegrationReviewResult:
@@ -714,6 +772,7 @@ def _run_review(
             candidate_commit=identity.candidate_commit,
             candidate_tree=identity.candidate_tree,
             known_unit_ids=known_unit_ids,
+            known_obligation_ids=known_obligation_ids,
         )
     except DeliveryIntegrationReviewAgentError as exc:
         review_evidence = {
@@ -728,6 +787,8 @@ def _run_review(
                 review_evidence,
                 phase_status="blocked",
                 finding_count=0,
+                obligation_satisfied_count=0,
+                obligation_gap_count=0,
             ) from exc
         raise
     review_evidence = {
@@ -737,10 +798,15 @@ def _run_review(
         "usage": reviewer.consume_usage_records(),
     }
     if not _safe_append_audit(evidence_path, review_evidence, project_root=audit_root):
+        obligation_satisfied_count = sum(
+            obligation.outcome == "satisfied" for obligation in result.assessment.obligation_results
+        )
         raise _ReviewAuditUnavailable(
             review_evidence,
             phase_status="approved" if result.assessment.approved else "rejected",
             finding_count=len(result.assessment.findings),
+            obligation_satisfied_count=obligation_satisfied_count,
+            obligation_gap_count=len(result.assessment.obligation_results) - obligation_satisfied_count,
         )
     return result
 
@@ -848,6 +914,7 @@ def _preflight_result(status, readiness) -> DeliveryVerifyResult | None:
             ready=False,
             succeeded=False,
             status="blocked",
+            obligation_count=_status_obligation_count(status),
             stop_code="delivery_verification.not_ready",
             next_action="resolve_delivery_verification_readiness",
             errors=tuple(readiness.errors),
@@ -866,6 +933,7 @@ def _preflight_result(status, readiness) -> DeliveryVerifyResult | None:
             ready=False,
             succeeded=False,
             status="blocked",
+            obligation_count=_status_obligation_count(status),
             stop_code=issue.code,
             next_action="run_delivery_units",
             errors=(issue,),
@@ -924,11 +992,17 @@ def _blocked_result(status, code: str, errors: list[DeliveryPlanIssue] | None = 
         ready=False,
         succeeded=False,
         status="blocked",
+        obligation_count=_status_obligation_count(status),
         stop_code=code,
         next_action="resolve_delivery_verification_blocker",
         errors=tuple(issues),
         warnings=tuple(status.warnings),
     )
+
+
+def _status_obligation_count(status) -> int:
+    plan = getattr(status, "plan", None)
+    return len(plan.obligations) if plan is not None else 0
 
 
 def _result_from_record(
@@ -951,6 +1025,9 @@ def _result_from_record(
         validation_reused=record.validation_reused,
         validation_executed=record.validation_executed,
         finding_count=record.finding_count,
+        obligation_count=record.obligation_count,
+        obligation_satisfied_count=record.obligation_satisfied_count,
+        obligation_gap_count=record.obligation_gap_count,
         stop_code=record.stop_code,
         next_action=next_action,
         warnings=tuple(status.warnings),
@@ -972,8 +1049,13 @@ def _record_for_identity(identity: DeliveryVerificationIdentity, **values: Any) 
     )
 
 
-def _record_matches_identity(record: DeliveryVerificationRecord, identity: DeliveryVerificationIdentity) -> bool:
-    return all(
+def _record_matches_identity(
+    record: DeliveryVerificationRecord,
+    identity: DeliveryVerificationIdentity,
+    *,
+    obligation_count: int,
+) -> bool:
+    return delivery_verification_covers_obligations(record, obligation_count) and all(
         getattr(record, key) == getattr(identity, key)
         for key in (
             "gate_id",
@@ -1018,11 +1100,15 @@ class _ReviewAuditUnavailable(RuntimeError):
         *,
         phase_status: str,
         finding_count: int,
+        obligation_satisfied_count: int,
+        obligation_gap_count: int,
     ) -> None:
         super().__init__("Delivery verification review evidence could not be persisted.")
         self.review_evidence = review_evidence
         self.phase_status = phase_status
         self.finding_count = finding_count
+        self.obligation_satisfied_count = obligation_satisfied_count
+        self.obligation_gap_count = obligation_gap_count
 
 
 class _GateValidationAuditUnavailable(RuntimeError):
@@ -1262,6 +1348,8 @@ def _review_blocked(
     *,
     semantic_status: str = "not_run",
     security_status: str = "not_run",
+    obligation_satisfied_count: int = 0,
+    obligation_gap_count: int = 0,
 ) -> DeliveryVerificationRecord:
     return replace(
         running,
@@ -1270,6 +1358,8 @@ def _review_blocked(
         security_status=security_status,
         validation_reused=validation.reused if validation is not None else False,
         validation_executed=validation.executed if validation is not None else False,
+        obligation_satisfied_count=obligation_satisfied_count,
+        obligation_gap_count=obligation_gap_count,
         stop_code=code,
         completed_at=_now(),
     )

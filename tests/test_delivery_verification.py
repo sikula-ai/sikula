@@ -10,6 +10,7 @@ from pathlib import Path
 import stat
 import subprocess
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import yaml
 
@@ -36,17 +37,20 @@ from core.delivery_progress import (
     upsert_delivery_unit_progress,
     write_delivery_progress,
 )
+from core.delivery_obligations import delivery_authority_fragments
 from core.delivery_verification_model import (
     DeliveryVerificationRecord,
     parse_delivery_verification_record,
 )
 from core.delivery_verification import (
     MAX_DELIVERY_VERIFICATION_PACKET_BYTES,
+    MAX_DELIVERY_VERIFICATION_PLAN_BYTES,
     MAX_DELIVERY_VERIFICATION_SOURCE_BYTES,
     _git_object,
     build_delivery_verification_identity,
     check_delivery_verification_readiness,
     delivery_verification_config_fingerprint,
+    delivery_verification_plan_context,
     with_delivery_verification_readiness,
 )
 from core.delivery_verification_review import (
@@ -73,7 +77,14 @@ from core.state import JsonStateStore
 from core.worktree import delivery_verification_git_env, detached_delivery_verification_worktree
 from sikula import _run_delivery_verification
 from tools.base_tool import ToolResult
-from sikula_cli.delivery import cmd_delivery_check, cmd_delivery_status, cmd_delivery_verify, register_parser
+from sikula_cli.delivery import (
+    DeliveryRunNextContext,
+    _run_next_delivery_unit,
+    cmd_delivery_check,
+    cmd_delivery_status,
+    cmd_delivery_verify,
+    register_parser,
+)
 
 
 _COMMIT = "a" * 40
@@ -173,7 +184,13 @@ def _git_commit_all(root: Path, message: str) -> str:
     ).stdout.strip()
 
 
-def _write_plan(root: Path, *, schema_version: int = 2, risk_tags: list[str] | None = None) -> Path:
+def _write_plan(
+    root: Path,
+    *,
+    schema_version: int = 2,
+    risk_tags: list[str] | None = None,
+    with_obligation: bool = False,
+) -> Path:
     unit_path = root / ".sikula" / "delivery" / "demo" / "units" / "unit.md"
     unit_path.parent.mkdir(parents=True, exist_ok=True)
     unit_path.write_text("# Unit\n", encoding="utf-8")
@@ -202,6 +219,15 @@ def _write_plan(root: Path, *, schema_version: int = 2, risk_tags: list[str] | N
             "sha256": "sha256:" + sha256(source_text.encode("utf-8")).hexdigest(),
         }
         data["verification"] = {"mode": "final_gate"}
+        if with_obligation:
+            data["obligations"] = [
+                {
+                    "id": "deliver-source-behavior",
+                    "summary": "The assembled candidate provides the requested source behavior.",
+                    "source_fragment_ids": [delivery_authority_fragments(source_text)[0].id],
+                    "unit_ids": ["unit"],
+                }
+            ]
     plan_path = root / ".sikula" / "delivery" / "demo" / "plan.yaml"
     plan_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     return plan_path
@@ -301,6 +327,12 @@ def test_delivery_verification_record_round_trip() -> None:
         {"security_status": {}},
         {"attempt": 0},
         {"security_required": "yes"},
+        {
+            "status": "passed",
+            "semantic_status": "approved",
+            "obligation_count": 1,
+            "obligation_satisfied_count": 0,
+        },
         {"evidence_path": "../private/audit.jsonl"},
         {"unexpected": True},
     ],
@@ -579,6 +611,139 @@ def test_schema_v2_finalize_requires_exact_passing_gate(tmp_path: Path) -> None:
 
     assert stale.finalized is False
     assert any(issue.code == "delivery_verification.stale" for issue in stale.errors)
+
+
+def test_final_gate_persists_bounded_obligation_closure(tmp_path: Path) -> None:
+    base = _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path, with_obligation=True)
+    plan = yaml.safe_load(plan_path.read_text())
+    plan["source_accounting"] = [
+        {
+            "source_fragment_id": plan["obligations"][0]["source_fragment_ids"][0],
+            "disposition": "mapped",
+            "obligation_ids": ["deliver-source-behavior"],
+            "constraint_ids": [],
+            "rationale_sha256": "sha256:" + sha256(b"PRIVATE ACCOUNTING RATIONALE").hexdigest(),
+        }
+    ]
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False))
+    unit_commit = _git_commit_all(tmp_path, "delivery unit")
+    progress = DeliveryProgress(
+        schema_version=1,
+        plan_id="demo",
+        units=[make_delivery_unit_progress("unit", "done", commit=unit_commit)],
+        assembly_base_commit=base,
+    )
+    write_delivery_progress(delivery_progress_path(tmp_path, "demo"), progress)
+    config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
+    approval = (
+        '{"schema_version":2,"disposition":"approved","summary":"Complete and coherent.","findings":[],'
+        '"obligation_results":[{"id":"deliver-source-behavior","outcome":"satisfied"}]}'
+    )
+    llm = _ReadonlyLLM([approval])
+
+    result = verify_delivery_plan(
+        plan_path,
+        config,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        semantic_reviewer=DeliveryIntegrationReviewAgent(llm, config),
+        security_reviewer=None,
+        project_root=tmp_path,
+    )
+
+    assert result.succeeded is True
+    assert result.obligation_count == 1
+    assert result.obligation_satisfied_count == 1
+    assert result.obligation_gap_count == 0
+    assert "deliver-source-behavior" in llm.calls[0][0]
+    persisted = read_delivery_progress(delivery_progress_path(tmp_path, "demo"), plan_id="demo")[0]
+    assert persisted is not None and persisted.verification is not None
+    assert persisted.verification.obligation_count == 1
+    assert persisted.verification.obligation_satisfied_count == 1
+    assert "source_accounting" in llm.calls[0][0]
+    assert "PRIVATE ACCOUNTING RATIONALE" not in llm.calls[0][0]
+
+    plan["source_accounting"][0]["rationale_sha256"] = "sha256:" + "f" * 64
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False))
+    status = with_delivery_verification_readiness(get_delivery_status(plan_path), config)
+    assert status.verification_status == "stale"
+    finalized = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=config)
+    assert finalized.finalized is False
+    assert any(issue.code == "delivery_verification.stale" for issue in finalized.errors)
+    assert len(llm.calls) == 1
+
+
+def test_blocked_verification_reports_plan_obligation_total(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path, with_obligation=True)
+    config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
+
+    result = verify_delivery_plan(
+        plan_path,
+        config,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        semantic_reviewer=None,
+        security_reviewer=None,
+        project_root=tmp_path,
+    )
+
+    assert result.status == "blocked"
+    assert result.stop_code == "delivery_verification.plan_not_done"
+    assert result.obligation_count == 1
+    assert result.to_dict()["obligation_count"] == 1
+
+
+def test_legacy_pass_without_obligation_closure_is_stale_and_not_reused(tmp_path: Path) -> None:
+    base = _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path, with_obligation=True)
+    unit_commit = _git_commit_all(tmp_path, "delivery unit")
+    progress_path = delivery_progress_path(tmp_path, "demo")
+    write_delivery_progress(
+        progress_path,
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="demo",
+            units=[make_delivery_unit_progress("unit", "done", commit=unit_commit)],
+            assembly_base_commit=base,
+        ),
+    )
+    config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
+    approval = (
+        '{"schema_version":2,"disposition":"approved","summary":"Complete and coherent.","findings":[],'
+        '"obligation_results":[{"id":"deliver-source-behavior","outcome":"satisfied"}]}'
+    )
+    initial = verify_delivery_plan(
+        plan_path,
+        config,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        semantic_reviewer=DeliveryIntegrationReviewAgent(_ReadonlyLLM([approval]), config),
+        security_reviewer=None,
+        project_root=tmp_path,
+    )
+    assert initial.succeeded is True
+
+    persisted = json.loads(progress_path.read_text(encoding="utf-8"))
+    for key in ("obligation_count", "obligation_satisfied_count", "obligation_gap_count"):
+        persisted["verification"].pop(key)
+    progress_path.write_text(json.dumps(persisted), encoding="utf-8")
+
+    status = with_delivery_verification_readiness(get_delivery_status(plan_path), config)
+    finalized = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=config)
+    retry_llm = _ReadonlyLLM([approval])
+    retried = verify_delivery_plan(
+        plan_path,
+        config,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        semantic_reviewer=DeliveryIntegrationReviewAgent(retry_llm, config),
+        security_reviewer=None,
+        project_root=tmp_path,
+    )
+
+    assert status.verification_status == "stale"
+    assert finalized.finalized is False
+    assert any(issue.code == "delivery_verification.stale" for issue in finalized.errors)
+    assert retried.succeeded is True
+    assert len(retry_llm.calls) == 1
 
 
 def test_delivery_verification_blocks_candidate_config_drift_before_validation(
@@ -1165,7 +1330,8 @@ def test_delivery_verification_reviews_source_captured_before_validation(
     )
 
     assert result.succeeded is True
-    assert original_source in llm.calls[0][0]
+    captured_fragments = [fragment.to_prompt_dict() for fragment in delivery_authority_fragments(original_source)]
+    assert json.dumps(captured_fragments, indent=2, sort_keys=True) in llm.calls[0][0]
     assert "Transient authority" not in llm.calls[0][0]
 
 
@@ -1507,7 +1673,7 @@ def test_review_audit_failure_preserves_evidence_in_terminal_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     base = _git_init(tmp_path)
-    plan_path = _write_plan(tmp_path)
+    plan_path = _write_plan(tmp_path, with_obligation=True)
     unit_commit = _git_commit_all(tmp_path, "delivery unit")
     progress_path = delivery_progress_path(tmp_path, "demo")
     write_delivery_progress(
@@ -1520,7 +1686,10 @@ def test_review_audit_failure_preserves_evidence_in_terminal_fallback(
         ),
     )
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'
+    approval = (
+        '{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],'
+        '"obligation_results":[{"id":"deliver-source-behavior","outcome":"satisfied"}]}'
+    )
     usage = {"agent": "reviewer", "reported_tokens": 42}
     reviewer = DeliveryIntegrationReviewAgent(
         _ReadonlyLLM([approval]),
@@ -1557,8 +1726,14 @@ def test_review_audit_failure_preserves_evidence_in_terminal_fallback(
     assert result.status == "blocked"
     assert result.stop_code == "delivery_verification.audit_unavailable"
     assert result.semantic_status == "approved"
+    assert result.obligation_count == 1
+    assert result.obligation_satisfied_count == 1
+    assert result.obligation_gap_count == 0
     assert progress is not None and not errors and progress.verification is not None
     assert progress.verification.semantic_status == "approved"
+    assert progress.verification.obligation_count == 1
+    assert progress.verification.obligation_satisfied_count == 1
+    assert progress.verification.obligation_gap_count == 0
     assert fallback["event"] == "blocked"
     assert fallback["review_evidence"]["event"] == "semantic_review"
     assert fallback["review_evidence"]["assessment"]["disposition"] == "approved"
@@ -1662,7 +1837,7 @@ def test_security_workspace_setup_failure_preserves_semantic_approval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     base = _git_init(tmp_path)
-    plan_path = _write_plan(tmp_path, risk_tags=["privacy"])
+    plan_path = _write_plan(tmp_path, risk_tags=["privacy"], with_obligation=True)
     unit_commit = _git_commit_all(tmp_path, "delivery unit")
     progress_path = delivery_progress_path(tmp_path, "demo")
     write_delivery_progress(
@@ -1680,7 +1855,10 @@ def test_security_workspace_setup_failure_preserves_semantic_approval(
         lambda *args, **kwargs: validation,
     )
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'
+    approval = (
+        '{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],'
+        '"obligation_results":[{"id":"deliver-source-behavior","outcome":"satisfied"}]}'
+    )
     semantic_llm = _ReadonlyLLM([approval])
     security_llm = _WorkspaceSetupFailingReadonlyLLM(
         [],
@@ -1702,12 +1880,18 @@ def test_security_workspace_setup_failure_preserves_semantic_approval(
     assert result.validation_executed is True
     assert result.semantic_status == "approved"
     assert result.security_status == "blocked"
+    assert result.obligation_count == 1
+    assert result.obligation_satisfied_count == 1
+    assert result.obligation_gap_count == 0
     assert len(semantic_llm.calls) == 1
     assert security_llm.calls == []
     assert progress is not None and not errors and progress.verification is not None
     assert progress.verification.validation_executed is True
     assert progress.verification.semantic_status == "approved"
     assert progress.verification.security_status == "blocked"
+    assert progress.verification.obligation_count == 1
+    assert progress.verification.obligation_satisfied_count == 1
+    assert progress.verification.obligation_gap_count == 0
 
 
 def test_delivery_verification_rejects_candidate_symlink_escape(tmp_path: Path) -> None:
@@ -1917,7 +2101,7 @@ def test_delivery_verification_interruption_is_durable_and_propagated(tmp_path: 
 
 def test_delivery_verify_projection_matches_published_schema_shape() -> None:
     schema = json.loads(
-        (Path(__file__).parents[1] / "docs" / "schemas" / "delivery-verification-result.v1.schema.json").read_text(
+        (Path(__file__).parents[1] / "docs" / "schemas" / "delivery-verification-result.v2.schema.json").read_text(
             encoding="utf-8"
         )
     )
@@ -2089,6 +2273,71 @@ def test_verification_readiness_bounds_complete_review_packet(tmp_path: Path, pa
     assert any(issue.code == "delivery_verification.hierarchy_required" for issue in readiness.errors)
 
 
+@pytest.mark.parametrize(("id_length", "expected_ready"), [(100, True), (900, False)])
+def test_verification_readiness_counts_obligation_response_template(
+    tmp_path: Path, id_length: int, expected_ready: bool
+) -> None:
+    _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path)
+    data = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    source_text = "x" * 126_000
+    (tmp_path / data["source_task"]["path"]).write_text(source_text, encoding="utf-8")
+    data["source_task"]["sha256"] = "sha256:" + sha256(source_text.encode("utf-8")).hexdigest()
+    source_ref = delivery_authority_fragments(source_text)[0].id
+    data["obligations"] = [
+        {
+            "id": f"outcome-{index:03}-" + "x" * (id_length - 12),
+            "summary": "Requested behavior is established.",
+            "source_fragment_ids": [source_ref],
+            "unit_ids": ["unit"],
+        }
+        for index in range(230)
+    ]
+    plan_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    status = get_delivery_status(plan_path)
+    config = _config(tmp_path)
+    assert status.valid is True
+    llm = _ReadonlyLLM([])
+    reviewer = DeliveryIntegrationReviewAgent(llm, config)
+    prompt_args = {
+        "cwd": tmp_path,
+        "review_kind": "semantic",
+        "source_task": source_text,
+        "plan_context": delivery_verification_plan_context(status),
+        "validation_summary": {"status": "passed"},
+        "candidate_commit": _COMMIT,
+        "candidate_tree": _TREE,
+        "known_obligation_ids": {obligation["id"] for obligation in data["obligations"]},
+    }
+    prompt = reviewer._prompt(**prompt_args)
+
+    readiness = check_delivery_verification_readiness(status, config)
+
+    assert readiness.source_bytes <= MAX_DELIVERY_VERIFICATION_SOURCE_BYTES
+    assert readiness.plan_bytes <= MAX_DELIVERY_VERIFICATION_PLAN_BYTES
+    assert readiness.packet_bytes >= len(prompt.encode("utf-8"))
+    assert readiness.ready is expected_ready
+    assert (len(prompt.encode("utf-8")) <= MAX_DELIVERY_VERIFICATION_PACKET_BYTES) is expected_ready
+    if not expected_ready:
+        assert {issue.code for issue in readiness.errors} == {"delivery_verification.hierarchy_required"}
+        run_task = Mock()
+        context = DeliveryRunNextContext(
+            run_task=run_task,
+            resolve_state_dir=lambda cfg: tmp_path / ".sikula" / "state",
+            state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        )
+        result = _run_next_delivery_unit(
+            argparse.Namespace(plan_file=str(plan_path)), config, context, project_root=tmp_path
+        )
+        assert result.ran is False
+        assert {issue.code for issue in result.errors} == {"delivery_verification.hierarchy_required"}
+        run_task.assert_not_called()
+        with pytest.raises(DeliveryIntegrationReviewAgentError) as exc_info:
+            reviewer.review(**prompt_args, known_unit_ids={"unit"})
+        assert exc_info.value.code == "delivery_verification.hierarchy_required"
+        assert llm.calls == []
+
+
 def test_verification_readiness_rejects_rules_outside_reviewer_read_scope(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
@@ -2215,6 +2464,45 @@ def test_integration_review_parser_accepts_exact_final_control_object() -> None:
     assert assessment.findings == []
 
 
+def test_integration_review_parser_requires_one_terminal_result_per_obligation() -> None:
+    output = (
+        '{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],'
+        '"obligation_results":[{"id":"deliver-source-behavior","outcome":"satisfied"}]}'
+    )
+
+    assessment = parse_delivery_integration_review(
+        output,
+        known_unit_ids={"unit"},
+        known_obligation_ids={"deliver-source-behavior"},
+    )
+
+    assert assessment.approved is True
+    assert [result.to_dict() for result in assessment.obligation_results] == [
+        {"id": "deliver-source-behavior", "outcome": "satisfied"}
+    ]
+
+    with pytest.raises(DeliveryIntegrationReviewParseError) as exc_info:
+        parse_delivery_integration_review(
+            '{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],"obligation_results":[]}',
+            known_unit_ids={"unit"},
+            known_obligation_ids={"deliver-source-behavior"},
+        )
+
+    assert exc_info.value.code == "delivery_verification.review_obligations_invalid"
+
+    with pytest.raises(DeliveryIntegrationReviewParseError) as exc_info:
+        parse_delivery_integration_review(
+            '{"schema_version":2,"disposition":"repair_required","summary":"Repair needed.",'
+            '"findings":[{"code":"missing","summary":"Behavior is missing.","unit_ids":["unit"],'
+            '"obligation_ids":[]}],"obligation_results":['
+            '{"id":"deliver-source-behavior","outcome":"missing"}]}',
+            known_unit_ids={"unit"},
+            known_obligation_ids={"deliver-source-behavior"},
+        )
+
+    assert exc_info.value.code == "delivery_verification.review_obligation_findings_invalid"
+
+
 def test_integration_reviewer_rejects_exact_oversized_prompt_before_provider(tmp_path: Path) -> None:
     llm = _ReadonlyLLM([])
     reviewer = DeliveryIntegrationReviewAgent(llm, _config(tmp_path))
@@ -2233,6 +2521,44 @@ def test_integration_reviewer_rejects_exact_oversized_prompt_before_provider(tmp
 
     assert exc_info.value.code == "delivery_verification.hierarchy_required"
     assert llm.calls == []
+
+
+def test_integration_review_prompt_renders_exact_current_obligation_ids(tmp_path: Path) -> None:
+    obligation_ids = {"deliver-api", "deliver-client"}
+    response = (
+        '{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],'
+        '"obligation_results":[{"id":"deliver-api","outcome":"satisfied"},'
+        '{"id":"deliver-client","outcome":"satisfied"}]}'
+    )
+    llm = _ReadonlyLLM([response])
+
+    DeliveryIntegrationReviewAgent(llm, _config(tmp_path)).review(
+        cwd=tmp_path,
+        review_kind="semantic",
+        source_task="# Source",
+        plan_context={"units": [{"id": "unit"}]},
+        validation_summary={"status": "passed"},
+        candidate_commit=_COMMIT,
+        candidate_tree=_TREE,
+        known_unit_ids={"unit"},
+        known_obligation_ids=obligation_ids,
+    )
+
+    expected = json.dumps(
+        {
+            "schema_version": 2,
+            "disposition": "approved",
+            "summary": "One bounded single-line summary",
+            "findings": [],
+            "obligation_results": [
+                {"id": "deliver-api", "outcome": "satisfied"},
+                {"id": "deliver-client", "outcome": "satisfied"},
+            ],
+        },
+        separators=(",", ":"),
+    )
+    assert f"must be exactly:\n{expected}\n" in llm.calls[0][0]
+    assert "obligation-id" not in llm.calls[0][0]
 
 
 @pytest.mark.parametrize(
@@ -2395,6 +2721,7 @@ def test_integration_review_prompt_declares_configured_read_paths(tmp_path: Path
     )
 
     assert 'configured paths: ["."]' in llm.calls[0][0]
+    assert '"obligation_results":[]' in llm.calls[0][0]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes are not portable to Windows")

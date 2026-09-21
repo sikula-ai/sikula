@@ -9,6 +9,7 @@ from agents.base_agent import AGENT_SECURITY_PREFIX, load_extra_rules as _load_e
 from core.delivery_verification_review import (
     DeliveryIntegrationAssessment,
     DeliveryIntegrationReviewParseError,
+    delivery_integration_review_control_example,
     parse_delivery_integration_review,
 )
 from core.delivery_verification import (
@@ -17,6 +18,7 @@ from core.delivery_verification import (
     delivery_verification_prompt_is_bounded,
 )
 from core.llm_client import LLMClient
+from core.delivery_obligations import delivery_authority_fragments
 from tools.base_tool import Sandbox
 from tools.file_tool import FileTool
 
@@ -70,6 +72,7 @@ class DeliveryIntegrationReviewAgent:
         candidate_commit: str,
         candidate_tree: str,
         known_unit_ids: set[str],
+        known_obligation_ids: set[str] | None = None,
     ) -> DeliveryIntegrationReviewResult:
         if review_kind not in {"semantic", "security"}:
             raise ValueError("delivery integration review kind is invalid")
@@ -81,6 +84,7 @@ class DeliveryIntegrationReviewAgent:
             validation_summary=validation_summary,
             candidate_commit=candidate_commit,
             candidate_tree=candidate_tree,
+            known_obligation_ids=known_obligation_ids or set(),
         )
         attempts: list[DeliveryIntegrationReviewAttempt] = []
         format_error: str | None = None
@@ -114,7 +118,11 @@ class DeliveryIntegrationReviewAgent:
                     attempts,
                 ) from None
             try:
-                assessment = parse_delivery_integration_review(output, known_unit_ids=known_unit_ids)
+                assessment = parse_delivery_integration_review(
+                    output,
+                    known_unit_ids=known_unit_ids,
+                    known_obligation_ids=known_obligation_ids or set(),
+                )
             except DeliveryIntegrationReviewParseError as exc:
                 attempts.append(
                     DeliveryIntegrationReviewAttempt(
@@ -158,6 +166,7 @@ class DeliveryIntegrationReviewAgent:
         validation_summary: dict[str, Any],
         candidate_commit: str,
         candidate_tree: str,
+        known_obligation_ids: set[str],
     ) -> str:
         focus = (
             "Review whether the complete assembled candidate satisfies the authoritative source task and whether "
@@ -197,16 +206,19 @@ class DeliveryIntegrationReviewAgent:
                 [],
             )
         extra_rules = _load_extra_rules(self.project_config, agent_name, file_tool)
+        control_object_example = delivery_integration_review_control_example(
+            known_obligation_ids if review_kind == "semantic" else set()
+        )
+        authority_fragments = [fragment.to_prompt_dict() for fragment in delivery_authority_fragments(source_task)]
         prompt = f"""{AGENT_SECURITY_PREFIX}{focus}
 
 Inspect the candidate workspace using read-only tools. Do not modify files or project state.
 You may only inspect project files under these configured paths: {json.dumps(allowed_read_paths)}.
 The candidate commit is {candidate_commit} and its tree is {candidate_tree}.
 
-Authoritative source task:
-<source-task>
-{source_task}
-</source-task>
+Authoritative source fragments. Their ids and exact text are deterministically derived from the
+fingerprinted source task:
+{json.dumps(authority_fragments, indent=2, sort_keys=True)}
 
 Delivery plan context:
 {json.dumps(plan_context, indent=2, sort_keys=True)}
@@ -219,12 +231,26 @@ Disposition rules:
 - repair_required: accepted authority can be satisfied by a new in-repository repair unit.
 - scope_amendment_required: accepted delivery scope or decomposition must change first.
 - external_dependency_gap: an authoritative external dependency must change first.
-- human_review_required: evidence or authority is ambiguous and cannot be approved safely.
+- human_review_required: a specific authoritative decision or external input remains unavailable after
+  bounded inspection of authorized project evidence. Resolve ordinary implementation uncertainty
+  from the codebase and supplied context; do not equate a missing prompt fact with missing authority.
+  Confirmed external-dependency and security stops take precedence; never invent a substitute.
+
+Obligation rules:
+- For semantic review, assess every obligation from the plan context exactly once.
+- Use satisfied only when the assembled candidate establishes the obligation.
+- Use missing, conflicting, or uncertain when the obligation is not safely established.
+- Approved requires every obligation outcome to be satisfied.
+- Check the full authoritative source independently of the extracted obligations and source_accounting.
+  Coverage records are traceability, not proof of semantic completeness. Reject context-only decisions
+  that hide a requirement, even when all listed obligations are satisfied. Owning units may contribute
+  collectively to an outcome; every applicable hard constraint remains binding.
+- Security review receives no functional obligation set; return an empty obligation_results list.
 
 You may write bounded review prose before the control object. The final non-empty line must be exactly:
-{{"schema_version":1,"disposition":"approved","summary":"One bounded single-line summary","findings":[]}}
+{control_object_example}
 
-For a non-approved disposition, include one or more findings with exactly code, summary, and unit_ids.
+For a non-approved disposition, include one or more findings with exactly code, summary, unit_ids, and obligation_ids.
 Do not output absolute paths, source excerpts, secrets, credentials, or private local metadata.
 """
         return read_only_agent_prompt(prompt)

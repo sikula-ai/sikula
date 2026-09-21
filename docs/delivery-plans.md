@@ -140,7 +140,7 @@ The assistant output accepted by `delivery prepare` contains exactly one
 schema-matching top-level JSON object. The object may be raw, fenced, or
 surrounded by incidental model prose; malformed, nested, and multiple response
 objects are rejected. Top-level fields are `plan_id`,
-`title`, `planning_mode`, `warnings`, `constraints`, and `units`; unknown fields are rejected.
+`title`, `planning_mode`, `warnings`, `constraints`, `obligations`, `source_accounting`, and `units`; unknown fields are rejected.
 `planning_mode`, when present, must be `fixed_window`. `units` must be a
 non-empty list of objects with `id`, `title`, `depends_on`, `task_markdown`,
 and optional `stream`, `component`, `phase`, `kind`, `platform`, and
@@ -204,22 +204,72 @@ Authoring uses this kind only for prerequisites known to be unavailable before
 execution. Conditional ownership, security, or fallback rules use their respective
 constraint kinds; blockers discovered during a child run use
 `external_dependency_gap`.
-After the first authoring response is parsed, Sikula makes a separate command-free
+Unless the parsed draft already identifies a prerequisite stop, Sikula makes a separate command-free
 read-only verification call with the authoritative source task and every candidate
 unit. The verifier must independently confirm that the constraint list is complete,
 echo every constraint identity and unit assignment exactly, and mark every disposition
 preserved. An empty authored list is accepted only when that verification confirms the
 source has no omitted hard rule. An incomplete result must identify every detected
 omitted constraint or missing unit assignment with bounded metadata. Sikula gives those
-gaps to one constraints-only repair call and independently verifies the repaired list.
+metadata-only gaps to one constraints-only repair call and independently verifies the repaired list.
 The constraint repair call cannot change units, dependencies, task Markdown, scope, asset
 assignments, sizing, risk tags, or budgets, cannot remove or rewrite existing constraints,
 and cannot add anything outside the verifier gaps. A malformed repair, a second incomplete result,
-uncertainty, or conflict blocks before the writer creates files and reports the remaining
+unresolved uncertainty, or conflict after supported bounded correction blocks before the writer creates files and reports the remaining
 bounded gaps. Every authoring, verification, and repair invocation remains in the local
 preparation audit with its actual round index and Sikula runtime version.
 
-Constraint repair does not rewrite unit tasks. Separately, the same independent
+Fresh authoring also requires `obligations`. Sikula deterministically splits
+the complete source task at Markdown headings and top-level list items and gives
+the author stable source-fragment IDs. Each obligation describes one observable
+outcome, references the exact fragments that establish it, and names every
+generated unit that owns it. The independent verifier reports specific omitted
+obligations and missing owners; one obligation-only repair may apply only those
+gaps before a second verification. Unknown fragments, unknown or superseded
+owners, duplicate IDs, unresolved dispositions, and a second incomplete result
+block publication. `plan.yaml` stores obligation identities, bounded summaries,
+provenance references, and owners, not source excerpts. Obligations require a
+schema-version-2 plan with `verification.mode: final_gate`; existing plans
+without this additive list remain readable.
+
+Fresh authoring also requires `source_accounting`: exactly one record per source
+fragment, with `source_fragment_id`, a `mapped`, `context_only`, or `unresolved`
+disposition, `obligation_ids`, `constraint_ids`, and a private bounded `rationale`.
+Mappings must agree with obligation provenance in both directions. Context-only
+records explain why a heading or other context introduces no requirement; the
+independent verifier can reject that decision. Unknown, duplicate, missing, or
+unresolved records cannot publish. The plan retains only the mapping and
+`rationale_sha256`; rationale text remains in the private preparation audit.
+Existing plans without source accounting retain their legacy interpretation;
+they do not acquire fabricated coverage. Accounting changes alter the plan
+fingerprint and invalidate incompatible final-gate evidence.
+
+For a concrete unit-contract gap, an unresolved interpretation, or a disputed
+source classification, preparation can make one bounded draft correction and
+verify it independently. It may change only affected task Markdown and the
+reported accounting/requirement gaps; unit identities, dependencies, scope,
+assets, budgets, and unrelated contracts remain fixed. The verifier can request
+up to eight project-relative context files, read once within `allowed_read_paths`
+(maximum 16 KB per file, 64 KB total). Private runtime paths, environment files,
+links, binary files, and oversized files are unavailable to this reader. The
+retrieved evidence and correction decisions remain in the private audit and are
+also supplied to the second independent verification. This is preparation only;
+it does not execute repair units or automatically apply amendments.
+
+Known `stop_and_follow_up` constraints stop before another provider call, even
+when unrelated bookkeeping is incomplete. A prerequisite discovered by the
+verifier likewise preempts repair; one discovered during correction blocks immediately
+without another verification call. No correction may invent a replacement for an
+unavailable dependency, erase a terminal stop, or broaden authority. Existing
+`external_dependency_gap`, reset, and amendment-follow-up boundaries are unchanged.
+An unresolved decision after the bounded correction remains blocked; provider,
+protocol, and context capability failures do not imply a new product requirement.
+Unresolved source or contract gaps report `delivery_prepare.authority_unresolved`;
+required evidence unavailable within the read capability reports
+`delivery_prepare.context_unavailable` (or `delivery_amend.context_unavailable`
+during amendment preparation). Private audit retains the failed retrieval details.
+
+The metadata-only constraint repair does not rewrite unit tasks. Separately, the same independent
 verification pass checks that each unit task is self-contained for source-defined
 identifiers and values that must be used verbatim. If localization keys, enum values,
 API field names, fixed copy, or similar exact source lines are missing, deterministic
@@ -338,6 +388,16 @@ the validated plan on pending, budget-split, and failed-child amendment paths ra
 than being inferred only from optional failure evidence. A separate read-only verifier
 must confirm that all replacements preserve every applicable constraint before
 deterministic proposal publication.
+For source-bound obligations, the amendment author supplies `obligation_assignments`
+mapping every applicable obligation ID to a non-empty subset of replacement IDs.
+Independent verification checks that those contracts collectively preserve the
+target unit's entire contribution. Other owners retain their unchanged contributions;
+replacements of a sole owner must cover the whole outcome. Apply preserves other owners, obligation identity, summary, and source
+provenance. The mapping is fingerprinted in the proposal and validated again on
+load/apply; unknown or missing owners cannot publish. Legacy proposals without
+this additive mapping retain their original all-replacements interpretation.
+Hard constraints still apply to every affected replacement. Uncertain, omitted,
+or conflicting outcomes block the proposal.
 Proposal publication uses a same-directory temporary file and atomic
 no-overwrite publish, so the content-addressed proposal is complete or absent.
 Directory fsync is best effort, matching Sikula's other state writers.
@@ -895,6 +955,11 @@ constraint or any retained security, privacy, authorization, or
 execution-boundary risk tag, including one on a superseded unit, additionally
 require an independent read-only security approval.
 Malformed output gets one bounded format retry and never becomes approval.
+For plans carrying source-bound obligations, the semantic reviewer must return
+one `satisfied`, `missing`, `conflicting`, or `uncertain` result per obligation.
+Only an all-`satisfied` set can approve. Status and JSON expose only bounded
+obligation totals and satisfied/gap counts; detailed assessments remain in the
+private local verification audit.
 If a later reviewer fails, status retains completed validation and earlier review
 phases. Rejected review dispositions select repair, amendment, external-dependency,
 or human-review recovery instead of recommending an unchanged verification retry.
@@ -995,8 +1060,19 @@ plan_id: checkout-redesign
 title: Checkout redesign
 planning_mode: fixed_window
 final_branch: sikula/delivery/checkout-redesign
+source_task:
+  path: .sikula/tasks/checkout-redesign.md
+  sha256: sha256:<fingerprint-of-logical-utf8-source>
 verification:
   mode: final_gate
+obligations:
+  - id: reject-invalid-carts
+    summary: Invalid cart submissions are rejected without changing valid checkout behavior.
+    source_fragment_ids:
+      - source-18-20-0123456789ab
+    unit_ids:
+      - 01-domain-model
+      - 02-api
 streams:
   - id: backend
     label: Backend
@@ -1144,7 +1220,8 @@ credentials, tokens, or source excerpts. Privacy-safe projections such as
 `delivery prepare --json`, `delivery status --json`, `delivery run-next --json`,
 `delivery run --json`, and `delivery verify --json` use project-relative paths for local delivery
 artifacts where possible. The `delivery verify --json` contract is published as
-`docs/schemas/delivery-verification-result.v1.schema.json`; extended status, run,
+`docs/schemas/delivery-verification-result.v2.schema.json`; v1 remains available
+for consumers pinned to the earlier projection. Extended status, run,
 and finalize projections include their projection schema version, Sikula version,
 command identity, and privacy mode. The operator-oriented `delivery check --json`
 may still include a local plan path. The parent plan path stored in the child task state

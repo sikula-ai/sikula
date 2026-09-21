@@ -8,8 +8,11 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
+from core.delivery_obligations import delivery_authority_fragments
 from core.delivery_plan import DeliveryPlanCheckResult, DeliveryPlanIssue, is_private_delivery_source_task_path
 from core.delivery_progress import DeliveryStatusResult
+from core.delivery_verification_model import delivery_verification_covers_obligations
+from core.delivery_verification_review import delivery_integration_review_control_example
 from core.delivery_verification_validation import delivery_validation_review_policy
 from core.worktree import delivery_verification_git_env
 from tools.base_tool import Sandbox
@@ -172,6 +175,7 @@ def check_delivery_verification_readiness(
     warnings = list(status.warnings)
     security_required = delivery_verification_security_required(status)
     source_bytes = 0
+    source_prompt_bytes = 0
     plan_bytes = 0
     packet_policy_bytes = 0
     active_unit_count = len([unit for unit in plan.units if not unit.superseded]) if plan else 0
@@ -252,8 +256,18 @@ def check_delivery_verification_readiness(
                 )
             else:
                 try:
-                    source_bytes = len(source_path.read_bytes())
-                except OSError:
+                    source_data = source_path.read_bytes()
+                    source_bytes = len(source_data)
+                    source_text = source_data.decode("utf-8")
+                    source_prompt_bytes = len(
+                        json.dumps(
+                            [fragment.to_prompt_dict() for fragment in delivery_authority_fragments(source_text)],
+                            indent=2,
+                            sort_keys=True,
+                            ensure_ascii=True,
+                        ).encode("utf-8")
+                    )
+                except (OSError, UnicodeError):
                     errors.append(
                         DeliveryPlanIssue(
                             "error",
@@ -320,8 +334,17 @@ def check_delivery_verification_readiness(
         if plan is not None
         else 0
     )
+    control_object_bytes = len(
+        delivery_integration_review_control_example(
+            {obligation.id for obligation in plan.obligations} if plan is not None else set()
+        ).encode("utf-8")
+    )
     packet_bytes = (
-        source_bytes + plan_context_bytes + packet_policy_bytes + _DELIVERY_VERIFICATION_PROMPT_OVERHEAD_BYTES
+        source_prompt_bytes
+        + plan_context_bytes
+        + packet_policy_bytes
+        + control_object_bytes
+        + _DELIVERY_VERIFICATION_PROMPT_OVERHEAD_BYTES
     )
     if packet_bytes > MAX_DELIVERY_VERIFICATION_PACKET_BYTES:
         errors.append(
@@ -415,7 +438,11 @@ def with_delivery_verification_readiness(
                 f"refs/heads/{status.plan.final_branch}",
                 verification.candidate_commit,
             )
-            and _verification_record_matches_identity(verification, identity)
+            and _verification_record_matches_identity(
+                verification,
+                identity,
+                obligation_count=len(status.plan.obligations),
+            )
         ):
             return status
         return replace(
@@ -563,6 +590,10 @@ def delivery_verification_plan_context(status: DeliveryPlanCheckResult | Deliver
         "title": plan.title,
         "units": [unit.to_authoring_dict() for unit in plan.units if not unit.superseded],
         "constraints": [constraint.to_dict() for constraint in plan.constraints],
+        "obligations": [obligation.to_context_dict() for obligation in plan.obligations],
+        "source_accounting": [record.to_dict() for record in plan.source_accounting]
+        if plan.source_accounting is not None
+        else None,
         "components": [component.to_dict() for component in plan.components],
     }
 
@@ -655,8 +686,13 @@ def _append_rules_unavailable(errors: list[DeliveryPlanIssue], agent_name: str) 
         errors.append(issue)
 
 
-def _verification_record_matches_identity(record: Any, identity: DeliveryVerificationIdentity) -> bool:
-    return all(
+def _verification_record_matches_identity(
+    record: Any,
+    identity: DeliveryVerificationIdentity,
+    *,
+    obligation_count: int,
+) -> bool:
+    return delivery_verification_covers_obligations(record, obligation_count) and all(
         getattr(record, key, None) == getattr(identity, key)
         for key in (
             "gate_id",
