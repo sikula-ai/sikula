@@ -21,6 +21,7 @@ from core.delivery_plan import (
     is_valid_delivery_branch_name,
     render_delivery_plan_check,
 )
+from core.delivery_obligations import delivery_authority_fragments
 from sikula import main
 from sikula_cli.delivery import cmd_delivery_check
 
@@ -689,6 +690,120 @@ def test_delivery_plan_check_accepts_schema_v2_final_gate_policy(tmp_path: Path)
     assert result.plan.verification.to_dict() == {"mode": "final_gate"}
 
 
+def test_delivery_plan_check_binds_obligations_to_source_fragments_and_active_units(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    source_text = "# Goal\n\nDeliver checkout behavior.\n\n## Acceptance criteria\n\n- Invalid carts are rejected.\n"
+    data = _base_plan(tmp_path)
+    data["schema_version"] = 2
+    data["source_task"] = _write_source_task(tmp_path, source_text)
+    data["verification"] = {"mode": "final_gate"}
+    data["obligations"] = [
+        {
+            "id": "reject-invalid-carts",
+            "summary": "Invalid cart submissions are rejected safely.",
+            "source_fragment_ids": [delivery_authority_fragments(source_text)[-1].id],
+            "unit_ids": ["01-domain", "02-api"],
+        }
+    ]
+    data["source_accounting"] = [
+        {
+            "source_fragment_id": fragment.id,
+            "disposition": "mapped" if fragment.id in data["obligations"][0]["source_fragment_ids"] else "context_only",
+            "obligation_ids": ["reject-invalid-carts"]
+            if fragment.id in data["obligations"][0]["source_fragment_ids"]
+            else [],
+            "constraint_ids": [],
+            "rationale_sha256": "sha256:" + sha256(b"Source coverage rationale.").hexdigest(),
+        }
+        for fragment in delivery_authority_fragments(source_text)
+    ]
+
+    result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
+
+    assert result.valid is True
+    assert result.plan is not None
+    assert result.plan.obligations[0].id == "reject-invalid-carts"
+
+    data["obligations"][0]["unit_ids"] = ["unknown"]
+    invalid = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
+
+    assert invalid.valid is False
+    assert "obligations.unit_unknown" in _codes(invalid)
+
+
+def test_delivery_plan_check_rejects_obligations_without_schema_v2_final_gate(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    source_text = "# Goal\n\nDeliver checkout behavior.\n"
+    data = _base_plan(tmp_path)
+    data["source_task"] = _write_source_task(tmp_path, source_text)
+    data["obligations"] = [
+        {
+            "id": "deliver-checkout",
+            "summary": "Checkout behavior is delivered.",
+            "source_fragment_ids": [delivery_authority_fragments(source_text)[0].id],
+            "unit_ids": ["01-domain"],
+        }
+    ]
+
+    result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
+
+    assert result.valid is False
+    assert "obligations.verification_required" in _codes(result)
+
+
+@pytest.mark.parametrize("source_error", ["private-path", "source-excerpt", "mixed-refs", "stale", "missing"])
+def test_delivery_check_omits_obligations_with_unvalidated_sources(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], source_error: str
+) -> None:
+    _git_init(tmp_path)
+    private_excerpt = "Checkout integrations must preserve the unpublished settlement protocol."
+    source_text = f"# Source\n\n{private_excerpt}\n"
+    data = _base_plan(tmp_path)
+    data["schema_version"] = 2
+    data["verification"] = {"mode": "final_gate"}
+    data["source_task"] = _write_source_task(tmp_path, source_text)
+    source_ref = delivery_authority_fragments(source_text)[0].id
+    valid_obligation = {
+        "id": "accepted-outcome",
+        "summary": "Checkout requests are validated safely.",
+        "source_fragment_ids": [source_ref],
+        "unit_ids": ["01-domain"],
+    }
+    rejected_obligation = {**valid_obligation, "id": "rejected-outcome"}
+    private_path = "/private/customer/settlement-notes.md"
+    if source_error == "private-path":
+        rejected_obligation["source_fragment_ids"] = [private_path]
+    elif source_error == "source-excerpt":
+        rejected_obligation["source_fragment_ids"] = [private_excerpt]
+    elif source_error == "mixed-refs":
+        rejected_obligation["source_fragment_ids"] = [source_ref, private_path]
+    else:
+        rejected_obligation["summary"] = private_excerpt
+        if source_error == "stale":
+            data["source_task"]["sha256"] = "sha256:" + "0" * 64
+        else:
+            (tmp_path / data["source_task"]["path"]).unlink()
+    data["obligations"] = [valid_obligation, rejected_obligation]
+    plan_path = _write_plan(tmp_path, data)
+
+    result = check_delivery_plan_file(plan_path, project_root=tmp_path)
+
+    assert result.valid is False
+    assert "obligations.source_ref_unknown" in _codes(result)
+    assert result.plan is not None
+    expected_obligations = [] if source_error in {"stale", "missing"} else [valid_obligation]
+    assert [obligation.to_dict() for obligation in result.plan.obligations] == expected_obligations
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_check(argparse.Namespace(plan_file=str(plan_path), json=True), {})
+
+    assert exc_info.value.code == 1
+    output = capsys.readouterr().out
+    assert json.loads(output)["plan"].get("obligations", []) == expected_obligations
+    for rejected_metadata in (private_path, private_excerpt, "rejected-outcome"):
+        assert rejected_metadata not in output
+        assert rejected_metadata not in json.dumps(result.to_dict())
+
+
 @pytest.mark.parametrize(
     ("schema_version", "verification", "expected_code"),
     [
@@ -1330,3 +1445,99 @@ def test_main_dispatches_delivery_check_with_optional_project_config(tmp_path: P
 
     load_config.assert_called_once_with(None, required=False)
     delivery_check.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        None,
+        "missing",
+        "duplicate",
+        "stale",
+        "private_rationale",
+        "unmapped_constraint",
+        "absent",
+        "null",
+        "empty",
+        "legacy",
+        "legacy_empty_obligations",
+    ],
+)
+def test_plan_checks_exhaustive_source_accounting(tmp_path: Path, mutation) -> None:
+    from core.delivery_source_accounting import parse_source_accounting
+
+    _git_init(tmp_path)
+    source = "# Export\n\n- Export permitted rows.\n- Exclude restricted rows.\n"
+    fragments = delivery_authority_fragments(source)
+    data = _base_plan(tmp_path)
+    data.update(schema_version=2, source_task=_write_source_task(tmp_path, source), verification={"mode": "final_gate"})
+    data["obligations"] = [
+        {
+            "id": "safe-export",
+            "summary": "The exported result respects access restrictions.",
+            "source_fragment_ids": [fragment.id for fragment in fragments[1:]],
+            "unit_ids": ["01-domain"],
+        }
+    ]
+    data["constraints"] = [
+        {
+            "id": "export-privacy",
+            "kind": "security_boundary",
+            "summary": "Exports keep data within the permitted access boundary.",
+            "unit_ids": ["01-domain"],
+            "disposition": "preserved",
+        }
+    ]
+    records = [
+        {
+            "source_fragment_id": fragment.id,
+            "disposition": "context_only" if index == 0 else "mapped",
+            "obligation_ids": [] if index == 0 else ["safe-export"],
+            "constraint_ids": [],
+            "rationale": "PRIVATE source interpretation.",
+        }
+        for index, fragment in enumerate(fragments)
+    ]
+    records[-1]["constraint_ids"] = ["export-privacy"]
+    parsed = parse_source_accounting(
+        records,
+        fragment_ids={fragment.id for fragment in fragments},
+        obligation_sources={"safe-export": {fragment.id for fragment in fragments[1:]}},
+        constraint_ids={"export-privacy"},
+        private_rationales=True,
+    )
+    data["source_accounting"] = [record.to_dict() for record in parsed]
+    if mutation == "missing":
+        data["source_accounting"].pop()
+    elif mutation == "duplicate":
+        data["source_accounting"].append(data["source_accounting"][0])
+    elif mutation == "stale":
+        data["source_accounting"][-1]["source_fragment_id"] = "source-old"
+    elif mutation == "private_rationale":
+        data["source_accounting"][0]["rationale"] = "PRIVATE source interpretation."
+    elif mutation == "unmapped_constraint":
+        data["source_accounting"][-1]["constraint_ids"] = []
+    elif mutation in {"absent", "legacy", "legacy_empty_obligations"}:
+        data.pop("source_accounting")
+        if mutation == "legacy":
+            data.pop("obligations")
+        elif mutation == "legacy_empty_obligations":
+            data["obligations"] = []
+    elif mutation == "null":
+        data["source_accounting"] = None
+    elif mutation == "empty":
+        data["source_accounting"] = []
+    result = check_delivery_plan_file(_write_plan(tmp_path, data), project_root=tmp_path)
+    assert result.valid is (mutation in {None, "legacy", "legacy_empty_obligations"})
+    assert "PRIVATE source interpretation" not in str(result.to_dict())
+    if mutation is None:
+        assert result.plan.source_accounting is not None
+        assert result.plan.to_dict()["source_accounting"] == data["source_accounting"]
+    elif mutation in {"legacy", "legacy_empty_obligations"}:
+        assert result.plan.source_accounting is None
+    else:
+        assert any(code.startswith("source_accounting.") for code in _codes(result))
+        if mutation == "unmapped_constraint":
+            assert "source_accounting.constraints_incomplete" in _codes(result)
+        elif mutation == "absent":
+            assert "source_accounting.required" in _codes(result)

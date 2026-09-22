@@ -18,7 +18,9 @@ from core.delivery_authoring import (
     parse_delivery_authoring_output,
     parse_delivery_constraint_repair_output,
     parse_delivery_constraint_verification_output,
+    parse_delivery_obligation_repair_output,
 )
+from core.delivery_obligations import delivery_authority_fragments
 from core.delivery_plan import (
     MAX_DELIVERY_CONSTRAINT_UNIT_IDS,
     MAX_DELIVERY_CONSTRAINTS,
@@ -218,6 +220,175 @@ def test_parse_delivery_authoring_output_accepts_valid_json_object(tmp_path: Pat
     assert draft.units[1].risk_tags == ["cli_surface"]
     assert draft.units[1].budget == DeliveryUnitBudget(max_planner_steps=1)
     assert not (tmp_path / ".sikula" / "delivery" / "team-invites").exists()
+
+
+def test_source_backed_authoring_requires_stable_owned_obligations(tmp_path: Path) -> None:
+    source = "# Goal\n\nDeliver team invitations.\n\n## Acceptance criteria\n\n- Invalid invitations are rejected.\n"
+    fragments = delivery_authority_fragments(source)
+    assert "".join(fragment.text for fragment in fragments) == source
+    data = _draft_data()
+    data["obligations"] = [
+        {
+            "id": "reject-invalid-invitations",
+            "summary": "Invalid invitation attempts are rejected safely.",
+            "source_fragment_ids": [fragments[-1].id],
+            "unit_ids": ["foundation", "cli"],
+            "disposition": "preserved",
+        }
+    ]
+
+    draft = parse_delivery_authoring_output(
+        json.dumps(data),
+        expected_plan_id="team-invites",
+        project_root=tmp_path,
+        output_dir=".sikula/delivery/team-invites",
+        source_task_description=source,
+        require_obligations=True,
+    )
+
+    assert draft.obligations[0].source_fragment_ids == [fragments[-1].id]
+    assert draft.obligations[0].unit_ids == ["foundation", "cli"]
+
+    del data["obligations"]
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        parse_delivery_authoring_output(
+            json.dumps(data),
+            expected_plan_id="team-invites",
+            project_root=tmp_path,
+            output_dir=".sikula/delivery/team-invites",
+            source_task_description=source,
+            require_obligations=True,
+        )
+
+    assert exc_info.value.code == "delivery_authoring.obligations_required"
+
+
+def test_obligation_verifier_reports_and_repairs_concrete_omission() -> None:
+    source = "# Acceptance criteria\n\n- Invalid invitations are rejected.\n"
+    fragment_id = delivery_authority_fragments(source)[-1].id
+    gap = {
+        "reason": "omitted",
+        "summary": "Invalid invitation attempts are rejected safely.",
+        "source_fragment_ids": [fragment_id],
+        "affected_unit_ids": ["foundation"],
+    }
+    verification = parse_delivery_constraint_verification_output(
+        json.dumps(
+            {
+                "constraints_complete": True,
+                "constraints": [],
+                "unit_context_complete": True,
+                "unit_context_gaps": [],
+                "obligations_complete": False,
+                "obligations": [],
+                "obligation_gaps": [gap],
+            }
+        ),
+        unit_ids={"foundation"},
+        source_task_description=source,
+        require_obligations=True,
+    )
+
+    assert verification.obligations_complete is False
+    assert verification.obligation_gaps[0].to_dict() == gap
+
+    repaired = parse_delivery_obligation_repair_output(
+        json.dumps(
+            {
+                "obligations": [
+                    {
+                        "id": "reject-invalid-invitations",
+                        "summary": gap["summary"],
+                        "source_fragment_ids": [fragment_id],
+                        "unit_ids": ["foundation"],
+                        "disposition": "preserved",
+                    }
+                ]
+            }
+        ),
+        unit_ids={"foundation"},
+        source_task_description=source,
+    )
+
+    assert repaired[0].id == "reject-invalid-invitations"
+
+
+def test_obligation_verifier_preserves_distinct_omissions_for_the_same_fragment() -> None:
+    source = "# Acceptance criteria\n\n- Invitations are handled safely.\n"
+    fragment_id = delivery_authority_fragments(source)[-1].id
+    gaps = [
+        {
+            "reason": "omitted",
+            "summary": "Invalid invitation attempts are rejected safely.",
+            "source_fragment_ids": [fragment_id],
+            "affected_unit_ids": ["foundation"],
+        },
+        {
+            "reason": "omitted",
+            "summary": "Valid invitation attempts complete successfully.",
+            "source_fragment_ids": [fragment_id],
+            "affected_unit_ids": ["foundation"],
+        },
+    ]
+
+    verification = parse_delivery_constraint_verification_output(
+        json.dumps(
+            {
+                "constraints_complete": True,
+                "constraints": [],
+                "unit_context_complete": True,
+                "unit_context_gaps": [],
+                "obligations_complete": False,
+                "obligations": [],
+                "obligation_gaps": gaps,
+            }
+        ),
+        unit_ids={"foundation"},
+        source_task_description=source,
+        require_obligations=True,
+    )
+
+    assert [gap.to_dict() for gap in verification.obligation_gaps] == gaps
+
+
+def test_obligation_verifier_requires_exact_id_for_incomplete_assignment() -> None:
+    source = "# Acceptance criteria\n\n- Invitations are handled safely.\n"
+    fragment_id = delivery_authority_fragments(source)[-1].id
+    obligation = {
+        "id": "handle-invitations",
+        "summary": "Invitation attempts are handled safely.",
+        "source_fragment_ids": [fragment_id],
+        "unit_ids": ["foundation"],
+        "disposition": "preserved",
+    }
+
+    with pytest.raises(DeliveryAuthoringParseError) as exc_info:
+        parse_delivery_constraint_verification_output(
+            json.dumps(
+                {
+                    "constraints_complete": True,
+                    "constraints": [],
+                    "unit_context_complete": True,
+                    "unit_context_gaps": [],
+                    "obligations_complete": False,
+                    "obligations": [obligation],
+                    "obligation_gaps": [
+                        {
+                            "reason": "incompletely_assigned",
+                            "obligation_id": "HANDLE-INVITATIONS",
+                            "summary": obligation["summary"],
+                            "source_fragment_ids": [fragment_id],
+                            "affected_unit_ids": ["consumer"],
+                        }
+                    ],
+                }
+            ),
+            unit_ids={"foundation", "consumer"},
+            source_task_description=source,
+            require_obligations=True,
+        )
+
+    assert exc_info.value.code == "delivery_obligation_verification.gap_id_invalid"
 
 
 def test_parse_delivery_authoring_output_accepts_legacy_validation_heading(tmp_path: Path) -> None:

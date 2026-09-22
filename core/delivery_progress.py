@@ -23,6 +23,7 @@ from core.delivery_public_metadata import (
 from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE, DeliveryUnitBudget
 from core.delivery_verification_model import (
     DeliveryVerificationRecord,
+    delivery_verification_covers_obligations,
     delivery_verification_recovery_action,
     parse_delivery_verification_record,
 )
@@ -486,6 +487,9 @@ class DeliveryStatusResult:
                     "validation_reused": self.verification.validation_reused,
                     "validation_executed": self.verification.validation_executed,
                     "finding_count": self.verification.finding_count,
+                    "obligation_count": self.verification.obligation_count,
+                    "obligation_satisfied_count": self.verification.obligation_satisfied_count,
+                    "obligation_gap_count": self.verification.obligation_gap_count,
                 }
             )
             if self.verification.stop_code:
@@ -972,6 +976,7 @@ def get_delivery_status(
         verification.plan_fingerprint != check_result.plan_fingerprint
         or assembly_status != "ready"
         or assembled_commit != verification.candidate_commit
+        or not delivery_verification_covers_obligations(verification, len(plan.obligations))
     ):
         verification_status = "stale"
     return DeliveryStatusResult(
@@ -1292,6 +1297,12 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
     lines.append(f"Verification: {verification['status']}")
     if verification.get("gate_id"):
         lines.append(f"Verification gate: {verification['gate_id']}")
+    if verification.get("obligation_count"):
+        lines.append(
+            "Verification obligations: "
+            f"{verification['obligation_satisfied_count']}/{verification['obligation_count']} satisfied, "
+            f"{verification['obligation_gap_count']} gap(s)"
+        )
     assembled_commit = projection.get("assembled_commit")
     if assembled_commit:
         assembly_detail = f"{plan_data['final_branch']} @ {assembled_commit}" if plan_data else assembled_commit

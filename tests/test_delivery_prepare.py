@@ -445,6 +445,7 @@ def test_create_delivery_preparation_agent_resolves_delivery_preparer_llm_config
     cfg: dict,
     args_kwargs: dict,
     expected: tuple[str, str, int],
+    tmp_path: Path,
 ) -> None:
     args = _args("tasks/team-invites.md", **args_kwargs)
     llm = object()
@@ -459,7 +460,11 @@ def test_create_delivery_preparation_agent_resolves_delivery_preparer_llm_config
     assert result is agent
     llm_config = create_llm_client.call_args.args[0]
     assert (llm_config.provider, llm_config.model, llm_config.agent_timeout) == expected
-    agent_cls.assert_called_once_with(llm=llm, project_config=cfg)
+    reader = agent_cls.call_args.kwargs["context_reader"]
+    agent_cls.assert_called_once_with(llm=llm, project_config=cfg, context_reader=reader)
+    (tmp_path / "context.md").write_text("Existing project contract.")
+    evidence = reader(tmp_path, ["context.md"])
+    assert evidence["files"][0]["text"] == "Existing project contract."
 
 
 def test_run_delivery_prepare_authoring_records_audit_and_forwards_context(tmp_path: Path) -> None:

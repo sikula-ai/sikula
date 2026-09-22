@@ -38,6 +38,7 @@
 | `ContractCheck` helpers | `core/contract_check.py` | Deterministic implementation-contract readiness checks for Markdown/plain-text task files; `sikula run` stores a warning-only state snapshot and `sikula contract check --write-report` explicitly writes report artifacts |
 | `StructuredOutput` helpers | `core/structured_output.py` | Side-effect-free schema-aware extraction of one unambiguous top-level JSON object from LLM output while rejecting malformed, nested, or multiple response candidates |
 | `DeliveryAuthoring` helpers | `core/delivery_authoring.py` | Side-effect-free parser and derived-path helpers for delivery prepare authoring drafts, including bounded inherited source-task constraints and source-asset assignments |
+| `DeliveryObligations` helpers | `core/delivery_obligations.py`, `core/delivery_source_accounting.py` | Deterministic lossless source-fragment identities, exhaustive source accounting, and bounded source-bound obligation records |
 | `DeliveryPrepareWriter` helpers | `core/delivery_prepare_writer.py` | Deterministic source-artifact writer for parsed delivery authoring drafts; binds generated plans to a source-task fingerprint, blocks unresolved constraints, preserves source-task asset declarations, and renders `plan.yaml` plus unit task files with readiness checks, plan validation, overwrite guards, and rollback |
 | `DeliveryAssetAssignment` helpers | `core/delivery_asset_assignment.py` | Deterministic source-to-unit asset completeness, canonical alias matching, exact declaration rendering, and rendered-contract verification for prepare and amendment flows |
 | `DeliveryConstraintContext` helpers | `core/delivery_constraint_context.py` | Strict validation, integrity fingerprinting, and deterministic agent-prompt projection for a delivery child's bounded inherited constraints and parent-plan correlation |
@@ -338,13 +339,15 @@ draft remains local audit evidence and is never published. Plan checking repeats
 the comparison against the fingerprinted authoritative source and omits a rejected
 summary from public projections, including invalid-plan JSON. `needs_review`
 and `conflict` dispositions block before filesystem mutation; only
-`preserved` constraints can enter a published plan. After the authoring call, a
+`preserved` constraints can enter a published plan. Unless the parsed draft already
+identifies a prerequisite stop, a
 second command-free read-only generation call independently compares the full
 source task, declared constraints, and complete candidate unit contracts. Its
 strict result must echo the constraint identities and assignments exactly,
 confirm completeness, and classify every disposition. An incomplete result must
 identify bounded `omitted` or `incompletely_assigned` gaps with affected unit IDs;
-a bare negative completeness claim is invalid. Sikula gives those gaps to one
+a bare negative completeness claim is invalid. Where no new source mapping is needed,
+Sikula gives metadata-only gaps to one
 constraints-only repair call that cannot alter units, dependencies, task Markdown,
 scope, assets, sizing, risk, or budgets. Deterministic validation permits only one
 new constraint per omitted gap and only the missing assignments named for existing
@@ -352,6 +355,58 @@ constraints, while preserving all original constraint identities and disposition
 The repaired list is independently verified once more. A second incomplete result,
 malformed repair, uncertainty, or conflict blocks before filesystem mutation and
 projects the remaining bounded gaps instead of a generic write failure.
+Fresh authoring also requires an explicit `obligations` list. Deterministic code
+partitions the exact source task at Markdown heading and top-level list-item
+boundaries and supplies stable line-and-content-hash fragment IDs. Each obligation
+has a path-safe identity, bounded paraphrased outcome, one or more exact source
+fragment references, one or more owning units, and an authoring disposition.
+The independent authority verifier must echo the list exactly and report concrete
+`omitted` or `incompletely_assigned` gaps; one bounded obligation-only repair may
+add only those omissions or assignments before a second verification. Only
+`preserved` obligations are published. Published plans retain the obligation ID,
+summary, provenance references, and active owners without copying source text.
+Obligations are valid only in schema-version-2 plans with final-gate verification;
+older plans remain readable only without obligations. Fresh authoring requires exhaustive
+`source_accounting`, including explicit context-only decisions and private rationales.
+Plan checking also requires source accounting whenever obligations are non-empty,
+including hand-authored and edited plans; omitting it blocks verification and finalization.
+`core/delivery_source_accounting.py` checks exact fragment membership, unique records,
+bidirectional obligation references, and at least one source-fragment mapping for
+every declared constraint; independent verification assesses meaning.
+Published records retain rationale hashes, with text only in the preparation audit.
+Rationales must encode as UTF-8 before hashing; malformed model text follows the
+audited parser-failure path and the existing bounded authoring retry.
+Plans lacking this additive field remain readable as legacy plans without coverage claims.
+The exact parsed-plan fingerprint and final review context include the accounting.
+Amendment authoring supplies a complete `obligation_assignments` mapping to applicable
+replacement subsets. Its independently verified contracts must collectively preserve
+the replaced unit's entire contribution to each outcome, while other owners retain
+their unchanged contributions. A sole owner's replacements must cover the whole outcome.
+Proposal fingerprints include that mapping; apply retains other owners
+and original obligation/source identities. Legacy proposals without it keep their
+all-replacements interpretation. Hard constraints still bind every affected replacement.
+
+Preparation can correct affected draft task Markdown and reported authority gaps once,
+then independently reverify with the same source and retrieved context. Unrelated
+contracts and all unit graph, scope, asset, and budget metadata remain immutable.
+Author and verifier dispositions remain separate. A `needs_review` or `conflict`
+from either assessment requires bounded correction even when the other says
+`preserved`; publication requires both the corrected draft and its independent
+verification to preserve every constraint and obligation.
+When accounting is present, an omitted constraint uses this correction round to add
+both the constraint and its source mappings. Unrelated existing mappings stay unchanged;
+new constraint references and their private rationale are independently verified.
+The command layer injects a bounded `tools/delivery_context_tool.py` reader, which
+uses the configured Sandbox read scope and never invokes a shell or provider.
+The verifier may request eight regular project files (16 KB each, 64 KB total);
+private runtime/environment paths, links, binary data, and oversized files are excluded.
+If any requested evidence cannot be read, preparation stops before correction or
+another verification call. This runtime blocker cannot be cleared by provider approval;
+preparation must be retried after the required evidence becomes accessible.
+Requested evidence, failures, and correction attempts remain in local audit; no
+context or free-form rationale enters ordinary public projections. Known prerequisite
+stops preempt verification and correction calls. A verifier-discovered prerequisite
+also stops before repair; source accounting cannot relabel it into executable work.
 Because `preserved` is the only disposition accepted in a published plan, a
 `stop_and_follow_up` constraint still represents an unresolved control-flow stop.
 Delivery prepare adds its ID to every affected unit's blocking readiness gaps,
@@ -468,6 +523,11 @@ path, independently of optional failure evidence. A second read-only verificatio
 call must confirm that every replacement preserves every applicable constraint,
 and deterministic proposal creation rejects absent, incomplete, changed,
 uncertain, or conflicting verification.
+Before publication, correctable replacement contract gaps may receive one bounded
+Markdown correction with authorized local evidence and a second independent check.
+Replacement identities, graph, scopes, budgets, assets, and obligation assignments
+remain fixed. Known prerequisite stops block amendment preparation before authoring;
+a newly discovered external dependency stops without publishing a proposal.
 The target reference is removed rather than leaving a constraint attached to a
 superseded unit. Sikula then rechecks source fingerprints and replacement path
 availability before and after
@@ -1081,9 +1141,15 @@ disposition; the recorded repair, amendment, dependency, or human-review action
 must occur first.
 Both providers use `run_readonly_agent`, exact-final-line structured output, one
 bounded malformed-protocol retry, and fail closed on uncertainty or mutation.
+For plans with source-bound obligations, semantic review schema version 2 returns
+exactly one terminal `satisfied`, `missing`, `conflicting`, or `uncertain` result
+for every obligation ID. Approval is impossible unless all outcomes are
+`satisfied`. The security reviewer remains an independent gate and does not
+duplicate functional obligation closure.
 
 Delivery progress stores only current candidate identity, attempt, compact
-phase statuses, safe counts, timestamps, stop code, and a project-relative local
+phase statuses, obligation totals and closure/gap counts, other safe counts,
+timestamps, stop code, and a project-relative local
 audit reference. The append-only local audit owns private source prompts,
 provider output, validation diagnostics, parser failures, and interruptions. Its
 file is created without following the file or any parent symlink and remains
@@ -1096,7 +1162,8 @@ Any unit, assembly, or amendment change invalidates current evidence. Covered
 finalization accepts only the exact passed candidate and never invokes an LLM or
 synthesizes a post-review commit. The first gate measures source text, rendered
 plan context, effective validation and final-check policy, applicable reviewer
-rules, security context, and bounded protocol overhead. It also checks each exact
+rules, security context, the generated response template with every obligation ID,
+and bounded protocol overhead. It also checks each exact
 rendered reviewer prompt immediately before provider execution. Oversized
 authority packets fail with `delivery_verification.hierarchy_required`; recursive
 checkpoint scheduling and unbounded authority graphs remain future extensions.

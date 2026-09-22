@@ -13,6 +13,7 @@ import yaml
 
 from core.delivery_amendment import capture_delivery_amendment_failure_evidence, inspect_delivery_amendment_target
 from core.delivery_handoff import delivery_unit_handoff_path, read_delivery_unit_handoff
+from core.delivery_obligations import delivery_authority_fragments
 from core.state import JsonStateStore
 from sikula import main
 
@@ -236,7 +237,32 @@ def _write_delivery_stop_fixture(
     return plan_path, unit_id
 
 
-def _delivery_prepare_authoring_output() -> str:
+def _prepare_obligations(source_text: str) -> list[dict]:
+    return [
+        {
+            "id": "deliver-source-intent",
+            "summary": "The source-defined delivery behavior is implemented.",
+            "source_fragment_ids": [fragment.id for fragment in delivery_authority_fragments(source_text)],
+            "unit_ids": ["prepare-artifacts"],
+            "disposition": "preserved",
+        }
+    ]
+
+
+def _prepare_accounting(source_text: str) -> list[dict]:
+    return [
+        {
+            "source_fragment_id": fragment.id,
+            "disposition": "mapped",
+            "obligation_ids": ["deliver-source-intent"],
+            "constraint_ids": [],
+            "rationale": "PRIVATE accounting rationale for the fixture source behavior.",
+        }
+        for fragment in delivery_authority_fragments(source_text)
+    ]
+
+
+def _delivery_prepare_authoring_output(source_text: str) -> str:
     unit_markdown = """# Prepare delivery artifacts
 
 ## Goal
@@ -279,6 +305,8 @@ The delivery plan contains a focused unit that can be validated before execution
             "planning_mode": "fixed_window",
             "warnings": [],
             "constraints": [],
+            "obligations": _prepare_obligations(source_text),
+            "source_accounting": _prepare_accounting(source_text),
             "units": [
                 {
                     "id": "prepare-artifacts",
@@ -470,13 +498,17 @@ def test_delivery_prepare_cli_authors_artifacts_then_check_succeeds(
     _write_project_config(git_project)
     fake = seq_fake_llm(
         generate_responses=[
-            _delivery_prepare_authoring_output(),
+            _delivery_prepare_authoring_output(task_path.read_text(encoding="utf-8")),
             json.dumps(
                 {
                     "constraints_complete": True,
                     "constraints": [],
                     "unit_context_complete": True,
                     "unit_context_gaps": [],
+                    "obligations_complete": True,
+                    "obligations": _prepare_obligations(task_path.read_text(encoding="utf-8")),
+                    "source_accounting": _prepare_accounting(task_path.read_text(encoding="utf-8")),
+                    "obligation_gaps": [],
                 }
             ),
         ]
@@ -525,6 +557,71 @@ def test_delivery_prepare_cli_authors_artifacts_then_check_succeeds(
     assert check_payload["plan"]["plan_id"] == "team-invites"
     assert check_payload["plan"]["source_task"]["path"] == ".sikula/tasks/team-invites.md"
     assert len(check_payload["plan"]["units"]) == 1
+    assert check_payload["plan"]["source_accounting"]
+    assert "PRIVATE accounting rationale" not in json.dumps(check_payload)
+    assert "PRIVATE accounting rationale" not in plan_path.read_text()
+
+
+def test_delivery_prepare_cli_audits_failed_context_and_blocks_before_correction(
+    git_project: Path,
+    seq_fake_llm,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    task_path = git_project / ".sikula" / "tasks" / "team-invites.md"
+    task_path.parent.mkdir(parents=True, exist_ok=True)
+    source_text = "# Team invites\n\nPrepare tracked delivery artifacts.\n"
+    task_path.write_text(source_text, encoding="utf-8")
+    _write_project_config(git_project)
+    evidence_path = git_project / "project-context.md"
+    evidence_path.write_text("PRIVATE project context.", encoding="utf-8")
+    requested_paths = [evidence_path.name, "missing-context.md"]
+    authored = _delivery_prepare_authoring_output(source_text)
+    review = {
+        "constraints_complete": True,
+        "constraints": [],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+        "obligations_complete": True,
+        "obligations": _prepare_obligations(source_text),
+        "source_accounting": _prepare_accounting(source_text),
+        "unit_contract_gaps": [{"unit_id": "prepare-artifacts", "summary": "Verify the existing artifact format."}],
+        "context_paths": requested_paths,
+    }
+    fake = seq_fake_llm(
+        generate_responses=[
+            authored,
+            json.dumps(review),
+            authored,
+            json.dumps({**review, "unit_contract_gaps": [], "context_paths": []}),
+        ]
+    )
+    monkeypatch.chdir(git_project)
+    with (
+        patch("core.llm_client.create_llm_client", return_value=fake),
+        patch.object(fake, "generate", wraps=fake.generate) as generate,
+        patch("sys.argv", ["sikula", "delivery", "prepare", ".sikula/tasks/team-invites.md", "--json"]),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main()
+    payload_text = capsys.readouterr().out
+    payload = json.loads(payload_text)
+    assert exc_info.value.code == 1
+    assert payload["status"] == "blocked"
+    assert payload["prepared"] is False
+    assert [issue["code"] for issue in payload["errors"]] == ["delivery_prepare.context_unavailable"]
+    assert "PRIVATE" not in payload_text
+    assert all(path not in payload_text for path in requested_paths)
+    assert generate.call_count == 2
+    assert not (git_project / ".sikula" / "delivery" / "team-invites").exists()
+    audit_path = git_project / ".sikula" / "contract-reports" / "team-invites.delivery-prepare.auto-llm.jsonl"
+    records = [json.loads(line)["record"] for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 3
+    assert records[-1]["phase"] == "delivery_prepare_context_retrieval"
+    assert records[-1]["parsed"]["error_code"] == "delivery_prepare.context_unavailable"
+    assert records[-1]["requested_paths"] == requested_paths
+    assert [item["status"] for item in records[-1]["retrieved"]["files"]] == ["read", "denied"]
+    assert records[-1]["retrieved"]["files"][0]["text"] == "PRIVATE project context."
 
 
 def test_delivery_prepare_cli_preserves_constraints_and_assets_from_one_source_snapshot(
@@ -555,8 +652,9 @@ def test_delivery_prepare_cli_preserves_constraints_and_assets_from_one_source_s
         "unit_ids": ["prepare-artifacts"],
         "disposition": "preserved",
     }
-    authored = json.loads(_delivery_prepare_authoring_output())
+    authored = json.loads(_delivery_prepare_authoring_output(task_path.read_text(encoding="utf-8")))
     authored["constraints"] = [constraint]
+    authored["source_accounting"][0]["constraint_ids"] = [constraint["id"]]
     authored["units"][0]["asset_paths"] = [asset_path]
     fake = seq_fake_llm(
         generate_responses=[
@@ -567,6 +665,10 @@ def test_delivery_prepare_cli_preserves_constraints_and_assets_from_one_source_s
                     "constraints": [constraint],
                     "unit_context_complete": True,
                     "unit_context_gaps": [],
+                    "obligations_complete": True,
+                    "obligations": _prepare_obligations(task_path.read_text(encoding="utf-8")),
+                    "source_accounting": authored["source_accounting"],
+                    "obligation_gaps": [],
                 }
             ),
         ]
@@ -610,7 +712,7 @@ def test_delivery_prepare_cli_adds_missing_source_literals_to_unit_contract(
         encoding="utf-8",
     )
     _write_project_config(git_project)
-    authored = json.loads(_delivery_prepare_authoring_output())
+    authored = json.loads(_delivery_prepare_authoring_output(task_path.read_text(encoding="utf-8")))
     authored["units"][0]["task_markdown"] = authored["units"][0]["task_markdown"].replace(
         "Create the reviewable unit task source artifact for the delivery plan.",
         "Create the reviewable unit task source artifact using the provided localization keys.",
@@ -629,6 +731,10 @@ def test_delivery_prepare_cli_adds_missing_source_literals_to_unit_contract(
                     "constraint_gaps": [],
                     "unit_context_complete": False,
                     "unit_context_gaps": [gap],
+                    "obligations_complete": True,
+                    "obligations": _prepare_obligations(task_path.read_text(encoding="utf-8")),
+                    "source_accounting": _prepare_accounting(task_path.read_text(encoding="utf-8")),
+                    "obligation_gaps": [],
                 }
             ),
             json.dumps(
@@ -638,6 +744,10 @@ def test_delivery_prepare_cli_adds_missing_source_literals_to_unit_contract(
                     "constraint_gaps": [],
                     "unit_context_complete": True,
                     "unit_context_gaps": [],
+                    "obligations_complete": True,
+                    "obligations": _prepare_obligations(task_path.read_text(encoding="utf-8")),
+                    "source_accounting": _prepare_accounting(task_path.read_text(encoding="utf-8")),
+                    "obligation_gaps": [],
                 }
             ),
         ]
@@ -683,7 +793,7 @@ def test_delivery_prepare_cli_blocks_when_source_literals_remain_missing(
     remaining_gap = {"unit_id": "prepare-artifacts", "source_literals": [second_literal]}
     fake = seq_fake_llm(
         generate_responses=[
-            _delivery_prepare_authoring_output(),
+            _delivery_prepare_authoring_output(task_path.read_text(encoding="utf-8")),
             json.dumps(
                 {
                     "constraints_complete": True,
@@ -691,6 +801,10 @@ def test_delivery_prepare_cli_blocks_when_source_literals_remain_missing(
                     "constraint_gaps": [],
                     "unit_context_complete": False,
                     "unit_context_gaps": [first_gap],
+                    "obligations_complete": True,
+                    "obligations": _prepare_obligations(task_path.read_text(encoding="utf-8")),
+                    "source_accounting": _prepare_accounting(task_path.read_text(encoding="utf-8")),
+                    "obligation_gaps": [],
                 }
             ),
             json.dumps(
@@ -700,6 +814,10 @@ def test_delivery_prepare_cli_blocks_when_source_literals_remain_missing(
                     "constraint_gaps": [],
                     "unit_context_complete": False,
                     "unit_context_gaps": [remaining_gap],
+                    "obligations_complete": True,
+                    "obligations": _prepare_obligations(task_path.read_text(encoding="utf-8")),
+                    "source_accounting": _prepare_accounting(task_path.read_text(encoding="utf-8")),
+                    "obligation_gaps": [],
                 }
             ),
         ]
@@ -752,9 +870,12 @@ def test_delivery_prepare_cli_repairs_an_omitted_constraint_before_writing(
         "unit_ids": ["prepare-artifacts"],
         "disposition": "preserved",
     }
+    repaired = json.loads(_delivery_prepare_authoring_output(task_path.read_text(encoding="utf-8")))
+    repaired["constraints"] = [constraint]
+    repaired["source_accounting"][0]["constraint_ids"] = [constraint["id"]]
     fake = seq_fake_llm(
         generate_responses=[
-            _delivery_prepare_authoring_output(),
+            _delivery_prepare_authoring_output(task_path.read_text(encoding="utf-8")),
             json.dumps(
                 {
                     "constraints_complete": False,
@@ -762,9 +883,13 @@ def test_delivery_prepare_cli_repairs_an_omitted_constraint_before_writing(
                     "constraint_gaps": [gap],
                     "unit_context_complete": True,
                     "unit_context_gaps": [],
+                    "obligations_complete": True,
+                    "obligations": _prepare_obligations(task_path.read_text(encoding="utf-8")),
+                    "source_accounting": _prepare_accounting(task_path.read_text(encoding="utf-8")),
+                    "obligation_gaps": [],
                 }
             ),
-            json.dumps({"constraints": [constraint]}),
+            json.dumps(repaired),
             json.dumps(
                 {
                     "constraints_complete": True,
@@ -772,6 +897,10 @@ def test_delivery_prepare_cli_repairs_an_omitted_constraint_before_writing(
                     "constraint_gaps": [],
                     "unit_context_complete": True,
                     "unit_context_gaps": [],
+                    "obligations_complete": True,
+                    "obligations": _prepare_obligations(task_path.read_text(encoding="utf-8")),
+                    "source_accounting": repaired["source_accounting"],
+                    "obligation_gaps": [],
                 }
             ),
         ]
@@ -792,12 +921,13 @@ def test_delivery_prepare_cli_repairs_an_omitted_constraint_before_writing(
     plan_path = git_project / ".sikula" / "delivery" / "team-invites" / "plan.yaml"
     plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
     assert plan["constraints"] == [constraint]
+    assert plan["source_accounting"][0]["constraint_ids"] == [constraint["id"]]
     audit_path = git_project / ".sikula" / "contract-reports" / "team-invites.delivery-prepare.auto-llm.jsonl"
     audit_records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
     assert [record["record"]["phase"] for record in audit_records] == [
         "delivery_prepare_authoring",
         "delivery_prepare_constraint_verification",
-        "delivery_prepare_constraint_repair",
+        "delivery_prepare_draft_recovery",
         "delivery_prepare_constraint_verification",
     ]
     assert audit_records[-1]["record"]["round_index"] == 2
@@ -835,9 +965,12 @@ def test_delivery_prepare_cli_blocks_with_gaps_when_constraint_repair_remains_in
         "summary": "The existing protocol contract remains authoritative.",
         "affected_unit_ids": ["prepare-artifacts"],
     }
+    repaired = json.loads(_delivery_prepare_authoring_output(task_path.read_text(encoding="utf-8")))
+    repaired["constraints"] = [repaired_constraint]
+    repaired["source_accounting"][0]["constraint_ids"] = [repaired_constraint["id"]]
     fake = seq_fake_llm(
         generate_responses=[
-            _delivery_prepare_authoring_output(),
+            _delivery_prepare_authoring_output(task_path.read_text(encoding="utf-8")),
             json.dumps(
                 {
                     "constraints_complete": False,
@@ -845,9 +978,13 @@ def test_delivery_prepare_cli_blocks_with_gaps_when_constraint_repair_remains_in
                     "constraint_gaps": [first_gap],
                     "unit_context_complete": True,
                     "unit_context_gaps": [],
+                    "obligations_complete": True,
+                    "obligations": _prepare_obligations(task_path.read_text(encoding="utf-8")),
+                    "source_accounting": _prepare_accounting(task_path.read_text(encoding="utf-8")),
+                    "obligation_gaps": [],
                 }
             ),
-            json.dumps({"constraints": [repaired_constraint]}),
+            json.dumps(repaired),
             json.dumps(
                 {
                     "constraints_complete": False,
@@ -855,6 +992,10 @@ def test_delivery_prepare_cli_blocks_with_gaps_when_constraint_repair_remains_in
                     "constraint_gaps": [remaining_gap],
                     "unit_context_complete": True,
                     "unit_context_gaps": [],
+                    "obligations_complete": True,
+                    "obligations": _prepare_obligations(task_path.read_text(encoding="utf-8")),
+                    "source_accounting": repaired["source_accounting"],
+                    "obligation_gaps": [],
                 }
             ),
         ]

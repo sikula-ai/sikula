@@ -1261,6 +1261,7 @@ def _create_task_preparation_agent(args: argparse.Namespace, cfg: dict):
 def _create_delivery_preparation_agent(args: argparse.Namespace, cfg: dict) -> DeliveryPreparationAgent:
     from agents.delivery_preparation_agent import DeliveryPreparationAgent
     from core.llm_client import create_llm_client
+    from tools.delivery_context_tool import read_delivery_context
 
     overrides = {
         "agent_llms": _parse_agent_llm_overrides(
@@ -1274,7 +1275,9 @@ def _create_delivery_preparation_agent(args: argparse.Namespace, cfg: dict) -> D
     llm = create_llm_client(
         _make_llm_config(base_llm_cfg, _effective_agent_llm_cfg(cfg, overrides, "delivery_preparer"))
     )
-    return DeliveryPreparationAgent(llm=llm, project_config=cfg)
+    return DeliveryPreparationAgent(
+        llm=llm, project_config=cfg, context_reader=lambda root, paths: read_delivery_context(root, paths, cfg)
+    )
 
 
 def _run_task_refine_auto(
@@ -3465,6 +3468,11 @@ def _run_delivery_amend_prepare_authoring(
     applicable_constraints = [
         constraint.to_dict() for constraint in target.plan.constraints if target.target.id in constraint.unit_ids
     ]
+    applicable_obligations = [
+        obligation.to_context_dict()
+        for obligation in target.plan.obligations
+        if target.target.id in obligation.unit_ids
+    ]
     downstream_by_id = {unit.id: unit for unit in target.plan.units}
     try:
         draft = agent.author_delivery_amendment(
@@ -3477,6 +3485,7 @@ def _run_delivery_amend_prepare_authoring(
             project_context=_prepare_project_context_from_config(cfg),
             component_ids=component_ids,
             applicable_constraints=applicable_constraints,
+            applicable_obligations=applicable_obligations,
             failure_evidence=failure_evidence.to_prompt_dict() if failure_evidence else None,
             amend_reason=amend_reason,
             budget_exceeded=budget_exceeded.to_dict() if budget_exceeded else None,

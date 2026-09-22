@@ -294,6 +294,9 @@ def write_delivery_prepare_artifacts(
     constraint_stop_issue = verification_stop_issues[0] if verification_stop_issues else _constraint_stop_issue(draft)
     if constraint_stop_issue is not None:
         failure_reason = {
+            "delivery_prepare.stop_and_follow_up_required": _FAILURE_UNIT_READINESS_BLOCKED,
+            "delivery_prepare.context_unavailable": "context_unavailable",
+            "delivery_prepare.authority_unresolved": "authority_unresolved",
             "delivery_prepare.constraint_conflict": _FAILURE_CONSTRAINT_CONFLICT,
             "delivery_prepare.constraint_review_required": _FAILURE_CONSTRAINT_REVIEW_REQUIRED,
             "delivery_prepare.constraint_verification_incomplete": _FAILURE_CONSTRAINT_REVIEW_REQUIRED,
@@ -405,6 +408,27 @@ def write_delivery_prepare_artifacts(
             failure_reason=_FAILURE_WRITE_FAILED,
             errors=exc.issues,
             written_artifacts=exc.written_artifacts,
+        )
+
+    stop_issues = _stop_and_follow_up_prepare_issues(draft)
+    if stop_issues:
+        try:
+            unit_readiness = _check_unit_readiness(draft, unit_task_paths, project_config=project_config)
+        except (OSError, RuntimeError, ValueError, KeyError):
+            unit_readiness = None  # The known prerequisite still blocks even if readiness diagnostics fail.
+        return _blocked_result(
+            paths,
+            unit_task_paths=unit_task_paths,
+            unit_readiness=unit_readiness,
+            failure_reason=_FAILURE_UNIT_READINESS_BLOCKED,
+            errors=[
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.unit_readiness_blocked",
+                    "Generated unit task contracts have blocking readiness gaps.",
+                ),
+                *stop_issues,
+            ],
         )
 
     try:
@@ -660,6 +684,16 @@ def _invalid_delivery_public_metadata_path(draft: DeliveryAuthoringDraft) -> str
         for unit_index, unit_id in enumerate(constraint.unit_ids):
             if not is_safe_delivery_public_metadata(unit_id):
                 return f"constraints[{index}].unit_ids[{unit_index}]"
+    for index, obligation in enumerate(draft.obligations):
+        for field_name in ("id", "summary"):
+            if not is_safe_delivery_public_metadata(getattr(obligation, field_name)):
+                return f"obligations[{index}].{field_name}"
+        for ref_index, fragment_id in enumerate(obligation.source_fragment_ids):
+            if not is_safe_delivery_public_metadata(fragment_id):
+                return f"obligations[{index}].source_fragment_ids[{ref_index}]"
+        for unit_index, unit_id in enumerate(obligation.unit_ids):
+            if not is_safe_delivery_public_metadata(unit_id):
+                return f"obligations[{index}].unit_ids[{unit_index}]"
     for index, unit in enumerate(draft.units):
         for field_name in ("title", "stream", "component", "phase", "kind", "platform"):
             value = getattr(unit, field_name)
@@ -669,6 +703,8 @@ def _invalid_delivery_public_metadata_path(draft: DeliveryAuthoringDraft) -> str
 
 
 def _constraint_stop_issue(draft: DeliveryAuthoringDraft) -> DeliveryPrepareWriteIssue | None:
+    if any(item.kind == DELIVERY_CONSTRAINT_STOP_AND_FOLLOW_UP_KIND for item in draft.constraints):
+        return None  # The prerequisite gate takes precedence over ordinary semantic conflicts.
     for index, constraint in enumerate(draft.constraints):
         if constraint.disposition == "needs_review":
             return DeliveryPrepareWriteIssue(
@@ -754,6 +790,8 @@ def _unresolved_scope_path_issues(
 
 
 def _constraint_verification_stop_issues(draft: DeliveryAuthoringDraft) -> list[DeliveryPrepareWriteIssue]:
+    if any(item.kind == DELIVERY_CONSTRAINT_STOP_AND_FOLLOW_UP_KIND for item in draft.constraints):
+        return []  # The readiness gate below owns this terminal blocker.
     if draft.source_task is None:
         return []
     verification = draft.constraint_verification
@@ -766,6 +804,47 @@ def _constraint_verification_stop_issues(draft: DeliveryAuthoringDraft) -> list[
                 "constraint_verification",
             )
         ]
+    if any(gap.kind == DELIVERY_CONSTRAINT_STOP_AND_FOLLOW_UP_KIND for gap in verification.constraint_gaps):
+        return [
+            DeliveryPrepareWriteIssue(
+                "error",
+                "delivery_prepare.stop_and_follow_up_required",
+                "Independent verification found an unresolved external prerequisite; resolve it in authoritative input before preparing again.",
+                "constraint_verification.constraint_gaps",
+            )
+        ]
+    if verification.context_unavailable or verification.context_paths:
+        return [
+            DeliveryPrepareWriteIssue(
+                "error",
+                "delivery_prepare.context_unavailable",
+                "Required project evidence remains unavailable within the bounded read capability; inspect the private audit before retrying preparation.",
+                "constraint_verification",
+            )
+        ]
+    if draft.source_accounting is not None:
+        if verification.source_accounting != draft.source_accounting:
+            return [
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.source_accounting_invalid",
+                    "Independent source accounting does not match the candidate.",
+                    "source_accounting",
+                )
+            ]
+        if (
+            verification.source_accounting_gaps
+            or verification.unit_contract_gaps
+            or any(record.disposition == "unresolved" for record in draft.source_accounting)
+        ):
+            return [
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.authority_unresolved",
+                    "Bounded preparation could not resolve all source or unit-contract gaps; inspect the private preparation audit.",
+                    "source_accounting",
+                )
+            ]
     expected = [
         (constraint.id, constraint.kind, constraint.summary, constraint.unit_ids) for constraint in draft.constraints
     ]
@@ -804,6 +883,60 @@ def _constraint_verification_stop_issues(draft: DeliveryAuthoringDraft) -> list[
                 )
             )
         return issues
+    expected_obligations = [
+        (item.id, item.summary, item.source_fragment_ids, item.unit_ids) for item in draft.obligations
+    ]
+    actual_obligations = [
+        (item.id, item.summary, item.source_fragment_ids, item.unit_ids) for item in verification.obligations
+    ]
+    if actual_obligations != expected_obligations:
+        return [
+            DeliveryPrepareWriteIssue(
+                "error",
+                "delivery_prepare.obligation_verification_invalid",
+                "Independent obligation verification does not match the authored obligations.",
+                "constraint_verification.obligations",
+            )
+        ]
+    if not verification.obligations_complete:
+        issues = [
+            DeliveryPrepareWriteIssue(
+                "error",
+                "delivery_prepare.obligation_verification_incomplete",
+                "Independent verification still found an omitted or incompletely assigned source obligation.",
+                "constraint_verification.obligations_complete",
+            )
+        ]
+        for index, gap in enumerate(verification.obligation_gaps):
+            issues.append(
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.obligation_gap",
+                    f"{gap.reason} obligation affecting {len(gap.affected_unit_ids)} unit(s): {gap.summary}",
+                    f"constraint_verification.obligation_gaps[{index}]",
+                )
+            )
+        return issues
+    for index, obligation in enumerate(draft.obligations):
+        if obligation.disposition != DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION:
+            return [
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.obligation_unresolved",
+                    "Authored obligation has a conflict or requires operator review.",
+                    f"obligations[{index}].disposition",
+                )
+            ]
+    for index, obligation in enumerate(verification.obligations):
+        if obligation.disposition != DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION:
+            return [
+                DeliveryPrepareWriteIssue(
+                    "error",
+                    "delivery_prepare.obligation_unresolved",
+                    "Independent obligation verification found a conflict or requires operator review.",
+                    f"constraint_verification.obligations[{index}].disposition",
+                )
+            ]
     for index, constraint in enumerate(verification.constraints):
         if constraint.disposition == "conflict":
             return [
@@ -1120,6 +1253,10 @@ def _render_plan_yaml(draft: DeliveryAuthoringDraft, unit_task_paths: dict[str, 
         plan_data["source_task"] = draft.source_task.to_dict()
     if draft.constraints:
         plan_data["constraints"] = [constraint.to_plan_dict() for constraint in draft.constraints]
+    if draft.obligations:
+        plan_data["obligations"] = [obligation.to_plan_dict() for obligation in draft.obligations]
+    if draft.source_accounting is not None:
+        plan_data["source_accounting"] = [record.to_dict() for record in draft.source_accounting]
     streams = _distinct_streams(draft)
     if streams:
         plan_data["streams"] = streams

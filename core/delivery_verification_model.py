@@ -38,6 +38,19 @@ def delivery_verification_recovery_action(stop_code: str | None) -> str:
     return "retry_delivery_verification"
 
 
+def delivery_verification_covers_obligations(
+    record: DeliveryVerificationRecord,
+    obligation_count: int,
+) -> bool:
+    """Return whether persisted evidence covers the current plan obligations."""
+
+    if record.obligation_count != obligation_count:
+        return False
+    if not record.passed:
+        return True
+    return record.obligation_satisfied_count == obligation_count and record.obligation_gap_count == 0
+
+
 @dataclass(frozen=True)
 class DeliveryVerificationRecord:
     schema_version: int
@@ -57,6 +70,9 @@ class DeliveryVerificationRecord:
     validation_reused: bool = False
     validation_executed: bool = False
     finding_count: int = 0
+    obligation_count: int = 0
+    obligation_satisfied_count: int = 0
+    obligation_gap_count: int = 0
     stop_code: str | None = None
     evidence_path: str | None = None
     started_at: str | None = None
@@ -81,6 +97,9 @@ class DeliveryVerificationRecord:
             "validation_reused": self.validation_reused,
             "validation_executed": self.validation_executed,
             "finding_count": self.finding_count,
+            "obligation_count": self.obligation_count,
+            "obligation_satisfied_count": self.obligation_satisfied_count,
+            "obligation_gap_count": self.obligation_gap_count,
         }
         for key in ("stop_code", "evidence_path", "started_at", "completed_at"):
             value = getattr(self, key)
@@ -114,6 +133,9 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         "validation_reused",
         "validation_executed",
         "finding_count",
+        "obligation_count",
+        "obligation_satisfied_count",
+        "obligation_gap_count",
         "stop_code",
         "evidence_path",
         "started_at",
@@ -165,6 +187,22 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         raise ValueError("delivery verification attempt must be a positive integer")
     if not isinstance(finding_count, int) or isinstance(finding_count, bool) or finding_count < 0:
         raise ValueError("delivery verification finding_count must be a non-negative integer")
+    obligation_counts: dict[str, int] = {}
+    for key in ("obligation_count", "obligation_satisfied_count", "obligation_gap_count"):
+        count = value.get(key, 0)
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError(f"delivery verification {key} must be a non-negative integer")
+        obligation_counts[key] = count
+    if (
+        obligation_counts["obligation_satisfied_count"] + obligation_counts["obligation_gap_count"]
+        > obligation_counts["obligation_count"]
+    ):
+        raise ValueError("delivery verification obligation counts are inconsistent")
+    if value["status"] == "passed" and (
+        obligation_counts["obligation_satisfied_count"] != obligation_counts["obligation_count"]
+        or obligation_counts["obligation_gap_count"] != 0
+    ):
+        raise ValueError("passed delivery verification requires complete obligation closure")
 
     semantic_status = value.get("semantic_status", "not_run")
     security_status = value.get("security_status", "not_run")
@@ -213,6 +251,9 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         validation_reused=value.get("validation_reused", False),
         validation_executed=value.get("validation_executed", False),
         finding_count=finding_count,
+        obligation_count=obligation_counts["obligation_count"],
+        obligation_satisfied_count=obligation_counts["obligation_satisfied_count"],
+        obligation_gap_count=obligation_counts["obligation_gap_count"],
         stop_code=stop_code,
         evidence_path=evidence_path,
         started_at=value.get("started_at"),

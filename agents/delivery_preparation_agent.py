@@ -15,17 +15,22 @@ from core.delivery_authoring import (
     DeliveryAssessmentDraft,
     DeliveryAuthoringConstraintDraft,
     DeliveryAuthoringDraft,
+    DeliveryAuthoringObligationDraft,
     DeliveryAuthoringParseError,
     DeliveryAuthoringUnitDraft,
     DeliveryConstraintGap,
     DeliveryConstraintVerification,
+    DeliveryObligationGap,
     apply_delivery_unit_context_gaps,
     parse_delivery_assessment_output,
     parse_delivery_amendment_authoring_output,
     parse_delivery_authoring_output,
     parse_delivery_constraint_repair_output,
     parse_delivery_constraint_verification_output,
+    parse_delivery_obligation_repair_output,
 )
+from core.delivery_obligations import MAX_DELIVERY_AUTHORITY_FRAGMENTS, delivery_authority_fragments
+from core.delivery_source_accounting import DeliverySourceAccounting
 from core.delivery_plan import DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION, DeliveryPlanSourceTask
 from core.llm_client import LLMClient
 
@@ -35,10 +40,11 @@ _DEFAULT_MAX_GUIDELINES_CHARS = 3000
 
 _DELIVERY_AUTHORING_SOURCE_EXCERPT_RETRY = """\
 
-Your previous draft was rejected because at least one constraints[].summary copied a complete
-source-task line. Return one fresh complete draft using the same schema and requirements. Rephrase
-every constraint summary in your own words while preserving its meaning; do not copy any complete
-source-task line into constraint metadata. Do not include the rejected draft or discuss the error.
+Your previous draft was rejected because at least one constraints[].summary or
+obligations[].summary copied a complete source-task line. Return one fresh complete draft using the
+same schema and requirements. Rephrase every constraint and obligation summary in your own words
+while preserving its meaning; do not copy any complete source-task line into structured metadata.
+Do not include the rejected draft or discuss the error.
 """
 
 _DELIVERY_AUTHORING_PROMPT = """\
@@ -91,6 +97,21 @@ Delivery-plan constraints:
 - units must be non-empty.
 - constraints must explicitly list every hard source-task constraint that affects delivery, or be
   an empty list when the source task contains none. Do not omit the field.
+- obligations must explicitly list every actionable source-task outcome that the delivery must
+  satisfy. Each obligation must use a stable path-safe id, a bounded paraphrased summary, every
+  owning unit in unit_ids, and one or more ids from the supplied authority fragments. Do not use
+  project context or unit prose as source authority. Use preserved only when every owning unit
+  carries its contribution and the owners collectively cover the outcome; needs_review or conflict blocks publication. Return an empty list only when
+  the source task has no actionable delivery outcome.
+- source_accounting must contain exactly one record for EVERY supplied authority fragment.
+  Each record has source_fragment_id, disposition (mapped, context_only, unresolved), obligation_ids,
+  constraint_ids, and a bounded private rationale. Mapped records reference requirements; context_only
+  records explain why the fragment adds none. Unresolved records block publication. Obligation links
+  must agree in both directions with source_fragment_ids. Every declared constraint must appear in
+  constraint_ids of at least one mapped source fragment. Headings need a context record, not a fake
+  obligation. Preserve every prohibition and prerequisite. Do not invent an unavailable dependency.
+- Resolve ordinary choices from supplied authorized project context. Never invent external contracts
+  or product intent; a confirmed stop takes precedence over correction attempts.
 - Supported constraint kinds are repository_ownership, authoritative_read_only_dependency,
   stop_and_follow_up, security_boundary, and prohibited_fallback.
 - Before returning, check the full source task once for each supported constraint kind. This is an
@@ -189,17 +210,32 @@ Source task description:
 {task_description}
 ```
 
+Deterministic authority fragments. Their ids and boundaries come from Sikula, not the model:
+```json
+{authority_fragments_json}
+```
+
 Return this JSON shape:
 {{
   "plan_id": "{plan_id}",
   "title": "Short delivery plan title",
   "planning_mode": "fixed_window",
   "warnings": [],
+  "source_accounting": [{{"source_fragment_id":"exact-supplied-id","disposition":"mapped","obligation_ids":["stable-obligation-id"],"constraint_ids":["stable-constraint-id"],"rationale":"Private explanation of this mapping"}}],
   "constraints": [
     {{
       "id": "stable-constraint-id",
       "kind": "repository_ownership",
       "summary": "Bounded paraphrase of the hard delivery rule",
+      "unit_ids": ["stable-unit-id"],
+      "disposition": "preserved"
+    }}
+  ],
+  "obligations": [
+    {{
+      "id": "stable-obligation-id",
+      "summary": "Bounded paraphrase of one required delivery outcome",
+      "source_fragment_ids": ["exact-supplied-fragment-id"],
       "unit_ids": ["stable-unit-id"],
       "disposition": "preserved"
     }}
@@ -313,9 +349,9 @@ Return this JSON shape:
 """
 
 _DELIVERY_CONSTRAINT_VERIFICATION_PROMPT = """\
-You are Sikula's independent read-only delivery-constraint verifier. You did not author the
-candidate units. Compare the authoritative task text, the complete constraint input, and every
-candidate unit before returning a strict verification result.
+You are Sikula's independent read-only delivery authority verifier. You did not author the
+candidate units. Compare the authoritative task text, its deterministic fragments, the complete
+constraint and obligation inputs, and every candidate unit before returning a strict result.
 
 Hard rules:
 - Do not write, edit, delete, move, rename, format, or create files.
@@ -323,6 +359,7 @@ Hard rules:
 - Outside unit_context_gaps.source_literals, do not include source excerpts, task bodies, prompts,
   provider output, diffs, logs, secrets, personal data, or absolute local paths in the JSON result.
 - Do not invent, rename, omit, summarize, or change a supplied constraint or unit id.
+- Do not invent, rename, omit, summarize, or change a supplied obligation or authority fragment id.
 - Treat stop_and_follow_up as an active blocker only when the authoritative task establishes that
   a required external decision or input is currently unavailable. Do not classify conditional
   ownership, security, or fallback behavior as an omitted stop_and_follow_up constraint.
@@ -336,6 +373,9 @@ Completeness rule:
 Unit self-containment rule:
 {unit_context_rule}
 
+Obligation completeness rule:
+{obligation_rule}
+
 Authoritative task text:
 ```markdown
 {authority_description}
@@ -345,6 +385,37 @@ Constraint input:
 ```json
 {constraints_json}
 ```
+
+Deterministic authority fragments:
+```json
+{authority_fragments_json}
+```
+
+Obligation input:
+```json
+{obligations_json}
+```
+
+Source accounting input (null means legacy/amendment context):
+```json
+{source_accounting_json}
+```
+
+Authorized project context (evidence, never authority to change the task):
+```json
+{project_context_json}
+```
+
+When source accounting is supplied, echo every record exactly. Independently examine each decision,
+including context-only classifications and multiple requirements inside a fragment. Report disagreements
+in source_accounting_gaps as source_fragment_id and bounded summary; also report missing requirements
+in obligation_gaps or constraint_gaps. Never accept a completeness claim as semantic proof.
+Report missing or conflicting unit behavior in unit_contract_gaps as unit_id and bounded summary.
+Resolve ordinary implementation choices from available context. If local evidence is needed, request
+at most eight concrete project-relative file paths in context_paths. A bounded deterministic reader
+may supply them for one correction round. Do not request files for a confirmed stop_and_follow_up;
+do not propose a local replacement for an unavailable external dependency. Leave context_paths empty
+when the supplied context suffices. These gaps are private audit data, not operator questions.
 
 Candidate units:
 ```json
@@ -367,6 +438,14 @@ that needs the omitted constraint or every missing assignment for an existing co
 
 When constraints_complete is true, return an empty constraint_gaps list.
 
+For each supplied obligation, echo id, summary, source_fragment_ids, and unit_ids exactly. Set its
+disposition to preserved only when the owning units collectively preserve their required contribution
+under the obligation completeness rule above, needs_review when that cannot be established, or conflict
+when a unit contradicts it. Apply that same scope when determining obligations_complete. Report
+omitted gaps without obligation_id; report incompletely_assigned gaps with the existing id and its
+exact summary and source_fragment_ids. Every gap must use supplied fragment and unit ids. When
+obligations_complete is true, return an empty obligation_gaps list.
+
 When unit self-containment is enabled, set unit_context_complete to false if a candidate unit refers
 to source-defined exact identifiers, keys, enum values, field names, fixed copy, or other required
 literals that are absent from its task_markdown. For each affected unit, return one unit_context_gaps
@@ -377,15 +456,30 @@ unit_context_complete to true and return an empty unit_context_gaps list.
 
 Return this JSON shape:
 {{
+  "source_accounting": [],
+  "source_accounting_gaps": [],
+  "unit_contract_gaps": [],
+  "context_paths": [],
   "constraints_complete": true,
   "constraint_gaps": [],
   "unit_context_complete": true,
   "unit_context_gaps": [],
+  "obligations_complete": true,
+  "obligation_gaps": [],
   "constraints": [
     {{
       "id": "exact-supplied-id",
       "kind": "repository_ownership",
       "summary": "Exact supplied bounded summary",
+      "unit_ids": ["exact-supplied-unit-id"],
+      "disposition": "preserved"
+    }}
+  ],
+  "obligations": [
+    {{
+      "id": "exact-supplied-obligation-id",
+      "summary": "Exact supplied bounded summary",
+      "source_fragment_ids": ["exact-supplied-fragment-id"],
       "unit_ids": ["exact-supplied-unit-id"],
       "disposition": "preserved"
     }}
@@ -451,6 +545,32 @@ Return this JSON shape:
 }}
 """
 
+_DELIVERY_OBLIGATION_REPAIR_PROMPT = """\
+You are Sikula's read-only delivery-obligation repair assistant.
+
+Repair only the structured obligation list from the supplied actionable verifier gaps. Units,
+constraints, source fragments, scope, dependencies, task Markdown, assets, and budgets are
+immutable. Do not add an obligation that is not represented by a gap.
+
+For incompletely_assigned gaps, preserve the existing obligation exactly and append only the
+listed affected_unit_ids. For omitted gaps, append one obligation in gap order with a new stable
+path-safe id and the exact supplied summary, source_fragment_ids, and affected_unit_ids. Every
+returned obligation must use disposition preserved.
+
+Existing obligations:
+```json
+{obligations_json}
+```
+
+Actionable gaps:
+```json
+{gaps_json}
+```
+
+Return exactly one JSON object and no Markdown outside it:
+{{"obligations":[{{"id":"stable-id","summary":"Bounded summary","source_fragment_ids":["source-id"],"unit_ids":["unit-id"],"disposition":"preserved"}}]}}
+"""
+
 _DELIVERY_AMENDMENT_PROMPT = """\
 You are Sikula's read-only delivery-plan amendment authoring assistant.
 
@@ -488,6 +608,19 @@ Applicable inherited constraints supplied by deterministic plan validation:
 ```json
 {applicable_constraints_json}
 ```
+
+Applicable source-bound obligations supplied by deterministic plan validation:
+```json
+{applicable_obligations_json}
+```
+
+Return obligation_assignments mapping every applicable obligation id to the non-empty subset of
+replacement unit ids that contributes to it. The assigned contracts must collectively preserve the
+selected target's entire contribution to that outcome; each need only describe its own contribution.
+Other original owners and their contracts remain unchanged. Do not duplicate their contributions in
+the replacements or transfer missing target behavior to them. If the target was the only owner, its
+replacements must collectively preserve the whole outcome. Do not rename, weaken, omit, or
+reinterpret outcomes. Every applicable hard constraint still governs every affected replacement.
 
 Target unit metadata:
 ```json
@@ -559,6 +692,7 @@ Return this JSON shape:
   "amend_reason": {amend_reason_json},
   "budget_exceeded": {budget_exceeded_json},
   "warnings": [],
+  "obligation_assignments": {{}},
   "replacement_units": [
     {{
       "id": "new-unit-a",
@@ -607,9 +741,16 @@ class DeliveryPreparationAgent:
 
     name = "delivery_preparer"
 
-    def __init__(self, llm: LLMClient, project_config: dict | None = None) -> None:
+    def __init__(
+        self,
+        llm: LLMClient,
+        project_config: dict | None = None,
+        *,
+        context_reader: Callable[[Path, list[str]], dict[str, Any]] | None = None,
+    ) -> None:
         self.llm = llm
         self.project_config = project_config or {}
+        self.context_reader = context_reader
 
     def author_delivery_plan(
         self,
@@ -623,6 +764,11 @@ class DeliveryPreparationAgent:
         audit_recorder: DeliveryPreparationAuditRecorder | None = None,
     ) -> DeliveryAuthoringDraft:
         root = Path(project_root).resolve()
+        if len(delivery_authority_fragments(task_description)) > MAX_DELIVERY_AUTHORITY_FRAGMENTS:
+            raise DeliveryAuthoringParseError(
+                "delivery_authoring.authority_too_large",
+                "The source task has too many authority fragments for one delivery plan.",
+            )
         authoring_prompt = self._build_authoring_prompt(
             task_description=task_description,
             task_path=task_path,
@@ -636,7 +782,15 @@ class DeliveryPreparationAgent:
         output = ""
         for round_index in (1, 2):
             prompt = read_only_agent_prompt(
-                authoring_prompt + (_DELIVERY_AUTHORING_SOURCE_EXCERPT_RETRY if round_index == 2 else "")
+                authoring_prompt
+                + (
+                    _DELIVERY_AUTHORING_SOURCE_EXCERPT_RETRY
+                    + "\nAlso correct any missing or invalid source_accounting records and requirement cross-references.\n"
+                    + "Every source-accounting rationale must be valid UTF-8 text without lone surrogate code points.\n"
+                    + "Map every declared constraint to at least one source-accounting record.\n"
+                    if round_index == 2
+                    else ""
+                )
             )
             try:
                 output = self.llm.generate("", prompt)
@@ -658,6 +812,8 @@ class DeliveryPreparationAgent:
                     project_root=root,
                     output_dir=output_dir,
                     source_task_description=task_description,
+                    require_obligations=True,
+                    require_source_accounting=True,
                 )
             except DeliveryAuthoringParseError as exc:
                 self._record_failure(
@@ -668,7 +824,14 @@ class DeliveryPreparationAgent:
                     error_code=exc.code,
                     round_index=round_index,
                 )
-                if exc.code == "delivery_authoring.constraint_summary_source_excerpt" and round_index == 1:
+                if (
+                    exc.code.startswith("source_accounting.")
+                    or exc.code
+                    in {
+                        "delivery_authoring.constraint_summary_source_excerpt",
+                        "delivery_authoring.obligation_summary_source_excerpt",
+                    }
+                ) and round_index == 1:
                     continue
                 raise
             break
@@ -685,9 +848,15 @@ class DeliveryPreparationAgent:
             )
 
         self._record_success(audit_recorder, prompt=prompt, output=output, draft=draft, round_index=round_index)
+        if any(item.kind == "stop_and_follow_up" for item in draft.constraints):
+            return draft
+        preparation_context = {"project": project_context or {}, "guidelines": self._guidelines_context(root)}
         verification = self._verify_constraint_continuity(
+            source_accounting=draft.source_accounting,
+            project_context=preparation_context,
             authority_description=task_description,
             constraints=draft.constraints,
+            obligations=draft.obligations,
             units=draft.units,
             verification_scope="source_task_to_units",
             completeness_rule=(
@@ -699,14 +868,35 @@ class DeliveryPreparationAgent:
             audit_phase="delivery_prepare_constraint_verification",
             round_index=1,
             verify_unit_context=True,
+            verify_obligations=True,
         )
-        if verification.constraints_complete and verification.unit_context_complete:
-            return replace(draft, constraint_verification=verification)
-        if any(
-            constraint.disposition != DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION
-            for constraint in (*draft.constraints, *verification.constraints)
+        needs_draft_recovery = (
+            self._needs_draft_recovery(verification)
+            or any(item.disposition != "preserved" for item in (*draft.constraints, *draft.obligations))
+            or (
+                draft.source_accounting is not None
+                and any(gap.reason == "omitted" for gap in verification.constraint_gaps)
+            )
+        )
+        if (
+            verification.constraints_complete
+            and verification.unit_context_complete
+            and verification.obligations_complete
+            and not needs_draft_recovery
         ):
             return replace(draft, constraint_verification=verification)
+        if self._verification_has_terminal_blocker(verification):
+            return replace(draft, constraint_verification=verification)
+        if needs_draft_recovery:
+            return self._recover_draft(
+                draft,
+                verification,
+                task_description=task_description,
+                root=root,
+                output_dir=output_dir,
+                project_context=preparation_context,
+                audit_recorder=audit_recorder,
+            )
 
         repaired_units = apply_delivery_unit_context_gaps(draft.units, verification.unit_context_gaps)
         repaired_constraints = list(draft.constraints)
@@ -718,9 +908,26 @@ class DeliveryPreparationAgent:
                 gaps=verification.constraint_gaps,
                 audit_recorder=audit_recorder,
             )
+        if any(item.kind == "stop_and_follow_up" for item in repaired_constraints):
+            return replace(
+                draft, constraints=repaired_constraints, units=repaired_units, constraint_verification=verification
+            )
+        repaired_obligations = list(draft.obligations)
+        if not verification.obligations_complete:
+            repaired_obligations = self._repair_obligation_gaps(
+                authority_description=task_description,
+                obligations=draft.obligations,
+                units=repaired_units,
+                gaps=verification.obligation_gaps,
+                audit_recorder=audit_recorder,
+            )
+        repaired_accounting = self._remap_source_accounting(draft.source_accounting, repaired_obligations)
         repaired_verification = self._verify_constraint_continuity(
+            source_accounting=repaired_accounting,
+            project_context=preparation_context,
             authority_description=task_description,
             constraints=repaired_constraints,
+            obligations=repaired_obligations,
             units=repaired_units,
             verification_scope="source_task_to_units_after_bounded_repair",
             completeness_rule=(
@@ -733,13 +940,323 @@ class DeliveryPreparationAgent:
             audit_phase="delivery_prepare_constraint_verification",
             round_index=2,
             verify_unit_context=True,
+            verify_obligations=True,
         )
         return replace(
             draft,
             units=repaired_units,
             constraints=repaired_constraints,
+            obligations=repaired_obligations,
+            source_accounting=repaired_accounting,
             constraint_verification=repaired_verification,
         )
+
+    @staticmethod
+    def _verification_has_terminal_blocker(verification: DeliveryConstraintVerification) -> bool:
+        return any(item.kind == "stop_and_follow_up" for item in verification.constraints) or any(
+            gap.kind == "stop_and_follow_up" for gap in verification.constraint_gaps
+        )
+
+    @staticmethod
+    def _needs_draft_recovery(verification: DeliveryConstraintVerification) -> bool:
+        return bool(
+            verification.source_accounting_gaps
+            or verification.unit_contract_gaps
+            or verification.context_paths
+            or any(record.disposition == "unresolved" for record in verification.source_accounting or [])
+            or any(item.disposition != "preserved" for item in (*verification.constraints, *verification.obligations))
+        )
+
+    @staticmethod
+    def _remap_source_accounting(
+        records: list[DeliverySourceAccounting] | None, obligations: Sequence[DeliveryAuthoringObligationDraft]
+    ) -> list[DeliverySourceAccounting] | None:
+        if records is None:
+            return None
+        updated = []
+        for record in records:
+            owners = [item.id for item in obligations if record.source_fragment_id in item.source_fragment_ids]
+            if owners == record.obligation_ids:
+                updated.append(record)
+                continue
+            rationale = "Mapping updated from independently verified obligation gaps."
+            updated.append(
+                replace(
+                    record,
+                    disposition="mapped",
+                    obligation_ids=owners,
+                    rationale=rationale,
+                    rationale_sha256="sha256:" + sha256(rationale.encode()).hexdigest(),
+                )
+            )
+        return updated
+
+    def _draft_payload(self, draft: DeliveryAuthoringDraft) -> dict[str, Any]:
+        payload = {
+            "plan_id": draft.plan_id,
+            "title": draft.title,
+            "units": [self._verification_unit_payload(unit) for unit in draft.units],
+            "constraints": [item.to_plan_dict() for item in draft.constraints],
+            "obligations": [item.to_verification_dict() for item in draft.obligations],
+            "warnings": draft.warnings,
+        }
+        if draft.source_accounting is not None:
+            payload["source_accounting"] = [record.to_verification_dict() for record in draft.source_accounting]
+        if draft.planning_mode is not None:
+            payload["planning_mode"] = draft.planning_mode
+        return payload
+
+    def _read_recovery_context(
+        self,
+        root: Path,
+        paths: list[str],
+        *,
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+        audit_prefix: str,
+    ) -> dict[str, Any] | None:
+        try:
+            retrieved = (
+                self.context_reader(root, paths)
+                if self.context_reader is not None
+                else {"status": "context_reader_unavailable"}
+            )
+        except Exception as exc:
+            retrieved = {"status": "context_reader_failed", "error_type": type(exc).__name__}
+        if not isinstance(retrieved, dict):
+            retrieved = {"status": "context_reader_invalid"}
+        files = retrieved.get("files")
+        if (
+            isinstance(files, list)
+            and len(files) == len(paths)
+            and all(isinstance(item, dict) and item.get("status") == "read" for item in files)
+        ):
+            return retrieved
+        # Required evidence is a runtime gate; a later provider response cannot waive it.
+        if audit_recorder is not None:
+            audit_recorder(
+                {
+                    "phase": f"{audit_prefix}_context_retrieval",
+                    "round_index": 1,
+                    "prompt": None,
+                    "raw_output": None,
+                    "requested_paths": list(paths),
+                    "retrieved": retrieved,
+                    "parsed": {"status": "failed", "error_code": f"{audit_prefix}.context_unavailable"},
+                }
+            )
+        return None
+
+    def _recover_draft(
+        self,
+        draft: DeliveryAuthoringDraft,
+        verification: DeliveryConstraintVerification,
+        *,
+        task_description: str,
+        root: Path,
+        output_dir: str | Path,
+        project_context: dict[str, Any],
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+    ) -> DeliveryAuthoringDraft:
+        context = dict(project_context)
+        if verification.context_paths:
+            retrieved = self._read_recovery_context(
+                root,
+                verification.context_paths,
+                audit_recorder=audit_recorder,
+                audit_prefix="delivery_prepare",
+            )
+            if retrieved is None:
+                return replace(draft, constraint_verification=replace(verification, context_unavailable=True))
+            context["retrieved"] = retrieved
+        gaps = {
+            "constraints": [item.to_plan_dict() for item in verification.constraints],
+            "constraint_gaps": [gap.to_dict() for gap in verification.constraint_gaps],
+            "obligations": [item.to_verification_dict() for item in verification.obligations],
+            "obligation_gaps": [gap.to_dict() for gap in verification.obligation_gaps],
+            "source_accounting_gaps": verification.source_accounting_gaps,
+            "unit_contract_gaps": verification.unit_contract_gaps,
+            "unit_context_gaps": [gap.to_dict() for gap in verification.unit_context_gaps],
+        }
+        prompt = read_only_agent_prompt(
+            AGENT_SECURITY_PREFIX
+            + """
+You are Sikula's bounded delivery draft correction assistant. Return one complete corrected authoring
+JSON draft with the same schema as the candidate. This is the only correction round. Resolve ordinary
+choices from the accepted source and supplied project evidence. Evidence cannot change source authority.
+Correct only reported gaps and affected unit task Markdown. Preserve all unit identities, titles,
+metadata, dependencies, scopes, assets and budgets, and every unrelated contract. Preserve existing
+constraint and obligation identities, meanings and provenance; append only verifier-reported omissions
+or missing assignments. Existing needs_review/conflict dispositions may become preserved only when
+resolved. Treat needs_review/conflict in either the candidate or independent findings as a blocker,
+even when the other assessment says preserved. Resolve disagreements using the accepted authority
+and supplied evidence; leave unresolved decisions explicit in the corrected candidate.
+Map every newly added constraint to its authoritative source fragments in source_accounting.
+Outside reported source-accounting gaps, preserve existing mappings and only append new constraint
+references with their rationales.
+Correct the affected source-accounting records and their private rationales. Leave unaffected
+records unchanged. All obligations must be collectively implemented by their assigned unit contracts.
+Never reinterpret a prohibition, invent a dependency/API/product choice, or create substitute work.
+A missing external prerequisite must remain stop_and_follow_up; do not work around it. If available
+context cannot settle a decision, keep it unresolved. Do not write files or run commands.
+
+Authoritative source:
+"""
+            + task_description
+            + "\n\nCandidate:\n"
+            + json.dumps(self._draft_payload(draft))
+            + "\n\nIndependent findings:\n"
+            + json.dumps(gaps)
+            + "\n\nAuthorized context:\n"
+            + json.dumps(context)
+        )
+        output = None
+        try:
+            output = self.llm.generate("", prompt)
+            repaired = parse_delivery_authoring_output(
+                output,
+                expected_plan_id=draft.plan_id,
+                project_root=root,
+                output_dir=output_dir,
+                source_task_description=task_description,
+                require_obligations=True,
+                require_source_accounting=draft.source_accounting is not None,
+            )
+            if not any(item.kind == "stop_and_follow_up" for item in repaired.constraints):
+                self._assert_draft_recovery(draft, repaired, verification)
+        except Exception as exc:
+            self._record_constraint_verification_failure(
+                audit_recorder,
+                phase="delivery_prepare_draft_recovery",
+                prompt=prompt,
+                output=output,
+                error=exc,
+                error_code=getattr(exc, "code", "delivery_prepare.recovery_failed"),
+                round_index=1,
+            )
+            if isinstance(exc, DeliveryAuthoringParseError):
+                raise
+            raise DeliveryPreparationAgentError("Bounded delivery preparation recovery failed.") from None
+        if audit_recorder is not None:
+            audit_recorder(
+                {
+                    "phase": "delivery_prepare_draft_recovery",
+                    "round_index": 1,
+                    "prompt": prompt,
+                    "raw_output": output,
+                    "parsed": {"status": "parsed", "unit_ids": [unit.id for unit in repaired.units]},
+                }
+            )
+        repaired = replace(repaired, source_task=draft.source_task)
+        if any(item.kind == "stop_and_follow_up" for item in repaired.constraints):
+            return repaired
+        final_verification = self._verify_constraint_continuity(
+            authority_description=task_description,
+            constraints=repaired.constraints,
+            obligations=repaired.obligations,
+            units=repaired.units,
+            source_accounting=repaired.source_accounting,
+            project_context=context,
+            verification_scope="source_task_to_units_after_bounded_recovery",
+            completeness_rule="Verify all source constraints, outcomes, coverage decisions and corrected unit contracts independently; unresolved decisions stay unresolved.",
+            audit_recorder=audit_recorder,
+            audit_phase="delivery_prepare_constraint_verification",
+            round_index=2,
+            verify_unit_context=True,
+            verify_obligations=True,
+        )
+        return replace(repaired, constraint_verification=final_verification)
+
+    def _assert_draft_recovery(
+        self,
+        original: DeliveryAuthoringDraft,
+        repaired: DeliveryAuthoringDraft,
+        verification: DeliveryConstraintVerification,
+    ) -> None:
+        def reject() -> None:
+            raise DeliveryAuthoringParseError(
+                "delivery_prepare.recovery_scope_changed",
+                "Draft recovery changed unrelated identity, metadata, or authority.",
+            )
+
+        if (original.plan_id, original.title, original.planning_mode, original.warnings) != (
+            repaired.plan_id,
+            repaired.title,
+            repaired.planning_mode,
+            repaired.warnings,
+        ):
+            reject()
+        affected = self._recovery_unit_ids(verification)
+        affected.update(
+            unit_id
+            for item in (*original.constraints, *original.obligations)
+            if item.disposition != "preserved"
+            for unit_id in item.unit_ids
+        )
+        if [unit.id for unit in original.units] != [unit.id for unit in repaired.units]:
+            reject()
+        for before, after in zip(original.units, repaired.units):
+            if replace(after, task_markdown=before.task_markdown) != before or (
+                before.id not in affected and before != after
+            ):
+                reject()
+        self._assert_constraint_repair(
+            [replace(item, disposition="preserved") for item in original.constraints],
+            [replace(item, disposition="preserved") for item in repaired.constraints],
+            verification.constraint_gaps,
+        )
+        self._assert_obligation_repair(
+            [replace(item, disposition="preserved") for item in original.obligations],
+            [replace(item, disposition="preserved") for item in repaired.obligations],
+            verification.obligation_gaps,
+        )
+        changed_fragments = {gap["source_fragment_id"] for gap in verification.source_accounting_gaps}
+        changed_fragments.update(ref for gap in verification.obligation_gaps for ref in gap.source_fragment_ids)
+        changed_fragments.update(
+            record.source_fragment_id
+            for record in original.source_accounting or []
+            if record.disposition == "unresolved"
+        )
+        corrected = {record.source_fragment_id: record for record in repaired.source_accounting or []}
+        new_constraint_ids = {item.id for item in repaired.constraints} - {item.id for item in original.constraints}
+        for record in original.source_accounting or []:
+            if record.source_fragment_id in changed_fragments:
+                continue
+            after = corrected.get(record.source_fragment_id)
+            if after == record:
+                continue
+            if after is None:
+                reject()
+            added_refs = set(after.constraint_ids) - set(record.constraint_ids)
+            if not added_refs or not added_refs <= new_constraint_ids:
+                reject()
+            if (
+                replace(
+                    after,
+                    constraint_ids=[ref for ref in after.constraint_ids if ref not in added_refs],
+                    disposition=record.disposition,
+                    rationale=record.rationale,
+                    rationale_sha256=record.rationale_sha256,
+                )
+                != record
+            ):
+                reject()
+
+    @staticmethod
+    def _recovery_unit_ids(verification: DeliveryConstraintVerification) -> set[str]:
+        affected = {gap["unit_id"] for gap in verification.unit_contract_gaps}
+        affected.update(gap.unit_id for gap in verification.unit_context_gaps)
+        affected.update(
+            unit_id
+            for gap in (*verification.constraint_gaps, *verification.obligation_gaps)
+            for unit_id in gap.affected_unit_ids
+        )
+        affected.update(
+            unit_id
+            for item in (*verification.constraints, *verification.obligations)
+            if item.disposition != "preserved"
+            for unit_id in item.unit_ids
+        )
+        return affected
 
     def assess_delivery_mode(
         self,
@@ -797,11 +1314,20 @@ class DeliveryPreparationAgent:
         project_context: dict[str, Any] | None = None,
         component_ids: Sequence[str] = (),
         applicable_constraints: Sequence[dict[str, Any]] = (),
+        applicable_obligations: Sequence[dict[str, Any]] = (),
         failure_evidence: dict[str, Any] | None = None,
         amend_reason: str | None = None,
         budget_exceeded: dict[str, Any] | None = None,
         audit_recorder: DeliveryPreparationAuditRecorder | None = None,
     ) -> DeliveryAmendmentAuthoringDraft:
+        if any(item.get("kind") == "stop_and_follow_up" for item in applicable_constraints):
+            return DeliveryAmendmentAuthoringDraft(
+                plan_id=plan_id,
+                target_unit_id=target_unit_id,
+                replacement_units=[],
+                disposition="external_dependency_follow_up_required",
+                summary="Resolve the authoritative external prerequisite before amendment authoring.",
+            )
         root = Path(project_root).resolve()
         component_id_list = list(component_ids)
         if component_id_list:
@@ -835,6 +1361,7 @@ class DeliveryPreparationAgent:
                 ),
                 failure_evidence_json=json.dumps(failure_evidence, indent=2, sort_keys=True),
                 applicable_constraints_json=json.dumps(list(applicable_constraints), indent=2, sort_keys=True),
+                applicable_obligations_json=json.dumps(list(applicable_obligations), indent=2, sort_keys=True),
                 amend_reason_json=json.dumps(amend_reason),
                 budget_exceeded_json=json.dumps(budget_exceeded, sort_keys=True),
                 component_guidance=component_guidance,
@@ -874,7 +1401,7 @@ class DeliveryPreparationAgent:
             )
             raise
         self._record_amendment_success(audit_recorder, prompt=prompt, output=output, draft=draft)
-        if not applicable_constraints or not draft.replacement_units:
+        if (not applicable_constraints and not applicable_obligations) or not draft.replacement_units:
             return draft
 
         replacement_ids = [unit.id for unit in draft.replacement_units]
@@ -888,9 +1415,34 @@ class DeliveryPreparationAgent:
             )
             for value in applicable_constraints
         ]
+        if set(draft.obligation_assignments) != {str(value["id"]) for value in applicable_obligations}:
+            raise DeliveryAuthoringParseError(
+                "delivery_amend.obligation_assignments_invalid",
+                "Assignments must cover exactly the applicable inherited obligations.",
+            )
+        obligations = [
+            DeliveryAuthoringObligationDraft(
+                id=str(value.get("id", "")),
+                summary=str(value.get("summary", "")),
+                source_fragment_ids=list(value.get("source_fragment_ids", [])),
+                unit_ids=list(draft.obligation_assignments.get(str(value["id"]), replacement_ids)),
+                disposition="preserved",
+            )
+            for value in applicable_obligations
+        ]
+        inspection_context = {
+            "project": project_context or {},
+            "guidelines": self._guidelines_context(root),
+            "amendment": {
+                "target_unit_id": target_unit_id,
+                "inherited_obligations": list(applicable_obligations),
+            },
+        }
         verification = self._verify_constraint_continuity(
+            project_context=inspection_context,
             authority_description=target_task_description,
             constraints=constraints,
+            obligations=obligations,
             units=draft.replacement_units,
             verification_scope="amendment_target_to_replacements",
             completeness_rule=(
@@ -901,14 +1453,178 @@ class DeliveryPreparationAgent:
             audit_phase="delivery_amend_constraint_verification",
             round_index=1,
             verify_unit_context=False,
+            verify_obligations=bool(obligations),
+            known_obligation_source_fragment_ids={
+                fragment_id for obligation in obligations for fragment_id in obligation.source_fragment_ids
+            },
         )
+        if self._verification_has_terminal_blocker(verification):
+            return self._stopped_amendment(draft, verification)
+        if (
+            self._needs_draft_recovery(verification)
+            or not verification.constraints_complete
+            or not verification.obligations_complete
+        ):
+            return self._recover_amendment(
+                draft,
+                verification,
+                root=root,
+                authoring_prompt=prompt,
+                authority=target_task_description,
+                constraints=constraints,
+                obligations=obligations,
+                inspection_context=inspection_context,
+                audit_recorder=audit_recorder,
+            )
         return replace(draft, constraint_verification=verification)
+
+    @staticmethod
+    def _stopped_amendment(
+        draft: DeliveryAmendmentAuthoringDraft,
+        verification: DeliveryConstraintVerification,
+    ) -> DeliveryAmendmentAuthoringDraft:
+        return replace(
+            draft,
+            replacement_units=[],
+            obligation_assignments={},
+            constraint_verification=verification,
+            disposition="external_dependency_follow_up_required",
+            summary="Independent verification identified an unresolved external prerequisite.",
+        )
+
+    def _recover_amendment(
+        self,
+        draft: DeliveryAmendmentAuthoringDraft,
+        verification: DeliveryConstraintVerification,
+        *,
+        root: Path,
+        authoring_prompt: str,
+        authority: str,
+        constraints: Sequence[DeliveryAuthoringConstraintDraft],
+        obligations: Sequence[DeliveryAuthoringObligationDraft],
+        inspection_context: dict[str, Any],
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+    ) -> DeliveryAmendmentAuthoringDraft:
+        context = dict(inspection_context)
+        if verification.context_paths:
+            retrieved = self._read_recovery_context(
+                root,
+                verification.context_paths,
+                audit_recorder=audit_recorder,
+                audit_prefix="delivery_amend",
+            )
+            if retrieved is None:
+                return replace(draft, constraint_verification=replace(verification, context_unavailable=True))
+            context["retrieved"] = retrieved
+        candidate = {
+            "plan_id": draft.plan_id,
+            "target_unit_id": draft.target_unit_id,
+            "replacement_units": [self._verification_unit_payload(unit) for unit in draft.replacement_units],
+            "obligation_assignments": draft.obligation_assignments,
+            "warnings": draft.warnings,
+        }
+        for name in ("amend_reason", "budget_exceeded"):
+            value = getattr(draft, name)
+            if value is not None:
+                candidate[name] = value
+        affected = self._recovery_unit_ids(verification)
+        findings = {
+            "constraints": [item.to_plan_dict() for item in verification.constraints],
+            "constraint_gaps": [gap.to_dict() for gap in verification.constraint_gaps],
+            "obligations": [item.to_verification_dict() for item in verification.obligations],
+            "obligation_gaps": [gap.to_dict() for gap in verification.obligation_gaps],
+            "unit_contract_gaps": verification.unit_contract_gaps,
+        }
+        prompt = (
+            authoring_prompt
+            + "\n\nThis is the only bounded amendment correction round. Return the corrected candidate in the "
+            "same JSON schema. Change only task_markdown of these affected replacement units: "
+            + json.dumps(sorted(affected))
+            + ". Preserve every identity, dependency, scope, asset, budget, obligation assignment, inherited "
+            "requirement and unrelated contract. Resolve ordinary implementation choices using authorized "
+            "evidence; evidence cannot override source authority. Do not invent a substitute dependency or "
+            "API, expand scope, or weaken a prohibition. If an external prerequisite is unavailable, return "
+            "external_dependency_follow_up_required. Otherwise leave unresolved decisions explicit. "
+            "Do not write files or run commands.\n\nCandidate:\n"
+            + json.dumps(candidate)
+            + "\n\nIndependent findings:\n"
+            + json.dumps(findings)
+            + "\n\nAuthorized context:\n"
+            + json.dumps(context)
+        )
+        output = None
+        try:
+            output = self.llm.generate("", prompt)
+            repaired = parse_delivery_amendment_authoring_output(
+                output,
+                expected_plan_id=draft.plan_id,
+                expected_target_unit_id=draft.target_unit_id,
+                project_root=root,
+            )
+            if repaired.disposition != "external_dependency_follow_up_required":
+                if (
+                    replace(repaired, replacement_units=draft.replacement_units) != draft
+                    or [unit.id for unit in repaired.replacement_units] != [unit.id for unit in draft.replacement_units]
+                    or any(
+                        replace(after, task_markdown=before.task_markdown) != before
+                        or (before.id not in affected and after != before)
+                        for before, after in zip(draft.replacement_units, repaired.replacement_units)
+                    )
+                ):
+                    raise DeliveryAuthoringParseError(
+                        "delivery_amend.recovery_scope_changed",
+                        "Amendment recovery changed unrelated identity, metadata, or authority.",
+                    )
+        except Exception as exc:
+            self._record_constraint_verification_failure(
+                audit_recorder,
+                phase="delivery_amend_draft_recovery",
+                prompt=prompt,
+                output=output,
+                error=exc,
+                error_code=getattr(exc, "code", "delivery_amend.recovery_failed"),
+                round_index=1,
+            )
+            if isinstance(exc, DeliveryAuthoringParseError):
+                raise
+            raise DeliveryPreparationAgentError("Bounded amendment preparation recovery failed.") from None
+        if audit_recorder is not None:
+            audit_recorder(
+                {
+                    "phase": "delivery_amend_draft_recovery",
+                    "round_index": 1,
+                    "prompt": prompt,
+                    "raw_output": output,
+                    "parsed": {"status": "parsed", "unit_ids": [unit.id for unit in repaired.replacement_units]},
+                }
+            )
+        if repaired.disposition == "external_dependency_follow_up_required":
+            return repaired
+        final_verification = self._verify_constraint_continuity(
+            project_context=context,
+            authority_description=authority,
+            constraints=constraints,
+            obligations=obligations,
+            units=repaired.replacement_units,
+            verification_scope="amendment_target_to_replacements_after_bounded_recovery",
+            completeness_rule="Verify every deterministic inherited constraint and collective outcome against the corrected replacement contracts; unresolved decisions stay unresolved.",
+            audit_recorder=audit_recorder,
+            audit_phase="delivery_amend_constraint_verification",
+            round_index=2,
+            verify_unit_context=False,
+            verify_obligations=bool(obligations),
+            known_obligation_source_fragment_ids={ref for item in obligations for ref in item.source_fragment_ids},
+        )
+        if self._verification_has_terminal_blocker(final_verification):
+            return self._stopped_amendment(repaired, final_verification)
+        return replace(repaired, constraint_verification=final_verification)
 
     def _verify_constraint_continuity(
         self,
         *,
         authority_description: str,
         constraints: Sequence[DeliveryAuthoringConstraintDraft],
+        obligations: Sequence[DeliveryAuthoringObligationDraft],
         units: Sequence[DeliveryAuthoringUnitDraft],
         verification_scope: str,
         completeness_rule: str,
@@ -916,12 +1632,21 @@ class DeliveryPreparationAgent:
         audit_phase: str,
         round_index: int,
         verify_unit_context: bool,
+        verify_obligations: bool,
+        known_obligation_source_fragment_ids: set[str] | None = None,
+        source_accounting: list[DeliverySourceAccounting] | None = None,
+        project_context: dict[str, Any] | None = None,
     ) -> DeliveryConstraintVerification:
         constraints_payload = [constraint.to_plan_dict() for constraint in constraints]
+        obligations_payload = [obligation.to_verification_dict() for obligation in obligations]
         units_payload = [self._verification_unit_payload(unit) for unit in units]
         prompt = read_only_agent_prompt(
             AGENT_SECURITY_PREFIX
             + _DELIVERY_CONSTRAINT_VERIFICATION_PROMPT.format(
+                source_accounting_json=json.dumps([record.to_verification_dict() for record in source_accounting])
+                if source_accounting is not None
+                else "null",
+                project_context_json=json.dumps(project_context or {}),
                 verification_scope=verification_scope,
                 completeness_rule=completeness_rule,
                 unit_context_rule=(
@@ -931,8 +1656,35 @@ class DeliveryPreparationAgent:
                     else "This is a constraint-only amendment check. Return unit_context_complete=true and "
                     "unit_context_gaps=[]."
                 ),
+                obligation_rule=(
+                    (
+                        "The supplied obligation set and replacement ownership are deterministic. Echo every supplied "
+                        "obligation exactly. Use disposition preserved only when its assigned replacement contracts collectively "
+                        "preserve the target contract's entire contribution to the outcome. The amendment context supplies "
+                        "original ownership: other owners and their contracts remain unchanged and retain their contributions. "
+                        "Do not require replacements to duplicate those contributions or assume other owners will absorb "
+                        "missing target behavior. If the target was the only owner, replacements must collectively deliver "
+                        "the whole outcome. Each replacement must specify its contribution; otherwise use needs_review, "
+                        "or conflict when its contract opposes the outcome. Do not infer obligations or gaps beyond "
+                        "the supplied deterministic set."
+                        if known_obligation_source_fragment_ids is not None
+                        else "Set obligations_complete to false if any actionable source requirement is absent from "
+                        "the obligation input, lacks source-fragment provenance, or is not assigned to every "
+                        "affected unit. Use disposition preserved only when the assigned contracts collectively "
+                        "deliver the whole source outcome."
+                    )
+                    if verify_obligations
+                    else "This amendment check does not assess source obligations. Return obligations_complete=true, "
+                    "obligation_gaps=[], and obligations=[]."
+                ),
                 authority_description=authority_description,
                 constraints_json=json.dumps(constraints_payload, indent=2, sort_keys=True),
+                authority_fragments_json=json.dumps(
+                    [fragment.to_prompt_dict() for fragment in delivery_authority_fragments(authority_description)],
+                    indent=2,
+                    sort_keys=True,
+                ),
+                obligations_json=json.dumps(obligations_payload, indent=2, sort_keys=True),
                 units_json=json.dumps(units_payload, indent=2, sort_keys=True),
             )
         )
@@ -957,8 +1709,21 @@ class DeliveryPreparationAgent:
                 source_task_description=authority_description,
                 unit_task_markdown_by_id={unit.id: unit.task_markdown for unit in units},
                 require_unit_context=verify_unit_context,
+                require_source_accounting=source_accounting is not None,
+                require_obligations=verify_obligations,
+                known_obligation_source_fragment_ids=known_obligation_source_fragment_ids,
             )
             self._assert_constraint_verification_echo(constraints, verification)
+            self._assert_obligation_verification_echo(obligations, verification)
+            if (
+                source_accounting is not None
+                and verification.source_accounting != source_accounting
+                and not self._verification_has_terminal_blocker(verification)
+            ):
+                raise DeliveryAuthoringParseError(
+                    "source_accounting.verification_mismatch",
+                    "Independent verification must echo the supplied accounting and report disagreements as gaps.",
+                )
         except DeliveryAuthoringParseError as exc:
             self._record_constraint_verification_failure(
                 audit_recorder,
@@ -1039,6 +1804,61 @@ class DeliveryPreparationAgent:
         )
         return repaired
 
+    def _repair_obligation_gaps(
+        self,
+        *,
+        authority_description: str,
+        obligations: Sequence[DeliveryAuthoringObligationDraft],
+        units: Sequence[DeliveryAuthoringUnitDraft],
+        gaps: Sequence[DeliveryObligationGap],
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+    ) -> list[DeliveryAuthoringObligationDraft]:
+        prompt = read_only_agent_prompt(
+            AGENT_SECURITY_PREFIX
+            + _DELIVERY_OBLIGATION_REPAIR_PROMPT.format(
+                obligations_json=json.dumps(
+                    [obligation.to_verification_dict() for obligation in obligations],
+                    indent=2,
+                    sort_keys=True,
+                ),
+                gaps_json=json.dumps([gap.to_dict() for gap in gaps], indent=2, sort_keys=True),
+            )
+        )
+        try:
+            output = self.llm.generate("", prompt)
+        except Exception as exc:
+            self._record_obligation_repair_failure(
+                audit_recorder,
+                prompt=prompt,
+                output=None,
+                error=exc,
+                error_code="delivery_obligation_repair.authoring_failed",
+            )
+            raise DeliveryPreparationAgentError("Delivery obligation repair assistant failed.") from None
+        try:
+            repaired = parse_delivery_obligation_repair_output(
+                output,
+                unit_ids={unit.id for unit in units},
+                source_task_description=authority_description,
+            )
+            self._assert_obligation_repair(obligations, repaired, gaps)
+        except DeliveryAuthoringParseError as exc:
+            self._record_obligation_repair_failure(
+                audit_recorder,
+                prompt=prompt,
+                output=output,
+                error=exc,
+                error_code=exc.code,
+            )
+            raise
+        self._record_obligation_repair_success(
+            audit_recorder,
+            prompt=prompt,
+            output=output,
+            obligations=repaired,
+        )
+        return repaired
+
     @staticmethod
     def _verification_unit_payload(unit: DeliveryAuthoringUnitDraft) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -1075,6 +1895,72 @@ class DeliveryPreparationAgent:
                 "delivery_constraint_verification.constraints_mismatch",
                 "Constraint verification must echo every supplied constraint exactly and in order.",
             )
+
+    @staticmethod
+    def _assert_obligation_verification_echo(
+        obligations: Sequence[DeliveryAuthoringObligationDraft],
+        verification: DeliveryConstraintVerification,
+    ) -> None:
+        expected = [(item.id, item.summary, item.source_fragment_ids, item.unit_ids) for item in obligations]
+        actual = [(item.id, item.summary, item.source_fragment_ids, item.unit_ids) for item in verification.obligations]
+        if actual != expected:
+            raise DeliveryAuthoringParseError(
+                "delivery_obligation_verification.obligations_mismatch",
+                "Obligation verification must echo every supplied obligation exactly and in order.",
+            )
+
+    @staticmethod
+    def _assert_obligation_repair(
+        original: Sequence[DeliveryAuthoringObligationDraft],
+        repaired: Sequence[DeliveryAuthoringObligationDraft],
+        gaps: Sequence[DeliveryObligationGap],
+    ) -> None:
+        omitted = [gap for gap in gaps if gap.reason == "omitted"]
+        if len(repaired) != len(original) + len(omitted):
+            raise DeliveryAuthoringParseError(
+                "delivery_obligation_repair.count_invalid",
+                "Obligation repair must add exactly one obligation for every omitted gap.",
+            )
+        assignments: dict[str, list[str]] = {}
+        for gap in gaps:
+            if gap.reason != "incompletely_assigned" or gap.obligation_id is None:
+                continue
+            assigned = assignments.setdefault(gap.obligation_id, [])
+            for unit_id in gap.affected_unit_ids:
+                if unit_id not in assigned:
+                    assigned.append(unit_id)
+        for index, existing in enumerate(original):
+            candidate = repaired[index]
+            if (
+                candidate.id != existing.id
+                or candidate.summary != existing.summary
+                or candidate.source_fragment_ids != existing.source_fragment_ids
+                or candidate.disposition != existing.disposition
+            ):
+                raise DeliveryAuthoringParseError(
+                    "delivery_obligation_repair.existing_changed",
+                    "Obligation repair must preserve existing obligation identity and provenance.",
+                )
+            expected_units = list(existing.unit_ids)
+            for unit_id in assignments.get(existing.id, []):
+                if unit_id not in expected_units:
+                    expected_units.append(unit_id)
+            if candidate.unit_ids != expected_units:
+                raise DeliveryAuthoringParseError(
+                    "delivery_obligation_repair.assignment_invalid",
+                    "Obligation repair may add only verifier-identified missing unit assignments.",
+                )
+        for candidate, gap in zip(repaired[len(original) :], omitted):
+            if (
+                candidate.summary != gap.summary
+                or candidate.source_fragment_ids != gap.source_fragment_ids
+                or candidate.unit_ids != gap.affected_unit_ids
+                or candidate.disposition != DELIVERY_CONSTRAINT_PRESERVED_DISPOSITION
+            ):
+                raise DeliveryAuthoringParseError(
+                    "delivery_obligation_repair.omitted_mismatch",
+                    "New obligations must match omitted verifier gaps exactly.",
+                )
 
     @staticmethod
     def _assert_constraint_repair(
@@ -1153,6 +2039,11 @@ class DeliveryPreparationAgent:
             project_context_json=json.dumps(context, indent=2, sort_keys=True),
             validation_commands_json=json.dumps(safe_validation_commands, indent=2, sort_keys=True),
             task_description=task_description,
+            authority_fragments_json=json.dumps(
+                [fragment.to_prompt_dict() for fragment in delivery_authority_fragments(task_description)],
+                indent=2,
+                sort_keys=True,
+            ),
         )
 
     def _build_assessment_prompt(
@@ -1243,6 +2134,8 @@ class DeliveryPreparationAgent:
                     "plan_id": draft.plan_id,
                     "unit_ids": [unit.id for unit in draft.units],
                     "unit_count": len(draft.units),
+                    "obligation_ids": [obligation.id for obligation in draft.obligations],
+                    "obligation_count": len(draft.obligations),
                     "planning_mode": draft.planning_mode,
                     "warnings": list(draft.warnings),
                 },
@@ -1412,6 +2305,16 @@ class DeliveryPreparationAgent:
                         {"unit_id": gap.unit_id, "source_literal_count": len(gap.source_literals)}
                         for gap in verification.unit_context_gaps
                     ],
+                    "obligations_complete": verification.obligations_complete,
+                    "obligation_ids": [obligation.id for obligation in verification.obligations],
+                    "obligation_dispositions": [obligation.disposition for obligation in verification.obligations],
+                    "obligation_gaps": [gap.to_dict() for gap in verification.obligation_gaps],
+                    "source_accounting": [record.to_verification_dict() for record in verification.source_accounting]
+                    if verification.source_accounting is not None
+                    else None,
+                    "source_accounting_gaps": verification.source_accounting_gaps,
+                    "unit_contract_gaps": verification.unit_contract_gaps,
+                    "context_paths": verification.context_paths,
                 },
             }
         )
@@ -1482,6 +2385,56 @@ class DeliveryPreparationAgent:
         audit_recorder(
             {
                 "phase": "delivery_prepare_constraint_repair",
+                "round_index": 1,
+                "prompt": prompt,
+                "raw_output": output,
+                "parsed": {
+                    "status": "failed",
+                    "error_type": type(error).__name__,
+                    "error_code": error_code,
+                    "error": str(error),
+                },
+            }
+        )
+
+    def _record_obligation_repair_success(
+        self,
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+        *,
+        prompt: str,
+        output: str,
+        obligations: Sequence[DeliveryAuthoringObligationDraft],
+    ) -> None:
+        if audit_recorder is None:
+            return
+        audit_recorder(
+            {
+                "phase": "delivery_prepare_obligation_repair",
+                "round_index": 1,
+                "prompt": prompt,
+                "raw_output": output,
+                "parsed": {
+                    "status": "parsed",
+                    "obligation_ids": [obligation.id for obligation in obligations],
+                    "dispositions": [obligation.disposition for obligation in obligations],
+                },
+            }
+        )
+
+    def _record_obligation_repair_failure(
+        self,
+        audit_recorder: DeliveryPreparationAuditRecorder | None,
+        *,
+        prompt: str,
+        output: str | None,
+        error: Exception,
+        error_code: str,
+    ) -> None:
+        if audit_recorder is None:
+            return
+        audit_recorder(
+            {
+                "phase": "delivery_prepare_obligation_repair",
                 "round_index": 1,
                 "prompt": prompt,
                 "raw_output": output,

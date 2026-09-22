@@ -37,6 +37,7 @@ from core.delivery_constraint_context import delivery_constraint_context_fingerp
 from core.delivery_authoring import (
     DeliveryAmendmentAuthoringDraft,
     DeliveryAuthoringConstraintDraft,
+    DeliveryAuthoringObligationDraft,
     DeliveryAuthoringParseError,
     DeliveryAuthoringUnitDraft,
     DeliveryConstraintVerification,
@@ -49,6 +50,7 @@ from core.delivery_plan import (
     check_delivery_plan_file,
     delivery_unit_constraint_context,
 )
+from core.delivery_obligations import delivery_authority_fragments
 from core.delivery_progress import (
     DeliveryProgressLockError,
     delivery_events_path,
@@ -300,6 +302,8 @@ def _add_target_constraint(root: Path, plan_path: Path) -> None:
     source_text = "# Source task\n\nPreserve the protocol authority boundary.\n"
     source_task.write_text(source_text, encoding="utf-8")
     plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    plan["schema_version"] = 2
+    plan["verification"] = {"mode": "final_gate"}
     plan["source_task"] = {
         "path": source_task.relative_to(root).as_posix(),
         "sha256": f"sha256:{hashlib.sha256(source_text.encode('utf-8')).hexdigest()}",
@@ -319,6 +323,26 @@ def _add_target_constraint(root: Path, plan_path: Path) -> None:
             "unit_ids": ["b"],
             "disposition": "preserved",
         },
+    ]
+    plan["obligations"] = [
+        {
+            "id": "preserve-protocol-boundary",
+            "summary": "The delivered behavior preserves external protocol ownership.",
+            "source_fragment_ids": [delivery_authority_fragments(source_text)[-1].id],
+            "unit_ids": ["c"],
+        }
+    ]
+    plan["source_accounting"] = [
+        {
+            "source_fragment_id": fragment.id,
+            "disposition": "mapped",
+            "obligation_ids": ["preserve-protocol-boundary"]
+            if fragment.id in plan["obligations"][0]["source_fragment_ids"]
+            else [],
+            "constraint_ids": ["protocol-authority", "foundation-boundary"],
+            "rationale_sha256": "sha256:" + hashlib.sha256(b"Source authority rationale.").hexdigest(),
+        }
+        for fragment in delivery_authority_fragments(source_text)
     ]
     plan_path.write_text(yaml.safe_dump(plan, sort_keys=False), encoding="utf-8")
 
@@ -1514,9 +1538,13 @@ def test_amendment_redacts_asset_assignment_check_failure(
     assert not proposal_root.exists()
 
 
-def test_constrained_middle_split_reassigns_constraint_to_every_replacement(tmp_path: Path) -> None:
+@pytest.mark.parametrize("owners", [None, ["c-2"], ["c-1", "c-3"]])
+def test_constrained_middle_split_reassigns_constraint_to_every_replacement(tmp_path: Path, owners) -> None:
     plan_path, _, proposal_root = _setup(tmp_path)
     _add_target_constraint(tmp_path, plan_path)
+    initial_plan = yaml.safe_load(plan_path.read_text())
+    initial_plan["obligations"][0]["unit_ids"] = ["a", "c"]
+    plan_path.write_text(yaml.safe_dump(initial_plan, sort_keys=False))
     asset_path = ".sikula/task-assets/protocol-reference.png"
     asset_file = tmp_path / asset_path
     asset_file.parent.mkdir(parents=True)
@@ -1529,7 +1557,11 @@ def test_constrained_middle_split_reassigns_constraint_to_every_replacement(tmp_
     )
     before = check_delivery_plan_file(plan_path, project_root=tmp_path)
     assert before.valid is True
+    assert before.plan is not None
+    target_obligation = before.plan.obligations[0]
     asset_draft = _draft()
+    if owners is not None:
+        asset_draft.obligation_assignments = {target_obligation.id: owners}
     asset_draft.replacement_units[0] = replace(
         asset_draft.replacement_units[0],
         asset_paths=[asset_path],
@@ -1546,19 +1578,47 @@ def test_constrained_middle_split_reassigns_constraint_to_every_replacement(tmp_
         )
     assert exc_info.value.issue.code == "delivery_amend.constraint_verification_required"
 
+    verified_constraint = DeliveryAuthoringConstraintDraft(
+        id="protocol-authority",
+        kind="authoritative_read_only_dependency",
+        summary="Protocol changes remain owned by the external protocol project.",
+        unit_ids=["c-1", "c-2", "c-3"],
+        disposition="preserved",
+    )
+    verified_obligation = DeliveryAuthoringObligationDraft(
+        id=target_obligation.id,
+        summary=target_obligation.summary,
+        source_fragment_ids=target_obligation.source_fragment_ids,
+        unit_ids=owners or ["c-1", "c-2", "c-3"],
+        disposition="preserved",
+    )
+    unresolved = replace(
+        asset_draft,
+        constraint_verification=DeliveryConstraintVerification(
+            constraints_complete=True,
+            constraints=[verified_constraint],
+            obligations_complete=True,
+            obligations=[replace(verified_obligation, disposition="needs_review")],
+        ),
+    )
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        create_delivery_amendment_proposal(
+            plan_path,
+            "c",
+            unresolved,
+            project_root=tmp_path,
+            proposal_root=proposal_root,
+            project_config=_project_config(tmp_path),
+        )
+    assert exc_info.value.issue.code == "delivery_amend.obligation_review_required"
+
     draft = replace(
         asset_draft,
         constraint_verification=DeliveryConstraintVerification(
             constraints_complete=True,
-            constraints=[
-                DeliveryAuthoringConstraintDraft(
-                    id="protocol-authority",
-                    kind="authoritative_read_only_dependency",
-                    summary="Protocol changes remain owned by the external protocol project.",
-                    unit_ids=["c-1", "c-2", "c-3"],
-                    disposition="preserved",
-                )
-            ],
+            constraints=[verified_constraint],
+            obligations_complete=True,
+            obligations=[verified_obligation],
         ),
     )
     proposal, _ = create_delivery_amendment_proposal(
@@ -1584,6 +1644,8 @@ def test_constrained_middle_split_reassigns_constraint_to_every_replacement(tmp_
     assert constraint["unit_ids"] == ["a", "c-1", "c-2", "c-3", "d"]
     assert "c" not in constraint["unit_ids"]
     assert amended["constraints"][1]["unit_ids"] == ["b"]
+    assert amended["obligations"][0]["unit_ids"] == ["a", *(owners or ["c-1", "c-2", "c-3"])]
+    assert proposal.obligation_assignments == asset_draft.obligation_assignments
 
     checked = check_delivery_plan_file(plan_path, project_root=tmp_path)
     assert checked.valid is True
@@ -1601,6 +1663,7 @@ def test_constrained_middle_split_reassigns_constraint_to_every_replacement(tmp_
         ("incomplete", "delivery_amend.constraint_verification_incomplete"),
         ("conflict", "delivery_amend.constraint_conflict"),
         ("needs_review", "delivery_amend.constraint_review_required"),
+        ("context_unavailable", "delivery_amend.context_unavailable"),
     ],
 )
 def test_constrained_amendment_rejects_untrusted_verification(
@@ -1618,7 +1681,7 @@ def test_constrained_amendment_rejects_untrusted_verification(
                 kind="authoritative_read_only_dependency",
                 summary="Protocol changes remain owned by the external protocol project.",
                 unit_ids=["c-1", "c-2", "c-3"],
-                disposition="preserved" if case == "incomplete" else case,
+                disposition="preserved" if case in {"incomplete", "context_unavailable"} else case,
             )
         ]
     draft = replace(
@@ -1626,6 +1689,7 @@ def test_constrained_amendment_rejects_untrusted_verification(
         constraint_verification=DeliveryConstraintVerification(
             constraints_complete=case != "incomplete",
             constraints=verification_constraints,
+            context_unavailable=case == "context_unavailable",
         ),
     )
 
@@ -4469,6 +4533,38 @@ def test_main_amend_commands_delegate_to_delivery_cli() -> None:
 
     prepare.assert_called_once()
     apply.assert_called_once_with(args, cfg)
+
+
+def test_amend_prepare_known_constraint_stop_never_calls_author(tmp_path: Path, capsys) -> None:
+    plan_path, _, proposal_root = _setup(tmp_path)
+    _add_target_constraint(tmp_path, plan_path)
+    plan = yaml.safe_load(plan_path.read_text())
+    plan["constraints"][0]["kind"] = "stop_and_follow_up"
+    plan_path.write_text(yaml.safe_dump(plan, sort_keys=False))
+
+    def author(**kwargs):
+        pytest.fail("Known prerequisite stops must precede amendment authoring.")
+
+    args = argparse.Namespace(
+        plan_file=str(plan_path),
+        split_unit="c",
+        json=True,
+        agent_model=None,
+        agent_provider=None,
+        agent_timeout=None,
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_delivery_amend_prepare(
+            args,
+            {**_project_config(tmp_path), "tasks": {"contract_report_dir": str(proposal_root)}},
+            _amend_context(tmp_path, author),
+        )
+    payload = json.loads(capsys.readouterr().out)
+    assert exc_info.value.code == 1
+    assert payload["recommended_action"] == "external_dependency_follow_up"
+    assert payload["errors"][0]["code"] == "delivery_amend.external_dependency_follow_up_required"
+    assert payload["proposal_path"] is None
+    assert not list(proposal_root.rglob("*.json"))
 
 
 def test_amend_prepare_external_failure_returns_follow_up_without_proposal(

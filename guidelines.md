@@ -472,8 +472,9 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
 - **Delivery unit contracts** must be self-contained because child agents cannot
   read the parent source task. Source-defined identifiers and values required
   verbatim must appear in every affected unit task. Independent preparation
-  verification may return only bounded complete source-task lines missing from
-  named units; deterministic repair may append those lines to task Markdown but
+  exact-literal verification may return only bounded complete source-task lines missing from
+  named units. Semantic contract gaps are separate findings eligible for the bounded draft
+  correction described below; deterministic literal repair may append those lines to task Markdown but
   must not modify any other unit field, and the result must be reverified.
 - **`AnalystAgent`** must not suggest or generate test file changes — test changes are exclusively the domain of `TestWriterAgent`.
 - **`AnalystAgent`, `ReviewerAgent`, and `TestWriterAgent`** must preserve structured input contracts: parser, validator, expression engine, DSL, config, schema, and rule-engine changes need explicit accepted/rejected cases, materially different rejected input classes, expected-result-type handling when typed contexts exist, and a validation-vs-runtime failure-phase distinction when observable.
@@ -850,6 +851,19 @@ python3 -m ruff format .
   exists. Integration and security reviewers remain physically read-only,
   use exact-final-line structured dispositions, receive at most one format retry,
   and cannot infer approval from empty, malformed, or uncertain output.
+- **Never** publish a newly authored source-backed delivery plan with an
+  unowned obligation, an unknown source-fragment reference, or unresolved
+  obligation disposition. Deterministic source-fragment identity and ownership
+  validation must surround independent semantic extraction. Final semantic
+  approval requires one acceptable terminal result for every current obligation;
+  a completeness boolean or aggregate prose is not closure evidence. Fresh source-backed
+  authoring must account for every source fragment, including independently checked
+  context-only decisions; keep rationale text in private audit. Bounded draft correction
+  may alter only reported gaps and affected task Markdown, never unrelated contracts or
+  unit graph/scope/asset/budget metadata. Known prerequisite stops preempt further LLM
+  verification or repair; source accounting must never erase or relabel them. Amendment
+  obligations may have contributing replacement subsets, while applicable hard
+  constraints remain binding on every affected replacement.
 - **Never** expose final-gate source text, prompts, provider output, validation
   output, diffs, child state, credentials, or absolute paths through delivery
   status or JSON. Keep private material in append-only local evidence and publish
