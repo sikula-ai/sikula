@@ -77,6 +77,7 @@ class DeliveryVerificationRecord:
     evidence_path: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
+    repair_input_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -101,7 +102,7 @@ class DeliveryVerificationRecord:
             "obligation_satisfied_count": self.obligation_satisfied_count,
             "obligation_gap_count": self.obligation_gap_count,
         }
-        for key in ("stop_code", "evidence_path", "started_at", "completed_at"):
+        for key in ("stop_code", "evidence_path", "started_at", "completed_at", "repair_input_fingerprint"):
             value = getattr(self, key)
             if value:
                 data[key] = value
@@ -140,6 +141,7 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         "evidence_path",
         "started_at",
         "completed_at",
+        "repair_input_fingerprint",
     }
     if set(value) - allowed:
         raise ValueError("delivery verification record contains unsupported fields")
@@ -222,6 +224,11 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         if candidate is not None and (not isinstance(candidate, str) or not candidate):
             raise ValueError(f"delivery verification {key} must be a non-empty string when present")
     stop_code = value.get("stop_code")
+    repair_fingerprint = value.get("repair_input_fingerprint")
+    if repair_fingerprint is not None and (
+        not isinstance(repair_fingerprint, str) or not _SHA256_ID_RE.fullmatch(repair_fingerprint)
+    ):
+        raise ValueError("delivery verification repair input fingerprint is invalid")
     if stop_code is not None and not _SAFE_CODE_RE.fullmatch(stop_code):
         raise ValueError("delivery verification stop_code is invalid")
     evidence_path = value.get("evidence_path")
@@ -258,4 +265,5 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         evidence_path=evidence_path,
         started_at=value.get("started_at"),
         completed_at=value.get("completed_at"),
+        repair_input_fingerprint=repair_fingerprint,
     )

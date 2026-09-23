@@ -3711,13 +3711,16 @@ def _validate_new_task_target(
             "delivery_amend.replacement_task_forbidden",
             "Replacement task path must not be inside configured private artifact storage.",
         )
-    current = path
-    while current != root:
+    for current in (path, *path.parents):
+        if current == root:
+            return
         if current.is_symlink():
             raise DeliveryAmendmentError(
                 "delivery_amend.replacement_task_symlink", "Replacement task path must not traverse symlinks."
             )
-        current = current.parent
+    raise DeliveryAmendmentError(
+        "delivery_amend.replacement_task_unsafe", "Replacement task path must be rooted in the project directory."
+    )
 
 
 def _backup(path: Path) -> _Backup:

@@ -2173,6 +2173,173 @@ def test_delivery_run_executes_and_finalizes_two_unit_plan(
     )
 
 
+@pytest.mark.parametrize(
+    "max_units,repair_succeeds,resume_override",
+    [(None, True, False), (None, False, False), (2, True, False), (2, False, False), (2, True, True)],
+)
+def test_delivery_run_repairs_source_obligation_and_reverifies(
+    git_project: Path,
+    fake_llm,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    max_units: int | None,
+    repair_succeeds: bool,
+    resume_override: bool,
+) -> None:
+    source = "# Calculator\n\nSubtraction and multiplication must be available together through a combined operation.\n"
+    source_path = git_project / "source.md"
+    source_path.write_text(source, encoding="utf-8")
+    fragments = delivery_authority_fragments(source)
+    unit_paths = [
+        _write_delivery_unit(git_project, name + ".md", "# Calculator\n\nAdd " + name + " support.\n")
+        for name in ("subtract", "multiply")
+    ]
+    plan_path = _write_delivery_plan(
+        git_project,
+        {
+            "schema_version": 2,
+            "plan_id": "integration-repair",
+            "title": "Combined calculator",
+            "final_branch": "sikula/delivery/integration-repair",
+            "verification": {"mode": "final_gate"},
+            "source_task": {"path": "source.md", "sha256": "sha256:" + sha256(source.encode()).hexdigest()},
+            "units": [
+                {"id": name, "task_path": task_path, "depends_on": [], "scope_paths": ["src/"]}
+                for name, task_path in zip(("subtract", "multiply"), unit_paths)
+            ],
+            "obligations": [
+                {
+                    "id": "combined-operation",
+                    "summary": "Both arithmetic behaviors work through their integration entrypoint.",
+                    "source_fragment_ids": [f.id for f in fragments],
+                    "unit_ids": ["subtract", "multiply"],
+                }
+            ],
+            "source_accounting": [
+                {
+                    "source_fragment_id": f.id,
+                    "disposition": "mapped",
+                    "obligation_ids": ["combined-operation"],
+                    "constraint_ids": [],
+                    "rationale_sha256": "sha256:" + "f" * 64,
+                }
+                for f in fragments
+            ],
+        },
+    )
+    _write_handoff_smoke_config(git_project)
+    config_path = git_project / ".sikula/config.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    config.update(run_build=True, run_tests=True)
+    config["build"]["compile_command"] = "python3 -m compileall -q src/"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    _git_commit_all(git_project, "add integration repair plan")
+    head_before = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=git_project, capture_output=True, check=True, text=True
+    ).stdout
+    fake = fake_llm(
+        agent_responses=[
+            {"src/subtract.py": "def subtract(a, b):\n    return a - b\n"},
+            {"src/multiply.py": "def multiply(a, b):\n    return a * b\n"},
+            {"src/combined.py": "def combined(a, b, c):\n    return (a - b) * c\n"},
+        ]
+    )
+    original_readonly = fake.run_readonly_agent
+    gate_calls = []
+    author_calls = []
+
+    def readonly(prompt: str, cwd: Path) -> str:
+        if "Review whether the complete assembled candidate" in prompt:
+            passed = repair_succeeds and (cwd / "src/combined.py").exists()
+            gate_calls.append(passed)
+            return json.dumps(
+                {
+                    "schema_version": 2,
+                    "disposition": "approved" if passed else "repair_required",
+                    "summary": "Integration verified." if passed else "The integration entrypoint is missing.",
+                    "findings": []
+                    if passed
+                    else [
+                        {
+                            "code": "entrypoint_missing",
+                            "summary": "Connect the existing arithmetic operations.",
+                            "unit_ids": ["subtract", "multiply"],
+                            "obligation_ids": ["combined-operation"],
+                        }
+                    ],
+                    "obligation_results": [
+                        {"id": "combined-operation", "outcome": "satisfied" if passed else "missing"}
+                    ],
+                }
+            )
+        if "Author one small, self-contained delivery repair contract" in prompt:
+            author_calls.append(prompt)
+            markdown = _delivery_stop_unit_markdown("Connect calculator operations").replace(
+                "- `python3 -m compileall -q src/`\n", ""
+            )
+            return json.dumps({"schema_version": 1, "disposition": "repair", "task_markdown": markdown})
+        return original_readonly(prompt, cwd)
+
+    fake.run_readonly_agent = readonly
+    monkeypatch.chdir(git_project)
+    command = ["sikula", "delivery", "run", str(plan_path), "--json"]
+
+    def run(arguments: list[str], *, succeeds: bool) -> dict:
+        with patch("sys.argv", arguments):
+            if succeeds:
+                main()
+            else:
+                with pytest.raises(SystemExit) as exc_info:
+                    main()
+                assert exc_info.value.code == 1
+        return json.loads(capsys.readouterr().out)
+
+    with patch("core.llm_client.create_llm_client", return_value=fake):
+        first = run(
+            command + (["--max-units", str(max_units)] if max_units is not None else []),
+            succeeds=repair_succeeds or max_units is not None,
+        )
+        if max_units is not None:
+            assert first["stop_code"] == "delivery.run.unit_limit_reached"
+            assert first["succeeded"] is True
+            assert first["units_attempted"] == 2
+            assert not author_calls
+            if resume_override:
+                command += ["--agent-model", "delivery_preparer=updated-repair-model"]
+                preview = run(command + ["--dry-run"], succeeds=True)
+                assert preview["ready"] is True
+                assert gate_calls == [False]
+                assert not author_calls
+            result = run(command, succeeds=repair_succeeds)
+        else:
+            result = first
+            assert result["units_attempted"] == 3
+        assert result["finalized"] is repair_succeeds, result
+        assert result["succeeded"] is repair_succeeds
+        if not repair_succeeds:
+            assert result["stop_code"] == "delivery_repair.budget_exhausted"
+            assert result["errors"][0]["code"] == "delivery_repair.budget_exhausted"
+        expected_gates = [False, False, repair_succeeds] if resume_override else [False, repair_succeeds]
+        assert gate_calls == expected_gates
+        assert len(author_calls) == 1
+        repeated = run(command, succeeds=repair_succeeds)
+        assert repeated["finalized"] is repair_succeeds
+        assert repeated["units_attempted"] == 0
+        if not repair_succeeds:
+            assert repeated["stop_code"] == "delivery_repair.budget_exhausted"
+        assert gate_calls == expected_gates
+        assert len(author_calls) == 1
+    progress = json.loads((git_project / ".sikula/state/delivery/integration-repair/progress.json").read_text())
+    assert len(progress["units"]) == 3
+    assert all(unit["status"] == "done" for unit in progress["units"])
+    assert progress["verification"]["status"] == ("passed" if repair_succeeds else "failed")
+    assert progress["verification"]["obligation_satisfied_count"] == int(repair_succeeds)
+    after_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=git_project, capture_output=True, check=True, text=True
+    ).stdout
+    assert after_head == head_before
+
+
 def test_delivery_budget_split_applies_to_assembly_and_runs_replacement(
     git_project: Path,
     seq_fake_llm,

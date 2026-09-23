@@ -24,7 +24,7 @@ from core.delivery_authoring import (
     DeliveryAuthoringDraft,
     DeliveryAuthoringParseError,
 )
-from core.delivery_handoff import SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION
+from core.delivery_handoff import SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION, load_delivery_dependency_handoffs
 from core.delivery_plan import (
     DeliveryBudgetExceeded,
     DeliveryPlanIssue,
@@ -273,7 +273,7 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
         "--max-units",
         type=_positive_int,
         metavar="N",
-        help="Stop after N successful unit executions; defaults to active units present at start",
+        help="Stop after N successful unit executions; default adds one repair slot for source-bound plans",
     )
     delivery_run_p.add_argument(
         "--max-elapsed-minutes",
@@ -2275,7 +2275,7 @@ def _validate_delivery_run_agent_overrides(args: argparse.Namespace) -> None:
         getattr(args, "agent_model", None),
         getattr(args, "agent_provider", None),
         getattr(args, "agent_timeout", None),
-        valid_agents=set(RUNTIME_AGENT_NAMES),
+        valid_agents=set(RUNTIME_AGENT_NAMES) | {"delivery_preparer"},
     )
 
 
@@ -2288,6 +2288,7 @@ def _preview_delivery_run(
 ):
     from core.delivery_finalize import preview_delivery_assembly_issue, preview_delivery_finalize
     from core.delivery_progress import get_delivery_status
+    from core.delivery_repair import coordinate_delivery_repair, delivery_repair_pending
     from core.delivery_run import (
         DELIVERY_RUN_BLOCKED,
         DELIVERY_RUN_COMPLETED,
@@ -2299,6 +2300,31 @@ def _preview_delivery_run(
     status = get_delivery_status(args.plan_file, project_root=project_root)
     status = with_delivery_verification_readiness(status, cfg)
     max_units = _delivery_run_unit_limit(args, status)
+    if delivery_repair_pending(args.plan_file, project_root=project_root) or (
+        status.plan
+        and getattr(status.plan, "obligations", None)
+        and _delivery_verification_recovery_stop_code(status) == "delivery_verification.repair_required"
+    ):
+        repair = coordinate_delivery_repair(
+            args.plan_file,
+            cfg,
+            project_root=project_root,
+            agent_factory=None,
+            state_store=context.state_store if context else None,
+            dry_run=True,
+        )
+        return _delivery_run_result(
+            status=status,
+            max_units=max_units,
+            max_elapsed_minutes=getattr(args, "max_elapsed_minutes", None),
+            dry_run=True,
+            ready=repair.ready,
+            stop_code=repair.issue.code if repair.issue else DELIVERY_RUN_PREVIEW,
+            errors=[repair.issue] if repair.issue else [],
+            message=repair.issue.message
+            if repair.issue
+            else "Dry run would prepare or resume one bounded integration repair.",
+        )
     if not status.valid:
         return _delivery_run_result(
             status=status,
@@ -2451,6 +2477,7 @@ def _run_delivery_plan(
 ):
     from core.delivery_plan import DeliveryPlanIssue
     from core.delivery_progress import get_delivery_status
+    from core.delivery_repair import coordinate_delivery_repair, delivery_repair_pending
     from core.delivery_run import (
         DELIVERY_RUN_BLOCKED,
         DELIVERY_RUN_ELAPSED_LIMIT_REACHED,
@@ -2475,9 +2502,65 @@ def _run_delivery_plan(
     last_unit = None
     child_task_id = None
     reset_failed_pending = bool(getattr(args, "reset_failed", False))
+    repair_requested = False
+    repair_admitted = False
 
     while True:
         status = get_delivery_status(args.plan_file, project_root=project_root)
+        if repair_requested or delivery_repair_pending(args.plan_file, project_root=project_root):
+            stop_code = None
+            if units_succeeded >= max_units:
+                stop_code = DELIVERY_RUN_UNIT_LIMIT_REACHED
+            elif max_elapsed_minutes is not None and time.monotonic() - started_at >= max_elapsed_minutes * 60:
+                stop_code = DELIVERY_RUN_ELAPSED_LIMIT_REACHED
+            # A successful bound stop requires resumable repair. Inspect persistent
+            # blockers read-only when the bound prevents further work.
+            repair = coordinate_delivery_repair(
+                args.plan_file,
+                cfg,
+                project_root=project_root,
+                state_store=context.state_store,
+                agent_factory=(lambda: context.repair_agent_factory(args, cfg))
+                if context.repair_agent_factory
+                else None,
+                dry_run=stop_code is not None,
+            )
+            if repair.issue is not None or not repair.ready or (stop_code is None and repair.unit_id is None):
+                issue = repair.issue or DeliveryPlanIssue(
+                    "error", DELIVERY_RUN_NO_PROGRESS, "Integration repair made no durable progress."
+                )
+                return _delivery_run_result(
+                    status=get_delivery_status(args.plan_file, project_root=project_root),
+                    max_units=max_units,
+                    max_elapsed_minutes=max_elapsed_minutes,
+                    started=units_attempted > 0,
+                    units_attempted=units_attempted,
+                    units_succeeded=units_succeeded,
+                    last_unit=last_unit,
+                    child_task_id=child_task_id,
+                    stop_code=issue.code,
+                    errors=[issue],
+                    message=issue.message,
+                )
+            if stop_code is not None:
+                return _delivery_run_result(
+                    status=status,
+                    max_units=max_units,
+                    max_elapsed_minutes=max_elapsed_minutes,
+                    started=units_attempted > 0,
+                    ready=True,
+                    succeeded=True,
+                    units_attempted=units_attempted,
+                    units_succeeded=units_succeeded,
+                    last_unit=last_unit,
+                    child_task_id=child_task_id,
+                    stop_code=stop_code,
+                    message="Delivery run reached a resumable bound before integration repair.",
+                )
+            initial_unit_ids = initial_unit_ids | {repair.unit_id}
+            repair_admitted = True
+            repair_requested = False
+            status = get_delivery_status(args.plan_file, project_root=project_root)
         if not status.valid:
             return _delivery_run_result(
                 status=status,
@@ -2494,7 +2577,7 @@ def _run_delivery_plan(
                 message="Delivery plan became invalid during bounded execution.",
             )
         if status.status == "done":
-            return _finalize_delivery_run(
+            final_result = _finalize_delivery_run(
                 args,
                 cfg=cfg,
                 context=context,
@@ -2507,6 +2590,15 @@ def _run_delivery_plan(
                 last_unit=last_unit,
                 child_task_id=child_task_id,
             )
+            if (
+                final_result.stop_code == "delivery_verification.repair_required"
+                and status.plan
+                and status.plan.obligations
+                and context.repair_agent_factory is not None
+            ):
+                repair_requested = True
+                continue
+            return final_result
         if units_succeeded >= max_units:
             return _delivery_run_result(
                 status=status,
@@ -2525,7 +2617,7 @@ def _run_delivery_plan(
             )
         if (
             max_elapsed_minutes is not None
-            and units_attempted > 0
+            and (units_attempted > 0 or repair_admitted)
             and time.monotonic() - started_at >= max_elapsed_minutes * 60
         ):
             return _delivery_run_result(
@@ -2780,7 +2872,9 @@ def _delivery_run_unit_limit(args: argparse.Namespace, status) -> int:
     configured = getattr(args, "max_units", None)
     if configured is not None:
         return configured
-    return sum(unit.status not in {"done", "superseded"} for unit in status.units)
+    remaining = sum(unit.status not in {"done", "superseded"} for unit in status.units)
+    plan = getattr(status, "plan", None)
+    return remaining + int(bool(plan and getattr(plan, "obligations", None)))
 
 
 def _delivery_run_status_signature(status) -> tuple[Any, ...]:
@@ -2899,6 +2993,7 @@ class DeliveryRunNextContext:
     run_amendment_authoring: Callable[..., DeliveryAmendmentAuthoringDraft] | None = None
     verify_plan: Callable[[argparse.Namespace, dict], Any] | None = None
     verification_config: Callable[[argparse.Namespace, dict], dict] | None = None
+    repair_agent_factory: Callable[[argparse.Namespace, dict], Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -3352,6 +3447,23 @@ def _run_next_delivery_unit(
         status = get_delivery_status(args.plan_file, project_root=project_root)
         status = with_delivery_verification_readiness(status, cfg)
         errors = list(status.errors)
+        from core.delivery_repair import delivery_repair_pending
+
+        if delivery_repair_pending(args.plan_file, project_root=project_root):
+            issue = DeliveryPlanIssue(
+                "error",
+                "delivery_repair.pending",
+                "Integration repair has unfinished control state; resume with delivery run before running a child.",
+            )
+            return _execution_result_from_status(
+                status,
+                ran=False,
+                selected_unit=None,
+                progress_path=str(progress_path),
+                events_path=str(events_path),
+                errors=[*errors, issue],
+                message=issue.message,
+            )
         if status.plan is None or status.project_root is None:
             return _execution_result_from_status(
                 status,
@@ -3506,7 +3618,7 @@ def _run_next_delivery_unit(
                 message=stop_issues[0].message,
             )
 
-        dependency_handoffs, handoff_errors = _load_dependency_handoffs(status, selected_unit, root)
+        dependency_handoffs, handoff_errors = load_delivery_dependency_handoffs(status, selected_unit.depends_on, root)
         if handoff_errors:
             errors.extend(handoff_errors)
             return _execution_result_from_status(
@@ -4248,7 +4360,7 @@ def _apply_delivery_preview_execution_guards(
     if selected_unit.status == "running":
         return replace(preview, selected_unit=selected_unit)
 
-    _, handoff_errors = _load_dependency_handoffs(status, selected_unit, root)
+    _, handoff_errors = load_delivery_dependency_handoffs(status, selected_unit.depends_on, root)
     if handoff_errors:
         return replace(
             preview,
@@ -4463,91 +4575,6 @@ def _dependency_commit_errors(status, selected_unit, root: Path, *, target_commi
                 )
             )
     return errors
-
-
-def _load_dependency_handoffs(
-    status: Any,
-    selected_unit: Any,
-    root: Path,
-) -> tuple[list[dict[str, Any]], list[DeliveryPlanIssue]]:
-    from core.delivery_handoff import (
-        DeliveryHandoffError,
-        delivery_unit_handoff_path,
-        delivery_unit_handoff_matches_unit,
-        read_delivery_unit_handoff,
-    )
-
-    units_by_id = {unit.id: unit for unit in status.units}
-    dependency_ids: set[str] = set()
-    pending = list(selected_unit.depends_on)
-    while pending:
-        dependency_id = pending.pop(0)
-        if dependency_id in dependency_ids:
-            continue
-        dependency_ids.add(dependency_id)
-        dependency = units_by_id.get(dependency_id)
-        if dependency is not None:
-            pending.extend(dependency.depends_on)
-
-    handoffs: list[dict[str, Any]] = []
-    errors: list[DeliveryPlanIssue] = []
-    for dependency in status.units:
-        if dependency.id not in dependency_ids or dependency.status != "done":
-            continue
-        if dependency.handoff_schema_version is None and dependency.handoff_fingerprint is None:
-            continue
-        if dependency.handoff_schema_version != SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION:
-            errors.append(
-                DeliveryPlanIssue(
-                    "error",
-                    "delivery.dependency_handoff_schema_unsupported",
-                    f"Dependency unit {dependency.id} uses an unsupported delivery handoff schema.",
-                )
-            )
-            continue
-
-        try:
-            path = delivery_unit_handoff_path(root, status.plan.plan_id, dependency.id)
-            handoff = read_delivery_unit_handoff(path, project_root=root)
-        except FileNotFoundError:
-            errors.append(
-                DeliveryPlanIssue(
-                    "error",
-                    "delivery.dependency_handoff_missing",
-                    f"Dependency unit {dependency.id} references a delivery handoff that is missing.",
-                )
-            )
-            continue
-        except DeliveryHandoffError:
-            errors.append(
-                DeliveryPlanIssue(
-                    "error",
-                    "delivery.dependency_handoff_invalid",
-                    f"Dependency unit {dependency.id} references an invalid delivery handoff.",
-                )
-            )
-            continue
-
-        if (
-            handoff.schema_version != dependency.handoff_schema_version
-            or handoff.fingerprint != dependency.handoff_fingerprint
-            or handoff.plan_id != status.plan.plan_id
-            or handoff.unit_id != dependency.id
-            or handoff.child_task_id != dependency.child_task_id
-            or handoff.result_branch != dependency.branch
-            or handoff.result_commit != dependency.commit
-            or not delivery_unit_handoff_matches_unit(handoff, dependency)
-        ):
-            errors.append(
-                DeliveryPlanIssue(
-                    "error",
-                    "delivery.dependency_handoff_mismatch",
-                    f"Dependency unit {dependency.id} handoff does not match parent progress evidence.",
-                )
-            )
-            continue
-        handoffs.append(handoff.to_dict())
-    return handoffs, errors
 
 
 def _running_delivery_units(status) -> list:

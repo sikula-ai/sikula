@@ -255,6 +255,17 @@ def preview_delivery_run_next(
     message = "Delivery plan is not ready to run."
     if git_root_error and not any(issue.code == git_root_error.code for issue in errors):
         errors.insert(0, git_root_error)
+    if status.valid and status.plan and status.plan.obligations:
+        from core.delivery_repair import delivery_repair_pending
+
+        if delivery_repair_pending(path, project_root=project_root):
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery_repair.pending",
+                    "Integration repair has unfinished control state; resume with delivery run before running a child.",
+                )
+            )
 
     if status.valid and not errors:
         running_recovery_unit = _select_running_recovery_unit(status)

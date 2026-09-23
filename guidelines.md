@@ -851,6 +851,15 @@ python3 -m ruff format .
   exists. Integration and security reviewers remain physically read-only,
   use exact-final-line structured dispositions, receive at most one format retry,
   and cannot infer approval from empty, malformed, or uncertain output.
+- **Never** drive integration repair from audit replay or unstructured reviewer
+  prose. Require current typed semantic findings bound to source obligations,
+  candidate, gate attempt, plan, and effective policy. Persist the finite repair
+  and authoring budgets across resume; completed units stay immutable. Append
+  repair work only within existing owners' authorized scope, validate its contract
+  before publication, run the normal child pipeline, and require a fresh final
+  gate. External-dependency, security, ownership, and required-evidence stops
+  preempt further repair calls. An interrupted publication must be reconciled
+  before `run-next` can execute its unit.
 - **Never** publish a newly authored source-backed delivery plan with an
   unowned obligation, an unknown source-fragment reference, or unresolved
   obligation disposition. Deterministic source-fragment identity and ownership

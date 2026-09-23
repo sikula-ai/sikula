@@ -12,7 +12,8 @@ import re
 import tempfile
 from typing import Any
 
-from core.delivery_progress import delivery_progress_path
+from core.delivery_plan import DeliveryPlanIssue
+from core.delivery_progress import DeliveryStatusResult, delivery_progress_path
 
 SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION = 1
 
@@ -278,6 +279,86 @@ def read_delivery_unit_handoff(path: Path, *, project_root: Path | None = None) 
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise DeliveryHandoffError("delivery handoff could not be read as JSON") from exc
     return parse_delivery_unit_handoff(data)
+
+
+def load_delivery_dependency_handoffs(
+    status: DeliveryStatusResult,
+    depends_on: list[str],
+    root: Path,
+) -> tuple[list[dict[str, Any]], list[DeliveryPlanIssue]]:
+    """Validate the same dependency evidence for child execution and repair preflight."""
+
+    units_by_id = {unit.id: unit for unit in status.units}
+    dependency_ids: set[str] = set()
+    pending = list(depends_on)
+    while pending:
+        dependency_id = pending.pop(0)
+        if dependency_id in dependency_ids:
+            continue
+        dependency_ids.add(dependency_id)
+        dependency = units_by_id.get(dependency_id)
+        if dependency is not None:
+            pending.extend(dependency.depends_on)
+
+    handoffs: list[dict[str, Any]] = []
+    errors: list[DeliveryPlanIssue] = []
+    for dependency in status.units:
+        if dependency.id not in dependency_ids or dependency.status != "done":
+            continue
+        if dependency.handoff_schema_version is None and dependency.handoff_fingerprint is None:
+            continue
+        if dependency.handoff_schema_version != SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery.dependency_handoff_schema_unsupported",
+                    f"Dependency unit {dependency.id} uses an unsupported delivery handoff schema.",
+                )
+            )
+            continue
+
+        try:
+            path = delivery_unit_handoff_path(root, status.plan.plan_id, dependency.id)
+            handoff = read_delivery_unit_handoff(path, project_root=root)
+        except FileNotFoundError:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery.dependency_handoff_missing",
+                    f"Dependency unit {dependency.id} references a delivery handoff that is missing.",
+                )
+            )
+            continue
+        except DeliveryHandoffError:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery.dependency_handoff_invalid",
+                    f"Dependency unit {dependency.id} references an invalid delivery handoff.",
+                )
+            )
+            continue
+
+        if (
+            handoff.schema_version != dependency.handoff_schema_version
+            or handoff.fingerprint != dependency.handoff_fingerprint
+            or handoff.plan_id != status.plan.plan_id
+            or handoff.unit_id != dependency.id
+            or handoff.child_task_id != dependency.child_task_id
+            or handoff.result_branch != dependency.branch
+            or handoff.result_commit != dependency.commit
+            or not delivery_unit_handoff_matches_unit(handoff, dependency)
+        ):
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery.dependency_handoff_mismatch",
+                    f"Dependency unit {dependency.id} handoff does not match parent progress evidence.",
+                )
+            )
+            continue
+        handoffs.append(handoff.to_dict())
+    return handoffs, errors
 
 
 def write_delivery_unit_handoff(path: Path, handoff: DeliveryUnitHandoff) -> None:

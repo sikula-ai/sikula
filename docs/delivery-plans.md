@@ -891,9 +891,12 @@ sikula delivery run .sikula/delivery/<slug>/plan.yaml --reset-failed
 `delivery run` is a thin coordinator over `delivery run-next`. It reloads the
 durable plan status after every child and runs only one child at a time through
 the normal Sikula pipeline. By default, one invocation can attempt at most the
-active units that exist when it starts; units added by a later amendment wait
-for another invocation. `--max-units` can lower that bound. The optional
-`--max-elapsed-minutes` limit is soft: Sikula checks it only between child runs
+active units that exist when it starts, plus one integration-repair slot for
+source-bound plans with obligations. Only a repair published by this coordinator
+is admitted beyond that initial snapshot; unrelated amended units wait for
+another invocation. `--max-units` sets an explicit total including repair work.
+The optional `--max-elapsed-minutes` limit is soft: Sikula checks it between child runs
+and before repair preparation,
 and never terminates an active child.
 
 The coordinator stops immediately when a unit fails, waits, exceeds its budget,
@@ -906,8 +909,10 @@ stops, prepare or apply amendments, split units, or skip blocked work. Operators
 use the existing `status`, `run-next`, and amendment commands for other recovery
 decisions, then rerun `delivery run`.
 
-Reaching a unit or elapsed limit is a successful resumable stop, not a failed
-plan. For a schema-version-2 plan that becomes `done`, the coordinator first
+Reaching a unit or elapsed limit is a successful stop when work can resume.
+An exhausted integration repair budget or terminal repair blocker remains an
+error even if the invocation has also reached its unit or elapsed limit.
+For a schema-version-2 plan that becomes `done`, the coordinator first
 runs the required final integration gate and finalizes only its passing exact
 candidate. Rerunning an already current
 finalized plan is idempotent and does not append another finalization event.
@@ -917,6 +922,81 @@ document; child JSON is kept on stderr rather than nested into the public
 result. Runtime agent model, provider, and timeout overrides are forwarded to
 each child in the same way as `run-next`; reviewer and security-reviewer
 overrides also govern the final gate.
+`delivery_preparer` overrides govern integration repair authoring and are not
+forwarded to implementation agents.
+
+### Bounded integration repair
+
+For a source-bound plan with exhaustive source accounting, `delivery run`
+automatically recovers an eligible semantic `repair_required` result by appending
+one repair unit. Every finding must identify current unsatisfied source
+obligations. Legacy evidence without structured repair input, security-review
+rejections, unmapped findings, validation failures, scope amendments, and external
+dependency stops do not enter this repair path.
+
+The author inspects the exact assembled candidate in a detached read-only
+workspace. It may decide implementation details from authorized project evidence,
+but cannot rewrite the source intent or expand scope. Sikula fixes the new unit's
+identity, dependencies on completed units, inherited hard constraints, obligation
+assignments, exact inherited asset declarations, and one-planner-step budget. Its
+write scope is bounded by the affected owners' recorded scope and current sandbox.
+The contract must pass readiness and
+match enabled validation commands before publication. A newly discovered external
+dependency, missing required evidence, scope, or security blocker stops preparation
+without publishing substitute work or invoking another recovery provider.
+
+The plan permits one published automatic repair unit and at most two authoring
+attempts, including malformed-output corrections and interrupted calls. Attempts
+are reserved only after checking that the plan with the appended repair fits the
+final gate's unit-count, plan-size, and verification-packet limits, and checking
+the complete rendered prompt size, including JSON escaping and correction instructions.
+These plan limits also apply to dry-run and checks before a resumable bound stop.
+Invalid preparer configuration, rejected provider workspace settings,
+and an oversized initial prompt stop before creating repair control state and do
+not consume an authoring attempt. The gate, source, completed child authority, and
+repair policy remain bound together. Changing preparer overrides before preparation
+starts refreshes the gate and its repair input on the next `delivery run`. Once
+preparation starts, changing overrides cannot reset its budget or terminal stops.
+Inherited assets are checked in the exact reviewed candidate before authoring,
+and again when publishing or resuming publication, even if they are absent from
+the operator checkout. The gate, source, completed child authority, and original
+contracts are revalidated before each provider call, including a format correction.
+The contracts must match the task text captured when their children ran; if child
+evidence is absent, the unchanged contract must exist in the reviewed candidate.
+Read-only violations reported by the provider also persist as terminal stops,
+including during workspace preparation before the first authoring call, even
+when its disposable workspace hides the mutation from the coordinator. The
+bounds survive new `delivery run` invocations and `--reset-failed`; the flag never
+resets the repair budget or clears a terminal boundary. Additional automatic repair
+rounds require a follow-up plan. Existing explicit amendments remain available for
+eligible pending or failed units.
+
+Repair publication retains completed units and their handoffs, adds the contract
+and updated plan to `final_branch` using the existing artifact assembly engine,
+and leaves the operator checkout's index untouched. Durable preparation snapshots
+allow interruption recovery after task, plan, assembly-ref, or progress publication
+without generating duplicate units. While publication is incomplete, use
+`delivery run`; `run-next` blocks before starting a child. The new unit uses the
+normal isolated execution, review, security, testing, and validation policy. Only
+a fresh passing final gate can authorize finalization of its result.
+
+Private `repair-input-*.json` files hold typed gate-bound assessments, separate
+from the append-only verification audit. `integration-repair.json` holds current
+recovery control state and `integration-repair.jsonl` retains prompts, outputs,
+usage, and transitions. If appending invocation evidence fails, repair blocks and
+preserves the pending record in `integration-repair-pending-audit.json` when private
+storage remains writable; that diagnostic file never authorizes recovery.
+All live under `.sikula/state/delivery/<plan-id>/`, with
+owner-only files and no linked parents or files. Public results expose stable
+stop codes and ordinary unit metadata, never repair prompts or contract bodies.
+Dry-run checks the current recovery boundary, inherited contracts, repair
+destination, and owner scope against the exact candidate without providers or
+changes to project artifacts, control state, or the original Git repository.
+Repair also validates referenced dependency handoffs with the same checks as
+child execution, before reserving each authoring attempt and throughout
+publication and resume. Missing or invalid handoffs stop repair without spending
+another authoring attempt; restoring the matching evidence permits recovery.
+Completed legacy units without handoff references remain compatible.
 
 Verify a completed assembled candidate explicitly:
 

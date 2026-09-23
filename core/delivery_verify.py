@@ -442,7 +442,11 @@ def verify_delivery_plan(
         terminal,
         succeeded=terminal.passed,
         next_action=(
-            "finalize_delivery" if terminal.passed else delivery_verification_recovery_action(terminal.stop_code)
+            "finalize_delivery"
+            if terminal.passed
+            else "run_delivery"
+            if terminal.repair_input_fingerprint
+            else delivery_verification_recovery_action(terminal.stop_code)
         ),
     )
 
@@ -608,6 +612,23 @@ def _execute_gate(
                     semantic_status="blocked",
                 )
             if not semantic.assessment.approved:
+                repair_fingerprint = None
+                if semantic.assessment.disposition == "repair_required" and status.plan.obligations:
+                    from core.delivery_repair_input import store_repair_input
+
+                    try:
+                        repair_fingerprint = store_repair_input(
+                            root, evidence_path.parent, identity, running.attempt, semantic.assessment, project_config
+                        )
+                    except (OSError, ValueError, TypeError):
+                        return _review_blocked(
+                            running,
+                            validation,
+                            "delivery_verification.repair_input_unavailable",
+                            semantic_status="rejected",
+                            obligation_satisfied_count=obligation_satisfied_count,
+                            obligation_gap_count=obligation_gap_count,
+                        )
                 return replace(
                     running,
                     status="failed",
@@ -619,6 +640,7 @@ def _execute_gate(
                     obligation_satisfied_count=obligation_satisfied_count,
                     obligation_gap_count=obligation_gap_count,
                     stop_code=f"delivery_verification.{semantic.assessment.disposition}",
+                    repair_input_fingerprint=repair_fingerprint,
                     completed_at=_now(),
                 )
 

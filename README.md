@@ -249,7 +249,8 @@ contracts directly to `final_branch`, so prepare, apply, and continued execution
 do not require a helper checkout. `delivery run` repeatedly invokes that same
 one-unit path, stops on the first blocker or failure, and automatically
 finalizes a completed plan. By default it is bounded to the active units that
-exist when the command starts; `--max-units` and the between-unit soft
+exist when the command starts, plus one integration-repair slot for plans with
+source-bound obligations; `--max-units` and the between-unit soft
 `--max-elapsed-minutes` limit can stop earlier without failing the plan.
 Each explicit `delivery run --reset-failed` invocation retries the current
 ordinary retryable failed child once and continues only after that retry
@@ -266,6 +267,14 @@ terminal satisfied result for every obligation. Fresh authoring also accounts fo
 source fragment, including independently verified context-only decisions. Obligations
 may be delivered collectively by their assigned units; amendments preserve that
 ownership without requiring each replacement to deliver the entire outcome.
+When the final gate identifies an eligible `repair_required` gap in an existing
+obligation, `delivery run` can append one small repair unit within the existing
+owners' permitted scope. It runs that unit through the normal child pipeline and
+requires a fresh final gate. Completed units stay unchanged. Repair authoring has
+at most two attempts across interruptions and resume; only one repair unit may
+be published per plan. External dependency, security, scope, and missing-evidence
+stops do not become permission to invent replacement work. Rerun `delivery run`
+to resume an interrupted repair or continue after a unit/time bound.
 `delivery finalize` never invokes an LLM and
 requires a current pass whenever the final-gate policy applies. Existing legacy
 plans retain their direct-finalization behavior. This is a bounded final gate;
