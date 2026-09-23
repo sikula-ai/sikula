@@ -117,6 +117,7 @@ from sikula_cli.agent_overrides import RUNTIME_AGENT_NAMES as _VALID_AGENTS
 from sikula_cli.agent_overrides import parse_agent_llm_overrides as _parse_agent_llm_overrides
 
 if TYPE_CHECKING:
+    from agents.delivery_repair_agent import DeliveryRepairAgent
     from agents.delivery_preparation_agent import DeliveryPreparationAgent
     from core.delivery_authoring import (
         DeliveryAmendmentAuthoringDraft,
@@ -3532,7 +3533,7 @@ def _run_delivery_verification(args: argparse.Namespace, cfg: dict):
         getattr(args, "agent_model", None),
         getattr(args, "agent_provider", None),
         getattr(args, "agent_timeout", None),
-        valid_agents=set(_VALID_AGENTS),
+        valid_agents=set(_VALID_AGENTS) | {"delivery_preparer"},
     )
     overrides = {"agent_llms": parsed}
     base_llm_cfg = effective_cfg.get("llm", {}) if isinstance(effective_cfg.get("llm"), dict) else {}
@@ -3566,10 +3567,10 @@ def _delivery_verification_effective_config(args: argparse.Namespace, cfg: dict)
         getattr(args, "agent_model", None),
         getattr(args, "agent_provider", None),
         getattr(args, "agent_timeout", None),
-        valid_agents=set(_VALID_AGENTS),
+        valid_agents=set(_VALID_AGENTS) | {"delivery_preparer"},
     )
     effective = {**cfg, "agents": {**cfg.get("agents", {})}}
-    for name in ("reviewer", "security_reviewer"):
+    for name in ("reviewer", "security_reviewer", "delivery_preparer"):
         if name not in parsed:
             continue
         current = cfg.get("agents", {}).get(name, {})
@@ -3607,7 +3608,20 @@ def _delivery_run_next_context(cfg: dict) -> cli_delivery.DeliveryRunNextContext
         run_amendment_authoring=_run_delivery_amend_prepare_authoring,
         verify_plan=_run_delivery_verification,
         verification_config=_delivery_verification_effective_config,
+        repair_agent_factory=_create_delivery_repair_agent,
     )
+
+
+def _create_delivery_repair_agent(args: argparse.Namespace, cfg: dict) -> DeliveryRepairAgent:
+    from agents.delivery_repair_agent import DeliveryRepairAgent
+    from core.llm_client import create_llm_client
+
+    base = cfg.get("llm", {})
+    effective = _effective_agent_llm_cfg(cfg, {}, "delivery_preparer")
+    usage: list[dict[str, object]] = []
+    llm_config = _make_llm_config(base, effective)
+    llm_config.usage_observer = lambda record: usage.append(dict(record))
+    return DeliveryRepairAgent(create_llm_client(llm_config), usage_records=usage)
 
 
 def cmd_delivery_run_next(args: argparse.Namespace, cfg: dict) -> None:

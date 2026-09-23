@@ -38,8 +38,10 @@ def delivery_verification_git_env() -> dict[str, str]:
 
 
 @contextmanager
-def detached_delivery_verification_worktree(project_root: Path, commit: str) -> Iterator[Path]:
-    """Create a detached candidate worktree and yield its configured project root."""
+def detached_delivery_verification_worktree(
+    project_root: Path, commit: str, *, preview: bool = False
+) -> Iterator[Path]:
+    """Yield the exact candidate; previews isolate all Git writes in temporary storage."""
 
     root = project_root.resolve(strict=True)
     env = delivery_verification_git_env()
@@ -60,6 +62,41 @@ def detached_delivery_verification_worktree(project_root: Path, commit: str) -> 
     except (OSError, RuntimeError, ValueError) as exc:
         raise DetachedWorktreeError("Delivery verification project root is outside its repository.") from exc
 
+    if preview:
+        # A shared clone reads original objects but owns its index, refs and checkout.
+        # Unlike worktree add/remove, it does not mutate the source repository.
+        with tempfile.TemporaryDirectory(prefix="sikula-delivery-preview-") as temporary:
+            candidate = Path(temporary) / "candidate"
+            empty_template = Path(temporary) / "template"
+            empty_template.mkdir()
+            empty_config = Path(temporary) / "config"
+            empty_config.touch()
+            preview_env = dict(env)
+            for key in list(preview_env):
+                if key in {"GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"} or key.startswith(
+                    ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+                ):
+                    preview_env.pop(key)
+            preview_env.update(GIT_CONFIG_GLOBAL=str(empty_config), GIT_CONFIG_NOSYSTEM="1", GIT_ATTR_NOSYSTEM="1")
+            for command in (
+                [
+                    "git",
+                    "clone",
+                    "--shared",
+                    "--no-checkout",
+                    "--template=" + str(empty_template),
+                    "--",
+                    str(git_root),
+                    str(candidate),
+                ],
+                ["git", "-C", str(candidate), "checkout", "--detach", commit],
+            ):
+                result = subprocess.run(command, cwd=git_root, capture_output=True, env=preview_env)
+                if result.returncode != 0:
+                    raise DetachedWorktreeError("Delivery verification could not preview its exact candidate.")
+            yield _delivery_candidate_project_root(candidate, project_prefix)
+        return
+
     parent = root / ".sikula" / "worktrees" / "delivery-verification"
     _prepare_private_worktree_parent(root, parent)
     worktree = Path(tempfile.mkdtemp(prefix="candidate-", dir=parent))
@@ -79,16 +116,7 @@ def detached_delivery_verification_worktree(project_root: Path, commit: str) -> 
         added = True
         if worktree.is_symlink() or not worktree.is_dir():
             raise DetachedWorktreeError("Delivery verification worktree has an unsafe filesystem identity.")
-        candidate_root = worktree
-        for part in project_prefix.parts:
-            candidate_root /= part
-            if candidate_root.is_symlink() or not candidate_root.is_dir():
-                raise DetachedWorktreeError("Delivery verification project root is unavailable in the candidate.")
-        try:
-            candidate_root.resolve(strict=True).relative_to(worktree.resolve(strict=True))
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise DetachedWorktreeError("Delivery verification project root escapes the candidate worktree.") from exc
-        yield candidate_root
+        yield _delivery_candidate_project_root(worktree, project_prefix)
     finally:
         cleanup_failed = False
         if added:
@@ -106,6 +134,19 @@ def detached_delivery_verification_worktree(project_root: Path, commit: str) -> 
             shutil.rmtree(worktree, ignore_errors=True)
         if cleanup_failed:
             raise DetachedWorktreeError("Delivery verification could not clean up its isolated worktree.")
+
+
+def _delivery_candidate_project_root(worktree: Path, project_prefix: Path) -> Path:
+    candidate_root = worktree
+    for part in project_prefix.parts:
+        candidate_root /= part
+        if candidate_root.is_symlink() or not candidate_root.is_dir():
+            raise DetachedWorktreeError("Delivery verification project root is unavailable in the candidate.")
+    try:
+        candidate_root.resolve(strict=True).relative_to(worktree.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise DetachedWorktreeError("Delivery verification project root escapes the candidate worktree.") from exc
+    return candidate_root
 
 
 def _prepare_private_worktree_parent(root: Path, parent: Path) -> None:

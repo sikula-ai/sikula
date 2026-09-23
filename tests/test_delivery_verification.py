@@ -2782,7 +2782,8 @@ def test_verification_worktree_preserves_existing_ancestor_permissions(tmp_path:
     assert stat.S_IMODE(worktrees_dir.stat().st_mode) == 0o751
 
 
-def test_verification_worktree_preserves_nested_project_root(tmp_path: Path) -> None:
+@pytest.mark.parametrize("preview", [False, True])
+def test_verification_worktree_preserves_nested_project_root(tmp_path: Path, preview: bool) -> None:
     _git_init(tmp_path)
     project_root = tmp_path / "apps" / "service"
     project_root.mkdir(parents=True)
@@ -2790,13 +2791,17 @@ def test_verification_worktree_preserves_nested_project_root(tmp_path: Path) -> 
     (tmp_path / "repository-marker.txt").write_text("repository root\n", encoding="utf-8")
     commit = _git_commit_all(tmp_path, "add nested project")
 
-    with detached_delivery_verification_worktree(project_root, commit) as candidate_root:
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    with detached_delivery_verification_worktree(project_root, commit, preview=preview) as candidate_root:
         assert candidate_root.parts[-2:] == ("apps", "service")
         assert (candidate_root / "project-marker.txt").read_text(encoding="utf-8") == "nested project\n"
         assert not (candidate_root / "repository-marker.txt").exists()
+    if preview:
+        assert {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
 
 
-def test_delivery_verification_ignores_git_replace_objects(tmp_path: Path) -> None:
+@pytest.mark.parametrize("preview", [False, True])
+def test_delivery_verification_ignores_git_replace_objects(tmp_path: Path, preview: bool) -> None:
     original_commit = _git_init(tmp_path)
     (tmp_path / "README.md").write_text("# Replacement\n", encoding="utf-8")
     replacement_commit = _git_commit_all(tmp_path, "replacement content")
@@ -2812,7 +2817,7 @@ def test_delivery_verification_ignores_git_replace_objects(tmp_path: Path) -> No
     ).stdout.strip()
 
     assert _git_object(tmp_path, f"{original_commit}^{{tree}}") == original_tree
-    with detached_delivery_verification_worktree(tmp_path, original_commit) as candidate_root:
+    with detached_delivery_verification_worktree(tmp_path, original_commit, preview=preview) as candidate_root:
         assert (candidate_root / "README.md").read_text(encoding="utf-8") == "# Demo\n"
 
 

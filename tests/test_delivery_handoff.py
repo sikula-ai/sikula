@@ -12,6 +12,7 @@ from core.delivery_handoff import (
     build_delivery_unit_handoff,
     delivery_unit_handoff_path,
     delivery_unit_handoff_matches_unit,
+    load_delivery_dependency_handoffs,
     parse_delivery_unit_handoff,
     read_delivery_unit_handoff,
     write_delivery_unit_handoff,
@@ -73,6 +74,41 @@ def test_delivery_handoff_roundtrip_projects_allowlisted_metadata(tmp_path: Path
     serialized = path.read_text(encoding="utf-8")
     assert "Private child task body" not in serialized
     assert "Private free-form gap details" not in serialized
+
+
+def test_dependency_handoff_validation_traverses_legacy_noop_dependencies(tmp_path: Path) -> None:
+    child = _child_state()
+    unit = _selected_unit()
+    handoff = build_delivery_unit_handoff(
+        plan_id="demo-plan", selected_unit=unit, child_task_id=child.task_id, child_state=child
+    )
+    path = delivery_unit_handoff_path(tmp_path, "demo-plan", unit.id)
+    write_delivery_unit_handoff(path, handoff)
+    dependency = SimpleNamespace(
+        **vars(unit),
+        status="done",
+        child_task_id=child.task_id,
+        branch=child.worktree_branch,
+        commit=child.result_commit,
+        handoff_schema_version=handoff.schema_version,
+        handoff_fingerprint=handoff.fingerprint,
+    )
+    legacy = SimpleNamespace(
+        id="legacy-noop",
+        status="done",
+        depends_on=[unit.id],
+        commit=None,
+        handoff_schema_version=None,
+        handoff_fingerprint=None,
+    )
+    unrelated = SimpleNamespace(id="unrelated", status="done", depends_on=[], handoff_schema_version=99)
+    status = SimpleNamespace(plan=SimpleNamespace(plan_id="demo-plan"), units=[dependency, legacy, unrelated])
+    handoffs, errors = load_delivery_dependency_handoffs(status, [legacy.id, dependency.id], tmp_path)
+    assert handoffs == [handoff.to_dict()] and not errors
+    path.unlink()
+    handoffs, errors = load_delivery_dependency_handoffs(status, [legacy.id], tmp_path)
+    assert not handoffs
+    assert [error.code for error in errors] == ["delivery.dependency_handoff_missing"]
 
 
 def test_delivery_handoff_paths_are_bounded_and_case_collision_safe(tmp_path: Path) -> None:

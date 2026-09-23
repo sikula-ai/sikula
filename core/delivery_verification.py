@@ -444,7 +444,10 @@ def with_delivery_verification_readiness(
                 obligation_count=len(status.plan.obligations),
             )
         ):
-            return status
+            from core.delivery_repair import delivery_repair_input_needs_refresh
+
+            if not delivery_repair_input_needs_refresh(status, project_config):
+                return status
         return replace(
             status,
             verification_status="stale",

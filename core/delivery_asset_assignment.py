@@ -141,6 +141,36 @@ def render_delivery_asset_assignments(
     return rendered
 
 
+def render_inherited_delivery_assets(
+    task_markdown: str, *, inherited_tasks: list[str], project_root: Path, unit_id: str
+) -> str:
+    """Copy affected owners' exact asset declarations into an integration repair.
+
+    The repair author cannot add, omit, or reclassify declarations. Conflicting
+    declarations in contributing contracts require resolution before authoring.
+    """
+    root = project_root.resolve()
+    inherited: dict[str, _SourceAsset] = {}
+    for task in inherited_tasks:
+        for asset in _parse_source_assets(task, root, allow_manifest=True):
+            previous = inherited.get(asset.project_path)
+            if previous is not None:
+                if (previous.lines, previous.subsection, previous.semantics) != (
+                    asset.lines,
+                    asset.subsection,
+                    asset.semantics,
+                ):
+                    raise _source_asset_conflict()
+            else:
+                inherited[asset.project_path] = asset
+    selected = list(inherited.values())
+    _validate_unit_markdown(DeliveryAssetAssignmentUnit(unit_id, task_markdown, []), _source_aliases(selected, root))
+    rendered, heading = _append_assigned_assets(task_markdown, selected)
+    if heading is not None:
+        _assert_rendered_assets_visible(rendered, heading, selected, unit_id, project_root=root)
+    return rendered
+
+
 def _parse_source_assets(markdown: str, project_root: Path, *, allow_manifest: bool) -> list[_SourceAsset]:
     document = parse_markdown_document(markdown)
     raw_lines = list(document.lines)

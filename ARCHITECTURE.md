@@ -1067,10 +1067,14 @@ each child retains the existing `delivery.run-next` lock and normal isolated
 Sikula pipeline.
 
 Each invocation has a finite unit-attempt bound. The default is the number of
-active units present when the loop starts, and `--max-units` can lower or
-explicitly set that bound. `--max-elapsed-minutes` is a soft wall-clock bound
-checked only between child runs; an active child is never interrupted. A bound
-stop is resumable and successful. A failed, waiting, budget-stopped, ambiguous,
+active units present when the loop starts, plus one integration-repair slot for
+source-bound plans with obligations. `--max-units` sets an explicit total that
+includes repairs. `--max-elapsed-minutes` is a soft wall-clock bound
+checked between child runs and before repair preparation; an active child is never interrupted. A bound
+stop is resumable and successful. Before pausing for a bound at integration repair,
+the coordinator checks recovery readiness without providers or writes. Persistent
+repair exhaustion and terminal blockers remain failures even when a unit or time
+limit has also been reached. A failed, waiting, budget-stopped, ambiguous,
 scope-stopped, external-dependency-stopped, or assembly-blocked unit stops the
 loop immediately without automatic reset,
 amendment, split, or unit skipping. Explicit `--reset-failed` permits one
@@ -1089,6 +1093,76 @@ machine-readable output is redirected to stderr. For schema-version-2 plans,
 completion hands off to the final integration gate described below before
 deterministic finalization. Legacy schema-version-1 plans retain the direct
 finalize path.
+
+**Bounded integration repair:** `core/delivery_repair.py` coordinates one appended
+unit for an eligible semantic `repair_required` result. The verification record's
+additive `repair_input_fingerprint` binds an owner-only control snapshot containing
+the typed assessment, exact gate identity and attempt, and captured repair policy.
+This snapshot is separate from the append-only audit and is never projected as
+public metadata. Repair requires current source obligations and accounting, a
+completed assembly, unchanged authority and effective policy, and findings mapped
+to unsatisfied obligations. Security-review rejection, missing required evidence,
+and prerequisite stops cannot authorize repair.
+
+`agents/delivery_repair_agent.py` uses the configured `delivery_preparer` provider
+read-only in the exact candidate worktree. The coordinator fixes unit identity,
+dependencies, scope, inherited constraints, obligation ownership additions, exact
+asset declarations copied from affected owners, and a one-step budget. Completed
+children retain their contracts and evidence. Contracts are compared with the
+task text captured when each child ran; that text is also bound into prepared
+repair evidence. Without linked child evidence, the unchanged contract must be
+present in the reviewed candidate. Each child's persisted scope can only narrow
+the current configured production boundary. The
+author returns only task Markdown or a typed terminal blocker. Readiness includes
+coverage by enabled validation commands; workspace mutation fails closed.
+Provider-reported read-only violations are durable terminal stops even when the
+coordinator's candidate itself is unchanged. Dry-run validates contracts,
+destinations, inherited assets, dependency handoffs, and owner scope before
+reporting readiness. It uses a temporary shared clone of the exact candidate without provider calls,
+control-state writes, or changes to the original Git repository.
+Repair and child execution share dependency-closure handoff validation in
+`core/delivery_handoff.py`. Missing, invalid, or mismatched referenced handoffs
+block readiness and authoring without consuming an attempt. The same check runs
+before each retry and publication, including resumed publication, and before
+publication is marked complete. Legacy completed units without handoff references
+remain supported.
+Inherited asset availability and contract asset readiness use the reviewed
+candidate, including when resuming partial publication; the operator checkout
+does not determine whether those assets are available.
+Readiness also bounds the exact rendered authoring prompt, including JSON
+escaping and protocol instructions. Before reporting repair readiness or reserving
+an authoring attempt, it constructs the enlarged plan in memory and checks its
+active-unit, serialized-plan, and final-verification packet limits. Publication
+repeats the same plan construction and checks. The prompt check runs before every
+attempt reservation, including corrections. Preparer configuration and provider
+workspace setup must succeed before the initial immutable repair snapshot is
+persisted, so rejected configuration cannot leave a zero-attempt snapshot that
+blocks a corrected invocation. Workspace preparation still persists a terminal
+stop for candidate mutation or a provider-reported read-only violation, including
+when preparation raises before any authoring call.
+If repair policy changes while the gate identity remains current and preparation
+has not started, `delivery run` refreshes verification and its typed repair input.
+Missing or corrupt input and existing repair control state cannot trigger this
+refresh; started attempts, publication state, and terminal stops remain binding.
+
+The plan-scoped `integration-repair.json` control snapshot reserves at most two
+authoring attempts before calls and permits one published repair unit. Its phases
+are `authoring`, `prepared`, `published`, and `blocked`; separate owner-only
+`integration-repair.jsonl` records retain prompts, outputs, usage, and transitions.
+An audit-append failure blocks further authoring and preserves the unappended
+invocation in a separate private `integration-repair-pending-audit.json` artifact
+when storage remains writable. This fallback is diagnostic evidence, not control.
+The delivery lock spans bounded preparation and publication. Prepared control
+state retains exact source/contract bytes and completed progress, allowing resume
+of partial publication without reading audit as control or consuming another
+authoring attempt. Publication uses existing delivery artifact assembly and
+compare-and-swap ref updates, preserving the operator index. Preparation and
+publication reuse the validated canonical plan path, including on resume from a
+relative path containing `..`. `run-next` refuses
+unfinished repair publication. The bounded run admits only the coordinator's
+repair ID beyond its initial snapshot, executes the normal child pipeline, and
+requires new candidate-bound final verification. Additional repair rounds and
+broader amendment/decision recovery remain separate work.
 
 **Delivery final integration gate:** newly prepared plans use schema version 2
 and declare `verification.mode: final_gate`; schema version 1 remains a readable

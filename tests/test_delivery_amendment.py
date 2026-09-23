@@ -5960,6 +5960,45 @@ def test_apply_does_not_clobber_replacement_task_created_at_publish_boundary(
     assert not (tmp_path / proposal.replacement_units[2].task_path).exists()
 
 
+@pytest.mark.parametrize("path_kind", ["sibling", "relative", "outside"])
+def test_new_task_target_rejects_paths_without_project_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path_kind: str
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    sibling = tmp_path / "operator"
+    sibling.mkdir()
+    monkeypatch.chdir(root)
+    if path_kind == "sibling":
+        target = sibling / ".." / root.name / "task.md"
+    elif path_kind == "relative":
+        target = Path("task.md")
+    else:
+        target = sibling / "task.md"
+    if path_kind != "outside":
+        delivery_amendment_module._validate_new_task_target(target.resolve(), root)
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        delivery_amendment_module._validate_new_task_target(target, root)
+    assert exc_info.value.issue.code == "delivery_amend.replacement_task_unsafe"
+
+
+@pytest.mark.parametrize("link_parent", [False, True])
+def test_new_task_target_still_rejects_symlinks_inside_project(tmp_path: Path, link_parent: bool) -> None:
+    original = tmp_path / "original"
+    original.mkdir()
+    (original / "task.md").write_text("original contract", encoding="utf-8")
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(original if link_parent else original / "task.md", target_is_directory=link_parent)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    target = link / "task.md" if link_parent else link
+    with pytest.raises(DeliveryAmendmentError) as exc_info:
+        delivery_amendment_module._validate_new_task_target(target, tmp_path)
+    assert exc_info.value.issue.code == "delivery_amend.replacement_task_symlink"
+    assert (original / "task.md").read_text(encoding="utf-8") == "original contract"
+
+
 @pytest.mark.delivery_amendment_git
 def test_apply_rejects_replacement_parent_swapped_to_outside_symlink(
     tmp_path: Path,

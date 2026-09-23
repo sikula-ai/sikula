@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ import pytest
 
 from core.delivery_plan import DeliveryPlanIssue
 from core.delivery_progress import DeliveryStatusUnit
+from core.delivery_repair import DeliveryRepairResult
 from core.delivery_run import (
     DELIVERY_RUN_BLOCKED,
     DELIVERY_RUN_COMPLETED,
@@ -705,6 +707,58 @@ def test_delivery_run_stops_when_status_becomes_invalid(monkeypatch: pytest.Monk
     assert result.succeeded is False
     assert result.stop_code == DELIVERY_RUN_BLOCKED
     assert [issue.code for issue in result.errors] == ["delivery.invalid"]
+
+
+@pytest.mark.parametrize("bound", ["unit", "elapsed"])
+@pytest.mark.parametrize(
+    "blocker", [None, "budget_exhausted", "authoring_budget_exhausted", "readonly_mutation", "hierarchy_required"]
+)
+def test_repair_blocker_takes_precedence_over_resumable_limit(
+    monkeypatch: pytest.MonkeyPatch, bound: str, blocker: str | None
+) -> None:
+    status = _status(["pending"])
+    status.plan.obligations = ["source-obligation"]
+    elapsed = [0.0]
+    context = replace(
+        _context(), repair_agent_factory=lambda *_: pytest.fail("limit checks must not create a provider")
+    )
+    issue = DeliveryPlanIssue("error", "delivery_repair." + blocker, "Repair cannot continue.") if blocker else None
+    checks = []
+
+    def run_unit(*args, **kwargs):
+        result = _unit_result(status)
+        status.units = [replace(status.units[0], status="done")]
+        status.status = "done"
+        elapsed[0] = 61.0
+        return result
+
+    def check_repair(*args, **kwargs):
+        checks.append(kwargs["dry_run"])
+        return DeliveryRepairResult(ready=issue is None, issue=issue)
+
+    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    monkeypatch.setattr("core.delivery_repair.delivery_repair_pending", lambda *args, **kwargs: False)
+    monkeypatch.setattr("core.delivery_repair.coordinate_delivery_repair", check_repair)
+    monkeypatch.setattr("sikula_cli.delivery._run_next_delivery_unit", run_unit)
+    monkeypatch.setattr("sikula_cli.delivery.time.monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(
+        "sikula_cli.delivery._finalize_delivery_run",
+        lambda *args, **kwargs: SimpleNamespace(stop_code="delivery_verification.repair_required"),
+    )
+    args = _args(max_units=1 if bound == "unit" else None, max_elapsed_minutes=1 if bound == "elapsed" else None)
+    result = _run_delivery_plan(args, {}, context, project_root=Path("/project"))
+    assert checks == [True]
+    assert result.units_attempted == result.units_succeeded == 1
+    assert not result.completed
+    if issue:
+        assert result.stop_code == issue.code
+        assert result.errors == [issue]
+        assert not result.ready and not result.succeeded
+    else:
+        expected = DELIVERY_RUN_UNIT_LIMIT_REACHED if bound == "unit" else DELIVERY_RUN_ELAPSED_LIMIT_REACHED
+        assert result.stop_code == expected
+        assert result.ready and result.succeeded
+        assert not result.errors
 
 
 def test_finalize_delivery_run_routes_current_finalization_through_finalizer(

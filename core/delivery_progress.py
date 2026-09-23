@@ -998,6 +998,7 @@ def get_delivery_status(
             verification_required=plan.requires_final_verification,
             verification_status=verification_status,
             verification_stop_code=verification.stop_code if verification else None,
+            repair_input_available=bool(verification and verification.repair_input_fingerprint),
         ),
         assembly_base_commit=assembly_base_commit,
         assembled_commit=assembled_commit,
@@ -1798,6 +1799,7 @@ def _next_action(
     verification_required: bool = False,
     verification_status: str = "not_required",
     verification_stop_code: str | None = None,
+    repair_input_available: bool = False,
 ) -> str:
     if status == "invalid":
         return "fix delivery plan status errors"
@@ -1850,6 +1852,8 @@ def _next_action(
         if verification_status in {"failed", "blocked"} and verification_stop_code:
             recovery_action = delivery_verification_recovery_action(verification_stop_code)
             if recovery_action == "add_delivery_repair_unit":
+                if repair_input_available:
+                    return "run delivery run to check and resume bounded integration repair"
                 return "add a delivery repair unit before rerunning delivery verification"
             if recovery_action == "prepare_delivery_amendment":
                 return "prepare a delivery amendment before rerunning delivery verification"
