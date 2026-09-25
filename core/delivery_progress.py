@@ -21,6 +21,7 @@ from core.delivery_public_metadata import (
     sanitize_delivery_public_metadata,
 )
 from core.delivery_unit_metadata import DELIVERY_UNIT_BUDGET_EXCEEDED_CODE, DeliveryUnitBudget
+from core.delivery_verification_scope import DeliveryVerificationScope
 from core.delivery_verification_model import (
     DeliveryVerificationRecord,
     delivery_verification_covers_obligations,
@@ -976,7 +977,9 @@ def get_delivery_status(
         verification.plan_fingerprint != check_result.plan_fingerprint
         or assembly_status != "ready"
         or assembled_commit != verification.candidate_commit
-        or not delivery_verification_covers_obligations(verification, len(plan.obligations))
+        or not delivery_verification_covers_obligations(
+            verification, len(DeliveryVerificationScope.from_plan(plan).obligation_ids)
+        )
     ):
         verification_status = "stale"
     return DeliveryStatusResult(

@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from core.delivery_progress import DeliveryStatusResult
+from core.delivery_verification_scope import DeliveryVerificationScope
 from core.state import StateStore
 from core.validation_coverage import effective_validation_commands
 from core.worktree import current_worktree_changes, delivery_verification_git_env
@@ -126,13 +127,18 @@ def reusable_delivery_validation(
     state_store: StateStore,
     *,
     candidate_tree: str,
+    scope: DeliveryVerificationScope | None = None,
 ) -> DeliveryVerificationValidationResult | None:
     policy = _validation_policy_from_config(project_config)
     if not policy["run_build"] and not policy["run_presync"]:
         return None
     policy_fingerprint = _fingerprint(policy)
+    if scope is None:
+        if status.plan is None:
+            return None
+        scope = DeliveryVerificationScope.from_plan(status.plan)
     for unit in reversed(status.units):
-        if unit.status != "done" or not unit.child_task_id:
+        if unit.id not in scope.unit_ids or unit.status != "done" or not unit.child_task_id:
             continue
         try:
             state = state_store.load(unit.child_task_id)

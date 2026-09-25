@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import asdict, replace
 from hashlib import sha256
 import json
 import os
@@ -48,6 +48,7 @@ from core.delivery_verification import (
     MAX_DELIVERY_VERIFICATION_SOURCE_BYTES,
     _git_object,
     build_delivery_verification_identity,
+    build_delivery_verification_snapshot,
     check_delivery_verification_readiness,
     delivery_verification_config_fingerprint,
     delivery_verification_plan_context,
@@ -2445,6 +2446,111 @@ def test_verification_identity_uses_the_bytes_parsed_into_status(tmp_path: Path)
 
     assert identity.plan_fingerprint == captured_fingerprint
     assert identity.plan_fingerprint != "sha256:" + sha256(plan_path.read_bytes()).hexdigest()
+
+
+def test_root_snapshot_preserves_persisted_identity_and_separates_execution(tmp_path: Path) -> None:
+    commit = _git_init(tmp_path)
+    status = get_delivery_status(_write_plan(tmp_path, with_obligation=True))
+    status = replace(
+        status, units=[replace(status.units[0], status="done", commit=commit, handoff_fingerprint="a" * 64)]
+    )
+    config = _config(tmp_path)
+    snapshot = build_delivery_verification_snapshot(status, config, candidate_commit=commit)
+
+    def fingerprint(value: object) -> str:
+        # The pre-scope schema-1 hash is a compatibility contract, not a new format.
+        return (
+            "sha256:"
+            + sha256(
+                json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+            ).hexdigest()
+        )
+
+    expected = {
+        "candidate_commit": commit,
+        "candidate_tree": _git_object(tmp_path, f"{commit}^{{tree}}"),
+        "source_fingerprint": status.plan.source_task.sha256,
+        "plan_fingerprint": status.plan_fingerprint,
+        "completed_scope_fingerprint": fingerprint(
+            [
+                {"unit_id": "unit", "commit": commit, "handoff_fingerprint": "a" * 64},
+            ]
+        ),
+        "config_fingerprint": delivery_verification_config_fingerprint(config, security_required=False),
+        "policy_fingerprint": fingerprint({"mode": "final_gate"}),
+    }
+    assert asdict(snapshot.identity) == {"gate_id": fingerprint(expected), **expected}
+    assert snapshot.scope.plan_context() == delivery_verification_plan_context(status)
+
+    changed = replace(status, units=[replace(status.units[0], handoff_fingerprint="b" * 64)])
+    changed_snapshot = build_delivery_verification_snapshot(changed, config, candidate_commit=commit)
+    assert changed_snapshot.scope == snapshot.scope
+    assert changed_snapshot.identity.gate_id != snapshot.identity.gate_id
+    assert snapshot.completed_units[0].handoff_fingerprint == "a" * 64
+
+    (tmp_path / "README.md").write_text("# Changed candidate\n", encoding="utf-8")
+    new_commit = _git_commit_all(tmp_path, "new candidate")
+    new_snapshot = build_delivery_verification_snapshot(status, config, candidate_commit=new_commit)
+    assert new_snapshot.scope == snapshot.scope
+    assert new_snapshot.identity.candidate_tree != snapshot.identity.candidate_tree
+    assert new_snapshot.identity.gate_id != snapshot.identity.gate_id
+
+
+@pytest.mark.parametrize("response_obligation", ["deliver-source-behavior", "foreign", None])
+def test_gate_uses_captured_scope_for_prompt_and_response_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, response_obligation: str | None
+) -> None:
+    base = _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path, with_obligation=True)
+    commit = _git_commit_all(tmp_path, "delivery unit")
+    write_delivery_progress(
+        delivery_progress_path(tmp_path, "demo"),
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="demo",
+            units=[make_delivery_unit_progress("unit", "done", commit=commit)],
+            assembly_base_commit=base,
+        ),
+    )
+    actual_capture = build_delivery_verification_snapshot
+    captured_status = []
+
+    def capture(*args, **kwargs):
+        captured_status.append(args[0])
+        return actual_capture(*args, **kwargs)
+
+    def validate(*args, **kwargs):
+        # Frozen plan dataclasses still contain mutable lists. An in-memory
+        # mutation must not change a running review's captured authority.
+        captured_status[-1].plan.obligations.clear()
+        captured_status[-1].plan.units.clear()
+        return DeliveryVerificationValidationResult(passed=True, reused=False, executed=True)
+
+    monkeypatch.setattr(delivery_verify_module, "build_delivery_verification_snapshot", capture)
+    monkeypatch.setattr(delivery_verify_module, "run_delivery_verification_validation", validate)
+    assessment = {
+        "schema_version": 2,
+        "disposition": "approved",
+        "summary": "Complete.",
+        "findings": [],
+        "obligation_results": [{"id": response_obligation, "outcome": "satisfied"}] if response_obligation else [],
+    }
+    llm = _ReadonlyLLM([json.dumps(assessment)] * 2)
+    config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
+    result = verify_delivery_plan(
+        plan_path,
+        config,
+        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        semantic_reviewer=DeliveryIntegrationReviewAgent(llm, config),
+        security_reviewer=None,
+        project_root=tmp_path,
+    )
+
+    assert result.obligation_count == 1
+    assert result.succeeded is (response_obligation == "deliver-source-behavior")
+    assert len(llm.calls) == (1 if result.succeeded else 2)
+    assert '"id": "deliver-source-behavior"' in llm.calls[0][0]
+    assert '"id": "unit"' in llm.calls[0][0]
 
 
 def test_security_sensitive_identity_changes_with_security_review_policy(tmp_path: Path) -> None:
