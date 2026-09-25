@@ -12,6 +12,7 @@ from core.delivery_plan import DeliveryPlan
 from core.delivery_repair_storage import read_repair_state, write_repair_state
 from core.delivery_verification import DeliveryVerificationIdentity
 from core.delivery_verification_model import DeliveryVerificationRecord
+from core.delivery_verification_scope import DeliveryVerificationScope
 from core.delivery_verification_review import DeliveryIntegrationAssessment, parse_delivery_integration_review
 
 
@@ -83,8 +84,9 @@ def _load_bound_input(root: Path, directory: Path, record: DeliveryVerificationR
 
 
 def _parse_assessment(payload: dict[str, Any], plan: DeliveryPlan) -> DeliveryIntegrationAssessment:
+    scope = DeliveryVerificationScope.from_plan(plan)
     return parse_delivery_integration_review(
         json.dumps(payload.get("assessment")),
-        known_unit_ids={unit.id for unit in plan.units if not unit.superseded},
-        known_obligation_ids={obligation.id for obligation in plan.obligations},
+        known_unit_ids=set(scope.unit_ids),
+        known_obligation_ids=set(scope.obligation_ids),
     )

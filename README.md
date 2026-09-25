@@ -279,6 +279,9 @@ to resume an interrupted repair or continue after a unit/time bound.
 requires a current pass whenever the final-gate policy applies. Existing legacy
 plans retain their direct-finalization behavior. This is a bounded final gate;
 automatic hierarchical checkpoints for plans beyond its limits are later work.
+The current gate covers the whole plan. Its readiness checks, review, and repair
+share that verification scope, while each result remains bound to the exact
+candidate and authority snapshot; an earlier pass cannot approve a changed candidate.
 Task completion output and `delivery status` report provider invocation counts,
 failed attempts, measured provider time, content-free input/output sizes, and
 explicit provider-reported token usage when available. Unavailable token data

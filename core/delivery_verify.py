@@ -36,12 +36,14 @@ from core.delivery_public_metadata import (
 )
 from core.delivery_verification import (
     DeliveryVerificationIdentity,
+    DeliveryVerificationSnapshot,
+    build_delivery_verification_snapshot,
     build_delivery_verification_identity,
     check_delivery_verification_readiness,
     delivery_verification_allowed_read_paths,
-    delivery_verification_plan_context,
     delivery_verification_source_task_is_private,
 )
+from core.delivery_verification_scope import DeliveryVerificationScope
 from core.delivery_verification_model import (
     DeliveryVerificationRecord,
     delivery_verification_covers_obligations,
@@ -208,7 +210,7 @@ def verify_delivery_plan(
                     and _record_matches_identity(
                         existing,
                         existing_identity,
-                        obligation_count=len(status.plan.obligations),
+                        obligation_count=_status_obligation_count(status),
                     )
                     and _assembly_ref_matches(root, status, existing.candidate_commit)
                 ):
@@ -228,13 +230,14 @@ def verify_delivery_plan(
                     [assembly_error] if assembly_error else [],
                 )
             status = get_delivery_status(path, project_root=root)
-            identity = build_delivery_verification_identity(
+            snapshot = build_delivery_verification_snapshot(
                 status,
                 project_config,
                 candidate_commit=candidate_commit,
             )
+            identity = snapshot.identity
             try:
-                source_task = _read_bound_source_task(root, status, identity, project_config)
+                source_task = _read_bound_source_task(root, snapshot, project_config)
             except _PrivateSourceTaskError:
                 return _blocked_result(status, "delivery_verification.source_private")
             except (OSError, UnicodeError, ValueError):
@@ -246,7 +249,7 @@ def verify_delivery_plan(
                 and _record_matches_identity(
                     existing,
                     identity,
-                    obligation_count=len(status.plan.obligations),
+                    obligation_count=len(snapshot.scope.obligation_ids),
                 )
             ):
                 return _result_from_record(status, existing, succeeded=True, next_action="finalize_delivery")
@@ -255,8 +258,8 @@ def verify_delivery_plan(
                 identity,
                 status="running",
                 attempt=attempt,
-                security_required=readiness.security_required,
-                obligation_count=len(status.plan.obligations),
+                security_required=snapshot.scope.security_required,
+                obligation_count=len(snapshot.scope.obligation_ids),
                 evidence_path=evidence_reference,
                 started_at=_now(),
             )
@@ -356,7 +359,7 @@ def verify_delivery_plan(
             status=status,
             project_config=project_config,
             state_store=state_store,
-            identity=identity,
+            snapshot=snapshot,
             running=running,
             source_task=source_task,
             evidence_path=evidence_path,
@@ -498,13 +501,15 @@ def _execute_gate(
     status,
     project_config: dict[str, Any],
     state_store: StateStore,
-    identity: DeliveryVerificationIdentity,
+    snapshot: DeliveryVerificationSnapshot,
     running: DeliveryVerificationRecord,
     source_task: str,
     evidence_path: Path,
     semantic_reviewer: DeliveryIntegrationReviewAgent,
     security_reviewer: DeliveryIntegrationReviewAgent | None,
 ) -> DeliveryVerificationRecord:
+    scope = snapshot.scope
+    identity = snapshot.identity
     validation: DeliveryVerificationValidationResult | None = None
     active_review: str | None = None
     semantic_status = "not_run"
@@ -533,6 +538,7 @@ def _execute_gate(
                 project_config,
                 state_store,
                 candidate_tree=identity.candidate_tree,
+                scope=scope,
             )
             validation_before = _review_snapshot(worktree, project_config, exclude_ephemeral_paths=True)
             validation = run_delivery_verification_validation(worktree, project_config, reusable=reusable)
@@ -579,9 +585,9 @@ def _execute_gate(
                     "delivery_verification.reviewer_workspace_unavailable",
                     semantic_status="blocked",
                 )
-            plan_context = delivery_verification_plan_context(status)
-            known_unit_ids = {unit.id for unit in status.plan.units if not unit.superseded}
-            known_obligation_ids = {obligation.id for obligation in status.plan.obligations}
+            plan_context = scope.plan_context()
+            known_unit_ids = set(scope.unit_ids)
+            known_obligation_ids = set(scope.obligation_ids)
             semantic_before = _review_snapshot(worktree, project_config)
             active_review = "semantic"
             semantic = _run_review(
@@ -613,7 +619,7 @@ def _execute_gate(
                 )
             if not semantic.assessment.approved:
                 repair_fingerprint = None
-                if semantic.assessment.disposition == "repair_required" and status.plan.obligations:
+                if semantic.assessment.disposition == "repair_required" and scope.obligation_ids:
                     from core.delivery_repair_input import store_repair_input
 
                     try:
@@ -1024,7 +1030,7 @@ def _blocked_result(status, code: str, errors: list[DeliveryPlanIssue] | None = 
 
 def _status_obligation_count(status) -> int:
     plan = getattr(status, "plan", None)
-    return len(plan.obligations) if plan is not None else 0
+    return len(DeliveryVerificationScope.from_plan(plan).obligation_ids) if plan is not None else 0
 
 
 def _result_from_record(
@@ -1094,11 +1100,10 @@ def _record_matches_identity(
 
 def _read_bound_source_task(
     root: Path,
-    status,
-    identity: DeliveryVerificationIdentity,
+    snapshot: DeliveryVerificationSnapshot,
     project_config: dict[str, Any],
 ) -> str:
-    source = status.plan.source_task
+    source = snapshot.scope.source_task
     if source is None:
         raise ValueError("delivery source task is unavailable")
     source_path = root / source.path
@@ -1106,7 +1111,7 @@ def _read_bound_source_task(
         raise _PrivateSourceTaskError("delivery source task references private data")
     source_text = source_path.read_text(encoding="utf-8")
     source_fingerprint = "sha256:" + sha256(source_text.encode("utf-8")).hexdigest()
-    if source_fingerprint != identity.source_fingerprint:
+    if source_fingerprint != snapshot.identity.source_fingerprint:
         raise ValueError("delivery source task changed during verification capture")
     return source_text
 

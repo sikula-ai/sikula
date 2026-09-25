@@ -1173,6 +1173,28 @@ owns readiness and immutable identity construction,
 `agents/delivery_integration_review_agent.py` owns the read-only semantic and
 security protocols. Unknown schema-2 policy values fail closed.
 
+`core/delivery_verification_scope.py` defines the private immutable declared
+verification scope. The currently supported logical node is `(plan_id, root)`:
+all active units, all obligations and constraints, complete source accounting,
+and the full source-task binding. Context-only fragments remain in its authority;
+superseded units do not enter active coverage, but their sensitive risk tags still
+require security review. Its prompt context is detached from mutable parsed-plan
+lists. Readiness limits, prompt context and response-template sizing, expected
+review results, obligation closure checks, and repair input/dependencies consume
+this same root-scope definition. It is not a public JSON projection or a source
+of new execution authority.
+
+`DeliveryVerificationSnapshot` binds that declaration to completed-unit commit
+and handoff evidence and the exact candidate/config/source/plan/policy identity.
+The gate captures it before validation and uses it throughout review. Logical
+node identity is independent of candidate and attempt: another candidate requires
+another current verification, while retries remain separate durable attempts.
+Root gate hashes and schema-1 verification/repair-input records retain their
+existing format, so current evidence and interrupted repair remain resumable.
+This foundation does not yet introduce partial scopes, checkpoint scheduling,
+mid-plan repair, or checkpoint-specific budgets; whole-plan completion remains
+required before the root gate.
+
 The gate captures dependency-ordered assembly under the delivery progress lock,
 parses and hashes one immutable plan byte snapshot, captures and hashes the exact
 source text used by the attempt, records a `running` attempt, then releases the

@@ -13,6 +13,7 @@ from core.delivery_plan import DeliveryPlanCheckResult, DeliveryPlanIssue, is_pr
 from core.delivery_progress import DeliveryStatusResult
 from core.delivery_verification_model import delivery_verification_covers_obligations
 from core.delivery_verification_review import delivery_integration_review_control_example
+from core.delivery_verification_scope import DeliveryVerificationCompletedUnit, DeliveryVerificationScope
 from core.delivery_verification_validation import delivery_validation_review_policy
 from core.worktree import delivery_verification_git_env
 from tools.base_tool import Sandbox
@@ -29,15 +30,6 @@ MAX_DELIVERY_VERIFICATION_PACKET_BYTES = 512 * 1024
 _DELIVERY_VERIFICATION_PROMPT_OVERHEAD_BYTES = 64 * 1024
 _SUPPORTED_BUILD_TOOLS = frozenset({"cargo", "gradle-android", "gradle-jvm", "maven", "node", "python", "xcodebuild"})
 _SUPPORTED_PROVIDERS = frozenset({"antigravity", "claude", "codex", "gemini", "opencode"})
-_SECURITY_SENSITIVE_RISK_TAGS = frozenset(
-    {
-        "auth_permissions",
-        "execution_boundary",
-        "external_execution_boundary",
-        "privacy",
-        "security_boundary",
-    }
-)
 
 
 def delivery_verification_allowed_read_paths(project_config: dict[str, Any]) -> list[str]:
@@ -143,13 +135,17 @@ class DeliveryVerificationIdentity:
     policy_fingerprint: str
 
 
+@dataclass(frozen=True)
+class DeliveryVerificationSnapshot:
+    """A concrete candidate binding, separate from declared coverage and attempt state."""
+
+    scope: DeliveryVerificationScope
+    completed_units: tuple[DeliveryVerificationCompletedUnit, ...]
+    identity: DeliveryVerificationIdentity
+
+
 def delivery_verification_security_required(status: DeliveryPlanCheckResult | DeliveryStatusResult) -> bool:
-    plan = status.plan
-    if plan is None:
-        return False
-    if any(constraint.kind == "security_boundary" for constraint in plan.constraints):
-        return True
-    return any(tag in _SECURITY_SENSITIVE_RISK_TAGS for unit in plan.units for tag in unit.risk_tags)
+    return DeliveryVerificationScope.from_plan(status.plan).security_required if status.plan is not None else False
 
 
 def check_delivery_verification_readiness(
@@ -173,12 +169,13 @@ def check_delivery_verification_readiness(
 
     errors = list(status.errors)
     warnings = list(status.warnings)
-    security_required = delivery_verification_security_required(status)
+    scope = DeliveryVerificationScope.from_plan(plan) if plan is not None else None
+    security_required = scope.security_required if scope is not None else False
     source_bytes = 0
     source_prompt_bytes = 0
     plan_bytes = 0
     packet_policy_bytes = 0
-    active_unit_count = len([unit for unit in plan.units if not unit.superseded]) if plan else 0
+    active_unit_count = len(scope.unit_ids) if scope is not None else 0
     root = Path(status.project_root).resolve() if status.project_root else None
     try:
         allowed_read_paths = delivery_verification_allowed_read_paths(project_config)
@@ -220,7 +217,7 @@ def check_delivery_verification_readiness(
                     "repositories",
                 )
             )
-        if plan.source_task is None:
+        if scope.source_task is None:
             errors.append(
                 DeliveryPlanIssue(
                     "error",
@@ -230,7 +227,7 @@ def check_delivery_verification_readiness(
                 )
             )
         else:
-            source_path = root / plan.source_task.path
+            source_path = root / scope.source_task.path
             if not source_path.is_file():
                 errors.append(
                     DeliveryPlanIssue(
@@ -243,7 +240,7 @@ def check_delivery_verification_readiness(
             elif delivery_verification_source_task_is_private(
                 root,
                 source_path,
-                plan.source_task.path,
+                scope.source_task.path,
                 project_config,
             ):
                 errors.append(
@@ -325,19 +322,19 @@ def check_delivery_verification_readiness(
     plan_context_bytes = (
         len(
             json.dumps(
-                delivery_verification_plan_context(status),
+                scope.plan_context(),
                 indent=2,
                 sort_keys=True,
                 ensure_ascii=True,
             ).encode("utf-8")
         )
-        if plan is not None
+        if scope is not None
         else 0
     )
     control_object_bytes = len(
-        delivery_integration_review_control_example(
-            {obligation.id for obligation in plan.obligations} if plan is not None else set()
-        ).encode("utf-8")
+        delivery_integration_review_control_example(set(scope.obligation_ids) if scope is not None else set()).encode(
+            "utf-8"
+        )
     )
     packet_bytes = (
         source_prompt_bytes
@@ -441,7 +438,7 @@ def with_delivery_verification_readiness(
             and _verification_record_matches_identity(
                 verification,
                 identity,
-                obligation_count=len(status.plan.obligations),
+                obligation_count=len(DeliveryVerificationScope.from_plan(status.plan).obligation_ids),
             )
         ):
             from core.delivery_repair import delivery_repair_input_needs_refresh
@@ -463,12 +460,12 @@ def with_delivery_verification_readiness(
     )
 
 
-def build_delivery_verification_identity(
+def build_delivery_verification_snapshot(
     status: DeliveryStatusResult,
     project_config: dict[str, Any],
     *,
     candidate_commit: str,
-) -> DeliveryVerificationIdentity:
+) -> DeliveryVerificationSnapshot:
     if status.plan is None or status.plan.source_task is None or status.project_root is None:
         raise ValueError("delivery verification identity requires a valid authoritative plan")
     root = Path(status.project_root).resolve()
@@ -480,23 +477,20 @@ def build_delivery_verification_identity(
     if status.plan_fingerprint is None:
         raise ValueError("delivery verification identity requires bound plan bytes")
     plan_fingerprint = status.plan_fingerprint
-    completed_scope_fingerprint = _fingerprint(
-        [
-            {
-                "unit_id": unit.id,
-                "commit": unit.commit,
-                "handoff_fingerprint": unit.handoff_fingerprint,
-            }
-            for unit in status.units
-            if unit.status == "done" and unit.status != "superseded"
-        ]
+    scope = DeliveryVerificationScope.from_plan(status.plan)
+    completed_units = tuple(
+        DeliveryVerificationCompletedUnit(unit.id, unit.commit, unit.handoff_fingerprint)
+        for unit in status.units
+        if unit.status == "done" and unit.id in scope.unit_ids
     )
+    # Preserve the root's persisted schema-1 identity and ordered evidence hash.
+    completed_scope_fingerprint = _fingerprint([unit.to_dict() for unit in completed_units])
     config_fingerprint = delivery_verification_config_fingerprint(
         project_config,
-        security_required=delivery_verification_security_required(status),
+        security_required=scope.security_required,
     )
-    policy_fingerprint = _fingerprint(status.plan.verification.to_dict() if status.plan.verification else {})
-    source_fingerprint = status.plan.source_task.sha256
+    policy_fingerprint = _fingerprint(scope.policy.to_dict() if scope.policy else {})
+    source_fingerprint = scope.source_task.sha256
     gate_id = _fingerprint(
         {
             "candidate_commit": resolved_commit,
@@ -508,7 +502,7 @@ def build_delivery_verification_identity(
             "policy_fingerprint": policy_fingerprint,
         }
     )
-    return DeliveryVerificationIdentity(
+    identity = DeliveryVerificationIdentity(
         gate_id=gate_id,
         candidate_commit=resolved_commit,
         candidate_tree=candidate_tree,
@@ -518,6 +512,17 @@ def build_delivery_verification_identity(
         config_fingerprint=config_fingerprint,
         policy_fingerprint=policy_fingerprint,
     )
+
+    return DeliveryVerificationSnapshot(scope=scope, completed_units=completed_units, identity=identity)
+
+
+def build_delivery_verification_identity(
+    status: DeliveryStatusResult,
+    project_config: dict[str, Any],
+    *,
+    candidate_commit: str,
+) -> DeliveryVerificationIdentity:
+    return build_delivery_verification_snapshot(status, project_config, candidate_commit=candidate_commit).identity
 
 
 def delivery_verification_config_fingerprint(
@@ -585,20 +590,7 @@ def _effective_provider(project_config: dict[str, Any], agent_name: str) -> str:
 
 
 def delivery_verification_plan_context(status: DeliveryPlanCheckResult | DeliveryStatusResult) -> dict[str, Any]:
-    plan = status.plan
-    if plan is None:
-        return {}
-    return {
-        "plan_id": plan.plan_id,
-        "title": plan.title,
-        "units": [unit.to_authoring_dict() for unit in plan.units if not unit.superseded],
-        "constraints": [constraint.to_dict() for constraint in plan.constraints],
-        "obligations": [obligation.to_context_dict() for obligation in plan.obligations],
-        "source_accounting": [record.to_dict() for record in plan.source_accounting]
-        if plan.source_accounting is not None
-        else None,
-        "components": [component.to_dict() for component in plan.components],
-    }
+    return DeliveryVerificationScope.from_plan(status.plan).plan_context() if status.plan is not None else {}
 
 
 def delivery_verification_prompt_is_bounded(prompt: str) -> bool:

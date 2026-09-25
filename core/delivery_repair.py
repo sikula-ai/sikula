@@ -50,10 +50,10 @@ from core.delivery_progress import (
 )
 from core.delivery_repair_input import load_repair_input, repair_content_fingerprint, repair_input_policy_changed
 from core.delivery_repair_storage import read_repair_state, write_repair_state
+from core.delivery_verification_scope import DeliveryVerificationScope
 from core.delivery_verification import (
     build_delivery_verification_identity,
     check_delivery_verification_readiness,
-    delivery_verification_plan_context,
 )
 from core.delivery_verification_model import parse_delivery_verification_record
 from core.delivery_verification_review import DeliveryIntegrationAssessment
@@ -497,6 +497,8 @@ def _repair_packet(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
     plan = status.plan
     assert plan is not None and plan.source_task is not None and status.verification is not None
+    verification_scope = DeliveryVerificationScope.from_plan(plan)
+    plan_context = verification_scope.plan_context()
     if any(unit.id == unit_id for unit in plan.units):
         _stop(
             "unit_conflict", "The deterministic integration repair unit already exists without matching control state."
@@ -573,7 +575,7 @@ def _repair_packet(
         "id": unit_id,
         "title": "Repair delivery integration",
         "task_path": task_path,
-        "depends_on": [item.id for item in plan.units if not item.superseded],
+        "depends_on": list(verification_scope.unit_ids),
         "scope_paths": list(dict.fromkeys(scope_paths)),
         "estimated_size": "small",
         "budget": {"max_planner_steps": 1},
@@ -593,11 +595,11 @@ def _repair_packet(
         _stop("contract_not_ready", "Inherited repair assets are not ready in the reviewed candidate.")
     packet = {
         "source_task": source,
-        "plan": delivery_verification_plan_context(status),
+        "plan": plan_context,
         "findings": assessment.to_dict(),
         "repair_unit": unit,
         "unit_contracts": owner_contracts,
-        "inherited_constraints": [item.to_dict() for item in plan.constraints],
+        "inherited_constraints": plan_context["constraints"],
         "validation_policy": {
             key: cfg.get(key) for key in ("build", "run_presync", "run_build", "run_tests", "run_checks")
         },

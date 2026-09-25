@@ -10,6 +10,7 @@ from core.delivery_assembly import delivery_assembly_branch_is_symbolic
 from core.delivery_plan import DeliveryPlanIssue
 from core.delivery_public_metadata import sanitize_delivery_public_metadata
 from core.delivery_verification_model import delivery_verification_covers_obligations
+from core.delivery_verification_scope import DeliveryVerificationScope
 from core.delivery_progress import (
     DeliveryProgressEvent,
     DeliveryProgressLockError,
@@ -524,7 +525,9 @@ def _final_verification_issue(
             "delivery_verification.required",
             "Run delivery verify successfully before finalizing this plan.",
         )
-    if not delivery_verification_covers_obligations(verification, len(status.plan.obligations)):
+    if not delivery_verification_covers_obligations(
+        verification, len(DeliveryVerificationScope.from_plan(status.plan).obligation_ids)
+    ):
         return DeliveryPlanIssue(
             "error",
             "delivery_verification.stale",
