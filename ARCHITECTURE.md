@@ -1056,6 +1056,10 @@ the merge on `final_branch` and switches away, rerunning `run-next` resumes by
 ancestry without duplicating integration. A recorded conflict also blocks
 `run-next --dry-run` and `finalize --dry-run` until the branch contains both the
 prior assembled commit and the blocked unit commit.
+For plans with checkpoints, this deterministic recovery precedes checkpoint
+handoff checks. Dry-run previews the same recovery without updating progress;
+execution reconciles assembly under the delivery lock, then checks checkpoint
+authority again before starting a child or invoking a reviewer.
 
 **Delivery bounded run command:** `sikula delivery run PLAN_FILE` is a CLI
 coordinator over the existing one-unit `run-next` path. The loop lives in
@@ -1068,7 +1072,7 @@ Sikula pipeline.
 
 Each invocation has a finite unit-attempt bound. The default is the number of
 active units present when the loop starts, plus one integration-repair slot for
-source-bound plans with obligations. `--max-units` sets an explicit total that
+source-bound plans with obligations and one slot per declared checkpoint. `--max-units` sets an explicit total that
 includes repairs. `--max-elapsed-minutes` is a soft wall-clock bound
 checked between child runs and before repair preparation; an active child is never interrupted. A bound
 stop is resumable and successful. Before pausing for a bound at integration repair,
@@ -1089,7 +1093,7 @@ finalization engine. An already current finalized plan returns idempotently
 without duplicating its finalization event. Dry-run uses the existing run-next
 and finalize previews and does not mutate state or Git. JSON output is one
 compact aggregate projection rather than accumulated child state; child
-machine-readable output is redirected to stderr. For schema-version-2 plans,
+machine-readable output is redirected to stderr. For schema-version-2 and schema-version-3 plans,
 completion hands off to the final integration gate described below before
 deterministic finalization. Legacy schema-version-1 plans retain the direct
 finalize path.
@@ -1164,24 +1168,117 @@ repair ID beyond its initial snapshot, executes the normal child pipeline, and
 requires new candidate-bound final verification. Additional repair rounds and
 broader amendment/decision recovery remain separate work.
 
-**Delivery final integration gate:** newly prepared plans use schema version 2
-and declare `verification.mode: final_gate`; schema version 1 remains a readable
+**Flat integration checkpoints:** ordinary delivery preparation asks the LLM to
+select useful boundaries from source obligations, dependency structure, repository
+context and integration risks. Small cohesive plans can remain root-only. The
+model emits `checkpoints: [{id, unit_ids, obligation_ids}]`; the coordinator makes
+no placement LLM calls during execution. A malformed declaration gets one audited
+preparation correction. Independent requirement-gap recovery may adjust affected
+checkpoint declarations while preserving unrelated boundaries and all unit graph,
+scope and contract guardrails. Known prerequisite stops still preempt correction calls.
+
+Schema version 3 prevents old runtimes from silently ignoring checkpoint barriers.
+Each checkpoint has a unique safe ID (not `root`), a proper dependency-closed subset
+of active units, and nonempty due obligations whose contributors are in that group.
+The group must have downstream consumers. The validator includes barriers in its
+cycle check; overlapping groups cannot deadlock one another. Checkpoints reference
+units, not other checkpoints. Amendments replace a superseded member with its
+replacement units, preserving the boundary and revalidating dependency closure.
+The existing bounded root packet and every declared node packet must fit before
+plan publication or unit execution; this slice does not remove large-plan limits.
+
+`core/delivery_checkpoints.py` determines when a group is complete and whether its
+historical handoff remains usable. `delivery run` verifies a due group before
+starting more work; `run-next`, previews and execution under the delivery lock
+cannot bypass a barrier. Shared preflight checks required handoffs, executed
+contracts, source authority and child/prerequisite stops before provider calls.
+Linked child task text is immutable contract evidence; legacy units without child
+state require the contract in their recorded commit. Checkpoints run the enabled
+ordinary build/test/check phases; `delivery.verification.final_checks` remain
+root-only. Semantic review checks the group's due outcomes while retaining full
+source prohibitions, rather than treating future work as missing implementation.
+Security review and physical read-only enforcement use the existing gate boundary.
+
+Progress adds `checkpoint_verifications` (records keyed by logical node ID) and
+`checkpoint_ids` (the fixed recovery-node set captured at first verification).
+Root `verification` retains its exact-candidate semantics. Checkpoint policy
+identity additionally binds the declaration, scoped requirement context and
+completed contract bytes. A passed checkpoint becomes an `accepted_handoff`, not
+approval of the current final tree: covered commits/handoffs, contracts, source,
+applicable rules, effective review/validation policy and ancestry from its reviewed
+candidate must still agree. Ordinary downstream commits and later repair ownership
+additions do not alone reopen it. Changed covered inputs invalidate the handoff;
+if downstream work already started, the coordinator stops for reconciliation.
+Direct child resumes (including `--reset-failed`) consult the same parent barrier
+before resetting state or constructing an orchestrator. A stale identity does not
+clear a recorded security rejection or read-only boundary violation.
+Failure to append review or terminal audit evidence must also preserve that
+boundary verdict in control state; audit failure alone cannot make it retryable.
+These terminal results persist against the matching running checkpoint gate and
+attempt even if the assembly advances or fails during review. They retain the
+captured candidate without rolling back the assembly or replacing a newer attempt;
+ordinary results and root verification still require the current candidate.
+Checkpoint records additionally retain private `review_rule_fingerprints` for
+applicable reviewer and security-reviewer rule files. Their candidate contents
+must match both the reviewed and current assembled commits; operator checkout
+contents cannot substitute for this evidence. Older checkpoint receipts without
+this binding require verification again. Root record and identity semantics remain
+unchanged.
+Later code changes are reviewed at subsequent checkpoints and by the full root
+gate; this slice does not claim semantic selective invalidation from read footprints.
+
+An eligible checkpoint repair depends only on its completed scope. Publication
+extends that checkpoint, unaccepted groups covering its full scope, and any later
+group needing its repaired prerequisites,
+and adds the repair dependency to downstream consumers. They therefore inherit
+both the repaired assembly and normal dependency handoff evidence. Completed units
+and contracts remain unchanged. Schema-3 coordinator repairs carry `repair_node`;
+a later node's repair may extend root obligation ownership without retroactively
+making it a prerequisite of an earlier accepted group. The earlier scope retains
+only its own contributions; final verification still checks the complete outcome.
+Unfinished publication blocks children and resumes from private control snapshots.
+
+Each fixed logical node, including the root, permits one published repair and two
+persistent authoring attempts. Thus N declared checkpoints permit at most N+1 repair
+units and 2(N+1) authoring calls across resume. Renaming, removing or adding nodes
+after verification starts is rejected; a new candidate cannot replenish a node's
+budget. Schema-3 coordinator repairs cannot be split by amendment to expand the
+fixed node budget; this is rejected before authoring/publication.
+If crossing groups would require rewriting an already published repair's
+dependencies, preflight stops with `delivery_repair.repair_lineage_bound` before
+reserving another authoring attempt; changing that topology requires a follow-up
+plan. Previously accepted groups keep their historical scope.
+Root-only plans keep their existing one-repair budget. Checkpoint control
+and append-only audit files use `checkpoint-<id>-integration-repair.json` / `.jsonl`
+and `checkpoint-<id>-verification.jsonl` under the plan's private state directory.
+Public status/run projections expose only bounded checkpoint identity, state,
+coverage counts, attempt, candidate commit and stop code. Raw findings, contracts,
+prompts and provider output remain private evidence.
+
+The full root review is mandatory after all work, including repairs. It covers
+cross-group and future obligations and approves only the exact final candidate.
+Adaptive insertion/regrouping, nested checkpoint composition, rolling windows and
+plans beyond the bounded root packet remain later work.
+
+**Delivery final integration gate:** newly prepared root-only plans use schema version 2;
+plans with checkpoints use schema version 3. Both declare `verification.mode: final_gate`; schema version 1 remains a readable
 legacy policy with no implied verification. `core/delivery_verify.py` owns one
-bounded root integration-node execution, while `core/delivery_verification.py`
+bounded integration-node execution, while `core/delivery_verification.py`
 owns readiness and immutable identity construction,
 `core/delivery_verification_validation.py` owns validation policy/reuse, and
 `agents/delivery_integration_review_agent.py` owns the read-only semantic and
 security protocols. Unknown schema-2 policy values fail closed.
 
 `core/delivery_verification_scope.py` defines the private immutable declared
-verification scope. The currently supported logical node is `(plan_id, root)`:
+verification scope. The root `(plan_id, root)` covers
 all active units, all obligations and constraints, complete source accounting,
-and the full source-task binding. Context-only fragments remain in its authority;
+and the full source-task binding. A checkpoint selects a declared completed group,
+its due obligations and applicable constraints, retaining the full source authority. Context-only fragments remain in its authority;
 superseded units do not enter active coverage, but their sensitive risk tags still
 require security review. Its prompt context is detached from mutable parsed-plan
 lists. Readiness limits, prompt context and response-template sizing, expected
 review results, obligation closure checks, and repair input/dependencies consume
-this same root-scope definition. It is not a public JSON projection or a source
+this same node-scope definition. It is not a public JSON projection or a source
 of new execution authority.
 
 `DeliveryVerificationSnapshot` binds that declaration to completed-unit commit
@@ -1191,9 +1288,10 @@ node identity is independent of candidate and attempt: another candidate require
 another current verification, while retries remain separate durable attempts.
 Root gate hashes and schema-1 verification/repair-input records retain their
 existing format, so current evidence and interrupted repair remain resumable.
-This foundation does not yet introduce partial scopes, checkpoint scheduling,
-mid-plan repair, or checkpoint-specific budgets; whole-plan completion remains
-required before the root gate.
+Whole-plan completion remains required before the root gate. Checkpoints use the
+same capture, validation, read-only review, typed findings and durable repair flow
+for a declared partial scope. Root gate identities and existing repair control
+records remain compatible.
 
 The gate captures dependency-ordered assembly under the delivery progress lock,
 parses and hashes one immutable plan byte snapshot, captures and hashes the exact

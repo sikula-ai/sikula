@@ -1,6 +1,6 @@
 """Private, immutable authority for a delivery verification node.
 
-Only the whole-plan root is supported today. Declaring its authority does not
+Declaring authority for the root or an explicit checkpoint does not
 require completed units and does not itself authorize execution or finalization.
 """
 
@@ -20,7 +20,7 @@ _SECURITY_SENSITIVE_RISK_TAGS = frozenset(
 
 @dataclass(frozen=True)
 class DeliveryVerificationScope:
-    """Declared root coverage, detached from mutable lists in the parsed plan.
+    """Declared node coverage, detached from mutable lists in the parsed plan.
 
     ``(plan_id, node_id)`` names the logical node, not a passing verification.
     The root retains the full source authority, including unmapped/context-only
@@ -37,30 +37,54 @@ class DeliveryVerificationScope:
     security_required: bool
     policy: DeliveryVerificationPolicy | None
     _context_json: str = field(repr=False)
-    node_id: str = field(default="root", init=False)
+    node_id: str = "root"
 
     @classmethod
-    def from_plan(cls, plan: DeliveryPlan) -> DeliveryVerificationScope:
-        """Capture the root of a parsed plan; plan validation remains mandatory."""
+    def from_plan(cls, plan: DeliveryPlan, node_id: str = "root") -> DeliveryVerificationScope:
+        """Capture a declared node of a parsed plan; validation remains mandatory."""
+        checkpoint = next((item for item in plan.checkpoints if item.id == node_id), None)
+        if node_id != "root" and checkpoint is None:
+            raise ValueError("Unknown delivery verification node")
+        units = [
+            unit
+            for unit in plan.units
+            if not unit.superseded and (checkpoint is None or unit.id in checkpoint.unit_ids)
+        ]
+        obligations = [item for item in plan.obligations if checkpoint is None or item.id in checkpoint.obligation_ids]
+        constraints = [
+            item
+            for item in plan.constraints
+            if checkpoint is None or set(item.unit_ids).intersection(checkpoint.unit_ids)
+        ]
         context = {
             "plan_id": plan.plan_id,
             "title": plan.title,
-            "units": [unit.to_authoring_dict() for unit in plan.units if not unit.superseded],
-            "constraints": [constraint.to_dict() for constraint in plan.constraints],
-            "obligations": [obligation.to_context_dict() for obligation in plan.obligations],
+            "units": [unit.to_authoring_dict() for unit in units],
+            "constraints": [constraint.to_dict() for constraint in constraints],
+            "obligations": [obligation.to_context_dict() for obligation in obligations],
             "source_accounting": [record.to_dict() for record in plan.source_accounting]
             if plan.source_accounting is not None
             else None,
             "components": [component.to_dict() for component in plan.components],
         }
+        if checkpoint is not None:
+            # Later repair owners extend root authority, not a historical group's
+            # original contribution. They receive their own verification node.
+            for obligation in context["obligations"]:
+                obligation["unit_ids"] = [key for key in obligation["unit_ids"] if key in checkpoint.unit_ids]
+            context["verification_node"] = checkpoint.to_dict()
+            context["scope_rule"] = (
+                "Verify this completed group and its due obligations only. Full source remains authority; future outcomes are reserved for later checkpoints and the mandatory root gate."
+            )
         fragment_ids = [record.source_fragment_id for record in plan.source_accounting or ()]
         fragment_ids.extend(ref for obligation in plan.obligations for ref in obligation.source_fragment_ids)
         return cls(
             plan_id=plan.plan_id,
+            node_id=node_id,
             source_task=plan.source_task,
             unit_ids=tuple(unit["id"] for unit in context["units"]),
-            obligation_ids=tuple(obligation.id for obligation in plan.obligations),
-            constraint_ids=tuple(constraint.id for constraint in plan.constraints),
+            obligation_ids=tuple(obligation.id for obligation in obligations),
+            constraint_ids=tuple(constraint.id for constraint in constraints),
             source_fragment_ids=tuple(dict.fromkeys(fragment_ids)),
             # Superseding a sensitive unit must not remove required security review.
             security_required=any(constraint.kind == "security_boundary" for constraint in plan.constraints)

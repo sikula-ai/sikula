@@ -14,6 +14,7 @@ import time
 from core.delivery_progress import delivery_terminal_stop_recovery_action
 from core.llm_usage import aggregate_llm_usage
 from core.worktree import WorktreeEnvironmentCopyError, copy_worktree_environment_file
+from sikula_cli.agent_overrides import with_agent_llm_overrides
 
 
 def register_parser(
@@ -211,8 +212,40 @@ def _recover_interrupted_delivery_scope_before_revalidation(
     return recovery_orchestrator.recover_interrupted_delivery_scope(state.task_id), True
 
 
+def _check_delivery_checkpoint_resume(cfg: dict, state) -> bool:
+    """Consult the parent authority before resuming any provider or resetting a child."""
+    from core.delivery_checkpoints import checkpoint_barrier_issue
+    from core.delivery_progress import get_delivery_status
+    from sikula_cli.config import _original_project_root_from_worktree
+
+    if not (state.delivery_plan_id and state.delivery_unit_id and state.delivery_plan_path):
+        return True  # Legacy tasks without a persisted parent path predate checkpoints.
+    root = Path(cfg["project"]["root_path"]).resolve()
+    root = _original_project_root_from_worktree(root) or root
+    try:
+        path = (root / state.delivery_plan_path).resolve()
+        path.relative_to(root)
+        status = get_delivery_status(path, project_root=root)
+        if not status.valid or status.plan is None or status.plan.plan_id != state.delivery_plan_id:
+            raise ValueError("Parent authority unavailable")
+        if not status.plan.checkpoints:
+            return True
+        unit = next((unit for unit in status.units if unit.id == state.delivery_unit_id), None)
+        if unit is None or unit.child_task_id != state.task_id:
+            raise ValueError("Parent child binding unavailable")
+        issue = checkpoint_barrier_issue(status, cfg, unit_id=state.delivery_unit_id)
+        if issue is None:
+            return True
+        code = issue.code
+    except (OSError, RuntimeError, ValueError):
+        code = "delivery_checkpoint.evidence_unavailable"
+    print(f"Delivery checkpoint error ({code}): reconcile the parent plan with delivery run before resuming.")
+    sys.exit(1)
+    return False
+
+
 def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = None) -> None:
-    from core.state import JsonStateStore
+    from core.state import DELIVERY_TERMINAL_STOP_CODES, JsonStateStore
 
     context = _run_context(context)
 
@@ -250,6 +283,25 @@ def cmd_run(args: argparse.Namespace, cfg: dict, context: RunContext | None = No
     already_terminal = False
     current_branch_delivery_retry = False
     delivery_failed = False
+
+    if args.task_id:
+        resume_state = store.load(args.task_id)
+        if resume_state is not None and (
+            (not resume_state.done and not resume_state.failed)
+            or context.current_branch_delivery_needs_finalization(resume_state)
+            or (
+                args.reset_failed
+                and resume_state.delivery_stop_code not in DELIVERY_TERMINAL_STOP_CODES
+                and not resume_state.delivery_budget_stop
+                and resume_state.delivery_disposition_parse_error is None
+                and resume_state.worktree_path
+            )
+        ):
+            checkpoint_cfg = with_agent_llm_overrides(
+                cfg, overrides["agent_llms"], agent_names=("reviewer", "security_reviewer")
+            )
+            if not _check_delivery_checkpoint_resume(checkpoint_cfg, resume_state):
+                return
 
     if args.reset_failed:
         if not args.task_id:

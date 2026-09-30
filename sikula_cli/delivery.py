@@ -2297,9 +2297,43 @@ def _preview_delivery_run(
     from core.delivery_run_next import preview_delivery_run_next
     from core.delivery_verification import with_delivery_verification_readiness
 
-    status = get_delivery_status(args.plan_file, project_root=project_root)
+    from core.delivery_checkpoints import reconcile_checkpoint_assembly
+
+    status = reconcile_checkpoint_assembly(get_delivery_status(args.plan_file, project_root=project_root))
     status = with_delivery_verification_readiness(status, cfg)
     max_units = _delivery_run_unit_limit(args, status)
+    from core.delivery_checkpoints import checkpoint_preflight_issue, due_delivery_checkpoint, verification_node_status
+
+    checkpoint_id = due_delivery_checkpoint(status, cfg)
+    if checkpoint_id is not None and not delivery_repair_pending(args.plan_file, project_root=project_root):
+        node = with_delivery_verification_readiness(verification_node_status(status, checkpoint_id), cfg)
+        issue = checkpoint_preflight_issue(node, cfg, context.state_store if context else None)
+        recovery = _delivery_verification_recovery_stop_code(node)
+        if issue is None and recovery == "delivery_verification.repair_required":
+            repair = coordinate_delivery_repair(
+                args.plan_file,
+                cfg,
+                project_root=project_root,
+                agent_factory=None,
+                state_store=context.state_store if context else None,
+                dry_run=True,
+                node_id=checkpoint_id,
+            )
+            issue = repair.issue
+        elif issue is None and recovery is not None:
+            issue = DeliveryPlanIssue("error", recovery, "Checkpoint retains a required recovery boundary.")
+        return _delivery_run_result(
+            status=status,
+            max_units=max_units,
+            max_elapsed_minutes=getattr(args, "max_elapsed_minutes", None),
+            dry_run=True,
+            ready=issue is None,
+            stop_code=issue.code if issue else DELIVERY_RUN_PREVIEW,
+            errors=[issue] if issue else [],
+            message=issue.message
+            if issue
+            else "Dry run would verify or recover the due checkpoint before downstream execution.",
+        )
     if delivery_repair_pending(args.plan_file, project_root=project_root) or (
         status.plan
         and getattr(status.plan, "obligations", None)
@@ -2477,7 +2511,15 @@ def _run_delivery_plan(
 ):
     from core.delivery_plan import DeliveryPlanIssue
     from core.delivery_progress import get_delivery_status
-    from core.delivery_repair import coordinate_delivery_repair, delivery_repair_pending
+    from core.delivery_repair import coordinate_delivery_repair, pending_delivery_repair_node
+    from core.delivery_checkpoints import (
+        checkpoint_preflight_issue,
+        due_delivery_checkpoint,
+        verification_node_status,
+        checkpoint_pass_is_usable,
+        reconcile_checkpoint_assembly,
+    )
+    from core.delivery_verification import with_delivery_verification_readiness
     from core.delivery_run import (
         DELIVERY_RUN_BLOCKED,
         DELIVERY_RUN_ELAPSED_LIMIT_REACHED,
@@ -2502,12 +2544,71 @@ def _run_delivery_plan(
     last_unit = None
     child_task_id = None
     reset_failed_pending = bool(getattr(args, "reset_failed", False))
-    repair_requested = False
+    repair_requested = None
     repair_admitted = False
 
     while True:
-        status = get_delivery_status(args.plan_file, project_root=project_root)
-        if repair_requested or delivery_repair_pending(args.plan_file, project_root=project_root):
+        status = reconcile_checkpoint_assembly(
+            get_delivery_status(args.plan_file, project_root=project_root), persist=True
+        )
+        if getattr(status.plan, "checkpoints", ()):
+            status = with_delivery_verification_readiness(status, cfg)
+        pending_repair = pending_delivery_repair_node(args.plan_file, project_root=project_root)
+        checkpoint_id = due_delivery_checkpoint(status, cfg)
+        if checkpoint_id is not None and repair_requested is None and pending_repair is None:
+            node = with_delivery_verification_readiness(verification_node_status(status, checkpoint_id), cfg)
+            checkpoint_issue = checkpoint_preflight_issue(node, cfg, context.state_store if context else None)
+            if checkpoint_issue is None:
+                recovery = _delivery_verification_recovery_stop_code(node)
+                if recovery == "delivery_verification.repair_required":
+                    repair_requested = checkpoint_id
+                elif recovery is not None:
+                    checkpoint_issue = DeliveryPlanIssue(
+                        "error", recovery, "Checkpoint retains a required recovery boundary."
+                    )
+                elif context.verify_plan is None:
+                    checkpoint_issue = DeliveryPlanIssue(
+                        "error",
+                        "delivery_verification.context_unavailable",
+                        "Checkpoint verification context is unavailable.",
+                    )
+                else:
+                    checkpoint_args = copy.copy(args)
+                    checkpoint_args.verification_node = checkpoint_id
+                    verification = context.verify_plan(checkpoint_args, cfg)
+                    if verification.succeeded:
+                        updated = get_delivery_status(args.plan_file, project_root=project_root)
+                        checkpoint = next(item for item in updated.plan.checkpoints if item.id == checkpoint_id)
+                        if checkpoint_pass_is_usable(updated, checkpoint, cfg):
+                            continue
+                        checkpoint_issue = DeliveryPlanIssue(
+                            "error", "delivery_checkpoint.no_progress", "Checkpoint did not leave a usable handoff."
+                        )
+                    elif verification.stop_code == "delivery_verification.repair_required":
+                        repair_requested = checkpoint_id
+                    else:
+                        checkpoint_issue = DeliveryPlanIssue(
+                            "error",
+                            verification.stop_code or "delivery_checkpoint.failed",
+                            "Checkpoint verification did not pass; its evidence is retained.",
+                        )
+            if checkpoint_issue is not None:
+                return _delivery_run_result(
+                    status=with_delivery_verification_readiness(
+                        get_delivery_status(args.plan_file, project_root=project_root), cfg
+                    ),
+                    max_units=max_units,
+                    max_elapsed_minutes=max_elapsed_minutes,
+                    started=units_attempted > 0,
+                    units_attempted=units_attempted,
+                    units_succeeded=units_succeeded,
+                    last_unit=last_unit,
+                    child_task_id=child_task_id,
+                    stop_code=checkpoint_issue.code,
+                    errors=[checkpoint_issue],
+                    message=checkpoint_issue.message,
+                )
+        if repair_requested is not None or pending_repair is not None:
             stop_code = None
             if units_succeeded >= max_units:
                 stop_code = DELIVERY_RUN_UNIT_LIMIT_REACHED
@@ -2524,6 +2625,7 @@ def _run_delivery_plan(
                 if context.repair_agent_factory
                 else None,
                 dry_run=stop_code is not None,
+                node_id=repair_requested or pending_repair,
             )
             if repair.issue is not None or not repair.ready or (stop_code is None and repair.unit_id is None):
                 issue = repair.issue or DeliveryPlanIssue(
@@ -2542,6 +2644,10 @@ def _run_delivery_plan(
                     errors=[issue],
                     message=issue.message,
                 )
+            if getattr(status.plan, "checkpoints", ()):
+                status = with_delivery_verification_readiness(
+                    get_delivery_status(args.plan_file, project_root=project_root), cfg
+                )
             if stop_code is not None:
                 return _delivery_run_result(
                     status=status,
@@ -2559,7 +2665,7 @@ def _run_delivery_plan(
                 )
             initial_unit_ids = initial_unit_ids | {repair.unit_id}
             repair_admitted = True
-            repair_requested = False
+            repair_requested = None
             status = get_delivery_status(args.plan_file, project_root=project_root)
         if not status.valid:
             return _delivery_run_result(
@@ -2596,7 +2702,7 @@ def _run_delivery_plan(
                 and status.plan.obligations
                 and context.repair_agent_factory is not None
             ):
-                repair_requested = True
+                repair_requested = "root"
                 continue
             return final_result
         if units_succeeded >= max_units:
@@ -2857,6 +2963,8 @@ def _delivery_verification_recovery_stop_code(status) -> str | None:
     stop_code = getattr(verification, "stop_code", None)
     if verification_status not in {"failed", "blocked"} or not isinstance(stop_code, str):
         return None
+    if getattr(verification, "security_status", None) == "rejected":
+        return "delivery_verification.security_rejected"
     if delivery_verification_recovery_action(stop_code) == "retry_delivery_verification":
         return None
     return stop_code
@@ -2874,7 +2982,7 @@ def _delivery_run_unit_limit(args: argparse.Namespace, status) -> int:
         return configured
     remaining = sum(unit.status not in {"done", "superseded"} for unit in status.units)
     plan = getattr(status, "plan", None)
-    return remaining + int(bool(plan and getattr(plan, "obligations", None)))
+    return remaining + int(bool(plan and getattr(plan, "obligations", None))) + len(getattr(plan, "checkpoints", ()))
 
 
 def _delivery_run_status_signature(status) -> tuple[Any, ...]:
@@ -2921,7 +3029,10 @@ def _delivery_run_result(
 ):
     from core.delivery_run import DeliveryRunResult
 
+    from core.delivery_checkpoints import checkpoint_projection
+
     return DeliveryRunResult(
+        checkpoints=checkpoint_projection(status) if getattr(getattr(status, "plan", None), "checkpoints", ()) else [],
         plan_path=status.plan_path,
         project_root=status.project_root,
         valid=status.valid and not errors,
@@ -3376,6 +3487,20 @@ def _run_next_delivery_unit(
     from core.delivery_write_scope import DeliveryWriteScopeError, resolve_delivery_write_scope
     from core.delivery_verification import with_delivery_verification_readiness
 
+    from core.delivery_checkpoints import reconcile_checkpoint_assembly
+
+    recovery_status = get_delivery_status(args.plan_file, project_root=project_root)
+    recovered = reconcile_checkpoint_assembly(recovery_status, persist=True)
+    if recovered is not recovery_status and not recovered.valid:
+        return _execution_result_from_status(
+            recovered,
+            ran=False,
+            selected_unit=None,
+            progress_path=recovered.progress_path,
+            events_path=None,
+            errors=list(recovered.errors),
+            message="Delivery assembly recovery is blocked.",
+        )
     reset_failed = bool(getattr(args, "reset_failed", False))
     preflight = preview_delivery_run_next(args.plan_file, project_root=project_root, reset_failed=reset_failed)
     status = get_delivery_status(args.plan_file, project_root=project_root)
@@ -3487,6 +3612,19 @@ def _run_next_delivery_unit(
         terminal_result = _execution_result_from_terminal_stop(status)
         if terminal_result is not None:
             return terminal_result
+        from core.delivery_checkpoints import checkpoint_barrier_issue
+
+        checkpoint_issue = checkpoint_barrier_issue(status, cfg)
+        if checkpoint_issue is not None:
+            return _execution_result_from_status(
+                status,
+                ran=False,
+                selected_unit=None,
+                progress_path=str(progress_path),
+                events_path=str(events_path),
+                errors=[checkpoint_issue],
+                message=checkpoint_issue.message,
+            )
         running_units = _running_delivery_units(status)
         if len(running_units) == 1:
             stop_issues = delivery_stop_and_follow_up_issues(status.plan, running_units[0].id)
@@ -3702,6 +3840,20 @@ def _run_next_delivery_unit(
                 errors=[*updated_status.errors, assembly_issue],
                 message=assembly_issue.message,
             )
+
+        if status.plan.checkpoints:
+            updated_status = get_delivery_status(args.plan_file, project_root=project_root)
+            checkpoint_issue = checkpoint_barrier_issue(updated_status, cfg)
+            if not updated_status.valid or checkpoint_issue is not None:
+                return _execution_result_from_status(
+                    updated_status,
+                    ran=False,
+                    selected_unit=selected_unit,
+                    progress_path=str(progress_path),
+                    events_path=str(events_path),
+                    errors=[*updated_status.errors, *([checkpoint_issue] if checkpoint_issue else [])],
+                    message="Checkpoint authority must be reconciled after assembly.",
+                )
 
         dependency_errors = _dependency_commit_errors(
             status,
@@ -4299,8 +4451,22 @@ def _apply_delivery_preview_execution_guards(
     from core.delivery_write_scope import DeliveryWriteScopeError, resolve_delivery_write_scope
     from core.delivery_verification import with_delivery_verification_readiness
 
-    status = get_delivery_status(plan_file, project_root=project_root)
+    from core.delivery_checkpoints import reconcile_checkpoint_assembly
+
+    status = reconcile_checkpoint_assembly(get_delivery_status(plan_file, project_root=project_root))
     status = with_delivery_verification_readiness(status, cfg)
+    from core.delivery_checkpoints import checkpoint_barrier_issue
+
+    checkpoint_issue = checkpoint_barrier_issue(status, cfg)
+    if checkpoint_issue is not None:
+        return replace(
+            preview,
+            valid=False,
+            ready=False,
+            selected_unit=None,
+            errors=[checkpoint_issue],
+            message=checkpoint_issue.message,
+        )
     terminal_stop = _delivery_terminal_stop(status)
     if terminal_stop is not None:
         terminal_stop_unit, terminal_stop_issue = terminal_stop

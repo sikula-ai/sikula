@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 from typing import Any
@@ -52,9 +52,12 @@ class DeliveryRunResult:
     warnings: list[DeliveryPlanIssue]
     message: str
 
+    checkpoints: list[dict[str, Any]] = field(default_factory=list)
+
     def to_dict(self) -> dict[str, Any]:
         root = Path(self.project_root).resolve() if self.project_root and self.project_root != "." else None
         return {
+            **({"checkpoints": self.checkpoints} if self.checkpoints else {}),
             "schema_version": 1,
             "sikula_version": sikula_version(),
             "command": "delivery.run",

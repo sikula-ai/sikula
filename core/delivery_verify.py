@@ -16,7 +16,7 @@ from agents.delivery_integration_review_agent import (
     DeliveryIntegrationReviewResult,
 )
 from core.delivery_finalize import assemble_delivery_candidate
-from core.llm_client import LLMConfigurationError
+from core.llm_client import LLMConfigurationError, LLMReadOnlyViolation
 from core.delivery_plan import DeliveryPlanIssue
 from core.delivery_progress import (
     DeliveryProgressEvent,
@@ -43,10 +43,16 @@ from core.delivery_verification import (
     delivery_verification_allowed_read_paths,
     delivery_verification_source_task_is_private,
 )
+from core.delivery_checkpoints import (
+    reconcile_checkpoint_assembly,
+    verification_node_status,
+    verification_scope_complete,
+)
 from core.delivery_verification_scope import DeliveryVerificationScope
 from core.delivery_verification_model import (
     DeliveryVerificationRecord,
     delivery_verification_covers_obligations,
+    delivery_verification_is_boundary_stop,
     delivery_verification_recovery_action,
 )
 from core.delivery_verification_validation import (
@@ -149,10 +155,13 @@ def verify_delivery_plan(
     semantic_reviewer: DeliveryIntegrationReviewAgent | None,
     security_reviewer: DeliveryIntegrationReviewAgent | None,
     project_root: Path | None = None,
+    node_id: str = "root",
 ) -> DeliveryVerifyResult:
-    status = get_delivery_status(path, project_root=project_root)
+    status = verification_node_status(
+        reconcile_checkpoint_assembly(get_delivery_status(path, project_root=project_root), persist=True), node_id
+    )
     readiness = check_delivery_verification_readiness(status, project_config)
-    blocked = _preflight_result(status, readiness)
+    blocked = _preflight_result(status, readiness, project_config)
     if blocked is not None:
         return blocked
     assert status.plan is not None and status.project_root is not None
@@ -172,16 +181,24 @@ def verify_delivery_plan(
     plan_id = status.plan.plan_id
     progress_path = delivery_progress_path(root, plan_id)
     events_path = delivery_events_path(root, plan_id)
-    evidence_path = progress_path.parent / "verification.jsonl"
+    evidence_path = progress_path.parent / (
+        "verification.jsonl" if node_id == "root" else f"checkpoint-{node_id}-verification.jsonl"
+    )
     evidence_reference = evidence_path.relative_to(root).as_posix()
 
     try:
         with acquire_delivery_progress_lock(root, plan_id, owner="delivery.verify.capture"):
-            status = get_delivery_status(path, project_root=root)
+            status = verification_node_status(get_delivery_status(path, project_root=root), node_id)
             readiness = check_delivery_verification_readiness(status, project_config)
-            blocked = _preflight_result(status, readiness)
+            blocked = _preflight_result(status, readiness, project_config)
             if blocked is not None:
                 return blocked
+            if node_id != "root":
+                from core.delivery_checkpoints import checkpoint_preflight_issue
+
+                issue = checkpoint_preflight_issue(status, project_config, state_store)
+                if issue is not None:
+                    return _blocked_result(status, issue.code, [issue])
             progress, progress_errors = read_delivery_progress(progress_path, plan_id=plan_id)
             if progress is None or progress_errors:
                 return _blocked_result(status, "delivery_verification.progress_invalid", progress_errors)
@@ -193,8 +210,12 @@ def verify_delivery_plan(
                 project_config,
             ):
                 return _blocked_result(status, "delivery_verification.source_private")
-            existing = progress.verification
-            if existing is not None and not _ensure_verification_progress_event(events_path, plan_id, existing):
+            if status.plan.checkpoints and progress.checkpoint_ids is None:
+                progress = replace(progress, checkpoint_ids=tuple(item.id for item in status.plan.checkpoints))
+            existing = progress.verification if node_id == "root" else progress.checkpoint_verifications.get(node_id)
+            if existing is not None and not _ensure_verification_progress_event(
+                events_path, plan_id, existing, node_id=node_id
+            ):
                 return _blocked_result(status, "delivery_verification.event_unavailable")
             if existing and existing.passed and progress.assembly_status == "ready" and progress.assembled_commit:
                 try:
@@ -207,6 +228,7 @@ def verify_delivery_plan(
                     existing_identity = None
                 if (
                     existing_identity is not None
+                    and (node_id == "root" or existing.review_rule_fingerprints is not None)
                     and _record_matches_identity(
                         existing,
                         existing_identity,
@@ -229,7 +251,12 @@ def verify_delivery_plan(
                     "delivery_verification.assembly_failed",
                     [assembly_error] if assembly_error else [],
                 )
-            status = get_delivery_status(path, project_root=root)
+            status = verification_node_status(get_delivery_status(path, project_root=root), node_id)
+            blocked = _preflight_result(
+                status, check_delivery_verification_readiness(status, project_config), project_config
+            )
+            if blocked is not None:
+                return blocked
             snapshot = build_delivery_verification_snapshot(
                 status,
                 project_config,
@@ -242,10 +269,11 @@ def verify_delivery_plan(
                 return _blocked_result(status, "delivery_verification.source_private")
             except (OSError, UnicodeError, ValueError):
                 return _blocked_result(status, "delivery_verification.source_changed")
-            existing = progress.verification
+            existing = progress.verification if node_id == "root" else progress.checkpoint_verifications.get(node_id)
             if (
                 existing
                 and existing.passed
+                and (node_id == "root" or existing.review_rule_fingerprints is not None)
                 and _record_matches_identity(
                     existing,
                     identity,
@@ -254,6 +282,20 @@ def verify_delivery_plan(
             ):
                 return _result_from_record(status, existing, succeeded=True, next_action="finalize_delivery")
             attempt = existing.attempt + 1 if existing and existing.gate_id == identity.gate_id else 1
+            rule_fingerprints = None
+            if node_id != "root":
+                from core.delivery_checkpoints import checkpoint_review_rule_fingerprints
+
+                roles = ("reviewer", "security_reviewer") if snapshot.scope.security_required else ("reviewer",)
+                paths = [
+                    Path(project_config[role]["extra_rules"]).as_posix()
+                    for role in roles
+                    if project_config.get(role, {}).get("extra_rules")
+                ]
+                try:
+                    rule_fingerprints = checkpoint_review_rule_fingerprints(root, candidate_commit, paths)
+                except (OSError, UnicodeError, ValueError):
+                    return _blocked_result(status, "delivery_verification.review_rules_unavailable")
             running = _record_for_identity(
                 identity,
                 status="running",
@@ -262,10 +304,12 @@ def verify_delivery_plan(
                 obligation_count=len(snapshot.scope.obligation_ids),
                 evidence_path=evidence_reference,
                 started_at=_now(),
+                review_rule_fingerprints=rule_fingerprints,
             )
-            progress = mark_delivery_verification(progress, running)
+            progress = mark_delivery_verification(progress, running, node_id=node_id)
             write_delivery_progress(progress_path, progress)
             running_event = DeliveryProgressEvent(
+                verification_node=node_id if node_id != "root" else None,
                 plan_id=plan_id,
                 event_type="verification.running",
                 timestamp=running.started_at or _now(),
@@ -278,11 +322,12 @@ def verify_delivery_plan(
                     stop_code="delivery_verification.event_unavailable",
                     completed_at=_now(),
                 )
-                progress = mark_delivery_verification(progress, blocked_record)
+                progress = mark_delivery_verification(progress, blocked_record, node_id=node_id)
                 write_delivery_progress(progress_path, progress)
                 _safe_append_progress_event(
                     events_path,
                     DeliveryProgressEvent(
+                        verification_node=node_id if node_id != "root" else None,
                         plan_id=plan_id,
                         event_type="verification.blocked",
                         timestamp=blocked_record.completed_at or _now(),
@@ -311,11 +356,12 @@ def verify_delivery_plan(
                     stop_code="delivery_verification.audit_unavailable",
                     completed_at=_now(),
                 )
-                progress = mark_delivery_verification(progress, blocked_record)
+                progress = mark_delivery_verification(progress, blocked_record, node_id=node_id)
                 write_delivery_progress(progress_path, progress)
                 _safe_append_progress_event(
                     events_path,
                     DeliveryProgressEvent(
+                        verification_node=node_id if node_id != "root" else None,
                         plan_id=plan_id,
                         event_type="verification.blocked",
                         timestamp=blocked_record.completed_at or _now(),
@@ -344,7 +390,9 @@ def verify_delivery_plan(
             {"event": "blocked", "record": terminal.to_dict()},
             project_root=root,
         )
-        _persist_terminal_if_current(path, root, plan_id, project_config, identity, terminal, events_path)
+        _persist_terminal_if_current(
+            path, root, plan_id, project_config, identity, terminal, events_path, node_id=node_id
+        )
         return _result_from_record(
             get_delivery_status(path, project_root=root),
             terminal,
@@ -384,7 +432,9 @@ def verify_delivery_plan(
             {"event": "interrupted", "record": terminal.to_dict()},
             project_root=root,
         )
-        _persist_terminal_if_current(path, root, plan_id, project_config, identity, terminal, events_path)
+        _persist_terminal_if_current(
+            path, root, plan_id, project_config, identity, terminal, events_path, node_id=node_id
+        )
         raise
     except BaseException as exc:
         terminal = replace(
@@ -408,7 +458,10 @@ def verify_delivery_plan(
         terminal = replace(
             terminal,
             status="blocked",
-            stop_code="delivery_verification.audit_unavailable",
+            stop_code=terminal.stop_code
+            if delivery_verification_recovery_action(terminal.stop_code)
+            in {"resolve_readonly_boundary", "resolve_workspace_boundary"}
+            else "delivery_verification.audit_unavailable",
             completed_at=_now(),
         )
 
@@ -420,6 +473,7 @@ def verify_delivery_plan(
         identity,
         terminal,
         events_path,
+        node_id=node_id,
     )
     if not current:
         stale = replace(
@@ -428,7 +482,7 @@ def verify_delivery_plan(
             stop_code="delivery_verification.candidate_changed",
             completed_at=_now(),
         )
-        _persist_stale_attempt(root, plan_id, identity, stale, events_path)
+        _persist_stale_attempt(root, plan_id, identity, stale, events_path, node_id=node_id)
         _safe_append_audit(
             evidence_path,
             {"event": "stale", "record": stale.to_dict()},
@@ -541,7 +595,12 @@ def _execute_gate(
                 scope=scope,
             )
             validation_before = _review_snapshot(worktree, project_config, exclude_ephemeral_paths=True)
-            validation = run_delivery_verification_validation(worktree, project_config, reusable=reusable)
+            validation = run_delivery_verification_validation(
+                worktree,
+                project_config,
+                reusable=reusable,
+                **({"include_final_checks": False} if scope.node_id != "root" else {}),
+            )
             validation_evidence = {"event": "validation", "result": _validation_audit(validation)}
             if not _safe_append_audit(evidence_path, validation_evidence, project_root=root):
                 terminal = _review_blocked(
@@ -578,6 +637,10 @@ def _execute_gate(
 
             try:
                 semantic_reviewer.prepare_workspace(worktree)
+            except LLMReadOnlyViolation:
+                return _review_blocked(
+                    running, validation, "delivery_verification.readonly_mutation", semantic_status="blocked"
+                )
             except (LLMConfigurationError, OSError):
                 return _review_blocked(
                     running,
@@ -664,6 +727,14 @@ def _execute_gate(
                     )
                 try:
                     security_reviewer.prepare_workspace(worktree)
+                except LLMReadOnlyViolation:
+                    return _review_blocked(
+                        running,
+                        validation,
+                        "delivery_verification.readonly_mutation",
+                        semantic_status=semantic_status,
+                        security_status="blocked",
+                    )
                 except (LLMConfigurationError, OSError):
                     return _review_blocked(
                         running,
@@ -744,7 +815,7 @@ def _execute_gate(
         terminal = _review_blocked(
             running,
             validation,
-            "delivery_verification.audit_unavailable",
+            exc.boundary_stop_code or "delivery_verification.audit_unavailable",
             semantic_status=phase_status if active_review == "semantic" else semantic_status,
             security_status=phase_status if active_review == "security" else security_status,
             obligation_satisfied_count=(
@@ -796,7 +867,11 @@ def _run_review(
             review_kind=kind,
             source_task=source_task,
             plan_context=plan_context,
-            validation_summary=validation.to_review_dict(reviewer.project_config, project_root=worktree),
+            validation_summary=validation.to_review_dict(
+                reviewer.project_config,
+                project_root=worktree,
+                include_final_checks=not bool(plan_context.get("verification_node")),
+            ),
             candidate_commit=identity.candidate_commit,
             candidate_tree=identity.candidate_tree,
             known_unit_ids=known_unit_ids,
@@ -817,6 +892,7 @@ def _run_review(
                 finding_count=0,
                 obligation_satisfied_count=0,
                 obligation_gap_count=0,
+                boundary_stop_code=exc.code if exc.code == "delivery_verification.readonly_mutation" else None,
             ) from exc
         raise
     review_evidence = {
@@ -847,35 +923,43 @@ def _persist_terminal_if_current(
     identity: DeliveryVerificationIdentity,
     terminal: DeliveryVerificationRecord,
     events_path: Path,
+    *,
+    node_id: str = "root",
 ) -> bool:
     try:
         with acquire_delivery_progress_lock(root, plan_id, owner="delivery.verify.complete"):
-            status = get_delivery_status(path, project_root=root)
             progress_path = delivery_progress_path(root, plan_id)
             progress, errors = read_delivery_progress(progress_path, plan_id=plan_id)
-            if progress is None or errors or progress.verification is None:
+            record = (
+                (progress.verification if node_id == "root" else progress.checkpoint_verifications.get(node_id))
+                if progress
+                else None
+            )
+            if progress is None or errors or record is None:
                 return False
-            if (
-                progress.verification.gate_id != identity.gate_id
-                or progress.verification.attempt != terminal.attempt
-                or progress.verification.status != "running"
-            ):
+            if record.gate_id != identity.gate_id or record.attempt != terminal.attempt or record.status != "running":
                 return False
-            try:
-                current_identity = build_delivery_verification_identity(
-                    status,
-                    project_config,
-                    candidate_commit=identity.candidate_commit,
-                )
-            except (OSError, RuntimeError, ValueError):
-                return False
-            if current_identity != identity or not _assembly_ref_matches(root, status, identity.candidate_commit):
-                return False
-            progress = mark_delivery_verification(progress, terminal)
+            # A boundary violation belongs to the attempt even when authority
+            # changes while its provider is running. Never replace it with stale.
+            retain_boundary = node_id != "root" and delivery_verification_is_boundary_stop(terminal)
+            if not retain_boundary:
+                try:
+                    status = verification_node_status(get_delivery_status(path, project_root=root), node_id)
+                    current_identity = build_delivery_verification_identity(
+                        status,
+                        project_config,
+                        candidate_commit=identity.candidate_commit,
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    return False
+                if current_identity != identity or not _assembly_ref_matches(root, status, identity.candidate_commit):
+                    return False
+            progress = mark_delivery_verification(progress, terminal, node_id=node_id)
             write_delivery_progress(progress_path, progress)
             append_delivery_progress_event(
                 events_path,
                 DeliveryProgressEvent(
+                    verification_node=node_id if node_id != "root" else None,
                     plan_id=plan_id,
                     event_type=f"verification.{terminal.status}",
                     timestamp=terminal.completed_at or _now(),
@@ -899,6 +983,8 @@ def _ensure_verification_progress_event(
     events_path: Path,
     plan_id: str,
     record: DeliveryVerificationRecord,
+    *,
+    node_id: str = "root",
 ) -> bool:
     timestamp = record.started_at if record.status == "running" else record.completed_at
     if record.status == "pending" or timestamp is None:
@@ -914,6 +1000,7 @@ def _ensure_verification_progress_event(
                     if (
                         isinstance(event, dict)
                         and event.get("plan_id") == plan_id
+                        and event.get("verification_node") == (node_id if node_id != "root" else None)
                         and event.get("event_type") == event_type
                         and event.get("timestamp") == timestamp
                         and event.get("commit") == record.candidate_commit
@@ -922,6 +1009,7 @@ def _ensure_verification_progress_event(
         append_delivery_progress_event(
             events_path,
             DeliveryProgressEvent(
+                verification_node=node_id if node_id != "root" else None,
                 plan_id=plan_id,
                 event_type=event_type,
                 timestamp=timestamp,
@@ -933,7 +1021,7 @@ def _ensure_verification_progress_event(
         return False
 
 
-def _preflight_result(status, readiness) -> DeliveryVerifyResult | None:
+def _preflight_result(status, readiness, project_config: dict[str, Any] | None = None) -> DeliveryVerifyResult | None:
     if not status.valid or not readiness.ready:
         return DeliveryVerifyResult(
             plan_path=status.plan_path,
@@ -945,10 +1033,10 @@ def _preflight_result(status, readiness) -> DeliveryVerifyResult | None:
             obligation_count=_status_obligation_count(status),
             stop_code="delivery_verification.not_ready",
             next_action="resolve_delivery_verification_readiness",
-            errors=tuple(readiness.errors),
+            errors=tuple(dict.fromkeys([*status.errors, *readiness.errors])),
             warnings=tuple(readiness.warnings),
         )
-    if readiness.required and status.status != "done":
+    if readiness.required and not verification_scope_complete(status):
         issue = DeliveryPlanIssue(
             "error",
             "delivery_verification.plan_not_done",
@@ -967,6 +1055,21 @@ def _preflight_result(status, readiness) -> DeliveryVerifyResult | None:
             errors=(issue,),
             warnings=tuple(readiness.warnings),
         )
+    if readiness.required and status.plan and status.plan.checkpoints:
+        from core.delivery_checkpoints import checkpoint_barrier_issue, checkpoint_pass_is_usable
+        from core.delivery_handoff import load_delivery_dependency_handoffs
+
+        issue = checkpoint_barrier_issue(status, project_config)
+        if issue is not None and issue.code == "delivery_checkpoint.handoff_stale":
+            return _blocked_result(status, issue.code, [issue])
+        if status.verification_node == "root" and any(
+            not checkpoint_pass_is_usable(status, checkpoint, project_config) for checkpoint in status.plan.checkpoints
+        ):
+            return _blocked_result(status, "delivery_checkpoint.required")
+        scope = DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
+        _, issues = load_delivery_dependency_handoffs(status, list(scope.unit_ids), Path(status.project_root))
+        if issues:
+            return _blocked_result(status, issues[0].code, issues)
     if readiness.required and not status.progress_exists:
         return _blocked_result(status, "delivery_verification.progress_missing")
     return None
@@ -978,27 +1081,35 @@ def _persist_stale_attempt(
     identity: DeliveryVerificationIdentity,
     stale: DeliveryVerificationRecord,
     events_path: Path,
+    *,
+    node_id: str = "root",
 ) -> None:
     try:
         with acquire_delivery_progress_lock(root, plan_id, owner="delivery.verify.stale"):
             progress_path = delivery_progress_path(root, plan_id)
             progress, errors = read_delivery_progress(progress_path, plan_id=plan_id)
+            record = (
+                (progress.verification if node_id == "root" else progress.checkpoint_verifications.get(node_id))
+                if progress
+                else None
+            )
             if (
                 progress is None
                 or errors
-                or progress.verification is None
-                or progress.verification.gate_id != identity.gate_id
-                or progress.verification.attempt != stale.attempt
-                or progress.verification.status != "running"
+                or record is None
+                or record.gate_id != identity.gate_id
+                or record.attempt != stale.attempt
+                or record.status != "running"
                 or progress.assembly_status != "ready"
                 or progress.assembled_commit != identity.candidate_commit
             ):
                 return
-            progress = mark_delivery_verification(progress, stale)
+            progress = mark_delivery_verification(progress, stale, node_id=node_id)
             write_delivery_progress(progress_path, progress)
             append_delivery_progress_event(
                 events_path,
                 DeliveryProgressEvent(
+                    verification_node=node_id if node_id != "root" else None,
                     plan_id=plan_id,
                     event_type="verification.stale",
                     timestamp=stale.completed_at or _now(),
@@ -1030,7 +1141,11 @@ def _blocked_result(status, code: str, errors: list[DeliveryPlanIssue] | None = 
 
 def _status_obligation_count(status) -> int:
     plan = getattr(status, "plan", None)
-    return len(DeliveryVerificationScope.from_plan(plan).obligation_ids) if plan is not None else 0
+    return (
+        len(DeliveryVerificationScope.from_plan(plan, getattr(status, "verification_node", "root")).obligation_ids)
+        if plan is not None
+        else 0
+    )
 
 
 def _result_from_record(
@@ -1129,6 +1244,7 @@ class _ReviewAuditUnavailable(RuntimeError):
         finding_count: int,
         obligation_satisfied_count: int,
         obligation_gap_count: int,
+        boundary_stop_code: str | None = None,
     ) -> None:
         super().__init__("Delivery verification review evidence could not be persisted.")
         self.review_evidence = review_evidence
@@ -1136,6 +1252,7 @@ class _ReviewAuditUnavailable(RuntimeError):
         self.finding_count = finding_count
         self.obligation_satisfied_count = obligation_satisfied_count
         self.obligation_gap_count = obligation_gap_count
+        self.boundary_stop_code = boundary_stop_code
 
 
 class _GateValidationAuditUnavailable(RuntimeError):

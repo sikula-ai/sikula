@@ -50,12 +50,16 @@ class DeliveryVerificationValidationResult:
     reused_child_task_id: str | None = None
     stop_code: str | None = None
 
-    def to_review_dict(self, project_config: dict[str, Any], *, project_root: Path | None = None) -> dict[str, Any]:
+    def to_review_dict(
+        self, project_config: dict[str, Any], *, project_root: Path | None = None, include_final_checks: bool = True
+    ) -> dict[str, Any]:
         return {
             "passed": self.passed,
             "reused": self.reused,
             "executed": self.executed,
-            "policy": delivery_validation_review_policy(project_config, project_root=project_root),
+            "policy": delivery_validation_review_policy(
+                project_config, project_root=project_root, include_final_checks=include_final_checks
+            ),
             "phases": [
                 {
                     "phase": record.phase,
@@ -72,6 +76,7 @@ def delivery_validation_review_policy(
     project_config: dict[str, Any],
     *,
     project_root: Path | None = None,
+    include_final_checks: bool = True,
 ) -> dict[str, Any]:
     """Return the bounded effective validation authority shown to integration reviewers."""
 
@@ -97,7 +102,7 @@ def delivery_validation_review_policy(
         )
         if command["phase"] != "check_autofix"
     ]
-    configured_final_checks = _configured_final_checks(effective_config)
+    configured_final_checks = _configured_final_checks(effective_config) if include_final_checks else []
     final_checks = configured_final_checks if configured_final_checks is not None else []
     return {
         "build_tool": effective_config.get("project", {}).get("build_tool", "gradle-android"),
@@ -207,6 +212,7 @@ def run_delivery_verification_validation(
     project_config: dict[str, Any],
     *,
     reusable: DeliveryVerificationValidationResult | None,
+    include_final_checks: bool = True,
 ) -> DeliveryVerificationValidationResult:
     policy = _validation_policy_from_config(project_config)
     policy_fingerprint = _fingerprint(policy)
@@ -266,7 +272,7 @@ def run_delivery_verification_validation(
                     if not result.success:
                         return _failed_validation(records, reused=False, executed=True, code="validation_failed")
 
-    configured_final_checks = _configured_final_checks(project_config)
+    configured_final_checks = _configured_final_checks(project_config) if include_final_checks else []
     if configured_final_checks is None:
         return _failed_validation(
             records,

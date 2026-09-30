@@ -4850,6 +4850,13 @@ class TestCmdRunChildDeliveryMetadata:
 
     def test_cmd_run_resume_preserves_existing_delivery_metadata(self, tmp_path: Path) -> None:
         from core.state import TaskState
+        from tests.test_delivery_plan import _base_plan, _git_init, _write_plan
+
+        _git_init(tmp_path)
+        data = _base_plan(tmp_path)
+        data["plan_id"] = "preserved-plan"
+        parent = _write_plan(tmp_path, data)
+        parent.rename(tmp_path / ".sikula/delivery/preserved.yaml")
 
         state_dir = tmp_path / ".sikula" / "state"
         store = JsonStateStore(state_dir)

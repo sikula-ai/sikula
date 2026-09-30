@@ -19,6 +19,7 @@ from agents.delivery_repair_agent import (
 )
 from core.contract_check import check_contract
 from core.delivery_asset_assignment import DeliveryAssetAssignmentError, render_inherited_delivery_assets
+from core.delivery_checkpoints import verification_node_status, verification_scope_complete
 from core.delivery_handoff import load_delivery_dependency_handoffs
 from core.delivery_amendment import (
     DeliveryAmendmentError,
@@ -103,18 +104,21 @@ def _stop(code: str, message: str) -> NoReturn:
     raise DeliveryRepairError("delivery_repair." + code, message)
 
 
-def _state_path(root: Path, plan_id: str) -> Path:
-    return delivery_progress_path(root, plan_id).parent / "integration-repair.json"
+def _state_path(root: Path, plan_id: str, node_id: str = "root") -> Path:
+    return delivery_progress_path(root, plan_id).parent / (
+        "integration-repair.json" if node_id == "root" else f"checkpoint-{node_id}-integration-repair.json"
+    )
 
 
-def _read_state(root: Path, plan_id: str) -> dict[str, Any] | None:
-    state = read_repair_state(root, _state_path(root, plan_id))
+def _read_state(root: Path, plan_id: str, node_id: str = "root") -> dict[str, Any] | None:
+    state = read_repair_state(root, _state_path(root, plan_id, node_id))
     if state is None:
         return None
     if (
         type(state.get("schema_version")) is not int
         or state.get("schema_version") != 1
         or state.get("plan_id") != plan_id
+        or state.get("node_id", "root") != node_id
         or state.get("phase") not in {"authoring", "prepared", "published", "blocked"}
         or type(state.get("attempts")) is not int
         or not 0 <= state["attempts"] <= _MAX_AUTHORING_ATTEMPTS
@@ -143,17 +147,23 @@ def _read_state(root: Path, plan_id: str) -> dict[str, Any] | None:
     return state
 
 
-def delivery_repair_pending(path: str | Path, *, project_root: Path | None) -> bool:
-    """Inspect only typed control state, without authoring or publication."""
+def pending_delivery_repair_node(path: str | Path, *, project_root: Path | None) -> str | None:
+    """Return the durable recovery node, including malformed/terminal control."""
     status = get_delivery_status(path, project_root=project_root)
     if status.plan is None or status.project_root is None or not getattr(status.plan, "plan_id", None):
-        return False
-    try:
-        state = _read_state(Path(status.project_root), status.plan.plan_id)
-    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
-        # Route malformed control state through the coordinator's fail-closed result.
-        return True
-    return bool(state and state["phase"] in {"authoring", "prepared", "blocked"})
+        return None
+    for node_id in ["root", *(item.id for item in getattr(status.plan, "checkpoints", ()))]:
+        try:
+            state = _read_state(Path(status.project_root), status.plan.plan_id, node_id)
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+            return node_id
+        if state and state["phase"] in {"authoring", "prepared", "blocked"}:
+            return node_id
+    return None
+
+
+def delivery_repair_pending(path: str | Path, *, project_root: Path | None) -> bool:
+    return pending_delivery_repair_node(path, project_root=project_root) is not None
 
 
 def delivery_repair_input_needs_refresh(status: DeliveryStatusResult, cfg: dict[str, Any]) -> bool:
@@ -174,8 +184,13 @@ def delivery_repair_input_needs_refresh(status: DeliveryStatusResult, cfg: dict[
         return False
     root = Path(status.project_root)
     try:
-        return _read_state(root, status.plan.plan_id) is None and repair_input_policy_changed(
-            root, delivery_progress_path(root, status.plan.plan_id).parent, record, status.plan, cfg
+        return _read_state(root, status.plan.plan_id, status.verification_node) is None and repair_input_policy_changed(
+            root,
+            delivery_progress_path(root, status.plan.plan_id).parent,
+            record,
+            status.plan,
+            cfg,
+            node_id=status.verification_node,
         )
     except (OSError, RuntimeError, ValueError, TypeError, KeyError):
         # Corrupt/missing evidence must retain its blocker, not trigger another gate.
@@ -183,8 +198,19 @@ def delivery_repair_input_needs_refresh(status: DeliveryStatusResult, cfg: dict[
 
 
 def _current_input(status: DeliveryStatusResult, cfg: dict[str, Any]) -> DeliveryIntegrationAssessment:
-    if not status.valid or status.status != "done" or status.plan is None or status.project_root is None:
+    if (
+        not status.valid
+        or not verification_scope_complete(status)
+        or status.plan is None
+        or status.project_root is None
+    ):
         _stop("plan_not_complete", "Integration repair requires a valid completed delivery candidate.")
+    if status.verification_node != "root":
+        from core.delivery_checkpoints import checkpoint_barrier_issue
+
+        barrier = checkpoint_barrier_issue(status, cfg)
+        if barrier is not None and barrier.code == "delivery_checkpoint.handoff_stale":
+            _stop("stale", "Checkpoint authority changed after downstream execution started.")
     plan = status.plan
     if not plan.requires_final_verification or not plan.obligations or not plan.source_accounting:
         _stop("authority_required", "Automatic integration repair requires source-bound obligations and accounting.")
@@ -212,7 +238,9 @@ def _current_input(status: DeliveryStatusResult, cfg: dict[str, Any]) -> Deliver
         or delivery_branch_commit(root, plan.final_branch) != record.candidate_commit
     ):
         _stop("stale", "The candidate or its authority changed after integration review.")
-    assessment = load_repair_input(root, delivery_progress_path(root, plan.plan_id).parent, record, plan, cfg)
+    assessment = load_repair_input(
+        root, delivery_progress_path(root, plan.plan_id).parent, record, plan, cfg, node_id=status.verification_node
+    )
     gaps = {item.id for item in assessment.obligation_results if item.outcome != "satisfied"}
     if (
         assessment.disposition != "repair_required"
@@ -234,6 +262,7 @@ def coordinate_delivery_repair(
     agent_factory: Callable[[], DeliveryRepairAgent] | None,
     state_store: StateStore | None = None,
     dry_run: bool = False,
+    node_id: str | None = None,
 ) -> DeliveryRepairResult:
     """Prepare/publish at most one repair; all implementation stays in run-next.
 
@@ -245,13 +274,21 @@ def coordinate_delivery_repair(
         return DeliveryRepairResult(
             issue=DeliveryPlanIssue("error", "delivery_repair.plan_invalid", "Delivery repair requires a valid plan.")
         )
+    node_id = node_id or pending_delivery_repair_node(path, project_root=project_root) or "root"
     root = Path(status.project_root)
     # Preserve the validated identity through preparation, publication, and resume.
     plan_path = Path(status.plan_path)
     try:
         if dry_run:
             return _coordinate(
-                plan_path, root, status.plan.plan_id, cfg, agent_factory=None, state_store=state_store, dry_run=True
+                plan_path,
+                root,
+                status.plan.plan_id,
+                cfg,
+                agent_factory=None,
+                state_store=state_store,
+                dry_run=True,
+                node_id=node_id,
             )
         with acquire_delivery_progress_lock(root, status.plan.plan_id, owner="delivery.repair"):
             return _coordinate(
@@ -262,6 +299,7 @@ def coordinate_delivery_repair(
                 agent_factory=agent_factory,
                 state_store=state_store,
                 dry_run=False,
+                node_id=node_id,
             )
     except DeliveryProgressLockError:
         return DeliveryRepairResult(
@@ -290,11 +328,12 @@ def _coordinate(
     agent_factory: Callable[[], DeliveryRepairAgent] | None,
     state_store: StateStore | None,
     dry_run: bool,
+    node_id: str = "root",
 ) -> DeliveryRepairResult:
-    state_path = _state_path(root, plan_id)
-    audit_path = state_path.with_name("integration-repair.jsonl")
-    state = _read_state(root, plan_id)
-    status = get_delivery_status(path, project_root=root)
+    state_path = _state_path(root, plan_id, node_id)
+    audit_path = state_path.with_suffix(".jsonl")
+    state = _read_state(root, plan_id, node_id)
+    status = verification_node_status(get_delivery_status(path, project_root=root), node_id)
     if state is not None:
         if state["phase"] == "blocked":
             raise DeliveryRepairError(
@@ -321,6 +360,7 @@ def _coordinate(
     if state is None:
         state = {
             "schema_version": 1,
+            "node_id": node_id,
             "plan_id": plan_id,
             "phase": "authoring",
             "attempts": 0,
@@ -348,6 +388,10 @@ def _coordinate(
             root,
             cfg,
             status.plan_path,
+            node_id=node_id,
+            passed_checkpoints=frozenset(
+                key for key, record in status.checkpoint_verifications.items() if record.passed
+            ),
         )
         if dry_run:
             return DeliveryRepairResult(ready=True)
@@ -366,7 +410,7 @@ def _coordinate(
                 _stop("readonly_mutation", "Repair workspace preparation changed its candidate.")
         before = _review_snapshot(worktree, cfg)
         while state["attempts"] < _MAX_AUTHORING_ATTEMPTS:
-            current = get_delivery_status(path, project_root=root)
+            current = verification_node_status(get_delivery_status(path, project_root=root), node_id)
             _current_input(current, cfg)
             if current.verification != status.verification:
                 _stop("stale", "Integration repair input changed before an authoring attempt.")
@@ -392,7 +436,7 @@ def _coordinate(
                         # It is diagnostic evidence, never an input to recovery.
                         write_repair_state(
                             root,
-                            state_path.with_name("integration-repair-pending-audit.json"),
+                            state_path.with_name(state_path.stem + "-pending-audit.json"),
                             {"schema_version": 1, "record": audit_record},
                         )
                     _stop("audit_unavailable", "Integration repair stopped because its audit could not be appended.")
@@ -432,7 +476,7 @@ def _coordinate(
                     raise
                 packet["previous_error"] = exc.issue.message
                 continue
-            current = get_delivery_status(path, project_root=root)
+            current = verification_node_status(get_delivery_status(path, project_root=root), node_id)
             _current_input(current, cfg)
             if current.verification != status.verification:
                 _stop("stale", "Integration repair input changed during authoring.")
@@ -497,7 +541,7 @@ def _repair_packet(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
     plan = status.plan
     assert plan is not None and plan.source_task is not None and status.verification is not None
-    verification_scope = DeliveryVerificationScope.from_plan(plan)
+    verification_scope = DeliveryVerificationScope.from_plan(plan, status.verification_node)
     plan_context = verification_scope.plan_context()
     if any(unit.id == unit_id for unit in plan.units):
         _stop(
@@ -580,6 +624,8 @@ def _repair_packet(
         "estimated_size": "small",
         "budget": {"max_planner_steps": 1},
     }
+    if plan.schema_version == 3:
+        unit["repair_node"] = status.verification_node
     source = (root / plan.source_task.path).read_text(encoding="utf-8")
     owner_contracts = {item.id: contracts[item.task_path] for item in plan.units if item.id in owners}
     # Validate inherited declarations and candidate availability before authoring.
@@ -725,7 +771,21 @@ def _prepared_plan(
     if _inherit_assets(state["authored_markdown"], contracts, asset_root, unit_id) != state["task_markdown"]:
         _stop("state_invalid", "Prepared repair assets differ from inherited authority.")
     _validate_contract(state["task_markdown"], unit["task_path"], cfg, asset_root=asset_root)
-    return _appended_plan(data, unit, state["obligation_ids"], root, cfg, plan_path)
+    checkpoint_records = state["completed_progress"].get("checkpoint_verifications", {})
+    if not isinstance(checkpoint_records, dict):
+        _stop("state_invalid", "Prepared checkpoint verification evidence is invalid.")
+    return _appended_plan(
+        data,
+        unit,
+        state["obligation_ids"],
+        root,
+        cfg,
+        plan_path,
+        node_id=state.get("node_id", "root"),
+        passed_checkpoints=frozenset(
+            key for key, record in checkpoint_records.items() if parse_delivery_verification_record(record).passed
+        ),
+    )
 
 
 def _appended_plan(
@@ -735,15 +795,61 @@ def _appended_plan(
     root: Path,
     cfg: dict[str, Any],
     plan_path: str,
+    *,
+    node_id: str = "root",
+    passed_checkpoints: frozenset[str] = frozenset(),
 ) -> bytes:
     """Build and preflight the exact enlarged plan independently of authored Markdown."""
     unit_id = unit["id"]
+    if node_id != "root":
+        checkpoint = next((item for item in data.get("checkpoints", []) if item["id"] == node_id), None)
+        if checkpoint is None:
+            _stop("state_invalid", "Repair checkpoint is unavailable.")
+        covered = set(checkpoint["unit_ids"])
+        by_id = {item["id"]: item for item in data["units"]}
+        covered_lineage = set(covered)
+        for key in covered:
+            ancestor = by_id[key].get("supersedes")
+            while ancestor and ancestor not in covered_lineage:
+                covered_lineage.add(ancestor)
+                ancestor = by_id[ancestor].get("supersedes")
+        # Covered replacements retain their original prerequisite contract, including
+        # superseded ancestors. Downstream amendment lineages still need coordinated
+        # rewiring of their original prerequisite and active entry units.
+        guarded = {
+            item["id"]
+            for item in data["units"]
+            if item["id"] not in covered_lineage and covered.intersection(item.get("depends_on", []))
+        }
+        # An older downstream ancestor can still reference a superseded covered
+        # prerequisite by its original ID. Its active entry was rewired by amend;
+        # keep their inherited prerequisite sets consistent when adding repair.
+        for key in tuple(guarded):
+            ancestor = by_id[key].get("supersedes")
+            while ancestor and ancestor not in covered_lineage and ancestor not in guarded:
+                guarded.add(ancestor)
+                ancestor = by_id[ancestor].get("supersedes")
+        for item in data["units"]:
+            if item["id"] in guarded:
+                if item.get("repair_node") is not None:
+                    _stop("repair_lineage_bound", "Checkpoint recovery cannot rewrite an earlier coordinator repair.")
+                item["depends_on"] = [*item.get("depends_on", []), unit_id]
+        # Unaccepted covering groups also inherit the repaired outcome, even when
+        # they contain no direct consumer. Preserve earlier historical handoffs.
+        for item in data["checkpoints"]:
+            if (
+                item["id"] == node_id
+                or guarded.intersection(item["unit_ids"])
+                or (item["id"] not in passed_checkpoints and covered <= set(item["unit_ids"]))
+            ):
+                item["unit_ids"] = [*item["unit_ids"], unit_id]
     # Private JSON snapshots sort object keys; publication bytes must be identical
     # both before and after loading a prepared snapshot on resume.
     data["units"].append({key: unit[key] for key in sorted(unit)})
     # YAML aliases can share ownership lists; extend each field independently.
     for constraint in data.get("constraints") or []:
-        constraint["unit_ids"] = [*constraint["unit_ids"], unit_id]
+        if node_id == "root" or set(unit["depends_on"]).intersection(constraint["unit_ids"]):
+            constraint["unit_ids"] = [*constraint["unit_ids"], unit_id]
     for obligation in data.get("obligations", []):
         if obligation["id"] in obligation_ids:
             obligation["unit_ids"] = [*obligation["unit_ids"], unit_id]
@@ -840,7 +946,10 @@ def _publish(
         if observed != expected:
             _stop("stale", "Delivery progress changed during repair publication.")
     if current_plan == plan_before and commit is None:
-        _current_input(get_delivery_status(plan_path, project_root=root), cfg)
+        _current_input(
+            verification_node_status(get_delivery_status(plan_path, project_root=root), state.get("node_id", "root")),
+            cfg,
+        )
     else:
         source = plan_data["source_task"]
         if (
@@ -854,7 +963,7 @@ def _publish(
             raise DeliveryRepairError(preview.error.code, preview.error.message)
     if dry_run:
         return DeliveryRepairResult(ready=True, unit_id=unit_id)
-    audit_path = _state_path(root, state["plan_id"]).with_name("integration-repair.jsonl")
+    audit_path = _state_path(root, state["plan_id"], state.get("node_id", "root")).with_suffix(".jsonl")
     _append_audit(
         audit_path, {"event": "publication_started", "unit_id": unit_id, "gate_id": record.gate_id}, project_root=root
     )
@@ -896,5 +1005,5 @@ def _publish(
     write_delivery_progress(delivery_progress_path(root, state["plan_id"]), repaired_progress)
     _append_audit(audit_path, {"event": "published", "unit_id": unit_id, "commit": commit}, project_root=root)
     state.update(phase="published", publication_commit=commit)
-    write_repair_state(root, _state_path(root, state["plan_id"]), state)
+    write_repair_state(root, _state_path(root, state["plan_id"], state.get("node_id", "root")), state)
     return DeliveryRepairResult(ready=True, unit_id=unit_id)

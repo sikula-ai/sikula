@@ -839,7 +839,7 @@ python3 -m ruff format .
   it; an exact-file root cannot become a directory prefix after dependency
   assembly. The winning terminal failure code selects recovery, and
   `--reset-failed` must not bypass scope, amendment, or external-dependency stops.
-- **Never** finalize a schema-version-2 delivery plan from per-unit success or
+- **Never** finalize a schema-version-2 or schema-version-3 delivery plan from per-unit success or
   Git ancestry alone. Require current final-gate evidence bound to the exact
   candidate tree, source, immutable parsed-plan byte snapshot, completed scope,
   policy, and effective validation configuration. Project mismatched passed
@@ -873,6 +873,17 @@ python3 -m ruff format .
   verification or repair; source accounting must never erase or relabel them. Amendment
   obligations may have contributing replacement subsets, while applicable hard
   constraints remain binding on every affected replacement.
+- **Never** bypass a declared checkpoint through `run-next`, explicit selection,
+  dry-run, resume, partial repair publication, or a unit/time bound. Placement is
+  authored by the preparation LLM and validated as a dependency barrier, not a
+  routine operator decision. Reject incomplete prerequisite coverage, future
+  contributors, barrier cycles and oversized packets before execution. Checkpoint
+  repairs append work within existing authority, depend on completed inputs and
+  propagate their repaired candidate/handoffs to downstream consumers. Bind finite
+  recovery budgets to fixed logical nodes; changing candidates or node names must
+  not replenish them. A historical accepted handoff cannot approve a later final
+  tree. Changed authority or completed inputs invalidate it; already-started
+  consumers require reconciliation. Keep the exact-candidate root gate mandatory.
 - **Never** expose final-gate source text, prompts, provider output, validation
   output, diffs, child state, credentials, or absolute paths through delivery
   status or JSON. Keep private material in append-only local evidence and publish

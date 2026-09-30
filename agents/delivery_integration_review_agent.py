@@ -17,7 +17,7 @@ from core.delivery_verification import (
     delivery_verification_provider_read_scope_supported,
     delivery_verification_prompt_is_bounded,
 )
-from core.llm_client import LLMClient
+from core.llm_client import LLMClient, LLMReadOnlyViolation
 from core.delivery_obligations import delivery_authority_fragments
 from tools.base_tool import Sandbox
 from tools.file_tool import FileTool
@@ -113,7 +113,9 @@ class DeliveryIntegrationReviewAgent:
                     )
                 )
                 raise DeliveryIntegrationReviewAgentError(
-                    "delivery_verification.review_provider_failed",
+                    "delivery_verification.readonly_mutation"
+                    if isinstance(exc, LLMReadOnlyViolation)
+                    else "delivery_verification.review_provider_failed",
                     "Integration reviewer provider failed.",
                     attempts,
                 ) from None
@@ -174,6 +176,12 @@ class DeliveryIntegrationReviewAgent:
             if review_kind == "semantic"
             else "Review cross-unit security and privacy behavior in the complete assembled candidate."
         )
+        if plan_context.get("verification_node"):
+            focus += (
+                " This is an intermediate checkpoint: assess only the declared completed group and its due obligations."
+                " The full source still governs that group, including omitted requirements and prohibitions."
+                " Do not require outcomes assigned to future work; the root gate will assess the entire delivery."
+            )
         security_context = ""
         if review_kind == "security":
             configured = str(self.project_config.get("security", {}).get("context") or "").strip()

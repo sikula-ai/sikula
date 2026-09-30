@@ -512,6 +512,17 @@ def _final_verification_issue(
     status: DeliveryStatusResult,
     project_config: dict[str, Any] | None,
 ) -> DeliveryPlanIssue | None:
+    from core.delivery_checkpoints import checkpoint_pass_is_usable
+
+    if status.plan and any(
+        not checkpoint_pass_is_usable(status, checkpoint, project_config)
+        for checkpoint in getattr(status.plan, "checkpoints", ())
+    ):
+        return DeliveryPlanIssue(
+            "error",
+            "delivery_checkpoint.required",
+            "Every checkpoint must have a usable historical handoff before finalization.",
+        )
     verification = status.verification
     if project_config is None:
         return DeliveryPlanIssue(
