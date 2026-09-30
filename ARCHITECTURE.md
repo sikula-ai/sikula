@@ -1251,7 +1251,12 @@ policy are revalidated on every handoff decision.
 Later code changes are reviewed at subsequent checkpoints and by the full root
 gate; this slice does not claim semantic selective invalidation from read footprints.
 
-An eligible checkpoint repair depends only on its completed scope. Publication
+An eligible checkpoint repair depends only on its completed scope. Preparation
+captures and rechecks only that scope's contracts and child execution evidence;
+pending or unrelated units do not consume its contract context budget. Repair
+write scope and inherited assets come from affected obligation owners within the
+checkpoint, including when prepared publication resumes. Root repair retains its
+full-plan contract and completed-child checks. Checkpoint repair publication
 extends that checkpoint, unaccepted groups covering its full scope, and any later
 group needing its repaired prerequisites,
 and adds the repair dependency to downstream consumers. They therefore inherit

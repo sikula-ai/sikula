@@ -555,14 +555,22 @@ def _repair_packet(
     assert plan is not None and plan.source_task is not None and status.verification is not None
     verification_scope = DeliveryVerificationScope.from_plan(plan, status.verification_node)
     plan_context = verification_scope.plan_context()
+    scoped_units = [
+        unit for unit in plan.units if status.verification_node == "root" or unit.id in verification_scope.unit_ids
+    ]
     if any(unit.id == unit_id for unit in plan.units):
         _stop(
             "unit_conflict", "The deterministic integration repair unit already exists without matching control state."
         )
     affected_obligations = {item.id for item in assessment.obligation_results if item.outcome != "satisfied"}
-    owners = {unit_id for item in plan.obligations if item.id in affected_obligations for unit_id in item.unit_ids}
+    owners = {
+        owner
+        for item in plan_context["obligations"]
+        if item["id"] in affected_obligations
+        for owner in item["unit_ids"]
+    }
     scope_paths: list[str] = []
-    for unit in plan.units:
+    for unit in scoped_units:
         if unit.id in owners:
             owner_config = copy.deepcopy(cfg)
             owner_config["project"]["root_path"] = str(worktree)
@@ -585,7 +593,7 @@ def _repair_packet(
     private_roots = _configured_private_artifact_roots(root, cfg)
     contracts: dict[str, str] = {}
     total_bytes = 0
-    for item in plan.units:
+    for item in scoped_units:
         content = _read_assembly_contract(root, item.task_path, private_artifact_roots=private_roots)
         total_bytes += len(content)
         if len(content) > _MAX_CONTRACT_BYTES or total_bytes > 512 * 1024:
@@ -639,7 +647,7 @@ def _repair_packet(
     if plan.schema_version == 3:
         unit["repair_node"] = status.verification_node
     source = (root / plan.source_task.path).read_text(encoding="utf-8")
-    owner_contracts = {item.id: contracts[item.task_path] for item in plan.units if item.id in owners}
+    owner_contracts = {item.id: contracts[item.task_path] for item in scoped_units if item.id in owners}
     # Validate inherited declarations and candidate availability before authoring.
     inherited = _inherit_assets("", list(owner_contracts.values()), worktree, unit_id)
     asset_check = check_contract(
@@ -733,7 +741,10 @@ def _child_fingerprint(child: TaskState) -> str:
 
 def _capture_child_evidence(status: DeliveryStatusResult, store: StateStore | None) -> dict[str, str]:
     evidence: dict[str, str] = {}
+    scope = DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
     for unit in status.units:
+        if status.verification_node != "root" and unit.id not in scope.unit_ids:
+            continue
         if unit.status != "done" or not unit.child_task_id:
             continue
         child = store.load(unit.child_task_id) if store is not None else None
@@ -779,6 +790,10 @@ def _prepared_plan(
         if obligation["id"] in state["obligation_ids"]
         for owner in obligation["unit_ids"]
     }
+    if state.get("node_id", "root") != "root":
+        # The prepared repair depends on exactly its captured checkpoint scope.
+        # Later repair owners can extend root obligations outside this group.
+        owners.intersection_update(unit["depends_on"])
     contracts = [state["contracts"][item["task_path"]] for item in data["units"] if item["id"] in owners]
     if _inherit_assets(state["authored_markdown"], contracts, asset_root, unit_id) != state["task_markdown"]:
         _stop("state_invalid", "Prepared repair assets differ from inherited authority.")

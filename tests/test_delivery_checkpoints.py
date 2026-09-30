@@ -223,6 +223,138 @@ def test_checkpoint_repairs_only_completed_group_and_passes_repair_to_consumers(
     assert exhausted.issue.code == "delivery_repair.budget_exhausted"
 
 
+@pytest.mark.parametrize("change_at", ["preflight", "authoring", "publication"])
+def test_checkpoint_repair_ignores_pending_contract_changes(checkpoint_plan, monkeypatch, change_at) -> None:
+    import core.delivery_repair as repair_module
+    from core.delivery_repair_storage import read_repair_state
+
+    path, cfg = checkpoint_plan
+    root = path.parent
+    assert _verify_node(path, cfg, "repair_required")[0].stop_code == "delivery_verification.repair_required"
+    future = root / "consumer.md"
+    original = future.read_bytes()
+    changed = original + b"\nFuture contract detail.\n" * 25_000
+
+    class Author(_LLM):
+        def run_readonly_agent(self, prompt, cwd):
+            if change_at == "authoring":
+                future.write_bytes(changed)
+            return super().run_readonly_agent(prompt, cwd)
+
+    author = Author(_draft())
+    if change_at == "preflight":
+        future.write_bytes(changed)
+    preview = coordinate_delivery_repair(
+        path, cfg, project_root=root, agent_factory=None, dry_run=True, node_id="storage"
+    )
+    assert preview.ready, preview
+    state_path = root / ".sikula/state/delivery/cache/checkpoint-storage-integration-repair.json"
+    assert not state_path.exists()
+    if change_at == "publication":
+
+        def interrupt(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        with monkeypatch.context() as interrupted:
+            interrupted.setattr(repair_module, "_atomic_replace_if_unchanged", interrupt)
+            with pytest.raises(KeyboardInterrupt):
+                _repair(path, cfg, author, node_id="storage")
+        future.write_bytes(changed)
+        preview = coordinate_delivery_repair(
+            path, cfg, project_root=root, agent_factory=None, dry_run=True, node_id="storage"
+        )
+        assert preview.ready, preview
+    result = _repair(path, cfg, author, node_id="storage")
+    assert result.ready, result
+    assert len(author.calls) == 1
+    assert "Future contract detail" not in author.calls[0]
+    state = read_repair_state(root, state_path)
+    assert set(state["contracts"]) == {"read.md", "write.md"}
+    assert state["phase"] == "published" and state["attempts"] == 1
+    assert future.read_bytes() == changed
+    status = get_delivery_status(path)
+    assert _git(root, "show", f"{status.assembled_commit}:consumer.md") == original.decode().strip()
+    _complete(path, result.unit_id)
+    assert _verify_node(path, cfg)[0].succeeded
+    assert preview_delivery_run_next(path).selected_unit.id == "consumer"
+
+
+@pytest.mark.parametrize("change_at", ["authoring", "publication"])
+def test_checkpoint_repair_still_rejects_scoped_contract_changes(checkpoint_plan, monkeypatch, change_at) -> None:
+    import core.delivery_repair as repair_module
+
+    path, cfg = checkpoint_plan
+    root = path.parent
+    assert _verify_node(path, cfg, "repair_required")[0].stop_code == "delivery_verification.repair_required"
+    original_plan = path.read_bytes()
+
+    def change_contract():
+        (root / "read.md").write_text(_CONTRACT + "\nChanged scoped authority.\n")
+
+    class Author(_LLM):
+        def run_readonly_agent(self, prompt, cwd):
+            if change_at == "authoring":
+                change_contract()
+            return super().run_readonly_agent(prompt, cwd)
+
+    author = Author(_draft())
+    if change_at == "publication":
+
+        def interrupt(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        with monkeypatch.context() as interrupted:
+            # Interrupt before any plan publication and retain the prepared snapshot.
+            interrupted.setattr(repair_module, "_publish", interrupt)
+            with pytest.raises(KeyboardInterrupt):
+                _repair(path, cfg, author, node_id="storage")
+        change_contract()
+    result = _repair(path, cfg, author, node_id="storage")
+    assert result.issue.code == "delivery_repair.stale"
+    assert len(author.calls) == 1
+    assert path.read_bytes() == original_plan
+    assert not preview_delivery_run_next(path).ready
+
+
+def test_checkpoint_repair_does_not_capture_unrelated_child_evidence(checkpoint_plan) -> None:
+    from core.delivery_repair_storage import read_repair_state
+
+    path, cfg = checkpoint_plan
+    root = path.parent
+    data = yaml.safe_load(path.read_text())
+    data["units"].append({"id": "unrelated", "task_path": "unrelated.md", "depends_on": [], "scope_paths": ["src/"]})
+    (root / "unrelated.md").write_text(_CONTRACT)
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "unrelated completed unit")
+    commit = _git(root, "rev-parse", "HEAD")
+    write_delivery_progress(
+        delivery_progress_path(root, "cache"),
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="cache",
+            assembly_base_commit=commit,
+            units=[
+                make_delivery_unit_progress(
+                    key,
+                    "done",
+                    commit=commit,
+                    child_task_id="unavailable-unrelated-child" if key == "unrelated" else None,
+                )
+                for key in ("read", "write", "unrelated")
+            ],
+        ),
+    )
+    assert _verify_node(path, cfg, "repair_required")[0].stop_code == "delivery_verification.repair_required"
+    author = _LLM(_draft())
+    result = _repair(path, cfg, author, node_id="storage")
+    assert result.ready, result
+    state = read_repair_state(root, root / ".sikula/state/delivery/cache/checkpoint-storage-integration-repair.json")
+    assert state["child_evidence"] == {}
+    assert set(state["contracts"]) == {"read.md", "write.md"}
+    assert len(author.calls) == 1
+
+
 @pytest.mark.parametrize("split", ["single", "nested", "downstream", "downstream_first"])
 def test_checkpoint_repair_preserves_covered_amendment_lineage(checkpoint_plan, split: str) -> None:
     from core.delivery_amendment import apply_delivery_amendment, create_delivery_amendment_proposal
