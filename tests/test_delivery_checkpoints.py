@@ -534,6 +534,102 @@ def test_changed_executed_contract_stops_before_checkpoint_provider(checkpoint_p
     assert not llm.calls
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("change", ["result", "restored", "candidate", "same", "crlf", "absent"])
+def test_initial_checkpoint_binds_candidate_contracts_to_child_evidence(checkpoint_plan, nested, change) -> None:
+    from core.delivery_checkpoints import checkpoint_preflight_issue
+    from core.state import TaskState
+
+    path, cfg = checkpoint_plan
+    repo = path.parent
+    if nested:
+        project = repo / "apps/service"
+        project.mkdir(parents=True)
+        for name in ("src", "read.md", "write.md", "consumer.md", "source.md", "plan.yaml", ".gitignore"):
+            (repo / name).rename(project / name)
+        path = project / "plan.yaml"
+        cfg["project"]["root_path"] = str(project)
+    root = path.parent
+    data = yaml.safe_load(path.read_text())
+    for unit in data["units"][:2]:
+        unit["scope_paths"].append("read.md")
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    # Keep CRLF bytes in Git too, independently of the host's checkout settings.
+    _git(repo, "config", "core.autocrlf", "false")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "contract authority test setup")
+    base = _git(repo, "rev-parse", "HEAD")
+    operator_branch = _git(repo, "branch", "--show-current")
+    _git(repo, "checkout", "-b", "child-results")
+    contract = root / "read.md"
+    if change in {"result", "restored"}:
+        contract.write_text(_CONTRACT + "\nChanged child requirement.\n")
+    elif change == "crlf":
+        contract.write_bytes(("\n" + _CONTRACT + "\n").replace("\n", "\r\n").encode())
+    elif change == "absent":
+        contract.unlink()
+    (root / "src/cache.py").write_text("cache = {'read': True}\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "read child result")
+    read_commit = _git(repo, "rev-parse", "HEAD")
+    if change == "restored":
+        contract.write_bytes(_CONTRACT.encode())
+    elif change == "candidate":
+        contract.write_text(_CONTRACT + "\nChanged by another checkpoint member.\n")
+    (root / "src/cache.py").write_text("cache = {'read': True, 'write': True}\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "write child result")
+    write_commit = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", operator_branch)
+    assert contract.read_text() == _CONTRACT
+
+    store = JsonStateStore(root / ".sikula/state")
+    child = TaskState(
+        task_id="read-child",
+        task_description=_CONTRACT,
+        delivery_plan_id="cache",
+        delivery_unit_id="read",
+        delivery_plan_path="plan.yaml",
+        done=True,
+        result_commit=read_commit,
+    )
+    store.save(child)
+    write_delivery_progress(
+        delivery_progress_path(root, "cache"),
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="cache",
+            assembly_base_commit=base,
+            units=[
+                make_delivery_unit_progress("read", "done", commit=read_commit, child_task_id=child.task_id),
+                make_delivery_unit_progress("write", "done", commit=write_commit),
+            ],
+        ),
+    )
+    status = verification_node_status(get_delivery_status(path, project_root=root), "storage")
+    assert status.valid, status.errors
+    issue = checkpoint_preflight_issue(status, cfg, store)
+    if change in {"result", "restored"}:
+        assert issue.code == "delivery_checkpoint.evidence_unavailable"
+    else:
+        assert issue is None
+    result, llm = _verify_node(path, cfg)
+    status = get_delivery_status(path, project_root=root)
+    if change in {"result", "restored", "candidate"}:
+        assert result.stop_code == "delivery_checkpoint.evidence_unavailable", result
+        assert not llm.calls
+        assert not status.checkpoint_verifications
+        assert not preview_delivery_run_next(path, project_root=root).ready
+        # An already assembled invalid candidate must also fail the next preflight.
+        issue = checkpoint_preflight_issue(verification_node_status(status, "storage"), cfg, store)
+        assert issue.code == "delivery_checkpoint.evidence_unavailable"
+    else:
+        assert result.succeeded, result
+        assert llm.calls
+        assert checkpoint_pass_is_usable(status, status.plan.checkpoints[0], cfg)
+        assert preview_delivery_run_next(path, project_root=root).selected_unit.id == "consumer"
+
+
 def test_two_checkpoints_keep_independent_persistent_repair_budgets(checkpoint_plan) -> None:
     path, cfg = checkpoint_plan
     root = path.parent

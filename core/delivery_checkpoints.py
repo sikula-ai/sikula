@@ -226,13 +226,24 @@ def checkpoint_review_rule_fingerprints(root: Path, commit: str, paths: Collecti
 
 
 def _checkpoint_file_fingerprints(
-    root: Path, commit: str, paths: Collection[str], *, allow_missing: bool = False, follow_links: bool = True
+    root: Path,
+    commit: str,
+    paths: Collection[str],
+    *,
+    allow_missing: bool = False,
+    follow_links: bool = True,
+    normalize_contract: bool = False,
 ) -> dict[str, str]:
     """Hash authority files in a commit without consulting checkout contents."""
     from core.delivery_verification import MAX_DELIVERY_VERIFICATION_PACKET_BYTES
 
     if not paths:
         return {}
+
+    def fingerprint(content: bytes) -> str:
+        if normalize_contract:
+            return _executed_contract_fingerprint(content.decode("utf-8"))
+        return "sha256:" + sha256(content).hexdigest()
 
     def git(*args: str, input: bytes | None = None) -> bytes:
         result = subprocess.run(
@@ -305,7 +316,7 @@ def _checkpoint_file_fingerprints(
             content = response.read(size)
             if len(content) != size or response.read(1) != b"\n":
                 raise ValueError("Checkpoint authority blob is incomplete")
-            hashes[oid] = "sha256:" + sha256(content).hexdigest()
+            hashes[oid] = fingerprint(content)
         if response.read(1):
             raise ValueError("Checkpoint authority blob response is invalid")
 
@@ -356,7 +367,7 @@ def _checkpoint_file_fingerprints(
             result[path] = hashes[regular[prefix + path][0]]
             continue
         content = contents(path)
-        result[path] = "absent" if content is None else "sha256:" + sha256(content).hexdigest()
+        result[path] = "absent" if content is None else fingerprint(content)
     return result
 
 
@@ -437,7 +448,6 @@ def checkpoint_preflight_issue(
     status: DeliveryStatusResult, cfg: dict[str, Any], state_store: StateStore | None = None
 ) -> DeliveryPlanIssue | None:
     """Read-only prerequisites shared by dry-run, direct verification and run."""
-    from core.delivery_amendment import _configured_private_artifact_roots, _read_assembly_contract
     from core.delivery_handoff import load_delivery_dependency_handoffs
     from core.delivery_verification import check_delivery_verification_readiness
 
@@ -490,19 +500,27 @@ def checkpoint_preflight_issue(
     _, issues = load_delivery_dependency_handoffs(status, list(scope.unit_ids), root)
     if issues:
         return issues[0]
+    return checkpoint_contract_evidence_issue(status, cfg, state_store)
+
+
+def _executed_contract_fingerprint(content: str) -> str:
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return "sha256:" + sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def checkpoint_contract_evidence_issue(
+    status: DeliveryStatusResult, cfg: dict[str, Any], state_store: StateStore | None
+) -> DeliveryPlanIssue | None:
+    """Bind checkout, child results and assembled contracts to executed authority."""
+    from core.delivery_amendment import _configured_private_artifact_roots, _read_assembly_contract
+
+    assert status.plan is not None and status.project_root is not None
+    scope = DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
+    root = Path(status.project_root)
     try:
         private_roots = _configured_private_artifact_roots(root, cfg)
-        prefix = (
-            subprocess.run(
-                ["git", "rev-parse", "--show-prefix"],
-                cwd=root,
-                env=delivery_verification_git_env(),
-                capture_output=True,
-                check=True,
-            )
-            .stdout.decode("utf-8")
-            .rstrip("\n")
-        )
+        # Batch each commit once, but never carry evidence across preflight calls.
+        expected_by_commit: dict[str, list[tuple[str, str, bool]]] = {}
         for unit in status.units:
             if unit.id not in scope.unit_ids:
                 continue
@@ -511,6 +529,7 @@ def checkpoint_preflight_issue(
             content = _read_assembly_contract(root, unit.task_path, private_artifact_roots=private_roots).decode(
                 "utf-8"
             )
+            expected = _executed_contract_fingerprint(content)
             if unit.child_task_id:
                 child = state_store.load(unit.child_task_id) if state_store else None
                 if (
@@ -520,22 +539,32 @@ def checkpoint_preflight_issue(
                     or child.delivery_unit_id != unit.id
                 ):
                     raise ValueError("Missing executed contract identity")
-                executed = child.task_description
-            else:
-                result = subprocess.run(
-                    ["git", "show", f"{unit.commit or status.assembly_base_commit}:{prefix}{unit.task_path}"],
-                    cwd=root,
-                    env=delivery_verification_git_env(),
-                    capture_output=True,
-                    check=True,
-                )
-                executed = result.stdout.decode("utf-8")
-            if (
-                not isinstance(executed, str)
-                or executed.replace("\r\n", "\n").replace("\r", "\n").strip()
-                != content.replace("\r\n", "\n").replace("\r", "\n").strip()
-            ):
-                raise ValueError("Executed contract changed")
+                if (
+                    not isinstance(child.task_description, str)
+                    or _executed_contract_fingerprint(child.task_description) != expected
+                ):
+                    raise ValueError("Executed contract changed")
+            result_commit = unit.commit or status.assembly_base_commit
+            if not result_commit:
+                raise ValueError("Missing executed contract commit")
+            expected_by_commit.setdefault(result_commit, []).append(
+                (unit.task_path, expected, bool(unit.child_task_id))
+            )
+            if status.assembled_commit:
+                expected_by_commit.setdefault(status.assembled_commit, []).append((unit.task_path, expected, True))
+        for commit, contracts in expected_by_commit.items():
+            fingerprints = _checkpoint_file_fingerprints(
+                root,
+                commit,
+                [path for path, _, _ in contracts],
+                allow_missing=True,
+                follow_links=False,
+                normalize_contract=True,
+            )
+            for path, expected, allow_missing in contracts:
+                actual = fingerprints[path]
+                if actual != expected and not (allow_missing and actual == "absent"):
+                    raise ValueError("Executed contract changed in candidate")
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
         return DeliveryPlanIssue(
             "error",

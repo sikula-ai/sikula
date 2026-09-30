@@ -257,6 +257,12 @@ def verify_delivery_plan(
             )
             if blocked is not None:
                 return blocked
+            if node_id != "root":
+                from core.delivery_checkpoints import checkpoint_contract_evidence_issue
+
+                issue = checkpoint_contract_evidence_issue(status, project_config, state_store)
+                if issue is not None:
+                    return _blocked_result(status, issue.code, [issue])
             snapshot = build_delivery_verification_snapshot(
                 status,
                 project_config,

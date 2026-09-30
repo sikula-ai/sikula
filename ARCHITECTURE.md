@@ -1193,7 +1193,12 @@ starting more work; `run-next`, previews and execution under the delivery lock
 cannot bypass a barrier. Shared preflight checks required handoffs, executed
 contracts, source authority and child/prerequisite stops before provider calls.
 Linked child task text is immutable contract evidence; legacy units without child
-state require the contract in their recorded commit. Checkpoints run the enabled
+state require the contract in their recorded commit. Before the initial review,
+any contract present in a covered child's result commit or the assembled candidate
+must match that execution evidence, with the same newline and surrounding-whitespace
+normalization as checkout comparisons. Linked child evidence still supports absent,
+uncommitted contracts. The assembled candidate is checked again after assembly and
+before invoking reviewers. Checkpoints run the enabled
 ordinary build/test/check phases; `delivery.verification.final_checks` remain
 root-only. Semantic review checks the group's due outcomes while retaining full
 source prohibitions, rather than treating future work as missing implementation.
