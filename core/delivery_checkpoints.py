@@ -177,6 +177,15 @@ def checkpoint_pass_is_usable(
         if record.review_rule_fingerprints is None:
             return False
         root = Path(status.project_root)
+        contract_paths = [unit.task_path for unit in status.plan.units if unit.id in checkpoint.unit_ids]
+        # Checkout contracts bind the policy identity, but cannot attest to
+        # downstream changes that exist only in the assembled candidate.
+        if _checkpoint_file_fingerprints(
+            root, record.candidate_commit, contract_paths, allow_missing=True, follow_links=False
+        ) != _checkpoint_file_fingerprints(
+            root, status.assembled_commit, contract_paths, allow_missing=True, follow_links=False
+        ):
+            return False
         for commit in (record.candidate_commit, status.assembled_commit):
             if (
                 checkpoint_review_rule_fingerprints(root, commit, record.review_rule_fingerprints)
@@ -211,6 +220,13 @@ def checkpoint_pass_is_usable(
 
 def checkpoint_review_rule_fingerprints(root: Path, commit: str, paths: Collection[str]) -> dict[str, str]:
     """Hash candidate rule contents, resolving only bounded, project-internal links."""
+    return _checkpoint_file_fingerprints(root, commit, paths)
+
+
+def _checkpoint_file_fingerprints(
+    root: Path, commit: str, paths: Collection[str], *, allow_missing: bool = False, follow_links: bool = True
+) -> dict[str, str]:
+    """Hash authority files in a commit without consulting checkout contents."""
     from core.delivery_verification import MAX_DELIVERY_VERIFICATION_PACKET_BYTES
 
     if not paths:
@@ -221,7 +237,7 @@ def checkpoint_review_rule_fingerprints(root: Path, commit: str, paths: Collecti
             ["git", *args], cwd=root, env=delivery_verification_git_env(), capture_output=True, check=False
         )
         if result.returncode:
-            raise ValueError("Checkpoint review rules are unavailable")
+            raise ValueError("Checkpoint authority files are unavailable")
         return result.stdout
 
     result = {}
@@ -229,10 +245,10 @@ def checkpoint_review_rule_fingerprints(root: Path, commit: str, paths: Collecti
 
     def blob(oid: str) -> bytes:
         if int(git("cat-file", "-s", oid)) > MAX_DELIVERY_VERIFICATION_PACKET_BYTES:
-            raise ValueError("Checkpoint review rule exceeds the bounded packet")
+            raise ValueError("Checkpoint authority file exceeds the bounded packet")
         return git("cat-file", "blob", oid)
 
-    def contents(path: str) -> bytes:
+    def contents(path: str) -> bytes | None:
         pending = list(PurePosixPath(path).parts)
         resolved: list[str] = []
         links = 0
@@ -240,19 +256,25 @@ def checkpoint_review_rule_fingerprints(root: Path, commit: str, paths: Collecti
             resolved.append(pending.pop(0))
             name = prefix + "/".join(resolved)
             entry = git("--literal-pathspecs", "ls-tree", "--full-tree", "-z", commit, "--", name)
+            if not entry and allow_missing:
+                # Uncommitted contracts can be bound by immutable child state.
+                # Their continued absence is distinct from a changed or added blob.
+                return None
             metadata, separator, entry_name = entry.rstrip(b"\0").partition(b"\t")
             fields = metadata.split()
             if not separator or entry_name.decode("utf-8") != name or len(fields) != 3:
-                raise ValueError("Checkpoint review rule is unavailable")
+                raise ValueError("Checkpoint authority file is unavailable")
             mode, kind, oid = fields
             if mode == b"120000" and kind == b"blob":
+                if not follow_links:
+                    raise ValueError("Checkpoint contract is not a regular candidate file")
                 links += 1
                 target = blob(oid.decode("ascii")).decode("utf-8")
                 if links > 40 or not target or target.startswith("/") or "\\" in target or ":" in target:
-                    raise ValueError("Checkpoint review rule link is unsafe")
+                    raise ValueError("Checkpoint authority file link is unsafe")
                 target = posixpath.normpath(posixpath.join(*resolved[:-1], target))
                 if target == ".." or target.startswith("../"):
-                    raise ValueError("Checkpoint review rule leaves the project")
+                    raise ValueError("Checkpoint authority file leaves the project")
                 pending = list(PurePosixPath(target).parts) + pending
                 resolved = []
             elif pending and mode == b"040000" and kind == b"tree":
@@ -260,8 +282,8 @@ def checkpoint_review_rule_fingerprints(root: Path, commit: str, paths: Collecti
             elif not pending and mode in {b"100644", b"100755"} and kind == b"blob":
                 return blob(oid.decode("ascii"))
             else:
-                raise ValueError("Checkpoint review rule is not a candidate file")
-        raise ValueError("Checkpoint review rule is not a candidate file")
+                raise ValueError("Checkpoint authority file is not a candidate file")
+        raise ValueError("Checkpoint authority file is not a candidate file")
 
     for path in paths:
         if (
@@ -272,8 +294,9 @@ def checkpoint_review_rule_fingerprints(root: Path, commit: str, paths: Collecti
             or "\\" in path
             or ":" in path
         ):
-            raise ValueError("Checkpoint review rule path is invalid")
-        result[path] = "sha256:" + sha256(contents(path)).hexdigest()
+            raise ValueError("Checkpoint authority file path is invalid")
+        content = contents(path)
+        result[path] = "absent" if content is None else "sha256:" + sha256(content).hexdigest()
     return result
 
 

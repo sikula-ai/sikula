@@ -1209,6 +1209,11 @@ applicable rules, effective review/validation policy and ancestry from its revie
 candidate must still agree. Ordinary downstream commits and later repair ownership
 additions do not alone reopen it. Changed covered inputs invalidate the handoff;
 if downstream work already started, the coordinator stops for reconciliation.
+Covered contract contents must match between the reviewed and current assembled
+commits, even when the operator checkout retains the original contracts. A
+contract's addition or deletion also invalidates the handoff. Contracts absent
+from both commits retain their existing binding to immutable child task evidence
+and the checkout policy fingerprint.
 Direct child resumes (including `--reset-failed`) consult the same parent barrier
 before resetting state or constructing an orchestrator. A stale identity does not
 clear a recorded security rejection or read-only boundary violation.

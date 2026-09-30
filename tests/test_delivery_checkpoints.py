@@ -338,6 +338,136 @@ def test_contract_change_invalidates_historical_handoff(checkpoint_plan) -> None
     assert status.to_dict()["checkpoints"][0]["status"] == "stale"
 
 
+@pytest.mark.parametrize("change", ["same", "changed", "missing", "symlink"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_checkpoint_receipt_binds_assembled_contracts(checkpoint_plan, change: str, nested: bool) -> None:
+    from core.delivery_checkpoints import checkpoint_barrier_issue
+
+    path, cfg = checkpoint_plan
+    root = path.parent
+    if nested:
+        project = root / "apps/service"
+        project.mkdir(parents=True)
+        for name in ("src", "read.md", "write.md", "consumer.md", "source.md", "plan.yaml"):
+            (root / name).rename(project / name)
+        _git(root, "add", ".")
+        _git(root, "commit", "-m", "nested project")
+        path = project / "plan.yaml"
+        cfg["project"]["root_path"] = str(project)
+        (project / ".gitignore").write_text(".sikula/state/\n.sikula/worktrees/\n")
+    project = path.parent
+    data = yaml.safe_load(path.read_text())
+    data["units"][2]["scope_paths"].append("read.md")
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "allow downstream contract edits")
+    commit = _git(root, "rev-parse", "HEAD")
+    progress_path = delivery_progress_path(project, "cache")
+    write_delivery_progress(
+        progress_path,
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="cache",
+            assembly_base_commit=commit,
+            units=[make_delivery_unit_progress(key, "done", commit=commit) for key in ("read", "write")],
+        ),
+    )
+    assert _verify_node(path, cfg)[0].succeeded
+    status = get_delivery_status(path, project_root=project)
+    record = status.checkpoint_verifications["storage"]
+    operator_branch = _git(root, "branch", "--show-current")
+    _git(root, "checkout", status.plan.final_branch)
+    if change == "changed":
+        (project / "read.md").write_text(_CONTRACT + "\nChanged assembled requirement.\n")
+    elif change == "missing":
+        (project / "read.md").unlink()
+    elif change == "symlink":
+        (project / "read.md").unlink()
+        try:
+            (project / "read.md").symlink_to("write.md")
+        except (OSError, NotImplementedError):
+            pytest.skip("Symlinks unavailable")
+    (project / "src/cache.py").write_text("cache = {'downstream': True}\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "downstream candidate")
+    candidate = _git(root, "rev-parse", "HEAD")
+    _git(root, "checkout", operator_branch)
+    assert (project / "read.md").read_text() == _CONTRACT
+    progress, _ = read_delivery_progress(progress_path, plan_id="cache")
+    progress = upsert_delivery_unit_progress(
+        progress, make_delivery_unit_progress("consumer", "done", commit=candidate)
+    )
+    write_delivery_progress(progress_path, replace(progress, assembled_commit=candidate))
+
+    status = get_delivery_status(path, project_root=project)
+    assert status.valid, status.errors
+    assert status.checkpoint_verifications["storage"] == record
+    for effective_cfg in (cfg, None):
+        assert checkpoint_pass_is_usable(status, status.plan.checkpoints[0], effective_cfg) == (change == "same")
+    issue = checkpoint_barrier_issue(status, cfg)
+    if change == "same":
+        assert issue is None
+    else:
+        assert issue.code == "delivery_checkpoint.handoff_stale"
+        assert status.to_dict()["checkpoints"][0]["status"] == "stale"
+
+
+@pytest.mark.parametrize("add_contract", [False, True])
+def test_checkpoint_preserves_uncommitted_executed_contract_evidence(checkpoint_plan, add_contract: bool) -> None:
+    from core.state import TaskState
+
+    path, cfg = checkpoint_plan
+    root = path.parent
+    contract = root / "read.md"
+    contract.unlink()
+    _git(root, "add", "read.md")
+    _git(root, "commit", "-m", "contract supplied outside candidate")
+    commit = _git(root, "rev-parse", "HEAD")
+    contract.write_text(_CONTRACT)
+    store = JsonStateStore(root / ".sikula/state")
+    child = TaskState(
+        task_id="read-child",
+        task_description=_CONTRACT,
+        delivery_plan_id="cache",
+        delivery_unit_id="read",
+        delivery_plan_path="plan.yaml",
+        done=True,
+        result_commit=commit,
+    )
+    store.save(child)
+    progress_path = delivery_progress_path(root, "cache")
+    write_delivery_progress(
+        progress_path,
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="cache",
+            assembly_base_commit=commit,
+            units=[
+                make_delivery_unit_progress("read", "done", commit=commit, child_task_id=child.task_id),
+                make_delivery_unit_progress("write", "done", commit=commit),
+            ],
+        ),
+    )
+    result, _ = _verify_node(path, cfg)
+    assert result.succeeded, result
+    status = get_delivery_status(path)
+    assert checkpoint_pass_is_usable(status, status.plan.checkpoints[0], cfg)
+    operator_branch = _git(root, "branch", "--show-current")
+    _git(root, "checkout", status.plan.final_branch)
+    (root / "src/cache.py").write_text("cache = {'downstream': True}\n")
+    _git(root, "add", "src/cache.py")
+    if add_contract:
+        _git(root, "add", "read.md")
+    _git(root, "commit", "-m", "downstream candidate")
+    candidate = _git(root, "rev-parse", "HEAD")
+    _git(root, "checkout", operator_branch)
+    contract.write_text(_CONTRACT)
+    progress, _ = read_delivery_progress(progress_path, plan_id="cache")
+    write_delivery_progress(progress_path, replace(progress, assembled_commit=candidate))
+    status = get_delivery_status(path)
+    assert checkpoint_pass_is_usable(status, status.plan.checkpoints[0], cfg) == (not add_contract)
+
+
 def test_checkpoint_rename_cannot_reset_recovery_lineage(checkpoint_plan) -> None:
     path, cfg = checkpoint_plan
     assert _verify_node(path, cfg)[0].succeeded
