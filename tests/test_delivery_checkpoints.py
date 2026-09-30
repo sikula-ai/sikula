@@ -232,6 +232,11 @@ def test_checkpoint_repair_ignores_pending_contract_changes(checkpoint_plan, mon
     root = path.parent
     assert _verify_node(path, cfg, "repair_required")[0].stop_code == "delivery_verification.repair_required"
     future = root / "consumer.md"
+    candidate = get_delivery_status(path).assembled_commit
+    original_blob = _git(root, "rev-parse", f"{candidate}:consumer.md")
+    # Exercise Windows checkout newlines on every platform. Git blob identity,
+    # rather than decoded checkout bytes, proves publication preserves the file.
+    future.write_bytes(_CONTRACT.replace("\n", "\r\n").encode("utf-8"))
     original = future.read_bytes()
     changed = original + b"\nFuture contract detail.\n" * 25_000
 
@@ -273,7 +278,7 @@ def test_checkpoint_repair_ignores_pending_contract_changes(checkpoint_plan, mon
     assert state["phase"] == "published" and state["attempts"] == 1
     assert future.read_bytes() == changed
     status = get_delivery_status(path)
-    assert _git(root, "show", f"{status.assembled_commit}:consumer.md") == original.decode().strip()
+    assert _git(root, "rev-parse", f"{status.assembled_commit}:consumer.md") == original_blob
     _complete(path, result.unit_id)
     assert _verify_node(path, cfg)[0].succeeded
     assert preview_delivery_run_next(path).selected_unit.id == "consumer"
