@@ -1197,8 +1197,10 @@ state require the contract in their recorded commit. Before the initial review,
 any contract present in a covered child's result commit or the assembled candidate
 must match that execution evidence, with the same newline and surrounding-whitespace
 normalization as checkout comparisons. Linked child evidence still supports absent,
-uncommitted contracts. The assembled candidate is checked again after assembly and
-before invoking reviewers. Checkpoints run the enabled
+uncommitted contracts. Absence from the assembled candidate is permitted only when
+the contract was already absent from that child's result commit; deleting a committed
+contract is an authority change and blocks review. The candidate is checked again
+after assembly and before invoking reviewers. Checkpoints run the enabled
 ordinary build/test/check phases; `delivery.verification.final_checks` remain
 root-only. Semantic review checks the group's due outcomes while retaining full
 source prohibitions, rather than treating future work as missing implementation.

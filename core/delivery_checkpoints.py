@@ -550,21 +550,35 @@ def checkpoint_contract_evidence_issue(
             expected_by_commit.setdefault(result_commit, []).append(
                 (unit.task_path, expected, bool(unit.child_task_id))
             )
-            if status.assembled_commit:
-                expected_by_commit.setdefault(status.assembled_commit, []).append((unit.task_path, expected, True))
-        for commit, contracts in expected_by_commit.items():
-            fingerprints = _checkpoint_file_fingerprints(
+        paths_by_commit = {
+            commit: [path for path, _, _ in contracts] for commit, contracts in expected_by_commit.items()
+        }
+        if status.assembled_commit:
+            paths_by_commit[status.assembled_commit] = [
+                path for contracts in expected_by_commit.values() for path, _, _ in contracts
+            ]
+        fingerprints_by_commit = {
+            commit: _checkpoint_file_fingerprints(
                 root,
                 commit,
-                [path for path, _, _ in contracts],
+                paths,
                 allow_missing=True,
                 follow_links=False,
                 normalize_contract=True,
             )
+            for commit, paths in paths_by_commit.items()
+        }
+        for commit, contracts in expected_by_commit.items():
             for path, expected, allow_missing in contracts:
-                actual = fingerprints[path]
+                actual = fingerprints_by_commit[commit][path]
                 if actual != expected and not (allow_missing and actual == "absent"):
-                    raise ValueError("Executed contract changed in candidate")
+                    raise ValueError("Executed contract changed in child result")
+                if status.assembled_commit:
+                    assembled = fingerprints_by_commit[status.assembled_commit][path]
+                    # Only a contract already absent from its execution result
+                    # may remain absent from the assembled candidate.
+                    if assembled != expected and not (actual == assembled == "absent"):
+                        raise ValueError("Executed contract changed in candidate")
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
         return DeliveryPlanIssue(
             "error",

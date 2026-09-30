@@ -535,7 +535,9 @@ def test_changed_executed_contract_stops_before_checkpoint_provider(checkpoint_p
 
 
 @pytest.mark.parametrize("nested", [False, True])
-@pytest.mark.parametrize("change", ["result", "restored", "candidate", "same", "crlf", "absent"])
+@pytest.mark.parametrize(
+    "change", ["result", "restored", "candidate", "deleted", "deleted_legacy", "same", "crlf", "absent"]
+)
 def test_initial_checkpoint_binds_candidate_contracts_to_child_evidence(checkpoint_plan, nested, change) -> None:
     from core.delivery_checkpoints import checkpoint_preflight_issue
     from core.state import TaskState
@@ -576,6 +578,8 @@ def test_initial_checkpoint_binds_candidate_contracts_to_child_evidence(checkpoi
         contract.write_bytes(_CONTRACT.encode())
     elif change == "candidate":
         contract.write_text(_CONTRACT + "\nChanged by another checkpoint member.\n")
+    elif change in {"deleted", "deleted_legacy"}:
+        contract.unlink()
     (root / "src/cache.py").write_text("cache = {'read': True, 'write': True}\n")
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "write child result")
@@ -601,7 +605,12 @@ def test_initial_checkpoint_binds_candidate_contracts_to_child_evidence(checkpoi
             plan_id="cache",
             assembly_base_commit=base,
             units=[
-                make_delivery_unit_progress("read", "done", commit=read_commit, child_task_id=child.task_id),
+                make_delivery_unit_progress(
+                    "read",
+                    "done",
+                    commit=read_commit,
+                    child_task_id=None if change == "deleted_legacy" else child.task_id,
+                ),
                 make_delivery_unit_progress("write", "done", commit=write_commit),
             ],
         ),
@@ -615,7 +624,7 @@ def test_initial_checkpoint_binds_candidate_contracts_to_child_evidence(checkpoi
         assert issue is None
     result, llm = _verify_node(path, cfg)
     status = get_delivery_status(path, project_root=root)
-    if change in {"result", "restored", "candidate"}:
+    if change in {"result", "restored", "candidate", "deleted", "deleted_legacy"}:
         assert result.stop_code == "delivery_checkpoint.evidence_unavailable", result
         assert not llm.calls
         assert not status.checkpoint_verifications
