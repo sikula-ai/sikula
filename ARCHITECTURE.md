@@ -1242,6 +1242,10 @@ a later node's repair may extend root obligation ownership without retroactively
 making it a prerequisite of an earlier accepted group. The earlier scope retains
 only its own contributions; final verification still checks the complete outcome.
 Unfinished publication blocks children and resumes from private control snapshots.
+Repair preflight determines accepted groups using currently usable handoffs under
+the effective policy, not merely stored `passed` results. It freezes that set in
+private repair control state before authoring; publication and resume reuse it so
+stale covering groups inherit the repair consistently.
 
 Each fixed logical node, including the root, permits one published repair and two
 persistent authoring attempts. Thus N declared checkpoints permit at most N+1 repair

@@ -637,6 +637,64 @@ def test_repair_extends_unaccepted_covering_groups_without_reopening_accepted_gr
     assert _verify_node(path, cfg, node_id="root")[0].succeeded
 
 
+@pytest.mark.parametrize("stale", [False, True])
+@pytest.mark.parametrize("interrupt", ["none", "authoring", "publication"])
+def test_repair_propagates_to_stale_covering_checkpoint(checkpoint_plan, stale: bool, interrupt: str) -> None:
+    from core.delivery_repair_storage import read_repair_state
+
+    path, cfg = checkpoint_plan
+    root = path.parent
+    data = yaml.safe_load(path.read_text())
+    data["checkpoints"].append({"id": "combined", "unit_ids": ["read", "write"], "obligation_ids": ["consistent-read"]})
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "covering checkpoint")
+    commit = _git(root, "rev-parse", "HEAD")
+    progress_path = delivery_progress_path(root, "cache")
+    progress, _ = read_delivery_progress(progress_path, plan_id="cache")
+    write_delivery_progress(
+        progress_path,
+        replace(progress, assembly_base_commit=commit, units=[replace(unit, commit=commit) for unit in progress.units]),
+    )
+    assert _verify_node(path, cfg, node_id="combined")[0].succeeded
+    if stale:
+        cfg["agents"] = {"reviewer": {"llm": {"model": "updated-reviewer"}}}
+    assert _verify_node(path, cfg, "repair_required")[0].stop_code == "delivery_verification.repair_required"
+    status = get_delivery_status(path)
+    assert status.checkpoint_verifications["combined"].passed
+    assert checkpoint_pass_is_usable(status, status.plan.checkpoints[1], cfg) == (not stale)
+    preview = coordinate_delivery_repair(
+        path, cfg, project_root=root, agent_factory=None, dry_run=True, node_id="storage"
+    )
+    assert preview.ready, preview
+    state_path = root / ".sikula/state/delivery/cache/checkpoint-storage-integration-repair.json"
+    assert not state_path.exists()
+    author = _LLM(_draft())
+    if interrupt != "none":
+        target = (
+            "agents.delivery_repair_agent.DeliveryRepairAgent.author"
+            if interrupt == "authoring"
+            else "core.delivery_repair.assemble_delivery_artifacts"
+        )
+        with patch(target, side_effect=KeyboardInterrupt), pytest.raises(KeyboardInterrupt):
+            _repair(path, cfg, author, node_id="storage")
+    repaired = _repair(path, cfg, author, node_id="storage")
+    assert repaired.ready, repaired
+    assert len(author.calls) == 1
+    updated = yaml.safe_load(path.read_text())
+    combined = next(item for item in updated["checkpoints"] if item["id"] == "combined")
+    assert (repaired.unit_id in combined["unit_ids"]) == stale
+    state = read_repair_state(root, state_path)
+    assert state["accepted_checkpoints"] == ([] if stale else ["combined"])
+    assert state["attempts"] == (2 if interrupt == "authoring" else 1)
+    _complete(path, repaired.unit_id)
+    assert _verify_node(path, cfg)[0].succeeded
+    if stale:
+        assert not preview_delivery_run_next(path).ready
+        assert _verify_node(path, cfg, node_id="combined")[0].succeeded
+    assert preview_delivery_run_next(path).selected_unit.id == "consumer"
+
+
 def test_crossing_checkpoint_repair_cannot_rewrite_an_already_published_repair(checkpoint_plan) -> None:
     path, cfg = checkpoint_plan
     root = path.parent

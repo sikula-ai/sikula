@@ -19,7 +19,7 @@ from agents.delivery_repair_agent import (
 )
 from core.contract_check import check_contract
 from core.delivery_asset_assignment import DeliveryAssetAssignmentError, render_inherited_delivery_assets
-from core.delivery_checkpoints import verification_node_status, verification_scope_complete
+from core.delivery_checkpoints import checkpoint_pass_is_usable, verification_node_status, verification_scope_complete
 from core.delivery_handoff import load_delivery_dependency_handoffs
 from core.delivery_amendment import (
     DeliveryAmendmentError,
@@ -125,6 +125,12 @@ def _read_state(root: Path, plan_id: str, node_id: str = "root") -> dict[str, An
     ):
         _stop("state_invalid", "Integration repair control state is invalid.")
     parse_delivery_verification_record(state.get("verification"))
+    if "accepted_checkpoints" in state and (
+        not isinstance(state["accepted_checkpoints"], list)
+        or any(not isinstance(item, str) for item in state["accepted_checkpoints"])
+        or len(set(state["accepted_checkpoints"])) != len(state["accepted_checkpoints"])
+    ):
+        _stop("state_invalid", "Integration repair checkpoint acceptance evidence is invalid.")
     if any(
         not isinstance(state.get(key), str) or not state[key] for key in ("config_fingerprint", "unit_id", "created_at")
     ):
@@ -369,6 +375,14 @@ def _coordinate(
             "created_at": datetime.now(timezone.utc).isoformat(),
             "unit_id": "integration-repair-" + status.verification.gate_id[-16:],
         }
+    if "accepted_checkpoints" not in state:
+        # Freeze effective handoff acceptance before authoring. Publication may
+        # resume after source artifacts changed, so cannot recompute this set.
+        state["accepted_checkpoints"] = sorted(
+            checkpoint.id
+            for checkpoint in status.plan.checkpoints
+            if checkpoint_pass_is_usable(status, checkpoint, cfg)
+        )
     with detached_delivery_verification_worktree(
         root, status.verification.candidate_commit, preview=dry_run
     ) as worktree:
@@ -389,9 +403,7 @@ def _coordinate(
             cfg,
             status.plan_path,
             node_id=node_id,
-            passed_checkpoints=frozenset(
-                key for key, record in status.checkpoint_verifications.items() if record.passed
-            ),
+            accepted_checkpoints=frozenset(state["accepted_checkpoints"]),
         )
         if dry_run:
             return DeliveryRepairResult(ready=True)
@@ -774,6 +786,12 @@ def _prepared_plan(
     checkpoint_records = state["completed_progress"].get("checkpoint_verifications", {})
     if not isinstance(checkpoint_records, dict):
         _stop("state_invalid", "Prepared checkpoint verification evidence is invalid.")
+    accepted_checkpoints = state.get("accepted_checkpoints", [] if state.get("node_id", "root") == "root" else None)
+    if accepted_checkpoints is None or any(
+        key not in checkpoint_records or not parse_delivery_verification_record(checkpoint_records[key]).passed
+        for key in accepted_checkpoints
+    ):
+        _stop("state_invalid", "Prepared checkpoint acceptance evidence is unavailable.")
     return _appended_plan(
         data,
         unit,
@@ -782,9 +800,7 @@ def _prepared_plan(
         cfg,
         plan_path,
         node_id=state.get("node_id", "root"),
-        passed_checkpoints=frozenset(
-            key for key, record in checkpoint_records.items() if parse_delivery_verification_record(record).passed
-        ),
+        accepted_checkpoints=frozenset(accepted_checkpoints),
     )
 
 
@@ -797,7 +813,7 @@ def _appended_plan(
     plan_path: str,
     *,
     node_id: str = "root",
-    passed_checkpoints: frozenset[str] = frozenset(),
+    accepted_checkpoints: frozenset[str] = frozenset(),
 ) -> bytes:
     """Build and preflight the exact enlarged plan independently of authored Markdown."""
     unit_id = unit["id"]
@@ -840,7 +856,7 @@ def _appended_plan(
             if (
                 item["id"] == node_id
                 or guarded.intersection(item["unit_ids"])
-                or (item["id"] not in passed_checkpoints and covered <= set(item["unit_ids"]))
+                or (item["id"] not in accepted_checkpoints and covered <= set(item["unit_ids"]))
             ):
                 item["unit_ids"] = [*item["unit_ids"], unit_id]
     # Private JSON snapshots sort object keys; publication bytes must be identical
