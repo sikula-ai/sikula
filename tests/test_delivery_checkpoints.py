@@ -1274,7 +1274,8 @@ def test_checkpoint_receipt_binds_candidate_review_rules(checkpoint_plan, role: 
     path, cfg = checkpoint_plan
     root = path.parent
     rules = root / "rules.md"
-    rules.write_text("Review storage invariants.\n")
+    _git(root, "config", "core.autocrlf", "true")
+    rules.write_bytes(b"Review storage invariants.\r\n")
     cfg[role] = {"extra_rules": "rules.md"}
     if role == "security_reviewer":
         data = yaml.safe_load(path.read_text())
@@ -1308,7 +1309,9 @@ def test_checkpoint_receipt_binds_candidate_review_rules(checkpoint_plan, role: 
     assert result.succeeded, result
     status = get_delivery_status(path)
     record = status.checkpoint_verifications["storage"]
-    assert record.review_rule_fingerprints == {"rules.md": "sha256:" + sha256(rules.read_bytes()).hexdigest()}
+    assert record.review_rule_fingerprints == {
+        "rules.md": "sha256:" + sha256(b"Review storage invariants.\n").hexdigest()
+    }
     assert "review_rule_fingerprints" not in json.dumps(status.to_dict())
     _git(root, "checkout", status.plan.final_branch)
     if change == "changed":
@@ -1496,10 +1499,11 @@ def test_candidate_rule_hashes_resolve_links_within_nested_project(tmp_path: Pat
     _git(tmp_path, "init")
     _git(tmp_path, "config", "user.name", "Test")
     _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "core.autocrlf", "true")
     root = tmp_path / "app"
     (root / "rules").mkdir(parents=True)
     target = root / "rules/review.md"
-    target.write_text("Original rules.\n")
+    target.write_bytes(b"Original rules.\r\n")
     (tmp_path / "outside.md").write_text("Outside the project.\n")
     alias = root / "alias"
     destination = {"file": "rules/review.md", "directory": "rules", "escape": "../outside.md", "cycle": "alias"}[link]
@@ -1515,7 +1519,7 @@ def test_candidate_rule_hashes_resolve_links_within_nested_project(tmp_path: Pat
         with pytest.raises(ValueError):
             checkpoint_review_rule_fingerprints(root, candidate, [path])
         return
-    expected = {path: "sha256:" + sha256(target.read_bytes()).hexdigest()}
+    expected = {path: "sha256:" + sha256(b"Original rules.\n").hexdigest()}
     target.write_text("Changed rules.\n")
     assert checkpoint_review_rule_fingerprints(root, candidate, [path]) == expected
     _git(tmp_path, "add", ".")

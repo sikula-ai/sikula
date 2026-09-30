@@ -1229,6 +1229,11 @@ must match both the reviewed and current assembled commits; operator checkout
 contents cannot substitute for this evidence. Older checkpoint receipts without
 this binding require verification again. Root record and identity semantics remain
 unchanged.
+Checkpoint authority reads batch regular-file metadata and bounded blob payloads
+from Git, deduplicating identical blobs and repeated commits within a check.
+Symlink and missing-path checks retain component-level validation. No authority
+result is cached across checks; candidate refs, checkout contracts and effective
+policy are revalidated on every handoff decision.
 Later code changes are reviewed at subsequent checkpoints and by the full root
 gate; this slice does not claim semantic selective invalidation from read footprints.
 

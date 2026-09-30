@@ -30,7 +30,7 @@ cd sikula/
 
 # Install pipx first if needed: https://pipx.pypa.io/stable/installation/
 pipx install --editable .
-pipx inject sikula pytest pytest-cov ruff
+pipx inject sikula pytest pytest-cov pytest-xdist ruff
 ```
 
 Editable installs run directly from the checkout. `sikula --version` shows the packaged
@@ -56,6 +56,9 @@ python3 -m pip install -e . --force-reinstall
 ```bash
 # All tests (unit + e2e)
 python3 -m pytest tests/
+
+# Parallel full suite, as used by Windows CI
+python3 -m pytest tests/ -n 2 --dist worksteal --durations=25
 
 # Unit tests only
 python3 -m pytest tests/ --ignore=tests/e2e
@@ -163,3 +166,4 @@ CI runs automatically on every PR. Linux runs the Python 3.10–3.13 matrix,
 compile check, tests, Ruff lint/format, and Codecov diff coverage. A Python 3.12
 Windows job runs the compile check and full test suite. All checks must pass
 before merge.
+The Windows suite uses two isolated pytest workers and reports its slowest tests.

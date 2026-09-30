@@ -53,4 +53,4 @@ jobs:
       - name: Compile check
         run: python -m compileall -q agents/ core/ sikula_cli/ tools/ sikula.py
       - name: Test
-        run: python -m pytest tests/ -v
+        run: python -m pytest tests/ -v -n 2 --dist worksteal --durations=25

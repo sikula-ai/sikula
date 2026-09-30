@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Collection
 from dataclasses import replace
 from hashlib import sha256
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 import posixpath
 import subprocess
@@ -180,13 +181,14 @@ def checkpoint_pass_is_usable(
         contract_paths = [unit.task_path for unit in status.plan.units if unit.id in checkpoint.unit_ids]
         # Checkout contracts bind the policy identity, but cannot attest to
         # downstream changes that exist only in the assembled candidate.
-        if _checkpoint_file_fingerprints(
+        reviewed_contracts = _checkpoint_file_fingerprints(
             root, record.candidate_commit, contract_paths, allow_missing=True, follow_links=False
-        ) != _checkpoint_file_fingerprints(
+        )
+        if record.candidate_commit != status.assembled_commit and reviewed_contracts != _checkpoint_file_fingerprints(
             root, status.assembled_commit, contract_paths, allow_missing=True, follow_links=False
         ):
             return False
-        for commit in (record.candidate_commit, status.assembled_commit):
+        for commit in dict.fromkeys((record.candidate_commit, status.assembled_commit)):
             if (
                 checkpoint_review_rule_fingerprints(root, commit, record.review_rule_fingerprints)
                 != record.review_rule_fingerprints
@@ -232,16 +234,80 @@ def _checkpoint_file_fingerprints(
     if not paths:
         return {}
 
-    def git(*args: str) -> bytes:
+    def git(*args: str, input: bytes | None = None) -> bytes:
         result = subprocess.run(
-            ["git", *args], cwd=root, env=delivery_verification_git_env(), capture_output=True, check=False
+            ["git", *args], cwd=root, env=delivery_verification_git_env(), input=input, capture_output=True, check=False
         )
         if result.returncode:
             raise ValueError("Checkpoint authority files are unavailable")
         return result.stdout
 
     result = {}
+    for path in paths:
+        if (
+            not isinstance(path, str)
+            or not path
+            or PurePosixPath(path).is_absolute()
+            or ".." in PurePosixPath(path).parts
+            or "\\" in path
+            or ":" in path
+        ):
+            raise ValueError("Checkpoint authority file path is invalid")
+    paths = tuple(dict.fromkeys(paths))
     prefix = git("rev-parse", "--show-prefix").decode("utf-8").rstrip("\n")
+
+    # Read ordinary file metadata together, including sizes before loading blobs.
+    # Missing paths and links still take the component-by-component safety path.
+    # Chunk path arguments below Windows' command-line limit.
+    regular: dict[str, tuple[str, int]] = {}
+    pending_paths = [prefix + path for path in paths]
+    while pending_paths:
+        batch_paths: list[str] = []
+        argument_size = 0
+        while pending_paths and (not batch_paths or argument_size + len(pending_paths[0]) + 3 <= 8000):
+            name = pending_paths.pop(0)
+            batch_paths.append(name)
+            argument_size += len(name) + 3
+        entries = git("--literal-pathspecs", "ls-tree", "--full-tree", "-z", "-l", commit, "--", *batch_paths)
+        requested = set(batch_paths)
+        for entry in entries.split(b"\0"):
+            if not entry:
+                continue
+            metadata, separator, name = entry.partition(b"\t")
+            fields = metadata.split()
+            if not separator or len(fields) != 4:
+                raise ValueError("Checkpoint authority file metadata is invalid")
+            path = name.decode("utf-8")
+            mode, kind, oid, size = fields
+            if path in requested and mode in {b"100644", b"100755"} and kind == b"blob":
+                size_int = int(size)
+                if not 0 <= size_int <= MAX_DELIVERY_VERIFICATION_PACKET_BYTES:
+                    raise ValueError("Checkpoint authority file exceeds the bounded packet")
+                regular[path] = (oid.decode("ascii"), size_int)
+
+    # Batch and deduplicate blobs without caching authority between checks.
+    # Each response remains bounded even for many large contracts.
+    pending_blobs = list(dict(regular.values()).items())
+    hashes: dict[str, str] = {}
+    while pending_blobs:
+        batch: list[tuple[str, int]] = []
+        payload_size = 0
+        while pending_blobs and (
+            not batch or payload_size + pending_blobs[0][1] <= MAX_DELIVERY_VERIFICATION_PACKET_BYTES
+        ):
+            oid, size = pending_blobs.pop(0)
+            batch.append((oid, size))
+            payload_size += size
+        response = BytesIO(git("cat-file", "--batch", input="".join(oid + "\n" for oid, _ in batch).encode("ascii")))
+        for oid, size in batch:
+            if response.readline().split() != [oid.encode("ascii"), b"blob", str(size).encode("ascii")]:
+                raise ValueError("Checkpoint authority blob metadata changed")
+            content = response.read(size)
+            if len(content) != size or response.read(1) != b"\n":
+                raise ValueError("Checkpoint authority blob is incomplete")
+            hashes[oid] = "sha256:" + sha256(content).hexdigest()
+        if response.read(1):
+            raise ValueError("Checkpoint authority blob response is invalid")
 
     def blob(oid: str) -> bytes:
         if int(git("cat-file", "-s", oid)) > MAX_DELIVERY_VERIFICATION_PACKET_BYTES:
@@ -286,15 +352,9 @@ def _checkpoint_file_fingerprints(
         raise ValueError("Checkpoint authority file is not a candidate file")
 
     for path in paths:
-        if (
-            not isinstance(path, str)
-            or not path
-            or PurePosixPath(path).is_absolute()
-            or ".." in PurePosixPath(path).parts
-            or "\\" in path
-            or ":" in path
-        ):
-            raise ValueError("Checkpoint authority file path is invalid")
+        if prefix + path in regular:
+            result[path] = hashes[regular[prefix + path][0]]
+            continue
         content = contents(path)
         result[path] = "absent" if content is None else "sha256:" + sha256(content).hexdigest()
     return result
