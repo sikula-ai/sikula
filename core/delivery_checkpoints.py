@@ -188,7 +188,12 @@ def checkpoint_pass_is_usable(
             root, status.assembled_commit, contract_paths, allow_missing=True, follow_links=False
         ):
             return False
+        source = status.plan.source_task
+        if source is None:
+            return False
         for commit in dict.fromkeys((record.candidate_commit, status.assembled_commit)):
+            if _checkpoint_source_fingerprint(root, commit, source.path) != source.sha256:
+                return False
             if (
                 checkpoint_review_rule_fingerprints(root, commit, record.review_rule_fingerprints)
                 != record.review_rule_fingerprints
@@ -225,6 +230,11 @@ def checkpoint_review_rule_fingerprints(root: Path, commit: str, paths: Collecti
     return _checkpoint_file_fingerprints(root, commit, paths)
 
 
+def _checkpoint_source_fingerprint(root: Path, commit: str, path: str) -> str:
+    """Use the source declaration's UTF-8/universal-newline hashing contract."""
+    return _checkpoint_file_fingerprints(root, commit, [path], follow_links=False, normalize_newlines=True)[path]
+
+
 def _checkpoint_file_fingerprints(
     root: Path,
     commit: str,
@@ -233,6 +243,7 @@ def _checkpoint_file_fingerprints(
     allow_missing: bool = False,
     follow_links: bool = True,
     normalize_contract: bool = False,
+    normalize_newlines: bool = False,
 ) -> dict[str, str]:
     """Hash authority files in a commit without consulting checkout contents."""
     from core.delivery_verification import MAX_DELIVERY_VERIFICATION_PACKET_BYTES
@@ -243,6 +254,8 @@ def _checkpoint_file_fingerprints(
     def fingerprint(content: bytes) -> str:
         if normalize_contract:
             return _executed_contract_fingerprint(content.decode("utf-8"))
+        if normalize_newlines:
+            content = content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
         return "sha256:" + sha256(content).hexdigest()
 
     def git(*args: str, input: bytes | None = None) -> bytes:
@@ -500,7 +513,7 @@ def checkpoint_preflight_issue(
     _, issues = load_delivery_dependency_handoffs(status, list(scope.unit_ids), root)
     if issues:
         return issues[0]
-    return checkpoint_contract_evidence_issue(status, cfg, state_store)
+    return checkpoint_authority_evidence_issue(status, cfg, state_store)
 
 
 def _executed_contract_fingerprint(content: str) -> str:
@@ -508,16 +521,22 @@ def _executed_contract_fingerprint(content: str) -> str:
     return "sha256:" + sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def checkpoint_contract_evidence_issue(
+def checkpoint_authority_evidence_issue(
     status: DeliveryStatusResult, cfg: dict[str, Any], state_store: StateStore | None
 ) -> DeliveryPlanIssue | None:
-    """Bind checkout, child results and assembled contracts to executed authority."""
+    """Bind candidate source and contracts to declared and executed authority."""
     from core.delivery_amendment import _configured_private_artifact_roots, _read_assembly_contract
 
     assert status.plan is not None and status.project_root is not None
     scope = DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
     root = Path(status.project_root)
     try:
+        source = scope.source_task
+        if source is None or (
+            status.assembled_commit
+            and _checkpoint_source_fingerprint(root, status.assembled_commit, source.path) != source.sha256
+        ):
+            raise ValueError("Candidate source authority changed")
         private_roots = _configured_private_artifact_roots(root, cfg)
         # Batch each commit once, but never carry evidence across preflight calls.
         expected_by_commit: dict[str, list[tuple[str, str, bool]]] = {}
@@ -583,7 +602,7 @@ def checkpoint_contract_evidence_issue(
         return DeliveryPlanIssue(
             "error",
             "delivery_checkpoint.evidence_unavailable",
-            "Completed checkpoint contracts must match immutable execution evidence.",
+            "Checkpoint source and contracts must match immutable authority evidence.",
         )
     return None
 

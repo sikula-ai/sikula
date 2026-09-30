@@ -412,6 +412,106 @@ def test_checkpoint_receipt_binds_assembled_contracts(checkpoint_plan, change: s
         assert status.to_dict()["checkpoints"][0]["status"] == "stale"
 
 
+@pytest.mark.parametrize("stage", ["initial", "historical"])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("change", ["changed", "missing", "symlink", "whitespace", "same", "crlf"])
+def test_checkpoint_binds_committed_source_authority(checkpoint_plan, stage, nested, change) -> None:
+    from core.delivery_checkpoints import checkpoint_barrier_issue
+
+    path, cfg = checkpoint_plan
+    repo = path.parent
+    if nested:
+        project = repo / "apps/service"
+        project.mkdir(parents=True)
+        for name in ("src", "read.md", "write.md", "consumer.md", "source.md", "plan.yaml", ".gitignore"):
+            (repo / name).rename(project / name)
+        path = project / "plan.yaml"
+        cfg["project"]["root_path"] = str(project)
+    root = path.parent
+    source = root / "source.md"
+    original = source.read_text()
+    data = yaml.safe_load(path.read_text())
+    for unit in data["units"]:
+        unit["scope_paths"].append("source.md")
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    _git(repo, "config", "core.autocrlf", "false")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "source authority test setup")
+    base = _git(repo, "rev-parse", "HEAD")
+    progress_path = delivery_progress_path(root, "cache")
+    write_delivery_progress(
+        progress_path,
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="cache",
+            assembly_base_commit=base,
+            units=[make_delivery_unit_progress(key, "done", commit=base) for key in ("read", "write")],
+        ),
+    )
+    operator_branch = _git(repo, "branch", "--show-current")
+    if stage == "historical":
+        assert _verify_node(path, cfg)[0].succeeded
+        status = get_delivery_status(path, project_root=root)
+        record = status.checkpoint_verifications["storage"]
+        _git(repo, "checkout", status.plan.final_branch)
+    else:
+        _git(repo, "checkout", "-b", "source-child-result")
+    if change == "changed":
+        source.write_text(original + "\nChanged source requirement.\n")
+    elif change == "missing":
+        source.unlink()
+    elif change == "symlink":
+        (root / "source-copy.md").write_text(original)
+        source.unlink()
+        try:
+            source.symlink_to("source-copy.md")
+        except (OSError, NotImplementedError):
+            pytest.skip("Symlinks unavailable")
+    elif change == "whitespace":
+        source.write_bytes((original + "\n").encode())
+    elif change == "crlf":
+        source.write_bytes(original.replace("\n", "\r\n").encode())
+    (root / "src/cache.py").write_text("cache = {'updated': True}\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "candidate source authority")
+    candidate = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", operator_branch)
+    assert source.read_text() == original
+    progress, _ = read_delivery_progress(progress_path, plan_id="cache")
+    if stage == "initial":
+        progress = replace(progress, units=[replace(unit, commit=candidate) for unit in progress.units])
+    else:
+        progress = upsert_delivery_unit_progress(
+            progress, make_delivery_unit_progress("consumer", "done", commit=candidate)
+        )
+        progress = replace(progress, assembled_commit=candidate)
+    write_delivery_progress(progress_path, progress)
+    unchanged = change in {"same", "crlf"}
+    if stage == "initial":
+        result, llm = _verify_node(path, cfg)
+        assert result.succeeded == unchanged, result
+        assert bool(llm.calls) == unchanged
+        if not unchanged:
+            assert result.stop_code == "delivery_checkpoint.evidence_unavailable"
+            assert not get_delivery_status(path, project_root=root).checkpoint_verifications
+            assert not preview_delivery_run_next(path, project_root=root).ready
+    else:
+        status = get_delivery_status(path, project_root=root)
+        assert status.checkpoint_verifications["storage"] == record
+        for effective_cfg in (cfg, None):
+            assert checkpoint_pass_is_usable(status, status.plan.checkpoints[0], effective_cfg) == unchanged
+        issue = checkpoint_barrier_issue(status, cfg)
+        if unchanged:
+            assert issue is None
+        else:
+            assert issue.code == "delivery_checkpoint.handoff_stale"
+            assert status.to_dict()["checkpoints"][0]["status"] == "stale"
+            result, llm = _verify_node(path, cfg, node_id="root")
+            assert not result.succeeded
+            assert result.stop_code == "delivery_checkpoint.handoff_stale"
+            assert not llm.calls
+
+
 @pytest.mark.parametrize("add_contract", [False, True])
 def test_checkpoint_preserves_uncommitted_executed_contract_evidence(checkpoint_plan, add_contract: bool) -> None:
     from core.state import TaskState

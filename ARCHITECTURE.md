@@ -1221,6 +1221,13 @@ commits, even when the operator checkout retains the original contracts. A
 contract's addition or deletion also invalidates the handoff. Contracts absent
 from both commits retain their existing binding to immutable child task evidence
 and the checkout policy fingerprint.
+The source task must be a regular file in the initially reviewed candidate and
+match its declared source hash. Historical handoffs recheck that hash in both the
+reviewed and current assembled commits. Source hashing uses UTF-8 text with
+universal newline normalization, matching plan validation, without stripping
+whitespace. Missing, changed or symlinked candidate sources block checkpoint
+approval or invalidate the handoff before consumers and the root gate proceed;
+the operator checkout cannot substitute for committed source authority.
 Direct child resumes (including `--reset-failed`) consult the same parent barrier
 before resetting state or constructing an orchestrator. A stale identity does not
 clear a recorded security rejection or read-only boundary violation.
