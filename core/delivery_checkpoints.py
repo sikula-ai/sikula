@@ -175,9 +175,18 @@ def checkpoint_pass_is_usable(
     ):
         return False
     try:
-        if record.review_rule_fingerprints is None:
+        if record.review_rule_fingerprints is None or record.plan_content_fingerprint is None:
             return False
         root = Path(status.project_root)
+        plan_path = Path(status.plan_path).relative_to(root).as_posix()
+        if (
+            _checkpoint_file_fingerprints(
+                root, record.candidate_commit, [plan_path], follow_links=False, normalize_newlines=True
+            )[plan_path]
+            != record.plan_content_fingerprint
+        ):
+            return False
+        checkpoint_plan_fingerprint(status, status.assembled_commit)
         contract_paths = [unit.task_path for unit in status.plan.units if unit.id in checkpoint.unit_ids]
         # Checkout contracts bind the policy identity, but cannot attest to
         # downstream changes that exist only in the assembled candidate.
@@ -228,6 +237,24 @@ def checkpoint_pass_is_usable(
 def checkpoint_review_rule_fingerprints(root: Path, commit: str, paths: Collection[str]) -> dict[str, str]:
     """Hash candidate rule contents, resolving only bounded, project-internal links."""
     return _checkpoint_file_fingerprints(root, commit, paths)
+
+
+def checkpoint_plan_fingerprint(status: DeliveryStatusResult, commit: str) -> str:
+    """Bind a candidate plan to captured checkout bytes without changing raw identity."""
+    root = Path(status.project_root)
+    plan_path = Path(status.plan_path)
+    raw = plan_path.read_bytes()
+    if "sha256:" + sha256(raw).hexdigest() != status.plan_fingerprint:
+        raise ValueError("Checkpoint plan changed during capture")
+    normalized = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    expected = "sha256:" + sha256(normalized.encode("utf-8")).hexdigest()
+    relative = plan_path.relative_to(root).as_posix()
+    actual = _checkpoint_file_fingerprints(root, commit, [relative], follow_links=False, normalize_newlines=True)[
+        relative
+    ]
+    if actual != expected:
+        raise ValueError("Candidate plan differs from captured authority")
+    return expected
 
 
 def _checkpoint_source_fingerprint(root: Path, commit: str, path: str) -> str:
@@ -531,6 +558,8 @@ def checkpoint_authority_evidence_issue(
     scope = DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
     root = Path(status.project_root)
     try:
+        if status.assembled_commit:
+            checkpoint_plan_fingerprint(status, status.assembled_commit)
         source = scope.source_task
         if source is None or (
             status.assembled_commit

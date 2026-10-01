@@ -319,6 +319,7 @@ def test_delivery_verification_record_round_trip() -> None:
         evidence_path=".sikula/state/delivery/demo/verification/audit.jsonl",
         completed_at="2026-09-02T12:00:00+00:00",
         review_rule_fingerprints={".sikula/reviewer_rules.md": "sha256:" + "a" * 64},
+        plan_content_fingerprint="sha256:" + "b" * 64,
     )
 
     assert parse_delivery_verification_record(record.to_dict()) == record
@@ -346,6 +347,8 @@ def test_delivery_verification_record_round_trip() -> None:
         },
         {"evidence_path": "../private/audit.jsonl"},
         {"review_rule_fingerprints": []},
+        {"plan_content_fingerprint": []},
+        {"plan_content_fingerprint": "invalid"},
         {"review_rule_fingerprints": {"../private.md": "sha256:" + "a" * 64}},
         {"review_rule_fingerprints": {"rules.md": "invalid"}},
         {"unexpected": True},

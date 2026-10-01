@@ -91,6 +91,7 @@ class DeliveryVerificationRecord:
     completed_at: str | None = None
     repair_input_fingerprint: str | None = None
     review_rule_fingerprints: dict[str, str] | None = None
+    plan_content_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -115,7 +116,14 @@ class DeliveryVerificationRecord:
             "obligation_satisfied_count": self.obligation_satisfied_count,
             "obligation_gap_count": self.obligation_gap_count,
         }
-        for key in ("stop_code", "evidence_path", "started_at", "completed_at", "repair_input_fingerprint"):
+        for key in (
+            "stop_code",
+            "evidence_path",
+            "started_at",
+            "completed_at",
+            "repair_input_fingerprint",
+            "plan_content_fingerprint",
+        ):
             value = getattr(self, key)
             if value:
                 data[key] = value
@@ -158,6 +166,7 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         "completed_at",
         "repair_input_fingerprint",
         "review_rule_fingerprints",
+        "plan_content_fingerprint",
     }
     if set(value) - allowed:
         raise ValueError("delivery verification record contains unsupported fields")
@@ -248,6 +257,11 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
     if stop_code is not None and not _SAFE_CODE_RE.fullmatch(stop_code):
         raise ValueError("delivery verification stop_code is invalid")
     evidence_path = value.get("evidence_path")
+    plan_content_fingerprint = value.get("plan_content_fingerprint")
+    if plan_content_fingerprint is not None and (
+        not isinstance(plan_content_fingerprint, str) or not _SHA256_ID_RE.fullmatch(plan_content_fingerprint)
+    ):
+        raise ValueError("delivery verification plan content fingerprint is invalid")
     rule_fingerprints = value.get("review_rule_fingerprints")
     if rule_fingerprints is not None and (
         not isinstance(rule_fingerprints, dict)
@@ -300,4 +314,5 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         completed_at=value.get("completed_at"),
         repair_input_fingerprint=repair_fingerprint,
         review_rule_fingerprints=rule_fingerprints,
+        plan_content_fingerprint=plan_content_fingerprint,
     )

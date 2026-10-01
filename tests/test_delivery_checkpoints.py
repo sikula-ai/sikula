@@ -551,6 +551,95 @@ def test_checkpoint_receipt_binds_assembled_contracts(checkpoint_plan, change: s
 
 @pytest.mark.parametrize("stage", ["initial", "historical"])
 @pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("change", ["changed", "missing", "symlink", "same", "coordinator"])
+def test_checkpoint_binds_committed_plan_authority(checkpoint_plan, stage, nested, change) -> None:
+    path, cfg = checkpoint_plan
+    repo = path.parent
+    if nested:
+        project = repo / "apps/service"
+        project.mkdir(parents=True)
+        for name in ("src", "read.md", "write.md", "consumer.md", "source.md", "plan.yaml", ".gitignore"):
+            (repo / name).rename(project / name)
+        path = project / "plan.yaml"
+        cfg["project"]["root_path"] = str(project)
+    root = path.parent
+    data = yaml.safe_load(path.read_text())
+    for unit in data["units"]:
+        unit["scope_paths"].append("plan.yaml")
+    original = yaml.safe_dump(data, sort_keys=False)
+    # The plan identity retains raw checkout bytes, whereas Git normalizes CRLF.
+    _git(repo, "config", "core.autocrlf", "true")
+    path.write_bytes(original.replace("\n", "\r\n").encode())
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "plan authority test setup")
+    base = _git(repo, "rev-parse", "HEAD")
+    progress_path = delivery_progress_path(root, "cache")
+    write_delivery_progress(
+        progress_path,
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="cache",
+            assembly_base_commit=base,
+            units=[make_delivery_unit_progress(key, "done", commit=base) for key in ("read", "write")],
+        ),
+    )
+    operator_branch = _git(repo, "branch", "--show-current")
+    if stage == "historical":
+        assert _verify_node(path, cfg)[0].succeeded
+        _git(repo, "checkout", get_delivery_status(path, project_root=root).plan.final_branch)
+    else:
+        _git(repo, "checkout", "-b", "plan-child-result")
+    if change in {"changed", "coordinator"}:
+        data["units"][0 if change == "changed" else 2]["scope_paths"].append("docs/")
+        path.write_text(yaml.safe_dump(data, sort_keys=False))
+    elif change == "missing":
+        path.unlink()
+    elif change == "symlink":
+        (root / "plan-copy.yaml").write_text(original)
+        path.unlink()
+        try:
+            path.symlink_to("plan-copy.yaml")
+        except (OSError, NotImplementedError):
+            pytest.skip("Symlinks unavailable")
+    (root / "src/cache.py").write_text("cache = {'updated': True}\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "candidate plan authority")
+    candidate = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", operator_branch)
+    assert path.read_text() == original
+    if change == "coordinator":
+        path.write_bytes(yaml.safe_dump(data, sort_keys=False).replace("\n", "\r\n").encode())
+    progress, _ = read_delivery_progress(progress_path, plan_id="cache")
+    if stage == "initial":
+        progress = replace(progress, units=[replace(unit, commit=candidate) for unit in progress.units])
+    else:
+        progress = upsert_delivery_unit_progress(
+            progress, make_delivery_unit_progress("consumer", "done", commit=candidate)
+        )
+        progress = replace(progress, assembled_commit=candidate)
+    write_delivery_progress(progress_path, progress)
+    usable = change in {"same", "coordinator"}
+    if stage == "initial":
+        result, llm = _verify_node(path, cfg)
+        assert result.succeeded == usable, result
+        assert bool(llm.calls) == usable
+        if not usable:
+            assert result.stop_code == "delivery_checkpoint.evidence_unavailable"
+    else:
+        status = get_delivery_status(path, project_root=root)
+        for effective_cfg in (cfg, None):
+            assert checkpoint_pass_is_usable(status, status.plan.checkpoints[0], effective_cfg) == usable
+        if not usable:
+            result, llm = _verify_node(path, cfg, node_id="root")
+            assert result.stop_code == "delivery_checkpoint.handoff_stale"
+            assert not llm.calls
+    if usable:
+        status = get_delivery_status(path, project_root=root)
+        assert "plan_content_fingerprint" not in json.dumps(status.to_dict())
+
+
+@pytest.mark.parametrize("stage", ["initial", "historical"])
+@pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("change", ["changed", "missing", "symlink", "whitespace", "same", "crlf"])
 def test_checkpoint_binds_committed_source_authority(checkpoint_plan, stage, nested, change) -> None:
     from core.delivery_checkpoints import checkpoint_barrier_issue
@@ -1419,6 +1508,15 @@ def test_checkpoint_allows_resolved_downstream_assembly_recovery(
         (root / "after.md").write_text(_CONTRACT)
         _git(root, "add", ".")
         _git(root, "commit", "-m", "downstream followup")
+        commit = _git(root, "rev-parse", "HEAD")
+        progress_path = delivery_progress_path(root, "cache")
+        progress, _ = read_delivery_progress(progress_path, plan_id="cache")
+        write_delivery_progress(
+            progress_path,
+            replace(
+                progress, assembly_base_commit=commit, units=[replace(unit, commit=commit) for unit in progress.units]
+            ),
+        )
     assert _verify_node(path, cfg)[0].succeeded
     status = get_delivery_status(path)
     receipt = status.checkpoint_verifications["storage"]
@@ -1870,12 +1968,13 @@ def test_candidate_rule_hashes_resolve_links_within_nested_project(tmp_path: Pat
     assert checkpoint_review_rule_fingerprints(root, updated, [path]) != expected
 
 
-def test_checkpoint_without_rule_binding_requires_new_verification(checkpoint_plan) -> None:
+@pytest.mark.parametrize("missing_binding", ["review_rule_fingerprints", "plan_content_fingerprint"])
+def test_checkpoint_without_authority_binding_requires_new_verification(checkpoint_plan, missing_binding) -> None:
     path, cfg = checkpoint_plan
     assert _verify_node(path, cfg)[0].succeeded
     progress_path = delivery_progress_path(path.parent, "cache")
     progress, _ = read_delivery_progress(progress_path, plan_id="cache")
-    old = replace(progress.checkpoint_verifications["storage"], review_rule_fingerprints=None)
+    old = replace(progress.checkpoint_verifications["storage"], **{missing_binding: None})
     write_delivery_progress(progress_path, replace(progress, checkpoint_verifications={"storage": old}))
     status = get_delivery_status(path)
     assert not checkpoint_pass_is_usable(status, status.plan.checkpoints[0], cfg)

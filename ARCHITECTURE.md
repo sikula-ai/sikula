@@ -1228,6 +1228,16 @@ universal newline normalization, matching plan validation, without stripping
 whitespace. Missing, changed or symlinked candidate sources block checkpoint
 approval or invalidate the handoff before consumers and the root gate proceed;
 the operator checkout cannot substitute for committed source authority.
+The delivery plan also binds checkout authority to Git: initial review requires
+the candidate plan to match the captured plan, and handoff reuse checks the
+reviewed plan against its receipt and the current assembled plan against the
+current checkout. Coordinated amendments and repairs may change both current
+copies without invalidating unrelated covered inputs. The private optional
+`plan_content_fingerprint` records newline-normalized plan content alongside the
+existing raw-byte `plan_fingerprint`; capture verifies both against the same
+checkout bytes. Only newline conversion is tolerated, preserving Windows Git
+compatibility without accepting changed YAML authority. Older receipts without
+this binding require verification again; terminal stops remain binding.
 Direct child resumes (including `--reset-failed`) consult the same parent barrier
 before resetting state or constructing an orchestrator. A stale identity does not
 clear a recorded security rejection or read-only boundary violation.

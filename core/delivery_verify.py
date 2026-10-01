@@ -228,7 +228,13 @@ def verify_delivery_plan(
                     existing_identity = None
                 if (
                     existing_identity is not None
-                    and (node_id == "root" or existing.review_rule_fingerprints is not None)
+                    and (
+                        node_id == "root"
+                        or (
+                            existing.review_rule_fingerprints is not None
+                            and existing.plan_content_fingerprint is not None
+                        )
+                    )
                     and _record_matches_identity(
                         existing,
                         existing_identity,
@@ -279,7 +285,10 @@ def verify_delivery_plan(
             if (
                 existing
                 and existing.passed
-                and (node_id == "root" or existing.review_rule_fingerprints is not None)
+                and (
+                    node_id == "root"
+                    or (existing.review_rule_fingerprints is not None and existing.plan_content_fingerprint is not None)
+                )
                 and _record_matches_identity(
                     existing,
                     identity,
@@ -289,8 +298,14 @@ def verify_delivery_plan(
                 return _result_from_record(status, existing, succeeded=True, next_action="finalize_delivery")
             attempt = existing.attempt + 1 if existing and existing.gate_id == identity.gate_id else 1
             rule_fingerprints = None
+            plan_content_fingerprint = None
             if node_id != "root":
-                from core.delivery_checkpoints import checkpoint_review_rule_fingerprints
+                from core.delivery_checkpoints import checkpoint_plan_fingerprint, checkpoint_review_rule_fingerprints
+
+                try:
+                    plan_content_fingerprint = checkpoint_plan_fingerprint(status, candidate_commit)
+                except (OSError, UnicodeError, ValueError):
+                    return _blocked_result(status, "delivery_checkpoint.evidence_unavailable")
 
                 roles = ("reviewer", "security_reviewer") if snapshot.scope.security_required else ("reviewer",)
                 paths = [
@@ -311,6 +326,7 @@ def verify_delivery_plan(
                 evidence_path=evidence_reference,
                 started_at=_now(),
                 review_rule_fingerprints=rule_fingerprints,
+                plan_content_fingerprint=plan_content_fingerprint,
             )
             progress = mark_delivery_verification(progress, running, node_id=node_id)
             write_delivery_progress(progress_path, progress)
