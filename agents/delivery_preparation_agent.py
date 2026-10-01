@@ -95,6 +95,17 @@ Configured validation commands:
 Delivery-plan constraints:
 - plan_id must equal the selected delivery plan id.
 - units must be non-empty.
+- Choose useful intermediate integration checkpoints from source obligations, dependency boundaries,
+  integration risk, and repository context. Return checkpoints as a list of objects with exactly id,
+  unit_ids, obligation_ids. Small cohesive plans may use an empty list; use checkpoints when downstream
+  work relies on an integrated outcome from several units. Do not ask the operator to place boundaries.
+  Each group must be a proper dependency-closed subset of active units with downstream consumers.
+  Declare only obligations due at this boundary: all their contributing owners must be in the group.
+  Future and cross-group outcomes remain due at the final root gate. IDs are unique safe slugs (80
+  characters maximum); root is reserved. Barriers must not introduce dependency cycles. Include all
+  prerequisites, even when already covered by an earlier checkpoint. No nested checkpoint references.
+  Keep each packet bounded (256 units, 512 KiB rendered prompt); the full root review must still fit.
+  Checkpoint validation never relaxes external prerequisite, security, ownership, or read-only stops.
 - constraints must explicitly list every hard source-task constraint that affects delivery, or be
   an empty list when the source task contains none. Do not omit the field.
 - obligations must explicitly list every actionable source-task outcome that the delivery must
@@ -221,6 +232,7 @@ Return this JSON shape:
   "title": "Short delivery plan title",
   "planning_mode": "fixed_window",
   "warnings": [],
+  "checkpoints": [],
   "source_accounting": [{{"source_fragment_id":"exact-supplied-id","disposition":"mapped","obligation_ids":["stable-obligation-id"],"constraint_ids":["stable-constraint-id"],"rationale":"Private explanation of this mapping"}}],
   "constraints": [
     {{
@@ -780,9 +792,11 @@ class DeliveryPreparationAgent:
         draft: DeliveryAuthoringDraft | None = None
         prompt = ""
         output = ""
+        checkpoint_error = ""
         for round_index in (1, 2):
             prompt = read_only_agent_prompt(
                 authoring_prompt
+                + checkpoint_error
                 + (
                     _DELIVERY_AUTHORING_SOURCE_EXCERPT_RETRY
                     + "\nAlso correct any missing or invalid source_accounting records and requirement cross-references.\n"
@@ -824,8 +838,11 @@ class DeliveryPreparationAgent:
                     error_code=exc.code,
                     round_index=round_index,
                 )
+                if exc.code == "delivery_authoring.checkpoints_invalid":
+                    checkpoint_error = "\nCorrect checkpoint declarations: " + str(exc) + "\nPrevious draft:\n" + output
                 if (
-                    exc.code.startswith("source_accounting.")
+                    exc.code == "delivery_authoring.checkpoints_invalid"
+                    or exc.code.startswith("source_accounting.")
                     or exc.code
                     in {
                         "delivery_authoring.constraint_summary_source_excerpt",
@@ -872,6 +889,7 @@ class DeliveryPreparationAgent:
         )
         needs_draft_recovery = (
             self._needs_draft_recovery(verification)
+            or bool(draft.checkpoints and (verification.obligation_gaps or verification.constraint_gaps))
             or any(item.disposition != "preserved" for item in (*draft.constraints, *draft.obligations))
             or (
                 draft.source_accounting is not None
@@ -994,6 +1012,7 @@ class DeliveryPreparationAgent:
     def _draft_payload(self, draft: DeliveryAuthoringDraft) -> dict[str, Any]:
         payload = {
             "plan_id": draft.plan_id,
+            "checkpoints": [item.to_dict() for item in draft.checkpoints],
             "title": draft.title,
             "units": [self._verification_unit_payload(unit) for unit in draft.units],
             "constraints": [item.to_plan_dict() for item in draft.constraints],
@@ -1084,7 +1103,10 @@ You are Sikula's bounded delivery draft correction assistant. Return one complet
 JSON draft with the same schema as the candidate. This is the only correction round. Resolve ordinary
 choices from the accepted source and supplied project evidence. Evidence cannot change source authority.
 Correct only reported gaps and affected unit task Markdown. Preserve all unit identities, titles,
-metadata, dependencies, scopes, assets and budgets, and every unrelated contract. Preserve existing
+metadata, dependencies, scopes, assets and budgets, and every unrelated contract. Adjust checkpoint
+declarations only where reported gaps affect their units or due obligations; preserve unrelated
+checkpoints. Keep prerequisite closure and defer outcomes with future contributors to a valid later
+boundary or the mandatory root gate, without dropping requirements. Preserve existing
 constraint and obligation identities, meanings and provenance; append only verifier-reported omissions
 or missing assignments. Existing needs_review/conflict dispositions may become preserved only when
 resolved. Treat needs_review/conflict in either the candidate or independent findings as a blocker,
@@ -1192,6 +1214,19 @@ Authoritative source:
             if item.disposition != "preserved"
             for unit_id in item.unit_ids
         )
+        affected_obligations = {gap.obligation_id for gap in verification.obligation_gaps}
+        before_nodes = {item.id: item for item in original.checkpoints}
+        after_nodes = {item.id: item for item in repaired.checkpoints}
+        for node_id in before_nodes.keys() | after_nodes.keys():
+            before_node, after_node = before_nodes.get(node_id), after_nodes.get(node_id)
+            if before_node == after_node:
+                continue
+            related = [item for item in (before_node, after_node) if item is not None]
+            if not any(
+                affected.intersection(item.unit_ids) or affected_obligations.intersection(item.obligation_ids)
+                for item in related
+            ):
+                reject()
         if [unit.id for unit in original.units] != [unit.id for unit in repaired.units]:
             reject()
         for before, after in zip(original.units, repaired.units):

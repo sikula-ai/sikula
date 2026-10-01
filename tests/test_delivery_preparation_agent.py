@@ -2306,3 +2306,99 @@ def test_draft_recovery_cannot_expand_authority(change: str, tmp_path: Path) -> 
     with pytest.raises(DeliveryAuthoringParseError):
         _author_delivery_plan(agent, tmp_path=tmp_path)
     assert len(llm.prompts) == 3
+
+
+@pytest.mark.parametrize("corrected", [True, False])
+def test_checkpoint_declaration_correction_is_bounded_and_audited(tmp_path: Path, corrected: bool) -> None:
+    import copy
+
+    source = _DEFAULT_TASK_DESCRIPTION
+    payload = json.loads(_authoring_output(task_description=source))
+    consumer = copy.deepcopy(payload["units"][0])
+    consumer.update(id="consumer", title="Use foundation", depends_on=["foundation"])
+    payload["units"].append(consumer)
+    payload["checkpoints"] = [
+        {"id": "foundation-ready", "unit_ids": ["foundation"], "obligation_ids": ["deliver-team-invites"]}
+    ]
+    invalid = copy.deepcopy(payload)
+    invalid["checkpoints"][0]["unit_ids"] = ["missing-unit"]
+    llm = CapturingLLM(json.dumps(invalid))
+    llm.outputs = [json.dumps(invalid), json.dumps(payload if corrected else invalid), llm.outputs[1]]
+    records = []
+    agent = DeliveryPreparationAgent(llm)
+    kwargs = dict(
+        task_description=source,
+        task_path=tmp_path / "source.md",
+        plan_id="team-invites",
+        project_root=tmp_path,
+        output_dir=tmp_path / ".sikula/delivery/team-invites",
+        audit_recorder=records.append,
+    )
+    if corrected:
+        draft = agent.author_delivery_plan(**kwargs)
+        assert draft.checkpoints[0].id == "foundation-ready"
+        assert len(llm.prompts) == 3
+    else:
+        with pytest.raises(DeliveryAuthoringParseError):
+            agent.author_delivery_plan(**kwargs)
+        assert len(llm.prompts) == 2
+    assert "Correct checkpoint declarations" in llm.prompts[1]
+    assert "delivery_authoring.checkpoints_invalid" in json.dumps(records)
+
+
+def test_obligation_owner_correction_moves_affected_checkpoint_autonomously(tmp_path: Path) -> None:
+    import copy
+
+    source = _DEFAULT_TASK_DESCRIPTION
+    original = json.loads(_authoring_output(task_description=source))
+    for key, parent in (("consumer", "foundation"), ("final", "consumer")):
+        unit = copy.deepcopy(original["units"][0])
+        unit.update(id=key, title=key.title(), depends_on=[parent])
+        original["units"].append(unit)
+    original["checkpoints"] = [
+        {"id": "foundation-ready", "unit_ids": ["foundation"], "obligation_ids": ["deliver-team-invites"]}
+    ]
+    corrected = copy.deepcopy(original)
+    corrected["obligations"][0]["unit_ids"].append("consumer")
+    corrected["checkpoints"][0]["unit_ids"].append("consumer")
+    obligation = original["obligations"][0]
+    gap = {
+        "reason": "incompletely_assigned",
+        "obligation_id": obligation["id"],
+        "summary": obligation["summary"],
+        "source_fragment_ids": obligation["source_fragment_ids"],
+        "affected_unit_ids": ["consumer"],
+    }
+    verification = {
+        "constraints_complete": True,
+        "constraints": [],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+        "obligations_complete": False,
+        "obligations": original["obligations"],
+        "obligation_gaps": [gap],
+    }
+    final_verification = {
+        **verification,
+        "obligations_complete": True,
+        "obligations": corrected["obligations"],
+        "obligation_gaps": [],
+    }
+    llm = CapturingLLM(json.dumps(original))
+    llm.outputs = [
+        json.dumps(original),
+        json.dumps(verification),
+        json.dumps(corrected),
+        json.dumps(final_verification),
+    ]
+    result = DeliveryPreparationAgent(llm).author_delivery_plan(
+        task_description=source,
+        task_path=tmp_path / "source.md",
+        plan_id="team-invites",
+        project_root=tmp_path,
+        output_dir=tmp_path / ".sikula/delivery/team-invites",
+    )
+    assert result.checkpoints[0].unit_ids == ("foundation", "consumer")
+    assert result.obligations[0].unit_ids == ["foundation", "consumer"]
+    assert result.constraint_verification.obligations_complete
+    assert len(llm.prompts) == 4

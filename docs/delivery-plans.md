@@ -229,7 +229,7 @@ gaps before a second verification. Unknown fragments, unknown or superseded
 owners, duplicate IDs, unresolved dispositions, and a second incomplete result
 block publication. `plan.yaml` stores obligation identities, bounded summaries,
 provenance references, and owners, not source excerpts. Obligations require a
-schema-version-2 plan with `verification.mode: final_gate`; existing plans
+schema-version-2 or schema-version-3 plan with `verification.mode: final_gate`; existing plans
 without this additive list remain readable.
 
 Fresh authoring also requires `source_accounting`: exactly one record per source
@@ -578,6 +578,62 @@ parent progress, created only by execution commands such as `run` and
 }
 ```
 
+## Intermediate integration checkpoints
+
+`delivery prepare` asks the LLM to choose useful intermediate boundaries from the
+source requirements, dependencies, repository context and integration risks. The
+operator does not need to place checkpoints or edit YAML. Small cohesive plans
+can remain root-only. Checkpoint plans use schema version 3 and include declarations
+such as:
+
+```yaml
+checkpoints:
+  - id: storage-integration
+    unit_ids: [read-api, write-api]
+    obligation_ids: [consistent-read-after-write]
+```
+
+This group must include every prerequisite of `read-api` and `write-api`, and all
+contributors required for its declared outcome. Other units consume the group via
+ordinary `depends_on` edges. The coordinator rejects unknown references, future
+contributors and cycles introduced by barriers. Malformed LLM declarations receive
+one audited correction before publication; hard prerequisite stops take precedence.
+
+`delivery run` checks a completed group before downstream execution. An eligible
+semantic gap triggers the existing bounded repair flow, followed by another
+checkpoint review. The repair depends only on the completed group and becomes a
+prerequisite of its downstream consumers, so their worktrees and handoff context
+contain the repair. `run-next` cannot bypass a pending checkpoint; use `delivery run`
+to verify/recover it. Dry-run checks the same deterministic evidence prerequisites
+without provider calls or state writes. Missing handoffs, edited executed contracts,
+external dependencies, security and read-only violations remain blockers.
+
+`delivery status --json` and `delivery run --json` add bounded `checkpoints` entries.
+`accepted_handoff` means the historical group result remains usable. It does not
+approve later commits: the root gate still checks all source outcomes and the exact
+final candidate. Normal downstream commits do not replay an accepted checkpoint;
+changed source, covered inputs/contracts or applicable policy invalidate it.
+If consumers already started, invalidated handoffs stop for reconciliation rather
+than silently adopting changed completed work. `delivery.verification.final_checks`
+run at the root only; ordinary configured validation also runs at checkpoints.
+
+Each checkpoint and the root allow one repair unit and two durable authoring
+attempts. N checkpoints therefore allow at most N+1 automatic repair units, bounded
+further by `--max-units` / `--max-elapsed-minutes` per invocation. Resume, new
+candidates and `--reset-failed` cannot reset budgets; changing node identities after
+verification starts is rejected. Interrupted preparation/publication resumes its
+existing repair. A schema-3 coordinator repair cannot be split by amendment to
+expand its fixed node budget; further decomposition requires a follow-up plan.
+If crossing checkpoint groups would require changing an earlier published repair's
+dependencies, `delivery_repair.repair_lineage_bound` stops before authoring or
+consuming another attempt. Resolving that topology requires a follow-up plan.
+Plans without checkpoints retain their prior one-repair behavior.
+
+This is a flat, bounded implementation. The complete root packet must still fit
+its existing limits (including 256 active units); nested composition, adaptive
+regrouping and large-plan scaling are subsequent work.
+
+
 ## Current MVP Commands
 
 Validate a plan file:
@@ -912,7 +968,7 @@ decisions, then rerun `delivery run`.
 Reaching a unit or elapsed limit is a successful stop when work can resume.
 An exhausted integration repair budget or terminal repair blocker remains an
 error even if the invocation has also reached its unit or elapsed limit.
-For a schema-version-2 plan that becomes `done`, the coordinator first
+For a schema-version-2 or schema-version-3 plan that becomes `done`, the coordinator first
 runs the required final integration gate and finalizes only its passing exact
 candidate. Rerunning an already current
 finalized plan is idempotent and does not append another finalization event.
@@ -945,8 +1001,8 @@ match enabled validation commands before publication. A newly discovered externa
 dependency, missing required evidence, scope, or security blocker stops preparation
 without publishing substitute work or invoking another recovery provider.
 
-The plan permits one published automatic repair unit and at most two authoring
-attempts, including malformed-output corrections and interrupted calls. Attempts
+Each verification node permits one published automatic repair unit and at most two authoring
+attempts (one node for root-only plans), including malformed-output corrections and interrupted calls. Attempts
 are reserved only after checking that the plan with the appended repair fits the
 final gate's unit-count, plan-size, and verification-packet limits, and checking
 the complete rendered prompt size, including JSON escaping and correction instructions.
@@ -1005,7 +1061,8 @@ sikula delivery verify .sikula/delivery/<slug>/plan.yaml
 sikula delivery verify .sikula/delivery/<slug>/plan.yaml --json
 ```
 
-Newly prepared plans use `schema_version: 2` with
+Newly prepared root-only plans use `schema_version: 2`; checkpoint plans use
+`schema_version: 3`. Both require
 `verification: {mode: final_gate}`. Verification binds its result to the exact
 candidate commit and tree, source-task hash, plan content, completed-unit scope,
 effective validation configuration, and policy. Long validation and read-only
@@ -1065,9 +1122,9 @@ task, rendered plan context, active-unit count, validation and final-check polic
 applicable reviewer rules, security context, and protocol overhead have
 conservative limits. The exact rendered prompt is checked again before each
 provider call. Exceeding a limit fails with
-`delivery_verification.hierarchy_required`; content is not truncated. Recursive
-verification nodes and automatically scheduled checkpoints are not implemented
-yet. This first milestone requires `sandbox.allowed_read_paths` to include `.`;
+`delivery_verification.hierarchy_required`; content is not truncated. Flat checkpoints are scheduled automatically, but
+recursive
+verification and large-plan scaling remain later work. This first milestone requires `sandbox.allowed_read_paths` to include `.`;
 narrower read scopes fail readiness because the autonomous provider boundary cannot
 enforce them consistently across providers. The packet shows the enabled validation
 phases and effective commands behind the reported results. Repeating verification
@@ -1095,7 +1152,7 @@ rather than the operator's current `HEAD`, becomes the final commit. Existing
 diverged or checked-out branches are rejected. A branch ahead of the assembly
 base is trusted only when progress records an expected assembled commit;
 otherwise it is treated as stale and rejected. Sikula never force-updates these
-branches. For schema-version-2 plans, finalize performs no assembly, validation,
+branches. For schema-version-2 and schema-version-3 plans, finalize performs no assembly, validation,
 or provider call: it accepts only the exact candidate with current passing gate
 evidence, revalidates the final branch immediately before recording finalization,
 and otherwise recommends `delivery verify`. No-op legacy plans retain
@@ -1116,7 +1173,7 @@ extended or rerun delivery plan must be finalized again after it returns to
 
 The validator checks:
 
-- legacy `schema_version: 1`, or `schema_version: 2` with the required recognized
+- legacy `schema_version: 1`, or `schema_version: 2` / `3` with the required recognized
   `verification.mode: final_gate` policy,
 - required plan metadata such as `plan_id`, `title`, and a valid local-branch
   `final_branch`,

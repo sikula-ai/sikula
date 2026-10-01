@@ -1240,10 +1240,12 @@ def _canonicalize_markdown_headings(markdown: str) -> str:
 
 def _render_plan_yaml(draft: DeliveryAuthoringDraft, unit_task_paths: dict[str, str]) -> str:
     plan_data: dict[str, Any] = {
-        "schema_version": SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION,
+        "schema_version": 3 if draft.checkpoints else SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION,
         "plan_id": draft.plan_id,
         "title": draft.title,
     }
+    if draft.checkpoints:
+        plan_data["checkpoints"] = [item.to_dict() for item in draft.checkpoints]
     if draft.planning_mode:
         plan_data["planning_mode"] = draft.planning_mode
     plan_data["final_branch"] = delivery_final_branch_for_plan_id(draft.plan_id)

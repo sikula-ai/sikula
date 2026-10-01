@@ -664,7 +664,7 @@ def test_delivery_plan_check_does_not_warn_for_low_risk_narrow_unit(tmp_path: Pa
 def test_delivery_plan_check_rejects_unsupported_schema_version(tmp_path: Path) -> None:
     _git_init(tmp_path)
     data = _base_plan(tmp_path)
-    data["schema_version"] = 3
+    data["schema_version"] = 4
     plan_path = _write_plan(tmp_path, data)
 
     result = check_delivery_plan_file(plan_path)

@@ -25,6 +25,7 @@ from core.delivery_verification_scope import DeliveryVerificationScope
 from core.delivery_verification_model import (
     DeliveryVerificationRecord,
     delivery_verification_covers_obligations,
+    delivery_verification_is_boundary_stop,
     delivery_verification_recovery_action,
     parse_delivery_verification_record,
 )
@@ -134,6 +135,8 @@ class DeliveryProgress:
     final_commit: str | None = None
     finalized_at: str | None = None
     verification: DeliveryVerificationRecord | None = None
+    checkpoint_verifications: dict[str, DeliveryVerificationRecord] = field(default_factory=dict)
+    checkpoint_ids: tuple[str, ...] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -155,6 +158,12 @@ class DeliveryProgress:
             value = getattr(self, key)
             if value:
                 data[key] = value
+        if self.checkpoint_ids is not None:
+            data["checkpoint_ids"] = list(self.checkpoint_ids)
+        if self.checkpoint_verifications:
+            data["checkpoint_verifications"] = {
+                key: record.to_dict() for key, record in self.checkpoint_verifications.items()
+            }
         if self.verification:
             data["verification"] = self.verification.to_dict()
         return data
@@ -165,6 +174,7 @@ class DeliveryProgressEvent:
     plan_id: str
     event_type: str
     timestamp: str
+    verification_node: str | None = None
     unit_id: str | None = None
     status: str | None = None
     child_task_id: str | None = None
@@ -189,6 +199,7 @@ class DeliveryProgressEvent:
             "timestamp": self.timestamp,
         }
         for key in (
+            "verification_node",
             "unit_id",
             "status",
             "child_task_id",
@@ -274,6 +285,7 @@ class DeliveryStatusUnit:
     task_path: str
     depends_on: list[str]
     blocked_by: list[str] = field(default_factory=list)
+    blocked_by_checkpoints: list[str] = field(default_factory=list)
     stream: str | None = None
     platform: str | None = None
     phase: str | None = None
@@ -303,7 +315,7 @@ class DeliveryStatusUnit:
 
     @property
     def run_next_available(self) -> bool:
-        if self.stop_and_follow_up_required:
+        if self.stop_and_follow_up_required or self.blocked_by_checkpoints:
             return False
         if self.failure_code == DELIVERY_UNIT_BUDGET_EXCEEDED_CODE or self.failure_code in DELIVERY_TERMINAL_STOP_CODES:
             return False
@@ -313,7 +325,7 @@ class DeliveryStatusUnit:
 
     @property
     def run_next_action(self) -> str | None:
-        if self.stop_and_follow_up_required:
+        if self.stop_and_follow_up_required or self.blocked_by_checkpoints:
             return None
         if self.status == "running" and self.child_task_id:
             return "resume_or_reconcile"
@@ -328,6 +340,8 @@ class DeliveryStatusUnit:
 
     @property
     def run_next_blocked_reason(self) -> str | None:
+        if self.blocked_by_checkpoints:
+            return "delivery_checkpoint.required"
         if self.stop_and_follow_up_required:
             return DELIVERY_STOP_AND_FOLLOW_UP_REQUIRED
         if self.status == "failed" and self.failure_code in DELIVERY_TERMINAL_STOP_CODES:
@@ -340,7 +354,7 @@ class DeliveryStatusUnit:
 
     @property
     def eligible(self) -> bool:
-        return self.dependency_ready and not self.stop_and_follow_up_required
+        return self.dependency_ready and not self.stop_and_follow_up_required and not self.blocked_by_checkpoints
 
     @property
     def dependency_ready(self) -> bool:
@@ -386,6 +400,8 @@ class DeliveryStatusUnit:
                 data[key] = value
         if self.run_next_action:
             data["run_next_action"] = self.run_next_action
+        if self.blocked_by_checkpoints:
+            data["blocked_by_checkpoints"] = list(self.blocked_by_checkpoints)
         if self.run_next_blocked_reason:
             data["run_next_blocked_reason"] = self.run_next_blocked_reason
         if self.scope_paths:
@@ -430,6 +446,9 @@ class DeliveryStatusResult:
     finalized_at: str | None = None
     verification_status: str = "not_required"
     verification: DeliveryVerificationRecord | None = None
+    checkpoint_verifications: dict[str, DeliveryVerificationRecord] = field(default_factory=dict)
+    verification_node: str = "root"
+    checkpoint_handoffs: frozenset[str] | None = None
     plan_fingerprint: str | None = None
     plan_bytes: int | None = None
     llm_usage: dict[str, Any] = field(default_factory=empty_llm_usage_summary)
@@ -496,6 +515,10 @@ class DeliveryStatusResult:
             if self.verification.stop_code:
                 verification_data["stop_code"] = self.verification.stop_code
         data["verification"] = verification_data
+        if self.plan and self.plan.checkpoints:
+            from core.delivery_checkpoints import checkpoint_projection
+
+            data["checkpoints"] = checkpoint_projection(self)
         for key in (
             "assembly_base_commit",
             "assembled_commit",
@@ -659,6 +682,8 @@ def upsert_delivery_unit_progress(
     updated = DeliveryProgress(
         schema_version=progress.schema_version,
         plan_id=progress.plan_id,
+        checkpoint_verifications=dict(progress.checkpoint_verifications),
+        checkpoint_ids=progress.checkpoint_ids,
         units=units,
         assembly_base_commit=progress.assembly_base_commit,
         assembled_commit=progress.assembled_commit,
@@ -756,6 +781,8 @@ def mark_delivery_assembly(
     updated = DeliveryProgress(
         schema_version=progress.schema_version,
         plan_id=progress.plan_id,
+        checkpoint_verifications=dict(progress.checkpoint_verifications),
+        checkpoint_ids=progress.checkpoint_ids,
         units=list(progress.units),
         assembly_base_commit=base_commit,
         assembled_commit=assembled_commit,
@@ -788,6 +815,8 @@ def mark_delivery_finalized(
     return DeliveryProgress(
         schema_version=progress.schema_version,
         plan_id=progress.plan_id,
+        checkpoint_verifications=dict(progress.checkpoint_verifications),
+        checkpoint_ids=progress.checkpoint_ids,
         units=list(progress.units),
         assembly_base_commit=progress.assembly_base_commit,
         assembled_commit=progress.assembled_commit,
@@ -805,14 +834,39 @@ def mark_delivery_finalized(
 def mark_delivery_verification(
     progress: DeliveryProgress,
     verification: DeliveryVerificationRecord,
+    *,
+    node_id: str = "root",
 ) -> DeliveryProgress:
     _validate_progress(progress)
     parse_delivery_verification_record(verification.to_dict())
-    if progress.assembly_status != "ready" or progress.assembled_commit != verification.candidate_commit:
+    captured = progress.checkpoint_verifications.get(node_id) if node_id != "root" else None
+    retain_boundary = (
+        delivery_verification_is_boundary_stop(verification)
+        and captured is not None
+        and captured.status == "running"
+        and captured.gate_id == verification.gate_id
+        and captured.attempt == verification.attempt
+        and captured.candidate_commit == verification.candidate_commit
+    )
+    if not retain_boundary and (
+        progress.assembly_status != "ready" or progress.assembled_commit != verification.candidate_commit
+    ):
         raise ValueError("delivery verification must match the current assembled candidate")
+    if node_id != "root":
+        updated = replace(
+            progress,
+            checkpoint_verifications={**progress.checkpoint_verifications, node_id: verification},
+            final_branch=None,
+            final_commit=None,
+            finalized_at=None,
+        )
+        _validate_progress(updated)
+        return updated
     updated = DeliveryProgress(
         schema_version=progress.schema_version,
         plan_id=progress.plan_id,
+        checkpoint_verifications=dict(progress.checkpoint_verifications),
+        checkpoint_ids=progress.checkpoint_ids,
         units=list(progress.units),
         assembly_base_commit=progress.assembly_base_commit,
         assembled_commit=progress.assembled_commit,
@@ -842,6 +896,7 @@ def select_next_delivery_unit(status: DeliveryStatusResult, reset_failed: bool =
                 if unit.status == "failed"
                 and unit.child_task_id
                 and not unit.stop_and_follow_up_required
+                and not unit.blocked_by_checkpoints
                 and unit.failure_code != DELIVERY_UNIT_BUDGET_EXCEEDED_CODE
                 and unit.failure_code not in DELIVERY_TERMINAL_STOP_CODES
             ),
@@ -953,6 +1008,22 @@ def get_delivery_status(
             plan_bytes=check_result.plan_bytes,
         )
 
+    if (
+        progress
+        and progress.checkpoint_ids is not None
+        and set(progress.checkpoint_ids) != {item.id for item in plan.checkpoints}
+    ):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "delivery_checkpoint.policy_changed",
+                "Checkpoint identities cannot change after verification starts; recovery budgets remain bound to their original nodes.",
+            )
+        )
+    if any(unit.repair_node is not None for unit in plan.units):
+        from core.delivery_checkpoints import checkpoint_repair_control_issues
+
+        errors.extend(checkpoint_repair_control_issues(plan, root))
     _validate_amendment_progress(plan, progress, errors)
     units = _build_status_units(plan, progress, warnings)
     status = "invalid" if errors else _overall_status(units)
@@ -982,7 +1053,7 @@ def get_delivery_status(
         )
     ):
         verification_status = "stale"
-    return DeliveryStatusResult(
+    result = DeliveryStatusResult(
         plan_path=check_result.plan_path,
         project_root=check_result.project_root,
         progress_path=str(progress_path),
@@ -1014,9 +1085,16 @@ def get_delivery_status(
         finalized_at=finalized_at,
         verification_status=verification_status,
         verification=verification,
+        checkpoint_verifications=dict(progress.checkpoint_verifications) if progress else {},
         plan_fingerprint=check_result.plan_fingerprint,
         plan_bytes=check_result.plan_bytes,
     )
+
+    if plan.checkpoints:
+        from core.delivery_checkpoints import with_checkpoint_barriers
+
+        return with_checkpoint_barriers(result)
+    return result
 
 
 def with_delivery_llm_usage(
@@ -1109,6 +1187,33 @@ def _validate_progress(progress: DeliveryProgress) -> None:
             "unsupported delivery progress schema_version "
             f"{progress.schema_version}; expected {SUPPORTED_DELIVERY_PROGRESS_SCHEMA_VERSION}"
         )
+    if progress.checkpoint_verifications and progress.checkpoint_ids is None:
+        raise ValueError("Checkpoint records require bound recovery node identities")
+    if progress.checkpoint_ids is not None and (
+        not isinstance(progress.checkpoint_ids, tuple)
+        or len(progress.checkpoint_ids) > 256
+        or any(
+            not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", key) or key == "root"
+            for key in progress.checkpoint_ids
+        )
+        or len(set(progress.checkpoint_ids)) != len(progress.checkpoint_ids)
+        or not progress.checkpoint_verifications.keys() <= set(progress.checkpoint_ids)
+    ):
+        raise ValueError("Invalid bound checkpoint identities")
+    if not isinstance(progress.checkpoint_verifications, dict) or len(progress.checkpoint_verifications) > 256:
+        raise ValueError("Invalid checkpoint verification progress")
+    for node_id, record in progress.checkpoint_verifications.items():
+        if (
+            not isinstance(node_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", node_id)
+            or node_id == "root"
+        ):
+            raise ValueError("Invalid checkpoint verification node")
+        parse_delivery_verification_record(record.to_dict())
+        if record.passed and (
+            record.semantic_status != "approved" or (record.security_required and record.security_status != "approved")
+        ):
+            raise ValueError("Passed checkpoint requires semantic and security approval")
     seen: set[str] = set()
     for unit in progress.units:
         _validate_unit_progress(unit)
@@ -1297,6 +1402,8 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
                 f"Final branch: {plan_data['final_branch']}",
             ]
         )
+    for checkpoint in projection.get("checkpoints", []):
+        lines.append(f"Checkpoint {checkpoint['id']}: {checkpoint['status']}")
     verification = projection["verification"]
     lines.append(f"Verification: {verification['status']}")
     if verification.get("gate_id"):
@@ -1519,7 +1626,22 @@ def _load_delivery_progress(path: Path, *, plan_id: str, errors: list[DeliveryPl
                 )
             )
             return None
+    try:
+        raw_ids = data.get("checkpoint_ids")
+        if raw_ids is not None and not isinstance(raw_ids, list):
+            raise ValueError("Invalid bound checkpoint identities")
+        raw_checkpoints = data.get("checkpoint_verifications", {})
+        if not isinstance(raw_checkpoints, dict) or len(raw_checkpoints) > 256:
+            raise ValueError("Invalid checkpoint progress")
+        checkpoints = {key: parse_delivery_verification_record(value) for key, value in raw_checkpoints.items()}
+    except ValueError:
+        errors.append(
+            DeliveryPlanIssue("error", "progress.checkpoints_invalid", "Checkpoint verification progress is malformed.")
+        )
+        return None
     progress = DeliveryProgress(
+        checkpoint_verifications=checkpoints,
+        checkpoint_ids=tuple(raw_ids) if raw_ids is not None else None,
         schema_version=schema_version,
         plan_id=plan_id,
         units=units,

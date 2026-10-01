@@ -338,12 +338,12 @@ class TestXcodeToolExtractErrors:
 
 
 class TestXcodeToolIsBuildConfigFile:
-    @pytest.mark.parametrize("filename", _BUILD_CONFIG_FILES)
+    @pytest.mark.parametrize("filename", sorted(_BUILD_CONFIG_FILES))
     def test_recognizes_build_config_files(self, filename: str, tmp_path: Path):
         tool = _make_tool(tmp_path)
         assert tool.is_build_config_file(filename) is True
 
-    @pytest.mark.parametrize("suffix", _BUILD_CONFIG_SUFFIXES)
+    @pytest.mark.parametrize("suffix", sorted(_BUILD_CONFIG_SUFFIXES))
     def test_recognizes_build_config_suffixes(self, suffix: str, tmp_path: Path):
         tool = _make_tool(tmp_path)
         assert tool.is_build_config_file(f"Config{suffix}") is True

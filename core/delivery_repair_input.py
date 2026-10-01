@@ -49,11 +49,13 @@ def load_repair_input(
     record: DeliveryVerificationRecord,
     plan: DeliveryPlan,
     project_config: dict[str, Any],
+    *,
+    node_id: str = "root",
 ) -> DeliveryIntegrationAssessment:
     payload = _load_bound_input(root, directory, record)
     if payload.get("repair_policy_fingerprint") != repair_content_fingerprint(project_config):
         raise ValueError("Current structured integration repair input is unavailable.")
-    return _parse_assessment(payload, plan)
+    return _parse_assessment(payload, plan, node_id)
 
 
 def repair_input_policy_changed(
@@ -62,10 +64,12 @@ def repair_input_policy_changed(
     record: DeliveryVerificationRecord,
     plan: DeliveryPlan,
     project_config: dict[str, Any],
+    *,
+    node_id: str = "root",
 ) -> bool:
     """Recognize a policy change only in intact, candidate-bound control evidence."""
     payload = _load_bound_input(root, directory, record)
-    _parse_assessment(payload, plan)
+    _parse_assessment(payload, plan, node_id)
     return payload.get("repair_policy_fingerprint") != repair_content_fingerprint(project_config)
 
 
@@ -83,8 +87,10 @@ def _load_bound_input(root: Path, directory: Path, record: DeliveryVerificationR
     return payload
 
 
-def _parse_assessment(payload: dict[str, Any], plan: DeliveryPlan) -> DeliveryIntegrationAssessment:
-    scope = DeliveryVerificationScope.from_plan(plan)
+def _parse_assessment(
+    payload: dict[str, Any], plan: DeliveryPlan, node_id: str = "root"
+) -> DeliveryIntegrationAssessment:
+    scope = DeliveryVerificationScope.from_plan(plan, node_id)
     return parse_delivery_integration_review(
         json.dumps(payload.get("assessment")),
         known_unit_ids=set(scope.unit_ids),

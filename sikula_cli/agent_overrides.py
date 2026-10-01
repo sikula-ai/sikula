@@ -17,6 +17,20 @@ PREPARATION_AGENT_NAMES = {"task_preparer"}
 DELIVERY_PREPARATION_AGENT_NAMES = {"delivery_preparer"}
 
 
+def with_agent_llm_overrides(cfg: dict, overrides: dict[str, dict], *, agent_names: tuple[str, ...]) -> dict:
+    """Layer selected CLI overrides onto agent settings without mutating the input."""
+    effective = {**cfg, "agents": {**cfg.get("agents", {})}}
+    for name in agent_names:
+        if name not in overrides:
+            continue
+        current = cfg.get("agents", {}).get(name, {})
+        effective["agents"][name] = {
+            **current,
+            "llm": {**current.get("llm", {}), **overrides[name]},
+        }
+    return effective
+
+
 def parse_agent_llm_overrides(
     agent_models: list[str] | None,
     agent_providers: list[str] | None,

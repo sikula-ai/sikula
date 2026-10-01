@@ -462,6 +462,11 @@ def inspect_delivery_amendment_target(
             "delivery_amend.target_unknown",
             f"Delivery plan has no unit with id {target_unit_id}.",
         )
+    if target.repair_node is not None:
+        raise DeliveryAmendmentError(
+            "delivery_amend.repair_lineage_bound",
+            "A coordinator repair is bound to its node budget and publication evidence; further decomposition requires a follow-up plan.",
+        )
     if any(item.kind == "stop_and_follow_up" and target_unit_id in item.unit_ids for item in status.plan.constraints):
         raise DeliveryAmendmentError(
             "delivery_amend.external_dependency_follow_up_required",
@@ -2392,6 +2397,13 @@ def _amended_plan_data(
                     if inherited_id not in reassigned_unit_ids:
                         reassigned_unit_ids.append(inherited_id)
             obligation["unit_ids"] = reassigned_unit_ids
+    for checkpoint in amended.get("checkpoints", []):
+        if proposal.target_unit_id in checkpoint["unit_ids"]:
+            checkpoint["unit_ids"] = [
+                replacement
+                for key in checkpoint["unit_ids"]
+                for replacement in (replacement_ids if key == proposal.target_unit_id else [key])
+            ]
     rewired: list[str] = []
     for item in units:
         if (

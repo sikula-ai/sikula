@@ -2766,3 +2766,204 @@ def test_delivery_check_json_does_not_project_verbatim_source_constraint(
     assert payload["valid"] is False
     assert any(issue["code"] == "constraints.summary_source_excerpt" for issue in payload["errors"])
     assert source_rule not in payload_text
+
+
+@pytest.mark.parametrize("correct_declaration", [False, True])
+def test_delivery_prepares_checkpoint_repairs_and_releases_consumer(
+    git_project: Path,
+    seq_fake_llm,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    correct_declaration: bool,
+) -> None:
+    """LLM placement -> bounded correction -> intermediate recovery -> root approval."""
+    import copy
+
+    source = "# Calculator integration\n\nSubtraction and multiplication must work through a combined operation before a downstream consumer uses it. The consumer must expose the combined result.\n"
+    task = git_project / ".sikula/tasks/checkpoint-flow.md"
+    task.parent.mkdir(parents=True, exist_ok=True)
+    task.write_text(source)
+    _write_handoff_smoke_config(git_project)
+    config_path = git_project / ".sikula/config.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    config.update(run_build=True, run_tests=True)
+    config["build"]["compile_command"] = "python3 -m compileall -q src/"
+    config_path.write_text(yaml.safe_dump(config))
+    fragments = [item.id for item in delivery_authority_fragments(source)]
+    obligations = [
+        {
+            "id": key,
+            "summary": summary,
+            "source_fragment_ids": fragments,
+            "unit_ids": owners,
+            "disposition": "preserved",
+        }
+        for key, summary, owners in (
+            ("combined-operation", "Arithmetic operations share an integrated entrypoint.", ["subtract", "multiply"]),
+            ("consumer-result", "The dependent client returns the integrated result.", ["consumer"]),
+        )
+    ]
+    accounting = [
+        {
+            "source_fragment_id": key,
+            "disposition": "mapped",
+            "obligation_ids": [item["id"] for item in obligations],
+            "constraint_ids": [],
+            "rationale": "Both delivered outcomes derive from this source.",
+        }
+        for key in fragments
+    ]
+    draft = {
+        "plan_id": "checkpoint-flow",
+        "title": "Calculator integration",
+        "constraints": [],
+        "obligations": obligations,
+        "source_accounting": accounting,
+        "units": [
+            {
+                "id": key,
+                "title": key.title(),
+                "depends_on": deps,
+                "scope_paths": ["src/"],
+                "task_markdown": _delivery_stop_unit_markdown(key.title()),
+            }
+            for key, deps in (("subtract", []), ("multiply", []), ("consumer", ["subtract", "multiply"]))
+        ],
+        "checkpoints": [
+            {"id": "arithmetic", "unit_ids": ["subtract", "multiply"], "obligation_ids": ["combined-operation"]}
+        ],
+    }
+    outputs = []
+    if correct_declaration:
+        invalid = copy.deepcopy(draft)
+        invalid["checkpoints"][0]["unit_ids"] = ["subtract"]
+        outputs.append(json.dumps(invalid))
+    outputs.extend(
+        [
+            json.dumps(draft),
+            json.dumps(
+                {
+                    "constraints_complete": True,
+                    "constraints": [],
+                    "unit_context_complete": True,
+                    "unit_context_gaps": [],
+                    "obligations_complete": True,
+                    "obligations": obligations,
+                    "obligation_gaps": [],
+                    "source_accounting": accounting,
+                }
+            ),
+        ]
+    )
+    fake = seq_fake_llm(
+        generate_responses=outputs,
+        agent_responses=[
+            {"src/subtract.py": "def subtract(a, b):\n    return a - b\n"},
+            {"src/multiply.py": "def multiply(a, b):\n    return a * b\n"},
+            {"src/combined.py": "def combined(a, b, c):\n    return (a - b) * c\n"},
+            {
+                "src/consumer.py": "from combined import combined\n\ndef consume(a, b, c):\n    return combined(a, b, c)\n"
+            },
+        ],
+    )
+    readonly_original = fake.run_readonly_agent
+    implementation_original = fake.run_agent
+    gates: list[tuple[str, bool]] = []
+    author_calls: list[str] = []
+    implementations = []
+
+    def readonly(prompt: str, cwd: Path) -> str:
+        if "Review whether the complete assembled candidate" in prompt:
+            checkpoint = '"verification_node"' in prompt
+            passed = (cwd / "src/combined.py").exists()
+            if not checkpoint:
+                passed = passed and (cwd / "src/consumer.py").exists()
+            gates.append(("checkpoint" if checkpoint else "root", passed))
+            ids = ["combined-operation"] if checkpoint else ["combined-operation", "consumer-result"]
+            return json.dumps(
+                {
+                    "schema_version": 2,
+                    "disposition": "approved" if passed else "repair_required",
+                    "summary": "Integration checked.",
+                    "findings": []
+                    if passed
+                    else [
+                        {
+                            "code": "entrypoint_missing",
+                            "summary": "Connect the arithmetic operations.",
+                            "unit_ids": ["subtract", "multiply"],
+                            "obligation_ids": ["combined-operation"],
+                        }
+                    ],
+                    "obligation_results": [{"id": key, "outcome": "satisfied" if passed else "missing"} for key in ids],
+                }
+            )
+        if "Author one small, self-contained delivery repair contract" in prompt:
+            author_calls.append(prompt)
+            return json.dumps(
+                {
+                    "schema_version": 1,
+                    "disposition": "repair",
+                    "task_markdown": _delivery_stop_unit_markdown("Connect operations").replace(
+                        "- `python3 -m compileall -q src/`\n", ""
+                    ),
+                }
+            )
+        return readonly_original(prompt, cwd)
+
+    def implement(prompt: str, cwd: Path):
+        if len(implementations) == 3:
+            assert (cwd / "src/combined.py").exists(), "Consumer must inherit the repaired candidate"
+        result = implementation_original(prompt, cwd)
+        implementations.append(result[0])
+        return result
+
+    fake.run_readonly_agent = readonly
+    fake.run_agent = implement
+    monkeypatch.chdir(git_project)
+
+    def invoke(command: list[str], *, succeeds: bool = True) -> dict:
+        with patch("sys.argv", ["sikula", "delivery", *command, "--json"]):
+            if succeeds:
+                main()
+            else:
+                with pytest.raises(SystemExit) as exc:
+                    main()
+                assert exc.value.code == 1
+        return json.loads(capsys.readouterr().out)
+
+    with patch("core.llm_client.create_llm_client", return_value=fake):
+        prepared = invoke(["prepare", str(task)])
+        assert prepared["ready"] and prepared["prepared"], prepared
+        plan_path = git_project / ".sikula/delivery/checkpoint-flow/plan.yaml"
+        plan = yaml.safe_load(plan_path.read_text())
+        assert plan["schema_version"] == 3
+        assert plan["checkpoints"] == draft["checkpoints"]
+        _git_commit_all(git_project, "prepared checkpoint flow")
+        index_before = (git_project / ".git/index").read_bytes()
+        paused = invoke(["run", str(plan_path), "--max-units", "2"])
+        assert paused["succeeded"] and paused["stop_code"] == "delivery.run.unit_limit_reached", paused
+        assert gates == [("checkpoint", False)]
+        assert not author_calls
+        blocked = invoke(["run-next", str(plan_path), "--dry-run"], succeeds=False)
+        assert any(item["code"] == "delivery_checkpoint.required" for item in blocked["errors"])
+        preview = invoke(["run", str(plan_path), "--dry-run"])
+        assert preview["ready"] and not author_calls
+        completed = invoke(["run", str(plan_path)])
+        assert completed["finalized"], completed
+        assert gates == [("checkpoint", False), ("checkpoint", True), ("root", True)]
+        assert len(author_calls) == 1
+        assert completed["checkpoints"][0]["status"] == "accepted_handoff"
+        repeated = invoke(["run", str(plan_path)])
+        assert repeated["finalized"] and repeated["units_attempted"] == 0
+        assert len(gates) == 3 and len(author_calls) == 1
+        assert (git_project / ".git/index").read_bytes() == index_before
+    progress = json.loads((git_project / ".sikula/state/delivery/checkpoint-flow/progress.json").read_text())
+    consumer = next(item for item in progress["units"] if item["unit_id"] == "consumer")
+    repair = next(item for item in progress["units"] if item["unit_id"].startswith("integration-repair-"))
+    child = JsonStateStore(git_project / ".sikula/state").load(consumer["child_task_id"])
+    assert repair["unit_id"] in {item["unit_id"] for item in child.delivery_dependency_handoffs}
+    assert progress["checkpoint_verifications"]["arithmetic"]["status"] == "passed"
+    if correct_declaration:
+        audit = (git_project / ".sikula/contract-reports/checkpoint-flow.delivery-prepare.auto-llm.jsonl").read_text()
+        assert "delivery_authoring.checkpoints_invalid" in audit

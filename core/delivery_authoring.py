@@ -8,6 +8,7 @@ import re
 from typing import Any
 import unicodedata
 
+from core.delivery_checkpoint_model import DeliveryCheckpoint, DeliveryCheckpointError, parse_delivery_checkpoints
 from core.delivery_unit_metadata import (
     DEFAULT_DELIVERY_UNIT_MAX_PLANNER_STEPS,
     DELIVERY_UNIT_BUDGET_FIELDS,
@@ -90,6 +91,7 @@ MAX_DELIVERY_UNIT_CONTEXT_LITERALS = 100
 MAX_DELIVERY_UNIT_CONTEXT_LITERAL_LENGTH = 1000
 MAX_DELIVERY_UNIT_CONTEXT_TOTAL_LENGTH = 20_000
 _TOP_LEVEL_FIELDS = {
+    "checkpoints",
     "plan_id",
     "title",
     "units",
@@ -331,6 +333,7 @@ class DeliveryAuthoringDraft:
     source_accounting: list[DeliverySourceAccounting] | None = None
     source_task: DeliveryPlanSourceTask | None = None
     constraint_verification: DeliveryConstraintVerification | None = None
+    checkpoints: list[DeliveryCheckpoint] = field(default_factory=list)
 
 
 @dataclass
@@ -474,7 +477,16 @@ def parse_delivery_authoring_output(
         )
     )
 
+    try:
+        checkpoints = (
+            []
+            if any(item.kind == "stop_and_follow_up" for item in constraints)
+            else parse_delivery_checkpoints(data.get("checkpoints"), units, obligations)
+        )
+    except DeliveryCheckpointError as exc:
+        raise DeliveryAuthoringParseError("delivery_authoring.checkpoints_invalid", str(exc)) from None
     return DeliveryAuthoringDraft(
+        checkpoints=checkpoints,
         plan_id=plan_id,
         title=title,
         units=units,

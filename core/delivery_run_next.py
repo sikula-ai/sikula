@@ -248,7 +248,9 @@ def preview_delivery_run_next(
             "project.git_root_missing",
             "Delivery run-next requires the configured project root to live inside one Git repository.",
         )
-    status = get_delivery_status(path, project_root=project_root)
+    from core.delivery_checkpoints import reconcile_checkpoint_assembly
+
+    status = reconcile_checkpoint_assembly(get_delivery_status(path, project_root=project_root))
     errors = list(status.errors)
     warnings = list(status.warnings)
     selected_unit: DeliveryStatusUnit | None = None
@@ -266,6 +268,14 @@ def preview_delivery_run_next(
                     "Integration repair has unfinished control state; resume with delivery run before running a child.",
                 )
             )
+
+    if status.valid:
+        from core.delivery_checkpoints import checkpoint_barrier_issue
+
+        checkpoint_issue = checkpoint_barrier_issue(status)
+        if checkpoint_issue is not None:
+            errors.append(checkpoint_issue)
+            message = checkpoint_issue.message
 
     if status.valid and not errors:
         running_recovery_unit = _select_running_recovery_unit(status)

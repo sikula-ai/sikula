@@ -27,6 +27,9 @@ _DELIVERY_VERIFICATION_RECOVERY_ACTIONS = {
     "external_dependency_gap": "resolve_external_dependency",
     "human_review_required": "request_human_review",
     "config_changed": "restart_with_candidate_config",
+    "readonly_mutation": "resolve_readonly_boundary",
+    "validation_workspace_mutated": "resolve_readonly_boundary",
+    "workspace_boundary_invalid": "resolve_workspace_boundary",
 }
 
 
@@ -49,6 +52,15 @@ def delivery_verification_covers_obligations(
     if not record.passed:
         return True
     return record.obligation_satisfied_count == obligation_count and record.obligation_gap_count == 0
+
+
+def delivery_verification_is_boundary_stop(record: DeliveryVerificationRecord) -> bool:
+    """Security and read-only failures remain stops even after candidate changes."""
+    return record.status in {"blocked", "failed"} and (
+        record.security_status == "rejected"
+        or delivery_verification_recovery_action(record.stop_code)
+        in {"resolve_readonly_boundary", "resolve_workspace_boundary"}
+    )
 
 
 @dataclass(frozen=True)
@@ -78,6 +90,8 @@ class DeliveryVerificationRecord:
     started_at: str | None = None
     completed_at: str | None = None
     repair_input_fingerprint: str | None = None
+    review_rule_fingerprints: dict[str, str] | None = None
+    plan_content_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -102,10 +116,19 @@ class DeliveryVerificationRecord:
             "obligation_satisfied_count": self.obligation_satisfied_count,
             "obligation_gap_count": self.obligation_gap_count,
         }
-        for key in ("stop_code", "evidence_path", "started_at", "completed_at", "repair_input_fingerprint"):
+        for key in (
+            "stop_code",
+            "evidence_path",
+            "started_at",
+            "completed_at",
+            "repair_input_fingerprint",
+            "plan_content_fingerprint",
+        ):
             value = getattr(self, key)
             if value:
                 data[key] = value
+        if self.review_rule_fingerprints is not None:
+            data["review_rule_fingerprints"] = dict(self.review_rule_fingerprints)
         return data
 
     @property
@@ -142,6 +165,8 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         "started_at",
         "completed_at",
         "repair_input_fingerprint",
+        "review_rule_fingerprints",
+        "plan_content_fingerprint",
     }
     if set(value) - allowed:
         raise ValueError("delivery verification record contains unsupported fields")
@@ -232,6 +257,28 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
     if stop_code is not None and not _SAFE_CODE_RE.fullmatch(stop_code):
         raise ValueError("delivery verification stop_code is invalid")
     evidence_path = value.get("evidence_path")
+    plan_content_fingerprint = value.get("plan_content_fingerprint")
+    if plan_content_fingerprint is not None and (
+        not isinstance(plan_content_fingerprint, str) or not _SHA256_ID_RE.fullmatch(plan_content_fingerprint)
+    ):
+        raise ValueError("delivery verification plan content fingerprint is invalid")
+    rule_fingerprints = value.get("review_rule_fingerprints")
+    if rule_fingerprints is not None and (
+        not isinstance(rule_fingerprints, dict)
+        or len(rule_fingerprints) > 2
+        or any(
+            not isinstance(path, str)
+            or not path
+            or path.startswith("/")
+            or "\\" in path
+            or ":" in path
+            or ".." in path.split("/")
+            or not isinstance(digest, str)
+            or not _SHA256_ID_RE.fullmatch(digest)
+            for path, digest in rule_fingerprints.items()
+        )
+    ):
+        raise ValueError("delivery verification review rule fingerprints are invalid")
     if evidence_path is not None and (
         evidence_path.startswith(("/", "\\"))
         or re.match(r"^[A-Za-z]:[\\/]", evidence_path)
@@ -266,4 +313,6 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         started_at=value.get("started_at"),
         completed_at=value.get("completed_at"),
         repair_input_fingerprint=repair_fingerprint,
+        review_rule_fingerprints=rule_fingerprints,
+        plan_content_fingerprint=plan_content_fingerprint,
     )

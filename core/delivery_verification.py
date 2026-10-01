@@ -145,12 +145,18 @@ class DeliveryVerificationSnapshot:
 
 
 def delivery_verification_security_required(status: DeliveryPlanCheckResult | DeliveryStatusResult) -> bool:
-    return DeliveryVerificationScope.from_plan(status.plan).security_required if status.plan is not None else False
+    return (
+        DeliveryVerificationScope.from_plan(status.plan, getattr(status, "verification_node", "root")).security_required
+        if status.plan is not None
+        else False
+    )
 
 
 def check_delivery_verification_readiness(
     status: DeliveryPlanCheckResult | DeliveryStatusResult,
     project_config: dict[str, Any],
+    *,
+    node_id: str | None = None,
 ) -> DeliveryVerificationReadiness:
     plan = status.plan
     required = bool(plan and getattr(plan, "requires_final_verification", False))
@@ -169,7 +175,11 @@ def check_delivery_verification_readiness(
 
     errors = list(status.errors)
     warnings = list(status.warnings)
-    scope = DeliveryVerificationScope.from_plan(plan) if plan is not None else None
+    scope = (
+        DeliveryVerificationScope.from_plan(plan, node_id or getattr(status, "verification_node", "root"))
+        if plan is not None
+        else None
+    )
     security_required = scope.security_required if scope is not None else False
     source_bytes = 0
     source_prompt_bytes = 0
@@ -392,6 +402,11 @@ def check_delivery_verification_readiness(
             )
         )
 
+    if scope is not None and scope.node_id == "root" and not errors:
+        for checkpoint in plan.checkpoints:
+            checkpoint_readiness = check_delivery_verification_readiness(status, project_config, node_id=checkpoint.id)
+            errors.extend(issue for issue in checkpoint_readiness.errors if issue not in errors)
+
     return DeliveryVerificationReadiness(
         required=True,
         ready=not errors,
@@ -411,6 +426,10 @@ def with_delivery_verification_readiness(
 ) -> DeliveryStatusResult:
     if not status.valid:
         return status
+    if status.plan and getattr(status.plan, "checkpoints", ()):
+        from core.delivery_checkpoints import with_checkpoint_barriers
+
+        status = with_checkpoint_barriers(status, project_config)
     readiness = check_delivery_verification_readiness(status, project_config)
     if not readiness.required:
         return status
@@ -438,7 +457,11 @@ def with_delivery_verification_readiness(
             and _verification_record_matches_identity(
                 verification,
                 identity,
-                obligation_count=len(DeliveryVerificationScope.from_plan(status.plan).obligation_ids),
+                obligation_count=len(
+                    DeliveryVerificationScope.from_plan(
+                        status.plan, getattr(status, "verification_node", "root")
+                    ).obligation_ids
+                ),
             )
         ):
             from core.delivery_repair import delivery_repair_input_needs_refresh
@@ -477,7 +500,7 @@ def build_delivery_verification_snapshot(
     if status.plan_fingerprint is None:
         raise ValueError("delivery verification identity requires bound plan bytes")
     plan_fingerprint = status.plan_fingerprint
-    scope = DeliveryVerificationScope.from_plan(status.plan)
+    scope = DeliveryVerificationScope.from_plan(status.plan, getattr(status, "verification_node", "root"))
     completed_units = tuple(
         DeliveryVerificationCompletedUnit(unit.id, unit.commit, unit.handoff_fingerprint)
         for unit in status.units
@@ -490,6 +513,10 @@ def build_delivery_verification_snapshot(
         security_required=scope.security_required,
     )
     policy_fingerprint = _fingerprint(scope.policy.to_dict() if scope.policy else {})
+    if scope.node_id != "root":
+        from core.delivery_checkpoints import checkpoint_policy_payload
+
+        policy_fingerprint = _fingerprint(checkpoint_policy_payload(status, scope))
     source_fingerprint = scope.source_task.sha256
     gate_id = _fingerprint(
         {
@@ -590,7 +617,11 @@ def _effective_provider(project_config: dict[str, Any], agent_name: str) -> str:
 
 
 def delivery_verification_plan_context(status: DeliveryPlanCheckResult | DeliveryStatusResult) -> dict[str, Any]:
-    return DeliveryVerificationScope.from_plan(status.plan).plan_context() if status.plan is not None else {}
+    return (
+        DeliveryVerificationScope.from_plan(status.plan, getattr(status, "verification_node", "root")).plan_context()
+        if status.plan is not None
+        else {}
+    )
 
 
 def delivery_verification_prompt_is_bounded(prompt: str) -> bool:

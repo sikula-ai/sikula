@@ -115,6 +115,7 @@ from sikula_cli.agent_overrides import DELIVERY_PREPARATION_AGENT_NAMES as _VALI
 from sikula_cli.agent_overrides import PREPARATION_AGENT_NAMES as _VALID_PREPARATION_AGENTS
 from sikula_cli.agent_overrides import RUNTIME_AGENT_NAMES as _VALID_AGENTS
 from sikula_cli.agent_overrides import parse_agent_llm_overrides as _parse_agent_llm_overrides
+from sikula_cli.agent_overrides import with_agent_llm_overrides
 
 if TYPE_CHECKING:
     from agents.delivery_repair_agent import DeliveryRepairAgent
@@ -3528,6 +3529,10 @@ def _run_delivery_verification(args: argparse.Namespace, cfg: dict):
     effective_cfg = _delivery_verification_effective_config(args, cfg)
     project_root = Path(effective_cfg["project"]["root_path"]).resolve()
     status = get_delivery_status(args.plan_file, project_root=project_root)
+    from core.delivery_checkpoints import verification_node_status, verification_scope_complete
+
+    node_id = getattr(args, "verification_node", "root")
+    status = verification_node_status(status, node_id)
     readiness = check_delivery_verification_readiness(status, effective_cfg)
     parsed = _parse_agent_llm_overrides(
         getattr(args, "agent_model", None),
@@ -3538,7 +3543,11 @@ def _run_delivery_verification(args: argparse.Namespace, cfg: dict):
     overrides = {"agent_llms": parsed}
     base_llm_cfg = effective_cfg.get("llm", {}) if isinstance(effective_cfg.get("llm"), dict) else {}
     agents: dict[str, DeliveryIntegrationReviewAgent] = {}
-    if readiness.required and readiness.ready and status.status == "done":
+    if (
+        readiness.required
+        and readiness.ready
+        and (status.status == "done" if node_id == "root" else verification_scope_complete(status))
+    ):
         agent_names = ["reviewer"]
         if readiness.security_required:
             agent_names.append("security_reviewer")
@@ -3559,6 +3568,7 @@ def _run_delivery_verification(args: argparse.Namespace, cfg: dict):
         semantic_reviewer=agents.get("reviewer"),
         security_reviewer=agents.get("security_reviewer"),
         project_root=project_root,
+        node_id=node_id,
     )
 
 
@@ -3569,16 +3579,7 @@ def _delivery_verification_effective_config(args: argparse.Namespace, cfg: dict)
         getattr(args, "agent_timeout", None),
         valid_agents=set(_VALID_AGENTS) | {"delivery_preparer"},
     )
-    effective = {**cfg, "agents": {**cfg.get("agents", {})}}
-    for name in ("reviewer", "security_reviewer", "delivery_preparer"):
-        if name not in parsed:
-            continue
-        current = cfg.get("agents", {}).get(name, {})
-        effective["agents"][name] = {
-            **current,
-            "llm": {**current.get("llm", {}), **parsed[name]},
-        }
-    return effective
+    return with_agent_llm_overrides(cfg, parsed, agent_names=("reviewer", "security_reviewer", "delivery_preparer"))
 
 
 def cmd_delivery_verify(args: argparse.Namespace, cfg: dict) -> None:

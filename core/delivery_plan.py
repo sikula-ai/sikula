@@ -24,6 +24,7 @@ from core.delivery_obligations import (
     delivery_authority_fragment_map,
 )
 from core.delivery_source_accounting import DeliverySourceAccounting, SourceAccountingError, parse_source_accounting
+from core.delivery_checkpoint_model import DeliveryCheckpoint, DeliveryCheckpointError, parse_delivery_checkpoints
 from core.delivery_unit_metadata import (
     DELIVERY_UNIT_BUDGET_FIELDS,
     DELIVERY_UNIT_RISK_TAG_VALUES,
@@ -36,7 +37,7 @@ from core.delivery_unit_metadata import (
 LEGACY_DELIVERY_PLAN_SCHEMA_VERSION = 1
 SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION = 2
 SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSIONS = frozenset(
-    {LEGACY_DELIVERY_PLAN_SCHEMA_VERSION, SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION}
+    {LEGACY_DELIVERY_PLAN_SCHEMA_VERSION, SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION, 3}
 )
 SUPPORTED_DELIVERY_CONSTRAINT_CONTEXT_SCHEMA_VERSION = 1
 DELIVERY_VERIFICATION_MODE_FINAL_GATE = "final_gate"
@@ -258,6 +259,7 @@ class DeliveryPlanUnit:
     amend_reason: str | None = None
     budget_exceeded: DeliveryBudgetExceeded | None = None
     source_path: str = ""
+    repair_node: str | None = None
 
     @property
     def superseded(self) -> bool:
@@ -277,6 +279,7 @@ class DeliveryPlanUnit:
             "depends_on": [project_identity(value) for value in self.depends_on],
         }
         for key in (
+            "repair_node",
             "title",
             "stream",
             "platform",
@@ -289,7 +292,7 @@ class DeliveryPlanUnit:
         ):
             value = getattr(self, key)
             if value:
-                if key in {"stream", "repo_id", "component", "supersedes"}:
+                if key in {"stream", "repo_id", "component", "supersedes", "repair_node"}:
                     value = project_identity(value)
                 elif public and key in {"title", "platform", "phase", "kind"}:
                     value = sanitize_delivery_public_metadata(value)
@@ -327,6 +330,7 @@ class DeliveryPlan:
     source_task: DeliveryPlanSourceTask | None = None
     planning_mode: str | None = None
     verification: DeliveryVerificationPolicy | None = None
+    checkpoints: list[DeliveryCheckpoint] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -351,6 +355,8 @@ class DeliveryPlan:
             data["source_accounting"] = [record.to_dict(public=True) for record in self.source_accounting]
         if self.planning_mode:
             data["planning_mode"] = self.planning_mode
+        if self.checkpoints:
+            data["checkpoints"] = [item.to_dict(public=True) for item in self.checkpoints]
         if self.verification:
             data["verification"] = self.verification.to_dict()
         return data
@@ -613,7 +619,7 @@ def _parse_delivery_plan(
         project_root=project_root,
         errors=errors,
     )
-    if schema_version == SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION and source_task is None:
+    if schema_version in {2, 3} and source_task is None:
         errors.append(
             DeliveryPlanIssue(
                 "error",
@@ -655,7 +661,7 @@ def _parse_delivery_plan(
     )
     source_accounting = None
     if "source_accounting" in data:
-        if source_task is None or schema_version != SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION or verification is None:
+        if source_task is None or schema_version not in {2, 3} or verification is None:
             errors.append(
                 DeliveryPlanIssue(
                     "error",
@@ -705,7 +711,7 @@ def _parse_delivery_plan(
         isinstance(raw_obligations, list)
         and raw_obligations
         and not (
-            schema_version == SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION
+            schema_version in {2, 3}
             and verification is not None
             and verification.mode == DELIVERY_VERIFICATION_MODE_FINAL_GATE
         )
@@ -716,6 +722,50 @@ def _parse_delivery_plan(
                 "obligations.verification_required",
                 "Source-bound obligations require schema_version 2 with final-gate verification.",
                 "obligations",
+            )
+        )
+
+    checkpoints = []
+    if data.get("checkpoints") is not None:
+        if schema_version != 3:
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "checkpoints.schema_version_required",
+                    "Checkpoint declarations require schema_version 3.",
+                    "checkpoints",
+                )
+            )
+        else:
+            try:
+                checkpoints = parse_delivery_checkpoints(data["checkpoints"], units, obligations)
+            except DeliveryCheckpointError as exc:
+                errors.append(DeliveryPlanIssue("error", "checkpoints.invalid", str(exc), "checkpoints"))
+    repair_nodes: set[str] = set()
+    for unit in units:
+        if unit.repair_node is not None:
+            if (
+                schema_version != 3
+                or unit.repair_node not in {"root", *(item.id for item in checkpoints)}
+                or unit.repair_node in repair_nodes
+                or not re.fullmatch(r"integration-repair-[0-9a-f]{16}", unit.id)
+            ):
+                errors.append(
+                    DeliveryPlanIssue(
+                        "error",
+                        "checkpoints.repair_invalid",
+                        "Repair units require a unique declared node and coordinator identity.",
+                        "units",
+                    )
+                )
+            repair_nodes.add(unit.repair_node)
+    if checkpoints and (not source_accounting or not obligations):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "checkpoints.authority_required",
+                "Checkpoints require source obligations and complete source accounting.",
+                "checkpoints",
             )
         )
 
@@ -740,6 +790,7 @@ def _parse_delivery_plan(
         source_task=source_task,
         planning_mode=planning_mode,
         verification=verification,
+        checkpoints=checkpoints,
     )
 
 
@@ -760,7 +811,7 @@ def _parse_verification_policy(
                 )
             )
         return None
-    if schema_version != SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION:
+    if schema_version not in {2, 3}:
         return None
     if not isinstance(value, dict):
         errors.append(
@@ -1106,6 +1157,7 @@ def _parse_units(
         platform = _optional_string(item, "platform", f"{unit_path}.platform", errors)
         phase = _optional_string(item, "phase", f"{unit_path}.phase", errors)
         kind = _optional_string(item, "kind", f"{unit_path}.kind", errors)
+        repair_node = _optional_string(item, "repair_node", f"{unit_path}.repair_node", errors)
         repo_id = _optional_string(item, "repo_id", f"{unit_path}.repo_id", errors)
         component = _optional_string(item, "component", f"{unit_path}.component", errors)
         scope_paths = _optional_string_list(item, "scope_paths", f"{unit_path}.scope_paths", errors)
@@ -1204,6 +1256,7 @@ def _parse_units(
             )
         if unit_id and task_path:
             unit = DeliveryPlanUnit(
+                repair_node=repair_node,
                 id=unit_id,
                 title=title,
                 task_path=task_path,

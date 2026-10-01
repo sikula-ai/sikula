@@ -318,6 +318,8 @@ def test_delivery_verification_record_round_trip() -> None:
         finding_count=2,
         evidence_path=".sikula/state/delivery/demo/verification/audit.jsonl",
         completed_at="2026-09-02T12:00:00+00:00",
+        review_rule_fingerprints={".sikula/reviewer_rules.md": "sha256:" + "a" * 64},
+        plan_content_fingerprint="sha256:" + "b" * 64,
     )
 
     assert parse_delivery_verification_record(record.to_dict()) == record
@@ -344,6 +346,11 @@ def test_delivery_verification_record_round_trip() -> None:
             "obligation_satisfied_count": 0,
         },
         {"evidence_path": "../private/audit.jsonl"},
+        {"review_rule_fingerprints": []},
+        {"plan_content_fingerprint": []},
+        {"plan_content_fingerprint": "invalid"},
+        {"review_rule_fingerprints": {"../private.md": "sha256:" + "a" * 64}},
+        {"review_rule_fingerprints": {"rules.md": "invalid"}},
         {"unexpected": True},
     ],
 )
@@ -360,6 +367,72 @@ def test_mark_delivery_verification_requires_current_candidate() -> None:
 
     with pytest.raises(ValueError, match="current assembled candidate"):
         mark_delivery_verification(progress, replace(_record(), candidate_commit="f" * 40))
+
+
+@pytest.mark.parametrize("assembly_status", ["ready", "failed"])
+@pytest.mark.parametrize(
+    "boundary", ["readonly_mutation", "validation_workspace_mutated", "workspace_boundary_invalid", "security"]
+)
+def test_mark_checkpoint_boundary_retains_captured_attempt(assembly_status: str, boundary: str) -> None:
+    captured = _record()
+    progress = mark_delivery_verification(
+        replace(_assembled_progress(), checkpoint_ids=("storage",)), captured, node_id="storage"
+    )
+    advanced = mark_delivery_assembly(
+        progress,
+        base_commit=progress.assembly_base_commit,
+        assembled_commit="f" * 40,
+        status=assembly_status,
+        error_code="assembly_failed" if assembly_status == "failed" else None,
+    )
+    terminal = replace(
+        captured,
+        status="failed",
+        security_status="rejected" if boundary == "security" else "not_run",
+        stop_code="delivery_verification.repair_required"
+        if boundary == "security"
+        else "delivery_verification." + boundary,
+    )
+
+    updated = mark_delivery_verification(advanced, terminal, node_id="storage")
+
+    assert updated == replace(advanced, checkpoint_verifications={"storage": terminal})
+    assert progress.checkpoint_verifications["storage"] == captured
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["root", "approval", "retryable_failure", "missing", "new_gate", "new_attempt", "completed", "changed_candidate"],
+)
+def test_mark_checkpoint_boundary_cannot_rebind_or_replace_another_attempt(change: str) -> None:
+    captured = _record()
+    progress = mark_delivery_verification(
+        replace(_assembled_progress(), checkpoint_ids=("storage",)), captured, node_id="storage"
+    )
+    progress = mark_delivery_assembly(
+        progress, base_commit=progress.assembly_base_commit, assembled_commit="f" * 40, status="ready"
+    )
+    terminal = replace(captured, status="blocked", stop_code="delivery_verification.readonly_mutation")
+    node_id = "root" if change == "root" else "storage"
+    if change == "approval":
+        terminal = replace(terminal, status="passed", semantic_status="approved", stop_code=None)
+    elif change == "retryable_failure":
+        terminal = replace(terminal, stop_code="delivery_verification.review_provider_failed")
+    elif change == "missing":
+        progress = replace(progress, checkpoint_verifications={})
+    elif change == "new_gate":
+        progress = replace(
+            progress, checkpoint_verifications={"storage": replace(captured, gate_id="sha256:" + "f" * 64)}
+        )
+    elif change == "new_attempt":
+        progress = replace(progress, checkpoint_verifications={"storage": replace(captured, attempt=2)})
+    elif change == "completed":
+        progress = replace(progress, checkpoint_verifications={"storage": replace(captured, status="failed")})
+    elif change == "changed_candidate":
+        terminal = replace(terminal, candidate_commit="e" * 40)
+
+    with pytest.raises(ValueError, match="current assembled candidate"):
+        mark_delivery_verification(progress, terminal, node_id=node_id)
 
 
 def test_unit_progress_change_invalidates_verification_and_finalization() -> None:
