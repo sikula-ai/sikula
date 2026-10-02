@@ -61,6 +61,7 @@ from sikula_cli.delivery import (
     cmd_delivery_run,
     cmd_delivery_run_next,
 )
+from tests.delivery_fixtures import bind_delivery_child, delivery_source
 
 
 def test_delivery_run_next_register_parser_sets_agent_overrides() -> None:
@@ -201,7 +202,9 @@ def _write_plan(root: Path) -> Path:
     unit_1 = _write_unit(root, "01-foundation.md", "# Unit 01\n\nPrivate task body.\n")
     unit_2 = _write_unit(root, "02-feature.md", "# Unit 02\n\nPrivate follow-up body.\n")
     plan = {
-        "schema_version": 1,
+        "source_task": delivery_source(root),
+        "verification": {"mode": "final_gate"},
+        "schema_version": 2,
         "plan_id": "delivery-run-next-demo",
         "title": "Delivery run-next demo",
         "planning_mode": "fixed_window",
@@ -264,6 +267,7 @@ def _resume_child_state(
     return TaskState(
         task_id=task_id,
         task_description="resume child",
+        delivery_handoff_schema_version=1,
         delivery_plan_id=plan_id,
         delivery_unit_id=unit_id,
         delivery_plan_path=plan_path,
@@ -276,6 +280,10 @@ def _record_resume_worktree(
     *,
     branch: str = "sikula/01-foundation-child",
 ) -> None:
+    if state.delivery_plan_path:
+        bind_delivery_child(
+            state, root, write_paths=(".",), preserve_scope=state.delivery_write_scope_schema_version is not None
+        )
     worktree_path = root / ".sikula" / "worktrees" / state.task_id / "project"
     worktree_path.mkdir(parents=True, exist_ok=True)
     state.worktree_path = str(worktree_path)
@@ -287,7 +295,9 @@ def _write_transitive_plan(root: Path) -> Path:
     unit_2 = _write_unit(root, "02-noop.md", "# Unit 02\n\nNo-op follow-up.\n")
     unit_3 = _write_unit(root, "03-feature.md", "# Unit 03\n\nFeature body.\n")
     plan = {
-        "schema_version": 1,
+        "source_task": delivery_source(root),
+        "verification": {"mode": "final_gate"},
+        "schema_version": 2,
         "plan_id": "delivery-run-next-demo",
         "title": "Delivery run-next demo",
         "planning_mode": "fixed_window",
@@ -392,6 +402,7 @@ def _run_next_cfg(root: Path) -> dict:
     return {
         "project": {"root_path": str(root), "build_tool": "python"},
         "tasks": {"state_dir": str(root / ".sikula" / "state")},
+        "sandbox": {"allowed_write_paths": ["."]},
     }
 
 
@@ -1324,6 +1335,7 @@ def test_cmd_delivery_run_next_runs_selected_unit_and_records_progress(
         store.save(state)
         run_args.created_task_id = state.task_id
         run_args.delivery_child_created_callback(state.task_id)
+        state.delivery_handoff_schema_version = 1
         state.done = True
         state.worktree_branch = "sikula/01-foundation-child"
         state.result_commit = "abc1234"
@@ -1360,6 +1372,8 @@ def test_cmd_delivery_run_next_runs_selected_unit_and_records_progress(
             "branch": "sikula/01-foundation-child",
             "child_task_id": payload["child_task_id"],
             "commit": "abc1234",
+            "handoff_schema_version": 1,
+            "handoff_fingerprint": progress["units"][0]["handoff_fingerprint"],
             "completed_at": progress["units"][0]["completed_at"],
             "started_at": progress["units"][0]["started_at"],
             "status": "done",
@@ -1398,6 +1412,7 @@ def test_cmd_delivery_run_next_records_already_satisfied_child_as_noop(
         )
         run_args.created_task_id = state.task_id
         run_args.delivery_child_created_callback(state.task_id)
+        state.delivery_handoff_schema_version = 1
         state.done = True
         state.delivery_no_change_outcome = "already_satisfied"
         store.save(state)
@@ -1441,6 +1456,7 @@ def test_cmd_delivery_run_next_reports_child_link_failure_if_parent_progress_lin
         run_args.created_task_id = state.task_id
         created_child_ids.append(state.task_id)
         run_args.delivery_child_created_callback(state.task_id)
+        state.delivery_handoff_schema_version = 1
         state.done = True
         state.worktree_branch = "sikula/01-foundation-child"
         state.result_commit = "abc1234"
@@ -1518,6 +1534,7 @@ def test_cmd_delivery_run_next_preserves_unknown_progress_entries(
     def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
         store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
         state = store.create("child task")
+        state.delivery_handoff_schema_version = 1
         state.done = True
         store.save(state)
         return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
@@ -1707,6 +1724,7 @@ def test_cmd_delivery_run_next_does_not_mark_unfinalized_child_run_done(
     def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
         store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
         state = store.create("child task")
+        state.delivery_handoff_schema_version = 1
         state.done = True
         state.worktree_path = str(unfinalized_worktree)
         state.worktree_base = str(unfinalized_worktree)
@@ -1748,6 +1766,7 @@ def test_cmd_delivery_run_next_allows_noop_dependency_without_result_commit(
         assert run_args.task_file == str((tmp_path / ".sikula/delivery/demo/units/02-feature.md").resolve())
         store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
         state = store.create("child task")
+        state.delivery_handoff_schema_version = 1
         state.done = True
         store.save(state)
         return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
@@ -2249,6 +2268,7 @@ def test_cmd_delivery_run_next_runs_dependent_unit_when_dependency_commit_is_app
         assert run_args.task_file == str((tmp_path / ".sikula/delivery/demo/units/02-feature.md").resolve())
         store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
         state = store.create("child task")
+        state.delivery_handoff_schema_version = 1
         state.done = True
         store.save(state)
         return DeliveryChildRunResult(exit_code=0, child_task_id=state.task_id)
@@ -2328,6 +2348,7 @@ def test_run_next_persists_handoff_and_passes_it_to_dependent_child(
         )
         run_args.created_task_id = state.task_id
         run_args.delivery_child_created_callback(state.task_id)
+        state.delivery_handoff_schema_version = 1
         state.done = True
         state.worktree_branch = f"sikula/{run_args.delivery_unit_id}-child"
         if run_args.delivery_unit_id == "01-foundation":
@@ -2541,6 +2562,7 @@ def test_run_next_reconciles_completed_child_after_handoff_write_failure(
         )
         run_args.created_task_id = state.task_id
         run_args.delivery_child_created_callback(state.task_id)
+        state.delivery_handoff_schema_version = 1
         state.done = True
         state.worktree_branch = "sikula/foundation-child"
         state.result_commit = "a" * 40
@@ -2874,6 +2896,7 @@ def test_cmd_delivery_run_next_resumes_non_terminal_running_child_unit(
         assert run_args.delivery_child_created_callback is None
         state = store.load("resume-child")
         assert state is not None
+        state.delivery_handoff_schema_version = 1
         state.done = True
         state.worktree_branch = "sikula/01-foundation-child"
         state.result_commit = "abc123"
@@ -2970,6 +2993,7 @@ def test_cmd_delivery_run_next_resumes_running_child_and_records_failed_parent_u
     def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
         state = store.load("resume-child")
         assert state is not None
+        state.delivery_handoff_schema_version = 1
         state.done = True
         store.save(state)
         return DeliveryChildRunResult(exit_code=1, child_task_id=run_args.created_task_id)
@@ -3547,6 +3571,7 @@ def test_cmd_delivery_run_next_reset_failed_retries_failed_running_child(
         state = store.load("resume-child")
         assert state is not None
         state.failed = False
+        state.delivery_handoff_schema_version = 1
         state.done = True
         state.worktree_branch = "sikula/01-foundation-child"
         state.result_commit = "abc123"
@@ -4439,6 +4464,7 @@ def test_cmd_delivery_run_next_computes_and_forwards_metadata(
         captured_args = run_args
         store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
         state = store.create("child task")
+        state.delivery_handoff_schema_version = 1
         state.done = True
         state.worktree_branch = "branch"
         state.result_commit = "commit"
@@ -4525,6 +4551,7 @@ def test_cmd_delivery_run_next_preserves_legacy_valid_unit_ids_in_child_context(
         parsed_unit_ids.append(context.unit_id)
         store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
         state = store.create("child task")
+        state.delivery_handoff_schema_version = 1
         state.done = True
         state.worktree_branch = "branch"
         state.result_commit = "commit"
@@ -4598,17 +4625,18 @@ def test_cmd_delivery_run_next_does_not_prepare_split_when_unit_completes(
 
     def runner(run_args: argparse.Namespace, run_cfg: dict) -> DeliveryChildRunResult:
         assert run_args.delivery_constraint_context_schema_version == 1
-        assert run_args.delivery_source_task is None
+        assert run_args.delivery_source_task == delivery_source(tmp_path)
         assert run_args.delivery_inherited_constraints == []
         assert len(run_args.delivery_constraint_context_fingerprint) == 64
         assert run_args.delivery_write_scope_schema_version == 2
         assert run_args.delivery_write_scope_mode == "repository_default"
         assert run_args.delivery_declared_write_paths == []
         assert run_args.delivery_declared_write_exact_file_paths == []
-        assert run_args.delivery_effective_write_paths == []
+        assert run_args.delivery_effective_write_paths == ["."]
         assert run_args.delivery_effective_write_exact_file_paths == []
         store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
         state = store.create("child task")
+        state.delivery_handoff_schema_version = 1
         state.done = True
         state.worktree_branch = "branch"
         state.result_commit = "commit"
@@ -5200,7 +5228,9 @@ def test_cmd_delivery_run_next_budget_split_blocks_invalid_child_state_before_au
     assert payload["budget_split_preparation"]["errors"][0]["code"] == "delivery.child_task_state_invalid"
 
 
-def test_cmd_delivery_run_next_omits_unsafe_metadata_plan_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cmd_delivery_run_next_rejects_unavailable_metadata_plan_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path)
     cfg = _run_next_cfg(tmp_path)
@@ -5212,6 +5242,7 @@ def test_cmd_delivery_run_next_omits_unsafe_metadata_plan_path(tmp_path: Path, m
         captured_args = run_args
         store = JsonStateStore(Path(run_cfg["tasks"]["state_dir"]))
         state = store.create("child task")
+        state.delivery_handoff_schema_version = 1
         state.done = True
         state.worktree_branch = "branch"
         state.result_commit = "commit"
@@ -5228,17 +5259,15 @@ def test_cmd_delivery_run_next_omits_unsafe_metadata_plan_path(tmp_path: Path, m
 
     monkeypatch.setattr("core.delivery_progress.get_delivery_status", mock_get_status)
 
-    cmd_delivery_run_next(
-        _run_next_args(plan_path),
-        cfg,
-        _run_next_context(tmp_path, runner),
-    )
-
-    assert captured_args is not None
-    assert captured_args.delivery_plan_id == "delivery-run-next-demo"
-    assert captured_args.delivery_unit_id == "01-foundation"
-    assert captured_args.delivery_plan_path is None
-    assert len(captured_args.delivery_constraint_context_fingerprint) == 64
+    with pytest.raises(SystemExit) as exc:
+        cmd_delivery_run_next(
+            _run_next_args(plan_path),
+            cfg,
+            _run_next_context(tmp_path, runner),
+        )
+    assert exc.value.code == 1
+    assert captured_args is None
+    assert not delivery_progress_path(tmp_path, "delivery-run-next-demo").exists()
 
 
 def test_cmd_delivery_run_next_blocks_missing_child_task_state_for_retry(
@@ -5479,6 +5508,7 @@ def test_cmd_delivery_run_next_dry_run_allows_completed_failed_child_retry_witho
     state.delivery_unit_id = "01-foundation"
     state.delivery_plan_path = ".sikula/delivery/demo/plan.yaml"
     state.done = True
+    state.delivery_handoff_schema_version = 1
     state.result_commit = "abc1234"
     store.save(state)
 
@@ -5556,6 +5586,7 @@ def test_cmd_delivery_run_next_reconciles_completed_failed_child_retry_without_w
     state.delivery_unit_id = "01-foundation"
     state.delivery_plan_path = ".sikula/delivery/demo/plan.yaml"
     state.done = True
+    state.delivery_handoff_schema_version = 1
     state.result_commit = "abc1234"
     state.worktree_branch = "sikula/01-foundation-manual"
     store.save(state)
@@ -5628,6 +5659,7 @@ def test_cmd_delivery_run_next_runs_failed_child_retry(tmp_path: Path, capsys: p
         assert progress["units"][0]["child_task_id"] == "task-xyz"
         assert progress["units"][0]["started_at"] == original_started_at
         assert progress["units"][0]["updated_at"] not in {original_started_at, original_updated_at}
+        state.delivery_handoff_schema_version = 1
         state.done = True
         state.worktree_branch = "sikula/01-foundation-retry"
         state.result_commit = "abc1234"

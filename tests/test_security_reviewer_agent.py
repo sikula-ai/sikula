@@ -47,6 +47,7 @@ def _make_agent(
 
 
 def _add_delivery_constraint_context(state: TaskState) -> None:
+    _add_delivery_write_scope(state)
     state.delivery_plan_id = "demo-plan"
     state.delivery_unit_id = "feature-unit"
     state.delivery_plan_path = ".sikula/delivery/demo-plan/plan.yaml"
@@ -198,6 +199,23 @@ class TestSecurityReviewerGuards:
         assert state.review_approved is True
         assert state.review_issues == []
         assert state.history[-1]["action"] == "delivery_constraint_context_rejected"
+
+    def test_missing_captured_write_scope_cannot_use_current_policy(self, stub_llm: StubLLMClient, file_tool):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        state.delivery_write_scope_schema_version = None
+        state.delivery_write_scope_mode = None
+        state.delivery_declared_write_paths = []
+        state.delivery_effective_write_paths = []
+        state.delivery_declared_write_exact_file_paths = None
+        state.delivery_effective_write_exact_file_paths = None
+        state.delivery_runtime_write_scope_binding = None
+
+        result = _make_agent(stub_llm, file_tool=file_tool).run(state)
+
+        assert not result.success
+        assert "snapshot_missing" in result.message
+        assert stub_llm.readonly_calls == []
 
     def test_invalid_active_write_scope_fails_before_provider_call(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state()
@@ -636,7 +654,7 @@ class TestSecurityReviewerDeliveryDispositions:
 
         prompt = stub_llm.readonly_calls[0]
         assert "AUTHORITATIVE ACTIVE DELIVERY WRITE SCOPE" in prompt
-        assert '{"kind":"path_prefix","path":"."}' in prompt
+        assert '{"kind":"path_prefix","path":"src"}' in prompt
         assert "DELIVERY SECURITY DISPOSITION CONTRACT" in prompt
         assert '"disposition":"approved"' in prompt
         assert "replaces the generic APPROVED output instructions" in prompt

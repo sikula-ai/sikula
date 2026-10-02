@@ -84,14 +84,21 @@ class DeliveryConstraintContext:
 
 
 def parse_delivery_constraint_context(state: TaskState) -> DeliveryConstraintContext | None:
-    """Parse private child state into a trusted context, preserving legacy absence."""
+    """Parse private child authority; only standalone tasks may omit the context."""
     schema_version = state.delivery_constraint_context_schema_version
     source_task_value = state.delivery_source_task
     constraints_value = state.delivery_inherited_constraints
     fingerprint_value = state.delivery_constraint_context_fingerprint
 
     if schema_version is None:
-        if source_task_value is not None or constraints_value != [] or fingerprint_value is not None:
+        if (
+            state.delivery_plan_id is not None
+            or state.delivery_unit_id is not None
+            or state.delivery_plan_path is not None
+            or source_task_value is not None
+            or constraints_value != []
+            or fingerprint_value is not None
+        ):
             _invalid(
                 "delivery_constraint_context.schema_version_missing",
                 "Inherited delivery constraint data requires a context schema version.",
@@ -110,12 +117,16 @@ def parse_delivery_constraint_context(state: TaskState) -> DeliveryConstraintCon
     plan_id = _required_identifier(state.delivery_plan_id, "plan_id")
     unit_id = _required_unit_identifier(state.delivery_unit_id, "unit_id")
     plan_path = _optional_project_relative_metadata_path(state.delivery_plan_path, "plan_path")
+    if plan_path is None:
+        _invalid(
+            "delivery_constraint_context.plan_path_missing", "Delivery child authority requires its parent plan path."
+        )
     source_task = _parse_source_task(source_task_value)
     constraints = _parse_constraints(constraints_value, unit_id=unit_id)
-    if constraints and source_task is None:
+    if source_task is None:
         _invalid(
             "delivery_constraint_context.source_task_missing",
-            "Inherited constraints require source-task correlation metadata.",
+            "Delivery child authority requires source-task correlation metadata.",
         )
     fingerprint = _required_fingerprint(fingerprint_value)
     context = DeliveryConstraintContext(

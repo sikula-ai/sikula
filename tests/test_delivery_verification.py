@@ -481,17 +481,18 @@ def test_passed_security_sensitive_record_requires_security_approval() -> None:
         mark_delivery_verification(progress, record)
 
 
-def test_verification_readiness_preserves_legacy_plan_behavior(tmp_path: Path) -> None:
+def test_verification_readiness_rejects_unreleased_schema_v1(tmp_path: Path) -> None:
     _git_init(tmp_path)
     status = get_delivery_status(_write_plan(tmp_path, schema_version=1))
 
     readiness = check_delivery_verification_readiness(status, _config(tmp_path))
 
     assert readiness.required is False
-    assert readiness.ready is True
+    assert readiness.ready is False
+    assert "schema_version.unsupported" in {issue.code for issue in readiness.errors}
 
 
-def test_legacy_delivery_verify_does_not_require_provider_or_progress(tmp_path: Path) -> None:
+def test_unsupported_delivery_verify_stops_before_provider_or_progress(tmp_path: Path) -> None:
     _git_init(tmp_path)
     plan_path = _write_plan(tmp_path, schema_version=1)
     config = {**_config(tmp_path), "llm": {"provider": "unsupported"}}
@@ -505,9 +506,9 @@ def test_legacy_delivery_verify_does_not_require_provider_or_progress(tmp_path: 
         project_root=tmp_path,
     )
 
-    assert result.succeeded is True
-    assert result.status == "not_required"
-    assert result.next_action == "finalize_delivery"
+    assert result.succeeded is False
+    assert "schema_version.unsupported" in {issue.code for issue in result.errors}
+    assert not delivery_progress_path(tmp_path, "demo").exists()
 
 
 def test_verification_readiness_accepts_bounded_schema_v2_plan(tmp_path: Path) -> None:
@@ -644,7 +645,7 @@ def test_schema_v2_finalize_requires_exact_passing_gate(tmp_path: Path) -> None:
     assert preview.ready is False
     assert any(issue.code == "delivery_verification.required" for issue in preview.errors)
 
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete and coherent.","findings":[]}'
+    approval = '{"schema_version":2,"disposition":"approved","summary":"Complete and coherent.","findings":[],"obligation_results":[]}'
     llm = _ReadonlyLLM([approval])
     reviewer = DeliveryIntegrationReviewAgent(llm, config)
     result = verify_delivery_plan(
@@ -946,7 +947,9 @@ def test_delivery_verification_reviews_configured_nested_project(tmp_path: Path)
         "run_tests": False,
         "run_checks": False,
     }
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'
+    approval = (
+        '{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],"obligation_results":[]}'
+    )
     llm = _ReadonlyLLM([approval])
 
     result = verify_delivery_plan(
@@ -1060,7 +1063,9 @@ def test_schema_v2_finalize_rechecks_branch_before_persisting(
         ),
     )
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'
+    approval = (
+        '{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],"obligation_results":[]}'
+    )
     verified = verify_delivery_plan(
         plan_path,
         config,
@@ -1110,7 +1115,7 @@ def test_delivery_verification_reuses_current_exact_pass(tmp_path: Path) -> None
         ),
     )
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete and coherent.","findings":[]}'
+    approval = '{"schema_version":2,"disposition":"approved","summary":"Complete and coherent.","findings":[],"obligation_results":[]}'
     llm = _ReadonlyLLM([approval])
     reviewer = DeliveryIntegrationReviewAgent(llm, config)
 
@@ -1157,7 +1162,9 @@ def test_failed_delivery_verification_becomes_stale_when_config_changes(tmp_path
         ),
     )
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'
+    approval = (
+        '{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],"obligation_results":[]}'
+    )
     verified = verify_delivery_plan(
         plan_path,
         config,
@@ -1208,7 +1215,7 @@ def test_delivery_verification_repairs_missing_terminal_event_on_reuse(
         ),
     )
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete and coherent.","findings":[]}'
+    approval = '{"schema_version":2,"disposition":"approved","summary":"Complete and coherent.","findings":[],"obligation_results":[]}'
     llm = _ReadonlyLLM([approval])
     reviewer = DeliveryIntegrationReviewAgent(llm, config)
     append_event = delivery_verify_module.append_delivery_progress_event
@@ -1271,7 +1278,9 @@ def test_delivery_verification_blocks_and_recovers_when_running_event_fails(
         ),
     )
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'
+    approval = (
+        '{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],"obligation_results":[]}'
+    )
     llm = _ReadonlyLLM([approval])
     reviewer = DeliveryIntegrationReviewAgent(llm, config)
     append_event = delivery_verify_module.append_delivery_progress_event
@@ -1372,7 +1381,7 @@ def test_delivery_verification_records_stale_when_plan_changes_during_review(tmp
         ),
     )
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete and coherent.","findings":[]}'
+    approval = '{"schema_version":2,"disposition":"approved","summary":"Complete and coherent.","findings":[],"obligation_results":[]}'
 
     def mutate_plan() -> None:
         plan_path.write_text(plan_path.read_text(encoding="utf-8") + "# concurrent update\n", encoding="utf-8")
@@ -1419,7 +1428,7 @@ def test_delivery_verification_reviews_source_captured_before_validation(
         "core.delivery_verify.run_delivery_verification_validation",
         mutate_source_during_validation,
     )
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete and coherent.","findings":[]}'
+    approval = '{"schema_version":2,"disposition":"approved","summary":"Complete and coherent.","findings":[],"obligation_results":[]}'
     llm = _SideEffectReadonlyLLM(
         approval,
         lambda: source_path.write_text(original_source, encoding="utf-8"),
@@ -1524,7 +1533,7 @@ def test_delivery_verification_does_not_overwrite_a_newer_running_attempt(tmp_pa
         newer = replace(progress.verification, attempt=progress.verification.attempt + 1)
         write_delivery_progress(progress_path, mark_delivery_verification(progress, newer))
 
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete and coherent.","findings":[]}'
+    approval = '{"schema_version":2,"disposition":"approved","summary":"Complete and coherent.","findings":[],"obligation_results":[]}'
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
     result = verify_delivery_plan(
         plan_path,
@@ -1559,7 +1568,7 @@ def test_security_sensitive_gate_requires_independent_security_approval(tmp_path
         ),
     )
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete and coherent.","findings":[]}'
+    approval = '{"schema_version":2,"disposition":"approved","summary":"Complete and coherent.","findings":[],"obligation_results":[]}'
     semantic_llm = _ReadonlyLLM([approval])
     security_llm = _ReadonlyLLM([approval])
 
@@ -1611,7 +1620,9 @@ def test_reviewer_failure_preserves_completed_gate_phases(
         lambda *args, **kwargs: validation,
     )
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'
+    approval = (
+        '{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],"obligation_results":[]}'
+    )
     semantic_llm = _FailingReadonlyLLM() if failed_review == "semantic" else _ReadonlyLLM([approval])
     security_reviewer = (
         DeliveryIntegrationReviewAgent(_FailingReadonlyLLM(), config) if failed_review == "security" else None
@@ -1667,11 +1678,10 @@ def test_terminal_audit_failure_preserves_completed_gate_phases(
 
     monkeypatch.setattr("core.delivery_verify._safe_append_audit", fail_terminal_append)
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'
-    rejection = (
-        '{"schema_version":1,"disposition":"repair_required","summary":"Repair required.",'
-        '"findings":[{"code":"integration_gap","summary":"Repair the integration.","unit_ids":["unit"]}]}'
+    approval = (
+        '{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],"obligation_results":[]}'
     )
+    rejection = '{"schema_version":2,"disposition":"repair_required","summary":"Repair required.","findings":[{"code":"integration_gap","summary":"Repair the integration.","unit_ids":["unit"],"obligation_ids":[]}],"obligation_results":[]}'
 
     result = verify_delivery_plan(
         plan_path,
@@ -1867,7 +1877,7 @@ def test_delivery_verification_rejects_ignored_readonly_provider_mutation(
         ),
     )
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete and coherent.","findings":[]}'
+    approval = '{"schema_version":2,"disposition":"approved","summary":"Complete and coherent.","findings":[],"obligation_results":[]}'
 
     def mutate_ignored_path() -> None:
         target = next((tmp_path / ".sikula" / "worktrees" / "delivery-verification").glob("candidate-*"))
@@ -2021,7 +2031,7 @@ def test_delivery_verification_rejects_candidate_symlink_escape(tmp_path: Path) 
         ),
     )
     config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete and coherent.","findings":[]}'
+    approval = '{"schema_version":2,"disposition":"approved","summary":"Complete and coherent.","findings":[],"obligation_results":[]}'
     llm = _ReadonlyLLM([approval])
 
     result = verify_delivery_plan(
@@ -2061,7 +2071,9 @@ def test_delivery_verification_rejects_narrow_reviewer_read_scope_before_provide
         "run_tests": False,
         "run_checks": False,
     }
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'
+    approval = (
+        '{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],"obligation_results":[]}'
+    )
     llm = _ReadonlyLLM([approval])
 
     result = verify_delivery_plan(
@@ -2106,7 +2118,9 @@ def test_delivery_verification_allows_internal_symlink_with_full_reviewer_scope(
         "run_tests": False,
         "run_checks": False,
     }
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'
+    approval = (
+        '{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],"obligation_results":[]}'
+    )
     llm = _ReadonlyLLM([approval])
 
     result = verify_delivery_plan(
@@ -2153,7 +2167,7 @@ def test_delivery_verification_rejects_persistent_ignored_validation_output(tmp_
             }
         },
     }
-    approval = '{"schema_version":1,"disposition":"approved","summary":"Complete and coherent.","findings":[]}'
+    approval = '{"schema_version":2,"disposition":"approved","summary":"Complete and coherent.","findings":[],"obligation_results":[]}'
     llm = _ReadonlyLLM([approval])
 
     result = verify_delivery_plan(
@@ -2677,8 +2691,8 @@ def test_verification_identity_changes_with_required_reviewer_llm(
 def test_integration_review_parser_accepts_exact_final_control_object() -> None:
     output = (
         "The candidate is coherent.\n"
-        '{"schema_version":1,"disposition":"approved",'
-        '"summary":"No blocking integration issues found.","findings":[]}'
+        '{"schema_version":2,"disposition":"approved",'
+        '"summary":"No blocking integration issues found.","findings":[],"obligation_results":[]}'
     )
 
     assessment = parse_delivery_integration_review(output, known_unit_ids={"unit"})
@@ -2788,16 +2802,14 @@ def test_integration_review_prompt_renders_exact_current_obligation_ids(tmp_path
     "output",
     [
         "",
-        'Decision: {"schema_version":1,"disposition":"approved","summary":"Clear.","findings":[]}',
-        '{"schema_version":1,"disposition":"approved","summary":"Clear.","findings":[]} trailing',
-        '{"schema_version":1,"disposition":"approved","summary":"Clear.",'
-        '"findings":[{"code":"x","summary":"Issue.","unit_ids":["unit"]}]}',
-        '{"schema_version":1,"disposition":"repair_required","summary":"Needs repair.","findings":[]}',
-        '{"schema_version":1,"disposition":"repair_required","summary":"Needs repair.",'
-        '"findings":[{"code":"x","summary":"Issue.","unit_ids":["unknown"]}]}',
-        '{"schema_version":1,"disposition":[],"summary":"Invalid.","findings":[]}',
-        '{"schema_version":true,"disposition":"approved","summary":"Invalid.","findings":[]}',
-        '{"schema_version":1.0,"disposition":"approved","summary":"Invalid.","findings":[]}',
+        'Decision: {"schema_version":2,"disposition":"approved","summary":"Clear.","findings":[],"obligation_results":[]}',
+        '{"schema_version":2,"disposition":"approved","summary":"Clear.","findings":[],"obligation_results":[]} trailing',
+        '{"schema_version":2,"disposition":"approved","summary":"Clear.","findings":[{"code":"x","summary":"Issue.","unit_ids":["unit"],"obligation_ids":[]}],"obligation_results":[]}',
+        '{"schema_version":2,"disposition":"repair_required","summary":"Needs repair.","findings":[],"obligation_results":[]}',
+        '{"schema_version":2,"disposition":"repair_required","summary":"Needs repair.","findings":[{"code":"x","summary":"Issue.","unit_ids":["unknown"],"obligation_ids":[]}],"obligation_results":[]}',
+        '{"schema_version":2,"disposition":[],"summary":"Invalid.","findings":[],"obligation_results":[]}',
+        '{"schema_version":true,"disposition":"approved","summary":"Invalid.","findings":[],"obligation_results":[]}',
+        '{"schema_version":2.0,"disposition":"approved","summary":"Invalid.","findings":[],"obligation_results":[]}',
     ],
 )
 def test_integration_review_parser_fails_closed(output: str) -> None:
@@ -2809,8 +2821,7 @@ def test_integration_review_agent_retries_one_malformed_response(tmp_path: Path)
     llm = _ReadonlyLLM(
         [
             "APPROVED",
-            '{"schema_version":1,"disposition":"approved",'
-            '"summary":"No blocking integration issues found.","findings":[]}',
+            '{"schema_version":2,"disposition":"approved","summary":"No blocking integration issues found.","findings":[],"obligation_results":[]}',
         ]
     )
     agent = DeliveryIntegrationReviewAgent(llm, {})
@@ -2867,7 +2878,9 @@ def test_integration_review_agent_applies_project_specific_rules(
     rules_path = tmp_path / f"{agent_name}-rules.md"
     rules_path.write_text(rule_text, encoding="utf-8")
     config = {agent_name: {"extra_rules": rules_path.name}}
-    llm = _ReadonlyLLM(['{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'])
+    llm = _ReadonlyLLM(
+        ['{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],"obligation_results":[]}']
+    )
 
     DeliveryIntegrationReviewAgent(llm, config).review(
         cwd=tmp_path,
@@ -2930,7 +2943,9 @@ def test_integration_review_agent_rejects_narrow_read_scope_before_provider(tmp_
 def test_integration_review_prompt_declares_configured_read_paths(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     config = {"sandbox": {"allowed_read_paths": ["."]}}
-    llm = _ReadonlyLLM(['{"schema_version":1,"disposition":"approved","summary":"Complete.","findings":[]}'])
+    llm = _ReadonlyLLM(
+        ['{"schema_version":2,"disposition":"approved","summary":"Complete.","findings":[],"obligation_results":[]}']
+    )
 
     DeliveryIntegrationReviewAgent(llm, config).review(
         cwd=tmp_path,

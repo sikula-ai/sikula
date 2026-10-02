@@ -276,14 +276,12 @@ be published per verification node (one for root-only plans). External dependenc
 stops do not become permission to invent replacement work. Rerun `delivery run`
 to resume an interrupted repair or continue after a unit/time bound.
 `delivery finalize` never invokes an LLM and
-requires a current pass whenever the final-gate policy applies. Existing legacy
-plans retain their direct-finalization behavior.
+requires a current passing final gate for every delivery plan.
 
 During normal preparation, the LLM can also place intermediate integration
 checkpoints where downstream work depends on a coherent completed group.
 `delivery run` verifies these groups, performs eligible bounded repair, and
 re-verifies before releasing dependent units. `run-next` cannot bypass the barrier.
-Checkpoint plans use schema version 3; small root-only plans keep version 2.
 `delivery status` distinguishes an accepted historical checkpoint handoff from the
 root pass for the exact final candidate. Each checkpoint has its own persistent
 repair budget. Nested hierarchy and large-plan scaling remain later work: this

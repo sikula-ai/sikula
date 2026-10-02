@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from core.state import JsonStateStore
+from tests.delivery_fixtures import link_delivery_parent
 
 _sikula = importlib.import_module("sikula")
 _resolve_task_path = _sikula._resolve_task_path
@@ -4526,6 +4527,9 @@ class TestCmdRunChildDeliveryMetadata:
                 worktree_base=str(worktree),
             )
         )
+        linked = store.load("assembled-scope")
+        link_delivery_parent(linked, project_root)
+        store.save(linked)
         cfg = _run_cfg(project_root)
         cfg["sandbox"]["allowed_write_paths"] = ["src/"]
 
@@ -4584,6 +4588,9 @@ class TestCmdRunChildDeliveryMetadata:
                 worktree_base=str(worktree),
             )
         )
+        linked = store.load("retargeted-scope")
+        link_delivery_parent(linked, project_root)
+        store.save(linked)
         cfg = _run_cfg(project_root)
         cfg["sandbox"]["allowed_write_paths"] = ["src/"]
 
@@ -4646,6 +4653,9 @@ class TestCmdRunChildDeliveryMetadata:
             worktree_base=str(worktree),
         )
         store.save(state)
+        linked = store.load("pending-scope-audit")
+        link_delivery_parent(linked, project_root)
+        store.save(linked)
         cfg = _run_cfg(project_root)
         cfg["sandbox"]["allowed_write_paths"] = ["."]
         build_calls = 0
@@ -4850,13 +4860,6 @@ class TestCmdRunChildDeliveryMetadata:
 
     def test_cmd_run_resume_preserves_existing_delivery_metadata(self, tmp_path: Path) -> None:
         from core.state import TaskState
-        from tests.test_delivery_plan import _base_plan, _git_init, _write_plan
-
-        _git_init(tmp_path)
-        data = _base_plan(tmp_path)
-        data["plan_id"] = "preserved-plan"
-        parent = _write_plan(tmp_path, data)
-        parent.rename(tmp_path / ".sikula/delivery/preserved.yaml")
 
         state_dir = tmp_path / ".sikula" / "state"
         store = JsonStateStore(state_dir)
@@ -4873,6 +4876,7 @@ class TestCmdRunChildDeliveryMetadata:
             delivery_effective_write_paths=["core/state.py"],
             delivery_effective_write_exact_file_paths=[],
         )
+        link_delivery_parent(state, tmp_path)
         store.save(state)
         captured: dict = {}
 
@@ -4946,6 +4950,7 @@ class TestCmdRunChildDeliveryMetadata:
             delivery_effective_write_paths=effective_paths,
             delivery_effective_write_exact_file_paths=[],
         )
+        link_delivery_parent(state, tmp_path)
         store.save(state)
         cfg = _run_cfg(tmp_path)
         cfg["sandbox"]["allowed_write_paths"] = configured_paths
@@ -4959,10 +4964,15 @@ class TestCmdRunChildDeliveryMetadata:
         assert exc_info.value.code == 1
         build_orchestrator.assert_not_called()
         output = capsys.readouterr().out
-        assert expected_code in output
+        malformed_snapshot = expected_code == "delivery_write_scope.snapshot_invalid"
+        assert ("delivery_checkpoint.evidence_unavailable" if malformed_snapshot else expected_code) in output
         assert str(tmp_path) not in output
         loaded = store.load("badscope1")
         assert loaded is not None
+        if malformed_snapshot:
+            assert not loaded.failed
+            assert loaded.history == state.history
+            return
         assert loaded.failed is True
         assert loaded.worktree_path is None
         assert loaded.history[-1]["action"] == "delivery_write_scope_invalid"

@@ -218,18 +218,37 @@ def _check_delivery_checkpoint_resume(cfg: dict, state) -> bool:
     from core.delivery_progress import get_delivery_status
     from sikula_cli.config import _original_project_root_from_worktree
 
-    if not (state.delivery_plan_id and state.delivery_unit_id and state.delivery_plan_path):
-        return True  # Legacy tasks without a persisted parent path predate checkpoints.
+    if all(value is None for value in (state.delivery_plan_id, state.delivery_unit_id, state.delivery_plan_path)):
+        return True
     root = Path(cfg["project"]["root_path"]).resolve()
     root = _original_project_root_from_worktree(root) or root
     try:
+        from core.delivery_constraint_context import parse_delivery_constraint_context
+        from core.delivery_write_scope import validate_delivery_write_scope_snapshot
+        from core.delivery_handoff import SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION
+
+        parse_delivery_constraint_context(state)
+        scope = validate_delivery_write_scope_snapshot(
+            project_root=root,
+            schema_version=state.delivery_write_scope_schema_version,
+            mode=state.delivery_write_scope_mode,
+            declared_paths=state.delivery_declared_write_paths,
+            declared_exact_file_paths=state.delivery_declared_write_exact_file_paths,
+            effective_paths=state.delivery_effective_write_paths,
+            effective_exact_file_paths=state.delivery_effective_write_exact_file_paths,
+            validate_current_paths=False,
+        )
+        if (
+            scope is None
+            or type(state.delivery_handoff_schema_version) is not int
+            or state.delivery_handoff_schema_version != SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION
+        ):
+            raise ValueError("Delivery child authority unavailable")
         path = (root / state.delivery_plan_path).resolve()
         path.relative_to(root)
         status = get_delivery_status(path, project_root=root)
         if not status.valid or status.plan is None or status.plan.plan_id != state.delivery_plan_id:
             raise ValueError("Parent authority unavailable")
-        if not status.plan.checkpoints:
-            return True
         unit = next((unit for unit in status.units if unit.id == state.delivery_unit_id), None)
         if unit is None or unit.child_task_id != state.task_id:
             raise ValueError("Parent child binding unavailable")

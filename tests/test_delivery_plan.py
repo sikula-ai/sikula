@@ -24,6 +24,7 @@ from core.delivery_plan import (
 from core.delivery_obligations import delivery_authority_fragments
 from sikula import main
 from sikula_cli.delivery import cmd_delivery_check
+from tests.delivery_fixtures import delivery_source
 
 
 def test_delivery_cli_module_imports() -> None:
@@ -64,7 +65,9 @@ def _base_plan(root: Path) -> dict:
     unit_1 = _write_unit(root, "01-domain.md")
     unit_2 = _write_unit(root, "02-api.md")
     return {
-        "schema_version": 1,
+        "source_task": delivery_source(root),
+        "verification": {"mode": "final_gate"},
+        "schema_version": 2,
         "plan_id": "checkout-redesign",
         "title": "Checkout redesign",
         "planning_mode": "fixed_window",
@@ -736,6 +739,7 @@ def test_delivery_plan_check_rejects_obligations_without_schema_v2_final_gate(tm
     source_text = "# Goal\n\nDeliver checkout behavior.\n"
     data = _base_plan(tmp_path)
     data["source_task"] = _write_source_task(tmp_path, source_text)
+    data.pop("verification")
     data["obligations"] = [
         {
             "id": "deliver-checkout",
@@ -807,7 +811,7 @@ def test_delivery_check_omits_obligations_with_unvalidated_sources(
 @pytest.mark.parametrize(
     ("schema_version", "verification", "expected_code"),
     [
-        (1, {"mode": "final_gate"}, "verification.schema_version_required"),
+        (1, {"mode": "final_gate"}, "schema_version.unsupported"),
         (2, None, "verification.required"),
         (2, {"mode": "unknown"}, "verification.mode_invalid"),
         (2, {"mode": "final_gate", "extra": True}, "verification.keys_invalid"),
@@ -824,8 +828,7 @@ def test_delivery_plan_check_rejects_invalid_verification_policy(
     data["schema_version"] = schema_version
     if schema_version == 2:
         data["source_task"] = _write_source_task(tmp_path)
-    if verification is not None:
-        data["verification"] = verification
+    data["verification"] = verification
     plan_path = _write_plan(tmp_path, data)
 
     result = check_delivery_plan_file(plan_path)

@@ -115,7 +115,7 @@ def build_delivery_unit_handoff(
         or isinstance(schema_version, bool)
         or schema_version != SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION
     ):
-        raise DeliveryHandoffError("child task does not opt in to the supported delivery handoff schema")
+        raise DeliveryHandoffError("child task requires the supported delivery handoff schema")
 
     unit_id = _required_unit_identifier(getattr(selected_unit, "id", None), "unit_id")
     validation_records = _required_list(getattr(child_state, "validation_cycle_records", None), "validation records")
@@ -306,6 +306,16 @@ def load_delivery_dependency_handoffs(
         if dependency.id not in dependency_ids or dependency.status != "done":
             continue
         if dependency.handoff_schema_version is None and dependency.handoff_fingerprint is None:
+            if dependency.child_task_id is None:
+                # Explicit completion without child execution has no child handoff.
+                continue
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery.dependency_handoff_missing",
+                    f"Dependency unit {dependency.id} has no required child handoff evidence.",
+                )
+            )
             continue
         if dependency.handoff_schema_version != SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION:
             errors.append(

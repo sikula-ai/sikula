@@ -252,6 +252,7 @@ def test_preview_delivery_run_handles_completed_plan(
     expected_code: str,
     expected_completed: bool,
 ) -> None:
+    monkeypatch.setattr("core.delivery_finalize._final_verification_issue", lambda *args: None)
     status = _status(["done"], final_commit="a" * 40)
     if not expected_completed:
         status.finalized_at = None
@@ -290,6 +291,7 @@ def test_preview_delivery_run_handles_completed_plan(
 def test_preview_delivery_run_keeps_finalize_blocker_when_recorded_branch_diverged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("core.delivery_finalize._final_verification_issue", lambda *args: None)
     status = _status(["done"], final_commit="a" * 40)
     issue = DeliveryPlanIssue(
         "error",
@@ -383,6 +385,7 @@ def test_current_finalization_requires_recorded_branch_to_match_plan(
 
 
 def test_current_finalization_rejects_symbolic_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("core.delivery_finalize._final_verification_issue", lambda *args: None)
     status = _status(["done"], final_commit="a" * 40)
     monkeypatch.setattr(
         "core.delivery_finalize.delivery_assembly_branch_is_symbolic",
@@ -467,6 +470,7 @@ def test_delivery_run_stops_successfully_at_unit_limit(monkeypatch: pytest.Monke
 
 
 def test_current_finalization_fails_closed_when_git_lookup_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("core.delivery_finalize._final_verification_issue", lambda *args: None)
     status = _status(["done"], final_commit="a" * 40)
 
     def fail_lookup(*args, **kwargs):
@@ -764,6 +768,7 @@ def test_repair_blocker_takes_precedence_over_resumable_limit(
 def test_finalize_delivery_run_routes_current_finalization_through_finalizer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("core.delivery_finalize._final_verification_issue", lambda *args: None)
     status = _status(["done"], final_commit="a" * 40)
     seen: list[str] = []
     monkeypatch.setattr(

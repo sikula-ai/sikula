@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.delivery_fixtures import bind_delivery_child
+
 import os
 import subprocess
 import stat
@@ -614,12 +616,13 @@ def _save_state(orch: Orchestrator, **kwargs) -> TaskState:
 
 
 def _scoped_delivery_state(orch: Orchestrator, effective_paths: list[str]) -> TaskState:
-    return _save_state(
+    state = _save_state(
         orch,
         implementation_prompt="implement scoped delivery unit",
         plan_decided=True,
         delivery_plan_id="delivery-plan",
         delivery_unit_id="scoped-unit",
+        delivery_plan_path=".sikula/delivery/plan.yaml",
         delivery_write_scope_schema_version=2,
         delivery_write_scope_mode="unit_explicit",
         delivery_declared_write_paths=list(effective_paths),
@@ -627,6 +630,10 @@ def _scoped_delivery_state(orch: Orchestrator, effective_paths: list[str]) -> Ta
         delivery_effective_write_paths=list(effective_paths),
         delivery_effective_write_exact_file_paths=[],
     )
+
+    bind_delivery_child(state, orch._config.project_root, preserve_scope=True)
+    orch._store.save(state)
+    return state
 
 
 def _delivery_disposition(disposition: str) -> DeliveryDisposition:

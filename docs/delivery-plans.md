@@ -228,9 +228,8 @@ obligations and missing owners; one obligation-only repair may apply only those
 gaps before a second verification. Unknown fragments, unknown or superseded
 owners, duplicate IDs, unresolved dispositions, and a second incomplete result
 block publication. `plan.yaml` stores obligation identities, bounded summaries,
-provenance references, and owners, not source excerpts. Obligations require a
-schema-version-2 or schema-version-3 plan with `verification.mode: final_gate`; existing plans
-without this additive list remain readable.
+provenance references, and owners, not source excerpts. Hand-authored plans may
+omit the obligations list.
 
 Fresh authoring also requires `source_accounting`: exactly one record per source
 fragment, with `source_fragment_id`, a `mapped`, `context_only`, or `unresolved`
@@ -243,7 +242,7 @@ unresolved records cannot publish. The plan retains only the mapping and
 Every plan with non-empty `obligations` must include exhaustive `source_accounting`,
 including hand-authored and edited plans. Omitting it reports
 `source_accounting.required` and blocks checking, verification, and finalization.
-Existing plans without obligations retain their legacy interpretation without
+Current plans without obligations remain valid without
 source accounting; they do not acquire fabricated coverage. Accounting changes alter the plan
 fingerprint and invalidate incompatible final-gate evidence.
 
@@ -400,8 +399,9 @@ Independent verification checks that those contracts collectively preserve the
 target unit's entire contribution. Other owners retain their unchanged contributions;
 replacements of a sole owner must cover the whole outcome. Apply preserves other owners, obligation identity, summary, and source
 provenance. The mapping is fingerprinted in the proposal and validated again on
-load/apply; unknown or missing owners cannot publish. Legacy proposals without
-this additive mapping retain their original all-replacements interpretation.
+load/apply; unknown or missing owners cannot publish. A proposal without explicit
+assignments for its applicable obligations is rejected rather than assigning every
+replacement automatically.
 Hard constraints still apply to every affected replacement. Uncertain, omitted,
 or conflicting outcomes block the proposal.
 Proposal publication uses a same-directory temporary file and atomic
@@ -795,7 +795,7 @@ After child execution starts, it records the terminal unit status as `done` or
 `failed`.
 It accepts the same per-agent `--agent-model`, `--agent-provider`, and
 `--agent-timeout` overrides as `sikula run` and passes them to the child run.
-When starting the child run, Sikula automatically configures and persists the parent delivery metadata in the child's `TaskState` (specifically the parent `delivery_plan_id`, `delivery_unit_id`, a project-relative `delivery_plan_path`, the effective `delivery_unit_budget`, the current `delivery_handoff_schema_version`, and validated `delivery_dependency_handoffs`). It also snapshots the inherited constraints assigned to the unit and validates that fingerprinted context independently before the Analyst, Implementer, Reviewer, or Security Reviewer invokes a provider. A malformed modern snapshot fails closed; legacy child state remains compatible. After assembled-worktree or resume validation, Sikula separately persists the actual runtime-effective production scope. Amendment evidence validates that narrower value against the preserved authoritative child worktree when present instead of resolving it against the operator checkout or presenting the creation-time upper bound as writable.
+When starting the child run, Sikula automatically configures and persists the parent delivery metadata in the child's `TaskState` (specifically the parent `delivery_plan_id`, `delivery_unit_id`, a project-relative `delivery_plan_path`, the effective `delivery_unit_budget`, the current `delivery_handoff_schema_version`, and validated `delivery_dependency_handoffs`). It also snapshots the inherited constraints assigned to the unit and validates that fingerprinted context independently before the Analyst, Implementer, Reviewer, or Security Reviewer invokes a provider. Every delivery child requires the parent path, source binding and captured constraint/write-scope snapshots; missing or malformed authority fails closed. After assembled-worktree or resume validation, Sikula separately persists the actual runtime-effective production scope. Amendment evidence validates that narrower value against the preserved authoritative child worktree when present instead of resolving it against the operator checkout or presenting the creation-time upper bound as writable.
 
 Explicit unit `scope_paths` must retain their lexical project identity. Sikula rejects a
 symlinked declared root, a declared path below a symlinked prefix, or an assembled
@@ -896,9 +896,9 @@ current unit task remains the scope authority. A missing, malformed, stale, or
 mismatched referenced handoff, including a symlink or path outside the project
 root, blocks before child creation. Correlation includes the current plan's unit
 title, component, dependencies, and scope paths so edited plan metadata cannot
-silently reuse stale evidence. Progress and child states created by older Sikula
-versions have no handoff schema marker; they remain compatible and continue
-without fabricated handoff context. If writing a new handoff fails after the
+silently reuse stale evidence. Every completed unit linked to a child task requires
+a handoff marker and artifact. An explicitly completed unit without child execution
+may omit them; it does not acquire fabricated handoff evidence. If writing a new handoff fails after the
 child completed, the parent unit is durably persisted as `running`; rerunning
 ordinary `delivery run-next` retries terminal reconciliation without rerunning
 the child agents, including after a `--reset-failed` attempt.
@@ -968,10 +968,9 @@ decisions, then rerun `delivery run`.
 Reaching a unit or elapsed limit is a successful stop when work can resume.
 An exhausted integration repair budget or terminal repair blocker remains an
 error even if the invocation has also reached its unit or elapsed limit.
-For a schema-version-2 or schema-version-3 plan that becomes `done`, the coordinator first
-runs the required final integration gate and finalizes only its passing exact
-candidate. Rerunning an already current
-finalized plan is idempotent and does not append another finalization event.
+When a plan becomes `done`, the coordinator runs the required final integration
+gate and finalizes only the exact candidate that passed. Rerunning an already
+current finalized plan is idempotent and does not append another finalization event.
 `--dry-run` previews the next unit, verification, or finalization preflight without creating
 state, worktrees, commits, or refs. `--json` emits one compact aggregate
 document; child JSON is kept on stderr rather than nested into the public
@@ -1052,7 +1051,8 @@ Repair also validates referenced dependency handoffs with the same checks as
 child execution, before reserving each authoring attempt and throughout
 publication and resume. Missing or invalid handoffs stop repair without spending
 another authoring attempt; restoring the matching evidence permits recovery.
-Completed legacy units without handoff references remain compatible.
+Explicitly completed units without child execution may omit handoff references.
+Completed units linked to child tasks require valid handoff evidence.
 
 Verify a completed assembled candidate explicitly:
 
@@ -1138,42 +1138,28 @@ sikula delivery finalize .sikula/delivery/<slug>/plan.yaml --dry-run
 sikula delivery finalize .sikula/delivery/<slug>/plan.yaml --dry-run --json
 ```
 
-Create or fast-forward the plan's final branch:
+Record the verified candidate as finalized:
 
 ```bash
 sikula delivery finalize .sikula/delivery/<slug>/plan.yaml
 sikula delivery finalize .sikula/delivery/<slug>/plan.yaml --json
 ```
 
-`finalize` requires the delivery plan status to be `done`. For legacy
-schema-version-1 plans it reconciles completed unit results through
-the same dependency-ordered assembly engine. The assembled branch commit,
-rather than the operator's current `HEAD`, becomes the final commit. Existing
-diverged or checked-out branches are rejected. A branch ahead of the assembly
-base is trusted only when progress records an expected assembled commit;
-otherwise it is treated as stale and rejected. Sikula never force-updates these
-branches. For schema-version-2 and schema-version-3 plans, finalize performs no assembly, validation,
-or provider call: it accepts only the exact candidate with current passing gate
-evidence, revalidates the final branch immediately before recording finalization,
-and otherwise recommends `delivery verify`. No-op legacy plans retain
-the recorded assembly base. Like `run-next`,
-`finalize` loads project runtime config because it mutates Git refs and parent
-delivery progress. `--dry-run` validates static ref and commit preconditions
-without writing refs, Git objects, or progress. A newly encountered merge
-conflict is conclusively reported by the mutating command. Once recorded,
-however, that conflict also blocks later `run-next --dry-run` and
-`finalize --dry-run` previews until `final_branch` advances to a resolution
-containing both the prior assembled commit and the blocked unit commit. When
-pending assembly must create a new commit, the dry-run remains ready but
-reports `final_commit: null` because that commit ID is not available without
-creating the Git object.
+`finalize` requires the delivery plan status to be `done` and a current passing
+final gate. It performs no assembly, validation or provider call: it accepts only
+the exact verified candidate and revalidates the final branch immediately before
+recording finalization. Otherwise it recommends `delivery verify`, which owns
+assembly reconciliation and verification. `finalize` loads project runtime config
+to validate the effective verification identity. `--dry-run` performs the same
+checks without writing refs, Git objects or progress.
+
 Any later unit progress update clears the recorded final branch metadata, so an
 extended or rerun delivery plan must be finalized again after it returns to
 `done`.
 
 The validator checks:
 
-- legacy `schema_version: 1`, or `schema_version: 2` / `3` with the required recognized
+- `schema_version: 2` / `3` with the required recognized
   `verification.mode: final_gate` policy,
 - required plan metadata such as `plan_id`, `title`, and a valid local-branch
   `final_branch`,
@@ -1185,6 +1171,9 @@ The validator checks:
 - optional stream references,
 - optional monorepo component references and project-relative scope paths,
 - single-repository scope.
+
+Unsupported delivery formats are rejected. Prepare a new plan from the source
+task instead of changing only the schema number.
 
 `delivery status` first runs the same plan validation, then reads ignored parent
 progress from `.sikula/state/delivery/<plan-id>/progress.json` when present. If

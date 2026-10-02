@@ -16,6 +16,7 @@ from core.delivery_handoff import delivery_unit_handoff_path, read_delivery_unit
 from core.delivery_obligations import delivery_authority_fragments
 from core.state import JsonStateStore
 from sikula import main
+from tests.delivery_fixtures import delivery_source
 
 
 def _write_delivery_unit(root: Path, name: str, body: str) -> str:
@@ -204,7 +205,8 @@ def _write_delivery_stop_fixture(
     plan_path = _write_delivery_plan(
         root,
         {
-            "schema_version": 1,
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": plan_id,
             "title": "Delivery boundary stop smoke",
             "final_branch": f"sikula/delivery/{plan_id}",
@@ -1039,7 +1041,9 @@ def test_delivery_check_cli_validates_plan_without_project_config(
     plan_path = _write_delivery_plan(
         git_project,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(git_project),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "delivery-smoke",
             "title": "Delivery smoke",
             "planning_mode": "fixed_window",
@@ -1086,7 +1090,9 @@ def test_delivery_status_cli_reports_pending_units_without_project_config(
     plan_path = _write_delivery_plan(
         git_project,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(git_project),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "delivery-status-smoke",
             "title": "Delivery status smoke",
             "final_branch": "sikula/delivery/delivery-status-smoke",
@@ -1140,7 +1146,9 @@ def test_delivery_run_next_dry_run_reports_selected_unit_with_project_config(
     plan_path = _write_delivery_plan(
         git_project,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(git_project),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "delivery-run-next-smoke",
             "title": "Delivery run-next smoke",
             "final_branch": "sikula/delivery/delivery-run-next-smoke",
@@ -1208,7 +1216,9 @@ def test_delivery_run_next_handoff_flows_between_dependent_children(
     plan_path = _write_delivery_plan(
         git_project,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(git_project),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "delivery-handoff-smoke",
             "title": "Delivery handoff smoke",
             "final_branch": "sikula/delivery/delivery-handoff-smoke",
@@ -1326,7 +1336,9 @@ def test_delivery_child_cannot_publish_an_escaping_scope_symlink(
     plan_path = _write_delivery_plan(
         git_project,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(git_project),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": plan_id,
             "title": "Assembled scope smoke",
             "final_branch": f"sikula/delivery/{plan_id}",
@@ -1435,7 +1447,9 @@ def test_delivery_child_rejects_in_project_scope_alias_created_by_dependency(
     plan_path = _write_delivery_plan(
         git_project,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(git_project),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": plan_id,
             "title": "Internal scope alias smoke",
             "final_branch": f"sikula/delivery/{plan_id}",
@@ -2062,7 +2076,9 @@ def test_delivery_run_executes_and_finalizes_two_unit_plan(
     plan_path = _write_delivery_plan(
         git_project,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(git_project),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "delivery-run-smoke",
             "title": "Delivery run smoke",
             "final_branch": "sikula/delivery/delivery-run-smoke",
@@ -2106,6 +2122,24 @@ def test_delivery_run_executes_and_finalizes_two_unit_plan(
             },
         ]
     )
+    original_readonly = fake.run_readonly_agent
+    gate_calls = []
+
+    def readonly(prompt: str, cwd: Path) -> str:
+        if "Review whether the complete assembled candidate" in prompt:
+            gate_calls.append(prompt)
+            return json.dumps(
+                {
+                    "schema_version": 2,
+                    "disposition": "approved",
+                    "summary": "Integration verified.",
+                    "findings": [],
+                    "obligation_results": [],
+                }
+            )
+        return original_readonly(prompt, cwd)
+
+    fake.run_readonly_agent = readonly
     relative_plan = plan_path.relative_to(git_project).as_posix()
     progress_path = git_project / ".sikula" / "state" / "delivery" / "delivery-run-smoke" / "progress.json"
     final_ref = "refs/heads/sikula/delivery/delivery-run-smoke"
@@ -2149,6 +2183,7 @@ def test_delivery_run_executes_and_finalizes_two_unit_plan(
         text=True,
     ).stdout.strip()
 
+    assert len(gate_calls) == 1
     assert payload["succeeded"] is True
     assert payload["completed"] is True
     assert payload["finalized"] is True
@@ -2358,7 +2393,9 @@ def test_delivery_budget_split_applies_to_assembly_and_runs_replacement(
     plan_path = _write_delivery_plan(
         project_root,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(project_root),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "delivery-budget-split-smoke",
             "title": "Delivery budget split smoke",
             "final_branch": "sikula/delivery/delivery-budget-split-smoke",
@@ -2575,15 +2612,21 @@ def test_delivery_budget_split_applies_to_assembly_and_runs_replacement(
 
 def test_delivery_finalize_dry_run_reports_final_branch_with_project_config(
     git_project: Path,
+    fake_llm,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    _write_handoff_smoke_config(git_project)
+    config_path = git_project / ".sikula/config.yaml"
+    _git_commit_file(git_project, ".sikula/config.yaml", config_path.read_text(encoding="utf-8"))
     commit = _git_commit_file(git_project, "feature.txt", "feature\n")
     unit_1 = _write_delivery_unit(git_project, "01-foundation.md", "# Unit 01\n\nAdd foundation.\n")
     plan_path = _write_delivery_plan(
         git_project,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(git_project),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "delivery-finalize-smoke",
             "title": "Delivery finalize smoke",
             "final_branch": "sikula/delivery/delivery-finalize-smoke",
@@ -2609,8 +2652,28 @@ def test_delivery_finalize_dry_run_reports_final_branch_with_project_config(
         ),
         encoding="utf-8",
     )
-    _write_project_config(git_project)
     monkeypatch.chdir(git_project)
+
+    fake = fake_llm(
+        readonly_response=json.dumps(
+            {
+                "schema_version": 2,
+                "disposition": "approved",
+                "summary": "Integration verified.",
+                "findings": [],
+                "obligation_results": [],
+            }
+        )
+    )
+    with (
+        patch("core.llm_client.create_llm_client", return_value=fake),
+        patch(
+            "sys.argv",
+            ["sikula", "delivery", "verify", str(plan_path), "--json"],
+        ),
+    ):
+        main()
+    assert json.loads(capsys.readouterr().out)["succeeded"] is True
 
     with patch(
         "sys.argv",
@@ -2624,7 +2687,12 @@ def test_delivery_finalize_dry_run_reports_final_branch_with_project_config(
     assert payload["finalized"] is False
     assert payload["final_branch"] == "sikula/delivery/delivery-finalize-smoke"
     assert payload["final_commit"] == commit
-    assert not (git_project / ".git" / "refs" / "heads" / "sikula" / "delivery" / "delivery-finalize-smoke").exists()
+    assert (
+        subprocess.check_output(
+            ["git", "rev-parse", "sikula/delivery/delivery-finalize-smoke"], cwd=git_project, text=True
+        ).strip()
+        == commit
+    )
 
 
 def test_delivery_commands_ignore_malformed_project_config(
@@ -2636,7 +2704,9 @@ def test_delivery_commands_ignore_malformed_project_config(
     plan_path = _write_delivery_plan(
         git_project,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(git_project),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "delivery-config-independent",
             "title": "Delivery config independent",
             "final_branch": "sikula/delivery/config-independent",
@@ -2676,7 +2746,9 @@ def test_delivery_check_cli_reports_invalid_plan_as_json(
     plan_path = _write_delivery_plan(
         git_project,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(git_project),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "delivery-smoke-invalid",
             "title": "Delivery smoke invalid",
             "final_branch": "sikula/delivery/delivery-smoke-invalid",
@@ -2723,7 +2795,8 @@ def test_delivery_check_json_does_not_project_verbatim_source_constraint(
     plan_path = _write_delivery_plan(
         git_project,
         {
-            "schema_version": 1,
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "delivery-private-constraint",
             "title": "Delivery private constraint",
             "final_branch": "sikula/delivery/private-constraint",

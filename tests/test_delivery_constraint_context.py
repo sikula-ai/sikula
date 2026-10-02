@@ -63,8 +63,8 @@ def _assert_error(state: TaskState, code: str) -> None:
     assert exc_info.value.code == code
 
 
-def test_legacy_state_has_no_constraint_prompt_context() -> None:
-    state = TaskState(task_id="legacy", task_description="Legacy child")
+def test_standalone_state_has_no_constraint_prompt_context() -> None:
+    state = TaskState(task_id="standalone", task_description="Standalone task")
 
     assert parse_delivery_constraint_context(state) is None
     assert delivery_constraint_prompt_context(state) == ""
@@ -72,7 +72,6 @@ def test_legacy_state_has_no_constraint_prompt_context() -> None:
 
 def test_explicit_empty_modern_context_is_rendered() -> None:
     state = _state(constraints=[])
-    state.delivery_source_task = None
     _refresh_fingerprint(state)
 
     rendered = delivery_constraint_prompt_context(state)
@@ -85,7 +84,7 @@ def test_explicit_empty_modern_context_is_rendered() -> None:
         "plan_id": "plan-1",
         "plan_path": ".sikula/delivery/plan-1/plan.yaml",
         "schema_version": 1,
-        "source_task": None,
+        "source_task": state.delivery_source_task,
         "unit_id": "unit-1",
     }
 
@@ -128,16 +127,12 @@ def test_context_preserves_plan_valid_legacy_unit_ids_and_projects_only_the_prom
         assert unit_id not in rendered
 
 
-def test_omitted_unsafe_parent_plan_path_remains_valid_and_fingerprinted() -> None:
+def test_missing_parent_plan_path_is_rejected_even_with_valid_fingerprint() -> None:
     state = _state()
     state.delivery_plan_path = None
     _refresh_fingerprint(state)
 
-    context = parse_delivery_constraint_context(state)
-
-    assert context is not None
-    assert context.plan_path is None
-    assert '"plan_path":null' in delivery_constraint_prompt_context(state)
+    _assert_error(state, "delivery_constraint_context.plan_path_missing")
 
 
 def test_prompt_projection_is_deterministic_and_separates_authority_from_evidence() -> None:
@@ -162,7 +157,6 @@ def test_unversioned_constraint_data_is_rejected() -> None:
 
 def test_removed_modern_context_is_rejected_by_fingerprint() -> None:
     state = _state()
-    state.delivery_source_task = None
     state.delivery_inherited_constraints = []
 
     _assert_error(state, "delivery_constraint_context.fingerprint_mismatch")
@@ -223,8 +217,9 @@ def test_invalid_source_task_binding_is_rejected(source_task: dict, code: str) -
     _assert_error(state, code)
 
 
-def test_constraints_require_source_task_binding() -> None:
-    state = _state()
+@pytest.mark.parametrize("has_constraints", [False, True])
+def test_delivery_context_requires_source_task_binding(has_constraints: bool) -> None:
+    state = _state() if has_constraints else _state(constraints=[])
     state.delivery_source_task = None
 
     _assert_error(state, "delivery_constraint_context.source_task_missing")

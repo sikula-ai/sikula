@@ -8,7 +8,6 @@ from core.delivery_public_metadata import is_safe_delivery_public_metadata
 
 
 DELIVERY_INTEGRATION_REVIEW_SCHEMA_VERSION = 2
-_LEGACY_DELIVERY_INTEGRATION_REVIEW_SCHEMA_VERSION = 1
 DELIVERY_INTEGRATION_REVIEW_DISPOSITIONS = frozenset(
     {
         "approved",
@@ -117,26 +116,15 @@ def parse_delivery_integration_review(
             "Integration reviewer disposition must be a JSON object.",
         )
     schema_version = payload.get("schema_version")
-    legacy = schema_version == _LEGACY_DELIVERY_INTEGRATION_REVIEW_SCHEMA_VERSION
-    expected_keys = (
-        {"schema_version", "disposition", "summary", "findings"}
-        if legacy
-        else {"schema_version", "disposition", "summary", "findings", "obligation_results"}
-    )
-    if set(payload) != expected_keys:
-        raise DeliveryIntegrationReviewParseError(
-            "delivery_verification.review_keys_invalid",
-            "Integration reviewer disposition fields are invalid.",
-        )
-    if (
-        not isinstance(schema_version, int)
-        or isinstance(schema_version, bool)
-        or schema_version
-        not in {_LEGACY_DELIVERY_INTEGRATION_REVIEW_SCHEMA_VERSION, DELIVERY_INTEGRATION_REVIEW_SCHEMA_VERSION}
-    ):
+    if type(schema_version) is not int or schema_version != DELIVERY_INTEGRATION_REVIEW_SCHEMA_VERSION:
         raise DeliveryIntegrationReviewParseError(
             "delivery_verification.review_schema_unsupported",
             "Integration reviewer disposition schema is unsupported.",
+        )
+    if set(payload) != {"schema_version", "disposition", "summary", "findings", "obligation_results"}:
+        raise DeliveryIntegrationReviewParseError(
+            "delivery_verification.review_keys_invalid",
+            "Integration reviewer disposition fields are invalid.",
         )
     disposition = payload["disposition"]
     if not isinstance(disposition, str) or disposition not in DELIVERY_INTEGRATION_REVIEW_DISPOSITIONS:
@@ -151,24 +139,16 @@ def parse_delivery_integration_review(
             "delivery_verification.review_findings_invalid",
             "Integration reviewer findings must be a bounded list.",
         )
-    if legacy and obligation_ids:
-        raise DeliveryIntegrationReviewParseError(
-            "delivery_verification.review_schema_unsupported",
-            "Source-bound obligations require integration review schema version 2.",
-        )
     findings = [
         _parse_finding(
             value,
             index=index,
             known_unit_ids=known_unit_ids,
             known_obligation_ids=obligation_ids,
-            legacy=legacy,
         )
         for index, value in enumerate(raw_findings)
     ]
-    obligation_results = (
-        [] if legacy else _parse_obligation_results(payload["obligation_results"], known_obligation_ids=obligation_ids)
-    )
+    obligation_results = _parse_obligation_results(payload["obligation_results"], known_obligation_ids=obligation_ids)
     if disposition == "approved" and findings:
         raise DeliveryIntegrationReviewParseError(
             "delivery_verification.review_approval_invalid",
@@ -205,18 +185,8 @@ def _parse_finding(
     index: int,
     known_unit_ids: set[str],
     known_obligation_ids: set[str],
-    legacy: bool,
 ) -> DeliveryIntegrationFinding:
-    expected_fields = (
-        {"code", "summary", "unit_ids"}
-        if legacy
-        else {
-            "code",
-            "summary",
-            "unit_ids",
-            "obligation_ids",
-        }
-    )
+    expected_fields = {"code", "summary", "unit_ids", "obligation_ids"}
     if not isinstance(value, dict) or set(value) != expected_fields:
         raise DeliveryIntegrationReviewParseError(
             "delivery_verification.review_findings_invalid",
@@ -235,7 +205,7 @@ def _parse_finding(
             "delivery_verification.review_findings_invalid",
             f"Integration reviewer finding {index + 1} references invalid units.",
         )
-    obligation_ids = [] if legacy else value["obligation_ids"]
+    obligation_ids = value["obligation_ids"]
     if (
         not isinstance(obligation_ids, list)
         or len(obligation_ids) > MAX_DELIVERY_INTEGRATION_FINDING_UNIT_IDS

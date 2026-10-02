@@ -3873,6 +3873,23 @@ def _run_next_delivery_unit(
                 message="Delivery unit dependencies are not present in the assembled delivery branch.",
             )
 
+        delivery_plan_path = _delivery_plan_metadata_path(status, root)
+        if delivery_plan_path is None:
+            issue = DeliveryPlanIssue(
+                "error",
+                "delivery.parent_path_unavailable",
+                "Delivery child creation requires a project-relative parent plan path.",
+            )
+            return _execution_result_from_status(
+                status,
+                ran=False,
+                selected_unit=selected_unit,
+                progress_path=str(progress_path),
+                events_path=str(events_path),
+                errors=[*errors, issue],
+                message=issue.message,
+            )
+
         progress_before_start = progress
         progress_existed_before_start = progress_path.exists()
         running_unit = make_delivery_unit_progress(selected_unit.id, "running")
@@ -3901,7 +3918,6 @@ def _run_next_delivery_unit(
             except Exception as exc:
                 raise DeliveryChildLinkFailed() from exc
 
-        delivery_plan_path = _delivery_plan_metadata_path(status, root)
         (
             constraint_context_schema_version,
             delivery_source_task,
@@ -4685,6 +4701,8 @@ def _delivery_preview_child_state_issue(
 def _delivery_preview_child_runtime_scope_issue(cfg: dict, child_state):
     """Mirror the non-mutating delivery-scope preflight used by child resume."""
     from core.delivery_plan import DeliveryPlanIssue
+    from core.delivery_constraint_context import DeliveryConstraintContextError, parse_delivery_constraint_context
+    from core.delivery_handoff import SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION
     from core.delivery_write_scope import DeliveryWriteScopeError, apply_delivery_write_scope_to_config
 
     worktree_path = getattr(child_state, "worktree_path", None)
@@ -4697,7 +4715,17 @@ def _delivery_preview_child_runtime_scope_issue(cfg: dict, child_state):
         preview_cfg["sandbox"] = dict(sandbox)
     try:
         apply_delivery_write_scope_to_config(preview_cfg, child_state)
-    except DeliveryWriteScopeError as exc:
+        parse_delivery_constraint_context(child_state)
+        if (
+            type(child_state.delivery_handoff_schema_version) is not int
+            or child_state.delivery_handoff_schema_version != SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION
+        ):
+            return DeliveryPlanIssue(
+                "error",
+                "delivery.handoff_schema_unavailable",
+                "Delivery child resume requires the current handoff schema marker.",
+            )
+    except (DeliveryWriteScopeError, DeliveryConstraintContextError) as exc:
         return DeliveryPlanIssue("error", exc.code, str(exc))
     return None
 
@@ -5600,8 +5628,7 @@ def _record_delivery_child_terminal_result(
     classification = _classify_delivery_child_run(child_result, child_state)
     unit_status = classification.unit_status
     handoff = None
-    handoff_schema_version = getattr(child_state, "delivery_handoff_schema_version", None) if child_state else None
-    if unit_status == "done" and handoff_schema_version is not None:
+    if unit_status == "done":
         try:
             handoff = build_delivery_unit_handoff(
                 plan_id=plan_id,

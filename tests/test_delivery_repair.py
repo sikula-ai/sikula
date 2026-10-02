@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.delivery_fixtures import bind_delivery_child, record_completed_child_handoffs
+
 import argparse
 import copy
 from dataclasses import replace
@@ -1149,9 +1151,11 @@ def _link_execution_evidence(path: Path, tmp_path: Path, *, description: str = _
             delivery_unit_id=unit.unit_id,
             delivery_plan_path=path.relative_to(tmp_path).as_posix(),
         )
+        bind_delivery_child(child, tmp_path, source_task=yaml.safe_load(path.read_text())["source_task"])
         store.save(child)
         linked.append(replace(unit, child_task_id=child.task_id))
     write_delivery_progress(progress_path, replace(progress, units=linked))
+    record_completed_child_handoffs(path, tmp_path, store)
     return store
 
 
@@ -1361,9 +1365,12 @@ def test_uncommitted_contract_requires_execution_evidence(completed_plan, tmp_pa
     path, cfg = completed_plan
     store = JsonStateStore(tmp_path / ".sikula/state")
     if change != "missing_child":
-        store = _link_execution_evidence(
-            path, tmp_path, description="" if change == "missing_description" else _CONTRACT.strip()
-        )
+        store = _link_execution_evidence(path, tmp_path)
+        assert _verify(path, cfg).stop_code == "delivery_verification.repair_required"
+    if change == "missing_description":
+        child = store.load("child-read")
+        child.task_description = ""
+        store.save(child)
     if change == "contract":
         (path.parent / "units/read.md").write_text(_CONTRACT + "\nChanged authority\n", encoding="utf-8")
     before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
@@ -1390,6 +1397,7 @@ def test_changed_executed_contract_blocks_further_repair(
     path, cfg = completed_plan
     before = path.read_bytes()
     store = _link_execution_evidence(path, tmp_path)
+    assert _verify(path, cfg).stop_code == "delivery_verification.repair_required"
 
     def change_evidence() -> None:
         child = store.load("child-read")
@@ -1457,10 +1465,15 @@ def test_completed_child_scope_bounds_repair_even_with_broader_current_config(co
             delivery_effective_write_paths=list(scope.effective_paths),
             delivery_effective_write_exact_file_paths=list(scope.effective_exact_file_paths),
         )
+        bind_delivery_child(
+            child, tmp_path, source_task=yaml.safe_load(path.read_text())["source_task"], preserve_scope=True
+        )
         store.save(child)
         linked.append(replace(unit, child_task_id=child.task_id))
     write_delivery_progress(progress_path, replace(progress, units=linked))
+    record_completed_child_handoffs(path, tmp_path, store)
     # Operator checkout shape must not replace the exact candidate in a dry-run.
+    assert _verify(path, cfg).stop_code == "delivery_verification.repair_required"
     (tmp_path / "src/cache.py").unlink()
     (tmp_path / "src/cache.py").mkdir()
     llm = _LLM(_draft())

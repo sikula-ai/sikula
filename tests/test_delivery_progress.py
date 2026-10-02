@@ -38,6 +38,7 @@ from core.delivery_progress import (
 from core.state import JsonStateStore, TaskState
 from sikula import main
 from sikula_cli.delivery import cmd_delivery_status
+from tests.delivery_fixtures import delivery_source
 
 
 def _git_init(root: Path) -> None:
@@ -55,7 +56,9 @@ def _write_plan(root: Path, data: dict | None = None) -> Path:
     unit_1 = _write_unit(root, "01-foundation.md")
     unit_2 = _write_unit(root, "02-feature.md")
     plan = data or {
-        "schema_version": 1,
+        "source_task": delivery_source(root),
+        "verification": {"mode": "final_gate"},
+        "schema_version": 2,
         "plan_id": "delivery-status-demo",
         "title": "Delivery status demo",
         "planning_mode": "fixed_window",
@@ -149,7 +152,9 @@ def test_delivery_status_redacts_unsafe_metadata_from_public_projection(tmp_path
     plan_path = _write_plan(
         tmp_path,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(tmp_path),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "delivery-status-demo",
             "title": f"Read {private_path}",
             "final_branch": "sikula/delivery/status-demo",
@@ -187,7 +192,9 @@ def test_delivery_status_projects_unsafe_identity_references_consistently(tmp_pa
     plan_path = _write_plan(
         tmp_path,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(tmp_path),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "delivery-status-demo",
             "title": "Delivery status demo",
             "final_branch": "sikula/delivery/status-demo",
@@ -248,7 +255,9 @@ def test_delivery_status_preserves_monorepo_component_metadata(tmp_path: Path) -
     plan_path = _write_plan(
         tmp_path,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(tmp_path),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "delivery-status-demo",
             "title": "Delivery status demo",
             "final_branch": "sikula/delivery/status-demo",
@@ -882,7 +891,7 @@ def test_delivery_status_reports_done_when_all_units_are_done(tmp_path: Path) ->
 
     assert result.valid is True
     assert result.status == "done"
-    assert result.next_action == "finalize delivery branch"
+    assert result.next_action == "verify the assembled delivery with delivery verify"
 
 
 @pytest.mark.parametrize(
@@ -1023,7 +1032,9 @@ def test_unit_progress_update_clears_stale_finalization_metadata(tmp_path: Path)
     plan_path = _write_plan(
         tmp_path,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(tmp_path),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "delivery-status-demo",
             "title": "Delivery status demo",
             "final_branch": "sikula/delivery/status-demo",
@@ -1085,7 +1096,7 @@ def test_unit_progress_update_clears_stale_finalization_metadata(tmp_path: Path)
     assert result.final_branch is None
     assert result.final_commit is None
     assert result.finalized_at is None
-    assert result.next_action == "finalize delivery branch"
+    assert result.next_action == "verify the assembled delivery with delivery verify"
 
 
 def test_mark_delivery_assembly_records_and_clears_recoverable_failure() -> None:
@@ -1121,7 +1132,9 @@ def test_delivery_status_reports_invalid_plan_without_progress_path(tmp_path: Pa
     plan_path = _write_plan(
         tmp_path,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(tmp_path),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "../bad",
             "title": "Bad plan id",
             "final_branch": "sikula/delivery/bad",
@@ -1947,7 +1960,9 @@ def test_select_next_delivery_unit_reset_failed_returns_none_for_terminal_status
     invalid_path = _write_plan(
         tmp_path,
         {
-            "schema_version": 1,
+            "source_task": delivery_source(tmp_path),
+            "verification": {"mode": "final_gate"},
+            "schema_version": 2,
             "plan_id": "../bad",
             "title": "Bad plan id",
             "final_branch": "sikula/delivery/bad",
