@@ -5,15 +5,12 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal
 
 from core.delivery_constraint_context import delivery_constraint_prompt_context
 from core.delivery_write_scope import (
-    DeliveryWriteScope,
     DeliveryWriteScopeError,
     apply_delivery_write_scope_to_config,
-    resolve_delivery_write_scope,
 )
 from core.state import TaskState
 from core.structured_output import (
@@ -214,7 +211,10 @@ def _delivery_review_scope_context(state: TaskState, project_config: dict | None
     runtime_config = copy.deepcopy(project_config)
     runtime_scope = apply_delivery_write_scope_to_config(runtime_config, state)
     if runtime_scope is None:
-        runtime_scope = _legacy_review_scope(runtime_config)
+        raise DeliveryWriteScopeError(
+            "delivery_write_scope.snapshot_missing",
+            "A delivery reviewer requires the child's captured production scope.",
+        )
     exact_files = set(runtime_scope.effective_exact_file_paths)
     entries = [
         json.dumps(
@@ -232,26 +232,6 @@ def _delivery_review_scope_context(state: TaskState, project_config: dict | None
         "\n".join(f"- {entry}" for entry in entries) if entries else "- none (no production writes authorized)"
     )
     return _REVIEW_SCOPE_CONTEXT.format(scope_entries=scope_entries)
-
-
-def _legacy_review_scope(project_config: dict) -> DeliveryWriteScope:
-    project = project_config.get("project")
-    sandbox = project_config.get("sandbox")
-    if (
-        not isinstance(project, dict)
-        or not isinstance(sandbox, dict)
-        or not isinstance(project.get("root_path"), (str, Path))
-        or not isinstance(sandbox.get("allowed_write_paths"), list)
-    ):
-        raise DeliveryWriteScopeError(
-            "delivery_write_scope.review_context_invalid",
-            "The delivery review write-scope context is unavailable.",
-        )
-    return resolve_delivery_write_scope(
-        project_root=Path(project["root_path"]),
-        configured_write_paths=sandbox["allowed_write_paths"],
-        unit_scope_paths=None,
-    )
 
 
 def classify_delivery_review_disposition(

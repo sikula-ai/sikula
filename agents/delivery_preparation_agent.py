@@ -408,7 +408,7 @@ Obligation input:
 {obligations_json}
 ```
 
-Source accounting input (null means legacy/amendment context):
+Source accounting input (null means no captured source accounting):
 ```json
 {source_accounting_json}
 ```
@@ -1460,7 +1460,7 @@ Authoritative source:
                 id=str(value.get("id", "")),
                 summary=str(value.get("summary", "")),
                 source_fragment_ids=list(value.get("source_fragment_ids", [])),
-                unit_ids=list(draft.obligation_assignments.get(str(value["id"]), replacement_ids)),
+                unit_ids=list(draft.obligation_assignments[str(value["id"])]),
                 disposition="preserved",
             )
             for value in applicable_obligations

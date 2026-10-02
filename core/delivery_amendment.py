@@ -914,11 +914,6 @@ def _delivery_amendment_changed_file_evidence(
         if code not in {"delivery_scope_audit_passed", "unit_scope_violation"}:
             continue
         audit_changed_values = metadata.get("changed_paths")
-        if audit_changed_values is None and code == "delivery_scope_audit_passed":
-            # Compatibility with successful audit records created before paths were retained.
-            continue
-        if audit_changed_values is None:
-            audit_changed_values = raw_changed
         audit_changed_count = _nonnegative_evidence_count(metadata.get("changed_count"), "changed-file")
         if not isinstance(audit_changed_values, list) or audit_changed_count < len(audit_changed_values):
             _invalid_failure_evidence("The linked child scope-audit counts are inconsistent.")
@@ -1324,9 +1319,7 @@ def _validate_amendment_constraint_verification(
                 "delivery_amend.constraint_review_required",
                 "Amendment constraint verification requires operator review.",
             )
-    if draft.obligation_assignments and set(draft.obligation_assignments) != {
-        item.id for item in applicable_obligations
-    }:
+    if set(draft.obligation_assignments) != {item.id for item in applicable_obligations}:
         raise DeliveryAmendmentError(
             "delivery_amend.obligation_assignments_invalid",
             "Assignments must match the applicable inherited obligations.",
@@ -1342,7 +1335,7 @@ def _validate_amendment_constraint_verification(
             obligation.id,
             obligation.summary,
             obligation.source_fragment_ids,
-            draft.obligation_assignments.get(obligation.id, replacement_ids),
+            draft.obligation_assignments[obligation.id],
         )
         for obligation in applicable_obligations
     ]
@@ -2369,7 +2362,7 @@ def _amended_plan_data(
                         reassigned_unit_ids.append(inherited_id)
             constraint["unit_ids"] = reassigned_unit_ids
     applicable_ids = {item.id for item in context.plan.obligations if proposal.target_unit_id in item.unit_ids}
-    if proposal.obligation_assignments and set(proposal.obligation_assignments) != applicable_ids:
+    if set(proposal.obligation_assignments) != applicable_ids:
         raise DeliveryAmendmentError(
             "delivery_amend.obligation_assignments_invalid",
             "Proposal obligation assignments no longer match the target.",
@@ -2389,7 +2382,7 @@ def _amended_plan_data(
             reassigned_unit_ids = []
             for unit_id in obligation["unit_ids"]:
                 inherited_ids = (
-                    proposal.obligation_assignments.get(obligation["id"], replacement_ids)
+                    proposal.obligation_assignments[obligation["id"]]
                     if unit_id == proposal.target_unit_id
                     else [unit_id]
                 )

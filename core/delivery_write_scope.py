@@ -166,8 +166,8 @@ def validate_delivery_write_scope_snapshot(
 ) -> DeliveryWriteScope | None:
     """Validate a persisted delivery-child write-scope snapshot.
 
-    Legacy state has no marker and empty path lists. Modern state must reproduce a
-    canonical resolver result without consulting the current repository-wide write
+    Non-delivery state has no marker and empty path lists. A captured scope must
+    reproduce a canonical resolver result without consulting the current repository-wide write
     policy, so a later config change cannot broaden the persisted child boundary.
     """
     if schema_version is None:
@@ -507,6 +507,13 @@ def apply_delivery_write_scope_to_config(project_config: dict, state: TaskState)
         ) from exc
 
     if scope is None:
+        if any(
+            value is not None for value in (state.delivery_plan_id, state.delivery_unit_id, state.delivery_plan_path)
+        ):
+            raise DeliveryWriteScopeError(
+                "delivery_write_scope.snapshot_missing",
+                "A delivery child requires its captured production write scope.",
+            )
         if runtime_binding is not None:
             raise DeliveryWriteScopeError(
                 "delivery_write_scope.runtime_binding_unbound",

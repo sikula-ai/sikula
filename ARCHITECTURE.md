@@ -365,9 +365,8 @@ The independent authority verifier must echo the list exactly and report concret
 add only those omissions or assignments before a second verification. Only
 `preserved` obligations are published. Published plans retain the obligation ID,
 summary, provenance references, and active owners without copying source text.
-Obligations are valid only in schema-version-2 plans with final-gate verification;
-older plans remain readable only without obligations. Fresh authoring requires exhaustive
-`source_accounting`, including explicit context-only decisions and private rationales.
+Fresh authoring requires exhaustive `source_accounting`, including explicit
+context-only decisions and private rationales.
 Plan checking also requires source accounting whenever obligations are non-empty,
 including hand-authored and edited plans; omitting it blocks verification and finalization.
 `core/delivery_source_accounting.py` checks exact fragment membership, unique records,
@@ -376,15 +375,16 @@ every declared constraint; independent verification assesses meaning.
 Published records retain rationale hashes, with text only in the preparation audit.
 Rationales must encode as UTF-8 before hashing; malformed model text follows the
 audited parser-failure path and the existing bounded authoring retry.
-Plans lacking this additive field remain readable as legacy plans without coverage claims.
+Current plans without obligations may omit source accounting; omission never implies coverage.
 The exact parsed-plan fingerprint and final review context include the accounting.
 Amendment authoring supplies a complete `obligation_assignments` mapping to applicable
 replacement subsets. Its independently verified contracts must collectively preserve
 the replaced unit's entire contribution to each outcome, while other owners retain
 their unchanged contributions. A sole owner's replacements must cover the whole outcome.
 Proposal fingerprints include that mapping; apply retains other owners
-and original obligation/source identities. Legacy proposals without it keep their
-all-replacements interpretation. Hard constraints still bind every affected replacement.
+and original obligation/source identities. Missing assignments for applicable obligations
+block proposal creation and application; ownership is never inferred as all replacements.
+Hard constraints still bind every affected replacement.
 
 Preparation can correct affected draft task Markdown and reported authority gaps once,
 then independently reverify with the same source and retrieved context. Unrelated
@@ -625,7 +625,7 @@ delivery-plan MVP primitive. Its CLI wrapper lives in `sikula_cli/delivery.py`;
 deterministic validation is implemented by `core/delivery_plan.py`. It validates
 tracked `.sikula/delivery/<slug>/plan.yaml` files without creating
 `TaskState`, starting agents, creating worktrees, preparing contracts, or
-updating branches. For schema-version-2 plans the command also loads an available
+updating branches. The command also loads an available
 runtime config without requiring one and applies the final-gate readiness checks;
 absent settings use the same runtime defaults as execution. The validator checks
 schema version, required plan metadata,
@@ -722,7 +722,7 @@ If no ambiguous/runnable running unit exists, `run-next` selects one eligible pe
 unit. Before mutating parent progress, creating child state, or creating a worktree,
 the new-child path resolves the unit's production write scope against
 `sandbox.allowed_write_paths`. An absent or empty unit `scope_paths` list keeps the
-legacy repository-default mode and configured production scope. A non-empty unit
+repository-default mode and configured production scope. A non-empty unit
 scope uses the canonical project-relative intersection; malformed paths or an empty
 intersection block fail closed without progress or child side effects. The resolved
 schema version, mode, declared paths, effective paths, and exact-file subsets are
@@ -756,14 +756,15 @@ prefix, or a disjoint current policy fails closed. A
 failed initial post-assembly check persists an explicit denied binding and a terminal
 `unit_scope_violation`, so parent status never recommends an unchanged reset. Amendment
 failure evidence validates this binding in the preserved authoritative child tree and
-falls back to the creation-time upper bound only for legacy children without the additive
-binding. A correlated `unit_scope_violation` validates the creation snapshot lexically.
+uses the captured creation-time upper bound when the child stopped before runtime
+binding was established. A correlated `unit_scope_violation` validates the creation
+snapshot lexically.
 A denied binding preserves that original upper bound as amendment evidence; a previously
 bound root validates its persisted lexical and resolved identities structurally against the
 same upper bound without requiring the current retargeted path to become valid again.
-Legacy child state without
-a scope marker keeps the current configured
-production policy. Runtime scope application does not modify
+A linked delivery child without a captured scope marker is invalid. Standalone
+tasks without delivery metadata continue to use their configured production policy.
+Runtime scope application does not modify
 `sandbox.allowed_test_write_paths`; TestWriter retains the independently configured test
 write policy.
 Before child creation or resume, `run-next` checks the selected unit for preserved
@@ -781,9 +782,9 @@ the plan next action points back to authoritative-input resolution and preparati
 so text and JSON automation do not recommend an action that `run-next` must reject.
 At child creation, `run-next` also snapshots the plan's project-relative source-task
 path and fingerprint plus only the bounded inherited constraints that explicitly
-reference the selected unit. A context schema marker distinguishes new children
-with an intentionally empty snapshot from legacy child state that predates this
-metadata. A fingerprint over the schema, parent plan/unit/path correlation, source
+reference the selected unit. Every delivery child requires a context schema marker,
+parent plan path and source binding, including when its inherited constraint list is
+empty. A fingerprint over the schema, parent plan/unit/path correlation, source
 binding, and constraints detects removed or modified state fields. `AnalystAgent`,
 `ImplementerAgent`, `FixerAgent`, `ReviewerAgent`, and `SecurityReviewerAgent`
 independently validate
@@ -794,11 +795,11 @@ the Fixer includes it between the original task and implementation prompt for ev
 build- or test-error correction pass;
 the Reviewer and Security Reviewer include it between the original task and implementation
 prompt for every review scope. Both reviewers treat violations as blocking, and security
-review keeps its existing fail-closed output contract. A malformed modern context fails
+review keeps its existing fail-closed output contract. A missing or malformed delivery context fails
 the agent without invoking the provider. Unit identity validation matches the delivery
 plan's bounded, control-free compatibility rules; raw legacy-valid identities remain in
 private state and its fingerprint, while provider prompt rendering applies the public
-identity projection. Legacy state omits the block. These private state
+identity projection. Standalone state omits the block. These private state
 and prompt fields are not added to ordinary delivery status or result projections.
 Before a delivery Implementer or Fixer invocation, the Orchestrator asks the provider
 through its generic write-workspace lifecycle hook to materialize stable provider-owned
@@ -986,8 +987,8 @@ action. `run-next` text/JSON use the corresponding
 for malformed advertised Implementer output. Ordinary, dry-run, and
 `--reset-failed` preflight are side-effect-free for such a persisted stop: they
 do not resume the child, invoke agents, append events, or mutate progress.
-New delivery children opt into the current handoff schema when their state is
-created. A successfully completed opted-in child produces
+Delivery children capture the current handoff schema when their state is
+created. Every successfully completed child produces
 `.sikula/state/delivery/<plan-id>/handoffs/<unit-key>.json` before its parent unit
 becomes `done`. The fingerprinted artifact contains allowlisted unit identity,
 branch/commit correlation, changed-file paths, validation counts/statuses, and
@@ -999,8 +1000,8 @@ it does not copy task bodies, prompts, provider output, diffs, logs, validation
 output, or raw child state. Later units receive validated handoffs from their
 dependency closure in `TaskState.delivery_dependency_handoffs`, and
 `AnalystAgent` includes that compact evidence in analysis without treating it
-as scope authority. Existing children and completed progress without a handoff
-schema marker remain valid legacy state and continue without handoff context.
+as scope authority. A completed unit linked to a child requires handoff evidence.
+An explicitly completed unit without child execution may omit it.
 If progress references a missing, malformed, stale, or mismatched handoff,
 or the handoff file is a symlink or resolves outside the project root,
 `run-next` blocks before creating another child. If a completed child handoff
@@ -1093,10 +1094,8 @@ finalization engine. An already current finalized plan returns idempotently
 without duplicating its finalization event. Dry-run uses the existing run-next
 and finalize previews and does not mutate state or Git. JSON output is one
 compact aggregate projection rather than accumulated child state; child
-machine-readable output is redirected to stderr. For schema-version-2 and schema-version-3 plans,
-completion hands off to the final integration gate described below before
-deterministic finalization. Legacy schema-version-1 plans retain the direct
-finalize path.
+machine-readable output is redirected to stderr. Completion requires a passing
+final integration gate before deterministic finalization.
 
 **Bounded integration repair:** `core/delivery_repair.py` coordinates one appended
 unit for an eligible semantic `repair_required` result. The verification record's
@@ -1128,8 +1127,8 @@ Repair and child execution share dependency-closure handoff validation in
 `core/delivery_handoff.py`. Missing, invalid, or mismatched referenced handoffs
 block readiness and authoring without consuming an attempt. The same check runs
 before each retry and publication, including resumed publication, and before
-publication is marked complete. Legacy completed units without handoff references
-remain supported.
+publication is marked complete. Explicitly completed units without child execution
+may omit handoff references.
 Inherited asset availability and contract asset readiness use the reviewed
 candidate, including when resuming partial publication; the operator checkout
 does not determine whether those assets are available.
@@ -1192,7 +1191,7 @@ historical handoff remains usable. `delivery run` verifies a due group before
 starting more work; `run-next`, previews and execution under the delivery lock
 cannot bypass a barrier. Shared preflight checks required handoffs, executed
 contracts, source authority and child/prerequisite stops before provider calls.
-Linked child task text is immutable contract evidence; legacy units without child
+Linked child task text is immutable contract evidence; explicitly completed units without child
 state require the contract in their recorded commit. Before the initial review,
 any contract present in a covered child's result commit or the assembled candidate
 must match that execution evidence, with the same newline and surrounding-whitespace
@@ -1290,9 +1289,8 @@ parser, checking integrity, exact record binding, completed-input identity, and
 typed obligation closure. Reuse also checks current scope and the existing
 candidate-authority rules. Missing or malformed evidence blocks before another
 reviewer call; restore the captured evidence rather than reconstructing results
-from counts. Checkpoints were not shipped in 0.3.0, so no migration or compatibility
-fallback for intermediate unreleased checkpoint formats is provided. Root records,
-failed reviews and terminal stops do not require a successful checkpoint artifact.
+from counts. Root records, failed reviews and terminal stops do not require a
+successful checkpoint artifact.
 
 These results remain private historical evidence, not approval of a later tree.
 No provider call or prompt field is added, and no descendant history is embedded.
@@ -1342,13 +1340,17 @@ Adaptive insertion/regrouping, nested checkpoint composition, rolling windows an
 plans beyond the bounded root packet remain later work.
 
 **Delivery final integration gate:** newly prepared root-only plans use schema version 2;
-plans with checkpoints use schema version 3. Both declare `verification.mode: final_gate`; schema version 1 remains a readable
-legacy policy with no implied verification. `core/delivery_verify.py` owns one
+plans with checkpoints use schema version 3. Both require `verification.mode: final_gate`.
+Unsupported delivery formats are rejected without migration. Integration reviews require
+protocol 2 and explicit `obligation_results`, including an empty list for security
+reviews with no assigned obligations. Released 0.3.0 standalone task state remains
+loadable and resumable; absence of delivery metadata is valid only for standalone tasks.
+`core/delivery_verify.py` owns one
 bounded integration-node execution, while `core/delivery_verification.py`
 owns readiness and immutable identity construction,
 `core/delivery_verification_validation.py` owns validation policy/reuse, and
 `agents/delivery_integration_review_agent.py` owns the read-only semantic and
-security protocols. Unknown schema-2 policy values fail closed.
+security protocols. Unknown verification policy values fail closed.
 
 `core/delivery_verification_scope.py` defines the private immutable declared
 verification scope. The root `(plan_id, root)` covers
@@ -1416,7 +1418,7 @@ disposition; the recorded repair, amendment, dependency, or human-review action
 must occur first.
 Both providers use `run_readonly_agent`, exact-final-line structured output, one
 bounded malformed-protocol retry, and fail closed on uncertainty or mutation.
-For plans with source-bound obligations, semantic review schema version 2 returns
+For plans with source-bound obligations, semantic review returns
 exactly one terminal `satisfied`, `missing`, `conflicting`, or `uncertain` result
 for every obligation ID. Approval is impossible unless all outcomes are
 `satisfied`. The security reviewer remains an independent gate and does not
@@ -1443,27 +1445,20 @@ rendered reviewer prompt immediately before provider execution. Oversized
 authority packets fail with `delivery_verification.hierarchy_required`; recursive
 checkpoint scheduling and unbounded authority graphs remain future extensions.
 
-**Delivery final branch command:** `sikula delivery finalize PLAN_FILE` is the
-explicit final branch assembly step for a completed delivery plan. Its CLI
-wrapper lives in `sikula_cli/delivery.py`; deterministic preflight and Git ref
-updates are implemented by `core/delivery_finalize.py`. Finalize requires the
-plan status to be `done`. It reconciles legacy schema-version-1 progress through the
-same dependency-ordered assembly engine, verifies the resulting ancestry, and
-records the assembled commit as final. Existing diverged or checked-out final
-branches are rejected; Sikula does not force-update them. The command records
-only compact parent metadata in delivery progress: assembly state, final branch,
-final commit, finalized timestamp, and append-only assembly/finalization events. It does
-not embed child task state, prompts, provider output, diffs, logs, or validation
-records. For schema-version-2 plans, finalize requires the current passing gate
-identity and records that exact candidate without assembly or provider calls.
+**Delivery final branch command:** `sikula delivery finalize PLAN_FILE` records the
+verified final candidate for a completed delivery plan. Its CLI wrapper lives in
+`sikula_cli/delivery.py`; deterministic preflight and finalization persistence live
+in `core/delivery_finalize.py`. Every supported plan requires status `done` and a
+current passing gate identity. Finalize performs no assembly, validation or provider
+calls. Assembly and conflict recovery belong to delivery execution and verification.
 It revalidates the complete gate identity and final branch ref immediately before
-persisting finalization metadata so an external Git ref move fails closed.
-Any later unit progress update clears finalization metadata because the
-recorded final branch is a snapshot of a specific completed unit set.
-`--dry-run` performs the same preflight without mutating Git refs or progress.
-Its projection exposes `final_commit` only when the candidate already contains
-every completed unit result; otherwise it remains ready with a null
-`final_commit` until the mutating command creates the required Git object.
+persisting compact final branch, commit, timestamp and append-only finalization event
+metadata. An external Git ref move fails closed. It does not embed child task state,
+prompts, provider output, diffs, logs or validation records.
+Any later unit progress update clears finalization metadata because the recorded
+final branch is a snapshot of a specific completed unit set. `--dry-run` performs
+the same preflight without mutating Git refs or progress and reports readiness only
+for the exact already verified candidate.
 
 ---
 
@@ -2720,21 +2715,21 @@ Sikula processes at once is still unsupported.
 | `delivery_stop_disposition` | `dict \| None` | Delivery agents / Orchestrator | Parser-validated bounded disposition, sanitized summary, recovery action, source, schema version, and timestamp. Raw provider output remains in the agent cycle record and is not projected to parent progress. |
 | `delivery_disposition_parse_error` | `dict \| None` | ImplementerAgent / Orchestrator | Bounded durable evidence that Implementer output advertised an invalid delivery disposition, whether malformed or semantically inconsistent with its changed files: schema version, stable error code, source, and timestamp only. Drives terminal `implementer_disposition_invalid` without storing raw output in the control field. |
 | `delivery_no_change_outcome` | `str \| None` | ImplementerAgent | Closed positive delivery no-change outcome. The only supported value is `already_satisfied`, accepted only from a parser-validated Implementer result with no changed files. It permits downstream gates and no-op completion but is not a terminal stop or amendment evidence. |
-| `delivery_constraint_context_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Version marker for the inherited-constraint snapshot. New delivery children use the current version even when no constraints apply; legacy and non-delivery state keep `None`. |
+| `delivery_constraint_context_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Version marker for the inherited-constraint snapshot. Every delivery child uses the current version even when no constraints apply; standalone state keeps `None`. |
 | `delivery_source_task` | `dict[str, str] \| None` | `delivery run-next` / `cmd_run()` | Allowlisted project-relative source-task path and SHA-256 binding copied from the validated parent plan. Raw source task text and absolute paths are never persisted here. |
 | `delivery_inherited_constraints` | `list[dict]` | `delivery run-next` / `cmd_run()` | Bounded normalized parent-plan constraints whose unit references include this child. The snapshot is private audit/context data and is not projected through ordinary delivery output. |
-| `delivery_constraint_context_fingerprint` | `str \| None` | `delivery run-next` / `cmd_run()` | SHA-256 integrity fingerprint over the complete versioned constraint snapshot and its parent plan/unit/path correlation. New marked context must match before agent prompt injection; legacy state keeps `None`. |
-| `delivery_write_scope_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Version marker for the effective production write-scope snapshot. New delivery children use the current version; legacy and non-delivery state keep `None`. |
-| `delivery_write_scope_mode` | `str \| None` | `delivery run-next` / `cmd_run()` | Resolution mode captured at child creation: `repository_default` for absent/empty unit scope or `unit_explicit` for a non-empty declared unit scope. Legacy and non-delivery state keep `None`. |
-| `delivery_declared_write_paths` | `list[str]` | `delivery run-next` / `cmd_run()` | Canonical project-relative production paths declared by the selected delivery unit. Empty in repository-default, legacy, and non-delivery state. |
-| `delivery_declared_write_exact_file_paths` | `list[str] \| None` | `delivery run-next` / `cmd_run()` | Schema-v2 subset of declared paths that were exact files at child creation. `None` distinguishes legacy/unmarked state; a marked snapshot requires a list. |
+| `delivery_constraint_context_fingerprint` | `str \| None` | `delivery run-next` / `cmd_run()` | SHA-256 integrity fingerprint over the complete versioned constraint snapshot and its parent plan/unit/path correlation. Every delivery context must match before agent prompt injection; standalone state keeps `None`. |
+| `delivery_write_scope_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Version marker for the effective production write-scope snapshot. Every delivery child uses the current version; standalone state keeps `None`. |
+| `delivery_write_scope_mode` | `str \| None` | `delivery run-next` / `cmd_run()` | Resolution mode captured at child creation: `repository_default` for absent/empty unit scope or `unit_explicit` for a non-empty declared unit scope. Standalone state keeps `None`. |
+| `delivery_declared_write_paths` | `list[str]` | `delivery run-next` / `cmd_run()` | Canonical project-relative production paths declared by the selected delivery unit. Empty in repository-default and standalone state. |
+| `delivery_declared_write_exact_file_paths` | `list[str] \| None` | `delivery run-next` / `cmd_run()` | Schema-v2 subset of declared paths that were exact files at child creation. `None` is valid for standalone state; a delivery snapshot requires a list. |
 | `delivery_effective_write_paths` | `list[str]` | `delivery run-next` / `cmd_run()` | Canonical project-relative production paths resolved from configured write scope and unit scope before child creation. They are the persisted upper bound for fresh and resumed child runtime; the current configured production policy may narrow but never expand them. This private audit snapshot is not added to ordinary delivery output. |
 | `delivery_effective_write_exact_file_paths` | `list[str] \| None` | `delivery run-next` / `cmd_run()` | Schema-v2 subset that preserves exact-file semantics in the persisted upper bound. Runtime construction stops if an entry is missing or has become a directory in the authoritative child tree. |
-| `delivery_runtime_write_scope_binding` | `dict \| None` | `cmd_run()` | Versioned immutable post-assembly production-scope binding. A `bound` value stores canonical lexical roots together with their resolved project-relative identities and exact-file kinds; a `denied` value records failed initial construction. Resume validates the original identities and can derive only a narrower active scope without replacing the binding. Legacy children keep `None`, and amendment evidence falls back to their creation-time upper bound. |
+| `delivery_runtime_write_scope_binding` | `dict \| None` | `cmd_run()` | Versioned immutable post-assembly production-scope binding. A `bound` value stores canonical lexical roots together with their resolved project-relative identities and exact-file kinds; a `denied` value records failed initial construction. Resume validates the original identities and can derive only a narrower active scope without replacing the binding. Children stopped before binding keep `None`; amendment evidence then uses their captured creation-time upper bound. |
 | `delivery_scope_audit_pending` | `dict \| None` | Orchestrator | Dedicated versioned control marker containing the active delivery write actor (Implementer/Fixer or an allowlisted deterministic mutation phase), authoritative project prefix, immutable pre-call Git commit ID, absolute Git/common-directory bindings, Git-reference and Git-ignore fingerprints, typed lexical and resolved production roots, and lexical and resolved Fixer test-write roots authorized for that invocation. It is persisted before the private sparse worktree baseline and cleared only after the post-mutation or resume audit result is saved. Resume accepts only the current complete marker schema, verifies that Git discovery and reference authority still match those bindings, computes Git candidates against the saved commit, audits its immutable policy before applying current runtime-scope changes, and never derives or broadens authority from current `HEAD`, errors, config, filesystem aliases, or `active_operation`; malformed, incomplete, unsupported, unavailable, retargeted, mutated-ref, or orphaned marker/baseline state fails closed. |
 | `delivery_quarantine_candidates` | `list[dict]` | Delivery scope audit / Orchestrator | Current-process, bounded quarantine authority for ordinary-untracked regular files first observed after a successful Implementer or Fixer provider attempt. Each record binds a project-relative path to digest, mode, filesystem identity, and a random process-session token stored only in private task state. A new process uses a different token and clears the list, failed or violating attempts cannot mint authority, and starting a move consumes the matching record before filesystem mutation. |
 | `delivery_quarantine_records` | `list[dict]` | Orchestrator / cleanup | Durable audit and cleanup state for requested file quarantine. `moving` is saved before rename and blocks resume after interruption; an in-process failure known to leave the source unmoved or successfully restored changes it to non-blocking `aborted`. Quarantine-only cleanup changes `moving` to `cleaned` when the exact retained entry proves rename completed, or when an idempotent retry finds both the retained entry and original worktree path absent after cleanup. An existing original path remains blocked. `quarantined` proves the bytes were moved outside the worktree and semantic gates were invalidated; explicit forced cleanup/delete removes storage for `aborted` or retained records and changes them to `cleaned`. Records contain bounded path and file metadata, never file contents or the private storage path. |
-| `delivery_handoff_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Opt-in schema marker set on newly created delivery children. Legacy children keep `None`, so terminal reconciliation does not fabricate or require a handoff for state created by older versions. |
+| `delivery_handoff_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Required schema marker on delivery children. Standalone tasks keep `None`; completed units with no child execution do not require handoff artifacts. |
 | `delivery_dependency_handoffs` | `list[dict]` | `delivery run-next` / `cmd_run()` | Validated, fingerprinted, allowlisted snapshots from the child unit's completed dependency closure. `AnalystAgent` consumes them as supporting evidence; malformed resume-state entries are ignored and recorded as warnings rather than injected into prompts. |
 | `config_snapshot` | `dict` | `cmd_run()` / Orchestrator | Effective run configuration captured on first run before agents start (never overwritten on resume): project name, all `run_*` flags, `max_iterations`, `max_review_iterations`, `max_security_review_iterations`, `progress.*`, `sandbox.allowed_write_paths` / `allowed_test_write_paths` / `allowed_read_paths`, `build.*` settings, `planner.*` settings, `test_writer.*` settings, and per-agent `provider`/`model`/`agent_timeout`. It is also saved for contract-gate failures that exit before `Orchestrator.run()`. Visible in `show <task_id>`. |
 | `run_invocation_schema_version` | `int \| None` | Orchestrator / report-only review | Set to `1` only with the first invocation record for a newly created state, proving that the audit is complete from that invocation. Fresh states blocked before tracked execution and legacy states keep `None`; later resume records never promote legacy partial history. This marker is audit-only and never drives pipeline behavior. |

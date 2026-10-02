@@ -34,11 +34,8 @@ from core.delivery_unit_metadata import (
     DeliveryUnitBudget,
 )
 
-LEGACY_DELIVERY_PLAN_SCHEMA_VERSION = 1
 SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION = 2
-SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSIONS = frozenset(
-    {LEGACY_DELIVERY_PLAN_SCHEMA_VERSION, SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION, 3}
-)
+SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSIONS = frozenset({SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION, 3})
 SUPPORTED_DELIVERY_CONSTRAINT_CONTEXT_SCHEMA_VERSION = 1
 DELIVERY_VERIFICATION_MODE_FINAL_GATE = "final_gate"
 DELIVERY_CONSTRAINT_KIND_VALUES = frozenset(
@@ -580,7 +577,7 @@ def _parse_delivery_plan(
             DeliveryPlanIssue(
                 "error",
                 "schema_version.unsupported",
-                (f"Unsupported delivery plan schema_version {schema_version}; expected 1 or 2."),
+                (f"Unsupported delivery plan schema_version {schema_version}; expected 2 or 3."),
                 "schema_version",
             )
         )
@@ -800,17 +797,6 @@ def _parse_verification_policy(
     schema_version: int | None,
     errors: list[DeliveryPlanIssue],
 ) -> DeliveryVerificationPolicy | None:
-    if schema_version == LEGACY_DELIVERY_PLAN_SCHEMA_VERSION:
-        if value is not None:
-            errors.append(
-                DeliveryPlanIssue(
-                    "error",
-                    "verification.schema_version_required",
-                    "Delivery verification policy requires delivery plan schema_version 2.",
-                    "verification",
-                )
-            )
-        return None
     if schema_version not in {2, 3}:
         return None
     if not isinstance(value, dict):

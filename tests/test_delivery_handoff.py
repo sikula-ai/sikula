@@ -76,7 +76,7 @@ def test_delivery_handoff_roundtrip_projects_allowlisted_metadata(tmp_path: Path
     assert "Private free-form gap details" not in serialized
 
 
-def test_dependency_handoff_validation_traverses_legacy_noop_dependencies(tmp_path: Path) -> None:
+def test_dependency_handoff_validation_traverses_completion_without_child(tmp_path: Path) -> None:
     child = _child_state()
     unit = _selected_unit()
     handoff = build_delivery_unit_handoff(
@@ -94,7 +94,8 @@ def test_dependency_handoff_validation_traverses_legacy_noop_dependencies(tmp_pa
         handoff_fingerprint=handoff.fingerprint,
     )
     legacy = SimpleNamespace(
-        id="legacy-noop",
+        id="explicit-noop",
+        child_task_id=None,
         status="done",
         depends_on=[unit.id],
         commit=None,
@@ -215,7 +216,7 @@ def test_build_delivery_handoff_rejects_boolean_schema_version() -> None:
     child_state = _child_state()
     child_state.delivery_handoff_schema_version = True
 
-    with pytest.raises(DeliveryHandoffError, match="does not opt in"):
+    with pytest.raises(DeliveryHandoffError, match="requires the supported"):
         build_delivery_unit_handoff(
             plan_id="demo-plan",
             selected_unit=_selected_unit(),

@@ -20,6 +20,7 @@ from core.delivery_finalize import (
 from core.delivery_progress import delivery_events_path, delivery_progress_path, get_delivery_status
 from sikula import main
 from sikula_cli.delivery import cmd_delivery_finalize
+from tests.delivery_fixtures import assemble_delivery_fixture, delivery_source, record_verified_delivery
 
 
 def _git_init(root: Path) -> None:
@@ -125,7 +126,9 @@ def _write_plan(root: Path, *, unit_count: int = 2, final_branch: str = "sikula/
             }
         )
     plan = {
-        "schema_version": 1,
+        "source_task": delivery_source(root),
+        "verification": {"mode": "final_gate"},
+        "schema_version": 2,
         "plan_id": "delivery-finalize-demo",
         "title": "Delivery finalize demo",
         "final_branch": final_branch,
@@ -168,7 +171,7 @@ def test_preview_delivery_finalize_blocks_incomplete_plan(tmp_path: Path) -> Non
     plan_path = _write_plan(tmp_path)
     _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": first_commit}])
 
-    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
+    result = preview_delivery_finalize(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.ready is False
     assert result.finalized is False
@@ -188,8 +191,9 @@ def test_preview_delivery_finalize_reports_ready_final_branch(tmp_path: Path) ->
             {"unit_id": "02-unit", "status": "done", "commit": second_commit},
         ],
     )
+    record_verified_delivery(plan_path, _cfg(tmp_path))
 
-    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
+    result = preview_delivery_finalize(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.ready is True
     assert result.dry_run is True
@@ -214,8 +218,9 @@ def test_finalize_delivery_plan_creates_branch_and_records_progress(tmp_path: Pa
             {"unit_id": "02-unit", "status": "done", "commit": second_commit, "branch": "sikula/unit-2"},
         ],
     )
+    record_verified_delivery(plan_path, _cfg(tmp_path))
 
-    result = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    result = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.finalized is True
     assert result.ready is True
@@ -248,8 +253,9 @@ def test_finalize_delivery_plan_is_idempotent_after_prior_finalization(tmp_path:
         tmp_path,
         [{"unit_id": "01-unit", "status": "done", "commit": commit}],
     )
+    record_verified_delivery(plan_path, _cfg(tmp_path))
 
-    first = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    first = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
     progress_path = delivery_progress_path(tmp_path, "delivery-finalize-demo")
     events_path = delivery_events_path(tmp_path, "delivery-finalize-demo")
     first_progress = json.loads(progress_path.read_text(encoding="utf-8"))
@@ -260,7 +266,7 @@ def test_finalize_delivery_plan_is_idempotent_after_prior_finalization(tmp_path:
         cwd=tmp_path,
         check=True,
     )
-    second = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    second = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
     second_progress = json.loads(progress_path.read_text(encoding="utf-8"))
     second_events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
 
@@ -283,6 +289,7 @@ def test_finalize_delivery_plan_repairs_missing_finalized_event(
         tmp_path,
         [{"unit_id": "01-unit", "status": "done", "commit": commit}],
     )
+    record_verified_delivery(plan_path, _cfg(tmp_path))
     append_event = delivery_finalize_module.append_delivery_progress_event
 
     def fail_finalized_event(path, event):
@@ -296,7 +303,7 @@ def test_finalize_delivery_plan_repairs_missing_finalized_event(
         fail_finalized_event,
     )
     with pytest.raises(OSError, match="interrupted finalization event write"):
-        finalize_delivery_plan(plan_path, project_root=tmp_path)
+        finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     progress = json.loads(delivery_progress_path(tmp_path, "delivery-finalize-demo").read_text(encoding="utf-8"))
     monkeypatch.setattr(
@@ -310,7 +317,7 @@ def test_finalize_delivery_plan_repairs_missing_finalized_event(
         check=True,
     )
 
-    result = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    result = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     events = [
         json.loads(line)
@@ -341,7 +348,8 @@ def test_finalize_delivery_plan_rechecks_current_finalization_under_lock(
         tmp_path,
         [{"unit_id": "01-unit", "status": "done", "commit": commit}],
     )
-    first = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    record_verified_delivery(plan_path, _cfg(tmp_path))
+    first = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
     assert first.finalized is True
     progress_path = delivery_progress_path(tmp_path, "delivery-finalize-demo")
     events_path = delivery_events_path(tmp_path, "delivery-finalize-demo")
@@ -364,7 +372,7 @@ def test_finalize_delivery_plan_rechecks_current_finalization_under_lock(
         status_with_stale_initial_snapshot,
     )
 
-    second = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    second = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert second.finalized is True
     assert progress_path.read_text(encoding="utf-8") == first_progress
@@ -380,7 +388,8 @@ def test_finalize_delivery_plan_rejects_symbolic_ref_after_finalization(tmp_path
         tmp_path,
         [{"unit_id": "01-unit", "status": "done", "commit": commit}],
     )
-    first = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    record_verified_delivery(plan_path, _cfg(tmp_path))
+    first = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
     assert first.finalized is True
     subprocess.run(
         ["git", "symbolic-ref", "refs/heads/sikula/delivery/final", f"refs/heads/{main_branch}"],
@@ -388,7 +397,7 @@ def test_finalize_delivery_plan_rejects_symbolic_ref_after_finalization(tmp_path
         check=True,
     )
 
-    second = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    second = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert second.finalized is False
     assert second.ready is False
@@ -403,11 +412,12 @@ def test_finalize_delivery_plan_rejects_new_pending_unit_after_finalization(tmp_
         tmp_path,
         [{"unit_id": "01-unit", "status": "done", "commit": commit}],
     )
-    first = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    record_verified_delivery(plan_path, _cfg(tmp_path))
+    first = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
     assert first.finalized is True
     _write_plan(tmp_path, unit_count=2)
 
-    second = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    second = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert second.finalized is False
     assert second.ready is False
@@ -424,7 +434,9 @@ def test_finalize_delivery_plan_uses_head_when_plan_order_lists_dependent_first(
     plan_path.write_text(
         yaml.safe_dump(
             {
-                "schema_version": 1,
+                "source_task": delivery_source(tmp_path),
+                "verification": {"mode": "final_gate"},
+                "schema_version": 2,
                 "plan_id": "delivery-finalize-demo",
                 "title": "Delivery finalize demo",
                 "final_branch": "sikula/delivery/final",
@@ -454,8 +466,9 @@ def test_finalize_delivery_plan_uses_head_when_plan_order_lists_dependent_first(
             {"unit_id": "02-unit", "status": "done", "commit": second_commit},
         ],
     )
+    record_verified_delivery(plan_path, _cfg(tmp_path))
 
-    result = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    result = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.finalized is True
     assert result.ready is True
@@ -470,6 +483,7 @@ def test_finalize_delivery_plan_does_not_update_branch_when_progress_reread_fail
     commit = _git_commit(tmp_path, "unit.txt", "unit\n")
     plan_path = _write_plan(tmp_path, unit_count=1)
     _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": commit}])
+    record_verified_delivery(plan_path, _cfg(tmp_path))
 
     monkeypatch.setattr(
         "core.delivery_finalize.read_delivery_progress",
@@ -479,11 +493,11 @@ def test_finalize_delivery_plan_does_not_update_branch_when_progress_reread_fail
         ),
     )
 
-    result = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    result = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.finalized is False
     assert [issue.code for issue in result.errors] == ["progress.read_failed"]
-    assert not (tmp_path / ".git" / "refs" / "heads" / "sikula" / "delivery" / "final").exists()
+    assert _rev_parse(tmp_path, "refs/heads/sikula/delivery/final") == commit
 
 
 def test_finalize_delivery_plan_reports_existing_progress_lock(tmp_path: Path) -> None:
@@ -491,6 +505,7 @@ def test_finalize_delivery_plan_reports_existing_progress_lock(tmp_path: Path) -
     commit = _git_commit(tmp_path, "unit.txt", "unit\n")
     plan_path = _write_plan(tmp_path, unit_count=1)
     _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": commit}])
+    record_verified_delivery(plan_path, _cfg(tmp_path))
     lock = delivery_finalize_module.acquire_delivery_progress_lock(
         tmp_path,
         "delivery-finalize-demo",
@@ -498,30 +513,27 @@ def test_finalize_delivery_plan_reports_existing_progress_lock(tmp_path: Path) -
     )
 
     try:
-        result = finalize_delivery_plan(plan_path, project_root=tmp_path)
+        result = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
     finally:
         lock.release()
 
     assert result.finalized is False
     assert result.ready is False
     assert [issue.code for issue in result.errors] == ["delivery.locked"]
-    assert not (tmp_path / ".git" / "refs" / "heads" / "sikula" / "delivery" / "final").exists()
+    assert _rev_parse(tmp_path, "refs/heads/sikula/delivery/final") == commit
 
 
-def test_preview_delivery_finalize_reports_missing_final_commit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_preview_delivery_finalize_requires_prior_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _git_init(tmp_path)
     commit = _git_commit(tmp_path, "unit.txt", "unit\n")
     plan_path = _write_plan(tmp_path, unit_count=1)
     _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": commit}])
-    monkeypatch.setattr(delivery_finalize_module, "_final_commit_candidate", lambda *args, **kwargs: None)
 
-    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
+    result = preview_delivery_finalize(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.ready is False
     assert result.final_commit is None
-    assert [issue.code for issue in result.errors] == ["delivery.final_commit_missing"]
+    assert [issue.code for issue in result.errors] == ["delivery_verification.required"]
 
 
 def test_finalize_delivery_plan_uses_head_for_all_noop_units(tmp_path: Path) -> None:
@@ -529,8 +541,9 @@ def test_finalize_delivery_plan_uses_head_for_all_noop_units(tmp_path: Path) -> 
     head = _git_commit(tmp_path, "base.txt", "base\n")
     plan_path = _write_plan(tmp_path, unit_count=1)
     _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done"}])
+    record_verified_delivery(plan_path, _cfg(tmp_path))
 
-    result = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    result = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.finalized is True
     assert result.final_commit == head
@@ -548,13 +561,14 @@ def test_preview_delivery_finalize_uses_base_when_noop_branch_is_behind(tmp_path
         [{"unit_id": "01-unit", "status": "done"}],
         assembly_base_commit=base,
     )
+    record_verified_delivery(plan_path, _cfg(tmp_path))
 
-    preview = preview_delivery_finalize(plan_path, project_root=tmp_path)
+    preview = preview_delivery_finalize(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert preview.ready is True
     assert preview.final_commit == base
 
-    result = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    result = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.finalized is True
     assert result.final_commit == base
@@ -577,12 +591,12 @@ def test_finalize_rejects_branch_ahead_of_base_without_recorded_progress(tmp_pat
         assembly_base_commit=base,
     )
 
-    preview = preview_delivery_finalize(plan_path, project_root=tmp_path)
+    preview = preview_delivery_finalize(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert preview.ready is False
     assert [issue.code for issue in preview.errors] == ["delivery.assembly_branch_diverged"]
 
-    result = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    result = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.finalized is False
     assert [issue.code for issue in result.errors] == ["delivery.assembly_branch_diverged"]
@@ -595,7 +609,7 @@ def test_preview_delivery_finalize_reports_missing_unit_commit(tmp_path: Path) -
     plan_path = _write_plan(tmp_path, unit_count=1)
     _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": "missing-ref"}])
 
-    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
+    result = preview_delivery_finalize(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.ready is False
     assert result.finalized is False
@@ -615,7 +629,7 @@ def test_preview_delivery_finalize_rejects_missing_recorded_assembly_branch(tmp_
         assembly_updated_at="2026-07-23T12:00:00+00:00",
     )
 
-    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
+    result = preview_delivery_finalize(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.ready is False
     assert result.finalized is False
@@ -634,7 +648,7 @@ def test_preview_delivery_finalize_rejects_symbolic_final_branch(tmp_path: Path)
         check=True,
     )
 
-    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
+    result = preview_delivery_finalize(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.ready is False
     assert result.finalized is False
@@ -653,7 +667,7 @@ def test_preview_delivery_finalize_rejects_checked_out_final_branch(
     _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": unit_commit}])
     monkeypatch.setattr(delivery_finalize_module, "branch_checked_out", lambda root, branch: True)
 
-    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
+    result = preview_delivery_finalize(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.ready is False
     assert result.finalized is False
@@ -668,11 +682,11 @@ def test_finalize_delivery_plan_rejects_diverged_final_branch(tmp_path: Path) ->
     other_commit = _git_commit(tmp_path, "other.txt", "other\n")
     subprocess.run(["git", "checkout", "-q", main_branch], cwd=tmp_path, check=True)
     unit_commit = _git_commit(tmp_path, "unit.txt", "unit\n")
-    subprocess.run(["git", "branch", "sikula/delivery/final", other_commit], cwd=tmp_path, check=True)
+    subprocess.run(["git", "update-ref", "refs/heads/sikula/delivery/final", other_commit], cwd=tmp_path, check=True)
     plan_path = _write_plan(tmp_path, unit_count=1)
     _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": unit_commit}])
 
-    result = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    result = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.finalized is False
     assert result.ready is False
@@ -690,7 +704,7 @@ def test_preview_delivery_finalize_rejects_branch_checkout_shorthand(tmp_path: P
     plan_path = _write_plan(tmp_path, unit_count=1, final_branch="@{-1}")
     _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": unit_commit}])
 
-    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
+    result = preview_delivery_finalize(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.ready is False
     assert result.finalized is False
@@ -705,7 +719,7 @@ def test_preview_delivery_finalize_rejects_refs_that_are_not_branch_names(tmp_pa
     plan_path = _write_plan(tmp_path, unit_count=1, final_branch=final_branch)
     _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": unit_commit}])
 
-    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
+    result = preview_delivery_finalize(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.ready is False
     assert result.finalized is False
@@ -755,6 +769,7 @@ def test_finalize_delivery_plan_rechecks_branch_before_update(tmp_path: Path, mo
     unit_commit = _git_commit(tmp_path, "unit.txt", "unit\n")
     plan_path = _write_plan(tmp_path, unit_count=1)
     _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": unit_commit}])
+    record_verified_delivery(plan_path, _cfg(tmp_path))
     original_read_delivery_progress = delivery_finalize_module.read_delivery_progress
     branch_created = False
 
@@ -763,17 +778,19 @@ def test_finalize_delivery_plan_rechecks_branch_before_update(tmp_path: Path, mo
         result = original_read_delivery_progress(*args, **kwargs)
         if not branch_created:
             branch_created = True
-            subprocess.run(["git", "branch", "sikula/delivery/final", other_commit], cwd=tmp_path, check=True)
+            subprocess.run(
+                ["git", "update-ref", "refs/heads/sikula/delivery/final", other_commit], cwd=tmp_path, check=True
+            )
         return result
 
     monkeypatch.setattr(delivery_finalize_module, "read_delivery_progress", create_diverged_branch_after_preflight)
 
-    result = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    result = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert branch_created is True
     assert result.finalized is False
     assert result.ready is False
-    assert [issue.code for issue in result.errors] == ["delivery.assembly_branch_diverged"]
+    assert [issue.code for issue in result.errors] == ["delivery_verification.ref_changed"]
     assert _rev_parse(tmp_path, "refs/heads/sikula/delivery/final") == other_commit
 
 
@@ -793,14 +810,15 @@ def test_finalize_delivery_plan_assembles_independent_unit_results(tmp_path: Pat
             {"unit_id": "02-unit", "status": "done", "commit": second_commit},
         ],
     )
+    record_verified_delivery(plan_path, _cfg(tmp_path))
 
-    preview = preview_delivery_finalize(plan_path, project_root=tmp_path)
+    preview = preview_delivery_finalize(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert preview.ready is True
-    assert preview.final_commit is None
-    assert "resulting commit is not known yet" in preview.message
+    assert preview.final_commit == _rev_parse(tmp_path, "refs/heads/sikula/delivery/final")
+    assert "verified candidate" in preview.message
 
-    result = finalize_delivery_plan(plan_path, project_root=tmp_path)
+    result = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert result.finalized is True
     assert result.ready is True
@@ -814,7 +832,7 @@ def test_finalize_delivery_plan_assembles_independent_unit_results(tmp_path: Pat
         assert ancestry.returncode == 0
 
 
-def test_preview_delivery_finalize_rejects_git_without_write_tree_merge_support(
+def test_assembly_preflight_rejects_git_without_write_tree_merge_support(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -838,14 +856,11 @@ def test_preview_delivery_finalize_rejects_git_without_write_tree_merge_support(
         lambda *_args, **_kwargs: False,
     )
 
-    result = preview_delivery_finalize(plan_path, project_root=tmp_path)
-
-    assert result.ready is False
-    assert result.final_commit is None
-    assert [issue.code for issue in result.errors] == ["delivery.assembly_git_unsupported"]
+    issue = delivery_finalize_module.preview_delivery_assembly_issue(tmp_path, get_delivery_status(plan_path))
+    assert issue.code == "delivery.assembly_git_unsupported"
 
 
-def test_finalize_delivery_plan_persists_recoverable_assembly_conflict(tmp_path: Path) -> None:
+def test_assembly_persists_recoverable_conflict(tmp_path: Path) -> None:
     _git_init(tmp_path)
     base, first_commit, second_commit = _git_conflicting_unit_commits(tmp_path)
     plan_path = _write_plan(tmp_path)
@@ -857,10 +872,8 @@ def test_finalize_delivery_plan_persists_recoverable_assembly_conflict(tmp_path:
         ],
     )
 
-    result = finalize_delivery_plan(plan_path, project_root=tmp_path)
-
-    assert result.finalized is False
-    assert [issue.code for issue in result.errors] == ["delivery.assembly_conflict"]
+    _, _, issue = assemble_delivery_fixture(plan_path)
+    assert issue.code == "delivery.assembly_conflict"
     progress = json.loads(delivery_progress_path(tmp_path, "delivery-finalize-demo").read_text(encoding="utf-8"))
     assert progress["assembly_status"] == "failed"
     assert progress["assembly_unit_id"] == "02-unit"
@@ -870,14 +883,12 @@ def test_finalize_delivery_plan_persists_recoverable_assembly_conflict(tmp_path:
     assert _rev_parse(tmp_path, "HEAD") == base
     assert not (tmp_path / ".git" / "MERGE_HEAD").exists()
 
-    preview = preview_delivery_finalize(plan_path, project_root=tmp_path)
-
-    assert preview.ready is False
-    assert [issue.code for issue in preview.errors] == ["delivery.assembly_conflict"]
-    assert "recorded merge conflict" in preview.errors[0].message
+    issue = delivery_finalize_module.preview_delivery_assembly_issue(tmp_path, get_delivery_status(plan_path))
+    assert issue.code == "delivery.assembly_conflict"
+    assert "recorded merge conflict" in issue.message
 
 
-def test_preview_delivery_finalize_allows_recorded_resolved_assembly_conflict(tmp_path: Path) -> None:
+def test_assembly_accepts_recorded_resolved_conflict(tmp_path: Path) -> None:
     _git_init(tmp_path)
     _, first_commit, second_commit = _git_conflicting_unit_commits(tmp_path)
     plan_path = _write_plan(tmp_path)
@@ -888,8 +899,8 @@ def test_preview_delivery_finalize_allows_recorded_resolved_assembly_conflict(tm
             {"unit_id": "02-unit", "status": "done", "commit": second_commit},
         ],
     )
-    conflict = finalize_delivery_plan(plan_path, project_root=tmp_path)
-    assert [issue.code for issue in conflict.errors] == ["delivery.assembly_conflict"]
+    _, _, issue = assemble_delivery_fixture(plan_path)
+    assert issue.code == "delivery.assembly_conflict"
     resolved_commit = _git_merge_commit(tmp_path, first_commit, second_commit)
     subprocess.run(
         [
@@ -903,11 +914,15 @@ def test_preview_delivery_finalize_allows_recorded_resolved_assembly_conflict(tm
         check=True,
     )
 
-    preview = preview_delivery_finalize(plan_path, project_root=tmp_path)
-
-    assert preview.ready is True
-    assert preview.errors == []
-    assert preview.final_commit == resolved_commit
+    issue = delivery_finalize_module.preview_delivery_assembly_issue(tmp_path, get_delivery_status(plan_path))
+    assert issue is None
+    _, commit, issue = assemble_delivery_fixture(plan_path)
+    assert issue is None
+    assert commit == resolved_commit
+    # Reconciliation alone does not authorize finalization.
+    preview = preview_delivery_finalize(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
+    assert not preview.ready
+    assert [item.code for item in preview.errors] == ["delivery_verification.required"]
 
 
 def test_cmd_delivery_finalize_dry_run_outputs_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -915,6 +930,7 @@ def test_cmd_delivery_finalize_dry_run_outputs_json(tmp_path: Path, capsys: pyte
     commit = _git_commit(tmp_path, "unit.txt", "unit\n")
     plan_path = _write_plan(tmp_path, unit_count=1)
     _write_progress(tmp_path, [{"unit_id": "01-unit", "status": "done", "commit": commit}])
+    record_verified_delivery(plan_path, _cfg(tmp_path))
 
     cmd_delivery_finalize(_finalize_args(plan_path, dry_run=True, json_output=True), _cfg(tmp_path))
 
@@ -923,7 +939,7 @@ def test_cmd_delivery_finalize_dry_run_outputs_json(tmp_path: Path, capsys: pyte
     assert payload["dry_run"] is True
     assert payload["finalized"] is False
     assert payload["final_commit"] == commit
-    assert not (tmp_path / ".git" / "refs" / "heads" / "sikula" / "delivery" / "final").exists()
+    assert _rev_parse(tmp_path, "refs/heads/sikula/delivery/final") == commit
 
 
 def test_cmd_delivery_finalize_invalid_plan_id_outputs_json_error(

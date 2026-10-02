@@ -33,6 +33,7 @@ from core.delivery_verification_validation import DeliveryVerificationValidation
 from core.state import JsonStateStore
 from sikula_cli.delivery import _preview_delivery_run, DeliveryRunNextContext
 from tests.test_delivery_repair import _CONTRACT, _LLM, _assessment, _draft, _git, _repair
+from tests.delivery_fixtures import bind_delivery_child, record_completed_child_handoffs
 
 
 def _declarations() -> tuple[list, list, list]:
@@ -397,6 +398,7 @@ def test_checkpoint_repair_preserves_covered_amendment_lineage(checkpoint_plan, 
         draft = DeliveryAmendmentAuthoringDraft(
             plan_id="cache",
             target_unit_id=target,
+            obligation_assignments={item.id: replacements for item in obligations},
             replacement_units=[
                 DeliveryAuthoringUnitDraft(key, key, [] if index == 0 else [replacements[0]], _CONTRACT)
                 for index, key in enumerate(replacements)
@@ -760,6 +762,7 @@ def test_checkpoint_preserves_uncommitted_executed_contract_evidence(checkpoint_
         done=True,
         result_commit=commit,
     )
+    bind_delivery_child(child, root, source_task=yaml.safe_load(path.read_text())["source_task"])
     store.save(child)
     progress_path = delivery_progress_path(root, "cache")
     write_delivery_progress(
@@ -774,6 +777,7 @@ def test_checkpoint_preserves_uncommitted_executed_contract_evidence(checkpoint_
             ],
         ),
     )
+    record_completed_child_handoffs(path, root, store)
     result, _ = _verify_node(path, cfg)
     assert result.succeeded, result
     status = get_delivery_status(path)
@@ -923,6 +927,7 @@ def test_initial_checkpoint_binds_candidate_contracts_to_child_evidence(checkpoi
         done=True,
         result_commit=read_commit,
     )
+    bind_delivery_child(child, root, source_task=yaml.safe_load(path.read_text())["source_task"])
     store.save(child)
     write_delivery_progress(
         delivery_progress_path(root, "cache"),
@@ -941,6 +946,7 @@ def test_initial_checkpoint_binds_candidate_contracts_to_child_evidence(checkpoi
             ],
         ),
     )
+    record_completed_child_handoffs(path, root, store)
     status = verification_node_status(get_delivery_status(path, project_root=root), "storage")
     assert status.valid, status.errors
     issue = checkpoint_preflight_issue(status, cfg, store)
@@ -1658,8 +1664,7 @@ def test_checkpoint_boundary_survives_concurrent_assembly_advance(checkpoint_pla
         else _LLM(_assessment("approved"))
     )
     security = AdvancingLLM(
-        '{"schema_version":1,"disposition":"repair_required","summary":"Unsafe integration.",'
-        '"findings":[{"code":"security_gap","summary":"Boundary violated.","unit_ids":["read"]}]}'
+        '{"schema_version":2,"disposition":"repair_required","summary":"Unsafe integration.","findings":[{"code":"security_gap","summary":"Boundary violated.","unit_ids":["read"],"obligation_ids":[]}],"obligation_results":[]}'
     )
     with patch(
         "core.delivery_verify.run_delivery_verification_validation",
@@ -1743,7 +1748,10 @@ def test_checkpoint_receipt_binds_candidate_review_rules(checkpoint_plan, role: 
             state_store=JsonStateStore(root / ".sikula/state"),
             semantic_reviewer=DeliveryIntegrationReviewAgent(llm, cfg),
             security_reviewer=DeliveryIntegrationReviewAgent(
-                _LLM('{"schema_version":1,"disposition":"approved","summary":"Secure.","findings":[]}'), cfg
+                _LLM(
+                    '{"schema_version":2,"disposition":"approved","summary":"Secure.","findings":[],"obligation_results":[]}'
+                ),
+                cfg,
             ),
         )
     assert result.succeeded, result
@@ -1794,6 +1802,7 @@ def test_direct_child_resume_checks_parent_checkpoint_before_mutation(
         failed=reset_failed,
         worktree_path=str(root),
     )
+    bind_delivery_child(state, root, source_task=yaml.safe_load(path.read_text())["source_task"])
     store.save(state)
     progress_path = delivery_progress_path(root, "cache")
     progress, _ = read_delivery_progress(progress_path, plan_id="cache")
@@ -1877,7 +1886,10 @@ def test_direct_child_resume_uses_effective_reviewer_overrides(
             state_store=store,
             semantic_reviewer=DeliveryIntegrationReviewAgent(_LLM(_assessment("approved")), gate_cfg),
             security_reviewer=DeliveryIntegrationReviewAgent(
-                _LLM('{"schema_version":1,"disposition":"approved","summary":"Secure.","findings":[]}'), gate_cfg
+                _LLM(
+                    '{"schema_version":2,"disposition":"approved","summary":"Secure.","findings":[],"obligation_results":[]}'
+                ),
+                gate_cfg,
             ),
         )
     assert result.succeeded, result
@@ -1890,6 +1902,7 @@ def test_direct_child_resume_uses_effective_reviewer_overrides(
         failed=reset_failed,
         worktree_path=str(root),
     )
+    bind_delivery_child(state, root, source_task=yaml.safe_load(path.read_text())["source_task"])
     store.save(state)
     progress_path = delivery_progress_path(root, "cache")
     progress, _ = read_delivery_progress(progress_path, plan_id="cache")

@@ -299,7 +299,7 @@ def test_project_root_must_be_a_directory(tmp_path: Path) -> None:
     assert exc_info.value.code == "delivery_write_scope.project_root_invalid"
 
 
-def test_legacy_snapshot_without_marker_remains_unscoped(scope_project: Path) -> None:
+def test_absent_standalone_snapshot_remains_unscoped(scope_project: Path) -> None:
     result = validate_delivery_write_scope_snapshot(
         project_root=scope_project,
         schema_version=None,

@@ -75,6 +75,7 @@ from sikula_cli.delivery import (
     render_delivery_amend_apply,
     render_delivery_amend_prepare,
 )
+from tests.delivery_fixtures import delivery_source, record_verified_delivery
 
 
 def _amend_context(root: Path, author: Callable[..., DeliveryAmendmentAuthoringDraft]) -> DeliveryAmendPrepareContext:
@@ -270,7 +271,9 @@ def _write_plan(root: Path) -> Path:
     plan_path.write_text(
         yaml.safe_dump(
             {
-                "schema_version": 1,
+                "source_task": delivery_source(root),
+                "verification": {"mode": "final_gate"},
+                "schema_version": 2,
                 "plan_id": "amend-demo",
                 "title": "Amend demo",
                 "final_branch": "sikula/delivery/amend-demo",
@@ -1135,7 +1138,8 @@ def test_capture_amendment_uses_paths_from_successful_scope_audit(tmp_path: Path
     assert evidence.omitted_changed_paths_count == 0
 
 
-def test_capture_amendment_ignores_unrelated_and_legacy_successful_audits(tmp_path: Path) -> None:
+@pytest.mark.parametrize("audit_code", ["delivery_scope_audit_passed", "unit_scope_violation"])
+def test_capture_amendment_rejects_scope_audit_without_changed_paths(tmp_path: Path, audit_code: str) -> None:
     plan_path, progress_path, _ = _setup(tmp_path, target_status="failed")
     state = _write_terminal_child_state(
         tmp_path,
@@ -1155,22 +1159,19 @@ def test_capture_amendment_ignores_unrelated_and_legacy_successful_audits(tmp_pa
         },
         {
             "phase": "delivery_scope_audit",
-            "status": "passed",
-            "metadata": {"code": "delivery_scope_audit_passed", "changed_count": 0},
+            "status": "passed" if audit_code == "delivery_scope_audit_passed" else "failed",
+            "metadata": {"code": audit_code, "changed_count": 0},
         },
     ]
     JsonStateStore(tmp_path / ".sikula" / "state").save(state)
     target = inspect_delivery_amendment_target(plan_path, "c", project_root=tmp_path)
 
-    evidence = capture_delivery_amendment_failure_evidence(
-        target,
-        state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
-    )
-
-    assert evidence is not None
-    assert evidence.changed_count == 1
-    assert evidence.changed_paths == ("src/tracked.py",)
-    assert evidence.omitted_changed_paths_count == 0
+    with pytest.raises(DeliveryAmendmentError) as exc:
+        capture_delivery_amendment_failure_evidence(
+            target,
+            state_store=JsonStateStore(tmp_path / ".sikula" / "state"),
+        )
+    assert exc.value.issue.code == "delivery_amend.failure_evidence_invalid"
 
 
 def test_scope_violation_recovery_ignores_lower_priority_external_disposition(tmp_path: Path) -> None:
@@ -1538,7 +1539,7 @@ def test_amendment_redacts_asset_assignment_check_failure(
     assert not proposal_root.exists()
 
 
-@pytest.mark.parametrize("owners", [None, ["c-2"], ["c-1", "c-3"]])
+@pytest.mark.parametrize("owners", [["c-1", "c-2", "c-3"], ["c-2"], ["c-1", "c-3"]])
 def test_constrained_middle_split_reassigns_constraint_to_every_replacement(tmp_path: Path, owners) -> None:
     plan_path, _, proposal_root = _setup(tmp_path)
     _add_target_constraint(tmp_path, plan_path)
@@ -1560,8 +1561,7 @@ def test_constrained_middle_split_reassigns_constraint_to_every_replacement(tmp_
     assert before.plan is not None
     target_obligation = before.plan.obligations[0]
     asset_draft = _draft()
-    if owners is not None:
-        asset_draft.obligation_assignments = {target_obligation.id: owners}
+    asset_draft.obligation_assignments = {target_obligation.id: owners}
     asset_draft.replacement_units[0] = replace(
         asset_draft.replacement_units[0],
         asset_paths=[asset_path],
@@ -1589,7 +1589,7 @@ def test_constrained_middle_split_reassigns_constraint_to_every_replacement(tmp_
         id=target_obligation.id,
         summary=target_obligation.summary,
         source_fragment_ids=target_obligation.source_fragment_ids,
-        unit_ids=owners or ["c-1", "c-2", "c-3"],
+        unit_ids=owners,
         disposition="preserved",
     )
     unresolved = replace(
@@ -1621,6 +1621,19 @@ def test_constrained_middle_split_reassigns_constraint_to_every_replacement(tmp_
             obligations=[verified_obligation],
         ),
     )
+    # A complete verifier response cannot supply the author's missing ownership decision.
+    with pytest.raises(DeliveryAmendmentError) as missing:
+        create_delivery_amendment_proposal(
+            plan_path,
+            "c",
+            replace(draft, obligation_assignments={}),
+            project_root=tmp_path,
+            proposal_root=proposal_root,
+            project_config=_project_config(tmp_path),
+        )
+    assert missing.value.issue.code == "delivery_amend.obligation_assignments_invalid"
+    assert not proposal_root.exists()
+
     proposal, _ = create_delivery_amendment_proposal(
         plan_path,
         "c",
@@ -1629,6 +1642,27 @@ def test_constrained_middle_split_reassigns_constraint_to_every_replacement(tmp_
         proposal_root=proposal_root,
         project_config=_project_config(tmp_path),
     )
+    # An old content-addressed proposal without assignments also cannot apply.
+    old_payload = proposal.to_dict()
+    old_payload.pop("obligation_assignments")
+    old_schema = old_payload.pop("schema_version")
+    old_payload.pop("proposal_id")
+    old_id = delivery_amendment_module._proposal_content_id(old_payload)
+    old_payload.update(schema_version=old_schema, proposal_id=old_id)
+    old_path = delivery_amendment_module.delivery_amendment_proposal_path(proposal_root, proposal.plan_id, old_id)
+    old_path.write_text(json.dumps(old_payload), encoding="utf-8")
+    before_apply = plan_path.read_bytes()
+    old_result = apply_delivery_amendment(
+        plan_path,
+        old_id,
+        project_root=tmp_path,
+        proposal_root=proposal_root,
+        project_config=_project_config(tmp_path),
+    )
+    assert not old_result.applied
+    assert "delivery_amend.obligation_assignments_invalid" in {issue.code for issue in old_result.errors}
+    assert plan_path.read_bytes() == before_apply
+
     result = apply_delivery_amendment(
         plan_path,
         proposal.proposal_id,
@@ -1644,7 +1678,7 @@ def test_constrained_middle_split_reassigns_constraint_to_every_replacement(tmp_
     assert constraint["unit_ids"] == ["a", "c-1", "c-2", "c-3", "d"]
     assert "c" not in constraint["unit_ids"]
     assert amended["constraints"][1]["unit_ids"] == ["b"]
-    assert amended["obligations"][0]["unit_ids"] == ["a", *(owners or ["c-1", "c-2", "c-3"])]
+    assert amended["obligations"][0]["unit_ids"] == ["a", *(owners)]
     assert proposal.obligation_assignments == asset_draft.obligation_assignments
 
     checked = check_delivery_plan_file(plan_path, project_root=tmp_path)
@@ -6573,6 +6607,7 @@ def test_run_next_after_amendment_without_existing_progress(
         run_args.created_task_id = state.task_id
         run_args.delivery_child_created_callback(state.task_id)
         state.done = True
+        state.delivery_handoff_schema_version = 1
         state.worktree_branch = "sikula/a-1-child"
         state.result_commit = head
         store.save(state)
@@ -6633,6 +6668,8 @@ def test_run_next_and_finalize_use_effective_amended_graph(tmp_path: Path) -> No
     status = get_delivery_status(plan_path, project_root=tmp_path)
     assert status.status == "done"
     assert next(unit for unit in status.units if unit.id == "c").status == "superseded"
-    finalize = preview_delivery_finalize(plan_path, project_root=tmp_path)
+    cfg = {"project": {"root_path": str(tmp_path), "build_tool": "python"}}
+    record_verified_delivery(plan_path, cfg)
+    finalize = preview_delivery_finalize(plan_path, project_root=tmp_path, project_config=cfg)
     assert finalize.ready is True
     assert finalize.final_commit == progress["assembled_commit"]

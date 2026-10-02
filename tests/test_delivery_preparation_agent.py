@@ -88,7 +88,7 @@ class CapturingLLM:
             return output
         if isinstance(payload, dict) and "constraints_complete" in payload:
             obligations = authored.get("obligations", []) if isinstance(authored, dict) else []
-            accounting_marker = "Source accounting input (null means legacy/amendment context):\n```json\n"
+            accounting_marker = "Source accounting input (null means no captured source accounting):\n```json\n"
             if accounting_marker in user:
                 accounting = json.JSONDecoder().raw_decode(user.split(accounting_marker, 1)[1])[0]
                 if accounting is not None:
