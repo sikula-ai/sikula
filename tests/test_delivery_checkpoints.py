@@ -1968,8 +1968,10 @@ def test_candidate_rule_hashes_resolve_links_within_nested_project(tmp_path: Pat
     assert checkpoint_review_rule_fingerprints(root, updated, [path]) != expected
 
 
-@pytest.mark.parametrize("missing_binding", ["review_rule_fingerprints", "plan_content_fingerprint"])
-def test_checkpoint_without_authority_binding_requires_new_verification(checkpoint_plan, missing_binding) -> None:
+@pytest.mark.parametrize(
+    "missing_binding", ["review_rule_fingerprints", "plan_content_fingerprint", "checkpoint_evidence_fingerprint"]
+)
+def test_checkpoint_without_authority_binding_cannot_recreate_evidence(checkpoint_plan, missing_binding) -> None:
     path, cfg = checkpoint_plan
     assert _verify_node(path, cfg)[0].succeeded
     progress_path = delivery_progress_path(path.parent, "cache")
@@ -1979,7 +1981,11 @@ def test_checkpoint_without_authority_binding_requires_new_verification(checkpoi
     status = get_delivery_status(path)
     assert not checkpoint_pass_is_usable(status, status.plan.checkpoints[0], cfg)
     result, llm = _verify_node(path, cfg)
+    assert result.stop_code == "delivery_checkpoint.evidence_unavailable"
+    assert not llm.calls
+    write_delivery_progress(progress_path, progress)
+    result, llm = _verify_node(path, cfg)
     assert result.succeeded, result
-    assert len(llm.calls) == 1
+    assert not llm.calls
     status = get_delivery_status(path)
     assert checkpoint_pass_is_usable(status, status.plan.checkpoints[0], cfg)

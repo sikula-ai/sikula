@@ -49,6 +49,7 @@ from core.delivery_checkpoints import (
     verification_scope_complete,
 )
 from core.delivery_verification_scope import DeliveryVerificationScope
+from core.delivery_checkpoint_evidence import load_checkpoint_evidence, store_checkpoint_evidence
 from core.delivery_verification_model import (
     DeliveryVerificationRecord,
     delivery_verification_covers_obligations,
@@ -296,7 +297,12 @@ def verify_delivery_plan(
                 )
             ):
                 return _result_from_record(status, existing, succeeded=True, next_action="finalize_delivery")
-            attempt = existing.attempt + 1 if existing and existing.gate_id == identity.gate_id else 1
+            # Checkpoint evidence is immutable. Returning to an earlier gate
+            # identity must not reuse its artifact after an intervening policy
+            # or candidate change. Root attempts retain their per-gate numbering.
+            attempt = (
+                existing.attempt + 1 if existing and (node_id != "root" or existing.gate_id == identity.gate_id) else 1
+            )
             rule_fingerprints = None
             plan_content_fingerprint = None
             if node_id != "root":
@@ -516,6 +522,7 @@ def verify_delivery_plan(
             succeeded=False,
             next_action="rerun_delivery_verification",
         )
+    terminal = current
     return _result_from_record(
         get_delivery_status(path, project_root=root),
         terminal,
@@ -810,7 +817,7 @@ def _execute_gate(
                         completed_at=_now(),
                     )
                 finding_count = len(security.assessment.findings)
-            return replace(
+            passed = replace(
                 running,
                 status="passed",
                 semantic_status="approved",
@@ -822,6 +829,19 @@ def _execute_gate(
                 obligation_gap_count=obligation_gap_count,
                 completed_at=_now(),
             )
+            if scope.node_id != "root":
+                try:
+                    fingerprint = store_checkpoint_evidence(
+                        root, evidence_path.parent, snapshot, passed, semantic.assessment
+                    )
+                except (OSError, ValueError):
+                    return replace(
+                        passed,
+                        status="blocked",
+                        stop_code="delivery_checkpoint.evidence_unavailable",
+                    )
+                passed = replace(passed, checkpoint_evidence_fingerprint=fingerprint)
+            return passed
     except DeliveryIntegrationReviewAgentError as exc:
         return _review_blocked(
             running,
@@ -947,7 +967,7 @@ def _persist_terminal_if_current(
     events_path: Path,
     *,
     node_id: str = "root",
-) -> bool:
+) -> DeliveryVerificationRecord | None:
     try:
         with acquire_delivery_progress_lock(root, plan_id, owner="delivery.verify.complete"):
             progress_path = delivery_progress_path(root, plan_id)
@@ -958,9 +978,9 @@ def _persist_terminal_if_current(
                 else None
             )
             if progress is None or errors or record is None:
-                return False
+                return None
             if record.gate_id != identity.gate_id or record.attempt != terminal.attempt or record.status != "running":
-                return False
+                return None
             # A boundary violation belongs to the attempt even when authority
             # changes while its provider is running. Never replace it with stale.
             retain_boundary = node_id != "root" and delivery_verification_is_boundary_stop(terminal)
@@ -973,9 +993,29 @@ def _persist_terminal_if_current(
                         candidate_commit=identity.candidate_commit,
                     )
                 except (OSError, RuntimeError, ValueError):
-                    return False
+                    return None
                 if current_identity != identity or not _assembly_ref_matches(root, status, identity.candidate_commit):
-                    return False
+                    return None
+            if node_id != "root" and terminal.passed:
+                try:
+                    evidence = load_checkpoint_evidence(
+                        root, progress_path.parent, terminal, plan_id=plan_id, node_id=node_id
+                    )
+                    if not evidence.covers(DeliveryVerificationScope.from_plan(status.plan, node_id)):
+                        raise ValueError("Checkpoint evidence coverage changed.")
+                except (OSError, ValueError):
+                    terminal = replace(
+                        terminal,
+                        status="blocked",
+                        stop_code="delivery_checkpoint.evidence_unavailable",
+                        checkpoint_evidence_fingerprint=None,
+                    )
+                    if terminal.evidence_path:
+                        _safe_append_audit(
+                            root / terminal.evidence_path,
+                            {"event": "evidence_unavailable", "record": terminal.to_dict()},
+                            project_root=root,
+                        )
             progress = mark_delivery_verification(progress, terminal, node_id=node_id)
             write_delivery_progress(progress_path, progress)
             append_delivery_progress_event(
@@ -988,9 +1028,9 @@ def _persist_terminal_if_current(
                     commit=identity.candidate_commit,
                 ),
             )
-            return True
+            return terminal
     except DeliveryProgressLockError:
-        return False
+        return None
 
 
 def _safe_append_progress_event(path: Path, event: DeliveryProgressEvent) -> bool:

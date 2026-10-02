@@ -178,6 +178,18 @@ def checkpoint_pass_is_usable(
         if record.review_rule_fingerprints is None or record.plan_content_fingerprint is None:
             return False
         root = Path(status.project_root)
+        from core.delivery_checkpoint_evidence import load_checkpoint_evidence
+        from core.delivery_progress import delivery_progress_path
+
+        evidence = load_checkpoint_evidence(
+            root,
+            delivery_progress_path(root, status.plan.plan_id).parent,
+            record,
+            plan_id=status.plan.plan_id,
+            node_id=checkpoint.id,
+        )
+        if not evidence.covers(DeliveryVerificationScope.from_plan(status.plan, checkpoint.id)):
+            return False
         plan_path = Path(status.plan_path).relative_to(root).as_posix()
         if (
             _checkpoint_file_fingerprints(
@@ -518,6 +530,25 @@ def checkpoint_preflight_issue(
 
     current = with_delivery_verification_readiness(status, cfg)
     record = current.verification
+    if record is not None and record.passed:
+        from core.delivery_checkpoint_evidence import load_checkpoint_evidence
+        from core.delivery_progress import delivery_progress_path
+
+        try:
+            root = Path(status.project_root)
+            load_checkpoint_evidence(
+                root,
+                delivery_progress_path(root, status.plan.plan_id).parent,
+                record,
+                plan_id=status.plan.plan_id,
+                node_id=status.verification_node,
+            )
+        except (OSError, ValueError):
+            return DeliveryPlanIssue(
+                "error",
+                "delivery_checkpoint.evidence_unavailable",
+                "Accepted checkpoint evidence is missing or invalid; restore its captured evidence.",
+            )
     if record is not None and record.status in {"blocked", "failed"}:
         if record.security_status == "rejected":
             return DeliveryPlanIssue(
