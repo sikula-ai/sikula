@@ -288,6 +288,10 @@ Checkpoint plans use schema version 3; small root-only plans keep version 2.
 root pass for the exact final candidate. Each checkpoint has its own persistent
 repair budget. Nested hierarchy and large-plan scaling remain later work: this
 first slice still requires the complete root review to fit its existing limits.
+Successful checkpoints retain private structured obligation results bound to the
+reviewed candidate and gate attempt. Handoff checks verify their integrity without
+replaying review logs or adding history to prompts. Missing or damaged evidence
+blocks continuation; the final gate still reviews the complete final candidate.
 Task completion output and `delivery status` report provider invocation counts,
 failed attempts, measured provider time, content-free input/output sizes, and
 explicit provider-reported token usage when available. Unavailable token data

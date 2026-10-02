@@ -2964,6 +2964,21 @@ def test_delivery_prepares_checkpoint_repairs_and_releases_consumer(
     child = JsonStateStore(git_project / ".sikula/state").load(consumer["child_task_id"])
     assert repair["unit_id"] in {item["unit_id"] for item in child.delivery_dependency_handoffs}
     assert progress["checkpoint_verifications"]["arithmetic"]["status"] == "passed"
+    from core.delivery_checkpoint_evidence import load_checkpoint_evidence
+    from core.delivery_verification_model import parse_delivery_verification_record
+
+    record = parse_delivery_verification_record(progress["checkpoint_verifications"]["arithmetic"])
+    evidence = load_checkpoint_evidence(
+        git_project,
+        git_project / ".sikula/state/delivery/checkpoint-flow",
+        record,
+        plan_id="checkpoint-flow",
+        node_id="arithmetic",
+    )
+    assert [(item.id, item.outcome) for item in evidence.obligation_results] == [("combined-operation", "satisfied")]
+    assert repair["unit_id"] in {item.unit_id for item in evidence.completed_units}
+    assert consumer["unit_id"] not in {item.unit_id for item in evidence.completed_units}
+    assert "checkpoint_evidence_fingerprint" not in progress["verification"]
     if correct_declaration:
         audit = (git_project / ".sikula/contract-reports/checkpoint-flow.delivery-prepare.auto-llm.jsonl").read_text()
         assert "delivery_authoring.checkpoints_invalid" in audit

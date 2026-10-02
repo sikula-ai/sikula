@@ -1236,8 +1236,8 @@ copies without invalidating unrelated covered inputs. The private optional
 `plan_content_fingerprint` records newline-normalized plan content alongside the
 existing raw-byte `plan_fingerprint`; capture verifies both against the same
 checkout bytes. Only newline conversion is tolerated, preserving Windows Git
-compatibility without accepting changed YAML authority. Older receipts without
-this binding require verification again; terminal stops remain binding.
+compatibility without accepting changed YAML authority. Incomplete receipts
+cannot release consumers; terminal stops remain binding.
 Direct child resumes (including `--reset-failed`) consult the same parent barrier
 before resetting state or constructing an orchestrator. A stale identity does not
 clear a recorded security rejection or read-only boundary violation.
@@ -1250,9 +1250,8 @@ ordinary results and root verification still require the current candidate.
 Checkpoint records additionally retain private `review_rule_fingerprints` for
 applicable reviewer and security-reviewer rule files. Their candidate contents
 must match both the reviewed and current assembled commits; operator checkout
-contents cannot substitute for this evidence. Older checkpoint receipts without
-this binding require verification again. Root record and identity semantics remain
-unchanged.
+contents cannot substitute for this evidence. Root record and identity semantics
+remain unchanged.
 Checkpoint authority reads batch regular-file metadata and bounded blob payloads
 from Git, deduplicating identical blobs and repeated commits within a check.
 Symlink and missing-path checks retain component-level validation. No authority
@@ -1260,6 +1259,45 @@ result is cached across checks; candidate refs, checkout contracts and effective
 policy are revalidated on every handoff decision.
 Later code changes are reviewed at subsequent checkpoints and by the full root
 gate; this slice does not claim semantic selective invalidation from read footprints.
+
+**Structured checkpoint evidence:** `core/delivery_checkpoint_evidence.py` retains
+the exact parsed successful obligation results outside audit replay. One private,
+versioned `checkpoint-evidence-<gate-sha256>-<attempt>.json` artifact contains the
+plan/node identity, captured completed-unit commits and handoff fingerprints,
+constraint IDs, obligation IDs/outcomes, and the verification record binding.
+That binding includes source/plan/policy identity, applicable rule-content hashes,
+semantic/security outcomes, validation execution/reuse flags and config identity,
+and the existing private audit reference for detailed phase provenance. It does
+not copy source text, contract text, review summaries, diagnostics or child audit.
+
+The artifact is written only after validation and required read-only reviews
+succeed. Its SHA-256 is linked by private control field
+`checkpoint_evidence_fingerprint`; the matching persisted `passed` attempt is the
+sole acceptance authority. Completion rechecks the artifact and candidate under
+the delivery lock before publishing the pass. A stale/interrupted attempt or an
+unreferenced artifact cannot release a barrier. Recovery preserves the orphan
+for local inspection and records a new attempt; it never promotes an orphan by
+replaying audit. Conflicting content cannot overwrite an existing attempt artifact.
+Checkpoint attempt numbers increase across candidate and policy changes within
+the logical node, so returning to an earlier gate identity cannot reuse its
+artifact. Root attempt numbering and persistent repair budgets are unchanged.
+Writes reuse atomic, owner-only delivery control storage, with bounded reads and
+link/hardlink rejection. The current private control-file ceiling is 2 MiB;
+artifact content is limited to the already bounded scope and fixed-size identities.
+
+Handoff checks and verification preflight load the artifact through one strict
+parser, checking integrity, exact record binding, completed-input identity, and
+typed obligation closure. Reuse also checks current scope and the existing
+candidate-authority rules. Missing or malformed evidence blocks before another
+reviewer call; restore the captured evidence rather than reconstructing results
+from counts. Checkpoints were not shipped in 0.3.0, so no migration or compatibility
+fallback for intermediate unreleased checkpoint formats is provided. Root records,
+failed reviews and terminal stops do not require a successful checkpoint artifact.
+
+These results remain private historical evidence, not approval of a later tree.
+No provider call or prompt field is added, and no descendant history is embedded.
+The full root review and its source, packet and unit limits remain mandatory.
+Parent-packet composition, code-impact invalidation and hierarchy remain later work.
 
 An eligible checkpoint repair depends only on its completed scope. Preparation
 captures and rechecks only that scope's contracts and child execution evidence;
