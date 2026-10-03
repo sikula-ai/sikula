@@ -449,6 +449,7 @@ class DeliveryStatusResult:
     checkpoint_verifications: dict[str, DeliveryVerificationRecord] = field(default_factory=dict)
     verification_node: str = "root"
     checkpoint_handoffs: frozenset[str] | None = None
+    checkpoint_candidate_evidence: dict[str, str] | None = None
     plan_fingerprint: str | None = None
     plan_bytes: int | None = None
     llm_usage: dict[str, Any] = field(default_factory=empty_llm_usage_summary)
@@ -1403,7 +1404,10 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
             ]
         )
     for checkpoint in projection.get("checkpoints", []):
-        lines.append(f"Checkpoint {checkpoint['id']}: {checkpoint['status']}")
+        lines.append(
+            f"Checkpoint {checkpoint['id']}: {checkpoint['status']} "
+            f"(candidate evidence: {checkpoint['candidate_evidence']})"
+        )
     verification = projection["verification"]
     lines.append(f"Verification: {verification['status']}")
     if verification.get("gate_id"):

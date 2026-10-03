@@ -283,7 +283,9 @@ checkpoints where downstream work depends on a coherent completed group.
 `delivery run` verifies these groups, performs eligible bounded repair, and
 re-verifies before releasing dependent units. `run-next` cannot bypass the barrier.
 `delivery status` distinguishes an accepted historical checkpoint handoff from the
-root pass for the exact final candidate. Each checkpoint has its own persistent
+evidence applicable to the current candidate. Changed code requires fresh
+verification; the full root gate establishes that evidence before finalization.
+Each checkpoint has its own persistent
 repair budget. Nested hierarchy and large-plan scaling remain later work: this
 first slice still requires the complete root review to fit its existing limits.
 Successful checkpoints retain private structured obligation results bound to the

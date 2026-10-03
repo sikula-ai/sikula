@@ -487,6 +487,7 @@ def checkpoint_projection(status: DeliveryStatusResult) -> list[dict[str, Any]]:
             "status": state,
             "unit_count": len(checkpoint.unit_ids),
             "obligation_count": len(checkpoint.obligation_ids),
+            "candidate_evidence": (status.checkpoint_candidate_evidence or {}).get(checkpoint.id, "not_checked"),
         }
         if record:
             item.update(attempt=record.attempt, candidate_commit=record.candidate_commit)
@@ -671,6 +672,9 @@ def with_checkpoint_barriers(status: DeliveryStatusResult, cfg: dict[str, Any] |
     if status.plan is None or not status.plan.checkpoints:
         return status
     usable = frozenset(item.id for item in status.plan.checkpoints if checkpoint_pass_is_usable(status, item, cfg))
+    from core.delivery_checkpoint_applicability import checkpoint_applicability
+
+    applicability = checkpoint_applicability(status, cfg, usable)
     guarded = {
         item.id: checkpoint_guarded_units(item, status.plan.units)
         for item in status.plan.checkpoints
@@ -684,6 +688,7 @@ def with_checkpoint_barriers(status: DeliveryStatusResult, cfg: dict[str, Any] |
         status,
         units=units,
         checkpoint_handoffs=usable,
+        checkpoint_candidate_evidence={key: item.status for key, item in applicability.items()},
         next_action="continue checkpoint verification or recovery with delivery run"
         if any(verification_scope_complete(verification_node_status(status, key)) for key in guarded)
         else status.next_action,

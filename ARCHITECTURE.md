@@ -1249,15 +1249,16 @@ ordinary results and root verification still require the current candidate.
 Checkpoint records additionally retain private `review_rule_fingerprints` for
 applicable reviewer and security-reviewer rule files. Their candidate contents
 must match both the reviewed and current assembled commits; operator checkout
-contents cannot substitute for this evidence. Root record and identity semantics
-remain unchanged.
+contents cannot substitute for this evidence. Checkpoint rule fingerprints do not
+alter the root verification identity.
 Checkpoint authority reads batch regular-file metadata and bounded blob payloads
 from Git, deduplicating identical blobs and repeated commits within a check.
 Symlink and missing-path checks retain component-level validation. No authority
 result is cached across checks; candidate refs, checkout contracts and effective
 policy are revalidated on every handoff decision.
 Later code changes are reviewed at subsequent checkpoints and by the full root
-gate; this slice does not claim semantic selective invalidation from read footprints.
+gate. Candidate applicability is separate from the historical admission barrier;
+it does not reopen consumers that already started.
 
 **Structured checkpoint evidence:** `core/delivery_checkpoint_evidence.py` retains
 the exact parsed successful obligation results outside audit replay. One private,
@@ -1295,7 +1296,48 @@ successful checkpoint artifact.
 These results remain private historical evidence, not approval of a later tree.
 No provider call or prompt field is added, and no descendant history is embedded.
 The full root review and its source, packet and unit limits remain mandatory.
-Parent-packet composition, code-impact invalidation and hierarchy remain later work.
+Parent-packet composition, selective code-impact assessment and hierarchy remain later work.
+
+**Checkpoint candidate applicability:** `core/delivery_checkpoint_applicability.py`
+derives a decision for the current assembled candidate and effective policy from
+accepted typed evidence. An unchanged Git tree with a still-valid historical
+handoff permits `exact` reuse. A different tree requires fresh verification;
+unchanged contracts, path disjointness, Git ancestry and passing tests do not
+establish semantic independence. A current semantic root rejection also requires
+re-verification even when the tree is unchanged; it does not rewrite historical
+admission. This first policy uses the existing full root review as that
+verification, with no additional impact-assessment provider call.
+Selective independence assessment remains a prerequisite of later bounded
+composition, rather than a duplicate review while the full root assessment is mandatory.
+
+For plans with checkpoints, a successful root gate persists its exact typed
+obligation results, completed inputs, constraint coverage and verification binding
+in a private `root-evidence-<content-sha256>.json` artifact. The root record's
+`root_evidence_fingerprint` is its sole acceptance reference. Content addressing
+preserves distinct results when root attempt numbers restart. Storage uses the
+same bounded, owner-only, atomic and link-rejecting path as checkpoint evidence.
+Publication rechecks coverage and artifact integrity under the delivery lock;
+an orphan, interrupted write or unaccepted assessment cannot establish applicability.
+Readiness, current root reuse and finalization also require this evidence. Missing evidence
+cannot be reconstructed from aggregate success counts or audit history.
+
+An accepted current root assessment establishes `reverified` applicability for
+historical checkpoints whose authority and completed inputs still match. Original
+checkpoint records, artifacts and recovery budgets remain unchanged. Each private
+decision binding includes the original receipt identity and fingerprint, the
+current candidate/authority/policy identity and, when used, the accepted root
+artifact fingerprint. Decisions are derived again from these durable inputs on
+resume; no mutable historical receipt is relabeled as a newer pass. Changed trees
+without accepted current evidence project `verification_required`; invalid
+authority, unavailable evidence or terminal stops project `unavailable`. Without
+an effective policy, applicability remains `not_checked`.
+
+Ordinary checkpoint projections expose only this allowlisted `candidate_evidence`
+status alongside the existing historical handoff status and the plan's assembled
+candidate identity. Prompt bodies, result artifacts and decision bindings remain
+private. Neither prior reviews nor evidence chains are added to provider prompts.
+The normal root findings, bounded repair and re-verification path resolves changed
+code; ordinary uncertainty does not add an operator approval step.
 
 An eligible checkpoint repair depends only on its completed scope. Preparation
 captures and rechecks only that scope's contracts and child execution evidence;
@@ -1369,12 +1411,13 @@ and handoff evidence and the exact candidate/config/source/plan/policy identity.
 The gate captures it before validation and uses it throughout review. Logical
 node identity is independent of candidate and attempt: another candidate requires
 another current verification, while retries remain separate durable attempts.
-Root gate hashes and schema-1 verification/repair-input records retain their
-existing format, so current evidence and interrupted repair remain resumable.
+Resume validates the captured scope and candidate identity before reusing
+accepted evidence or continuing interrupted repair. A passing root record for a
+checkpoint plan must reference its accepted typed result artifact; a pass without
+that reference is incomplete control state, not an alternative resumable format.
 Whole-plan completion remains required before the root gate. Checkpoints use the
 same capture, validation, read-only review, typed findings and durable repair flow
-for a declared partial scope. Root gate identities and existing repair control
-records remain compatible.
+for a declared partial scope.
 
 The gate captures dependency-ordered assembly under the delivery progress lock,
 parses and hashes one immutable plan byte snapshot, captures and hashes the exact

@@ -93,6 +93,7 @@ class DeliveryVerificationRecord:
     review_rule_fingerprints: dict[str, str] | None = None
     plan_content_fingerprint: str | None = None
     checkpoint_evidence_fingerprint: str | None = None
+    root_evidence_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -125,6 +126,7 @@ class DeliveryVerificationRecord:
             "repair_input_fingerprint",
             "plan_content_fingerprint",
             "checkpoint_evidence_fingerprint",
+            "root_evidence_fingerprint",
         ):
             value = getattr(self, key)
             if value:
@@ -170,6 +172,7 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         "review_rule_fingerprints",
         "plan_content_fingerprint",
         "checkpoint_evidence_fingerprint",
+        "root_evidence_fingerprint",
     }
     if set(value) - allowed:
         raise ValueError("delivery verification record contains unsupported fields")
@@ -267,6 +270,11 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         raise ValueError("delivery verification plan content fingerprint is invalid")
     rule_fingerprints = value.get("review_rule_fingerprints")
     checkpoint_fingerprint = value.get("checkpoint_evidence_fingerprint")
+    root_fingerprint = value.get("root_evidence_fingerprint")
+    if root_fingerprint is not None and (
+        not isinstance(root_fingerprint, str) or not _SHA256_ID_RE.fullmatch(root_fingerprint)
+    ):
+        raise ValueError("delivery verification root evidence fingerprint is invalid")
     if checkpoint_fingerprint is not None and (
         not isinstance(checkpoint_fingerprint, str) or not _SHA256_ID_RE.fullmatch(checkpoint_fingerprint)
     ):
@@ -324,4 +332,5 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         review_rule_fingerprints=rule_fingerprints,
         plan_content_fingerprint=plan_content_fingerprint,
         checkpoint_evidence_fingerprint=checkpoint_fingerprint,
+        root_evidence_fingerprint=root_fingerprint,
     )

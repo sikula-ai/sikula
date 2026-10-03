@@ -466,6 +466,26 @@ def with_delivery_verification_readiness(
         ):
             from core.delivery_repair import delivery_repair_input_needs_refresh
 
+            if verification.passed and status.verification_node == "root" and status.plan.checkpoints:
+                from core.delivery_checkpoint_applicability import validate_root_evidence
+
+                try:
+                    validate_root_evidence(status, verification)
+                except (OSError, RuntimeError, ValueError):
+                    return replace(
+                        status,
+                        status="invalid",
+                        errors=[
+                            *status.errors,
+                            DeliveryPlanIssue(
+                                "error",
+                                "delivery_verification.evidence_unavailable",
+                                "Restore the accepted root verification evidence before continuing.",
+                            ),
+                        ],
+                        verification_status="blocked",
+                        next_action="restore accepted root verification evidence",
+                    )
             if not delivery_repair_input_needs_refresh(status, project_config):
                 return status
         return replace(
