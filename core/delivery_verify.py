@@ -49,7 +49,8 @@ from core.delivery_checkpoints import (
     verification_scope_complete,
 )
 from core.delivery_verification_scope import DeliveryVerificationScope
-from core.delivery_checkpoint_evidence import load_checkpoint_evidence, store_checkpoint_evidence
+from core.delivery_checkpoint_evidence import load_checkpoint_evidence, store_checkpoint_evidence, store_root_evidence
+from core.delivery_checkpoint_applicability import validate_root_evidence
 from core.delivery_verification_model import (
     DeliveryVerificationRecord,
     delivery_verification_covers_obligations,
@@ -841,6 +842,12 @@ def _execute_gate(
                         stop_code="delivery_checkpoint.evidence_unavailable",
                     )
                 passed = replace(passed, checkpoint_evidence_fingerprint=fingerprint)
+            elif status.plan.checkpoints:
+                try:
+                    fingerprint = store_root_evidence(root, evidence_path.parent, snapshot, passed, semantic.assessment)
+                except (OSError, ValueError):
+                    return replace(passed, status="blocked", stop_code="delivery_verification.evidence_unavailable")
+                passed = replace(passed, root_evidence_fingerprint=fingerprint)
             return passed
     except DeliveryIntegrationReviewAgentError as exc:
         return _review_blocked(
@@ -1016,6 +1023,22 @@ def _persist_terminal_if_current(
                             {"event": "evidence_unavailable", "record": terminal.to_dict()},
                             project_root=root,
                         )
+            if node_id == "root" and terminal.passed and status.plan.checkpoints:
+                try:
+                    validate_root_evidence(status, terminal)
+                except (OSError, ValueError):
+                    terminal = replace(
+                        terminal,
+                        status="blocked",
+                        stop_code="delivery_verification.evidence_unavailable",
+                        root_evidence_fingerprint=None,
+                    )
+                    if terminal.evidence_path:
+                        _safe_append_audit(
+                            root / terminal.evidence_path,
+                            {"event": "evidence_unavailable", "record": terminal.to_dict()},
+                            project_root=root,
+                        )
             progress = mark_delivery_verification(progress, terminal, node_id=node_id)
             write_delivery_progress(progress_path, progress)
             append_delivery_progress_event(
@@ -1134,6 +1157,24 @@ def _preflight_result(status, readiness, project_config: dict[str, Any] | None =
             return _blocked_result(status, issues[0].code, issues)
     if readiness.required and not status.progress_exists:
         return _blocked_result(status, "delivery_verification.progress_missing")
+    if (
+        status.verification_node == "root"
+        and status.plan
+        and status.plan.checkpoints
+        and status.verification
+        and status.verification.passed
+        and status.assembled_commit == status.verification.candidate_commit
+    ):
+        try:
+            identity = build_delivery_verification_identity(
+                status, project_config or {}, candidate_commit=status.assembled_commit
+            )
+            if _record_matches_identity(
+                status.verification, identity, obligation_count=_status_obligation_count(status)
+            ):
+                validate_root_evidence(status, status.verification)
+        except (OSError, RuntimeError, ValueError):
+            return _blocked_result(status, "delivery_verification.evidence_unavailable")
     return None
 
 

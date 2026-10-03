@@ -522,6 +522,17 @@ def _final_verification_issue(
             "delivery_verification.ref_changed",
             "The assembled branch moved after verification; rerun delivery verify.",
         )
+    if status.plan.checkpoints:
+        from core.delivery_checkpoint_applicability import validate_root_evidence
+
+        try:
+            validate_root_evidence(status, verification)
+        except (OSError, RuntimeError, ValueError):
+            return DeliveryPlanIssue(
+                "error",
+                "delivery_verification.evidence_unavailable",
+                "Restore the accepted root verification evidence before finalizing.",
+            )
     return None
 
 

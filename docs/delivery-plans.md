@@ -617,6 +617,34 @@ If consumers already started, invalidated handoffs stop for reconciliation rathe
 than silently adopting changed completed work. `delivery.verification.final_checks`
 run at the root only; ordinary configured validation also runs at checkpoints.
 
+Status distinguishes historical admission from evidence for the current assembled
+candidate. The text output shows both statuses, for example
+`Checkpoint storage: accepted_handoff (candidate evidence: verification_required)`.
+JSON exposes the same distinction through `status` and `candidate_evidence`:
+
+- `exact`: the Git tree is unchanged and the historical evidence still matches
+  the current authority and effective policy;
+- `reverified`: a fresh, accepted root assessment supplies typed evidence for
+  the changed candidate;
+- `verification_required`: code changed and no current accepted assessment
+  establishes the earlier outcomes, or a current root assessment rejected them;
+- `unavailable`: authority or required evidence is invalid, or a terminal boundary
+  prevents acceptance;
+- `not_checked`: effective policy has not been supplied to the status projection.
+
+Changed files outside a unit's declared scope are not automatically independent:
+shared dependencies can affect earlier behavior. In this first policy, changed
+trees use the normal full root assessment; no separate impact-review call or
+operator approval is added. Its findings feed the existing bounded repair flow.
+Historical admission records and already completed units remain unchanged.
+
+Successful root verification of a plan with checkpoints retains exact typed
+results in private content-addressed evidence. Dry-run, resume and finalization validate
+the accepted artifact; missing or damaged evidence cannot be reconstructed from
+success counts or audit logs. Original checkpoint evidence remains required.
+Only bounded status metadata is projected publicly. Neither artifact contents
+nor past review history accumulate in provider prompts.
+
 Each checkpoint and the root allow one repair unit and two durable authoring
 attempts. N checkpoints therefore allow at most N+1 automatic repair units, bounded
 further by `--max-units` / `--max-elapsed-minutes` per invocation. Resume, new

@@ -1,4 +1,4 @@
-"""Private checkpoint results, bound to accepted control state rather than audit replay.
+"""Private node results, bound to accepted control state rather than audit replay.
 
 These describe the reviewed candidate only. Loading them does not establish their
 applicability to later code, or replace the mandatory root review.
@@ -27,7 +27,7 @@ _GIT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 
 
 @dataclass(frozen=True)
-class DeliveryCheckpointEvidence:
+class DeliveryVerificationEvidence:
     """Bounded typed results for one scope and one accepted verification attempt."""
 
     plan_id: str
@@ -62,12 +62,12 @@ def checkpoint_evidence_path(directory: Path, record: DeliveryVerificationRecord
 def _record_binding(record: DeliveryVerificationRecord) -> dict[str, Any]:
     # The control record is the sole acceptance pointer. The artifact cannot
     # reference its own digest, and contains neither raw review nor source text.
-    return replace(record, checkpoint_evidence_fingerprint=None).to_dict()
+    return replace(record, checkpoint_evidence_fingerprint=None, root_evidence_fingerprint=None).to_dict()
 
 
 def _parse_evidence(
     payload: dict[str, Any], record: DeliveryVerificationRecord, *, plan_id: str, node_id: str
-) -> DeliveryCheckpointEvidence:
+) -> DeliveryVerificationEvidence:
     parsed_record = parse_delivery_verification_record(payload.get("verification"))
     if (
         set(payload)
@@ -84,15 +84,15 @@ def _parse_evidence(
         or payload["schema_version"] != 1
         or payload["plan_id"] != plan_id
         or payload["node_id"] != node_id
-        or node_id == "root"
         or payload["verification"] != _record_binding(record)
-        or parsed_record != replace(record, checkpoint_evidence_fingerprint=None)
+        or parsed_record != replace(record, checkpoint_evidence_fingerprint=None, root_evidence_fingerprint=None)
         or not record.passed
         or record.semantic_status != "approved"
         or record.security_status != ("approved" if record.security_required else "not_run")
         or record.stop_code is not None
-        or record.review_rule_fingerprints is None
-        or record.plan_content_fingerprint is None
+        or (node_id != "root" and (record.review_rule_fingerprints is None or record.plan_content_fingerprint is None))
+        or (node_id == "root" and record.checkpoint_evidence_fingerprint is not None)
+        or (node_id != "root" and record.root_evidence_fingerprint is not None)
     ):
         raise ValueError("Checkpoint evidence does not match accepted verification.")
     units = payload["completed_units"]
@@ -149,7 +149,7 @@ def _parse_evidence(
         ):
             raise ValueError("Checkpoint obligation result is invalid.")
         seen.add(result["id"])
-    return DeliveryCheckpointEvidence(
+    return DeliveryVerificationEvidence(
         plan_id,
         node_id,
         record,
@@ -160,6 +160,36 @@ def _parse_evidence(
 
 
 def store_checkpoint_evidence(
+    root: Path,
+    directory: Path,
+    snapshot: DeliveryVerificationSnapshot,
+    record: DeliveryVerificationRecord,
+    assessment: DeliveryIntegrationAssessment,
+) -> str:
+    if snapshot.scope.node_id == "root":
+        raise ValueError("Checkpoint evidence requires a checkpoint scope.")
+    return _store_evidence(root, directory, snapshot, record, assessment)
+
+
+def root_evidence_path(directory: Path, fingerprint: str) -> Path:
+    if not isinstance(fingerprint, str) or not _SHA256.fullmatch(fingerprint):
+        raise ValueError("Invalid root evidence identity.")
+    return directory / f"root-evidence-{fingerprint[7:]}.json"
+
+
+def store_root_evidence(
+    root: Path,
+    directory: Path,
+    snapshot: DeliveryVerificationSnapshot,
+    record: DeliveryVerificationRecord,
+    assessment: DeliveryIntegrationAssessment,
+) -> str:
+    if snapshot.scope.node_id != "root":
+        raise ValueError("Root evidence requires the root scope.")
+    return _store_evidence(root, directory, snapshot, record, assessment)
+
+
+def _store_evidence(
     root: Path,
     directory: Path,
     snapshot: DeliveryVerificationSnapshot,
@@ -184,21 +214,28 @@ def store_checkpoint_evidence(
     evidence = _parse_evidence(payload, record, plan_id=scope.plan_id, node_id=scope.node_id)
     if not evidence.covers(scope):
         raise ValueError("Checkpoint evidence must cover the captured scope exactly.")
-    path = checkpoint_evidence_path(directory, record)
+    fingerprint = _fingerprint(payload)
+    # Root attempt numbering may restart after authority or candidate changes.
+    # Content addressing retains every distinct immutable result without collisions.
+    path = (
+        root_evidence_path(directory, fingerprint)
+        if scope.node_id == "root"
+        else checkpoint_evidence_path(directory, record)
+    )
     existing = read_repair_state(root, path)
     if existing is not None:
         if existing != payload:
             raise ValueError("Checkpoint evidence for this attempt already exists.")
     else:
         write_repair_state(root, path, payload)
-    return _fingerprint(payload)
+    return fingerprint
 
 
 def load_checkpoint_evidence(
     root: Path, directory: Path, record: DeliveryVerificationRecord, *, plan_id: str, node_id: str
-) -> DeliveryCheckpointEvidence:
+) -> DeliveryVerificationEvidence:
     """Load explicit results, never infer them from counts or replay review audit."""
-    if not record.passed or record.checkpoint_evidence_fingerprint is None:
+    if node_id == "root" or not record.passed or record.checkpoint_evidence_fingerprint is None:
         raise ValueError("Accepted checkpoint evidence is unavailable.")
     try:
         payload = read_repair_state(root, checkpoint_evidence_path(directory, record))
@@ -208,3 +245,19 @@ def load_checkpoint_evidence(
     if not intact:
         raise ValueError("Accepted checkpoint evidence is unavailable.")
     return _parse_evidence(payload, record, plan_id=plan_id, node_id=node_id)
+
+
+def load_root_evidence(
+    root: Path, directory: Path, record: DeliveryVerificationRecord, *, plan_id: str
+) -> DeliveryVerificationEvidence:
+    """Load the accepted root's typed results, not its aggregate success counts."""
+    if not record.passed or record.root_evidence_fingerprint is None:
+        raise ValueError("Accepted root evidence is unavailable.")
+    try:
+        payload = read_repair_state(root, root_evidence_path(directory, record.root_evidence_fingerprint))
+        intact = payload is not None and _fingerprint(payload) == record.root_evidence_fingerprint
+    except (RecursionError, TypeError):
+        raise ValueError("Accepted root evidence is invalid.") from None
+    if not intact:
+        raise ValueError("Accepted root evidence is unavailable.")
+    return _parse_evidence(payload, record, plan_id=plan_id, node_id="root")
