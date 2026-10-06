@@ -883,7 +883,15 @@ python3 -m ruff format .
   recovery budgets to fixed logical nodes; changing candidates or node names must
   not replenish them. A historical accepted handoff cannot approve a later final
   tree. Changed authority or completed inputs invalidate it; already-started
-  consumers require reconciliation. Keep the exact-candidate root gate mandatory.
+  consumers require reconciliation. Keep the exact-candidate final gate mandatory.
+- **Always** treat checkpoint evidence in a composed final review as provisional
+  until current applicability is established. Do not infer independence from
+  disjoint paths, ancestry or passing tests. Bound child fan-in, direct context,
+  change evidence and the complete rendered protocol; unsupported inputs and
+  ordinary uncertainty use a preflighted full-review fallback. Reserve composition
+  work durably before calls, accept only audited read-only results against their
+  captured attempt, and preserve accepted decisions across resume. Never refill
+  repair budgets or discard a terminal boundary to obtain a reusable result.
 - **Never** expose final-gate source text, prompts, provider output, validation
   output, diffs, child state, credentials, or absolute paths through delivery
   status or JSON. Keep private material in append-only local evidence and publish

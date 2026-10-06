@@ -63,8 +63,10 @@ def delivery_verification_source_task_is_private(
     source_path: Path,
     source_metadata: str,
     project_config: dict[str, Any],
+    *,
+    allow_missing: bool = False,
 ) -> bool:
-    """Return whether a delivery source path is outside the provider-safe authority boundary."""
+    """Check provider-safe authority; historical delta paths may no longer exist."""
 
     if is_private_delivery_source_task_path(source_metadata):
         return True
@@ -73,7 +75,7 @@ def delivery_verification_source_task_is_private(
         tasks = {}
     private_roots: list[Path] = []
     try:
-        resolved_source = source_path.resolve(strict=True)
+        resolved_source = source_path.resolve(strict=not allow_missing)
         resolved_root = root.resolve(strict=True)
         resolved_source.relative_to(resolved_root)
         for key, default in (
@@ -466,6 +468,25 @@ def with_delivery_verification_readiness(
         ):
             from core.delivery_repair import delivery_repair_input_needs_refresh
 
+            if verification.composition_evidence_fingerprint and status.verification_node == "root":
+                from core.delivery_composition import load_composition
+
+                try:
+                    load_composition(status, verification)
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                    return replace(
+                        status,
+                        status="invalid",
+                        verification_status="blocked",
+                        errors=[
+                            *status.errors,
+                            DeliveryPlanIssue(
+                                "error",
+                                "delivery_verification.evidence_unavailable",
+                                "Restore the accepted composition evidence before continuing.",
+                            ),
+                        ],
+                    )
             if verification.passed and status.verification_node == "root" and status.plan.checkpoints:
                 from core.delivery_checkpoint_applicability import validate_root_evidence
 
@@ -533,6 +554,10 @@ def build_delivery_verification_snapshot(
         security_required=scope.security_required,
     )
     policy_fingerprint = _fingerprint(scope.policy.to_dict() if scope.policy else {})
+    if scope.node_id == "root" and status.plan.checkpoints:
+        from core.delivery_composition import COMPOSITION_POLICY
+
+        policy_fingerprint = _fingerprint({"policy": policy_fingerprint, "composition": COMPOSITION_POLICY})
     if scope.node_id != "root":
         from core.delivery_checkpoints import checkpoint_policy_payload
 

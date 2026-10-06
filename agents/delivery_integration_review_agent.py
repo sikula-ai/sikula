@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 import json
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ from core.delivery_verification import (
 )
 from core.llm_client import LLMClient, LLMReadOnlyViolation
 from core.delivery_obligations import delivery_authority_fragments
+from core.delivery_composition import CompositionResult, composition_example, parse_composition
 from tools.base_tool import Sandbox
 from tools.file_tool import FileTool
 
@@ -35,6 +37,7 @@ class DeliveryIntegrationReviewAttempt:
 class DeliveryIntegrationReviewResult:
     assessment: DeliveryIntegrationAssessment
     attempts: list[DeliveryIntegrationReviewAttempt]
+    composition: CompositionResult | None = None
 
 
 class DeliveryIntegrationReviewAgentError(RuntimeError):
@@ -73,6 +76,7 @@ class DeliveryIntegrationReviewAgent:
         candidate_tree: str,
         known_unit_ids: set[str],
         known_obligation_ids: set[str] | None = None,
+        before_attempt: Callable[[str, list[DeliveryIntegrationReviewAttempt]], None] | None = None,
     ) -> DeliveryIntegrationReviewResult:
         if review_kind not in {"semantic", "security"}:
             raise ValueError("delivery integration review kind is invalid")
@@ -87,6 +91,7 @@ class DeliveryIntegrationReviewAgent:
             known_obligation_ids=known_obligation_ids or set(),
         )
         attempts: list[DeliveryIntegrationReviewAttempt] = []
+        composition = None
         format_error: str | None = None
         for attempt in (1, 2):
             effective_prompt = prompt
@@ -101,6 +106,8 @@ class DeliveryIntegrationReviewAgent:
                     "The integration review packet exceeds the bounded final-gate limit.",
                     attempts,
                 )
+            if before_attempt is not None:
+                before_attempt(effective_prompt, attempts)
             try:
                 output = self.llm.run_readonly_agent(effective_prompt, cwd)
             except Exception as exc:
@@ -120,11 +127,15 @@ class DeliveryIntegrationReviewAgent:
                     attempts,
                 ) from None
             try:
-                assessment = parse_delivery_integration_review(
-                    output,
-                    known_unit_ids=known_unit_ids,
-                    known_obligation_ids=known_obligation_ids or set(),
-                )
+                if review_kind == "semantic" and "checkpoint_composition" in plan_context:
+                    composition = parse_composition(output, plan_context, known_unit_ids)
+                    assessment = composition.assessment
+                else:
+                    assessment = parse_delivery_integration_review(
+                        output,
+                        known_unit_ids=known_unit_ids,
+                        known_obligation_ids=known_obligation_ids or set(),
+                    )
             except DeliveryIntegrationReviewParseError as exc:
                 attempts.append(
                     DeliveryIntegrationReviewAttempt(
@@ -145,7 +156,7 @@ class DeliveryIntegrationReviewAgent:
                     output=output,
                 )
             )
-            return DeliveryIntegrationReviewResult(assessment=assessment, attempts=attempts)
+            return DeliveryIntegrationReviewResult(assessment=assessment, attempts=attempts, composition=composition)
         raise AssertionError("bounded integration review loop did not terminate")
 
     def prepare_workspace(self, cwd: Path) -> None:
@@ -217,6 +228,23 @@ class DeliveryIntegrationReviewAgent:
         control_object_example = delivery_integration_review_control_example(
             known_obligation_ids if review_kind == "semantic" else set()
         )
+        if review_kind == "semantic" and "checkpoint_composition" in plan_context:
+            control_object_example = composition_example(plan_context)
+            focus += (
+                "\nThis final gate composes historical checkpoint evidence with direct work."
+                " Historical passes are provisional: explicitly assess each checkpoint against the CURRENT candidate."
+                " For exact trees, validated typed results establish the child outcomes, but still inspect integration."
+                " For changed trees, inspect the supplied complete bounded delta and read relevant current code,"
+                " callers and shared dependencies. Cite delta:<checkpoint-id> and give a bounded evidence-based rationale."
+                " Ancestry, disjoint paths and passing tests alone never prove continued applicability."
+                " Use verification_required whenever applicability cannot be established or a child regressed;"
+                " Sikula will autonomously run full verification. Do not request human review for that uncertainty."
+                " Check cross-group behavior, every hard constraint and the complete source independently."
+                " Return obligation_results ONLY for direct obligations, plus exactly one checkpoint_results entry"
+                " for each child. Child outcomes are applicable or verification_required."
+                " You may approve direct work while a child requires verification; that is NOT final approval."
+                " Report external dependency or unavailable authoritative decisions using the normal stop dispositions."
+            )
         authority_fragments = [fragment.to_prompt_dict() for fragment in delivery_authority_fragments(source_task)]
         prompt = f"""{AGENT_SECURITY_PREFIX}{focus}
 

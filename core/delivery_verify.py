@@ -14,11 +14,13 @@ from agents.delivery_integration_review_agent import (
     DeliveryIntegrationReviewAgent,
     DeliveryIntegrationReviewAgentError,
     DeliveryIntegrationReviewResult,
+    DeliveryIntegrationReviewAttempt,
 )
 from core.delivery_finalize import assemble_delivery_candidate
 from core.llm_client import LLMConfigurationError, LLMReadOnlyViolation
 from core.delivery_plan import DeliveryPlanIssue
 from core.delivery_progress import (
+    DeliveryStatusResult,
     DeliveryProgressEvent,
     DeliveryProgressLockError,
     acquire_delivery_progress_lock,
@@ -334,6 +336,17 @@ def verify_delivery_plan(
                 started_at=_now(),
                 review_rule_fingerprints=rule_fingerprints,
                 plan_content_fingerprint=plan_content_fingerprint,
+                composition_attempted=bool(
+                    node_id == "root"
+                    and existing
+                    and existing.gate_id == identity.gate_id
+                    and existing.composition_attempted
+                ),
+                composition_evidence_fingerprint=(
+                    existing.composition_evidence_fingerprint
+                    if node_id == "root" and existing and existing.gate_id == identity.gate_id
+                    else None
+                ),
             )
             progress = mark_delivery_verification(progress, running, node_id=node_id)
             write_delivery_progress(progress_path, progress)
@@ -683,19 +696,32 @@ def _execute_gate(
             known_obligation_ids = set(scope.obligation_ids)
             semantic_before = _review_snapshot(worktree, project_config)
             active_review = "semantic"
-            semantic = _run_review(
-                semantic_reviewer,
+            semantic, running = _composition_review(
+                status=status,
+                snapshot=snapshot,
+                running=running,
+                reviewer=semantic_reviewer,
                 worktree=worktree,
-                kind="semantic",
+                root=root,
                 source_task=source_task,
-                plan_context=plan_context,
                 validation=validation,
-                identity=identity,
-                known_unit_ids=known_unit_ids,
-                known_obligation_ids=known_obligation_ids,
                 evidence_path=evidence_path,
-                audit_root=root,
+                project_config=project_config,
             )
+            if semantic is None:
+                semantic = _run_review(
+                    semantic_reviewer,
+                    worktree=worktree,
+                    kind="semantic",
+                    source_task=source_task,
+                    plan_context=plan_context,
+                    validation=validation,
+                    identity=identity,
+                    known_unit_ids=known_unit_ids,
+                    known_obligation_ids=known_obligation_ids,
+                    evidence_path=evidence_path,
+                    audit_root=root,
+                )
             semantic_status = "approved" if semantic.assessment.approved else "rejected"
             obligation_satisfied_count = sum(
                 result.outcome == "satisfied" for result in semantic.assessment.obligation_results
@@ -896,6 +922,160 @@ def _execute_gate(
         )
 
 
+def _composition_review(
+    *,
+    status: DeliveryStatusResult,
+    snapshot: DeliveryVerificationSnapshot,
+    running: DeliveryVerificationRecord,
+    reviewer: DeliveryIntegrationReviewAgent,
+    worktree: Path,
+    root: Path,
+    source_task: str,
+    validation: DeliveryVerificationValidationResult,
+    evidence_path: Path,
+    project_config: dict[str, Any],
+) -> tuple[DeliveryIntegrationReviewResult | None, DeliveryVerificationRecord]:
+    from core.delivery_composition import build_composition_context, load_composition, store_composition
+    from core.delivery_verification import delivery_verification_prompt_is_bounded
+
+    if snapshot.scope.node_id != "root" or not status.plan.checkpoints:
+        return None, running
+    try:
+        if running.composition_evidence_fingerprint:
+            accepted = load_composition(status, running)
+            if accepted.fallback:
+                return None, running
+            return DeliveryIntegrationReviewResult(accepted.assessment, [], accepted), running
+        if running.composition_attempted:
+            return None, running
+        context = build_composition_context(status, snapshot, project_config)
+        if context is None:
+            return None, running
+        prompt_args = dict(
+            cwd=worktree,
+            review_kind="semantic",
+            source_task=source_task,
+            validation_summary=validation.to_review_dict(project_config, project_root=worktree),
+            candidate_commit=snapshot.identity.candidate_commit,
+            candidate_tree=snapshot.identity.candidate_tree,
+            known_obligation_ids=set(snapshot.scope.obligation_ids),
+        )
+        full_prompt = reviewer._prompt(plan_context=snapshot.scope.plan_context(), **prompt_args)
+        composed_prompt = reviewer._prompt(plan_context=context, **prompt_args)
+        if not delivery_verification_prompt_is_bounded(full_prompt + " " * 512):
+            return None, running
+        # Account for the actual control template, rules, JSON escaping and retry instruction.
+        if not delivery_verification_prompt_is_bounded(composed_prompt + " " * 512) or len(
+            composed_prompt.encode()
+        ) >= len(full_prompt.encode()):
+            return None, running
+        running = _persist_composition_control(status, snapshot, running, project_config, attempted=True)
+        if not _safe_append_audit(
+            evidence_path,
+            {
+                "event": "composition_reserved",
+                "gate_id": running.gate_id,
+                "attempt": running.attempt,
+                "max_provider_calls": 2,
+            },
+            project_root=root,
+        ):
+            raise DeliveryIntegrationReviewAgentError(
+                "delivery_verification.audit_unavailable", "Composition audit is unavailable.", []
+            )
+        before = _review_snapshot(worktree, project_config)
+        try:
+            result = _run_review(
+                reviewer,
+                worktree=worktree,
+                kind="semantic",
+                source_task=source_task,
+                plan_context=context,
+                validation=validation,
+                identity=snapshot.identity,
+                known_unit_ids=set(snapshot.scope.unit_ids),
+                known_obligation_ids=set(snapshot.scope.obligation_ids),
+                evidence_path=evidence_path,
+                audit_root=root,
+            )
+        except DeliveryIntegrationReviewAgentError as exc:
+            if not _review_workspace_unchanged(worktree, project_config, before) or not _candidate_is_clean(
+                worktree, snapshot.identity.candidate_commit
+            ):
+                raise DeliveryIntegrationReviewAgentError(
+                    "delivery_verification.readonly_mutation", "Composition reviewer changed its workspace.", []
+                ) from exc
+            if exc.code == "delivery_verification.composition_invalid":
+                return None, running
+            raise
+        except _ReviewAuditUnavailable as exc:
+            if not _review_workspace_unchanged(worktree, project_config, before) or not _candidate_is_clean(
+                worktree, snapshot.identity.candidate_commit
+            ):
+                exc.boundary_stop_code = "delivery_verification.readonly_mutation"
+            raise
+        if not _review_workspace_unchanged(worktree, project_config, before) or not _candidate_is_clean(
+            worktree, snapshot.identity.candidate_commit
+        ):
+            raise DeliveryIntegrationReviewAgentError(
+                "delivery_verification.readonly_mutation", "Composition reviewer changed its workspace.", []
+            )
+        if result.composition is None:
+            raise ValueError("Composition assessment unavailable.")
+        if not result.assessment.approved and not result.composition.fallback:
+            # Preserve the stop, but do not cache an unavailable external input forever.
+            # A later explicit retry uses full review within the existing recovery policy.
+            return result, running
+        digest = store_composition(root, evidence_path.parent, running.gate_id, context, result.composition)
+        running = _persist_composition_control(
+            status, snapshot, running, project_config, attempted=True, fingerprint=digest
+        )
+        return (None if result.composition.fallback else result), running
+    except (OSError, ValueError, KeyError, DeliveryProgressLockError):
+        raise DeliveryIntegrationReviewAgentError(
+            "delivery_verification.evidence_unavailable", "Composition evidence is unavailable.", []
+        ) from None
+
+
+def _persist_composition_control(
+    status: DeliveryStatusResult,
+    snapshot: DeliveryVerificationSnapshot,
+    running: DeliveryVerificationRecord,
+    cfg: dict[str, Any],
+    *,
+    attempted: bool,
+    fingerprint: str | None = None,
+) -> DeliveryVerificationRecord:
+    """Only this captured running attempt can reserve work or accept its proof."""
+    from core.delivery_checkpoints import checkpoint_pass_is_usable
+
+    root = Path(status.project_root)
+    with acquire_delivery_progress_lock(root, status.plan.plan_id, owner="delivery.verify.composition"):
+        current = get_delivery_status(status.plan_path, project_root=root)
+        if build_delivery_verification_identity(
+            current, cfg, candidate_commit=snapshot.identity.candidate_commit
+        ) != snapshot.identity or not _assembly_ref_matches(root, current, snapshot.identity.candidate_commit):
+            raise ValueError("Composition candidate changed.")
+        if current.checkpoint_verifications != status.checkpoint_verifications or any(
+            not checkpoint_pass_is_usable(current, child, cfg) for child in status.plan.checkpoints
+        ):
+            raise ValueError("Composition checkpoint authority changed.")
+        path = delivery_progress_path(root, status.plan.plan_id)
+        progress, errors = read_delivery_progress(path, plan_id=status.plan.plan_id)
+        record = progress.verification if progress else None
+        if (
+            errors
+            or record is None
+            or record.status != "running"
+            or record.gate_id != running.gate_id
+            or record.attempt != running.attempt
+        ):
+            raise ValueError("Composition attempt changed.")
+        updated = replace(record, composition_attempted=attempted, composition_evidence_fingerprint=fingerprint)
+        write_delivery_progress(path, mark_delivery_verification(progress, updated))
+        return updated
+
+
 def _run_review(
     reviewer: DeliveryIntegrationReviewAgent,
     *,
@@ -910,6 +1090,25 @@ def _run_review(
     evidence_path: Path,
     audit_root: Path,
 ) -> DeliveryIntegrationReviewResult:
+    composing = kind == "semantic" and "checkpoint_composition" in plan_context
+    composition_before = _review_snapshot(worktree, reviewer.project_config) if composing else None
+
+    def audit_composition_attempt(prompt: str, attempts: list[DeliveryIntegrationReviewAttempt]) -> None:
+        if not _review_workspace_unchanged(
+            worktree, reviewer.project_config, composition_before
+        ) or not _candidate_is_clean(worktree, identity.candidate_commit):
+            raise DeliveryIntegrationReviewAgentError(
+                "delivery_verification.readonly_mutation", "Composition reviewer changed its workspace.", attempts
+            )
+        if not _safe_append_audit(
+            evidence_path,
+            {"event": "composition_call", "prompt": prompt, "prior_attempts": _attempt_audit(attempts)},
+            project_root=audit_root,
+        ):
+            raise DeliveryIntegrationReviewAgentError(
+                "delivery_verification.audit_unavailable", "Composition prompt audit is unavailable.", attempts
+            )
+
     try:
         result = reviewer.review(
             cwd=worktree,
@@ -925,6 +1124,7 @@ def _run_review(
             candidate_tree=identity.candidate_tree,
             known_unit_ids=known_unit_ids,
             known_obligation_ids=known_obligation_ids,
+            **({"before_attempt": audit_composition_attempt} if composing else {}),
         )
     except DeliveryIntegrationReviewAgentError as exc:
         review_evidence = {
@@ -950,6 +1150,11 @@ def _run_review(
         "attempts": _attempt_audit(result.attempts),
         "usage": reviewer.consume_usage_records(),
     }
+    if result.composition is not None:
+        review_evidence["composition"] = {
+            "checkpoint_results": result.composition.checkpoints,
+            "full_review_required": result.composition.fallback,
+        }
     if not _safe_append_audit(evidence_path, review_evidence, project_root=audit_root):
         obligation_satisfied_count = sum(
             obligation.outcome == "satisfied" for obligation in result.assessment.obligation_results
@@ -988,6 +1193,13 @@ def _persist_terminal_if_current(
                 return None
             if record.gate_id != identity.gate_id or record.attempt != terminal.attempt or record.status != "running":
                 return None
+            if node_id == "root":
+                # Reservations and accepted composition survive interruption and outer error paths.
+                terminal = replace(
+                    terminal,
+                    composition_attempted=record.composition_attempted,
+                    composition_evidence_fingerprint=record.composition_evidence_fingerprint,
+                )
             # A boundary violation belongs to the attempt even when authority
             # changes while its provider is running. Never replace it with stale.
             retain_boundary = node_id != "root" and delivery_verification_is_boundary_stop(terminal)
@@ -1144,6 +1356,12 @@ def _preflight_result(status, readiness, project_config: dict[str, Any] | None =
         from core.delivery_checkpoints import checkpoint_barrier_issue, checkpoint_pass_is_usable
         from core.delivery_handoff import load_delivery_dependency_handoffs
 
+        if (
+            status.verification_node == "root"
+            and status.verification
+            and delivery_verification_is_boundary_stop(status.verification)
+        ):
+            return _blocked_result(status, status.verification.stop_code or "delivery_verification.security_rejected")
         issue = checkpoint_barrier_issue(status, project_config)
         if issue is not None and issue.code == "delivery_checkpoint.handoff_stale":
             return _blocked_result(status, issue.code, [issue])

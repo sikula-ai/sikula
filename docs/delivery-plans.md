@@ -610,7 +610,7 @@ external dependencies, security and read-only violations remain blockers.
 
 `delivery status --json` and `delivery run --json` add bounded `checkpoints` entries.
 `accepted_handoff` means the historical group result remains usable. It does not
-approve later commits: the root gate still checks all source outcomes and the exact
+approve later commits: the final gate still checks all source outcomes and the exact
 final candidate. Normal downstream commits do not replay an accepted checkpoint;
 changed source, covered inputs/contracts or applicable policy invalidate it.
 If consumers already started, invalidated handoffs stop for reconciliation rather
@@ -634,10 +634,25 @@ JSON exposes the same distinction through `status` and `candidate_evidence`:
 - `not_checked`: effective policy has not been supplied to the status projection.
 
 Changed files outside a unit's declared scope are not automatically independent:
-shared dependencies can affect earlier behavior. In this first policy, changed
-trees use the normal full root assessment; no separate impact-review call or
-operator approval is added. Its findings feed the existing bounded repair flow.
+shared dependencies can affect earlier behavior. For supported groups, the final
+gate combines direct work with checkpoint results and explicitly assesses their
+applicability to the current code. It uses a bounded change packet and inspects
+relevant code, including shared dependencies. This replaces the repeated full
+semantic review when the composed prompt is smaller. Uncertain applicability or
+integration gaps automatically select full review; confirmed external-dependency
+and security boundaries remain stops. Full-review findings feed bounded repair.
 Historical admission records and already completed units remain unchanged.
+
+The composed path supports up to eight nonoverlapping checkpoints and 32 direct
+units, within fixed context and change budgets. Other shapes use full review;
+these bounds do not reject otherwise supported plans. Required security review
+and final validation still cover the current candidate. A later repair owner
+outside a checkpoint makes its obligation direct again.
+Composition gets one durable exchange per unchanged candidate/policy, with at
+most two calls for format correction. Resume reuses its accepted decision; an
+interrupted exchange without a result or malformed responses use full review.
+Referenced composition evidence remains private and must be intact, just like
+the original checkpoint and final evidence.
 
 Successful root verification of a plan with checkpoints retains exact typed
 results in private content-addressed evidence. Dry-run, resume and finalization validate
@@ -658,7 +673,7 @@ dependencies, `delivery_repair.repair_lineage_bound` stops before authoring or
 consuming another attempt. Resolving that topology requires a follow-up plan.
 Plans without checkpoints retain their prior one-repair behavior.
 
-This is a flat, bounded implementation. The complete root packet must still fit
+This is a flat, bounded implementation. The full-review fallback must still fit
 its existing limits (including 256 active units); nested composition, adaptive
 regrouping and large-plan scaling are subsequent work.
 
