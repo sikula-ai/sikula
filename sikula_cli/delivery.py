@@ -3030,9 +3030,15 @@ def _delivery_run_result(
     from core.delivery_run import DeliveryRunResult
 
     from core.delivery_checkpoints import checkpoint_projection
+    from core.delivery_progress import delivery_verification_projection
 
     return DeliveryRunResult(
         checkpoints=checkpoint_projection(status) if getattr(getattr(status, "plan", None), "checkpoints", ()) else [],
+        verification=delivery_verification_projection(
+            required=bool(status.plan and getattr(status.plan, "requires_final_verification", False)),
+            status=getattr(status, "verification_status", "not_required"),
+            record=getattr(status, "verification", None),
+        ),
         plan_path=status.plan_path,
         project_root=status.project_root,
         valid=status.valid and not errors,

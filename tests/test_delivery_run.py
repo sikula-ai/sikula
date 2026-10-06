@@ -26,11 +26,13 @@ from core.delivery_run import (
     _public_path,
     render_delivery_run,
 )
+from core.delivery_verification_model import DeliveryVerificationRecord
 from core.state import JsonStateStore
 from sikula_cli.delivery import (
     DeliveryRunNextContext,
     _bounded_delivery_run_snapshot_issue,
     _delivery_run_is_current_finalization,
+    _delivery_run_result,
     _finalize_delivery_run,
     _preview_delivery_run,
     _run_delivery_plan,
@@ -95,6 +97,23 @@ def _status(unit_statuses: list[str], *, final_commit: str | None = None) -> Sim
         final_commit=final_commit,
         finalized_at="2026-07-27T12:00:00+00:00" if final_commit else None,
     )
+
+
+def _verification_record(**changes) -> DeliveryVerificationRecord:
+    record = DeliveryVerificationRecord(
+        schema_version=1,
+        gate_id="sha256:" + "a" * 64,
+        candidate_commit="a" * 40,
+        candidate_tree="b" * 40,
+        source_fingerprint="sha256:" + "c" * 64,
+        plan_fingerprint="sha256:" + "d" * 64,
+        completed_scope_fingerprint="sha256:" + "e" * 64,
+        config_fingerprint="sha256:" + "f" * 64,
+        policy_fingerprint="sha256:" + "1" * 64,
+        status="failed",
+        attempt=1,
+    )
+    return replace(record, **changes)
 
 
 def _context() -> DeliveryRunNextContext:
@@ -359,7 +378,7 @@ def test_preview_delivery_run_does_not_offer_actionable_verification_retry(
     status = _status(["done"])
     status.plan.requires_final_verification = True
     status.verification_status = "failed"
-    status.verification = SimpleNamespace(stop_code="delivery_verification.scope_amendment_required")
+    status.verification = _verification_record(stop_code="delivery_verification.scope_amendment_required")
     monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
     monkeypatch.setattr(
         "core.delivery_verification.with_delivery_verification_readiness",
@@ -887,7 +906,7 @@ def test_finalize_delivery_run_does_not_retry_actionable_verification_failure(
     status = _status(["done"])
     status.plan.requires_final_verification = True
     status.verification_status = "failed"
-    status.verification = SimpleNamespace(stop_code=stop_code)
+    status.verification = _verification_record(stop_code=stop_code)
     calls: list[str] = []
 
     def verify(args, cfg):
@@ -922,7 +941,7 @@ def test_finalize_delivery_run_does_not_retry_blocked_config_drift(monkeypatch: 
     status = _status(["done"])
     status.plan.requires_final_verification = True
     status.verification_status = "blocked"
-    status.verification = SimpleNamespace(stop_code="delivery_verification.config_changed")
+    status.verification = _verification_record(stop_code="delivery_verification.config_changed")
     calls: list[str] = []
 
     monkeypatch.setattr(
@@ -954,7 +973,7 @@ def test_finalize_delivery_run_retries_technical_verification_failure(
     status = _status(["done"])
     status.plan.requires_final_verification = True
     status.verification_status = "failed"
-    status.verification = SimpleNamespace(stop_code="delivery_verification.validation_failed")
+    status.verification = _verification_record(stop_code="delivery_verification.validation_failed")
     calls: list[str] = []
 
     def verify(args, cfg):
@@ -1009,7 +1028,7 @@ def test_finalize_delivery_run_reverifies_projected_stale_record(
     status = _status(["done"])
     status.plan.requires_final_verification = True
     status.verification_status = verification_status
-    status.verification = SimpleNamespace(stop_code="delivery_verification.config_changed")
+    status.verification = _verification_record(stop_code="delivery_verification.config_changed")
     calls: list[str] = []
 
     def project(current, cfg):
@@ -1170,6 +1189,61 @@ def test_cmd_delivery_run_json_is_one_compact_document(capsys: pytest.CaptureFix
     assert payload["completed"] is False
     assert payload["units_succeeded"] == 1
     assert payload["progress_path"] == ".sikula/state/delivery/demo/progress.json"
+
+
+@pytest.mark.parametrize("gate_status", ["pending", "passed", "failed", "blocked", "stale"])
+def test_delivery_run_projects_current_final_gate_without_private_evidence(gate_status: str) -> None:
+    status = _status(["done"])
+    status.plan.requires_final_verification = True
+    status.verification_status = gate_status
+    gap = int(gate_status in {"failed", "blocked"})
+    status.verification = (
+        None
+        if gate_status == "pending"
+        else _verification_record(
+            status="passed" if gate_status == "stale" else gate_status,
+            obligation_count=4,
+            obligation_satisfied_count=4 - gap,
+            obligation_gap_count=gap,
+            stop_code="delivery_verification.repair_required" if gap else None,
+            evidence_path="/private/audit/verification.jsonl",
+            review_rule_fingerprints={"private-rule.md": "sha256:" + "2" * 64},
+            root_evidence_fingerprint="sha256:" + "3" * 64,
+        )
+    )
+    result = _delivery_run_result(
+        status=status,
+        max_units=1,
+        max_elapsed_minutes=None,
+        stop_code=DELIVERY_RUN_PREVIEW,
+        message="Verification summary.",
+    )
+
+    data = result.to_dict()
+    output = render_delivery_run(result)
+    assert data["verification"]["status"] == gate_status
+    assert data["verification"]["required"] is True
+    assert f"Final gate: {gate_status}\n" in output
+    if gate_status == "pending":
+        assert "Final gate obligations:" not in output
+        assert "obligation_count" not in data["verification"]
+    else:
+        assert f"Final gate obligations: {4 - gap}/4 satisfied, {gap} gap(s)" in output
+        assert data["verification"]["obligation_satisfied_count"] == 4 - gap
+    if gap:
+        assert "Final gate stop code: delivery_verification.repair_required" in output
+    for private_field in (
+        "evidence_path",
+        "source_fingerprint",
+        "plan_fingerprint",
+        "config_fingerprint",
+        "policy_fingerprint",
+        "review_rule_fingerprints",
+        "root_evidence_fingerprint",
+    ):
+        assert private_field not in data["verification"]
+    assert "/private/audit" not in json.dumps(data) + output
+    assert "private-rule.md" not in json.dumps(data) + output
 
 
 def test_render_delivery_run_uses_public_projection() -> None:

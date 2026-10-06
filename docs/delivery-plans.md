@@ -618,7 +618,8 @@ than silently adopting changed completed work. `delivery.verification.final_chec
 run at the root only; ordinary configured validation also runs at checkpoints.
 
 Status distinguishes historical admission from evidence for the current assembled
-candidate. The text output shows both statuses, for example
+candidate. Both `delivery status` and the `delivery run` text summary show these
+checkpoint statuses, including successful checkpoints, for example
 `Checkpoint storage: accepted_handoff (candidate evidence: verification_required)`.
 JSON exposes the same distinction through `status` and `candidate_evidence`:
 
@@ -1007,6 +1008,12 @@ each child in the same way as `run-next`; reviewer and security-reviewer
 overrides also govern the final gate.
 `delivery_preparer` overrides govern integration repair authoring and are not
 forwarded to implementation agents.
+
+The `delivery run` summary reports the separate `Final gate` status, its recorded
+gate ID, and, when an assessment exists, its satisfied/total obligation counts and gaps.
+Failed assessments include their final-gate stop code. Its JSON `verification`
+object uses the same public metadata projection as `delivery status`; checkpoint
+acceptance alone does not imply that the final gate passed.
 
 ### Bounded integration repair
 
