@@ -284,10 +284,13 @@ checkpoints where downstream work depends on a coherent completed group.
 re-verifies before releasing dependent units. `run-next` cannot bypass the barrier.
 `delivery status` distinguishes an accepted historical checkpoint handoff from the
 evidence applicable to the current candidate. Changed code requires fresh
-verification; the full root gate establishes that evidence before finalization.
+verification; the final gate establishes that evidence before finalization.
+For supported small groups, it combines checkpoint results with direct work and
+checks that those results still apply to the current code. This reduces repeated
+context. Uncertain applicability automatically falls back to full review.
 Each checkpoint has its own persistent
 repair budget. Nested hierarchy and large-plan scaling remain later work: this
-first slice still requires the complete root review to fit its existing limits.
+slice still requires the full-review fallback to fit its existing limits.
 Successful checkpoints retain private structured obligation results bound to the
 reviewed candidate and gate attempt. Handoff checks verify their integrity without
 replaying review logs or adding history to prompts. Missing or damaged evidence

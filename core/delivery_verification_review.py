@@ -95,6 +95,7 @@ def parse_delivery_integration_review(
     *,
     known_unit_ids: set[str],
     known_obligation_ids: set[str] | None = None,
+    known_finding_obligation_ids: set[str] | None = None,
 ) -> DeliveryIntegrationAssessment:
     obligation_ids = set(known_obligation_ids or set())
     if not isinstance(output, str) or not output.strip():
@@ -144,7 +145,9 @@ def parse_delivery_integration_review(
             value,
             index=index,
             known_unit_ids=known_unit_ids,
-            known_obligation_ids=obligation_ids,
+            known_obligation_ids=obligation_ids
+            if known_finding_obligation_ids is None
+            else known_finding_obligation_ids,
         )
         for index, value in enumerate(raw_findings)
     ]

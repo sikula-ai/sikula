@@ -1,8 +1,8 @@
 """Candidate-specific checkpoint evidence, separate from historical admission.
 
 Exact-tree reuse needs no semantic inference. Changed trees require fresh typed
-root results in this slice; path overlap or ancestry never establishes independence.
-The existing root reviewer supplies that assessment without an additional call.
+final results, from full review or grounded composition; path overlap or ancestry
+never establishes independence. Historical admission remains separate.
 """
 
 from __future__ import annotations
@@ -39,6 +39,15 @@ def validate_root_evidence(status: DeliveryStatusResult, record: DeliveryVerific
     scope = DeliveryVerificationScope.from_plan(status.plan, "root")
     if not evidence.covers(scope):
         raise ValueError("Root evidence coverage changed.")
+    if record.composition_evidence_fingerprint:
+        from core.delivery_composition import load_composition
+
+        composition = load_composition(status, record)
+        if not composition.fallback and (
+            not composition.assessment.approved
+            or composition.assessment.obligation_results != list(evidence.obligation_results)
+        ):
+            raise ValueError("Composition outcomes changed.")
 
 
 def checkpoint_applicability(

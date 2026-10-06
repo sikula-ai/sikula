@@ -1261,7 +1261,7 @@ inside repository-relative filenames are supported where the host filesystem
 allows them; absolute paths, Windows drive prefixes, backslashes and parent
 traversal remain rejected. A valid source filename must not become a blocker only
 when a completed group reaches its checkpoint.
-Later code changes are reviewed at subsequent checkpoints and by the full root
+Later code changes are reviewed at subsequent checkpoints and by the final
 gate. Candidate applicability is separate from the historical admission barrier;
 it does not reopen consumers that already started.
 
@@ -1299,9 +1299,9 @@ from counts. Root records, failed reviews and terminal stops do not require a
 successful checkpoint artifact.
 
 These results remain private historical evidence, not approval of a later tree.
-No provider call or prompt field is added, and no descendant history is embedded.
-The full root review and its source, packet and unit limits remain mandatory.
-Parent-packet composition, selective code-impact assessment and hierarchy remain later work.
+The final gate can consume them through bounded composition described below;
+it never embeds descendant review history. The existing source, packet and unit
+limits still apply to the full-review fallback. Hierarchy remains later work.
 
 **Checkpoint candidate applicability:** `core/delivery_checkpoint_applicability.py`
 derives a decision for the current assembled candidate and effective policy from
@@ -1310,10 +1310,9 @@ handoff permits `exact` reuse. A different tree requires fresh verification;
 unchanged contracts, path disjointness, Git ancestry and passing tests do not
 establish semantic independence. A current semantic root rejection also requires
 re-verification even when the tree is unchanged; it does not rewrite historical
-admission. This first policy uses the existing full root review as that
-verification, with no additional impact-assessment provider call.
-Selective independence assessment remains a prerequisite of later bounded
-composition, rather than a duplicate review while the full root assessment is mandatory.
+admission. The final gate establishes applicability through either a full review
+or a composed assessment grounded in current code and bounded change evidence.
+Successful composition replaces the full semantic review for that candidate.
 
 For plans with checkpoints, a successful root gate persists its exact typed
 obligation results, completed inputs, constraint coverage and verification binding
@@ -1381,10 +1380,63 @@ Public status/run projections expose only bounded checkpoint identity, state,
 coverage counts, attempt, candidate commit and stop code. Raw findings, contracts,
 prompts and provider output remain private evidence.
 
-The full root review is mandatory after all work, including repairs. It covers
+The final gate is mandatory after all work, including repairs. It covers
 cross-group and future obligations and approves only the exact final candidate.
 Adaptive insertion/regrouping, nested checkpoint composition, rolling windows and
 plans beyond the bounded root packet remain later work.
+
+**Bounded final-gate composition:** `core/delivery_composition.py` supplies a
+supported flat path with at most eight nonoverlapping checkpoints and 32 direct
+units. Only obligations whose complete current ownership lies inside a child can
+be inherited; later repair owners leave an obligation direct. The packet retains
+full source authority, constraints, source accounting and direct work, replacing
+covered unit metadata with typed receipt references and obligation descriptions.
+It includes complete project-relative changes since each child candidate within
+a shared 64 KiB delta budget (at most 32 changed paths per child), with a 128 KiB
+serialized context ceiling. Oversized, binary, private-path or unsupported deltas
+select full review; no truncated delta establishes independence. Git reads are
+bounded and timed out. Path inspection and diff rendering both disable rename
+detection so the original side of a rename cannot hide a private path.
+Delta paths also obey configured private state/report roots and build-tool
+environment-file exclusions, including deleted historical paths. Both Git reads
+explicitly disable submodule suppression; gitlink changes select full review
+before diff content is read because pointer changes are not complete dependency evidence.
+Individual review prompts retain the 512 KiB ceiling.
+Rendered prompts include rules, JSON escaping, response templates and correction
+headroom. Composition is chosen only when it is smaller than full review and the
+full fallback fits. These are supported-path bounds, not new plan-size limits.
+
+The same read-only semantic reviewer assesses direct obligations, whole-source
+completeness, cross-group integration and explicit `checkpoint_results`. Each
+child decision is `applicable` or `verification_required`, with a bounded rationale;
+changed-tree applicability must cite its supplied delta and inspect relevant code
+and shared dependencies. Citations and schemas are checked deterministically;
+semantic correctness remains the reviewer's responsibility. Native provider
+inspection retains the existing read-only scope and timeout boundaries. This
+slice does not claim a new cross-provider per-file retrieval quota.
+Only applicable child outcomes are expanded into the exact typed final obligation
+closure. Uncertainty, child regressions, partial repair findings or two malformed
+responses trigger the existing full semantic review automatically. Confirmed
+external-dependency, scope and unavailable-authority dispositions remain stops.
+Security review, when required, still reviews the full current candidate; ordinary
+validation and final checks also remain mandatory.
+
+Before the first composition call, the captured running final-gate record durably
+sets `composition_attempted`. One exchange (at most two calls for format correction)
+is permitted for that unchanged gate across resume; an interrupted exchange without
+accepted evidence proceeds directly to full review. The read-only workspace boundary
+is checked before each composition call, including a format correction. After private
+audit succeeds and the candidate remains read-only, a content-addressed `composition-evidence-<sha>.json`
+stores the typed response, packet fingerprint, current gate identity and immediate
+receipt fingerprints. The record's `composition_evidence_fingerprint` alone accepts
+it under the delivery lock. An orphan or audit transcript is never reused. Accepted
+decisions, including fallback decisions, survive interruption before security review;
+missing referenced evidence blocks before providers. Final typed evidence binds the
+composition reference, and readiness, reuse and finalization validate it. Historical
+checkpoint admission and fixed logical-node repair budgets remain unchanged.
+Non-approved authoritative stops are persisted as gate failures, not cached as
+accepted composition. After an external prerequisite is resolved, an explicit retry
+can run full review. Security and read-only boundary stops continue to preempt review.
 
 **Delivery final integration gate:** newly prepared root-only plans use schema version 2;
 plans with checkpoints use schema version 3. Both require `verification.mode: final_gate`.
