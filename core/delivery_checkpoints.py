@@ -6,7 +6,7 @@ from collections.abc import Collection
 from dataclasses import replace
 from hashlib import sha256
 from io import BytesIO
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import posixpath
 import subprocess
 from typing import Any
@@ -313,7 +313,7 @@ def _checkpoint_file_fingerprints(
             or PurePosixPath(path).is_absolute()
             or ".." in PurePosixPath(path).parts
             or "\\" in path
-            or ":" in path
+            or PureWindowsPath(path).drive
         ):
             raise ValueError("Checkpoint authority file path is invalid")
     paths = tuple(dict.fromkeys(paths))
@@ -399,7 +399,13 @@ def _checkpoint_file_fingerprints(
                     raise ValueError("Checkpoint contract is not a regular candidate file")
                 links += 1
                 target = blob(oid.decode("ascii")).decode("utf-8")
-                if links > 40 or not target or target.startswith("/") or "\\" in target or ":" in target:
+                if (
+                    links > 40
+                    or not target
+                    or target.startswith("/")
+                    or "\\" in target
+                    or PureWindowsPath(target).drive
+                ):
                     raise ValueError("Checkpoint authority file link is unsafe")
                 target = posixpath.normpath(posixpath.join(*resolved[:-1], target))
                 if target == ".." or target.startswith("../"):

@@ -2153,6 +2153,7 @@ def test_delivery_run_executes_and_finalizes_two_unit_plan(
         assert preview["ready"] is True
         assert preview["started"] is False
         assert preview["units_attempted"] == 0
+        assert preview["verification"] == {"required": True, "status": "pending"}
         assert not progress_path.exists()
         assert (
             subprocess.run(
@@ -2190,11 +2191,15 @@ def test_delivery_run_executes_and_finalizes_two_unit_plan(
     assert payload["units_attempted"] == 2
     assert payload["units_succeeded"] == 2
     assert payload["stop_code"] == "delivery.run.completed"
+    assert payload["verification"]["status"] == "passed"
+    assert payload["verification"]["gate_id"] == progress["verification"]["gate_id"]
+    assert "evidence_path" not in payload["verification"]
     assert progress["final_commit"] == final_commit
     assert all(unit["status"] == "done" for unit in progress["units"])
     assert repeated["succeeded"] is True
     assert repeated["completed"] is True
     assert repeated["units_attempted"] == 0
+    assert repeated["verification"] == payload["verification"]
     assert events_path.read_text(encoding="utf-8").splitlines() == first_events
     assert (
         subprocess.run(
@@ -2351,6 +2356,9 @@ def test_delivery_run_repairs_source_obligation_and_reverifies(
             assert result["units_attempted"] == 3
         assert result["finalized"] is repair_succeeds, result
         assert result["succeeded"] is repair_succeeds
+        assert result["verification"]["status"] == ("passed" if repair_succeeds else "failed")
+        assert result["verification"]["obligation_count"] == 1
+        assert result["verification"]["obligation_satisfied_count"] == int(repair_succeeds)
         if not repair_succeeds:
             assert result["stop_code"] == "delivery_repair.budget_exhausted"
             assert result["errors"][0]["code"] == "delivery_repair.budget_exhausted"

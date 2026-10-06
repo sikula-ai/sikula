@@ -8,7 +8,7 @@ import re
 from typing import Any
 
 from core.delivery_plan import DeliveryPlanIssue
-from core.delivery_progress import DeliveryStatusUnit
+from core.delivery_progress import DeliveryStatusUnit, render_delivery_checkpoint_status
 from core.delivery_public_metadata import (
     project_delivery_public_identity,
     sanitize_delivery_public_metadata,
@@ -53,11 +53,13 @@ class DeliveryRunResult:
     message: str
 
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
+    verification: dict[str, Any] = field(default_factory=lambda: {"required": False, "status": "not_required"})
 
     def to_dict(self) -> dict[str, Any]:
         root = Path(self.project_root).resolve() if self.project_root and self.project_root != "." else None
         return {
             **({"checkpoints": self.checkpoints} if self.checkpoints else {}),
+            "verification": self.verification,
             "schema_version": 1,
             "sikula_version": sikula_version(),
             "command": "delivery.run",
@@ -107,6 +109,19 @@ def render_delivery_run(result: DeliveryRunResult) -> str:
         lines.append(f"Project root: {data['project_root']}")
     if data["status"]:
         lines.append(f"Plan status: {data['status']}")
+    lines.extend(render_delivery_checkpoint_status(checkpoint) for checkpoint in data.get("checkpoints", []))
+    verification = data["verification"]
+    lines.append(f"Final gate: {verification['status']}")
+    if verification.get("gate_id"):
+        lines.append(f"Final gate ID: {verification['gate_id']}")
+    if verification.get("obligation_count"):
+        lines.append(
+            "Final gate obligations: "
+            f"{verification['obligation_satisfied_count']}/{verification['obligation_count']} satisfied, "
+            f"{verification['obligation_gap_count']} gap(s)"
+        )
+    if verification.get("stop_code"):
+        lines.append(f"Final gate stop code: {verification['stop_code']}")
     lines.extend(
         [
             f"Unit limit: {data['max_units']}",

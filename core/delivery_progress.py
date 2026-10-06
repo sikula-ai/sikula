@@ -491,31 +491,11 @@ class DeliveryStatusResult:
         }
         if self.next_action:
             data["next_action"] = sanitize_delivery_public_metadata(self.next_action)
-        verification_data: dict[str, Any] = {
-            "required": bool(self.plan and self.plan.requires_final_verification),
-            "status": self.verification_status,
-        }
-        if self.verification:
-            verification_data.update(
-                {
-                    "gate_id": self.verification.gate_id,
-                    "candidate_commit": self.verification.candidate_commit,
-                    "candidate_tree": self.verification.candidate_tree,
-                    "attempt": self.verification.attempt,
-                    "semantic_status": self.verification.semantic_status,
-                    "security_required": self.verification.security_required,
-                    "security_status": self.verification.security_status,
-                    "validation_reused": self.verification.validation_reused,
-                    "validation_executed": self.verification.validation_executed,
-                    "finding_count": self.verification.finding_count,
-                    "obligation_count": self.verification.obligation_count,
-                    "obligation_satisfied_count": self.verification.obligation_satisfied_count,
-                    "obligation_gap_count": self.verification.obligation_gap_count,
-                }
-            )
-            if self.verification.stop_code:
-                verification_data["stop_code"] = self.verification.stop_code
-        data["verification"] = verification_data
+        data["verification"] = delivery_verification_projection(
+            required=bool(self.plan and self.plan.requires_final_verification),
+            status=self.verification_status,
+            record=self.verification,
+        )
         if self.plan and self.plan.checkpoints:
             from core.delivery_checkpoints import checkpoint_projection
 
@@ -1379,6 +1359,45 @@ def _sanitize_issue(
     return DeliveryPlanIssue(issue.severity, issue.code, msg, path)
 
 
+def delivery_verification_projection(
+    *, required: bool, status: str, record: DeliveryVerificationRecord | None
+) -> dict[str, Any]:
+    """Project only public verification metadata, never private evidence or authority."""
+    verification_data: dict[str, Any] = {
+        "required": required,
+        "status": status,
+    }
+    if record:
+        verification_data.update(
+            {
+                "gate_id": record.gate_id,
+                "candidate_commit": record.candidate_commit,
+                "candidate_tree": record.candidate_tree,
+                "attempt": record.attempt,
+                "semantic_status": record.semantic_status,
+                "security_required": record.security_required,
+                "security_status": record.security_status,
+                "validation_reused": record.validation_reused,
+                "validation_executed": record.validation_executed,
+                "finding_count": record.finding_count,
+                "obligation_count": record.obligation_count,
+                "obligation_satisfied_count": record.obligation_satisfied_count,
+                "obligation_gap_count": record.obligation_gap_count,
+            }
+        )
+        if record.stop_code:
+            verification_data["stop_code"] = record.stop_code
+    return verification_data
+
+
+def render_delivery_checkpoint_status(checkpoint: dict[str, Any]) -> str:
+    """Render one checkpoint from the public status projection."""
+    return (
+        f"Checkpoint {checkpoint['id']}: {checkpoint['status']} "
+        f"(candidate evidence: {checkpoint['candidate_evidence']})"
+    )
+
+
 def render_delivery_status(result: DeliveryStatusResult) -> str:
     projection = result.to_dict()
     plan_path = projection["plan_path"]
@@ -1403,11 +1422,7 @@ def render_delivery_status(result: DeliveryStatusResult) -> str:
                 f"Final branch: {plan_data['final_branch']}",
             ]
         )
-    for checkpoint in projection.get("checkpoints", []):
-        lines.append(
-            f"Checkpoint {checkpoint['id']}: {checkpoint['status']} "
-            f"(candidate evidence: {checkpoint['candidate_evidence']})"
-        )
+    lines.extend(render_delivery_checkpoint_status(checkpoint) for checkpoint in projection.get("checkpoints", []))
     verification = projection["verification"]
     lines.append(f"Verification: {verification['status']}")
     if verification.get("gate_id"):

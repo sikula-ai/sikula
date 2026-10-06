@@ -1256,6 +1256,11 @@ from Git, deduplicating identical blobs and repeated commits within a check.
 Symlink and missing-path checks retain component-level validation. No authority
 result is cached across checks; candidate refs, checkout contracts and effective
 policy are revalidated on every handoff decision.
+Authority paths use literal Git pathspecs and blobs are read by object ID. Colons
+inside repository-relative filenames are supported where the host filesystem
+allows them; absolute paths, Windows drive prefixes, backslashes and parent
+traversal remain rejected. A valid source filename must not become a blocker only
+when a completed group reaches its checkpoint.
 Later code changes are reviewed at subsequent checkpoints and by the full root
 gate. Candidate applicability is separate from the historical admission barrier;
 it does not reopen consumers that already started.
