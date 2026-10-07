@@ -140,7 +140,8 @@ The assistant output accepted by `delivery prepare` contains exactly one
 schema-matching top-level JSON object. The object may be raw, fenced, or
 surrounded by incidental model prose; malformed, nested, and multiple response
 objects are rejected. Top-level fields are `plan_id`,
-`title`, `planning_mode`, `warnings`, `constraints`, `obligations`, `source_accounting`, and `units`; unknown fields are rejected.
+`title`, `planning_mode`, `warnings`, `constraints`, `obligations`, `source_accounting`,
+`checkpoints`, and `units`; unknown fields are rejected.
 `planning_mode`, when present, must be `fixed_window`. `units` must be a
 non-empty list of objects with `id`, `title`, `depends_on`, `task_markdown`,
 and optional `stream`, `component`, `phase`, `kind`, `platform`, and
@@ -234,6 +235,8 @@ omit the obligations list.
 Fresh authoring also requires `source_accounting`: exactly one record per source
 fragment, with `source_fragment_id`, a `mapped`, `context_only`, or `unresolved`
 disposition, `obligation_ids`, `constraint_ids`, and a private bounded `rationale`.
+Checkpoint plans also attribute relevance with `checkpoint_ids`, as described under
+[intermediate integration checkpoints](#intermediate-integration-checkpoints).
 Mappings must agree with obligation provenance in both directions. Context-only
 records explain why a heading or other context introduces no requirement; the
 independent verifier can reject that decision. Unknown, duplicate, missing, or
@@ -598,6 +601,29 @@ contributors required for its declared outcome. Other units consume the group vi
 ordinary `depends_on` edges. The coordinator rejects unknown references, future
 contributors and cycles introduced by barriers. Malformed LLM declarations receive
 one audited correction before publication; hard prerequisite stops take precedence.
+
+Preparation also attributes source authority to checkpoints and independently
+checks that attribution against the complete source and all unit contracts.
+Each source-accounting record can carry `checkpoint_ids`: null or omission means
+global authority, a list names the checkpoints that need it, and `[]` reserves it
+for the final gate. Attribution covers contextual requirements and prohibitions as
+well as explicit outcomes. A checkpoint still needs source governing its contribution
+when the whole outcome depends on later work.
+
+After successful independent verification, the writer records `checkpoint_authority`
+input fingerprints. These enable packets containing the relevant **exact** source
+fragments, enclosing context, shared constraints and local component/accounting data
+for both semantic and security review. Editing a source, covered contract or node scope
+invalidates its attribution; missing or mismatched fingerprints use full authority
+within existing limits. Attribution declarations alone cannot omit source. These
+fingerprints belong to the immutable prepared plan and should not be rewritten by
+hand. Amendments and repairs do not issue replacement attribution approvals.
+Private preparation audit retains the independent decisions and rationales.
+
+The final gate always consumes the complete source and accounting, including all
+requirements excluded from intermediate packets. Scoped packets reduce repeated
+checkpoint context; nested hierarchy and removal of whole-plan size limits remain
+separate work. An oversized packet is rejected before provider work, never truncated.
 
 `delivery run` checks a completed group before downstream execution. An eligible
 semantic gap triggers the existing bounded repair flow, followed by another

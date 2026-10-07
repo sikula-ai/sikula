@@ -113,6 +113,7 @@ _AMENDMENT_TOP_LEVEL_FIELDS = {
     "warnings",
 }
 _CONSTRAINT_VERIFICATION_TOP_LEVEL_FIELDS = {
+    "checkpoint_authority_complete",
     "constraints_complete",
     "constraints",
     "constraint_gaps",
@@ -318,6 +319,8 @@ class DeliveryConstraintVerification:
     unit_contract_gaps: list[dict[str, str]] = field(default_factory=list)
     context_paths: list[str] = field(default_factory=list)
     context_unavailable: bool = False  # Determined by local retrieval, never by model output.
+    checkpoint_authority_complete: bool = False
+    checkpoint_authority_input: str | None = None  # Captured by the verifier, never parsed from model output.
 
 
 @dataclass
@@ -485,6 +488,15 @@ def parse_delivery_authoring_output(
         )
     except DeliveryCheckpointError as exc:
         raise DeliveryAuthoringParseError("delivery_authoring.checkpoints_invalid", str(exc)) from None
+    accounting = _parse_source_accounting(
+        data, source_task_description, obligations, constraints, required=require_source_accounting
+    )
+    from core.delivery_authority import validate_checkpoint_attribution
+
+    try:
+        validate_checkpoint_attribution(accounting or [], checkpoints, obligations, constraints)
+    except SourceAccountingError as exc:
+        raise DeliveryAuthoringParseError(exc.code, str(exc)) from None
     return DeliveryAuthoringDraft(
         checkpoints=checkpoints,
         plan_id=plan_id,
@@ -494,9 +506,7 @@ def parse_delivery_authoring_output(
         warnings=warnings,
         constraints=constraints,
         obligations=obligations,
-        source_accounting=_parse_source_accounting(
-            data, source_task_description, obligations, constraints, required=require_source_accounting
-        ),
+        source_accounting=accounting,
     )
 
 
@@ -592,7 +602,13 @@ def parse_delivery_constraint_verification_output(
             "delivery_obligation_verification.gaps_required",
             "Incomplete obligation verification must identify at least one actionable gap.",
         )
+    checkpoint_authority_complete = data.get("checkpoint_authority_complete", False)
+    if type(checkpoint_authority_complete) is not bool:
+        raise DeliveryAuthoringParseError(
+            "source_accounting.checkpoint_invalid", "Checkpoint authority completeness must be a boolean."
+        )
     return DeliveryConstraintVerification(
+        checkpoint_authority_complete=checkpoint_authority_complete,
         constraints_complete=constraints_complete,
         constraints=constraints,
         constraint_gaps=constraint_gaps,

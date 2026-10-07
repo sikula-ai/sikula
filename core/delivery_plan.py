@@ -328,6 +328,8 @@ class DeliveryPlan:
     planning_mode: str | None = None
     verification: DeliveryVerificationPolicy | None = None
     checkpoints: list[DeliveryCheckpoint] = field(default_factory=list)
+    checkpoint_authority: dict[str, str] = field(default_factory=dict, repr=False)
+    verified_checkpoint_authority: dict[str, str] = field(default_factory=dict, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -766,13 +768,46 @@ def _parse_delivery_plan(
             )
         )
 
+    from core.delivery_authority import restore_checkpoint_authority
+
+    if source_accounting is not None and not errors:
+        if any(
+            not set(record.checkpoint_ids or ()) <= {item.id for item in checkpoints} for record in source_accounting
+        ):
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "source_accounting.checkpoint_invalid",
+                    "Source attribution references an unknown checkpoint.",
+                    "source_accounting",
+                )
+            )
+    checkpoint_authority = data.get("checkpoint_authority", {})
+    if (
+        not isinstance(checkpoint_authority, dict)
+        or not set(checkpoint_authority) <= {item.id for item in checkpoints}
+        or any(
+            not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+            for value in checkpoint_authority.values()
+        )
+    ):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "checkpoints.authority_invalid",
+                "Checkpoint authority receipts must bind known nodes to input fingerprints.",
+                "checkpoint_authority",
+            )
+        )
+        checkpoint_authority = {}
+
     if units:
         _validate_dependencies(units, errors)
         _validate_amendment_metadata(units, errors)
 
     if schema_version is None or plan_id is None or title is None or final_branch is None:
         return None
-    return DeliveryPlan(
+    plan = DeliveryPlan(
         schema_version=schema_version,
         plan_id=plan_id,
         title=title,
@@ -788,7 +823,13 @@ def _parse_delivery_plan(
         planning_mode=planning_mode,
         verification=verification,
         checkpoints=checkpoints,
+        checkpoint_authority=checkpoint_authority,
     )
+    if not errors:
+        plan.verified_checkpoint_authority.update(
+            restore_checkpoint_authority(plan, source_task_description or "", project_root)
+        )
+    return plan
 
 
 def _parse_verification_policy(

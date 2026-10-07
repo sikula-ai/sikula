@@ -873,6 +873,15 @@ python3 -m ruff format .
   verification or repair; source accounting must never erase or relabel them. Amendment
   obligations may have contributing replacement subsets, while applicable hard
   constraints remain binding on every affected replacement.
+- **Never** omit checkpoint source using obligation references or unreviewed
+  relevance declarations alone. Require independently checked attribution bound to
+  the exact source, node packet and covered contracts. Preserve exact fragments,
+  enclosing context, shared constraints, literals, assets and prohibitions. Use the
+  same packet for readiness and both semantic/security reviews, and bind it into
+  evidence/resume policy. Missing or changed attribution receipts use full authority
+  only within existing bounds; they cannot mint approval, reset budgets or erase
+  terminal stops. The final gate retains complete source and excluded/cross-group
+  responsibility. Keep raw attribution rationales and prompts in private audit.
 - **Never** bypass a declared checkpoint through `run-next`, explicit selection,
   dry-run, resume, partial repair publication, or a unit/time bound. Placement is
   authored by the preparation LLM and validated as a dependency barrier, not a

@@ -19,7 +19,7 @@ from core.delivery_verification import (
     delivery_verification_prompt_is_bounded,
 )
 from core.llm_client import LLMClient, LLMReadOnlyViolation
-from core.delivery_obligations import delivery_authority_fragments
+from core.delivery_authority import verification_authority_fragments
 from core.delivery_composition import CompositionResult, composition_example, parse_composition
 from tools.base_tool import Sandbox
 from tools.file_tool import FileTool
@@ -190,8 +190,15 @@ class DeliveryIntegrationReviewAgent:
         if plan_context.get("verification_node"):
             focus += (
                 " This is an intermediate checkpoint: assess only the declared completed group and its due obligations."
-                " The full source still governs that group, including omitted requirements and prohibitions."
-                " Do not require outcomes assigned to future work; the root gate will assess the entire delivery."
+                " All supplied source governs that group, including omitted requirements and prohibitions."
+                " Do not require outcomes assigned to future work; the final gate will assess the entire delivery."
+            )
+        if plan_context.get("authority_packet"):
+            focus += (
+                " This packet uses independently reviewed source attribution. Its references resolve to exact text"
+                " below; no authority retrieval or historical audit replay is needed. Independently check every"
+                " supplied fragment, including context-only and shared authority. The final gate retains ALL"
+                " excluded source and cross-group outcomes; this checkpoint cannot discharge them."
             )
         security_context = ""
         if review_kind == "security":
@@ -245,7 +252,7 @@ class DeliveryIntegrationReviewAgent:
                 " You may approve direct work while a child requires verification; that is NOT final approval."
                 " Report external dependency or unavailable authoritative decisions using the normal stop dispositions."
             )
-        authority_fragments = [fragment.to_prompt_dict() for fragment in delivery_authority_fragments(source_task)]
+        authority_fragments = verification_authority_fragments(source_task, plan_context)
         prompt = f"""{AGENT_SECURITY_PREFIX}{focus}
 
 Inspect the candidate workspace using read-only tools. Do not modify files or project state.
@@ -277,7 +284,7 @@ Obligation rules:
 - Use satisfied only when the assembled candidate establishes the obligation.
 - Use missing, conflicting, or uncertain when the obligation is not safely established.
 - Approved requires every obligation outcome to be satisfied.
-- Check the full authoritative source independently of the extracted obligations and source_accounting.
+- Check all supplied authoritative source independently of the extracted obligations and source_accounting.
   Coverage records are traceability, not proof of semantic completeness. Reject context-only decisions
   that hide a requirement, even when all listed obligations are satisfied. Owning units may contribute
   collectively to an outcome; every applicable hard constraint remains binding.

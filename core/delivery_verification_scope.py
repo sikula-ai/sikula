@@ -24,7 +24,8 @@ class DeliveryVerificationScope:
 
     ``(plan_id, node_id)`` names the logical node, not a passing verification.
     The root retains the full source authority, including unmapped/context-only
-    fragments; fragment IDs describe accounting, never permission to omit text.
+    fragments; fragment IDs alone never authorize omission. Checkpoints may use
+    a packet restored from independently reviewed attribution receipts.
     Context is private prompt data and must not enter public projections.
     """
 
@@ -78,13 +79,17 @@ class DeliveryVerificationScope:
             )
         fragment_ids = [record.source_fragment_id for record in plan.source_accounting or ()]
         fragment_ids.extend(ref for obligation in plan.obligations for ref in obligation.source_fragment_ids)
+        captured = plan.verified_checkpoint_authority.get(node_id)
+        if captured is not None:
+            context = json.loads(captured)
+            fragment_ids = [item["id"] for item in context["authority_packet"]["fragments"]]
         return cls(
             plan_id=plan.plan_id,
             node_id=node_id,
             source_task=plan.source_task,
             unit_ids=tuple(unit["id"] for unit in context["units"]),
             obligation_ids=tuple(obligation.id for obligation in obligations),
-            constraint_ids=tuple(constraint.id for constraint in constraints),
+            constraint_ids=tuple(item["id"] for item in context["constraints"]),
             source_fragment_ids=tuple(dict.fromkeys(fragment_ids)),
             # Superseding a sensitive unit must not remove required security review.
             security_required=any(constraint.kind == "security_boundary" for constraint in plan.constraints)
