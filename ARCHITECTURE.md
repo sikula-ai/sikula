@@ -1496,6 +1496,8 @@ use universal Markdown newlines so Git checkout line endings do not change attri
 
 A scoped packet retains original fragment IDs, hashes, exact text and enclosing
 heading fragments, applicable constraints, local accounting and component context.
+Unranked colon-style headings retain enclosing Markdown authority and remain context
+within that section; they cannot discard its governing prose.
 Cross-group accounting names the local contribution and reserves outcome closure
 for the final gate. Shared fragments are resolved inline once; there is no hidden
 authority retrieval, summary substitution, truncation, or historical audit replay.

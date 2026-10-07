@@ -357,6 +357,33 @@ def test_enclosing_context_is_included_even_if_author_routes_only_a_list_item(tm
     assert "CACHE_KEY" in prompt and "UNRELATED" not in prompt
 
 
+@pytest.mark.parametrize("subsection", ["", "### Details\nPreserve this nested context.\n"])
+def test_colon_headings_preserve_enclosing_markdown_authority(tmp_path, subsection):
+    source = (
+        "# Delivery\nGlobal context.\n\n"
+        "## Earlier\nUNRELATED earlier section.\nAcceptance:\nUNRELATED earlier criteria.\n\n"
+        "## Security\nNever disclose stored values.\n\n"
+        "Acceptance:\nPreserve isolation.\n\n"
+        "Notes:\nDo not log credentials.\n\n" + subsection + "- Use `CACHE_KEY`.\n\n## Future\nUNRELATED future work.\n"
+    )
+    data = _draft_data(source)
+    fragments = delivery_authority_fragments(source)
+    for index, record in enumerate(data["source_accounting"]):
+        record["checkpoint_ids"] = ["storage"] if index == 0 or "CACHE_KEY" in fragments[index].text else []
+    _, cfg, checked, _, _, _ = _prepare(tmp_path, source, data)
+    assert "storage" in checked.plan.verified_checkpoint_authority
+    scope = DeliveryVerificationScope.from_plan(checked.plan, "storage")
+    for role in ("semantic", "security"):
+        prompt = _prompt(tmp_path, cfg, source, scope, role)
+        assert "Never disclose stored values." in prompt
+        assert "Preserve isolation." in prompt
+        assert "Do not log credentials." in prompt
+        assert "CACHE_KEY" in prompt
+        if subsection:
+            assert "Preserve this nested context." in prompt
+        assert "UNRELATED" not in prompt
+
+
 @pytest.mark.parametrize("resolved", [True, False])
 def test_context_only_attribution_disagreement_uses_one_audited_correction(tmp_path, resolved):
     authored = _draft_data()

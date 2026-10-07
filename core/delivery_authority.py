@@ -88,9 +88,16 @@ def _enclosing_fragments(source: str, selected: set[str]) -> set[str]:
     for fragment in fragments:
         heading = headings.get(fragment.start_line - 1)
         if heading is not None:
-            while stack and stack[-1][0] >= heading.level:
-                stack.pop()
-            stack.append((heading.level, fragment.id))
+            if heading.level == 0:
+                # Unranked text headings cannot close Markdown ancestors. Keep
+                # their context until the containing Markdown scope closes,
+                # including across subsequent text headings and subsections.
+                level = stack[-1][0] if stack else 0
+            else:
+                level = heading.level
+                while stack and stack[-1][0] >= level:
+                    stack.pop()
+            stack.append((level, fragment.id))
         if fragment.id in selected:
             result.update(key for _, key in stack)
     return result
