@@ -292,14 +292,18 @@ def test_unverified_scope_declaration_cannot_omit_source(tmp_path):
     )
 
 
-def test_packet_rejects_changed_source_and_preserves_windows_newlines(tmp_path):
+@pytest.mark.parametrize("initial_newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_packet_rejects_changed_source_and_preserves_windows_newlines(tmp_path, initial_newline):
     path, _, checked, _, _, _ = _prepare(tmp_path)
     context = DeliveryVerificationScope.from_plan(checked.plan, "storage").plan_context()
     with pytest.raises(ValueError):
         verification_authority_fragments(SOURCE + "Changed", context)
     for unit in checked.plan.units:
         task = tmp_path / unit.task_path
-        task.write_bytes(task.read_bytes().replace(b"\n", b"\r\n"))
+        task.write_bytes(task.read_text(encoding="utf-8").replace("\n", initial_newline).encode("utf-8"))
+        # Normalize existing CRLF first; replacing raw LF would create CRCRLF on Windows.
+        task.write_bytes(task.read_text(encoding="utf-8").replace("\n", "\r\n").encode("utf-8"))
+        assert b"\r\r\n" not in task.read_bytes()
     (tmp_path / "source.md").write_bytes(SOURCE.replace("\n", "\r\n").encode())
     restored = check_delivery_plan_file(path, project_root=tmp_path)
     assert restored.valid
