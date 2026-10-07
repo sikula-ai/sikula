@@ -1479,7 +1479,11 @@ to global attribution; it is not an operator question. Deterministic validation
 requires source for every covered contributor, even when an obligation is due later.
 
 Only a writer with an independently accepted, unchanged draft can issue tracked
-`checkpoint_authority` receipts. Each receipt hashes the exact proposed node context,
+`checkpoint_authority` receipts. The writer checks that binding again after heading
+canonicalization and asset assignment. If rendering changed the reviewed draft,
+it publishes without scoped receipts and ordinary full-authority readiness applies;
+rendering cannot transfer approval to contracts the verifier did not inspect.
+Each receipt hashes the exact proposed node context,
 source binding and covered contract contents under a fixed packet policy. These
 receipts record preparation's decision, not cryptographic signatures: they are
 protected by the existing immutable plan/source/contract authority checks. Hand-authored

@@ -824,20 +824,7 @@ def _constraint_verification_stop_issues(draft: DeliveryAuthoringDraft) -> list[
         ]
     if draft.source_accounting is not None:
         if draft.checkpoints and any(record.checkpoint_ids is not None for record in draft.source_accounting):
-            from core.delivery_authority import preparation_authority_fingerprint
-
-            expected_authority = preparation_authority_fingerprint(
-                draft.source_task.sha256 if draft.source_task else "",
-                draft.checkpoints,
-                draft.units,
-                draft.constraints,
-                draft.obligations,
-                draft.source_accounting,
-            )
-            if (
-                not verification.checkpoint_authority_complete
-                or verification.checkpoint_authority_input != expected_authority
-            ):
+            if not _checkpoint_authority_matches_draft(draft):
                 return [
                     DeliveryPrepareWriteIssue(
                         "error",
@@ -1261,6 +1248,22 @@ def _canonicalize_markdown_headings(markdown: str) -> str:
     return normalized if changed else markdown
 
 
+def _checkpoint_authority_matches_draft(draft: DeliveryAuthoringDraft) -> bool:
+    from core.delivery_authority import preparation_authority_fingerprint
+
+    verification = draft.constraint_verification
+    if verification is None or not verification.checkpoint_authority_complete:
+        return False
+    return verification.checkpoint_authority_input == preparation_authority_fingerprint(
+        draft.source_task.sha256 if draft.source_task else "",
+        draft.checkpoints,
+        draft.units,
+        draft.constraints,
+        draft.obligations,
+        draft.source_accounting or [],
+    )
+
+
 def _render_plan_yaml(draft: DeliveryAuthoringDraft, unit_task_paths: dict[str, str], *, project_root: Path) -> str:
     plan_data: dict[str, Any] = {
         "schema_version": 3 if draft.checkpoints else SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION,
@@ -1288,9 +1291,11 @@ def _render_plan_yaml(draft: DeliveryAuthoringDraft, unit_task_paths: dict[str, 
     plan_data["units"] = [_unit_plan_entry(unit, unit_task_paths[unit.id]) for unit in draft.units]
     if (
         draft.checkpoints
-        and draft.constraint_verification
-        and draft.constraint_verification.checkpoint_authority_complete
         and any(record.checkpoint_ids is not None for record in draft.source_accounting or ())
+        # Heading canonicalization and asset assignment happen after verification.
+        # Changed contracts require full authority, never a newly minted receipt
+        # claiming that the verifier reviewed their rendered contents.
+        and _checkpoint_authority_matches_draft(draft)
     ):
         from core.delivery_authority import (
             authority_contract_fingerprint,

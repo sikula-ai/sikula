@@ -31,7 +31,11 @@ SOURCE = "# Delivery\nGlobal context.\n\n## Foundation\nUse the exact `CACHE_KEY
 def _draft_data(source: str = SOURCE) -> dict:
     data = json.loads(_authoring_output(task_description=source))
     data["units"][0]["asset_paths"] = []
-    data["units"][0]["task_markdown"] = _ready_task_markdown("Foundation") + "\nUse `CACHE_KEY`.\n"
+    # The ordinary receipt fixture is already in the writer's canonical form;
+    # transformation cases below exercise fallback for changed contracts.
+    data["units"][0]["task_markdown"] = (
+        _ready_task_markdown("Foundation").replace("## Verification", "## Validation") + "\nUse `CACHE_KEY`.\n"
+    )
     data["units"][0]["risk_tags"] = ["privacy"]
     consumer = deepcopy(data["units"][0])
     consumer.update(id="consumer", title="Consumer", depends_on=["foundation"])
@@ -220,6 +224,45 @@ def test_writer_rejects_reusing_verification_for_a_changed_draft(tmp_path):
     assert not result.prepared
     assert result.errors[0].code == "delivery_prepare.authority_unresolved"
     assert not (tmp_path / "other").exists()
+
+
+@pytest.mark.parametrize("transformation", ["headings", "assets"])
+def test_writer_contract_transformations_select_full_authority(tmp_path, transformation):
+    source = SOURCE
+    if transformation == "assets":
+        asset = tmp_path / ".sikula/task-assets/reference.png"
+        asset.parent.mkdir(parents=True)
+        asset.write_bytes(b"reference")
+        source += "\n## Assets\n- Reference asset: `.sikula/task-assets/reference.png`\n  - Usage: reference only.\n"
+    data = _draft_data(source)
+    unit = data["units"][0]
+    if transformation == "headings":
+        unit["task_markdown"] = unit["task_markdown"].replace("## Security and privacy", "## Security/privacy notes")
+    else:
+        unit["asset_paths"] = [".sikula/task-assets/reference.png"]
+        for record in data["source_accounting"][-2:]:
+            record["checkpoint_ids"] = ["storage"]
+
+    path, cfg, checked, draft, llm, audit = _prepare(tmp_path, source, data)
+    written = (tmp_path / checked.plan.units[0].task_path).read_text(encoding="utf-8")
+    assert written != draft.units[0].task_markdown.rstrip("\n") + "\n"
+    if transformation == "headings":
+        assert "## Security and privacy" in written
+        assert "## Security/privacy notes" not in written
+    else:
+        assert "- Reference asset: `.sikula/task-assets/reference.png`" in written
+    assert len(llm.prompts) == 2
+    assert audit[-1]["parsed"]["checkpoint_authority_complete"]
+    assert "checkpoint_authority" not in yaml.safe_load(path.read_text())
+    assert not checked.plan.verified_checkpoint_authority
+    scope = DeliveryVerificationScope.from_plan(checked.plan, "storage")
+    assert "authority_packet" not in scope.plan_context()
+    readiness = check_delivery_verification_readiness(checked, cfg, node_id="storage")
+    assert readiness.ready, readiness.errors
+    for role in ("semantic", "security"):
+        prompt = _prompt(tmp_path, cfg, source, scope, role)
+        assert "UNRELATED" in prompt
+        assert readiness.packet_bytes >= len(prompt.encode("utf-8"))
 
 
 def test_preparer_rejects_omitted_contributor_authority_before_verification(tmp_path):
