@@ -113,6 +113,7 @@ _AMENDMENT_TOP_LEVEL_FIELDS = {
     "warnings",
 }
 _CONSTRAINT_VERIFICATION_TOP_LEVEL_FIELDS = {
+    "final_gate_authority_complete",
     "checkpoint_authority_complete",
     "constraints_complete",
     "constraints",
@@ -320,6 +321,7 @@ class DeliveryConstraintVerification:
     context_paths: list[str] = field(default_factory=list)
     context_unavailable: bool = False  # Determined by local retrieval, never by model output.
     checkpoint_authority_complete: bool = False
+    final_gate_authority_complete: bool = False
     checkpoint_authority_input: str | None = None  # Captured by the verifier, never parsed from model output.
 
 
@@ -603,11 +605,17 @@ def parse_delivery_constraint_verification_output(
             "Incomplete obligation verification must identify at least one actionable gap.",
         )
     checkpoint_authority_complete = data.get("checkpoint_authority_complete", False)
+    final_gate_authority_complete = data.get("final_gate_authority_complete", False)
+    if type(final_gate_authority_complete) is not bool:
+        raise DeliveryAuthoringParseError(
+            "source_accounting.checkpoint_invalid", "Final authority completeness must be a boolean."
+        )
     if type(checkpoint_authority_complete) is not bool:
         raise DeliveryAuthoringParseError(
             "source_accounting.checkpoint_invalid", "Checkpoint authority completeness must be a boolean."
         )
     return DeliveryConstraintVerification(
+        final_gate_authority_complete=final_gate_authority_complete,
         checkpoint_authority_complete=checkpoint_authority_complete,
         constraints_complete=constraints_complete,
         constraints=constraints,

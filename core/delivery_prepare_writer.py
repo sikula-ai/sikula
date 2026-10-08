@@ -1321,6 +1321,15 @@ def _render_plan_yaml(draft: DeliveryAuthoringDraft, unit_task_paths: dict[str, 
             )
             for node in draft.checkpoints
         }
+        if draft.constraint_verification.final_gate_authority_complete:
+            from core.delivery_final_authority import final_authority_context
+
+            try:
+                final_context = final_authority_context(checked.plan, source)
+            except (ValueError, KeyError):
+                pass  # Unsupported delegation retains the independently checked full review.
+            else:
+                plan_data["final_gate_authority"] = checkpoint_authority_receipt(final_context, contracts)
     return yaml.safe_dump(plan_data, sort_keys=False, default_flow_style=False)
 
 

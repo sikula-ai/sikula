@@ -127,7 +127,9 @@ class DeliveryIntegrationReviewAgent:
                     attempts,
                 ) from None
             try:
-                if review_kind == "semantic" and "checkpoint_composition" in plan_context:
+                if "checkpoint_composition" in plan_context and (
+                    review_kind == "semantic" or plan_context["checkpoint_composition"].get("compact")
+                ):
                     composition = parse_composition(output, plan_context, known_unit_ids)
                     assessment = composition.assessment
                 else:
@@ -193,11 +195,11 @@ class DeliveryIntegrationReviewAgent:
                 " All supplied source governs that group, including omitted requirements and prohibitions."
                 " Do not require outcomes assigned to future work; the final gate will assess the entire delivery."
             )
-        if plan_context.get("authority_packet"):
+        if plan_context.get("authority_packet") and not plan_context.get("final_authority"):
             focus += (
                 " This packet uses independently reviewed source attribution. Its references resolve to exact text"
                 " below; no authority retrieval or historical audit replay is needed. Independently check every"
-                " supplied fragment, including context-only and shared authority. The final gate retains ALL"
+                " supplied fragment, including context-only and shared authority. The final gate remains responsible for ALL"
                 " excluded source and cross-group outcomes; this checkpoint cannot discharge them."
             )
         security_context = ""
@@ -235,7 +237,9 @@ class DeliveryIntegrationReviewAgent:
         control_object_example = delivery_integration_review_control_example(
             known_obligation_ids if review_kind == "semantic" else set()
         )
-        if review_kind == "semantic" and "checkpoint_composition" in plan_context:
+        if "checkpoint_composition" in plan_context and (
+            review_kind == "semantic" or plan_context["checkpoint_composition"].get("compact")
+        ):
             control_object_example = composition_example(plan_context)
             focus += (
                 "\nThis final gate composes historical checkpoint evidence with direct work."
@@ -246,12 +250,28 @@ class DeliveryIntegrationReviewAgent:
                 " Ancestry, disjoint paths and passing tests alone never prove continued applicability."
                 " Use verification_required whenever applicability cannot be established or a child regressed;"
                 " Sikula will autonomously run full verification. Do not request human review for that uncertainty."
-                " Check cross-group behavior, every hard constraint and the complete source independently."
+                " Check cross-group behavior and every supplied governing source fragment independently."
                 " Return obligation_results ONLY for direct obligations, plus exactly one checkpoint_results entry"
                 " for each child. Child outcomes are applicable or verification_required."
                 " You may approve direct work while a child requires verification; that is NOT final approval."
                 " Report external dependency or unavailable authoritative decisions using the normal stop dispositions."
             )
+            if plan_context.get("final_authority"):
+                focus += (
+                    " Final responsibility and child integration contexts were independently checked against the complete source."
+                    " Exact child-local authority and outcomes remain in immutable accepted child evidence; do not re-enumerate them."
+                    " Coverage hashes identify that evidence, not proof that changed code preserves it. Inspect current interfaces"
+                    " and supplied complete deltas using the checked child integration context. If that context is insufficient,"
+                    " return verification_required; never infer missing authority or approve from a summary alone."
+                )
+            if review_kind == "security":
+                focus += (
+                    " This is an independent SECURITY applicability assessment. Every inherited child has an accepted security pass."
+                    " Reassess its security assumptions, changed dependencies and cross-boundary behavior for the current candidate."
+                    " Semantic approval cannot establish security. Return no functional obligation_results, and one security"
+                    " checkpoint_results decision per child. Confirmed security defects are blocking dispositions; uncertainty"
+                    " selects verification_required and a bounded full security review."
+                )
         authority_fragments = verification_authority_fragments(source_task, plan_context)
         prompt = f"""{AGENT_SECURITY_PREFIX}{focus}
 

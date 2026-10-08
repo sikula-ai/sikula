@@ -285,7 +285,11 @@ re-verifies before releasing dependent units. `run-next` cannot bypass the barri
 Preparation independently checks which source requirements and context each checkpoint
 needs. When that attribution still matches, both reviewers receive the relevant exact
 source fragments, shared rules and local plan context. Otherwise verification uses the
-full source within the existing limits. The final gate always retains the complete source.
+full source within the existing limits. Preparation can separately verify which
+requirements are fully discharged by a checkpoint and which remain for final integration.
+With that approval, the final gate uses exact remaining authority, checked child interfaces
+and compact evidence references. Both reviewers independently assess applicability;
+child internals and review history do not accumulate in their prompts.
 `delivery status` distinguishes an accepted historical checkpoint handoff from the
 evidence applicable to the current candidate. Changed code requires fresh
 verification; the final gate establishes that evidence before finalization.

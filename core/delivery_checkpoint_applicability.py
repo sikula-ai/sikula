@@ -34,7 +34,11 @@ def validate_root_evidence(status: DeliveryStatusResult, record: DeliveryVerific
         raise ValueError("Root evidence requires plan authority.")
     root = Path(status.project_root)
     evidence = load_root_evidence(
-        root, delivery_progress_path(root, status.plan.plan_id).parent, record, plan_id=status.plan.plan_id
+        root,
+        delivery_progress_path(root, status.plan.plan_id).parent,
+        record,
+        plan_id=status.plan.plan_id,
+        unit_order=tuple(unit.id for unit in status.units if unit.status == "done"),
     )
     scope = DeliveryVerificationScope.from_plan(status.plan, "root")
     if not evidence.covers(scope):
@@ -43,11 +47,23 @@ def validate_root_evidence(status: DeliveryStatusResult, record: DeliveryVerific
         from core.delivery_composition import load_composition
 
         composition = load_composition(status, record)
-        if not composition.fallback and (
-            not composition.assessment.approved
-            or composition.assessment.obligation_results != list(evidence.obligation_results)
-        ):
+        actual = {item.id: item.outcome for item in evidence.obligation_results}
+        outcomes_match = (
+            (
+                all(actual.get(item.id) == item.outcome for item in composition.assessment.obligation_results)
+                and len(composition.assessment.obligation_results) + composition.inherited_count == len(actual)
+            )
+            if composition.child_refs
+            else composition.assessment.obligation_results == list(evidence.obligation_results)
+        )
+        if not composition.fallback and (not composition.assessment.approved or not outcomes_match):
             raise ValueError("Composition outcomes changed.")
+    if record.security_composition_evidence_fingerprint:
+        from core.delivery_composition import load_composition
+
+        security = load_composition(status, record, review_kind="security")
+        if not security.fallback and not security.assessment.approved:
+            raise ValueError("Security composition changed.")
 
 
 def checkpoint_applicability(

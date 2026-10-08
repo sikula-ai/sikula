@@ -468,11 +468,16 @@ def with_delivery_verification_readiness(
         ):
             from core.delivery_repair import delivery_repair_input_needs_refresh
 
-            if verification.composition_evidence_fingerprint and status.verification_node == "root":
+            if (
+                verification.composition_evidence_fingerprint or verification.security_composition_evidence_fingerprint
+            ) and status.verification_node == "root":
                 from core.delivery_composition import load_composition
 
                 try:
-                    load_composition(status, verification)
+                    if verification.composition_evidence_fingerprint:
+                        load_composition(status, verification)
+                    if verification.security_composition_evidence_fingerprint:
+                        load_composition(status, verification, review_kind="security")
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     return replace(
                         status,

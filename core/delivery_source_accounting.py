@@ -21,6 +21,7 @@ class DeliverySourceAccounting:
     rationale: str = ""
     # None is global authority; [] reserves the fragment for the final gate.
     checkpoint_ids: list[str] | None = None
+    final_gate: bool = True
 
     def to_dict(self, *, public: bool = False) -> dict[str, Any]:
         identity = project_delivery_public_identity if public else str
@@ -33,6 +34,8 @@ class DeliverySourceAccounting:
         }
         if self.checkpoint_ids is not None:
             data["checkpoint_ids"] = [identity(value) for value in self.checkpoint_ids]
+        if not self.final_gate:
+            data["final_gate"] = False
         return data
 
     def to_verification_dict(self) -> dict[str, Any]:
@@ -67,6 +70,7 @@ def parse_source_accounting(
         "constraint_ids",
         "rationale_sha256",
         "checkpoint_ids",
+        "final_gate",
     }
     if private_rationales:
         fields.add("rationale")
@@ -129,8 +133,15 @@ def parse_source_accounting(
                     "checkpoint_invalid", "Checkpoint attribution requires unique bounded checkpoint IDs."
                 )
             checkpoint_ids = list(checkpoint_ids)
+        final_gate = item.get("final_gate", True)
+        if type(final_gate) is not bool or (not final_gate and (checkpoint_ids is None or len(checkpoint_ids) != 1)):
+            raise SourceAccountingError(
+                "checkpoint_invalid", "Delegated final authority requires one owning checkpoint."
+            )
         records.append(
-            DeliverySourceAccounting(fragment, disposition, obligations, constraints, digest, rationale, checkpoint_ids)
+            DeliverySourceAccounting(
+                fragment, disposition, obligations, constraints, digest, rationale, checkpoint_ids, final_gate
+            )
         )
     if seen != fragment_ids:
         raise SourceAccountingError(

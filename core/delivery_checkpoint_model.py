@@ -18,14 +18,18 @@ class DeliveryCheckpoint:
     id: str
     unit_ids: tuple[str, ...]
     obligation_ids: tuple[str, ...]
+    integration_context: str | None = None
 
     def to_dict(self, *, public: bool = False) -> dict[str, Any]:
         identity = project_delivery_public_identity if public else lambda value: value
-        return {
+        data = {
             "id": identity(self.id),
             "unit_ids": [identity(key) for key in self.unit_ids],
             "obligation_ids": [identity(key) for key in self.obligation_ids],
         }
+        if self.integration_context is not None and not public:
+            data["integration_context"] = self.integration_context
+        return data
 
 
 class DeliveryCheckpointError(ValueError):
@@ -52,8 +56,10 @@ def parse_delivery_checkpoints(value: Any, units: list[Any], obligations: list[A
     result: list[DeliveryCheckpoint] = []
     seen: set[str] = set()
     for item in value:
-        if not isinstance(item, dict) or set(item) != {"id", "unit_ids", "obligation_ids"}:
-            raise DeliveryCheckpointError("Each checkpoint requires exactly id, unit_ids, and obligation_ids.")
+        if not isinstance(item, dict) or set(item) - {"integration_context"} != {"id", "unit_ids", "obligation_ids"}:
+            raise DeliveryCheckpointError(
+                "Each checkpoint requires id, unit_ids, obligation_ids and optional integration_context."
+            )
         identity = item["id"]
         if (
             not isinstance(identity, str)
@@ -97,7 +103,23 @@ def parse_delivery_checkpoints(value: Any, units: list[Any], obligations: list[A
                 raise DeliveryCheckpointError(
                     "Checkpoint obligations must be known and have all contributors inside the covered group."
                 )
-        checkpoint = DeliveryCheckpoint(identity, tuple(item["unit_ids"]), tuple(item["obligation_ids"]))
+        integration_context = item.get("integration_context")
+        if integration_context is not None:
+            try:
+                valid_context = (
+                    isinstance(integration_context, str)
+                    and bool(integration_context.strip())
+                    and len(integration_context.encode("utf-8")) <= 4096
+                )
+            except UnicodeError:
+                valid_context = False
+            if not valid_context:
+                raise DeliveryCheckpointError(
+                    "Checkpoint integration_context must be nonempty UTF-8 text within 4096 bytes."
+                )
+        checkpoint = DeliveryCheckpoint(
+            identity, tuple(item["unit_ids"]), tuple(item["obligation_ids"]), integration_context
+        )
         if not checkpoint_guarded_units(checkpoint, units):
             raise DeliveryCheckpointError("A checkpoint must guard downstream consumers of its completed group.")
         seen.add(identity.casefold())

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -28,7 +28,7 @@ from core.delivery_verification_scope import DeliveryVerificationScope
 from core.delivery_verification_model import DeliveryVerificationRecord
 from core.worktree import delivery_verification_git_env
 
-COMPOSITION_POLICY = "flat-final-composition-v1"
+COMPOSITION_POLICY = "flat-final-composition-v2"
 MAX_COMPOSITION_CHILDREN = 8
 MAX_COMPOSITION_DIRECT_UNITS = 32
 MAX_COMPOSITION_DELTA_BYTES = 64 * 1024
@@ -69,7 +69,11 @@ def _git_bounded(root: Path, args: list[str], limit: int) -> str:
 
 
 def build_composition_context(
-    status: DeliveryStatusResult, snapshot: DeliveryVerificationSnapshot, project_config: dict[str, Any]
+    status: DeliveryStatusResult,
+    snapshot: DeliveryVerificationSnapshot,
+    project_config: dict[str, Any],
+    *,
+    review_kind: str = "semantic",
 ) -> dict[str, Any] | None:
     """Caller validates admission/policy first. Unsupported shapes use full review."""
     if snapshot.scope.node_id != "root" or not status.plan.checkpoints:
@@ -79,6 +83,10 @@ def build_composition_context(
     root = Path(status.project_root)
     directory = delivery_progress_path(root, status.plan.plan_id).parent
     context = snapshot.scope.plan_context()
+    captured = status.plan.verified_final_gate_authority
+    final_context = json.loads(captured) if captured else None
+    if review_kind == "security" and final_context is None:
+        return None
     children = []
     covered_units: set[str] = set()
     inherited: set[str] = set()
@@ -91,6 +99,8 @@ def build_composition_context(
         evidence = load_checkpoint_evidence(root, directory, origin, plan_id=scope.plan_id, node_id=checkpoint.id)
         if not evidence.covers(scope):
             raise ValueError("Composition checkpoint evidence changed.")
+        if review_kind == "security" and (not origin.security_required or origin.security_status != "approved"):
+            return None
         # A later repair outside the checkpoint makes that obligation direct.
         obligations = [
             item
@@ -98,6 +108,8 @@ def build_composition_context(
             if item["id"] in scope.obligation_ids and set(item["unit_ids"]) <= set(scope.unit_ids)
         ]
         if not obligations:
+            return None
+        if final_context is not None and {item["id"] for item in obligations} != set(scope.obligation_ids):
             return None
         delta = ""
         if origin.candidate_tree != snapshot.identity.candidate_tree:
@@ -156,20 +168,38 @@ def build_composition_context(
                 "delta": delta,
             }
         )
+        if final_context is not None:
+            interface = next(
+                item for item in final_context["final_authority"]["children"] if item["id"] == checkpoint.id
+            )
+            children[-1].pop("unit_ids")
+            children[-1].pop("obligations")
+            children[-1].update(interface)
+            children[-1]["security_outcome"] = origin.security_status
         covered_units.update(scope.unit_ids)
         inherited.update(item["id"] for item in obligations)
+    if final_context is not None:
+        context = final_context
+        context["final_authority"] = {"policy": final_context["final_authority"]["policy"]}
     context["units"] = [item for item in context["units"] if item["id"] not in covered_units]
     context["obligations"] = [item for item in context["obligations"] if item["id"] not in inherited]
     if len(context["units"]) > MAX_COMPOSITION_DIRECT_UNITS:
         return None
     context["checkpoint_composition"] = {"policy": COMPOSITION_POLICY, "children": children}
+    if final_context is not None:
+        context["checkpoint_composition"].update(compact=True, review_kind=review_kind)
     if len(json.dumps(context).encode()) > MAX_COMPOSITION_PACKET_BYTES:
         return None
     return context
 
 
 def composition_example(context: dict[str, Any]) -> str:
-    payload = json.loads(delivery_integration_review_control_example({item["id"] for item in context["obligations"]}))
+    security = context["checkpoint_composition"].get("review_kind") == "security"
+    payload = json.loads(
+        delivery_integration_review_control_example(
+            set() if security else {item["id"] for item in context["obligations"]}
+        )
+    )
     payload["checkpoint_results"] = [
         {
             "id": child["id"],
@@ -188,9 +218,16 @@ class CompositionResult:
     checkpoints: list[dict[str, Any]]
     fallback: bool
     control: dict[str, Any]
+    child_refs: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def inherited_count(self) -> int:
+        return sum(child["obligation_count"] for child in self.child_refs)
 
 
 def parse_composition(output: str, context: dict[str, Any], known_unit_ids: set[str]) -> CompositionResult:
+    compact = context["checkpoint_composition"].get("compact", False)
+    security = context["checkpoint_composition"].get("review_kind") == "security"
     try:
         payload = json.loads(
             next(line for line in reversed(output.splitlines()) if line.strip()), object_pairs_hook=_unique_object
@@ -217,9 +254,9 @@ def parse_composition(output: str, context: dict[str, Any], known_unit_ids: set[
         assessment = parse_delivery_integration_review(
             json.dumps(payload),
             known_unit_ids=known_unit_ids,
-            known_obligation_ids={item["id"] for item in context["obligations"]},
+            known_obligation_ids=set() if security else {item["id"] for item in context["obligations"]},
             known_finding_obligation_ids={item["id"] for item in context["obligations"]}
-            | {item["id"] for child in children.values() for item in child["obligations"]},
+            | {item["id"] for child in children.values() for item in child.get("obligations", [])},
         )
     except (ValueError, KeyError, TypeError, AttributeError, StopIteration):
         raise DeliveryIntegrationReviewParseError(
@@ -227,12 +264,25 @@ def parse_composition(output: str, context: dict[str, Any], known_unit_ids: set[
             "Return all direct outcomes and every checkpoint decision exactly once.",
         ) from None
     fallback = any(item["outcome"] != "applicable" for item in checkpoints)
-    inherited = [item["id"] for child in children.values() for item in child["obligations"]]
+    inherited = [item["id"] for child in children.values() for item in child.get("obligations", [])]
     hard_stop = assessment.disposition in {
         "external_dependency_gap",
         "human_review_required",
         "scope_amendment_required",
     }
+    if compact:
+        refs = [
+            {key: child[key] for key in ("id", "evidence_fingerprint", "coverage_fingerprint", "obligation_count")}
+            for child in children.values()
+        ]
+        needs_full = fallback if security else (fallback or not assessment.approved)
+        return CompositionResult(
+            assessment,
+            checkpoints,
+            needs_full and not hard_stop and (not security or assessment.approved),
+            {**payload, "checkpoint_results": checkpoints},
+            refs,
+        )
     # A provisional child is never reported as satisfied, even on a hard stop.
     outcomes = {item["id"]: item["outcome"] for item in checkpoints}
     extra = [
@@ -277,22 +327,36 @@ def store_composition(root: Path, directory: Path, gate_id: str, context: dict, 
             child["id"]: child["evidence_fingerprint"] for child in context["checkpoint_composition"]["children"]
         },
     }
+    if context["checkpoint_composition"].get("compact"):
+        payload.update(compact=True, review_kind=context["checkpoint_composition"]["review_kind"])
     digest = fingerprint(payload)
     write_repair_state(root, composition_evidence_path(directory, digest), payload)
     return digest
 
 
-def load_composition(status: DeliveryStatusResult, record: DeliveryVerificationRecord) -> CompositionResult:
+def load_composition(
+    status: DeliveryStatusResult, record: DeliveryVerificationRecord, *, review_kind: str = "semantic"
+) -> CompositionResult:
     root = Path(status.project_root)
     directory = delivery_progress_path(root, status.plan.plan_id).parent
-    payload = read_repair_state(root, composition_evidence_path(directory, record.composition_evidence_fingerprint))
+    digest = (
+        record.composition_evidence_fingerprint
+        if review_kind == "semantic"
+        else record.security_composition_evidence_fingerprint
+    )
+    payload = read_repair_state(root, composition_evidence_path(directory, digest))
     if (
         payload is None
-        or set(payload) != {"schema_version", "gate_id", "packet_fingerprint", "control", "origins"}
+        or set(payload)
+        != (
+            {"schema_version", "gate_id", "packet_fingerprint", "control", "origins"}
+            | ({"compact", "review_kind"} if payload.get("compact") is True else set())
+        )
         or type(payload["schema_version"]) is not int
         or payload["schema_version"] != 1
-        or fingerprint(payload) != record.composition_evidence_fingerprint
+        or fingerprint(payload) != digest
         or payload.get("gate_id") != record.gate_id
+        or payload.get("review_kind", "semantic") != review_kind
     ):
         raise ValueError("Composition evidence unavailable.")
     composition_evidence_path(directory, payload["packet_fingerprint"])
@@ -308,7 +372,13 @@ def load_composition(status: DeliveryStatusResult, record: DeliveryVerificationR
     if payload["origins"] != origins:
         raise ValueError("Composition origins changed.")
     scope = DeliveryVerificationScope.from_plan(status.plan)
-    authority = scope.plan_context()
+    full_context = scope.plan_context()
+    authority = full_context
+    compact = payload.get("compact") is True
+    if compact:
+        if status.plan.verified_final_gate_authority is None:
+            raise ValueError("Accepted final authority changed.")
+        authority = json.loads(status.plan.verified_final_gate_authority)
     children = []
     inherited = set()
     covered = set()
@@ -320,7 +390,7 @@ def load_composition(status: DeliveryStatusResult, record: DeliveryVerificationR
         covered.update(child.unit_ids)
         obligations = [
             item
-            for item in authority["obligations"]
+            for item in full_context["obligations"]
             if item["id"] in child.obligation_ids and set(item["unit_ids"]) <= set(child.unit_ids)
         ]
         ids = {item["id"] for item in obligations}
@@ -334,6 +404,15 @@ def load_composition(status: DeliveryStatusResult, record: DeliveryVerificationR
                 "exact_tree": status.checkpoint_verifications[child.id].candidate_tree == record.candidate_tree,
             }
         )
+        if compact:
+            origin = status.checkpoint_verifications[child.id]
+            if review_kind == "security" and (not origin.security_required or origin.security_status != "approved"):
+                raise ValueError("Security composition origin changed.")
+            interface = next(item for item in authority["final_authority"]["children"] if item["id"] == child.id)
+            children[-1].pop("obligations")
+            children[-1].update(interface, evidence_fingerprint=origin.checkpoint_evidence_fingerprint)
     authority["obligations"] = [item for item in authority["obligations"] if item["id"] not in inherited]
     authority["checkpoint_composition"] = {"children": children}
+    if compact:
+        authority["checkpoint_composition"].update(compact=True, review_kind=review_kind)
     return parse_composition(json.dumps(payload["control"]), authority, set(scope.unit_ids))
