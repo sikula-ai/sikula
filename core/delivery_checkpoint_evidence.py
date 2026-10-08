@@ -19,6 +19,8 @@ from core.delivery_verification_review import DeliveryIntegrationAssessment, Del
 from core.delivery_verification_scope import DeliveryVerificationCompletedUnit, DeliveryVerificationScope
 
 if TYPE_CHECKING:
+    from core.delivery_composition import CompositionResult
+    from core.delivery_progress import DeliveryStatusResult
     from core.delivery_verification import DeliveryVerificationSnapshot
 
 
@@ -183,9 +185,16 @@ def store_root_evidence(
     snapshot: DeliveryVerificationSnapshot,
     record: DeliveryVerificationRecord,
     assessment: DeliveryIntegrationAssessment,
+    *,
+    composition: CompositionResult | None = None,
+    status: DeliveryStatusResult | None = None,
 ) -> str:
     if snapshot.scope.node_id != "root":
         raise ValueError("Root evidence requires the root scope.")
+    if composition is not None and composition.child_refs and not composition.fallback:
+        if status is None:
+            raise ValueError("Root closure requires accepted child control records.")
+        return _store_root_closure(root, directory, snapshot, record, assessment, composition, status)
     return _store_evidence(root, directory, snapshot, record, assessment)
 
 
@@ -248,7 +257,12 @@ def load_checkpoint_evidence(
 
 
 def load_root_evidence(
-    root: Path, directory: Path, record: DeliveryVerificationRecord, *, plan_id: str
+    root: Path,
+    directory: Path,
+    record: DeliveryVerificationRecord,
+    *,
+    plan_id: str,
+    unit_order: tuple[str, ...] | None = None,
 ) -> DeliveryVerificationEvidence:
     """Load the accepted root's typed results, not its aggregate success counts."""
     if not record.passed or record.root_evidence_fingerprint is None:
@@ -260,4 +274,138 @@ def load_root_evidence(
         raise ValueError("Accepted root evidence is invalid.") from None
     if not intact:
         raise ValueError("Accepted root evidence is unavailable.")
+    if payload.get("child_evidence") is not None:
+        try:
+            return _parse_root_closure(root, directory, payload, record, plan_id=plan_id, unit_order=unit_order)
+        except (KeyError, TypeError, AttributeError, RecursionError):
+            raise ValueError("Accepted root closure is invalid.") from None
     return _parse_evidence(payload, record, plan_id=plan_id, node_id="root")
+
+
+def _parse_root_closure(
+    root: Path,
+    directory: Path,
+    payload: dict[str, Any],
+    record: DeliveryVerificationRecord,
+    *,
+    plan_id: str,
+    unit_order: tuple[str, ...] | None,
+) -> DeliveryVerificationEvidence:
+    """Resolve bounded immediate children for deterministic coverage, never into prompts."""
+    from core.delivery_composition import MAX_COMPOSITION_CHILDREN, composition_evidence_path, fingerprint
+
+    if set(payload) != {
+        "schema_version",
+        "plan_id",
+        "node_id",
+        "verification",
+        "completed_units",
+        "constraint_ids",
+        "obligation_results",
+        "child_evidence",
+    }:
+        raise ValueError("Invalid root closure fields.")
+    children = payload["child_evidence"]
+    if not isinstance(children, list) or not 0 < len(children) <= MAX_COMPOSITION_CHILDREN:
+        raise ValueError("Invalid root closure fan-in.")
+    composed = read_repair_state(root, composition_evidence_path(directory, record.composition_evidence_fingerprint))
+    if (
+        not composed
+        or fingerprint(composed) != record.composition_evidence_fingerprint
+        or composed.get("gate_id") != record.gate_id
+        or composed.get("compact") is not True
+        or composed.get("review_kind") != "semantic"
+    ):
+        raise ValueError("Accepted root composition is unavailable.")
+    control = composed["control"]
+    if (
+        control["disposition"] != "approved"
+        or control["findings"]
+        or control["obligation_results"] != payload["obligation_results"]
+    ):
+        raise ValueError("Root closure does not match accepted direct results.")
+    decisions = control["checkpoint_results"]
+    ids = [item["id"] for item in decisions]
+    if len(set(ids)) != len(ids) or any(item["outcome"] != "applicable" for item in decisions):
+        raise ValueError("Root closure requires every child to be applicable.")
+    origins = {}
+    units = list(payload["completed_units"])
+    constraints = set(payload["constraint_ids"])
+    results = list(payload["obligation_results"])
+    for child in children:
+        if not isinstance(child, dict) or set(child) != {"node_id", "verification"} or child["node_id"] in origins:
+            raise ValueError("Invalid child closure reference.")
+        origin = parse_delivery_verification_record(child["verification"])
+        evidence = load_checkpoint_evidence(root, directory, origin, plan_id=plan_id, node_id=child["node_id"])
+        origins[child["node_id"]] = origin.checkpoint_evidence_fingerprint
+        units.extend(unit.to_dict() for unit in evidence.completed_units)
+        constraints.update(evidence.constraint_ids)
+        results.extend(result.to_dict() for result in evidence.obligation_results)
+    if origins != composed["origins"] or set(origins) != set(ids):
+        raise ValueError("Root closure origins changed.")
+    # Restore the captured declaration order, then use the same immutable execution
+    # fingerprint check as full evidence. No per-unit order list enters the artifact.
+    by_id = {unit["unit_id"]: unit for unit in units}
+    if unit_order is None or len(by_id) != len(units) or set(by_id) != set(unit_order):
+        raise ValueError("Root closure execution inputs changed.")
+    expanded = {key: value for key, value in payload.items() if key != "child_evidence"}
+    expanded.update(
+        completed_units=[by_id[key] for key in unit_order],
+        constraint_ids=sorted(constraints),
+        obligation_results=results,
+    )
+    return _parse_evidence(expanded, record, plan_id=plan_id, node_id="root")
+
+
+def _store_root_closure(
+    root: Path,
+    directory: Path,
+    snapshot: DeliveryVerificationSnapshot,
+    record: DeliveryVerificationRecord,
+    assessment: DeliveryIntegrationAssessment,
+    composition: CompositionResult,
+    status: DeliveryStatusResult,
+) -> str:
+    if (
+        not assessment.approved
+        or assessment.findings
+        or any(getattr(record, key) != value for key, value in vars(snapshot.identity).items())
+    ):
+        raise ValueError("Root closure requires the captured approved candidate.")
+    covered = set()
+    inherited_constraints = set()
+    children = []
+    expected = {unit.unit_id: unit for unit in snapshot.completed_units}
+    for ref in composition.child_refs:
+        origin = status.checkpoint_verifications[ref["id"]]
+        if origin.checkpoint_evidence_fingerprint != ref["evidence_fingerprint"]:
+            raise ValueError("Root closure child changed.")
+        child = load_checkpoint_evidence(root, directory, origin, plan_id=snapshot.scope.plan_id, node_id=ref["id"])
+        if any(expected.get(unit.unit_id) != unit for unit in child.completed_units):
+            raise ValueError("Root closure child execution changed.")
+        covered.update(unit.unit_id for unit in child.completed_units)
+        inherited_constraints.update(child.constraint_ids)
+        children.append({"node_id": ref["id"], "verification": origin.to_dict()})
+    payload = {
+        "schema_version": 1,
+        "plan_id": snapshot.scope.plan_id,
+        "node_id": "root",
+        "verification": _record_binding(record),
+        "completed_units": [unit.to_dict() for unit in snapshot.completed_units if unit.unit_id not in covered],
+        "constraint_ids": [key for key in snapshot.scope.constraint_ids if key not in inherited_constraints],
+        "obligation_results": [item.to_dict() for item in assessment.obligation_results],
+        "child_evidence": children,
+    }
+    evidence = _parse_root_closure(
+        root,
+        directory,
+        payload,
+        record,
+        plan_id=snapshot.scope.plan_id,
+        unit_order=tuple(unit.unit_id for unit in snapshot.completed_units),
+    )
+    if not evidence.covers(snapshot.scope):
+        raise ValueError("Root closure must cover the complete scope.")
+    digest = _fingerprint(payload)
+    write_repair_state(root, root_evidence_path(directory, digest), payload)
+    return digest

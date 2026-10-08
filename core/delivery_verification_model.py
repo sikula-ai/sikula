@@ -96,6 +96,8 @@ class DeliveryVerificationRecord:
     root_evidence_fingerprint: str | None = None
     composition_attempted: bool = False
     composition_evidence_fingerprint: str | None = None
+    security_composition_attempted: bool = False
+    security_composition_evidence_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -130,6 +132,7 @@ class DeliveryVerificationRecord:
             "checkpoint_evidence_fingerprint",
             "root_evidence_fingerprint",
             "composition_evidence_fingerprint",
+            "security_composition_evidence_fingerprint",
         ):
             value = getattr(self, key)
             if value:
@@ -138,6 +141,8 @@ class DeliveryVerificationRecord:
             data["review_rule_fingerprints"] = dict(self.review_rule_fingerprints)
         if self.composition_attempted:
             data["composition_attempted"] = True
+        if self.security_composition_attempted:
+            data["security_composition_attempted"] = True
         return data
 
     @property
@@ -180,6 +185,8 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         "root_evidence_fingerprint",
         "composition_attempted",
         "composition_evidence_fingerprint",
+        "security_composition_attempted",
+        "security_composition_evidence_fingerprint",
     }
     if set(value) - allowed:
         raise ValueError("delivery verification record contains unsupported fields")
@@ -251,7 +258,13 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
     if not isinstance(security_status, str) or security_status not in DELIVERY_VERIFICATION_REVIEW_STATUSES:
         raise ValueError("delivery verification security_status is unsupported")
 
-    bool_fields = ("security_required", "validation_reused", "validation_executed", "composition_attempted")
+    bool_fields = (
+        "security_required",
+        "validation_reused",
+        "validation_executed",
+        "composition_attempted",
+        "security_composition_attempted",
+    )
     for key in bool_fields:
         if not isinstance(value.get(key, False), bool):
             raise ValueError(f"delivery verification {key} must be a boolean")
@@ -279,6 +292,14 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
     checkpoint_fingerprint = value.get("checkpoint_evidence_fingerprint")
     root_fingerprint = value.get("root_evidence_fingerprint")
     composition_fingerprint = value.get("composition_evidence_fingerprint")
+    security_composition_fingerprint = value.get("security_composition_evidence_fingerprint")
+    if security_composition_fingerprint is not None and (
+        not isinstance(security_composition_fingerprint, str)
+        or not _SHA256_ID_RE.fullmatch(security_composition_fingerprint)
+        or not value.get("security_composition_attempted", False)
+        or not value.get("security_required", False)
+    ):
+        raise ValueError("delivery verification security composition fingerprint is invalid")
     if composition_fingerprint is not None and (
         not isinstance(composition_fingerprint, str)
         or not _SHA256_ID_RE.fullmatch(composition_fingerprint)
@@ -318,6 +339,8 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
         raise ValueError("delivery verification evidence_path must be bounded and project-relative")
 
     return DeliveryVerificationRecord(
+        security_composition_attempted=value.get("security_composition_attempted", False),
+        security_composition_evidence_fingerprint=security_composition_fingerprint,
         schema_version=SUPPORTED_DELIVERY_VERIFICATION_SCHEMA_VERSION,
         gate_id=value["gate_id"],
         candidate_commit=value["candidate_commit"],

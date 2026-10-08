@@ -620,10 +620,20 @@ fingerprints belong to the immutable prepared plan and should not be rewritten b
 hand. Amendments and repairs do not issue replacement attribution approvals.
 Private preparation audit retains the independent decisions and rationales.
 
-The final gate always consumes the complete source and accounting, including all
-requirements excluded from intermediate packets. Scoped packets reduce repeated
-checkpoint context; nested hierarchy and removal of whole-plan size limits remain
-separate work. An oversized packet is rejected before provider work, never truncated.
+Preparation can also propose `final_gate: false` on source-accounting records that
+are fully discharged by exactly one checkpoint. The default is true: shared rules,
+cross-group requirements and final-only authority stay in the final review. A checkpoint
+can supply a bounded `integration_context` describing its interface and integration
+responsibilities. The independent verifier separately checks these descriptions and
+all exclusions against the complete source and contracts before the writer can issue
+`final_gate_authority`. Manual declarations alone cannot enable omission.
+
+With that unchanged approval, the final gate receives exact retained source and
+accounting, direct work and compact child evidence references with checked interfaces.
+Child internal requirements, contracts and historical reviews do not accumulate in
+its prompt. Missing or changed approval uses full authority. Nested hierarchy and
+removal of whole-plan size limits remain separate work. An oversized packet is
+rejected before provider work, never truncated.
 
 `delivery run` checks a completed group before downstream execution. An eligible
 semantic gap triggers the existing bounded repair flow, followed by another
@@ -672,16 +682,22 @@ Historical admission records and already completed units remain unchanged.
 The composed path supports up to eight nonoverlapping checkpoints and 32 direct
 units, within fixed context and change budgets. Other shapes use full review;
 these bounds do not reject otherwise supported plans. Required security review
-and final validation still cover the current candidate. A later repair owner
-outside a checkpoint makes its obligation direct again.
-Composition gets one durable exchange per unchanged candidate/policy, with at
+and final validation still cover the current candidate. With separately approved
+final responsibility and accepted child security evidence, the security reviewer
+makes its own compact applicability assessment. Uncertainty uses full security review;
+confirmed security rejection remains a stop. Semantic approval cannot replace security.
+A later repair owner outside a checkpoint makes its obligation direct again and
+invalidates compact final attribution.
+Composition gets one durable exchange per reviewer for unchanged candidate/policy, with at
 most two calls for format correction. Resume reuses its accepted decision; an
 interrupted exchange without a result or malformed responses use full review.
 Referenced composition evidence remains private and must be intact, just like
 the original checkpoint and final evidence.
 
-Successful root verification of a plan with checkpoints retains exact typed
-results in private content-addressed evidence. Dry-run, resume and finalization validate
+Successful final verification of a plan with checkpoints retains exact typed
+results in private content-addressed evidence. Compact final evidence stores direct
+results and immediate child evidence references; deterministic checks resolve exact
+coverage without copying inherited outcome lists into the artifact or prompt. Dry-run, resume and finalization validate
 the accepted artifact; missing or damaged evidence cannot be reconstructed from
 success counts or audit logs. Original checkpoint evidence remains required.
 Only bounded status metadata is projected publicly. Neither artifact contents

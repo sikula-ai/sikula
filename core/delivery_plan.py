@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
@@ -330,6 +330,8 @@ class DeliveryPlan:
     checkpoints: list[DeliveryCheckpoint] = field(default_factory=list)
     checkpoint_authority: dict[str, str] = field(default_factory=dict, repr=False)
     verified_checkpoint_authority: dict[str, str] = field(default_factory=dict, repr=False)
+    final_gate_authority: str | None = field(default=None, repr=False)
+    verified_final_gate_authority: str | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -783,6 +785,19 @@ def _parse_delivery_plan(
                 )
             )
     checkpoint_authority = data.get("checkpoint_authority", {})
+    final_gate_authority = data.get("final_gate_authority")
+    if final_gate_authority is not None and (
+        not isinstance(final_gate_authority, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", final_gate_authority)
+    ):
+        errors.append(
+            DeliveryPlanIssue(
+                "error",
+                "checkpoints.authority_invalid",
+                "Final authority receipt must be an input fingerprint.",
+                "final_gate_authority",
+            )
+        )
+        final_gate_authority = None
     if (
         not isinstance(checkpoint_authority, dict)
         or not set(checkpoint_authority) <= {item.id for item in checkpoints}
@@ -824,10 +839,17 @@ def _parse_delivery_plan(
         verification=verification,
         checkpoints=checkpoints,
         checkpoint_authority=checkpoint_authority,
+        final_gate_authority=final_gate_authority,
     )
     if not errors:
         plan.verified_checkpoint_authority.update(
             restore_checkpoint_authority(plan, source_task_description or "", project_root)
+        )
+        from core.delivery_final_authority import restore_final_authority
+
+        plan = replace(
+            plan,
+            verified_final_gate_authority=restore_final_authority(plan, source_task_description or "", project_root),
         )
     return plan
 

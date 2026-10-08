@@ -880,8 +880,13 @@ python3 -m ruff format .
   same packet for readiness and both semantic/security reviews, and bind it into
   evidence/resume policy. Missing or changed attribution receipts use full authority
   only within existing bounds; they cannot mint approval, reset budgets or erase
-  terminal stops. The final gate retains complete source and excluded/cross-group
-  responsibility. Keep raw attribution rationales and prompts in private audit.
+  terminal stops. The final gate retains complete source unless separate independent
+  verification authorizes child-local discharge. Keep shared/cross-group authority
+  exact; omission requires checked child interfaces and exact typed evidence closure.
+  Security must establish its own applicability, independently of semantic approval.
+  Do not expand child internals or history into parent prompts or copy inherited
+  outcomes into compact parent artifacts. Keep raw attribution rationales and prompts
+  in private audit.
 - **Never** bypass a declared checkpoint through `run-next`, explicit selection,
   dry-run, resume, partial repair publication, or a unit/time bound. Placement is
   authored by the preparation LLM and validated as a dependency barrier, not a

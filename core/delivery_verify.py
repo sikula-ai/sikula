@@ -347,6 +347,17 @@ def verify_delivery_plan(
                     if node_id == "root" and existing and existing.gate_id == identity.gate_id
                     else None
                 ),
+                security_composition_attempted=bool(
+                    node_id == "root"
+                    and existing
+                    and existing.gate_id == identity.gate_id
+                    and existing.security_composition_attempted
+                ),
+                security_composition_evidence_fingerprint=(
+                    existing.security_composition_evidence_fingerprint
+                    if node_id == "root" and existing and existing.gate_id == identity.gate_id
+                    else None
+                ),
             )
             progress = mark_delivery_verification(progress, running, node_id=node_id)
             write_delivery_progress(progress_path, progress)
@@ -727,6 +738,15 @@ def _execute_gate(
                 result.outcome == "satisfied" for result in semantic.assessment.obligation_results
             )
             obligation_gap_count = len(semantic.assessment.obligation_results) - obligation_satisfied_count
+            if (
+                semantic.composition is not None
+                and semantic.composition.child_refs
+                and not semantic.composition.fallback
+            ):
+                if semantic.assessment.approved:
+                    obligation_satisfied_count += semantic.composition.inherited_count
+                else:
+                    obligation_gap_count += semantic.composition.inherited_count
             if not _review_workspace_unchanged(worktree, project_config, semantic_before) or not _candidate_is_clean(
                 worktree, identity.candidate_commit
             ):
@@ -803,19 +823,33 @@ def _execute_gate(
                     )
                 security_before = _review_snapshot(worktree, project_config)
                 active_review = "security"
-                security = _run_review(
-                    security_reviewer,
+                security, running = _composition_review(
+                    status=status,
+                    snapshot=snapshot,
+                    running=running,
+                    reviewer=security_reviewer,
                     worktree=worktree,
-                    kind="security",
+                    root=root,
                     source_task=source_task,
-                    plan_context=plan_context,
                     validation=validation,
-                    identity=identity,
-                    known_unit_ids=known_unit_ids,
-                    known_obligation_ids=set(),
                     evidence_path=evidence_path,
-                    audit_root=root,
+                    project_config=project_config,
+                    review_kind="security",
                 )
+                if security is None:
+                    security = _run_review(
+                        security_reviewer,
+                        worktree=worktree,
+                        kind="security",
+                        source_task=source_task,
+                        plan_context=plan_context,
+                        validation=validation,
+                        identity=identity,
+                        known_unit_ids=known_unit_ids,
+                        known_obligation_ids=set(),
+                        evidence_path=evidence_path,
+                        audit_root=root,
+                    )
                 security_status = "approved" if security.assessment.approved else "rejected"
                 if not _review_workspace_unchanged(
                     worktree, project_config, security_before
@@ -870,7 +904,20 @@ def _execute_gate(
                 passed = replace(passed, checkpoint_evidence_fingerprint=fingerprint)
             elif status.plan.checkpoints:
                 try:
-                    fingerprint = store_root_evidence(root, evidence_path.parent, snapshot, passed, semantic.assessment)
+                    fingerprint = store_root_evidence(
+                        root,
+                        evidence_path.parent,
+                        snapshot,
+                        passed,
+                        semantic.assessment,
+                        **(
+                            {"composition": semantic.composition, "status": status}
+                            if semantic.composition is not None
+                            and semantic.composition.child_refs
+                            and not semantic.composition.fallback
+                            else {}
+                        ),
+                    )
                 except (OSError, ValueError):
                     return replace(passed, status="blocked", stop_code="delivery_verification.evidence_unavailable")
                 passed = replace(passed, root_evidence_fingerprint=fingerprint)
@@ -934,6 +981,7 @@ def _composition_review(
     validation: DeliveryVerificationValidationResult,
     evidence_path: Path,
     project_config: dict[str, Any],
+    review_kind: str = "semantic",
 ) -> tuple[DeliveryIntegrationReviewResult | None, DeliveryVerificationRecord]:
     from core.delivery_composition import build_composition_context, load_composition, store_composition
     from core.delivery_verification import delivery_verification_prompt_is_bounded
@@ -941,24 +989,30 @@ def _composition_review(
     if snapshot.scope.node_id != "root" or not status.plan.checkpoints:
         return None, running
     try:
-        if running.composition_evidence_fingerprint:
-            accepted = load_composition(status, running)
+        evidence_field = (
+            "composition_evidence_fingerprint"
+            if review_kind == "semantic"
+            else "security_composition_evidence_fingerprint"
+        )
+        attempted_field = "composition_attempted" if review_kind == "semantic" else "security_composition_attempted"
+        if getattr(running, evidence_field):
+            accepted = load_composition(status, running, review_kind=review_kind)
             if accepted.fallback:
                 return None, running
             return DeliveryIntegrationReviewResult(accepted.assessment, [], accepted), running
-        if running.composition_attempted:
+        if getattr(running, attempted_field):
             return None, running
-        context = build_composition_context(status, snapshot, project_config)
+        context = build_composition_context(status, snapshot, project_config, review_kind=review_kind)
         if context is None:
             return None, running
         prompt_args = dict(
             cwd=worktree,
-            review_kind="semantic",
+            review_kind=review_kind,
             source_task=source_task,
             validation_summary=validation.to_review_dict(project_config, project_root=worktree),
             candidate_commit=snapshot.identity.candidate_commit,
             candidate_tree=snapshot.identity.candidate_tree,
-            known_obligation_ids=set(snapshot.scope.obligation_ids),
+            known_obligation_ids=set(snapshot.scope.obligation_ids) if review_kind == "semantic" else set(),
         )
         full_prompt = reviewer._prompt(plan_context=snapshot.scope.plan_context(), **prompt_args)
         composed_prompt = reviewer._prompt(plan_context=context, **prompt_args)
@@ -969,11 +1023,14 @@ def _composition_review(
             composed_prompt.encode()
         ) >= len(full_prompt.encode()):
             return None, running
-        running = _persist_composition_control(status, snapshot, running, project_config, attempted=True)
+        running = _persist_composition_control(
+            status, snapshot, running, project_config, attempted=True, review_kind=review_kind
+        )
         if not _safe_append_audit(
             evidence_path,
             {
                 "event": "composition_reserved",
+                "review_kind": review_kind,
                 "gate_id": running.gate_id,
                 "attempt": running.attempt,
                 "max_provider_calls": 2,
@@ -988,13 +1045,13 @@ def _composition_review(
             result = _run_review(
                 reviewer,
                 worktree=worktree,
-                kind="semantic",
+                kind=review_kind,
                 source_task=source_task,
                 plan_context=context,
                 validation=validation,
                 identity=snapshot.identity,
                 known_unit_ids=set(snapshot.scope.unit_ids),
-                known_obligation_ids=set(snapshot.scope.obligation_ids),
+                known_obligation_ids=set(snapshot.scope.obligation_ids) if review_kind == "semantic" else set(),
                 evidence_path=evidence_path,
                 audit_root=root,
             )
@@ -1028,7 +1085,7 @@ def _composition_review(
             return result, running
         digest = store_composition(root, evidence_path.parent, running.gate_id, context, result.composition)
         running = _persist_composition_control(
-            status, snapshot, running, project_config, attempted=True, fingerprint=digest
+            status, snapshot, running, project_config, attempted=True, fingerprint=digest, review_kind=review_kind
         )
         return (None if result.composition.fallback else result), running
     except (OSError, ValueError, KeyError, DeliveryProgressLockError):
@@ -1045,6 +1102,7 @@ def _persist_composition_control(
     *,
     attempted: bool,
     fingerprint: str | None = None,
+    review_kind: str = "semantic",
 ) -> DeliveryVerificationRecord:
     """Only this captured running attempt can reserve work or accept its proof."""
     from core.delivery_checkpoints import checkpoint_pass_is_usable
@@ -1071,7 +1129,11 @@ def _persist_composition_control(
             or record.attempt != running.attempt
         ):
             raise ValueError("Composition attempt changed.")
-        updated = replace(record, composition_attempted=attempted, composition_evidence_fingerprint=fingerprint)
+        prefix = "" if review_kind == "semantic" else "security_"
+        updated = replace(
+            record,
+            **{prefix + "composition_attempted": attempted, prefix + "composition_evidence_fingerprint": fingerprint},
+        )
         write_delivery_progress(path, mark_delivery_verification(progress, updated))
         return updated
 
@@ -1090,7 +1152,9 @@ def _run_review(
     evidence_path: Path,
     audit_root: Path,
 ) -> DeliveryIntegrationReviewResult:
-    composing = kind == "semantic" and "checkpoint_composition" in plan_context
+    composing = "checkpoint_composition" in plan_context and (
+        kind == "semantic" or plan_context["checkpoint_composition"].get("compact")
+    )
     composition_before = _review_snapshot(worktree, reviewer.project_config) if composing else None
 
     def audit_composition_attempt(prompt: str, attempts: list[DeliveryIntegrationReviewAttempt]) -> None:
@@ -1199,6 +1263,8 @@ def _persist_terminal_if_current(
                     terminal,
                     composition_attempted=record.composition_attempted,
                     composition_evidence_fingerprint=record.composition_evidence_fingerprint,
+                    security_composition_attempted=record.security_composition_attempted,
+                    security_composition_evidence_fingerprint=record.security_composition_evidence_fingerprint,
                 )
             # A boundary violation belongs to the attempt even when authority
             # changes while its provider is running. Never replace it with stale.

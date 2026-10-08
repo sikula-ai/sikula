@@ -1313,6 +1313,8 @@ re-verification even when the tree is unchanged; it does not rewrite historical
 admission. The final gate establishes applicability through either a full review
 or a composed assessment grounded in current code and bounded change evidence.
 Successful composition replaces the full semantic review for that candidate.
+With separately verified final responsibility, required security review can also
+compose accepted security evidence through its own applicability assessment.
 
 For plans with checkpoints, a successful root gate persists its exact typed
 obligation results, completed inputs, constraint coverage and verification binding
@@ -1388,9 +1390,32 @@ plans beyond the bounded root packet remain later work.
 **Bounded final-gate composition:** `core/delivery_composition.py` supplies a
 supported flat path with at most eight nonoverlapping checkpoints and 32 direct
 units. Only obligations whose complete current ownership lies inside a child can
-be inherited; later repair owners leave an obligation direct. The packet retains
-full source authority, constraints, source accounting and direct work, replacing
-covered unit metadata with typed receipt references and obligation descriptions.
+be inherited; later repair owners leave an obligation direct. Without separately
+verified final responsibility, the packet retains full source authority, constraints,
+source accounting and direct work, replacing covered unit metadata with typed receipt
+references and obligation descriptions. Required security review then remains full.
+
+`core/delivery_final_authority.py` owns the optional compact final packet. Preparation
+may mark a source-accounting fragment `final_gate: false` only when exactly one
+checkpoint completely discharges that child-local requirement. The default is true.
+Each child supplies at most 4 KiB of `integration_context`: an independently checked
+interface description for assessing integration and security, not a substitute for
+exact governing authority. Global, shared, cross-group and final-only requirements
+remain exact final authority, including enclosing context and prohibitions.
+The independent verifier sees the complete source and all contracts and must
+separately approve `final_gate_authority_complete`. Its audited input fingerprint
+binds exclusions and interfaces. Only an unchanged independently approved draft can
+receive a `final_gate_authority` receipt, binding the proposed final packet and all
+contract contents. This also requires every checkpoint's authority receipt.
+Declarations alone never authorize omission; unsupported ownership, changed inputs
+or missing receipts select full authority without minting replacement approvals.
+
+The compact packet carries exact retained source, direct units/outcomes, applicable
+constraints and immediate child references with checked integration context, coverage
+hash/count, origin candidate and accepted evidence hash. Dependencies on child internals
+are represented by checkpoint IDs. Child contracts, internal obligation lists and
+internal accounting do not accumulate in the parent prompt. Both final reviewers use
+this packet, with independent decisions and full fallback for each role.
 It includes complete project-relative changes since each child candidate within
 a shared 64 KiB delta budget (at most 32 changed paths per child), with a 128 KiB
 serialized context ceiling. Oversized, binary, private-path or unsupported deltas
@@ -1406,7 +1431,7 @@ Rendered prompts include rules, JSON escaping, response templates and correction
 headroom. Composition is chosen only when it is smaller than full review and the
 full fallback fits. These are supported-path bounds, not new plan-size limits.
 
-The same read-only semantic reviewer assesses direct obligations, whole-source
+The same read-only semantic reviewer assesses direct obligations, retained authority
 completeness, cross-group integration and explicit `checkpoint_results`. Each
 child decision is `applicable` or `verification_required`, with a bounded rationale;
 changed-tree applicability must cite its supplied delta and inspect relevant code
@@ -1414,22 +1439,34 @@ and shared dependencies. Citations and schemas are checked deterministically;
 semantic correctness remains the reviewer's responsibility. Native provider
 inspection retains the existing read-only scope and timeout boundaries. This
 slice does not claim a new cross-provider per-file retrieval quota.
-Only applicable child outcomes are expanded into the exact typed final obligation
-closure. Uncertainty, child regressions, partial repair findings or two malformed
+Only applicable children enter the exact typed final obligation closure. On the
+compact path, the final artifact stores direct results/inputs and bounded immediate
+child evidence references, rather than duplicating every inherited outcome or unit.
+Deterministic coverage validation resolves those children privately, restores declared
+execution order and checks the original completed-input fingerprint and exact scope.
+It checks typed results, never infers success from a hash or count. This host-side
+resolution remains bounded by the current flat plan limits and never feeds expanded
+child state or audit history back into prompts. Uncertainty, child regressions, partial repair findings or two malformed
 responses trigger the existing full semantic review automatically. Confirmed
 external-dependency, scope and unavailable-authority dispositions remain stops.
-Security review, when required, still reviews the full current candidate; ordinary
+Security review, when required, independently assesses the current candidate.
+Compact security composition requires accepted security results for every child and
+uses its own `checkpoint_results` with empty functional `obligation_results`.
+Semantic applicability never proves security applicability. Security uncertainty uses
+full security review; confirmed security rejection and read-only violations remain
+terminal even if applicability is uncertain or audit persistence fails. Ordinary
 validation and final checks also remain mandatory.
 
 Before the first composition call, the captured running final-gate record durably
-sets `composition_attempted`. One exchange (at most two calls for format correction)
+sets `composition_attempted` for semantic review or `security_composition_attempted`
+for security review. One exchange per role (at most two calls for format correction)
 is permitted for that unchanged gate across resume; an interrupted exchange without
 accepted evidence proceeds directly to full review. The read-only workspace boundary
 is checked before each composition call, including a format correction. After private
 audit succeeds and the candidate remains read-only, a content-addressed `composition-evidence-<sha>.json`
 stores the typed response, packet fingerprint, current gate identity and immediate
-receipt fingerprints. The record's `composition_evidence_fingerprint` alone accepts
-it under the delivery lock. An orphan or audit transcript is never reused. Accepted
+receipt fingerprints. The record's role-specific `composition_evidence_fingerprint` or
+`security_composition_evidence_fingerprint` alone accepts it under the delivery lock. An orphan or audit transcript is never reused. Accepted
 decisions, including fallback decisions, survive interruption before security review;
 missing referenced evidence blocks before providers. Final typed evidence binds the
 composition reference, and readiness, reuse and finalization validate it. Historical
@@ -1468,7 +1505,8 @@ of new execution authority.
 `core/delivery_authority.py` owns checkpoint source attribution. Source-accounting
 records may declare `checkpoint_ids`: null/absent is global authority, a nonempty
 list assigns local/shared authority, and an empty list reserves the fragment for
-the final gate. All fragments remain final-gate authority regardless of attribution.
+the final gate. All fragments remain final-gate authority unless a separately
+verified final responsibility receipt authorizes child-local discharge, as above.
 Preparation's independent verifier receives the complete source, every unit,
 checkpoint and accounting decision; it must check inclusions and exclusions,
 including context-only requirements, literals, assets, prohibitions, security and
@@ -1501,15 +1539,18 @@ within that section; they cannot discard its governing prose.
 Cross-group accounting names the local contribution and reserves outcome closure
 for the final gate. Shared fragments are resolved inline once; there is no hidden
 authority retrieval, summary substitution, truncation, or historical audit replay.
-Excluded authority stays in the immutable full source/accounting consumed by the
-final gate, not a growing list copied into every checkpoint. The same resolver
+Authority excluded from a checkpoint stays in immutable full source/accounting.
+It is final-gate authority unless separately verified child-local discharge applies;
+it is never a growing list copied into every checkpoint. The same resolver
 feeds readiness, semantic review and required security review. Packet context enters
 the checkpoint policy fingerprint and therefore typed evidence, handoff reuse and
 resume identity. Readiness includes escaped source/context, rules, security context,
 response templates and protocol/correction allowance. Terminal security/read-only
-stops and all retry/repair budgets are unchanged. Full-source final review and current
-whole-plan limits remain required; this is not recursive verification or unbounded
-plan support.
+stops and all retry/repair budgets are unchanged. The full-source fallback and current
+whole-plan limits still apply; this is not recursive verification or unbounded plan
+support. Failed composed semantic assessments use full review before repair so repair
+input keeps complete obligation provenance; changed repair ownership invalidates final
+attribution and selects full authority.
 
 `DeliveryVerificationSnapshot` binds that declaration to completed-unit commit
 and handoff evidence and the exact candidate/config/source/plan/policy identity.
