@@ -448,6 +448,8 @@ def test_author_delivery_plan_calls_generate_and_records_success(tmp_path: Path)
     verification_record = audit_records[1]
     assert verification_record["phase"] == "delivery_prepare_constraint_verification"
     assert verification_record["parsed"] == {
+        "checkpoint_authority_complete": False,
+        "checkpoint_authority_input": None,
         "source_accounting": [record.to_verification_dict() for record in draft.source_accounting],
         "source_accounting_gaps": [],
         "unit_contract_gaps": [],

@@ -282,6 +282,10 @@ During normal preparation, the LLM can also place intermediate integration
 checkpoints where downstream work depends on a coherent completed group.
 `delivery run` verifies these groups, performs eligible bounded repair, and
 re-verifies before releasing dependent units. `run-next` cannot bypass the barrier.
+Preparation independently checks which source requirements and context each checkpoint
+needs. When that attribution still matches, both reviewers receive the relevant exact
+source fragments, shared rules and local plan context. Otherwise verification uses the
+full source within the existing limits. The final gate always retains the complete source.
 `delivery status` distinguishes an accepted historical checkpoint handoff from the
 evidence applicable to the current candidate. Changed code requires fresh
 verification; the final gate establishes that evidence before finalization.

@@ -1455,13 +1455,61 @@ security protocols. Unknown verification policy values fail closed.
 verification scope. The root `(plan_id, root)` covers
 all active units, all obligations and constraints, complete source accounting,
 and the full source-task binding. A checkpoint selects a declared completed group,
-its due obligations and applicable constraints, retaining the full source authority. Context-only fragments remain in its authority;
+its due obligations and applicable constraints. It uses full source authority unless
+an unchanged independently reviewed attribution authorizes a scoped packet.
+Relevant context-only fragments remain authority;
 superseded units do not enter active coverage, but their sensitive risk tags still
 require security review. Its prompt context is detached from mutable parsed-plan
 lists. Readiness limits, prompt context and response-template sizing, expected
 review results, obligation closure checks, and repair input/dependencies consume
 this same node-scope definition. It is not a public JSON projection or a source
 of new execution authority.
+
+`core/delivery_authority.py` owns checkpoint source attribution. Source-accounting
+records may declare `checkpoint_ids`: null/absent is global authority, a nonempty
+list assigns local/shared authority, and an empty list reserves the fragment for
+the final gate. All fragments remain final-gate authority regardless of attribution.
+Preparation's independent verifier receives the complete source, every unit,
+checkpoint and accounting decision; it must check inclusions and exclusions,
+including context-only requirements, literals, assets, prohibitions, security and
+cross-group rules. Its `checkpoint_authority_complete` decision and input fingerprint
+are privately audited. Reported attribution gaps use the existing single bounded
+draft correction and independent re-verification. Unknown relevance can be corrected
+to global attribution; it is not an operator question. Deterministic validation
+requires source for every covered contributor, even when an obligation is due later.
+
+Only a writer with an independently accepted, unchanged draft can issue tracked
+`checkpoint_authority` receipts. The writer checks that binding again after heading
+canonicalization and asset assignment. If rendering changed the reviewed draft,
+it publishes without scoped receipts and ordinary full-authority readiness applies;
+rendering cannot transfer approval to contracts the verifier did not inspect.
+Each receipt hashes the exact proposed node context,
+source binding and covered contract contents under a fixed packet policy. These
+receipts record preparation's decision, not cryptographic signatures: they are
+protected by the existing immutable plan/source/contract authority checks. Hand-authored
+attribution alone never enables omission. Loading validates receipts against current
+inputs; absent or mismatched receipts select full-authority review, subject to normal
+readiness bounds. Amendment/repair cannot mint new receipts. Widened covered ownership
+adds the newly required source before comparison, so stale receipts cannot authorize
+exclusion. Unrelated pending contracts do not change a node's receipt. Contract hashes
+use universal Markdown newlines so Git checkout line endings do not change attribution.
+
+A scoped packet retains original fragment IDs, hashes, exact text and enclosing
+heading fragments, applicable constraints, local accounting and component context.
+Unranked colon-style headings retain enclosing Markdown authority and remain context
+within that section; they cannot discard its governing prose.
+Cross-group accounting names the local contribution and reserves outcome closure
+for the final gate. Shared fragments are resolved inline once; there is no hidden
+authority retrieval, summary substitution, truncation, or historical audit replay.
+Excluded authority stays in the immutable full source/accounting consumed by the
+final gate, not a growing list copied into every checkpoint. The same resolver
+feeds readiness, semantic review and required security review. Packet context enters
+the checkpoint policy fingerprint and therefore typed evidence, handoff reuse and
+resume identity. Readiness includes escaped source/context, rules, security context,
+response templates and protocol/correction allowance. Terminal security/read-only
+stops and all retry/repair budgets are unchanged. Full-source final review and current
+whole-plan limits remain required; this is not recursive verification or unbounded
+plan support.
 
 `DeliveryVerificationSnapshot` binds that declaration to completed-unit commit
 and handoff evidence and the exact candidate/config/source/plan/policy identity.

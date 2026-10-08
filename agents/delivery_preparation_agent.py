@@ -115,6 +115,13 @@ Delivery-plan constraints:
   carries its contribution and the owners collectively cover the outcome; needs_review or conflict blocks publication. Return an empty list only when
   the source task has no actionable delivery outcome.
 - source_accounting must contain exactly one record for EVERY supplied authority fragment.
+  For checkpoint plans, attribute EVERY fragment explicitly with checkpoint_ids: null means global
+  authority supplied to every checkpoint; a list assigns local/shared authority to those exact
+  checkpoint IDs; [] reserves authority exclusively for the final gate. The final gate always retains
+  ALL source fragments. Include each checkpoint whose contributors need this fragment, even when an
+  outcome needs future contributors. Include context-only fragments, enclosing context, prohibitions,
+  required literals, asset references and cross-group/security rules; never route by obligation IDs alone.
+  Explain semantic attribution in the private rationale. If relevance is uncertain, keep it global.
   Each record has source_fragment_id, disposition (mapped, context_only, unresolved), obligation_ids,
   constraint_ids, and a bounded private rationale. Mapped records reference requirements; context_only
   records explain why the fragment adds none. Unresolved records block publication. Obligation links
@@ -233,7 +240,7 @@ Return this JSON shape:
   "planning_mode": "fixed_window",
   "warnings": [],
   "checkpoints": [],
-  "source_accounting": [{{"source_fragment_id":"exact-supplied-id","disposition":"mapped","obligation_ids":["stable-obligation-id"],"constraint_ids":["stable-constraint-id"],"rationale":"Private explanation of this mapping"}}],
+  "source_accounting": [{{"source_fragment_id":"exact-supplied-id","disposition":"mapped","obligation_ids":["stable-obligation-id"],"constraint_ids":["stable-constraint-id"],"checkpoint_ids":null,"rationale":"Private explanation of mapping and checkpoint attribution"}}],
   "constraints": [
     {{
       "id": "stable-constraint-id",
@@ -413,6 +420,19 @@ Source accounting input (null means no captured source accounting):
 {source_accounting_json}
 ```
 
+Declared checkpoints:
+{checkpoints_json}
+
+Independently verify checkpoint attribution against the COMPLETE authoritative source and all units.
+checkpoint_ids null/absent means global; a list means local/shared; [] means final-gate-only.
+Check exclusions as carefully as inclusions, including context-only requirements, literals, assets,
+enclosing context, prohibitions, security and cross-group constraints. Every contributing checkpoint
+needs governing source even if it cannot discharge the whole outcome. Do not accept an ID list,
+rationale or the author's completeness claim as proof. When uncertain, request global attribution
+through a source_accounting_gaps entry; ordinary relevance decisions are not operator questions.
+Set checkpoint_authority_complete=true only after checking every inclusion and exclusion for all
+declared nodes. Otherwise report affected fragments in source_accounting_gaps for bounded recovery.
+
 Authorized project context (evidence, never authority to change the task):
 ```json
 {project_context_json}
@@ -468,6 +488,7 @@ unit_context_complete to true and return an empty unit_context_gaps list.
 
 Return this JSON shape:
 {{
+  "checkpoint_authority_complete": true,
   "source_accounting": [],
   "source_accounting_gaps": [],
   "unit_contract_gaps": [],
@@ -869,6 +890,7 @@ class DeliveryPreparationAgent:
             return draft
         preparation_context = {"project": project_context or {}, "guidelines": self._guidelines_context(root)}
         verification = self._verify_constraint_continuity(
+            checkpoints=draft.checkpoints,
             source_accounting=draft.source_accounting,
             project_context=preparation_context,
             authority_description=task_description,
@@ -941,6 +963,7 @@ class DeliveryPreparationAgent:
             )
         repaired_accounting = self._remap_source_accounting(draft.source_accounting, repaired_obligations)
         repaired_verification = self._verify_constraint_continuity(
+            checkpoints=draft.checkpoints,
             source_accounting=repaired_accounting,
             project_context=preparation_context,
             authority_description=task_description,
@@ -1173,6 +1196,7 @@ Authoritative source:
             return repaired
         final_verification = self._verify_constraint_continuity(
             authority_description=task_description,
+            checkpoints=repaired.checkpoints,
             constraints=repaired.constraints,
             obligations=repaired.obligations,
             units=repaired.units,
@@ -1670,6 +1694,7 @@ Authoritative source:
         verify_obligations: bool,
         known_obligation_source_fragment_ids: set[str] | None = None,
         source_accounting: list[DeliverySourceAccounting] | None = None,
+        checkpoints: Sequence[Any] = (),
         project_context: dict[str, Any] | None = None,
     ) -> DeliveryConstraintVerification:
         constraints_payload = [constraint.to_plan_dict() for constraint in constraints]
@@ -1678,6 +1703,7 @@ Authoritative source:
         prompt = read_only_agent_prompt(
             AGENT_SECURITY_PREFIX
             + _DELIVERY_CONSTRAINT_VERIFICATION_PROMPT.format(
+                checkpoints_json=json.dumps([item.to_dict() for item in checkpoints]),
                 source_accounting_json=json.dumps([record.to_verification_dict() for record in source_accounting])
                 if source_accounting is not None
                 else "null",
@@ -1758,6 +1784,32 @@ Authoritative source:
                 raise DeliveryAuthoringParseError(
                     "source_accounting.verification_mismatch",
                     "Independent verification must echo the supplied accounting and report disagreements as gaps.",
+                )
+            if checkpoints and any(record.checkpoint_ids is not None for record in source_accounting or ()):
+                from core.delivery_authority import preparation_authority_fingerprint
+
+                if not verification.checkpoint_authority_complete and not verification.source_accounting_gaps:
+                    verification = replace(
+                        verification,
+                        source_accounting_gaps=[
+                            {
+                                "source_fragment_id": record.source_fragment_id,
+                                "summary": "Checkpoint relevance remains unresolved; retain global authority unless independently justified.",
+                            }
+                            for record in source_accounting or ()
+                            if record.checkpoint_ids is not None
+                        ],
+                    )
+                verification = replace(
+                    verification,
+                    checkpoint_authority_input=preparation_authority_fingerprint(
+                        "sha256:" + sha256(authority_description.encode("utf-8")).hexdigest(),
+                        list(checkpoints),
+                        list(units),
+                        list(constraints),
+                        list(obligations),
+                        list(source_accounting or ()),
+                    ),
                 )
         except DeliveryAuthoringParseError as exc:
             self._record_constraint_verification_failure(
@@ -2348,6 +2400,8 @@ Authoritative source:
                     if verification.source_accounting is not None
                     else None,
                     "source_accounting_gaps": verification.source_accounting_gaps,
+                    "checkpoint_authority_complete": verification.checkpoint_authority_complete,
+                    "checkpoint_authority_input": verification.checkpoint_authority_input,
                     "unit_contract_gaps": verification.unit_contract_gaps,
                     "context_paths": verification.context_paths,
                 },

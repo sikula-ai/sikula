@@ -19,16 +19,21 @@ class DeliverySourceAccounting:
     constraint_ids: list[str] = field(default_factory=list)
     rationale_sha256: str = ""
     rationale: str = ""
+    # None is global authority; [] reserves the fragment for the final gate.
+    checkpoint_ids: list[str] | None = None
 
     def to_dict(self, *, public: bool = False) -> dict[str, Any]:
         identity = project_delivery_public_identity if public else str
-        return {
+        data = {
             "source_fragment_id": self.source_fragment_id,
             "disposition": self.disposition,
             "obligation_ids": [identity(value) for value in self.obligation_ids],
             "constraint_ids": [identity(value) for value in self.constraint_ids],
             "rationale_sha256": self.rationale_sha256,
         }
+        if self.checkpoint_ids is not None:
+            data["checkpoint_ids"] = [identity(value) for value in self.checkpoint_ids]
+        return data
 
     def to_verification_dict(self) -> dict[str, Any]:
         data = self.to_dict()
@@ -55,7 +60,14 @@ def parse_source_accounting(
     """Validate exhaustive source and constraint coverage and obligation provenance."""
     if not isinstance(value, list) or len(value) > MAX_DELIVERY_AUTHORITY_FRAGMENTS:
         raise SourceAccountingError("invalid", "Source accounting must be a bounded list.")
-    fields = {"source_fragment_id", "disposition", "obligation_ids", "constraint_ids", "rationale_sha256"}
+    fields = {
+        "source_fragment_id",
+        "disposition",
+        "obligation_ids",
+        "constraint_ids",
+        "rationale_sha256",
+        "checkpoint_ids",
+    }
     if private_rationales:
         fields.add("rationale")
     records: list[DeliverySourceAccounting] = []
@@ -100,7 +112,26 @@ def parse_source_accounting(
                 raise SourceAccountingError(
                     "mapping_invalid", "Source accounting and obligation provenance must agree."
                 )
-        records.append(DeliverySourceAccounting(fragment, disposition, obligations, constraints, digest, rationale))
+        checkpoint_ids = item.get("checkpoint_ids")
+        if checkpoint_ids is not None:
+            if (
+                not isinstance(checkpoint_ids, list)
+                or len(checkpoint_ids) > 256
+                or any(
+                    not isinstance(key, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", key)
+                    or key.casefold() == "root"
+                    for key in checkpoint_ids
+                )
+                or len(set(checkpoint_ids)) != len(checkpoint_ids)
+            ):
+                raise SourceAccountingError(
+                    "checkpoint_invalid", "Checkpoint attribution requires unique bounded checkpoint IDs."
+                )
+            checkpoint_ids = list(checkpoint_ids)
+        records.append(
+            DeliverySourceAccounting(fragment, disposition, obligations, constraints, digest, rationale, checkpoint_ids)
+        )
     if seen != fragment_ids:
         raise SourceAccountingError(
             "incomplete", "Every authoritative source fragment needs an explicit accounting record."

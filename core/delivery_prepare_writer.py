@@ -503,7 +503,7 @@ def write_delivery_prepare_artifacts(
         )
 
     try:
-        plan_yaml = _render_plan_yaml(draft, unit_task_paths)
+        plan_yaml = _render_plan_yaml(draft, unit_task_paths, project_root=root)
         targets = _artifact_targets(
             draft,
             paths=paths,
@@ -823,6 +823,16 @@ def _constraint_verification_stop_issues(draft: DeliveryAuthoringDraft) -> list[
             )
         ]
     if draft.source_accounting is not None:
+        if draft.checkpoints and any(record.checkpoint_ids is not None for record in draft.source_accounting):
+            if not _checkpoint_authority_matches_draft(draft):
+                return [
+                    DeliveryPrepareWriteIssue(
+                        "error",
+                        "delivery_prepare.authority_unresolved",
+                        "Scoped checkpoint authority requires independent verification of this exact draft.",
+                        "source_accounting",
+                    )
+                ]
         if verification.source_accounting != draft.source_accounting:
             return [
                 DeliveryPrepareWriteIssue(
@@ -1238,7 +1248,23 @@ def _canonicalize_markdown_headings(markdown: str) -> str:
     return normalized if changed else markdown
 
 
-def _render_plan_yaml(draft: DeliveryAuthoringDraft, unit_task_paths: dict[str, str]) -> str:
+def _checkpoint_authority_matches_draft(draft: DeliveryAuthoringDraft) -> bool:
+    from core.delivery_authority import preparation_authority_fingerprint
+
+    verification = draft.constraint_verification
+    if verification is None or not verification.checkpoint_authority_complete:
+        return False
+    return verification.checkpoint_authority_input == preparation_authority_fingerprint(
+        draft.source_task.sha256 if draft.source_task else "",
+        draft.checkpoints,
+        draft.units,
+        draft.constraints,
+        draft.obligations,
+        draft.source_accounting or [],
+    )
+
+
+def _render_plan_yaml(draft: DeliveryAuthoringDraft, unit_task_paths: dict[str, str], *, project_root: Path) -> str:
     plan_data: dict[str, Any] = {
         "schema_version": 3 if draft.checkpoints else SUPPORTED_DELIVERY_PLAN_SCHEMA_VERSION,
         "plan_id": draft.plan_id,
@@ -1263,6 +1289,38 @@ def _render_plan_yaml(draft: DeliveryAuthoringDraft, unit_task_paths: dict[str, 
     if streams:
         plan_data["streams"] = streams
     plan_data["units"] = [_unit_plan_entry(unit, unit_task_paths[unit.id]) for unit in draft.units]
+    if (
+        draft.checkpoints
+        and any(record.checkpoint_ids is not None for record in draft.source_accounting or ())
+        # Heading canonicalization and asset assignment happen after verification.
+        # Changed contracts require full authority, never a newly minted receipt
+        # claiming that the verifier reviewed their rendered contents.
+        and _checkpoint_authority_matches_draft(draft)
+    ):
+        from core.delivery_authority import (
+            authority_contract_fingerprint,
+            checkpoint_authority_context,
+            checkpoint_authority_receipt,
+        )
+        from core.delivery_plan import check_delivery_plan_data
+
+        checked = check_delivery_plan_data(
+            plan_data, project_root=project_root, virtual_task_paths=set(unit_task_paths.values())
+        )
+        if not checked.valid or checked.plan is None or checked.plan.source_task is None:
+            raise ValueError("Checkpoint attribution requires a valid source-backed plan")
+        source = (project_root / checked.plan.source_task.path).read_text(encoding="utf-8")
+        contracts = {
+            unit.id: authority_contract_fingerprint((unit.task_markdown.rstrip("\n") + "\n").encode("utf-8"))
+            for unit in draft.units
+        }
+        plan_data["checkpoint_authority"] = {
+            node.id: checkpoint_authority_receipt(
+                checkpoint_authority_context(checked.plan, node.id, source),
+                {key: contracts[key] for key in node.unit_ids},
+            )
+            for node in draft.checkpoints
+        }
     return yaml.safe_dump(plan_data, sort_keys=False, default_flow_style=False)
 
 

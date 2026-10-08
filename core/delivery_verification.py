@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
-from core.delivery_obligations import delivery_authority_fragments
+from core.delivery_authority import verification_authority_fragments
 from core.delivery_plan import DeliveryPlanCheckResult, DeliveryPlanIssue, is_private_delivery_source_task_path
 from core.delivery_progress import DeliveryStatusResult
 from core.delivery_verification_model import delivery_verification_covers_obligations
@@ -267,16 +267,16 @@ def check_delivery_verification_readiness(
                 try:
                     source_data = source_path.read_bytes()
                     source_bytes = len(source_data)
-                    source_text = source_data.decode("utf-8")
+                    source_text = source_data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
                     source_prompt_bytes = len(
                         json.dumps(
-                            [fragment.to_prompt_dict() for fragment in delivery_authority_fragments(source_text)],
+                            verification_authority_fragments(source_text, scope.plan_context()),
                             indent=2,
                             sort_keys=True,
                             ensure_ascii=True,
                         ).encode("utf-8")
                     )
-                except (OSError, UnicodeError):
+                except (OSError, ValueError):
                     errors.append(
                         DeliveryPlanIssue(
                             "error",
