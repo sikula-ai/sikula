@@ -30,6 +30,7 @@ _DELIVERY_VERIFICATION_RECOVERY_ACTIONS = {
     "readonly_mutation": "resolve_readonly_boundary",
     "validation_workspace_mutated": "resolve_readonly_boundary",
     "workspace_boundary_invalid": "resolve_workspace_boundary",
+    "reverification_budget_exhausted": "resolve_delivery_verification_budget",
 }
 
 
@@ -56,6 +57,11 @@ def delivery_verification_covers_obligations(
 
 def delivery_verification_is_boundary_stop(record: DeliveryVerificationRecord) -> bool:
     """Security and read-only failures remain stops even after candidate changes."""
+    if record.reverification and any(
+        delivery_verification_is_boundary_stop(parse_delivery_verification_record(entry["verification"]))
+        for entry in record.reverification["children"].values()
+    ):
+        return True
     return record.status in {"blocked", "failed"} and (
         record.security_status == "rejected"
         or delivery_verification_recovery_action(record.stop_code)
@@ -99,6 +105,8 @@ class DeliveryVerificationRecord:
     security_composition_attempted: bool = False
     security_composition_evidence_fingerprint: str | None = None
 
+    reverification: dict[str, Any] | None = None
+
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "schema_version": self.schema_version,
@@ -137,6 +145,10 @@ class DeliveryVerificationRecord:
             value = getattr(self, key)
             if value:
                 data[key] = value
+        if self.reverification is not None:
+            from copy import deepcopy
+
+            data["reverification"] = deepcopy(self.reverification)
         if self.review_rule_fingerprints is not None:
             data["review_rule_fingerprints"] = dict(self.review_rule_fingerprints)
         if self.composition_attempted:
@@ -154,6 +166,7 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
     if not isinstance(value, dict):
         raise ValueError("delivery verification record must be an object")
     allowed = {
+        "reverification",
         "schema_version",
         "gate_id",
         "candidate_commit",
@@ -338,7 +351,14 @@ def parse_delivery_verification_record(value: Any) -> DeliveryVerificationRecord
     ):
         raise ValueError("delivery verification evidence_path must be bounded and project-relative")
 
+    reverification = value.get("reverification")
+    if reverification is not None:
+        from core.delivery_reverification import parse_reverification
+
+        reverification = parse_reverification(reverification, value)
+
     return DeliveryVerificationRecord(
+        reverification=reverification,
         security_composition_attempted=value.get("security_composition_attempted", False),
         security_composition_evidence_fingerprint=security_composition_fingerprint,
         schema_version=SUPPORTED_DELIVERY_VERIFICATION_SCHEMA_VERSION,

@@ -661,8 +661,8 @@ JSON exposes the same distinction through `status` and `candidate_evidence`:
 
 - `exact`: the Git tree is unchanged and the historical evidence still matches
   the current authority and effective policy;
-- `reverified`: a fresh, accepted root assessment supplies typed evidence for
-  the changed candidate;
+- `reverified`: a fresh final-gate assessment or targeted checkpoint review supplies
+  accepted typed evidence for the changed candidate; final integration may still be pending;
 - `verification_required`: code changed and no current accepted assessment
   establishes the earlier outcomes, or a current root assessment rejected them;
 - `unavailable`: authority or required evidence is invalid, or a terminal boundary
@@ -674,9 +674,12 @@ shared dependencies can affect earlier behavior. For supported groups, the final
 gate combines direct work with checkpoint results and explicitly assesses their
 applicability to the current code. It uses a bounded change packet and inspects
 relevant code, including shared dependencies. This replaces the repeated full
-semantic review when the composed prompt is smaller. Uncertain applicability or
-integration gaps automatically select full review; confirmed external-dependency
-and security boundaries remain stops. Full-review findings feed bounded repair.
+semantic review when the composed prompt is smaller. With independently checked
+final responsibility, uncertain applicability first reviews the affected checkpoint
+on the final candidate, then reassesses integration. This includes required security
+review and configured validation. Unsupported cases, confirmed semantic gaps and
+repeated uncertainty select full review; external-dependency and security boundaries
+remain stops. Full-review findings feed bounded repair.
 Historical admission records and already completed units remain unchanged.
 
 The composed path supports up to eight nonoverlapping checkpoints and 32 direct
@@ -684,15 +687,22 @@ units, within fixed context and change budgets. Other shapes use full review;
 these bounds do not reject otherwise supported plans. Required security review
 and final validation still cover the current candidate. With separately approved
 final responsibility and accepted child security evidence, the security reviewer
-makes its own compact applicability assessment. Uncertainty uses full security review;
-confirmed security rejection remains a stop. Semantic approval cannot replace security.
+makes its own compact applicability assessment. It can request targeted checkpoint
+review too; remaining uncertainty uses full security review. Confirmed security
+rejection remains a stop. Semantic approval cannot replace security.
 A later repair owner outside a checkpoint makes its obligation direct again and
 invalidates compact final attribution.
-Composition gets one durable exchange per reviewer for unchanged candidate/policy, with at
-most two calls for format correction. Resume reuses its accepted decision; an
-interrupted exchange without a result or malformed responses use full review.
-Referenced composition evidence remains private and must be intact, just like
-the original checkpoint and final evidence.
+For unchanged candidate/policy, each reviewer gets one initial composition exchange,
+one parent reassessment after targeted checks, and one full fallback. Each requested
+checkpoint is reviewed at most once, with both required roles. Every exchange allows
+at most two calls for format correction; reservations survive interruption.
+Resume reuses accepted decisions, child evidence and fallback results. A consumed
+exchange without a result uses the remaining fallback; an interrupted fallback with
+no accepted result stops with `delivery_verification.reverification_budget_exhausted`.
+Further automatic calls require investigation or follow-up work, not a budget reset.
+All referenced evidence remains private and must be intact, including original
+checkpoint evidence. Candidate reviews never overwrite historical admission or
+rerun completed units, and they do not replenish repair budgets.
 
 Successful final verification of a plan with checkpoints retains exact typed
 results in private content-addressed evidence. Compact final evidence stores direct

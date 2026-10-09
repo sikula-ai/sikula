@@ -409,6 +409,25 @@ def check_delivery_verification_readiness(
             checkpoint_readiness = check_delivery_verification_readiness(status, project_config, node_id=checkpoint.id)
             errors.extend(issue for issue in checkpoint_readiness.errors if issue not in errors)
 
+    if scope is not None and scope.node_id == "root" and not errors and plan.verified_final_gate_authority:
+        from core.delivery_reverification import preflight_review_packets
+
+        try:
+            preflight_review_packets(
+                status,
+                project_config,
+                root,
+                source_text,
+            )
+        except (OSError, ValueError):
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery_verification.hierarchy_required",
+                    "The rendered candidate review or fallback exceeds supported packet bounds.",
+                )
+            )
+
     return DeliveryVerificationReadiness(
         required=True,
         ready=not errors,
@@ -469,11 +488,16 @@ def with_delivery_verification_readiness(
             from core.delivery_repair import delivery_repair_input_needs_refresh
 
             if (
-                verification.composition_evidence_fingerprint or verification.security_composition_evidence_fingerprint
+                verification.composition_evidence_fingerprint
+                or verification.security_composition_evidence_fingerprint
+                or verification.reverification
             ) and status.verification_node == "root":
                 from core.delivery_composition import load_composition
 
                 try:
+                    from core.delivery_reverification import validate_reverification
+
+                    validate_reverification(status, verification, project_config)
                     if verification.composition_evidence_fingerprint:
                         load_composition(status, verification)
                     if verification.security_composition_evidence_fingerprint:
@@ -492,6 +516,23 @@ def with_delivery_verification_readiness(
                             ),
                         ],
                     )
+            from core.delivery_reverification import reverification_budget_exhausted
+
+            if reverification_budget_exhausted(status, verification):
+                return replace(
+                    status,
+                    status="invalid",
+                    verification_status="blocked",
+                    next_action="investigate the exhausted candidate review budget or prepare follow-up work",
+                    errors=[
+                        *status.errors,
+                        DeliveryPlanIssue(
+                            "error",
+                            "delivery_verification.reverification_budget_exhausted",
+                            "The bounded candidate review cycle has no fallback covering current child assessments; further automatic review is exhausted.",
+                        ),
+                    ],
+                )
             if verification.passed and status.verification_node == "root" and status.plan.checkpoints:
                 from core.delivery_checkpoint_applicability import validate_root_evidence
 

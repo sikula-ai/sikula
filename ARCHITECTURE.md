@@ -1245,7 +1245,8 @@ boundary verdict in control state; audit failure alone cannot make it retryable.
 These terminal results persist against the matching running checkpoint gate and
 attempt even if the assembly advances or fails during review. They retain the
 captured candidate without rolling back the assembly or replacing a newer attempt;
-ordinary results and root verification still require the current candidate.
+ordinary results still require the current candidate. Final-gate boundary results
+also retain their captured attempt, including boundaries from candidate child reviews.
 Checkpoint records additionally retain private `review_rule_fingerprints` for
 applicable reviewer and security-reviewer rule files. Their candidate contents
 must match both the reviewed and current assembled commits; operator checkout
@@ -1327,7 +1328,8 @@ an orphan, interrupted write or unaccepted assessment cannot establish applicabi
 Readiness, current root reuse and finalization also require this evidence. Missing evidence
 cannot be reconstructed from aggregate success counts or audit history.
 
-An accepted current root assessment establishes `reverified` applicability for
+An accepted current root assessment or a separately accepted current-candidate
+checkpoint review establishes `reverified` applicability for
 historical checkpoints whose authority and completed inputs still match. Original
 checkpoint records, artifacts and recovery budgets remain unchanged. Each private
 decision binding includes the original receipt identity and fingerprint, the
@@ -1446,22 +1448,26 @@ Deterministic coverage validation resolves those children privately, restores de
 execution order and checks the original completed-input fingerprint and exact scope.
 It checks typed results, never infers success from a hash or count. This host-side
 resolution remains bounded by the current flat plan limits and never feeds expanded
-child state or audit history back into prompts. Uncertainty, child regressions, partial repair findings or two malformed
-responses trigger the existing full semantic review automatically. Confirmed
+child state or audit history back into prompts. With verified final authority,
+ordinary uncertainty invokes selective candidate re-verification below. Child
+regressions, partial repair findings, repeated uncertainty or two malformed
+responses select the preflighted full semantic review. Confirmed
 external-dependency, scope and unavailable-authority dispositions remain stops.
 Security review, when required, independently assesses the current candidate.
 Compact security composition requires accepted security results for every child and
 uses its own `checkpoint_results` with empty functional `obligation_results`.
-Semantic applicability never proves security applicability. Security uncertainty uses
-full security review; confirmed security rejection and read-only violations remain
+Semantic applicability never proves security applicability. Security uncertainty can
+request the same selective child review; unsupported or still-uncertain results use
+full security review. Confirmed security rejection and read-only violations remain
 terminal even if applicability is uncertain or audit persistence fails. Ordinary
 validation and final checks also remain mandatory.
 
 Before the first composition call, the captured running final-gate record durably
 sets `composition_attempted` for semantic review or `security_composition_attempted`
-for security review. One exchange per role (at most two calls for format correction)
-is permitted for that unchanged gate across resume; an interrupted exchange without
-accepted evidence proceeds directly to full review. The read-only workspace boundary
+for security review. One initial exchange per role (at most two calls for format correction) is permitted
+for that unchanged gate across resume; an interrupted initial exchange without
+accepted evidence proceeds directly to the single reserved full fallback. A supported
+uncertain result can additionally authorize one parent reassessment, as below. The read-only workspace boundary
 is checked before each composition call, including a format correction. After private
 audit succeeds and the candidate remains read-only, a content-addressed `composition-evidence-<sha>.json`
 stores the typed response, packet fingerprint, current gate identity and immediate
@@ -1474,6 +1480,78 @@ checkpoint admission and fixed logical-node repair budgets remain unchanged.
 Non-approved authoritative stops are persisted as gate failures, not cached as
 accepted composition. After an external prerequisite is resolved, an explicit retry
 can run full review. Security and read-only boundary stops continue to preempt review.
+
+**Selective checkpoint verification on the final candidate:**
+`core/delivery_reverification.py` owns the bounded private control schema, candidate
+identity, accepted-reference resolution and rendered-packet preflight. The existing
+final-gate coordinator schedules the work; there is no new operator approval step.
+Only compact composition with independently verified final authority can request
+this path. Each `verification_required` decision names a declared checkpoint.
+The coordinator reviews its original exact authorized scope, current contracts and
+completed execution inputs against the final candidate in a detached read-only
+workspace, with configured validation and both required reviewer roles. Validation
+for a child excludes root-only final checks; final validation remains mandatory.
+
+The root record's private `reverification` control contains at most eight child
+reservations/results, each bound to its original admission evidence fingerprint,
+and per-role reassessment and fallback reservations. Each child has a distinct
+identity derived from its checkpoint policy and the captured final gate, with one
+attempt. Successful typed checkpoint artifacts use the existing immutable storage
+and strict coverage parser; only the accepted control pointer authorizes reuse.
+Original admission records, contracts, completed units and repair budgets are never
+rewritten. Final closure can reference either original evidence whose applicability
+was established or newly accepted exact-candidate evidence. A child pass alone does
+not satisfy the final gate's retained/global authority or cross-group integration.
+Required security establishes applicability independently.
+
+For one unchanged compact final gate the maximum is one initial composition, one parent
+reassessment and one full fallback per role, plus one review of each requested
+child including required security. Each exchange permits at most two calls for
+format correction: at most 4N+12 reviewer calls for N <= 8 children when both roles
+are required. The bound includes spent/interrupted exchanges, not just successes.
+Children already accepted for one role's request serve the other role's request
+without another child execution. Parent reassessment still reviews integration.
+Repeated uncertainty, a consumed child exchange without accepted evidence or a
+confirmed semantic gap selects the preflighted full review and existing typed
+root repair path. Confirmed external/authority/security/read-only stops preempt
+further automatic review. After resolving an external prerequisite, explicit
+verification can spend the remaining full fallback without reopening the child
+exchange. Security/read-only child boundaries remain durable even
+if auditing fails or assembly advances; they also block after candidate/policy changes.
+
+A semantic rejection from a child requested by security also supersedes the earlier
+semantic composition pass. Before continuing security or accepting the final gate,
+the coordinator uses the remaining full semantic fallback and its normal repair
+outcome. Fallback evidence binds the child rejections known at that review; an
+earlier fallback cannot cover a later rejection or receive a new budget. This
+requirement survives interruption and is checked by readiness and final evidence
+validation. Security fallback rejection goes directly to terminal boundary
+persistence for the captured attempt, without ordinary acceptance/freshness checks
+that could discard it when assembly advances.
+
+Reservations precede calls and private prompt/output audit precedes acceptance.
+Child and fallback exchanges check the read-only boundary before format retries.
+Accepted parent decisions and full fallback assessments survive interruption;
+fallback results use content-addressed `candidate-review-<sha>.json` files. Missing
+referenced child, initial-composition, reassessment or fallback evidence blocks
+without regenerating it. An interrupted parent reassessment uses the remaining
+fallback. A reserved fallback without an accepted result reports
+`delivery_verification.reverification_budget_exhausted`; resume cannot replenish it
+or advertise a successful resumable pause. This requires operator investigation or
+follow-up work, not an automatic budget reset. Candidate changes invalidate ordinary
+applicability; they do not reset logical-node repair budgets or terminal boundaries.
+
+Shared readiness sizes every potential child's semantic/security packet and full
+fallback, including actual templates, rules, JSON escaping and correction headroom.
+Sizing includes the possible executed and reused validation phase metadata, so reused
+root validation cannot underestimate a child that must execute its named checks.
+Execution repeats the check in the captured candidate workspace before composition.
+Public status exposes only existing bounded candidate-evidence states: fresh child
+evidence can show `reverified` while final integration remains pending. Neither
+control records, child internals, typed outcomes nor history enter parent prompts.
+Dry-run and finalization validate accepted references and exhausted reservations.
+This remains a flat supported path with the current full-fallback and plan limits;
+nested subtree scheduling and large-plan scaling are subsequent work.
 
 **Delivery final integration gate:** newly prepared root-only plans use schema version 2;
 plans with checkpoints use schema version 3. Both require `verification.mode: final_gate`.

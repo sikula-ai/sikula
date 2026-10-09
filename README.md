@@ -295,7 +295,11 @@ evidence applicable to the current candidate. Changed code requires fresh
 verification; the final gate establishes that evidence before finalization.
 For supported small groups, it combines checkpoint results with direct work and
 checks that those results still apply to the current code. This reduces repeated
-context. Uncertain applicability automatically falls back to full review.
+context. With independently checked final responsibility, uncertain applicability
+first triggers a bounded review of the affected checkpoint on the final candidate,
+including required security review. The final gate then reassesses integration.
+Historical admission and completed units stay unchanged. Unsupported cases, confirmed
+semantic gaps or repeated uncertainty use a bounded full-review fallback.
 Each checkpoint has its own persistent
 repair budget. Nested hierarchy and large-plan scaling remain later work: this
 slice still requires the full-review fallback to fit its existing limits.

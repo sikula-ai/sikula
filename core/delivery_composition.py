@@ -28,7 +28,7 @@ from core.delivery_verification_scope import DeliveryVerificationScope
 from core.delivery_verification_model import DeliveryVerificationRecord
 from core.worktree import delivery_verification_git_env
 
-COMPOSITION_POLICY = "flat-final-composition-v2"
+COMPOSITION_POLICY = "flat-final-composition-v3"
 MAX_COMPOSITION_CHILDREN = 8
 MAX_COMPOSITION_DIRECT_UNITS = 32
 MAX_COMPOSITION_DELTA_BYTES = 64 * 1024
@@ -74,6 +74,7 @@ def build_composition_context(
     project_config: dict[str, Any],
     *,
     review_kind: str = "semantic",
+    record: DeliveryVerificationRecord | None = None,
 ) -> dict[str, Any] | None:
     """Caller validates admission/policy first. Unsupported shapes use full review."""
     if snapshot.scope.node_id != "root" or not status.plan.checkpoints:
@@ -95,7 +96,9 @@ def build_composition_context(
         scope = DeliveryVerificationScope.from_plan(status.plan, checkpoint.id)
         if covered_units.intersection(scope.unit_ids) or inherited.intersection(scope.obligation_ids):
             return None
-        origin = status.checkpoint_verifications[checkpoint.id]
+        from core.delivery_reverification import composition_origin
+
+        origin = composition_origin(status, record, checkpoint.id)
         evidence = load_checkpoint_evidence(root, directory, origin, plan_id=scope.plan_id, node_id=checkpoint.id)
         if not evidence.covers(scope):
             raise ValueError("Composition checkpoint evidence changed.")
@@ -359,16 +362,22 @@ def load_composition(
         or payload.get("review_kind", "semantic") != review_kind
     ):
         raise ValueError("Composition evidence unavailable.")
+    if not isinstance(payload["origins"], dict):
+        raise ValueError("Composition origins must be an object.")
     composition_evidence_path(directory, payload["packet_fingerprint"])
     origins = {}
+    origin_records = {}
     for child in status.plan.checkpoints:
-        origin = status.checkpoint_verifications.get(child.id)
+        from core.delivery_reverification import composition_origin
+
+        origin = composition_origin(status, record, child.id, digest=payload["origins"].get(child.id))
         if origin is None:
             raise ValueError("Composition origin unavailable.")
         evidence = load_checkpoint_evidence(root, directory, origin, plan_id=status.plan.plan_id, node_id=child.id)
         if not evidence.covers(DeliveryVerificationScope.from_plan(status.plan, child.id)):
             raise ValueError("Composition origin coverage changed.")
         origins[child.id] = origin.checkpoint_evidence_fingerprint
+        origin_records[child.id] = origin
     if payload["origins"] != origins:
         raise ValueError("Composition origins changed.")
     scope = DeliveryVerificationScope.from_plan(status.plan)
@@ -401,11 +410,11 @@ def load_composition(
             {
                 "id": child.id,
                 "obligations": obligations,
-                "exact_tree": status.checkpoint_verifications[child.id].candidate_tree == record.candidate_tree,
+                "exact_tree": origin_records[child.id].candidate_tree == record.candidate_tree,
             }
         )
         if compact:
-            origin = status.checkpoint_verifications[child.id]
+            origin = origin_records[child.id]
             if review_kind == "security" and (not origin.security_required or origin.security_status != "approved"):
                 raise ValueError("Security composition origin changed.")
             interface = next(item for item in authority["final_authority"]["children"] if item["id"] == child.id)

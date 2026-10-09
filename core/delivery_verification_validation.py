@@ -466,3 +466,37 @@ def _bounded_error(value: str, limit: int = 4000) -> str:
 def _fingerprint(value: Any) -> str:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
     return "sha256:" + sha256(payload.encode("utf-8")).hexdigest()
+
+
+def preview_delivery_validation_summary(
+    project_config: dict[str, Any], *, project_root: Path, include_final_checks: bool = True
+) -> dict[str, Any]:
+    """Upper-bound review metadata for sizing only, never validation evidence.
+
+    Execution and reuse can produce different phase lists. Include their union so
+    a reused root validation cannot underestimate a child's executed checks.
+    """
+    policy = _validation_policy_from_config(project_config)
+    phases = []
+    if policy["run_presync"]:
+        phases.append(("sync", "sync"))
+    if policy["run_build"]:
+        phases.extend((("sync", "sync"), ("build", "compile")))
+        if policy["run_tests"]:
+            phases.append(("test", "tests"))
+        if policy["run_checks"]:
+            phases.extend(("check", check["name"]) for check in policy["checks"])
+    final_checks = _configured_final_checks(project_config) if include_final_checks else []
+    if final_checks:
+        phases.append(("sync", "final-sync"))
+        phases.extend(
+            ("final_check", str(check.get("name") or f"final-check-{index}"))
+            for index, check in enumerate(final_checks, start=1)
+        )
+    summary = DeliveryVerificationValidationResult(True, False, False).to_review_dict(
+        project_config, project_root=project_root, include_final_checks=include_final_checks
+    )
+    summary["phases"] = [
+        {"phase": phase, "name": name, "status": "passed", "source": "executed"} for phase, name in phases
+    ]
+    return summary

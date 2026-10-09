@@ -225,26 +225,6 @@ def test_final_closure_runs_both_reviewers_persists_and_reuses(closure_plan):
     assert finalized.finalized, finalized
 
 
-@pytest.mark.parametrize("role", ["semantic", "security"])
-def test_uncertain_final_child_uses_full_review(closure_plan, role):
-    path, cfg = closure_plan
-    contexts = _contexts(path, cfg)
-    outputs = [composition_example(context) for context in contexts]
-    index = 0 if role == "semantic" else 1
-    uncertain = json.loads(outputs[index])
-    uncertain["checkpoint_results"][0]["outcome"] = "verification_required"
-    outputs[index] = json.dumps(uncertain)
-    status = get_delivery_status(path)
-    full = delivery_integration_review_control_example(
-        set(status.plan.checkpoints[0].obligation_ids) if role == "semantic" else set()
-    )
-    llms = [_LLM(value, full) if i == index else _LLM(value) for i, value in enumerate(outputs)]
-    result, _ = _run(path, cfg, *llms, node_id="root")
-    assert result.succeeded, result
-    assert len(llms[index].calls) == 2
-    assert "CHILD_INTERNAL" in llms[index].calls[-1]
-
-
 @pytest.mark.parametrize("point", ["security", "evidence"])
 def test_final_closure_recovers_interruption_without_repeating_composition(closure_plan, point):
     from unittest.mock import patch
@@ -431,12 +411,12 @@ def test_failed_full_fallback_preserves_repair_provenance(closure_plan):
             "obligation_ids": [key],
         }
     ]
-    semantic = _LLM(json.dumps(uncertain), json.dumps(full))
+    semantic = _LLM(json.dumps(uncertain), json.dumps(full), json.dumps(full))
     security = _LLM()
     result, _ = _run(path, cfg, semantic, security, node_id="root")
     assert result.stop_code == "delivery_verification.repair_required", result
     assert not security.calls
-    assert len(semantic.calls) == 2 and "CHILD_INTERNAL" in semantic.calls[-1]
+    assert len(semantic.calls) == 3 and "CHILD_INTERNAL" in semantic.calls[-1]
     before = get_delivery_status(path)
     contract = Path(cfg["project"]["root_path"]) / before.plan.units[0].task_path
     repaired = _repair(path, cfg, _LLM(_draft(markdown=contract.read_text())))
