@@ -242,14 +242,14 @@ class DeliveryIntegrationReviewAgent:
         ):
             control_object_example = composition_example(plan_context)
             focus += (
-                "\nThis final gate composes historical checkpoint evidence with direct work."
+                "\nThis final gate composes accepted checkpoint evidence with direct work."
                 " Historical passes are provisional: explicitly assess each checkpoint against the CURRENT candidate."
                 " For exact trees, validated typed results establish the child outcomes, but still inspect integration."
                 " For changed trees, inspect the supplied complete bounded delta and read relevant current code,"
                 " callers and shared dependencies. Cite delta:<checkpoint-id> and give a bounded evidence-based rationale."
                 " Ancestry, disjoint paths and passing tests alone never prove continued applicability."
                 " Use verification_required whenever applicability cannot be established or a child regressed;"
-                " Sikula will autonomously run full verification. Do not request human review for that uncertainty."
+                " Sikula will autonomously select bounded checkpoint verification or full review. Do not request human review for that uncertainty."
                 " Check cross-group behavior and every supplied governing source fragment independently."
                 " Return obligation_results ONLY for direct obligations, plus exactly one checkpoint_results entry"
                 " for each child. Child outcomes are applicable or verification_required."
@@ -270,7 +270,7 @@ class DeliveryIntegrationReviewAgent:
                     " Reassess its security assumptions, changed dependencies and cross-boundary behavior for the current candidate."
                     " Semantic approval cannot establish security. Return no functional obligation_results, and one security"
                     " checkpoint_results decision per child. Confirmed security defects are blocking dispositions; uncertainty"
-                    " selects verification_required and a bounded full security review."
+                    " selects verification_required for bounded candidate verification or full security review."
                 )
         authority_fragments = verification_authority_fragments(source_task, plan_context)
         prompt = f"""{AGENT_SECURITY_PREFIX}{focus}

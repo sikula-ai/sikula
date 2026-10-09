@@ -901,11 +901,17 @@ python3 -m ruff format .
 - **Always** treat checkpoint evidence in a composed final review as provisional
   until current applicability is established. Do not infer independence from
   disjoint paths, ancestry or passing tests. Bound child fan-in, direct context,
-  change evidence and the complete rendered protocol; unsupported inputs and
-  ordinary uncertainty use a preflighted full-review fallback. Reserve composition
-  work durably before calls, accept only audited read-only results against their
-  captured attempt, and preserve accepted decisions across resume. Never refill
-  repair budgets or discard a terminal boundary to obtain a reusable result.
+  change evidence and the complete rendered protocol. With verified final authority,
+  ordinary uncertainty first reviews the named child on the current final candidate,
+  then reassesses parent integration; unsupported inputs, confirmed semantic gaps
+  and repeated uncertainty use a preflighted full-review fallback. Keep new child
+  evidence separate from historical admission. Reserve the entire finite cycle's
+  work durably before calls, including child reviews, parent reassessment, format
+  correction and fallback. Resume accepted results; never reconstruct missing
+  evidence or repeat consumed exchanges to obtain approval. Preflight both roles'
+  rendered child and fallback packets before the first call. Security/read-only
+  boundaries survive audit failure and candidate changes. Never refill repair
+  budgets or discard a terminal boundary to obtain a reusable result.
 - **Never** expose final-gate source text, prompts, provider output, validation
   output, diffs, child state, credentials, or absolute paths through delivery
   status or JSON. Keep private material in append-only local evidence and publish

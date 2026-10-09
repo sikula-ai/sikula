@@ -377,7 +377,9 @@ def _store_root_closure(
     children = []
     expected = {unit.unit_id: unit for unit in snapshot.completed_units}
     for ref in composition.child_refs:
-        origin = status.checkpoint_verifications[ref["id"]]
+        from core.delivery_reverification import composition_origin
+
+        origin = composition_origin(status, record, ref["id"], digest=ref["evidence_fingerprint"])
         if origin.checkpoint_evidence_fingerprint != ref["evidence_fingerprint"]:
             raise ValueError("Root closure child changed.")
         child = load_checkpoint_evidence(root, directory, origin, plan_id=snapshot.scope.plan_id, node_id=ref["id"])

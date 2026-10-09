@@ -570,7 +570,9 @@ def test_composition_format_retry_checks_readonly_boundary_first(tmp_path: Path,
     _git(tmp_path, "add", ".")
     _git(tmp_path, "commit", "-m", "candidate")
     identity = SimpleNamespace(
-        candidate_commit=_git(tmp_path, "rev-parse", "HEAD"), candidate_tree=_git(tmp_path, "rev-parse", "HEAD^{tree}")
+        gate_id="sha256:" + "a" * 64,
+        candidate_commit=_git(tmp_path, "rev-parse", "HEAD"),
+        candidate_tree=_git(tmp_path, "rev-parse", "HEAD^{tree}"),
     )
 
     class MutatingLLM(_LLM):
@@ -634,7 +636,7 @@ def test_composed_semantics_does_not_skip_security_and_survives_its_interruption
 
 @pytest.mark.parametrize("shape", ["larger", "oversized", "fallback_oversized"])
 def test_rendered_prompt_preflight_does_not_reserve_unusable_composition(tmp_path: Path, shape: str) -> None:
-    from core.delivery_verify import _composition_review
+    from core.delivery_verify import _composition_exchange
 
     full, composed = "full prompt", "longer composed prompt"
     if shape == "oversized":
@@ -647,12 +649,12 @@ def test_rendered_prompt_preflight_does_not_reserve_unusable_composition(tmp_pat
     snapshot = SimpleNamespace(
         scope=scope, identity=SimpleNamespace(candidate_commit="a" * 40, candidate_tree="b" * 40)
     )
-    running = SimpleNamespace(composition_attempted=False, composition_evidence_fingerprint=None)
+    running = SimpleNamespace(composition_attempted=False, composition_evidence_fingerprint=None, reverification=None)
     with (
         patch("core.delivery_composition.build_composition_context", return_value={}),
         patch("core.delivery_verify._persist_composition_control") as reserve,
     ):
-        result, unchanged = _composition_review(
+        result, unchanged = _composition_exchange(
             status=SimpleNamespace(plan=SimpleNamespace(checkpoints=["storage"])),
             snapshot=snapshot,
             running=running,

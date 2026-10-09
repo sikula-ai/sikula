@@ -675,7 +675,9 @@ def upsert_delivery_unit_progress(
         final_branch=final_branch,
         final_commit=final_commit,
         finalized_at=finalized_at,
-        verification=progress.verification if units == progress.units else None,
+        verification=progress.verification
+        if units == progress.units or _retain_verification_attempt(progress.verification)
+        else None,
     )
     _validate_progress(updated)
     return updated
@@ -743,6 +745,16 @@ def make_delivery_progress_event(
     )
 
 
+def _retain_verification_attempt(record: DeliveryVerificationRecord | None) -> bool:
+    return bool(
+        record
+        and (
+            delivery_verification_is_boundary_stop(record)
+            or (record.reverification is not None and record.status == "running")
+        )
+    )
+
+
 def mark_delivery_assembly(
     progress: DeliveryProgress,
     *,
@@ -776,7 +788,8 @@ def mark_delivery_assembly(
         finalized_at=None,
         verification=(
             progress.verification
-            if progress.assembled_commit == assembled_commit and progress.assembly_status == status
+            if (progress.assembled_commit == assembled_commit and progress.assembly_status == status)
+            or _retain_verification_attempt(progress.verification)
             else None
         ),
     )
@@ -820,7 +833,7 @@ def mark_delivery_verification(
 ) -> DeliveryProgress:
     _validate_progress(progress)
     parse_delivery_verification_record(verification.to_dict())
-    captured = progress.checkpoint_verifications.get(node_id) if node_id != "root" else None
+    captured = progress.checkpoint_verifications.get(node_id) if node_id != "root" else progress.verification
     retain_boundary = (
         delivery_verification_is_boundary_stop(verification)
         and captured is not None
@@ -1219,7 +1232,12 @@ def _validate_progress(progress: DeliveryProgress) -> None:
         raise ValueError("delivery assembly failure metadata requires failed status")
     if progress.verification is not None:
         parse_delivery_verification_record(progress.verification.to_dict())
-        if progress.assembly_status != "ready" or progress.assembled_commit != progress.verification.candidate_commit:
+        if (
+            progress.assembly_status != "ready" or progress.assembled_commit != progress.verification.candidate_commit
+        ) and not (
+            delivery_verification_is_boundary_stop(progress.verification)
+            or (progress.verification.reverification is not None and not progress.verification.passed)
+        ):
             raise ValueError("delivery verification does not match the assembled candidate")
         if progress.verification.passed:
             if progress.verification.semantic_status != "approved":

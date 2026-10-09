@@ -32,6 +32,9 @@ def validate_root_evidence(status: DeliveryStatusResult, record: DeliveryVerific
     """Validate exact typed coverage; the caller separately validates freshness."""
     if not status.plan or not status.project_root:
         raise ValueError("Root evidence requires plan authority.")
+    from core.delivery_reverification import validate_reverification
+
+    validate_reverification(status, record)
     root = Path(status.project_root)
     evidence = load_root_evidence(
         root,
@@ -104,6 +107,19 @@ def checkpoint_applicability(
     root_current = root_matches and root_record.passed
     root_rejected = root_matches and root_record.semantic_status == "rejected"
     root_unavailable = False
+    current_children = set()
+    if root_matches and root_record.reverification:
+        try:
+            from core.delivery_reverification import validate_reverification
+
+            validate_reverification(status, root_record, cfg)
+            current_children = {
+                key
+                for key, item in root_record.reverification["children"].items()
+                if item["verification"]["status"] == "passed"
+            }
+        except (OSError, RuntimeError, ValueError):
+            root_unavailable = True
     if root_current:
         try:
             validate_root_evidence(status, root_record)
@@ -122,7 +138,7 @@ def checkpoint_applicability(
             decision = "verification_required"
         elif origin.candidate_tree == identity.candidate_tree:
             decision = "exact"
-        elif root_current:
+        elif root_current or checkpoint.id in current_children:
             decision = "reverified"
         binding = None
         if decision in {"exact", "reverified"}:
@@ -135,6 +151,13 @@ def checkpoint_applicability(
                 "target": vars(identity),
                 "decision": decision,
                 "root_evidence": root_record.root_evidence_fingerprint if decision == "reverified" else None,
+                "candidate_evidence": (root_record.reverification or {})
+                .get("children", {})
+                .get(checkpoint.id, {})
+                .get("verification", {})
+                .get("checkpoint_evidence_fingerprint")
+                if root_matches
+                else None,
             }
             binding = "sha256:" + sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         result[checkpoint.id] = CheckpointApplicability(
