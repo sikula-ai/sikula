@@ -6,9 +6,10 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 import re
-from typing import Any, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, Callable
 
 from core.delivery_checkpoint_evidence import load_checkpoint_evidence
+from core.delivery_composition_scope import DeliveryCompositionScope, flat_delivery_composition_scope
 from core.delivery_progress import DeliveryStatusResult, delivery_progress_path
 from core.delivery_verification_model import DeliveryVerificationRecord, parse_delivery_verification_record
 from core.delivery_verification_scope import DeliveryVerificationScope
@@ -17,6 +18,8 @@ from core.delivery_verification_scope import DeliveryVerificationScope
 if TYPE_CHECKING:
     from core.delivery_verification import DeliveryVerificationSnapshot
     from core.delivery_verification_review import DeliveryIntegrationAssessment
+    from core.delivery_composition import CompositionResult
+    from agents.delivery_integration_review_agent import DeliveryIntegrationReviewResult
 
 
 _ROLES = {"semantic", "security"}
@@ -132,6 +135,17 @@ def composition_origin(
     historical = status.checkpoint_verifications.get(node_id)
     if historical is None:
         raise ValueError("Original checkpoint admission is unavailable.")
+    return accepted_composition_origin(historical, parent, node_id, digest=digest)
+
+
+def accepted_composition_origin(
+    historical: DeliveryVerificationRecord,
+    parent: DeliveryVerificationRecord | None,
+    node_id: str,
+    *,
+    digest: str | None = None,
+) -> DeliveryVerificationRecord:
+    """Select within the parent's captured attempt without traversing a plan."""
     entry = (parent.reverification or {}).get("children", {}).get(node_id) if parent else None
     if entry is not None:
         if entry["origin"] != historical.checkpoint_evidence_fingerprint:
@@ -145,11 +159,18 @@ def composition_origin(
 
 
 def validate_reverification(
-    status: DeliveryStatusResult, record: DeliveryVerificationRecord, cfg: dict[str, Any] | None = None
+    status: DeliveryStatusResult,
+    record: DeliveryVerificationRecord,
+    cfg: dict[str, Any] | None = None,
+    *,
+    scope: DeliveryCompositionScope | None = None,
 ) -> None:
     if record.reverification is None:
         return
     parse_reverification(record.reverification, record.to_dict())
+    composition_scope = scope or flat_delivery_composition_scope(status.plan)
+    if composition_scope is None:
+        raise ValueError("Candidate review requires captured composition authority.")
     root = Path(status.project_root)
     directory = delivery_progress_path(root, status.plan.plan_id).parent
     from core.delivery_composition import load_composition
@@ -158,24 +179,29 @@ def validate_reverification(
         field = (
             "composition_evidence_fingerprint" if role == "semantic" else "security_composition_evidence_fingerprint"
         )
-        initial = load_composition(status, replace(record, **{field: round_state["initial"]}), review_kind=role)
+        initial = load_composition(
+            status, replace(record, **{field: round_state["initial"]}), review_kind=role, scope=composition_scope
+        )
         if not initial.fallback or not initial.assessment.approved:
             raise ValueError("Candidate review did not originate in ordinary uncertainty.")
     for role, digest in record.reverification["fallbacks"].items():
         if digest:
-            load_full_result(status, record, role)
+            load_full_result(status, record, role, scope=composition_scope.parent)
     for node_id, entry in record.reverification["children"].items():
+        child_scope = composition_scope.child(node_id)
         historical = status.checkpoint_verifications.get(node_id)
         if historical is None or historical.checkpoint_evidence_fingerprint != entry["origin"]:
             raise ValueError("Candidate re-verification admission changed.")
         child = parse_delivery_verification_record(entry["verification"])
         if cfg is not None:
             snapshot = candidate_snapshot(status, cfg, record, node_id)
-            if any(getattr(child, key) != val for key, val in vars(snapshot.identity).items()):
+            if snapshot.scope != child_scope or any(
+                getattr(child, key) != val for key, val in vars(snapshot.identity).items()
+            ):
                 raise ValueError("Candidate re-verification authority changed.")
         if child.passed:
             evidence = load_checkpoint_evidence(root, directory, child, plan_id=status.plan.plan_id, node_id=node_id)
-            if not evidence.covers(DeliveryVerificationScope.from_plan(status.plan, node_id)):
+            if not evidence.covers(child_scope):
                 raise ValueError("Candidate re-verification coverage changed.")
     if record.passed and semantic_gap_ids(record) and not semantic_fallback_covers_gaps(status, record):
         raise ValueError("Final semantic approval predates a rejected candidate child.")
@@ -239,13 +265,17 @@ def reverification_budget_exhausted(status: DeliveryStatusResult, record: Delive
 
 
 def load_full_result(
-    status: DeliveryStatusResult, parent: DeliveryVerificationRecord, role: str
+    status: DeliveryStatusResult,
+    parent: DeliveryVerificationRecord,
+    role: str,
+    *,
+    scope: DeliveryVerificationScope | None = None,
 ) -> DeliveryIntegrationAssessment:
     from core.delivery_verification_review import parse_delivery_integration_review
     import json
 
     payload = _full_result_payload(status, parent, role)
-    scope = DeliveryVerificationScope.from_plan(status.plan)
+    scope = scope or DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
     return parse_delivery_integration_review(
         json.dumps(payload["assessment"]),
         known_unit_ids=set(scope.unit_ids),
@@ -255,14 +285,29 @@ def load_full_result(
 
 def preflight_review_packets(status: DeliveryStatusResult, cfg: dict[str, Any], cwd: Path, source: str) -> None:
     """Size every potential child and full fallback before reserving provider work."""
+    scope = flat_delivery_composition_scope(status.plan)
+    if scope is None:
+        scope = DeliveryCompositionScope(
+            DeliveryVerificationScope.from_plan(status.plan), (), include_final_checks=True
+        )
+    preflight_node_review_packets(scope, cfg, cwd, source)
+
+
+def preflight_node_review_packets(
+    composition_scope: DeliveryCompositionScope, cfg: dict[str, Any], cwd: Path, source: str
+) -> None:
+    """A parent's fallback and immediate children only; never discover descendants."""
     from agents.delivery_integration_review_agent import DeliveryIntegrationReviewAgent
     from core.delivery_verification import delivery_verification_prompt_is_bounded
     from core.delivery_verification_validation import preview_delivery_validation_summary
 
     reviewer = DeliveryIntegrationReviewAgent(None, cfg)
-    for node_id in ("root", *(node.id for node in status.plan.checkpoints)):
-        scope = DeliveryVerificationScope.from_plan(status.plan, node_id)
-        validation = preview_delivery_validation_summary(cfg, project_root=cwd, include_final_checks=node_id == "root")
+    for scope in (composition_scope.parent, *composition_scope.children):
+        validation = preview_delivery_validation_summary(
+            cfg,
+            project_root=cwd,
+            include_final_checks=composition_scope.include_final_checks and scope is composition_scope.parent,
+        )
         for role in ("semantic", "security") if scope.security_required else ("semantic",):
             prompt = reviewer._prompt(
                 cwd=cwd,
@@ -276,3 +321,57 @@ def preflight_review_packets(status: DeliveryStatusResult, cfg: dict[str, Any], 
             )
             if not delivery_verification_prompt_is_bounded(prompt + " " * 4096):
                 raise ValueError("Candidate re-verification packet exceeds the prompt limit.")
+
+
+class SemanticRecheckRequired(RuntimeError):
+    """A child rejection invalidated an earlier semantic parent approval."""
+
+    def __init__(self, record: DeliveryVerificationRecord) -> None:
+        self.record = record
+
+
+def run_node_composition_cycle(
+    scope: DeliveryCompositionScope | None,
+    running: DeliveryVerificationRecord,
+    role: str,
+    *,
+    exchange: Callable[
+        [DeliveryVerificationRecord, bool], tuple[DeliveryIntegrationReviewResult | None, DeliveryVerificationRecord]
+    ],
+    validate: Callable[[DeliveryVerificationRecord], None],
+    load: Callable[[DeliveryVerificationRecord], CompositionResult],
+    review_child: Callable[[DeliveryVerificationRecord, str], tuple[DeliveryVerificationRecord, bool]],
+    semantic_fallback_covers: Callable[[DeliveryVerificationRecord], bool],
+) -> tuple[DeliveryIntegrationReviewResult | None, DeliveryVerificationRecord]:
+    """The finite node cycle; persistence and delivery policy belong to the caller.
+
+    Hooks use the same captured attempt and durably reserve work before provider
+    calls. This coordinator neither allocates new budgets nor admits children.
+    """
+    if role == "semantic" and semantic_gap_ids(running):
+        return None, running
+    result, running = exchange(running, False)
+    if result is not None or scope is None or running.reverification is None:
+        return result, running
+    field = "composition_evidence_fingerprint" if role == "semantic" else "security_composition_evidence_fingerprint"
+    if not getattr(running, field):
+        return None, running
+    validate(running)
+    if role in running.reverification["reassessments"]:
+        return exchange(running, True)
+    accepted = load(running)
+    if not accepted.fallback or not accepted.assessment.approved or not accepted.child_refs:
+        return None, running
+    nodes = [item["id"] for item in accepted.checkpoints if item["outcome"] == "verification_required"]
+    # Validate the entire selection before invoking any child, including on resume.
+    for node_id in nodes:
+        scope.child(node_id)
+    for node_id in nodes:
+        running, passed = review_child(running, node_id)
+        if not passed:
+            if role == "security" and semantic_gap_ids(running) and not semantic_fallback_covers(running):
+                raise SemanticRecheckRequired(running)
+            return None, running
+    if not nodes:
+        return None, running
+    return exchange(running, True)

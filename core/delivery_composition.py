@@ -1,4 +1,4 @@
-"""Bounded final-gate composition. Historical receipts are inputs, never approval."""
+"""Bounded node composition. Historical receipts are inputs, never approval."""
 
 from __future__ import annotations
 
@@ -11,6 +11,11 @@ from threading import Timer
 from typing import Any, TYPE_CHECKING
 
 from core.delivery_checkpoint_evidence import load_checkpoint_evidence
+from core.delivery_composition_scope import (
+    DeliveryCompositionAttempt,
+    DeliveryCompositionScope,
+    capture_composition_attempt,
+)
 from core.delivery_progress import DeliveryStatusResult, delivery_progress_path
 from core.delivery_repair_storage import read_repair_state, write_repair_state
 from core.delivery_verification import delivery_verification_source_task_is_private
@@ -24,7 +29,6 @@ from core.delivery_verification_review import (
     delivery_integration_review_control_example,
     parse_delivery_integration_review,
 )
-from core.delivery_verification_scope import DeliveryVerificationScope
 from core.delivery_verification_model import DeliveryVerificationRecord
 from core.worktree import delivery_verification_git_env
 
@@ -76,30 +80,45 @@ def build_composition_context(
     review_kind: str = "semantic",
     record: DeliveryVerificationRecord | None = None,
 ) -> dict[str, Any] | None:
-    """Caller validates admission/policy first. Unsupported shapes use full review."""
-    if snapshot.scope.node_id != "root" or not status.plan.checkpoints:
+    """Flat delivery adapter; common construction uses only captured node inputs."""
+    composition_scope = snapshot.composition_scope
+    if composition_scope is None:
         return None
-    if len(status.plan.checkpoints) > MAX_COMPOSITION_CHILDREN:
+    attempt = capture_composition_attempt(status, record, composition_scope)
+    return build_node_composition_context(
+        Path(status.project_root), snapshot, attempt, project_config, review_kind=review_kind
+    )
+
+
+def build_node_composition_context(
+    root: Path,
+    snapshot: DeliveryVerificationSnapshot,
+    attempt: DeliveryCompositionAttempt,
+    project_config: dict[str, Any],
+    *,
+    review_kind: str = "semantic",
+) -> dict[str, Any] | None:
+    """Build both roles' packets from exact authority and immediate children only."""
+    composition_scope = attempt.scope
+    attempt.assert_candidate(snapshot.identity)
+    if composition_scope.parent != snapshot.scope:
+        raise ValueError("Composition snapshot scope changed.")
+    if not 0 < len(composition_scope.children) <= MAX_COMPOSITION_CHILDREN:
         return None
-    root = Path(status.project_root)
-    directory = delivery_progress_path(root, status.plan.plan_id).parent
-    context = snapshot.scope.plan_context()
-    captured = status.plan.verified_final_gate_authority
-    final_context = json.loads(captured) if captured else None
+    directory = delivery_progress_path(root, snapshot.scope.plan_id).parent
+    context = composition_scope.parent.plan_context()
+    final_context = composition_scope.retained_authority()
     if review_kind == "security" and final_context is None:
         return None
     children = []
     covered_units: set[str] = set()
     inherited: set[str] = set()
     remaining_delta = MAX_COMPOSITION_DELTA_BYTES
-    for checkpoint in status.plan.checkpoints:
-        scope = DeliveryVerificationScope.from_plan(status.plan, checkpoint.id)
+    for scope in composition_scope.children:
         if covered_units.intersection(scope.unit_ids) or inherited.intersection(scope.obligation_ids):
             return None
-        from core.delivery_reverification import composition_origin
-
-        origin = composition_origin(status, record, checkpoint.id)
-        evidence = load_checkpoint_evidence(root, directory, origin, plan_id=scope.plan_id, node_id=checkpoint.id)
+        origin = attempt.origin(scope.node_id)
+        evidence = load_checkpoint_evidence(root, directory, origin, plan_id=scope.plan_id, node_id=scope.node_id)
         if not evidence.covers(scope):
             raise ValueError("Composition checkpoint evidence changed.")
         if review_kind == "security" and (not origin.security_required or origin.security_status != "approved"):
@@ -160,7 +179,7 @@ def build_composition_context(
                 return None
         children.append(
             {
-                "id": checkpoint.id,
+                "id": scope.node_id,
                 "origin_commit": origin.candidate_commit,
                 "origin_tree": origin.candidate_tree,
                 "evidence_fingerprint": origin.checkpoint_evidence_fingerprint,
@@ -173,7 +192,7 @@ def build_composition_context(
         )
         if final_context is not None:
             interface = next(
-                item for item in final_context["final_authority"]["children"] if item["id"] == checkpoint.id
+                item for item in final_context["final_authority"]["children"] if item["id"] == scope.node_id
             )
             children[-1].pop("unit_ids")
             children[-1].pop("obligations")
@@ -189,6 +208,9 @@ def build_composition_context(
     if len(context["units"]) > MAX_COMPOSITION_DIRECT_UNITS:
         return None
     context["checkpoint_composition"] = {"policy": COMPOSITION_POLICY, "children": children}
+    if not composition_scope.include_final_checks:
+        # The node identity is bounded; its full descendant coverage stays private.
+        context["verification_node"] = {"id": composition_scope.parent.node_id}
     if final_context is not None:
         context["checkpoint_composition"].update(compact=True, review_kind=review_kind)
     if len(json.dumps(context).encode()) > MAX_COMPOSITION_PACKET_BYTES:
@@ -338,10 +360,28 @@ def store_composition(root: Path, directory: Path, gate_id: str, context: dict, 
 
 
 def load_composition(
-    status: DeliveryStatusResult, record: DeliveryVerificationRecord, *, review_kind: str = "semantic"
+    status: DeliveryStatusResult,
+    record: DeliveryVerificationRecord,
+    *,
+    review_kind: str = "semantic",
+    scope: DeliveryCompositionScope | None = None,
 ) -> CompositionResult:
-    root = Path(status.project_root)
-    directory = delivery_progress_path(root, status.plan.plan_id).parent
+    return load_node_composition(
+        Path(status.project_root), capture_composition_attempt(status, record, scope), record, review_kind=review_kind
+    )
+
+
+def load_node_composition(
+    root: Path,
+    attempt: DeliveryCompositionAttempt,
+    record: DeliveryVerificationRecord,
+    *,
+    review_kind: str = "semantic",
+) -> CompositionResult:
+    """Validate accepted results against the same explicit coverage as construction."""
+    attempt.assert_record(record)
+    scope = attempt.scope.parent
+    directory = delivery_progress_path(root, scope.plan_id).parent
     digest = (
         record.composition_evidence_fingerprint
         if review_kind == "semantic"
@@ -367,33 +407,30 @@ def load_composition(
     composition_evidence_path(directory, payload["packet_fingerprint"])
     origins = {}
     origin_records = {}
-    for child in status.plan.checkpoints:
-        from core.delivery_reverification import composition_origin
-
-        origin = composition_origin(status, record, child.id, digest=payload["origins"].get(child.id))
+    for child in attempt.scope.children:
+        origin = attempt.origin(child.node_id, digest=payload["origins"].get(child.node_id))
         if origin is None:
             raise ValueError("Composition origin unavailable.")
-        evidence = load_checkpoint_evidence(root, directory, origin, plan_id=status.plan.plan_id, node_id=child.id)
-        if not evidence.covers(DeliveryVerificationScope.from_plan(status.plan, child.id)):
+        evidence = load_checkpoint_evidence(root, directory, origin, plan_id=scope.plan_id, node_id=child.node_id)
+        if not evidence.covers(child):
             raise ValueError("Composition origin coverage changed.")
-        origins[child.id] = origin.checkpoint_evidence_fingerprint
-        origin_records[child.id] = origin
+        origins[child.node_id] = origin.checkpoint_evidence_fingerprint
+        origin_records[child.node_id] = origin
     if payload["origins"] != origins:
         raise ValueError("Composition origins changed.")
-    scope = DeliveryVerificationScope.from_plan(status.plan)
     full_context = scope.plan_context()
     authority = full_context
     compact = payload.get("compact") is True
     if compact:
-        if status.plan.verified_final_gate_authority is None:
+        if attempt.scope.retained_authority_json is None:
             raise ValueError("Accepted final authority changed.")
-        authority = json.loads(status.plan.verified_final_gate_authority)
+        authority = attempt.scope.retained_authority()
     children = []
     inherited = set()
     covered = set()
-    if not 0 < len(status.plan.checkpoints) <= MAX_COMPOSITION_CHILDREN:
+    if not 0 < len(attempt.scope.children) <= MAX_COMPOSITION_CHILDREN:
         raise ValueError("Unsupported composition coverage.")
-    for child in status.plan.checkpoints:
+    for child in attempt.scope.children:
         if covered.intersection(child.unit_ids):
             raise ValueError("Overlapping composition coverage.")
         covered.update(child.unit_ids)
@@ -408,16 +445,16 @@ def load_composition(
         inherited.update(ids)
         children.append(
             {
-                "id": child.id,
+                "id": child.node_id,
                 "obligations": obligations,
-                "exact_tree": origin_records[child.id].candidate_tree == record.candidate_tree,
+                "exact_tree": origin_records[child.node_id].candidate_tree == record.candidate_tree,
             }
         )
         if compact:
-            origin = origin_records[child.id]
+            origin = origin_records[child.node_id]
             if review_kind == "security" and (not origin.security_required or origin.security_status != "approved"):
                 raise ValueError("Security composition origin changed.")
-            interface = next(item for item in authority["final_authority"]["children"] if item["id"] == child.id)
+            interface = next(item for item in authority["final_authority"]["children"] if item["id"] == child.node_id)
             children[-1].pop("obligations")
             children[-1].update(interface, evidence_fingerprint=origin.checkpoint_evidence_fingerprint)
     authority["obligations"] = [item for item in authority["obligations"] if item["id"] not in inherited]

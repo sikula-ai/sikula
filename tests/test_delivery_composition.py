@@ -5,6 +5,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
@@ -17,8 +18,11 @@ from core.delivery_composition import (
     composition_example,
     parse_composition,
 )
+from core.delivery_composition_scope import flat_delivery_composition_scope
+from core.delivery_verification_model import DeliveryVerificationRecord
 from core.delivery_verification_review import DeliveryIntegrationReviewParseError
 from core.delivery_progress import (
+    DeliveryStatusResult,
     delivery_progress_path,
     get_delivery_status,
     make_delivery_unit_progress,
@@ -346,6 +350,33 @@ def test_authoritative_stops_do_not_fall_back(packet: dict, disposition: str) ->
     assert result.assessment.obligation_results[-1].outcome == "uncertain"
 
 
+def _origin_record(**changes: Any) -> DeliveryVerificationRecord:
+    fields = dict(
+        schema_version=1,
+        gate_id="sha256:" + "a" * 64,
+        candidate_commit="a" * 40,
+        candidate_tree="a" * 40,
+        source_fingerprint="sha256:" + "a" * 64,
+        plan_fingerprint="sha256:" + "a" * 64,
+        completed_scope_fingerprint="sha256:" + "a" * 64,
+        config_fingerprint="sha256:" + "a" * 64,
+        policy_fingerprint="sha256:" + "a" * 64,
+        status="passed",
+        attempt=1,
+        semantic_status="approved",
+    )
+    return DeliveryVerificationRecord(**{**fields, **changes})
+
+
+def _packet_snapshot(status: DeliveryStatusResult, **identity: str) -> SimpleNamespace:
+    scope = DeliveryVerificationScope.from_plan(status.plan)
+    return SimpleNamespace(
+        scope=scope,
+        composition_scope=flat_delivery_composition_scope(status.plan, scope),
+        identity=SimpleNamespace(**identity),
+    )
+
+
 @pytest.mark.parametrize(
     "reason", ["large_delta", "many_paths", "private", "binary", "large_packet", "fan_in", "overlap"]
 )
@@ -354,14 +385,10 @@ def test_unsupported_composition_selects_full_review_before_calls(
 ) -> None:
     path, cfg = checkpoint_plan
     status = get_delivery_status(path)
-    origin = SimpleNamespace(
+    origin = _origin_record(
         candidate_commit="a" * 40, candidate_tree="a" * 40, checkpoint_evidence_fingerprint="sha256:" + "a" * 64
     )
     status = replace(status, checkpoint_verifications={"storage": origin})
-    scope = DeliveryVerificationScope.from_plan(status.plan)
-    snapshot = SimpleNamespace(
-        scope=scope, identity=SimpleNamespace(candidate_commit="b" * 40, candidate_tree="b" * 40)
-    )
     metadata = ":100644 100644 " + "a" * 40 + " " + "b" * 40 + " M\0"
     names = metadata + "src/cache.py\0"
     diff = "Changed storage dependency."
@@ -373,11 +400,19 @@ def test_unsupported_composition_selects_full_review_before_calls(
         diff = "Binary files a/cache and b/cache differ"
     elif reason == "large_packet":
         status = replace(status, plan=replace(status.plan, title="x" * (128 * 1024)))
-        snapshot.scope = DeliveryVerificationScope.from_plan(status.plan)
     elif reason in {"fan_in", "overlap"}:
         status = replace(
-            status, plan=replace(status.plan, checkpoints=status.plan.checkpoints * (9 if reason == "fan_in" else 2))
+            status,
+            plan=replace(
+                status.plan,
+                checkpoints=[
+                    replace(status.plan.checkpoints[0], id=f"storage-{i}")
+                    for i in range(9 if reason == "fan_in" else 2)
+                ],
+            ),
+            checkpoint_verifications={f"storage-{i}": origin for i in range(9 if reason == "fan_in" else 2)},
         )
+    snapshot = _packet_snapshot(status, candidate_commit="b" * 40, candidate_tree="b" * 40)
     outputs = [names, ValueError("delta budget")] if reason == "large_delta" else [names, diff]
     with (
         patch(
@@ -396,9 +431,9 @@ def test_later_repair_owner_keeps_obligation_direct(checkpoint_plan: tuple[Path,
     status = replace(
         status,
         plan=replace(status.plan, obligations=obligations),
-        checkpoint_verifications={"storage": SimpleNamespace()},
+        checkpoint_verifications={"storage": _origin_record()},
     )
-    snapshot = SimpleNamespace(scope=DeliveryVerificationScope.from_plan(status.plan))
+    snapshot = _packet_snapshot(status)
     with patch(
         "core.delivery_composition.load_checkpoint_evidence", return_value=SimpleNamespace(covers=lambda scope: True)
     ):
@@ -433,15 +468,12 @@ def test_composition_rejects_renamed_private_origin(checkpoint_plan: tuple[Path,
     _git(root, "mv", ".env", "settings.txt")
     _git(root, "commit", "-m", "rename fixture")
     status = get_delivery_status(path)
-    origin = SimpleNamespace(
+    origin = _origin_record(
         candidate_commit=origin_commit, candidate_tree=origin_tree, checkpoint_evidence_fingerprint="sha256:" + "a" * 64
     )
     status = replace(status, checkpoint_verifications={"storage": origin})
-    snapshot = SimpleNamespace(
-        scope=DeliveryVerificationScope.from_plan(status.plan),
-        identity=SimpleNamespace(
-            candidate_commit=_git(root, "rev-parse", "HEAD"), candidate_tree=_git(root, "rev-parse", "HEAD^{tree}")
-        ),
+    snapshot = _packet_snapshot(
+        status, candidate_commit=_git(root, "rev-parse", "HEAD"), candidate_tree=_git(root, "rev-parse", "HEAD^{tree}")
     )
     with patch(
         "core.delivery_composition.load_checkpoint_evidence", return_value=SimpleNamespace(covers=lambda scope: True)
@@ -451,18 +483,16 @@ def test_composition_rejects_renamed_private_origin(checkpoint_plan: tuple[Path,
 
 def _changed_context(path: Path, cfg: dict, origin_commit: str) -> dict | None:
     status = get_delivery_status(path)
-    origin = SimpleNamespace(
+    origin = _origin_record(
         candidate_commit=origin_commit,
         candidate_tree=_git(path.parent, "rev-parse", origin_commit + "^{tree}"),
         checkpoint_evidence_fingerprint="sha256:" + "a" * 64,
     )
     status = replace(status, checkpoint_verifications={"storage": origin})
-    snapshot = SimpleNamespace(
-        scope=DeliveryVerificationScope.from_plan(status.plan),
-        identity=SimpleNamespace(
-            candidate_commit=_git(path.parent, "rev-parse", "HEAD"),
-            candidate_tree=_git(path.parent, "rev-parse", "HEAD^{tree}"),
-        ),
+    snapshot = _packet_snapshot(
+        status,
+        candidate_commit=_git(path.parent, "rev-parse", "HEAD"),
+        candidate_tree=_git(path.parent, "rev-parse", "HEAD^{tree}"),
     )
     with patch(
         "core.delivery_composition.load_checkpoint_evidence", return_value=SimpleNamespace(covers=lambda scope: True)
@@ -647,7 +677,9 @@ def test_rendered_prompt_preflight_does_not_reserve_unusable_composition(tmp_pat
     reviewer._prompt.side_effect = [full, composed]
     scope = SimpleNamespace(node_id="root", obligation_ids={"direct"}, plan_context=lambda: {})
     snapshot = SimpleNamespace(
-        scope=scope, identity=SimpleNamespace(candidate_commit="a" * 40, candidate_tree="b" * 40)
+        scope=scope,
+        composition_scope=Mock(),
+        identity=SimpleNamespace(candidate_commit="a" * 40, candidate_tree="b" * 40),
     )
     running = SimpleNamespace(composition_attempted=False, composition_evidence_fingerprint=None, reverification=None)
     with (

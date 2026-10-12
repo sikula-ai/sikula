@@ -36,6 +36,7 @@ from core.delivery_public_metadata import (
     REDACTED_DELIVERY_PUBLIC_METADATA,
     sanitize_delivery_public_metadata,
 )
+from core.delivery_reverification import SemanticRecheckRequired as _SemanticRecheckRequired
 from core.delivery_verification import (
     DeliveryVerificationIdentity,
     DeliveryVerificationSnapshot,
@@ -695,12 +696,12 @@ def _execute_gate(
                     completed_at=_now(),
                 )
 
-            if scope.node_id == "root" and status.plan.verified_final_gate_authority:
-                from core.delivery_reverification import preflight_review_packets
+            if snapshot.composition_scope and snapshot.composition_scope.retained_authority_json:
+                from core.delivery_reverification import preflight_node_review_packets
 
                 try:
-                    preflight_review_packets(
-                        status,
+                    preflight_node_review_packets(
+                        snapshot.composition_scope,
                         project_config,
                         worktree,
                         source_task,
@@ -720,7 +721,11 @@ def _execute_gate(
                     "delivery_verification.reviewer_workspace_unavailable",
                     semantic_status="blocked",
                 )
-            if scope.node_id == "root" and status.plan.verified_final_gate_authority and scope.security_required:
+            if (
+                snapshot.composition_scope
+                and snapshot.composition_scope.retained_authority_json
+                and scope.security_required
+            ):
                 if security_reviewer is None:
                     return _review_blocked(
                         running, validation, "delivery_verification.security_unavailable", security_status="blocked"
@@ -1046,11 +1051,6 @@ def _execute_gate(
         )
 
 
-class _SemanticRecheckRequired(RuntimeError):
-    def __init__(self, record: DeliveryVerificationRecord) -> None:
-        self.record = record
-
-
 class _CandidateReviewStopped(RuntimeError):
     def __init__(self, record: DeliveryVerificationRecord) -> None:
         self.record = record
@@ -1092,7 +1092,7 @@ def _save_reverification(
                 or any(not checkpoint_pass_is_usable(current, child, cfg) for child in current.plan.checkpoints)
             ):
                 raise ValueError("Candidate review authority changed.")
-            validate_reverification(current, updated, cfg)
+            validate_reverification(current, updated, cfg, scope=snapshot.composition_scope)
         # Boundary evidence is captured even if a concurrent assembly moved.
         write_delivery_progress(path, replace(progress, verification=updated))
         return updated
@@ -1105,30 +1105,28 @@ def _composition_review(
     security_reviewer: DeliveryIntegrationReviewAgent | None,
     **kwargs: Any,
 ) -> tuple[DeliveryIntegrationReviewResult | None, DeliveryVerificationRecord]:
-    """One initial exchange, selective children, then one parent reassessment."""
+    """Adapt the common node cycle to captured delivery persistence and review."""
     from core.delivery_composition import load_composition
-    from core.delivery_reverification import validate_reverification, semantic_gap_ids, semantic_fallback_covers_gaps
+    from core.delivery_reverification import (
+        run_node_composition_cycle,
+        validate_reverification,
+        semantic_fallback_covers_gaps,
+    )
 
     role = kwargs.get("review_kind", "semantic")
-    if role == "semantic" and semantic_gap_ids(kwargs["running"]):
-        return None, kwargs["running"]
-    result, running = _composition_exchange(**kwargs)
-    if result is not None or kwargs["snapshot"].scope.node_id != "root" or running.reverification is None:
-        return result, running
-    field = "composition_evidence_fingerprint" if role == "semantic" else "security_composition_evidence_fingerprint"
-    if not getattr(running, field):
-        return None, running
-    validate_reverification(kwargs["status"], running, kwargs["project_config"])
-    if role in running.reverification["reassessments"]:
-        return _composition_exchange(**{**kwargs, "running": running, "reassessment": True})
-    accepted = load_composition(kwargs["status"], running, review_kind=role)
-    # Typed negative semantic results need the existing full repair assessment.
-    # Authoritative/security stops have already returned above.
-    if not accepted.fallback or not accepted.assessment.approved or not accepted.child_refs:
-        return None, running
-    nodes = [item["id"] for item in accepted.checkpoints if item["outcome"] == "verification_required"]
-    for node_id in nodes:
-        running, passed = _reverify_candidate_child(
+    scope = kwargs["snapshot"].composition_scope
+    return run_node_composition_cycle(
+        scope,
+        kwargs["running"],
+        role,
+        exchange=lambda running, reassessment: _composition_exchange(
+            **{**kwargs, "running": running, "reassessment": reassessment}
+        ),
+        validate=lambda running: validate_reverification(
+            kwargs["status"], running, kwargs["project_config"], scope=scope
+        ),
+        load=lambda running: load_composition(kwargs["status"], running, review_kind=role, scope=scope),
+        review_child=lambda running, node_id: _reverify_candidate_child(
             status=kwargs["status"],
             snapshot=kwargs["snapshot"],
             running=running,
@@ -1139,18 +1137,9 @@ def _composition_review(
             state_store=state_store,
             semantic_reviewer=semantic_reviewer,
             security_reviewer=security_reviewer,
-        )
-        if not passed:
-            if (
-                role == "security"
-                and semantic_gap_ids(running)
-                and not semantic_fallback_covers_gaps(kwargs["status"], running)
-            ):
-                raise _SemanticRecheckRequired(running)
-            return None, running
-    if not nodes:
-        return None, running
-    return _composition_exchange(**{**kwargs, "running": running, "reassessment": True})
+        ),
+        semantic_fallback_covers=lambda running: semantic_fallback_covers_gaps(kwargs["status"], running),
+    )
 
 
 def _reverify_candidate_child(
@@ -1171,6 +1160,9 @@ def _reverify_candidate_child(
     from core.delivery_verification_model import parse_delivery_verification_record
     from core.delivery_checkpoints import checkpoint_plan_fingerprint, checkpoint_review_rule_fingerprints
 
+    if snapshot.composition_scope is None:
+        raise ValueError("Candidate review requires a captured composition scope.")
+    snapshot.composition_scope.child(node_id)
     control = deepcopy(running.reverification)
     existing = control["children"].get(node_id)
     if existing:
@@ -1294,7 +1286,9 @@ def _bounded_full_review(
                 "The reserved fallback has no accepted result covering current child assessments.",
                 [],
             )
-        return DeliveryIntegrationReviewResult(load_full_result(status, running, role), []), running
+        return DeliveryIntegrationReviewResult(
+            load_full_result(status, running, role, scope=snapshot.scope), []
+        ), running
     control["fallbacks"][role] = None
     running = _save_reverification(status, snapshot, running, project_config, control)
     before = _review_snapshot(kwargs["worktree"], project_config)
@@ -1343,7 +1337,7 @@ def _composition_exchange(
     from core.delivery_composition import build_composition_context, load_composition, store_composition
     from core.delivery_verification import delivery_verification_prompt_is_bounded
 
-    if snapshot.scope.node_id != "root" or not status.plan.checkpoints:
+    if snapshot.composition_scope is None:
         return None, running
     try:
         evidence_field = (
@@ -1356,7 +1350,7 @@ def _composition_exchange(
         if reassessment and round_state and not round_state["accepted"]:
             return None, running
         if getattr(running, evidence_field) and (not reassessment or round_state):
-            accepted = load_composition(status, running, review_kind=review_kind)
+            accepted = load_composition(status, running, review_kind=review_kind, scope=snapshot.composition_scope)
             if accepted.fallback:
                 return None, running
             return DeliveryIntegrationReviewResult(accepted.assessment, [], accepted), running
