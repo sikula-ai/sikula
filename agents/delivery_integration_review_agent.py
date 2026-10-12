@@ -241,8 +241,9 @@ class DeliveryIntegrationReviewAgent:
             review_kind == "semantic" or plan_context["checkpoint_composition"].get("compact")
         ):
             control_object_example = composition_example(plan_context)
+            node_label = "verification node" if plan_context.get("verification_node") else "final gate"
             focus += (
-                "\nThis final gate composes accepted checkpoint evidence with direct work."
+                f"\nThis {node_label} composes accepted checkpoint evidence with direct work."
                 " Historical passes are provisional: explicitly assess each checkpoint against the CURRENT candidate."
                 " For exact trees, validated typed results establish the child outcomes, but still inspect integration."
                 " For changed trees, inspect the supplied complete bounded delta and read relevant current code,"
@@ -257,8 +258,9 @@ class DeliveryIntegrationReviewAgent:
                 " Report external dependency or unavailable authoritative decisions using the normal stop dispositions."
             )
             if plan_context.get("final_authority"):
+                authority_label = "Node" if plan_context.get("verification_node") else "Final"
                 focus += (
-                    " Final responsibility and child integration contexts were independently checked against the complete source."
+                    f" {authority_label} responsibility and child integration contexts were independently checked against the complete source."
                     " Exact child-local authority and outcomes remain in immutable accepted child evidence; do not re-enumerate them."
                     " Coverage hashes identify that evidence, not proof that changed code preserves it. Inspect current interfaces"
                     " and supplied complete deltas using the checked child integration context. If that context is insufficient,"

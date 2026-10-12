@@ -9,6 +9,7 @@ import subprocess
 from typing import Any
 
 from core.delivery_authority import verification_authority_fragments
+from core.delivery_composition_scope import DeliveryCompositionScope, flat_delivery_composition_scope
 from core.delivery_plan import DeliveryPlanCheckResult, DeliveryPlanIssue, is_private_delivery_source_task_path
 from core.delivery_progress import DeliveryStatusResult
 from core.delivery_verification_model import delivery_verification_covers_obligations
@@ -144,6 +145,7 @@ class DeliveryVerificationSnapshot:
     scope: DeliveryVerificationScope
     completed_units: tuple[DeliveryVerificationCompletedUnit, ...]
     identity: DeliveryVerificationIdentity
+    composition_scope: DeliveryCompositionScope | None = None
 
 
 def delivery_verification_security_required(status: DeliveryPlanCheckResult | DeliveryStatusResult) -> bool:
@@ -631,7 +633,12 @@ def build_delivery_verification_snapshot(
         policy_fingerprint=policy_fingerprint,
     )
 
-    return DeliveryVerificationSnapshot(scope=scope, completed_units=completed_units, identity=identity)
+    return DeliveryVerificationSnapshot(
+        scope=scope,
+        completed_units=completed_units,
+        identity=identity,
+        composition_scope=flat_delivery_composition_scope(status.plan, scope),
+    )
 
 
 def build_delivery_verification_identity(

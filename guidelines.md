@@ -912,6 +912,11 @@ python3 -m ruff format .
   rendered child and fallback packets before the first call. Security/read-only
   boundaries survive audit failure and candidate changes. Never refill repair
   budgets or discard a terminal boundary to obtain a reusable result.
+- **Always** drive shared composition, accepted evidence selection and packet
+  preflight from a captured parent scope and explicit immediate children. Keep
+  flat-plan selection, final-only validation and finalization in the delivery
+  adapter/coordinator. Scope capture cannot grant authority, refill an attempt or
+  import unrelated checkpoints or descendant history into a parent prompt.
 - **Never** expose final-gate source text, prompts, provider output, validation
   output, diffs, child state, credentials, or absolute paths through delivery
   status or JSON. Keep private material in append-only local evidence and publish

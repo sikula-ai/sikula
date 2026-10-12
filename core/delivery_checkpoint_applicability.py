@@ -33,8 +33,11 @@ def validate_root_evidence(status: DeliveryStatusResult, record: DeliveryVerific
     if not status.plan or not status.project_root:
         raise ValueError("Root evidence requires plan authority.")
     from core.delivery_reverification import validate_reverification
+    from core.delivery_composition_scope import flat_delivery_composition_scope
 
-    validate_reverification(status, record)
+    scope = DeliveryVerificationScope.from_plan(status.plan, "root")
+    composition_scope = flat_delivery_composition_scope(status.plan, scope)
+    validate_reverification(status, record, scope=composition_scope)
     root = Path(status.project_root)
     evidence = load_root_evidence(
         root,
@@ -43,13 +46,12 @@ def validate_root_evidence(status: DeliveryStatusResult, record: DeliveryVerific
         plan_id=status.plan.plan_id,
         unit_order=tuple(unit.id for unit in status.units if unit.status == "done"),
     )
-    scope = DeliveryVerificationScope.from_plan(status.plan, "root")
     if not evidence.covers(scope):
         raise ValueError("Root evidence coverage changed.")
     if record.composition_evidence_fingerprint:
         from core.delivery_composition import load_composition
 
-        composition = load_composition(status, record)
+        composition = load_composition(status, record, scope=composition_scope)
         actual = {item.id: item.outcome for item in evidence.obligation_results}
         outcomes_match = (
             (
@@ -64,7 +66,7 @@ def validate_root_evidence(status: DeliveryStatusResult, record: DeliveryVerific
     if record.security_composition_evidence_fingerprint:
         from core.delivery_composition import load_composition
 
-        security = load_composition(status, record, review_kind="security")
+        security = load_composition(status, record, review_kind="security", scope=composition_scope)
         if not security.fallback and not security.assessment.approved:
             raise ValueError("Security composition changed.")
 

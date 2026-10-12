@@ -1389,7 +1389,38 @@ cross-group and future obligations and approves only the exact final candidate.
 Adaptive insertion/regrouping, nested checkpoint composition, rolling windows and
 plans beyond the bounded root packet remain later work.
 
-**Bounded final-gate composition:** `core/delivery_composition.py` supplies a
+**Shared node composition:** `core/delivery_composition_scope.py` captures one
+parent verification scope, its explicitly selected immediate children, exact
+retained authority restored from validated receipts, and final-check applicability.
+The verification snapshot carries this immutable composition scope alongside its
+candidate identity. The current flat-plan adapter selects all declared checkpoints
+for the final gate; leaf checkpoints have no composition scope. Selection of
+children is adapter policy, never a traversal performed by the shared mechanism.
+Compact capture checks direct/inherited unit and obligation coverage, constraints,
+source-fragment coverage and the exact set of independently checked interfaces.
+It cannot authorize new source omissions or replace independent attribution.
+
+Both roles use the same captured scope for packet construction and accepted-response
+validation in `core/delivery_composition.py`. Attempt capture freezes accepted
+historical and candidate-review references, checks candidate/attempt binding and
+rejects children outside that scope. Typed closure construction checks each child's
+scope and execution inputs before resolving complete parent coverage privately.
+Only direct results and immediate child references enter the closure artifact;
+child-local descriptions, outcome lists and history do not enter compact parent
+prompts or response templates. Rendered preflight sizes the parent fallback and
+explicit immediate children, with final-only checks applied solely by adapter policy.
+
+`core/delivery_reverification.py` owns the common finite composition/child-review/
+reassessment cycle. The delivery coordinator supplies the existing durable exchange,
+review and persistence operations; it retains finalization, assembly reconciliation,
+final validation and progress ownership. Real verification, readiness, audit,
+resume and final evidence validation use these shared paths. Capturing a scope
+neither allocates another attempt nor changes accepted identities, recovery budgets,
+historical admission or terminal boundary precedence. Public plan/control formats
+and existing flat fallback behavior remain unchanged. This is the foundation for
+nested execution, not a nested plan schema or an increase in supported plan limits.
+
+**Bounded final-gate composition:** the flat adapter to `core/delivery_composition.py` supplies a
 supported flat path with at most eight nonoverlapping checkpoints and 32 direct
 units. Only obligations whose complete current ownership lies inside a child can
 be inherited; later repair owners leave an obligation direct. Without separately
